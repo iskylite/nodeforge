@@ -1,0 +1,1857 @@
+# NodeForge 分阶段详细设计与实现计划
+
+本文基于 `DESIGN.md` 的收敛版概要设计，作为后续代码实现的执行蓝图。它把 NodeForge 第一阶段拆成可落地的实现阶段，明确每个阶段要写哪些模块、形成哪些数据结构、暴露哪些接口和 CLI、需要哪些测试，以及达到什么标准才能进入下一阶段。
+
+本文不替代概要设计。概要设计回答“做什么、边界是什么、核心取舍是什么”；本文回答“按什么顺序实现、每一步交付什么代码、如何验证”。
+
+## 1. 实施总原则
+
+### 1.1 实现策略
+
+- 先完成单机单进程闭环，再扩展高级能力。
+- 先把配置、状态、事件、CLI、端口自检和单 HTTP listener 骨架打稳，再实现网络协议服务。
+- DHCP/TFTP 协议层保持通用和可测试，PXE 策略放在 policy/resolver 层。
+- HTTP 承载大文件、配置、answer file 和事件上报，TFTP 只承载启动小文件。
+- 自动安装和无盘启动作为两条一等公民链路并行建模，但实现顺序先安装后无盘。
+- 所有破坏性安装动作必须来自显式认领的 node + install profile。MVP 以 MAC 作为主要节点身份，DHCP client id 和 SN 作为辅助信息。
+- 未知节点默认进入等待/观察态；安全 discovery 或 safe/ephemeral diskless 必须显式配置，未知节点自动安装属于非法配置。
+- diskless 的 kernel、小 initrd、rootfs 必须以 boot bundle 方式校验一致性。
+- CLI 默认输出面向人，所有命令预留 `--output json`；命令解析和帮助信息优先使用成熟开源库，不长期维护手写 parser。启动配置、管理 catalog 和运行态分开：站点配置走 `config.json` 和重启加载；导入/构建/发布产生的 asset、repository、install source、rootfs、initrd、boot bundle 由 `nodeforged` 写入 catalog；运行期高频、批量和观测操作走 CLI/API。
+- 网络协议明确只支持 IPv4；配置、监听地址、DHCP option 和 initrd 网络逻辑均不接受 IPv6。
+- 密码直接以明文字符串配置和存储，包括系统用户密码（`users.password`）和 IPMI 凭据（`oob.ipmi.password`）；MVP 不引入 SecretRef、外部 secret store、临时密码状态或轮换流程。发行版 adapter 在渲染 answer file 时按安装器要求临时生成 hash，配置事实源仍只保留明文。
+
+### 1.2 阶段划分
+
+| 阶段 | 名称 | 前置 | 核心结果 |
+| --- | --- | --- | --- |
+| M0 | 项目骨架、单 HTTP listener 和本机管理接口 | 无 | `nodeforged` / `nodeforge` 可启动，配置和端口可自检 |
+| M1 | TFTP 闭环 | M0 | 标准 TFTP client 可下载 x86_64/aarch64 启动文件 |
+| M2 | DHCP + PXE 闭环 | M0、M1 | 节点获得 lease 和正确 bootfile，并进入 bootloader |
+| M3 | HTTP 资产、ISO 仓库和事件接口 | M0、资产模型 | 节点可获取配置/answer/rootfs/ISO repo，并上报事件 |
+| M4 | PXE 无人值守安装与基础后处理 | M1-M3 | Rocky Linux 9.7 aarch64、Ubuntu Server 22.04 LTS 安装和 `install_post` 跑通 |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、基础 runner | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
+| M6 | 支持矩阵增强 | M4、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
+| M7 | 补充包和后处理增强 | M4、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
+
+### 1.3 完成标准
+
+每个阶段必须满足：
+
+- 代码能构建。
+- 该阶段新增模块有单元测试。
+- 关键链路有集成测试或可复现实验脚本。
+- CLI 输出符合统一格式；顶层、资源级和动作级 `-h/--help` 可用。
+- 配置 schema 和示例同步更新。
+- 失败路径能给出结构化错误。
+- 公共 API、协议实现、破坏性操作和非显然逻辑的注释符合 2.3。
+
+### 1.4 阅读顺序与阶段依赖
+
+- M0-M7 是可验收的产品阶段，按章节顺序阅读和交付。
+- M1 先实现正式 TFTP 只读服务，并用标准 TFTP client 验证 RRQ/OACK、重传和路径安全。
+- M2 再实现 DHCP 地址、架构识别和 bootfile 决策，最后与 M1 联调完整 PXE 入口。
+- M4/M5 交付基础 provisioning runner；M7 只增强 archive、script、firstboot 和诊断，不是安装或无盘链路的前置阻塞。
+
+## 2. 代码结构总览
+
+代码结构按"少模块、清边界、按需拆文件"设计。MVP 不需要一开始把所有未来目录铺开；先保证主链路短、依赖方向清楚，再在文件变大或职责变多时拆分。
+
+## 3. M0：项目骨架、单 HTTP listener 和本机管理接口
+
+M0 目标是建立项目基础架构，实现可启动的守护进程和本机管理接口。当前已实现:
+
+### 3.1 已完成的代码模块
+
+- `src/main.zig`: 应用入口和主要流程控制
+- `src/app.zig`: 应用核心逻辑和生命周期管理  
+- `src/nodeforged.zig`: 守护进程实现
+- `src/root.zig`: 根模块和公共导出
+- `src/paths.zig`: 路径管理和默认位置
+- `src/preflight.zig`: 预检逻辑和端口验证
+- `src/version.zig`: 版本信息
+- `src/model.zig`: 核心数据模型定义，包含完整的文档注释
+- `src/config/load.zig`: 配置加载功能
+- `src/config/validate.zig`: 配置校验，包含详细的错误处理和文档
+- `src/config/store.zig`: 配置存储管理
+- `src/catalog/store.zig`: 目录管理和资产跟踪，支持导入/导出操作
+- `src/http/server.zig`: HTTP 服务器实现，包含请求处理和路由
+- `src/http/client.zig`: HTTP 客户端用于状态探测
+- `src/http/management.zig`: 管理接口实现
+- `src/state/runtime.zig`: 运行状态管理
+- `src/state/events.zig`: 事件记录和追踪
+- `src/observe/error.zig`: 错误处理和响应格式化
+
+### 3.2 代码质量改进
+
+所有公共类型和函数均已添加详细的 /// 文档注释:
+
+- `model.zig` 中的结构体如 `Catalog`、`RepositoryConfig`、`AssetConfig`、`InstallSourceConfig`、`BootBundleConfig`、`ProfileConfig`、`NodeConfig`、`PolicyConfig` 等
+- `catalog/store.zig` 模块级注释说明默认路径、文件大小限制和函数职责
+- `config/validate.zig` 详细说明校验顺序和限制
+- `http/server.zig` 函数文档包括 `serveConnection`、`route`、`validationError`、`json` 等
+- `http/client.zig` 的 `Status` 结构和 `probeAt` 函数
+- `state/runtime.zig` 和 `state/events.zig` 的运行态模型
+- `observe/error.zig` 的错误信封结构和响应格式
+
+### 3.3 关键修复
+
+- **Use-after-free 修复**: `http/server.zig` 的 `json()` 函数中，将日志记录从 `respond()` 调用后移至调用前，避免访问已释放的 `request.head.target`
+- **重复注释清理**: 删除 `catalog/store.zig` 中重复的 `default_path` 注释
+
+当前 M0 目录：
+
+```text
+src/
+  main.zig
+  nodeforged.zig
+  root.zig
+  paths.zig
+  app.zig
+  catalog.zig
+  model.zig
+  config/
+    load.zig
+    validate.zig
+    store.zig
+  http/
+    client.zig
+    server.zig
+    management.zig
+  catalog/
+    store.zig
+  state/
+    runtime.zig
+    events.zig
+  observe/
+    error.zig
+  preflight.zig
+  version.zig
+```
+
+DHCP、TFTP、boot resolver、profile renderer、asset store、rootfs/initrd 等目录按阶段落地时再新增，不在 M0 代码里预铺空壳。
+
+文件增长后的拆分规则：
+
+| 触发条件 | 拆分方式 |
+| --- | --- |
+| `model.zig` 过大 | 拆为 `model/node.zig`、`model/profile.zig`、`model/asset.zig`，但对外仍由 `model.zig` re-export |
+| DHCP/TFTP packet 逻辑复杂 | 增加 `options.zig`、`lease.zig`、`transfer.zig`，协议层仍不依赖业务配置 |
+| HTTP 路由变多 | 从 `routes.zig` 拆出 `static.zig`、`api.zig`、`range.zig` |
+| bootloader 增加 BIOS | 增加 `boot/pxelinux.zig`，MVP 只保留 GRUB |
+| rootfs/initrd 工具链落地 | 增加 `rootfs/`、`initrd/` 子目录，MVP 可先放在 `assets/validate.zig` 和脚本约定里 |
+
+模块依赖方向：
+
+```text
+main/app
+  -> config/state/assets/profile/boot
+  -> dhcp/tftp/http
+  -> observe
+
+dhcp/tftp/http
+  -> config read-only snapshot
+  -> catalog read-only snapshot
+  -> state update API
+  -> events writer
+
+cli
+  -> 127.0.0.1 HTTP management client
+  -> output formatter
+```
+
+核心代码原则：
+
+- `model.zig` 是 config、catalog 和 runtime 类型事实源；不要在 CLI、HTTP handler、renderer 里重复定义影子结构。
+- M0 的 `config/validate.zig` 同时校验启动配置和 catalog 引用关系；后续 catalog 规则变重时再拆出 `catalog/validate.zig`。
+- `boot/resolver.zig` 是唯一 PXE 决策入口；DHCP 只问 resolver 要 lease/bootfile，不自己理解 profile 细节。
+- DHCP/TFTP packet 编解码保持纯函数风格，方便 fixture 和 fuzz。
+- HTTP handler 只做路由、鉴权、参数解析和调用业务函数，不直接拼配置。
+- profile adapter 只负责把规范化模型渲染成 autoinstall/kickstart，不反向修改配置。
+- state/events 只能追加或通过 state manager 更新，避免多个模块直接写 runtime 文件。
+- 扩展优先通过 enum/union/config 字段和 validator 扩展，不为了未来能力提前引入 trait/plugin 抽象。
+
+### 3.1 复杂度预算
+
+为了避免代码设计过早复杂化，MVP 执行以下约束：
+
+| 项目 | MVP 约束 | 允许扩展时机 |
+| --- | --- | --- |
+| 数据模型 | `AppConfig` 表达启动/策略配置，`Catalog` 表达导入/构建/发布得到的管理目录，`RuntimeState` 表达运行态 | 配置迁移或 Web API 需要稳定 schema 时再拆 schema 包 |
+| 存储 | `/opt/nodeforge/config/config.json` + `/opt/nodeforge/catalog/catalog.json` + runtime/events；站点结构性配置修改后重启生效；DHCP discovery 策略和 catalog 变更支持运行期在线切换 | 并发写入、查询性能或多实例需求出现后再考虑数据库 |
+| 管理接口 | 复用唯一 HTTP listener；CLI 固定访问 `127.0.0.1:<http.port>`；管理路由不做 loopback peer 检查；不单设 `management_port` | MVP 不做远程管理 |
+| 发行版 adapter | `ubuntu.zig`、`kickstart.zig` 两个文件 | 版本差异明显增多后再拆能力表文件 |
+| 带外管理 | 只保存 IPMI 信息，不实现控制动作 | 明确要做电源控制/启动设备控制时再加执行模块 |
+| 补充包和后处理 | M4/M5 实现强类型步骤和最小 runner；M7 补齐高级步骤与诊断 | 明确需要常驻任务后再考虑 agent |
+| 插件系统 | 不做 | 第三方扩展成为明确目标后再设计 |
+
+拆模块的判断标准：
+
+- 单文件超过约 500 行，且存在两个以上稳定职责。
+- 同一文件的测试 fixture 已经明显分成不同协议或业务域。
+- 新功能需要独立生命周期，例如 rootfs 构建任务、initrd 构建任务。
+- 不因为“未来可能会有”而提前拆目录。
+
+### 2.2 核心调用路径
+
+MVP 只保留三条主要业务路径：
+
+```text
+CLI / 127.0.0.1 management HTTP
+  -> runtime change / batch import / config validate / catalog operation
+  -> nodeforged 校验并写入 config/catalog/runtime
+  -> state/event
+
+DHCP request
+  -> dhcp.packet parse
+  -> boot.resolver resolve(config, catalog, runtime, client_identity)
+  -> dhcp.server offer/ack
+  -> state/event
+
+HTTP/TFTP request
+  -> route/path parse
+  -> asset/catalog/config lookup
+  -> stream file or render config
+  -> state/event
+```
+
+关键约束：
+
+- `boot.resolver` 返回明确的 `BootDecision`，例如 `wait`、`deny`、`discovery`、`install`、`diskless`，并携带 bootfile、profile、原因。
+- DHCP、TFTP、HTTP 数据路由不直接修改启动配置或 catalog；运行期高频变更和 catalog 操作才通过 CLI/本机 management HTTP 请求 `nodeforged` 执行。站点配置由 `config.json` 表达，重启服务后加载生效；导入、构建、发布产生的对象由 `nodeforged` 写入 catalog。
+- 业务函数接收已经校验过的 `AppConfig` 和 `Catalog` 快照，避免服务处理过程中读取半更新配置或目录。
+- 所有对外错误转换为统一 `NodeForgeError`，CLI 和 API 只负责格式化。
+
+### 2.3 注释与代码文档要求
+
+注释要详细说明设计意图和约束，但不逐行复述语法。以下要求属于代码评审和阶段验收条件：
+
+- 每个模块使用 `//!` 说明职责、输入输出、依赖关系和明确不负责的事项。
+- 所有公开类型、语义不直观的 enum/union 和公开函数使用 `///`；说明参数、返回值、错误、所有权/生命周期、线程安全和副作用。
+- DHCP/TFTP/HTTP 协议代码标明对应 RFC、option/opcode、字节布局、网络字节序、长度上限、重试和状态转换。
+- `boot.resolver`、配置合并和校验逻辑说明优先级与安全不变量，尤其是 node/profile 显式绑定、未知节点禁止安装和 override 边界。
+- 擦盘、分区、格式化、安装 bootloader、执行自定义脚本等代码，在函数注释中明确前置条件、不可逆影响和失败后的状态。
+- allocator、buffer、指针、文件句柄、锁和异步任务说明由谁创建、持有和释放；跨线程共享状态说明同步方式。
+- 发行版 adapter 和模板映射注明适用版本、目标字段和版本差异来源。
+- 常量必须命名；端口、超时、大小和协议数值注明单位与标准来源，不留无解释的 magic number。
+- `TODO`/`FIXME` 必须包含原因、预期处理阶段或 issue；禁止只有“以后优化”之类的空注释。
+- 修改行为时同步修改注释和测试；禁止保留注释掉的旧代码，禁止写与代码语义重复且容易失真的行级旁白。
+
+```zig
+//! Read-only TFTP service for PXE boot assets.
+//! Implements RFC 1350 RRQ and RFC 2347 option negotiation.
+
+/// Resolves a client without mutating configuration.
+/// Unknown clients may wait, discover, or enter safe diskless; they never install.
+/// Returned paths borrow memory from validated config/catalog snapshots.
+fn resolveBoot(
+    config: *const AppConfig,
+    catalog: *const Catalog,
+    runtime: *const RuntimeState,
+    client: ClientIdentity,
+) NodeForgeError!BootDecision
+```
+
+## 4. 核心数据模型
+
+### 4.1 配置模型
+
+MVP 不把所有对象都塞进单一手写配置文件，而是分为三类事实源：
+
+| 类型 | 文件 | 主要内容 | 修改入口 |
+| --- | --- | --- | --- |
+| 启动/策略配置 | `/opt/nodeforge/config/config.json` | server、dhcp/tftp/http 站点配置、安全默认值、profile、provisioning bundle | 手工编辑 + `config validate`，或 `config apply`；结构性配置重启生效，DHCP discovery 策略支持在线切换 |
+| 管理 catalog | `/opt/nodeforge/catalog/catalog.json` | asset、repository、install source、rootfs、initrd、boot bundle | CLI/API 发起请求，`nodeforged` import/build/package/publish 并写入 |
+| 运行态 | `/opt/nodeforge/state/runtime.json`、`/opt/nodeforge/logs/events.jsonl` | lease、unknown client、session、node status、事件 | 服务运行时更新 |
+
+MVP 不读取 YAML 配置文件；如果后续需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。catalog 是 `nodeforged` 的内部持久化文件，CLI 不直接写。配置和 catalog 明显变大后再评估拆分或引入数据库。
+
+```zig
+const AppConfig = struct {
+    server: ServerConfig,
+    dhcp: DhcpConfig,
+    tftp: TftpConfig,
+    http: HttpConfig,
+    nodes: []NodeConfig,
+    distros: []DistroConfig,
+    profiles: []ProfileConfig,
+    provisioning_bundles: []ProvisioningBundle,
+    policy: PolicyConfig,
+};
+
+const Catalog = struct {
+    assets: []AssetConfig,
+    repositories: []RepositoryConfig,
+    install_sources: []InstallSourceConfig,
+    rootfs: []RootfsConfig,
+    boot_bundles: []BootBundleConfig,
+};
+```
+
+`nodes` 暂时保留在 `AppConfig`，因为它表达管理员确认后的节点身份、IP/profile 绑定和部署意图；它可以通过 `node import/add/update` 由 `nodeforged` 写回配置。asset、repository、install source、rootfs、boot bundle 这类由扫描、导入、构建、发布得到的对象放入 `Catalog`。
+
+关键字段：
+
+```zig
+const NodeConfig = struct {
+    id: []const u8,
+    mac: ?MacAddress,
+    client_id: ?[]const u8,
+    serial_number: ?[]const u8,
+    ip: ?Ipv4Address,
+    arch: Arch,
+    profile: []const u8,
+    hostname: ?[]const u8,
+    role: ?[]const u8,
+    tags: [][]const u8,
+    vars: JsonObject,
+    overrides: NodeOverrideConfig,
+    oob: ?OutOfBandConfig,
+};
+
+const NodeOverrideConfig = struct {
+    network: ?NodeNetworkOverride,
+    install_vars: JsonObject,
+    diskless: ?NodeDisklessOverride,
+};
+
+const NodeNetworkOverride = struct {
+    mode: NetworkMode,
+    interface: ?[]const u8,
+    address: ?Ipv4Address,
+    prefix_len: ?u8,
+    netmask: ?Ipv4Address,
+    gateway: ?Ipv4Address,
+    dns: []Ipv4Address,
+    search_domains: [][]const u8,
+};
+
+const NetworkMode = enum {
+    inherit,
+    dhcp,
+    static,
+};
+
+const NodeDisklessOverride = struct {
+    overlay_tmpfs_size: ?SizeExpr,
+    debug: bool,
+};
+
+const OutOfBandConfig = struct {
+    ipmi: ?IpmiConfig,
+};
+
+const IpmiConfig = struct {
+    address: ?Ipv4Address,
+    netmask: ?Ipv4Address,
+    gateway: ?Ipv4Address,
+    username: ?[]const u8,
+    password: ?[]const u8,
+};
+
+const DistroConfig = struct {
+    name: []const u8,
+    family: DistroFamily,
+    versions: []DistroVersionConfig,
+};
+
+const DistroVersionConfig = struct {
+    version: []const u8,
+    archs: []Arch,
+    install_adapter: InstallAdapter,
+    package_manager: PackageManager,
+};
+
+const RepositoryConfig = struct {
+    name: []const u8,
+    distro: []const u8,
+    version: []const u8,
+    arch: Arch,
+    manager: PackageManager,
+    base_url: []const u8,
+    suites: [][]const u8,
+    components: [][]const u8,
+    repo_ids: [][]const u8,
+    gpg_check: bool,
+    gpg_key: ?AssetRef,
+    roles: []RepositoryRole,
+};
+
+const InstallSourceConfig = struct {
+    name: []const u8,
+    distro: []const u8,
+    version: []const u8,
+    arch: Arch,
+    kind: InstallSourceKind,
+    source: AssetOrRepositoryRef,
+    installer_kernel: AssetRef,
+    installer_initrd: AssetRef,
+    repositories: []RepositoryRef,
+};
+
+const ProfileConfig = struct {
+    name: []const u8,
+    mode: ProfileMode,
+    distro: []const u8,
+    version: []const u8,
+    arch: Arch,
+    boot: BootConfig,
+    boot_source: BootSourceRef,
+    cmdline_template: []const u8,
+    safety: ProfileSafetyConfig,
+    install: ?InstallConfig,
+    diskless: ?DisklessConfig,
+};
+
+const BootSourceRef = union(enum) {
+    install_source: []const u8,
+    boot_bundle: []const u8,
+};
+
+const ProfileSafetyConfig = struct {
+    safe_for_unknown: bool,
+    destructive: bool,
+    persistent_writes: bool,
+};
+
+const DhcpConfig = struct {
+    mode: DhcpMode,
+    subnet: Cidr,
+    range: IpRange,
+    router: ?Ipv4Address,
+    dns: []Ipv4Address,
+    lease_seconds: u32,
+    discovery: DiscoveryConfig,
+};
+
+const DiscoveryConfig = struct {
+    enabled: bool,
+    default_action: DiscoveryAction,
+    default_profile: ?[]const u8,
+    allow_unknown_diskless: bool,
+    auto_claim: bool,
+};
+
+const DiscoveryAction = enum {
+    wait,
+    discovery,
+    diskless,
+    deny,
+};
+```
+
+约束：
+
+- profile 是部署能力边界，node override 只表达单节点差异。
+- profile 通过 `boot_source` 引用 `install_source` 或 `boot_bundle`；实现中不要让 profile 长期直接保存裸 kernel/initrd 路径。
+- asset 是物理文件清单；distro、repository、install_source、rootfs、boot_bundle 是语义关系对象。
+- `client_id` 对应 DHCP option 61，不是 NodeForge 业务 ID；MVP 身份匹配以 MAC 为主，`client_id` 可辅助，`serial_number` 只作为资产信息。
+- `tags` 只用于查询、分组、批量操作和策略筛选，不应直接触发安装或无盘行为。
+- `vars` 是模板输入；`overrides` 是 NodeForge 认识并校验的覆盖项。二者都不能绕过 profile 安全边界。
+- `overrides.network` 是安装后系统内或无盘系统内的网络覆盖，不等同于 PXE 阶段 DHCP 保留地址 `node.ip`。DNS、gateway、search domain 都是可选字段。
+- `NodeNetworkOverride.dns` 和 `search_domains` 用空列表表示未配置；静态网络只强制 address + prefix/netmask。
+- `oob` 是可选带外管理信息，当前只预留 IPMI；MVP 可以先只保存和展示 BMC 地址/掩码/网关、IPMI 用户名和密码。
+- IPMI 用户名和密码直接作为可选明文字段保存，不做 SecretRef、加密封装或轮换状态。
+- IP 可以是静态保留或临时 lease，但不能单独作为部署身份，也不能单独触发安装。
+- `install_vars` 只能填充 install profile 模板中声明的变量；擦盘、分区、bootloader、安装源仍由 install profile 决定。
+- `diskless.overlay_tmpfs_size` 覆盖值必须通过 profile/global 上限校验。
+- unknown diskless profile 必须满足 `safety.safe_for_unknown = true`、`safety.destructive = false`、`safety.persistent_writes = false`。
+- `DiscoveryAction` 不包含 `install`；配置解析层遇到未知节点安装动作必须报错。
+
+### 3.2 基础数据关系
+
+实现时必须把物理文件和语义关系分开：
+
+| 对象 | 实现职责 |
+| --- | --- |
+| `AssetConfig` | 保存物理文件路径、类型、大小、SHA256、来源和可选 kernel_release |
+| `DistroConfig` | 保存发行版族、版本、架构、安装 adapter 和包管理器 |
+| `RepositoryConfig` | 保存 apt/yum/dnf 源、mirror、GPG key、suite/component/repo id 和用途 |
+| `InstallSourceConfig` | 绑定 ISO/安装树/image 与 installer kernel/initrd、repo 列表 |
+| `RootfsConfig` | 记录 rootfs 构建输入、repo 列表、kernel_release 和发布物 |
+| `BootBundleConfig` | 绑定 diskless kernel、小 initrd、rootfs、repo，并校验一致性 |
+| `ProfileConfig` | 引用 install source 或 boot bundle，再叠加安装/无盘策略 |
+
+基础关系约束：
+
+- `distro + version + arch` 是 repo、install source、rootfs、boot bundle、profile 的共同主键维度。
+- Ubuntu repository 使用 apt 字段；Rocky/RHEL/Alma/Fedora 使用 dnf/yum 兼容字段。实现可以统一结构，但校验必须按 distro family 解释。
+- 标准 ISO 是 install source 的首选输入。导入时解包到 NodeForge 管理的版本目录，提取 installer kernel/initrd，并通过 `/repos/<install-source>/` 只读发布。
+- Rocky/RHEL 系 DVD ISO 具有有效 `.treeinfo` 和 `repodata` 时，自动创建基础 yum/dnf repository 并挂到 install source。
+- Ubuntu Server ISO 始终可作为 installer media 发布；只有检测到可用 `dists/`、`pool/` 和 apt 元数据时才自动创建 apt repository。ISO 包不完整时必须显式配置外部 mirror，不能把“不完整介质”伪装成完整 apt 源。
+- `gpg_check` 默认 `false`，不要求 GPG key；只有用户明确启用时才校验 key，并向 yum/dnf/apt 输出签名检查配置。
+- install profile 的 `boot_source.install_source` 指向 `InstallSourceConfig`，renderer 再从 install source 找 installer kernel/initrd 和 repo。
+- diskless profile 的 `boot_source.boot_bundle` 指向 `BootBundleConfig`，boot resolver 再展开 kernel、小 initrd、rootfs 和 repo。
+- `kernel_release` 使用 `uname -r`、`/lib/modules/<kernel_release>` 或 kernel 包元数据解析结果。asset store 中文件可以命名为 `vmlinuz`，但 manifest 必须保存真实 release。
+- 不依赖运行时直接读取构建机原始 `/boot` 路径；导入后以 asset manifest 的 path、SHA256、kernel_release 为准。
+
+### 3.3 install 配置
+
+```zig
+const InstallConfig = struct {
+    installer: InstallKind,
+    answer_template: AssetRef,
+    storage: StorageConfig,
+    bootloader: BootloaderInstallConfig,
+    packages: PackageSelection,
+    network: ?InstallNetworkConfig,
+    users: []UserConfig,
+    files: []FileOverlay,
+    hooks: HookSet,
+};
+
+const StorageConfig = struct {
+    wipe: bool,
+    boot_disk: DiskSelector,
+    install_disks: []DiskSelector,
+    boot_mode: BootMode,
+    partition_table: PartitionTable,
+    partitions: []PartitionConfig,
+};
+
+const BootloaderInstallConfig = struct {
+    install: bool,
+    target: BootloaderTarget,
+    set_firmware_boot_order: bool,
+};
+
+const UserConfig = struct {
+    name: []const u8,
+    groups: [][]const u8,
+    sudo: bool,
+    shell: ?[]const u8,
+    password: ?[]const u8,
+    ssh_authorized_keys: [][]const u8,
+    lock_password: bool,
+};
+```
+
+约束：
+
+- `bootloader.install` 对自动安装 profile 默认必须为 `true`。
+- `bootloader.target` 默认指向 `storage.boot_disk`。
+- UEFI 安装必须存在 `/boot/efi` ESP 分区。
+- BIOS + GPT 安装必须存在 BIOS boot 分区。
+- 修改固件启动顺序不是 MVP 必达能力，`set_firmware_boot_order` 默认 `false`。
+- `users.password` 直接保存明文，例如 `111111` 或 `asdf1234`。adapter 在渲染 answer file 时按目标安装器要求临时生成 hash，配置事实源仍只保留明文。
+- `InstallConfig.packages` 表示发行版标准安装阶段的基础包选择；provisioning step 的 `standard_packages` action 表示安装后或 rootfs 构建时的补充包，二者不得重复渲染。
+
+### 3.4 diskless 配置
+
+```zig
+const DisklessConfig = struct {
+    rootfs_mode: RootfsMode,
+    overlay: OverlayConfig,
+};
+
+const OverlayConfig = struct {
+    tmpfs_size: SizeExpr,
+    tmpfs_mode: FileMode,
+    high_write_paths: [][]const u8,
+};
+```
+
+约束：
+
+- `overlay.tmpfs_size` 必须可解析，支持 `50%`、`8g`、`4096m`。
+- MVP 不定义持久化 overlay 配置。
+- profile 的 `boot_source.boot_bundle` 必须校验 `distro`、`version`、`arch`、`kernel_release` 一致。
+
+### 3.5 补充包与后处理配置
+
+M4/M5/M7 共用同一最小模型：
+
+```zig
+const ProvisioningBundle = struct {
+    name: []const u8,
+    version: []const u8,
+    distro: []const u8,
+    distro_version: []const u8,
+    arch: Arch,
+    steps: []ProvisionStep,
+};
+
+const ProvisionStep = struct {
+    name: []const u8,
+    phase: ProvisionPhase,
+    enabled: bool,
+    required: bool,
+    action: ProvisionAction,
+};
+
+const ProvisionAction = union(enum) {
+    repository: RepositoryRef,
+    standard_packages: []const []const u8,
+    archive: ArchivePackage,
+    managed_file: ManagedFile,
+    script: ProvisionScript,
+};
+
+const ArchivePackage = struct {
+    asset: AssetRef,
+    sha256: Sha256,
+    extract_to: []const u8,
+    install_script: ?[]const u8,
+};
+
+const ManagedFile = struct {
+    source: AssetRef,
+    destination: []const u8,
+    mode: FileMode,
+    owner: []const u8,
+    group: []const u8,
+};
+
+const ProvisionScript = struct {
+    asset: AssetRef,
+    timeout_seconds: u32,
+    summary: []const u8,
+    affects: [][]const u8,
+};
+```
+
+约束：
+
+- 每个 step 包含名称、阶段、开关、失败策略和一种强类型 action。
+- `steps` 数组顺序就是同一阶段执行顺序；跨阶段按固定阶段顺序执行。
+- M4/M5 先实现 repository、standard-packages、managed-file；M7 再启用 archive、script 和 firstboot。
+- 不做模块注册表、动态插件、依赖 DAG 或任意 JSON 参数。
+- bundle 发布后不可原地修改；内容变化产生新版本。
+
+### 3.6 运行态模型
+
+```zig
+const RuntimeState = struct {
+    leases: []DhcpLease,
+    unknown_clients: []UnknownClient,
+    node_facts: []NodeFacts,
+    node_status: []NodeStatus,
+    tftp_sessions: []TftpSession,
+};
+
+const NodeFacts = struct {
+    node_id: ?[]const u8,
+    unknown_client_id: ?[]const u8,
+    observed_at: Timestamp,
+    source: FactsSource,
+    serial_number: ?[]const u8,
+    bmc_address: ?Ipv4Address,
+    bmc_netmask: ?Ipv4Address,
+    bmc_gateway: ?Ipv4Address,
+    ipmi_username: ?[]const u8,
+    ipmi_password: ?[]const u8,
+};
+
+const NodeStatus = struct {
+    node_id: []const u8,
+    mode: ProfileMode,
+    profile: []const u8,
+    stage: NodeStage,
+    last_event_at: Timestamp,
+    last_error: ?NodeError,
+    summary: NodeSummary,
+};
+```
+
+运行态写入规则：
+
+- 运行态由 `state` 模块统一修改。
+- `runtime.json` 可周期性保存或关键事件后保存。
+- `events.jsonl` 只追加，不作为当前状态事实源。
+- discovery/initrd 上报的 `NodeFacts` 默认只是观察数据；只包含 SN、BMC 地址/掩码/网关、IPMI 用户名和密码。管理员确认后可回填到 `node.serial_number` 或 `node.oob.ipmi`。
+
+## 5. M0 验收标准与验证结果
+
+> 实现状态：M0 代码已按单 HTTP listener、config/catalog/runtime 分层和 `zig-clap 0.12.0`
+> CLI 完成收敛。macOS 已完成构建、单元测试、管理 API、CLI 状态检查、
+> config/catalog 校验与导出、配置导入、运行中端口占用检查和管理路由。
+> Rocky 9.7 aarch64 可通过 `ssh root@r97n0` 做 systemd、端口、CLI 和 HTTP 实机验证；虚拟机缺包时可用 `dnf`/`yum` 安装验证工具。
+
+### 4.1 目标
+
+建立可运行骨架：
+
+- `nodeforged` 可启动、加载配置，并由唯一 HTTP listener 提供管理和 PXE 数据接口。
+- `nodeforge` CLI 固定通过 `127.0.0.1:<http.port>` 连接管理接口。
+- 启动配置和 catalog 可校验、导入、导出、原子写回。
+- 日志、错误、输出格式和 CLI 帮助信息成型。
+- 启动前可检查 IPv4 监听地址和端口占用；目录权限、资产可读性、TFTP/DHCP 检查随对应阶段补齐。
+
+### 4.2 代码任务
+
+| 模块 | 任务 |
+| --- | --- |
+| `main.zig` | `nodeforge` CLI 入口、zig-clap 集成、命令分发和 human/json 输出格式 |
+| `nodeforged.zig` | 守护进程入口，自动加载默认 config/catalog，处理 `--check`/`--check-config` |
+| `app.zig` | 初始化 allocator、config、catalog、state、统一 HTTP、日志 |
+| `model.zig` | 定义核心结构，包括 config、catalog、runtime、node、profile、asset、repository、install source、rootfs、boot bundle 关系 |
+| `paths.zig` | 统一定义默认安装根和派生路径，避免业务模块散落 `/opt/nodeforge` 硬编码 |
+| `config/load.zig` | 从默认路径 `/opt/nodeforge/config/config.json` 加载启动配置，允许参数覆盖 |
+| `catalog/store.zig` | `nodeforged` 内部使用，从默认路径 `/opt/nodeforge/catalog/catalog.json` 加载、校验、原子保存管理目录，允许参数覆盖 |
+| `config/validate.zig` | 实现基础校验和关系一致性校验 |
+| `config/store.zig` | 原子写回启动配置 JSON |
+| `http/server.zig` | 单 HTTP listener 生命周期、路由分发和 JSON 错误 |
+| `http/management.zig` | 管理路由定义 |
+| `observe/error.zig` | 统一错误类型和用户提示 |
+
+### 4.3 统一 HTTP 与管理接口
+
+MVP 不实现第二套 RPC，也不再拆成 management listener 与 PXE listener。一个 HTTP server 实现复用路由、JSON 错误、状态和生命周期，只启动一个 IPv4 listener：
+
+- HTTP listener 固定绑定 `0.0.0.0:http.port`，提供 boot config、answer、repo/rootfs 下载、节点事件和管理 API。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。
+- `server.bind_interface` 可选，用于表达 HTTP/DHCP/TFTP 共同归属的服务网卡。M0 只校验字段格式；M1/M2 接入 TFTP/DHCP 后必须校验该网卡存在，并拥有或可到达 `server.server_ip` 所在网段。
+- `nodeforge` CLI 管理客户端固定连接 `127.0.0.1:http.port`，不提供远程管理地址配置项。
+- MVP 不配置独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`；端口冲突时修改 `config.json` 并重启。
+- 管理路由与 PXE 数据路由逻辑分区；管理路由不做 loopback peer 检查——安全边界是网络隔离（PXE 管理网段本身是受控网络），CLI 固定连接 `127.0.0.1` 即可。
+- MVP 不做远程管理和管理鉴权；未来若开放远程管理，必须另行设计 TLS、鉴权和审计。
+
+```json
+{
+  "method": "POST",
+  "path": "/api/v1/management/config/validate",
+  "body": {}
+}
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "result": {}
+}
+```
+
+错误：
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "config.invalid",
+    "message": "profile rocky-9.7-aarch64-install references missing kernel asset",
+    "hint": "import the asset or update the profile"
+  }
+}
+```
+
+### 4.4 CLI 命令
+
+CLI 解析、帮助信息、参数类型和默认值优先使用成熟开源库。当前项目声明 `minimum_zig_version = "0.16.0"`；M0 采用固定的 `zig-clap 0.12.0` 作为首选 CLI 解析层。该 release 面向 Zig 0.16 系列并已验证可在本项目 Zig 0.16.0 环境编译测试通过。不要直接跟随 `zig-clap` main 分支，因为 main 当前追 Zig 0.17-dev。若后续发现 `zig-clap` 无法满足嵌套帮助或错误输出要求，备选为支持 Zig 0.16.0 的 `zig-args`；再不满足时才保留极薄自研 command table。无论选择哪个库，都只负责 CLI 语法和帮助，不承载复杂业务配置模型。
+
+CLI 与配置文件分工：
+
+- 站点启动配置、默认策略、profile 和 provisioning bundle 通过 `config.json` 或 `config apply` 表达；结构性配置修改后重启生效，DHCP discovery 策略支持在线切换。
+- asset、repository、install source、rootfs、initrd、boot bundle 通过 CLI/API 发起导入、构建、校验和发布请求，由 `nodeforged` 写入 catalog。
+- CLI/API 主要处理运行期常变对象、批量导入、资产/catalog 管理、状态查看、事件和日志。
+- 复杂人工策略对象创建和大范围修改优先接受文件、清单或 patch 输入，不为每个字段设计长参数。
+- 可提供融合式高频入口，例如 `nodeforge status`、`nodeforge check`、`nodeforge apply <file>`，但必须在帮助信息中说明覆盖范围。
+
+所有命令层级必须支持帮助信息：
+
+```bash
+nodeforge --help
+nodeforge status --help
+nodeforge check --help
+nodeforge config --help
+nodeforge config validate --help
+```
+
+M0 实现：
+
+```bash
+nodeforge status
+nodeforge check
+nodeforge config validate
+nodeforge config export --output json
+nodeforge config import <path>
+nodeforge catalog validate
+nodeforge catalog export --output json
+```
+
+`status` 面向人工查看，输出进程、HTTP、管理路由和配置 API 的详细状态；`check`
+面向自动化健康检查，成功时只输出简短通过信息并依赖退出码表达结果。
+
+`install-source import` 需要实际解析 ISO、发布 HTTP 仓库、提取安装内核/initrd，并由 `nodeforged` 写入 catalog，因此归入 M3；M0 只定义 config/catalog 模型边界、writer 边界和最小校验。
+
+### 4.5 配置与 catalog 校验
+
+M0 至少校验：
+
+- JSON 格式和必填字段。
+- `server.server_ip` 格式合法；如配置 `server.bind_interface`，不能为空字符串；唯一 HTTP listener 的 `0.0.0.0:http.port` 未被占用。
+- HTTP listener 和预检均允许 `SO_REUSEADDR`，保证 systemd 快速重启不会被刚释放的 socket 窗口误伤；不启用 `SO_REUSEPORT`，活跃实例仍保持端口独占。
+- node id、MAC、IP、arch 和 profile 引用。
+- distro/version/arch 支持矩阵格式。
+- profile mode 枚举。
+- profile `safety` 元数据必须与 mode 和 hooks 一致。
+- profile 的 `boot_source` 必须符合 mode：install 只引用 catalog 中的 install source，diskless 只引用 catalog 中的 boot bundle。
+- `policy.default_action` 只能是 `wait`、`discovery`、`diskless`、`deny`，缺省值为 `wait`。
+- 未知节点默认 diskless 必须同时满足 `allow_unknown_diskless = true` 和目标 profile 的 `safety` 字段满足 safe/ephemeral 条件。
+- 未知节点默认 install 是非法配置。
+- 端口规则：DHCP/TFTP 端口不可配置。
+- 所有地址、CIDR、DNS、gateway 和监听地址只接受 IPv4。
+- catalog JSON 格式、对象 ID、引用关系和 SHA256 字段格式。
+- catalog 中已有 repository 时，manager 必须匹配 distro family；仅当 `gpg_check = true` 时要求 GPG key asset 存在。
+- catalog 中已有 install source 时，必须能解析到 source asset 或 repository，并声明 installer kernel/initrd asset。
+- catalog 中已有 boot bundle 时，kernel、initrd、rootfs、repository 的 distro/version/arch/kernel_release 必须一致。
+
+### 4.6 启动自检、服务检查与 systemd
+
+M0 的 `nodeforged` 启动前执行 preflight：
+
+- 对唯一 HTTP 端口尝试 bind，明确报告端口占用。
+- `--check-config` 只校验配置和 catalog；`--check` 额外检查 M0 已实现的 HTTP 监听端口，但不长期启动。
+- UDP 69、UDP 67 和资产可读性检查分别随 M1、M2、M3 服务实现加入，避免未实现服务产生虚假的通过状态。
+
+M0 的 `nodeforge check` 在服务运行后通过 `127.0.0.1:<http.port>` 验证 process、HTTP、management route 和配置 API。
+TFTP 探针、DHCP resolver、repository 和 state 检查在对应阶段实现后逐项加入。
+
+提供 `packaging/systemd/nodeforged.service`：
+
+- `ExecStart=/opt/nodeforge/bin/nodeforged`
+- `ExecStartPre=/opt/nodeforge/bin/nodeforged --check`
+- `Restart=on-failure`、`RestartSec=2s`
+- M0 HTTP 默认使用 8080，不申请 DHCP/TFTP 阶段才需要的 Linux capability。
+- systemd unit 本体放在 `/opt/nodeforge/systemd/nodeforged.service`；`/etc/systemd/system/nodeforged.service` 只是软链接。二进制主体安装在 `/opt/nodeforge/bin/`；`/usr/bin/nodeforge` 和 `/usr/bin/nodeforged` 也只是软链接。
+- 不在 NodeForge CLI 中重复封装 `systemctl`。
+- M0 需要在 Rocky 9.7 aarch64 上执行 systemd 启动、快速重启、CLI 管理接口和外部 HTTP 数据路由验证。
+
+`nodeforged` 正常安装时自动发现 `/opt/nodeforge/config/config.json` 和 `/opt/nodeforge/catalog/catalog.json`。`--config`、`--catalog` 仅作为开发测试、迁移验证和临时排障覆盖参数，不写入默认 systemd unit，避免把部署命令变成长参数清单。
+
+M0 日志策略：
+
+- 默认日志后端使用 stderr；systemd 管理时进入 journal，不默认写 `/opt/nodeforge/logs/nodeforged.log`。
+- 日常 `info` 日志包括启动、配置加载/校验、preflight、监听地址，以及每个 HTTP 请求的 method、path 和 status。
+- `debug` 日志用于连接建立/关闭、协议细节、后续 DHCP/TFTP 报文摘要和排障信息；Debug 构建可打开这些细节，ReleaseSafe 默认保持日常噪声较低。
+- 节点事件、安装阶段、无盘阶段等业务事件进入 `events.jsonl`，不与服务进程日志混为一个文件。
+
+### 4.7 测试
+
+- 配置 JSON 成功加载。
+- 缺失必填字段返回结构化错误。
+- 原子写回不会损坏旧文件。
+- CLI `--output json` 输出可解析 JSON。
+- 顶层、资源级和动作级 `-h/--help` 可显示用途、参数和示例。
+- 模拟端口占用时 preflight 明确失败。
+- 管理路由不做 loopback peer 检查；CLI 固定连接 `127.0.0.1:<http.port>`。
+
+### 4.8 阶段验收
+
+- 启动 `nodeforged --check-config` 能校验配置。
+- `nodeforge status` 能显示服务状态。
+- `nodeforge config validate` 能输出清晰错误。
+- `nodeforge check` 能区分进程存活与各协议实际可用。
+
+当前结果：
+
+- [x] `nodeforged --check-config` 校验有效配置。
+- [x] `nodeforged --check` 改为检查 M0 的唯一 HTTP 独占端口。
+- [x] `nodeforge status/check` 固定访问 `127.0.0.1:<http.port>` 管理 API，并检查唯一 HTTP listener。
+- [x] 配置、catalog 加载、关系校验、格式化导出和原子导入通过。
+- [x] M0 命令默认输出面向人，显式 `--output json` 输出可解析 JSON。
+- [x] CLI 固定接入 `zig-clap 0.12.0`，顶层帮助可用；资源级帮助已覆盖 M0 命令。
+- [x] systemd 仅交付适配的 service 文件，不追加 Linux 环境验证。
+- [x] Rocky 9.7 aarch64 远程环境构建、部署和验证通过。
+- [x] HTTP 守护进程稳定性修复，use-after-free 问题已解决。
+- [x] 所有模块公共类型和函数均已添加详细的 /// 文档注释。
+
+### 4.9 最新验证更新
+
+**代码质量改进**:
+- 完整补全了 `model.zig` 核心数据类型的文档注释
+- `http/server.zig` 关键函数包含详细的行为说明
+- `config/validate.zig` 明确了校验顺序和限制条件
+- `catalog/store.zig` 说明了默认路径、文件大小限制和导入/导出机制
+
+**关键修复**:
+- 修复了 `http/server.zig` 中 `json()` 函数的 use-after-free 问题：将日志记录从 `respond()` 调用后移至调用前
+- 确保守护进程在处理 HTTP 请求时的稳定性
+- [x] 管理配置校验、配置状态和服务状态 API 可用。
+- [x] 管理路由不做 loopback peer 检查，CLI 固定连接 `127.0.0.1`。
+- [x] 配置、catalog 加载、关系校验、格式化导出和原子导入通过。
+- [x] M0 命令默认输出面向人，显式 `--output json` 输出可解析 JSON。
+- [x] CLI 固定接入 `zig-clap 0.12.0`，顶层帮助可用；资源级帮助已覆盖 M0 命令。
+- [x] systemd 仅交付适配的 service 文件，不追加 Linux 环境验证。
+
+## 6. M1：PXE TFTP 闭环
+
+### 6.1 目标
+
+实现标准 TFTP 读路径，确保节点能拉取 PXE 启动资产。
+
+### 5.2 代码任务
+
+| 模块 | 任务 |
+| --- | --- |
+| `tftp/packet.zig` | RRQ/DATA/ACK/ERROR/OACK 编解码 |
+| `tftp/server.zig` | UDP 69 dispatcher、option 协商、路径 normalize、session 状态机 |
+| `assets/store.zig` | asset manifest 读写，bootloader/kernel/initrd/ISO/rootfs 等资产导入 |
+| `assets/validate.zig` | asset 类型、路径、SHA256 校验 |
+| `state/runtime.zig` | TFTP session 运行态 |
+
+### 5.3 TFTP 行为
+
+支持：
+
+- `RRQ`
+- `DATA`
+- `ACK`
+- `ERROR`
+- `OACK`
+- `octet`
+- `blksize`
+- `timeout`
+- `tsize`
+
+策略：
+
+- MVP 不实现 `WRQ`，收到写请求直接返回标准 ERROR。
+- 文件必须位于 TFTP asset root 内。
+- 文件必须存在于 asset manifest 或 boot resolver 允许列表。
+- 禁止 `..`、绝对路径、符号链接逃逸。
+
+### 5.4 bootloader 配置生成
+
+GRUB 配置由 `boot/grub.zig` 生成：
+
+```text
+set timeout=5
+menuentry 'NodeForge {{node_id}}' {
+  linuxefi {{kernel_path}} {{cmdline}}
+  initrdefi {{initrd_path}}
+}
+```
+
+MVP 同时支持 UEFI x86_64 和 UEFI aarch64 GRUB，分别使用 `grubx64.efi`、`grubaa64.efi`。BIOS PXELINUX 在 M6 完整化。
+
+### 5.5 CLI 命令
+
+```bash
+nodeforge tftp show
+nodeforge tftp session list
+nodeforge asset import --type bootloader --name grub-uefi-aarch64 --path grubaa64.efi --arch aarch64
+nodeforge asset import --type kernel --name rocky-9.7-aarch64-kernel --path vmlinuz-<kernel-release> --distro rocky --version 9.7 --arch aarch64 --kernel-release <kernel-release>
+nodeforge asset import --type initrd --name rocky-9.7-aarch64-nodeforge-initrd --path initrd-nodeforge.img --distro rocky --version 9.7 --arch aarch64 --kernel-release <kernel-release>
+nodeforge asset list
+nodeforge asset show rocky-9.7-aarch64-kernel
+nodeforge asset validate
+```
+
+### 5.6 测试
+
+- RRQ 成功返回 DATA block。
+- 文件不存在返回 ERROR。
+- 路径穿越被拒绝。
+- option 协商正确。
+- block 重传正确。
+- 标准 TFTP client 可分别下载 `grubx64.efi`、`grubaa64.efi`。
+- 使用系统 `tftp`/`atftp` 客户端验证 RRQ/OACK、重传、路径和状态管理，不依赖 DHCP。
+
+### 5.7 阶段验收
+
+- x86_64/aarch64 PXE 客户端可通过 TFTP 拉取对应 GRUB EFI 文件。
+- GRUB 可拉取配置、kernel、initrd。
+- TFTP session 能在 CLI 中看到。
+
+## 7. M2：DHCP + PXE 闭环
+
+### 7.1 目标
+
+在 PXE 管理网段内提供 authoritative DHCP：
+
+- 未知节点获得临时 lease，并默认等待管理员认领。
+- 已登记节点获得静态 IP 或稳定 lease。
+- DHCP 返回 `next-server` 和 bootfile。
+- 租约和事件进入运行态。
+
+### 6.2 代码任务
+
+| 模块 | 任务 |
+| --- | --- |
+| `dhcp/packet.zig` | BOOTP/DHCP 报文和 option 解析/编码 |
+| `dhcp/server.zig` | UDP 67 loop、lease 分配、续租、释放、过期和错误处理 |
+| `boot/resolver.zig` | 节点身份到 node/profile/bootfile 的唯一决策入口 |
+| `state/runtime.zig` | 运行态 lease 写入 |
+
+### 6.3 DHCP 行为
+
+必须处理：
+
+- `DISCOVER` -> `OFFER`
+- `REQUEST` -> `ACK` / `NAK`
+- `RELEASE`
+- `DECLINE`
+
+必须识别：
+
+- option 53 message type
+- option 50 requested IP
+- option 54 server identifier
+- option 60 vendor class
+- option 61 client identifier
+- option 82 relay agent information（含 RFC 3527 Link Selection 子选项）
+- option 93 client system architecture
+- option 97 client UUID
+
+协议对齐要求：
+
+- 基础报文遵循 RFC 2131/2132；PXE 架构识别遵循 RFC 4578，优先使用 option 93，不从 vendor class 字符串猜架构。
+- option 60 仅用于识别 `PXEClient`、HTTPClient 等标准 vendor class；MVP 不定义私有 option 43 子选项。
+- option 61 是客户端标识辅助信息，不替代 MAC 与显式 node 绑定。
+- **`giaddr` 处理（RFC 2131 标准行为）**：当收到的 DHCP 报文 `giaddr` 非零时，表示报文经由外部 relay agent（路由器 IP Helper 或 `dhcrelay`）转发。服务器基于 `giaddr` 或 option 82 中的 RFC 3527 Link Selection 子选项定位目标 subnet，而非使用接收接口的 subnet。回复报文按 RFC 2131 Section 4.1 发送到 `giaddr:67`（relay agent 的 UDP 67 端口），而非广播或直接发给客户端。这是任何 RFC 2131 合规 DHCP 服务器的基本行为，不是独立功能特性。NodeForge 自身不实现 relay agent。参考 ISC DHCP `locate_network()`（`server/dhcp.c`）和 `bootp()`（`server/bootp.c`）的实现。
+- **服务器端地址冲突检测（Ping Probe）**：在发送 DHCPOFFER 前，对候选 IP 发送 ICMP Echo Request。在配置的超时内（默认 500ms）未收到 Echo Reply 才正式分配；收到回复则调用 `abandon_lease()` 标记该 IP 为 abandoned 状态（保持 `abandon_lease_time`，默认 1 小时），并尝试分配下一个候选 IP。参考 ISC DHCP `do_ping_check()`/`lease_pinged()`/`abandon_lease()` 实现。
+- 未识别 option 必须安全跳过并保留报文边界；编码顺序稳定，必须正确写 end option 255。
+- `vendor/dhcp/` 保存去标识化的真实 DHCPv4 fixture、来源说明和期望解析结果。基于 ISC DHCP 源码重构实现，不直接链接 C 代码。
+- 只实现 DHCPv4；不监听 UDP 546/547，不解析 DHCPv6，也不输出 IPv6 地址。
+
+返回基础 option：
+
+- subnet mask
+- router
+- DNS
+- lease time
+- server identifier
+- renewal/rebinding time 可后续补充
+
+返回 PXE 字段：
+
+- `next-server`
+- `bootfile`
+
+### 6.4 DHCP 决策
+
+```text
+收到 DHCP 请求
+  -> 解析 MAC/client id/arch
+  -> 查找 node
+  -> 已绑定 node:
+       选择 node.profile
+       合并 profile 默认值和 node override
+       使用静态 IP 或现有 lease
+       选择 bootfile
+  -> 未绑定 node:
+       分配临时 lease
+       记录 unknown_client
+       读取 dhcp.discovery.default_action
+       wait:
+         不执行安装/无盘，必要时返回只读等待或诊断 bootfile
+       discovery:
+         返回非破坏性 discovery profile
+       diskless:
+         仅当 allow_unknown_diskless=true 且 profile safety 满足 safe/ephemeral 时返回 diskless bootfile
+       deny:
+         不返回 PXE bootfile 或按策略拒绝
+  -> 写 lease/state/event
+  -> 返回 OFFER/ACK
+```
+
+### 6.5 CLI 命令
+
+```bash
+nodeforge dhcp show
+nodeforge dhcp network update --mode authoritative --subnet 192.168.50.0/24 --router 192.168.50.1
+nodeforge dhcp pool update --range 192.168.50.100-192.168.50.200 --lease 30m
+nodeforge dhcp discovery enable --action wait --profile discovery-pxe
+nodeforge dhcp discovery update --action diskless --profile rocky-9.7-aarch64-diskless --allow-unknown-diskless
+nodeforge dhcp discovery update --action wait --disallow-unknown-diskless
+nodeforge runtime leases list
+nodeforge runtime unknown list
+nodeforge node list
+nodeforge node add node-01 --identity mac:52:54:00:12:34:01 --ip 192.168.50.101 --profile rocky-9.7-aarch64-install
+nodeforge node update node-01 --tag rack:r1 --tag gpu --var cluster_id=lab-a --override network.mode=static --override network.address=192.168.50.101 --override network.prefix_len=24 --override diskless.overlay.tmpfs_size=50%
+nodeforge node oob update node-01 --ipmi-address 192.168.10.51 --ipmi-netmask 255.255.255.0 --ipmi-gateway 192.168.10.1 --ipmi-username admin --ipmi-password 111111
+```
+
+### 6.6 测试
+
+单元测试：
+
+- DHCP packet decode/encode。
+- option 60/82/93/97 解析。
+- `giaddr` 非零时的 subnet 定位和回复路由。
+- 租约池分配、续租、释放、DECLINE。
+- 静态 IP 冲突检测。
+- 服务器端 ICMP Ping Probe 冲突检测和 lease abandon 流程。
+
+集成测试：
+
+- 用 fixture 验证 UEFI x86_64/aarch64 DISCOVER。
+- 使用虚拟网络或测试 UDP client 完成 DISCOVER/REQUEST。
+- 未知节点身份默认进入等待认领；显式配置后可进入非破坏性 discovery 或 safe/ephemeral diskless。
+
+### 6.7 阶段验收
+
+- 未知节点能获得临时 IP。
+- 未知节点默认不执行安装或无盘启动。
+- 已登记节点能获得指定 IP。
+- DHCP 按 option 93 返回启动文件：UEFI x86_64 使用 `grubx64.efi`，UEFI aarch64 使用 `grubaa64.efi`。
+- `events.jsonl` 出现 `dhcp.discover`、`dhcp.offer`、`dhcp.ack`。
+
+## 8. M3：HTTP 配置、资产、ISO 仓库和事件接口
+
+### 8.1 目标
+
+HTTP 成为 TFTP 之后的主要数据通道：
+
+- 提供 boot config。
+- 提供 answer file。
+- 提供大文件下载和 Range。
+- 接收事件和日志摘要。
+
+### 7.2 代码任务
+
+| 模块 | 任务 |
+| --- | --- |
+| `http/server.zig` | HTTP server 生命周期 |
+| `http/routes.zig` | 路由表 |
+| `http/static.zig` | 静态资产发送 |
+| `http/range.zig` | Range / Content-Length / ETag |
+| `http/api.zig` | JSON API handler |
+| `profile/render.zig` | 模板渲染入口 |
+| `state/events.zig` | JSONL append writer |
+
+### 7.3 路由
+
+| 路由 | 方法 | 输出 |
+| --- | --- | --- |
+| `/healthz` | GET | 健康状态 |
+| `/boot/config/:node_id` | GET | boot config JSON |
+| `/api/v1/nodes/:id/config` | GET | 节点配置 JSON |
+| `/api/v1/nodes/:id/answer` | GET | autoinstall/kickstart |
+| `/api/v1/nodes/:id/events` | POST | 事件写入 |
+| `/api/v1/nodes/:id/logs` | POST | 日志摘要 |
+| `/rootfs/:name` | GET | rootfs 文件 |
+| `/images/:name` | GET | ISO/image |
+| `/repos/:name/*` | GET | repo 文件 |
+| `/api/v1/management/runtime` | GET | 本机 CLI 使用的运行态摘要 |
+
+### 7.4 ISO 自动仓库
+
+`nodeforge install-source import <iso>` 执行以下流程：
+
+1. 校验 ISO 类型、SHA256、发行版、版本和架构。
+2. 解包到临时目录，提取 installer kernel/initrd，校验成功后 rename 到版本化目录。
+3. 在 `/opt/nodeforge/repos/<install-source>/` 发布完整 ISO 内容。
+4. Rocky/RHEL 系校验 `.treeinfo`、`repodata/repomd.xml`；Ubuntu 校验 installer media，并单独判断是否具备 apt repository 元数据。
+5. 元数据完整时自动创建 `RepositoryConfig`，`base_url` 指向 `/repos/<install-source>/` 并关联 install source；不完整时只创建 install source。
+6. renderer 使用已关联 repository 输出 Kickstart `url/repo` 或 Ubuntu apt 配置；缺少必要外部 mirror 时在 profile validate 阶段报错。
+
+ISO 中通过元数据校验的仓库是默认基础源，用户可以追加 mirror/额外源。GPG 检查默认关闭，仅在 repository 明确 `gpg_check = true` 时启用。
+
+### 7.5 boot config
+
+diskless boot config 示例：
+
+```json
+{
+  "node_id": "node-02",
+  "mode": "diskless",
+  "profile": "rocky-9.7-aarch64-diskless",
+  "rootfs_url": "http://192.168.50.1:8080/rootfs/rocky-9.7-aarch64-<kernel-release>.squashfs",
+  "rootfs_sha256": "...",
+  "rootfs_mode": "squashfs_overlay",
+  "overlay": {
+    "tmpfs_size": "50%",
+    "tmpfs_mode": "0755"
+  },
+  "event_url": "http://192.168.50.1:8080/api/v1/nodes/node-02/events"
+}
+```
+
+### 7.6 事件写入
+
+事件格式：
+
+```json
+{
+  "ts": "2026-07-06T10:00:05Z",
+  "node": "node-01",
+  "type": "boot.initrd_started",
+  "stage": "initrd_started",
+  "message": "initrd started"
+}
+```
+
+事件写入要求：
+
+- 单行 JSON。
+- append only。
+- 写入失败返回明确错误。
+- 同步更新 `node_status`。
+
+### 7.7 CLI 命令
+
+```bash
+nodeforge runtime status
+nodeforge runtime events tail --node node-01
+nodeforge node status node-01
+nodeforge install render node-01
+nodeforge install-source import Rocky-9.7-aarch64-dvd.iso --distro rocky --version 9.7 --arch aarch64
+nodeforge repository show rocky-9.7-aarch64-iso
+```
+
+### 7.8 并发与 HTTP 实现选择
+
+- MVP 先基于 Zig 标准库 HTTP 能力做可替换的 `HttpServer` adapter；在锁定 Zig 版本后，用 spike 验证请求解析、keep-alive、Range、流式文件和并发连接。若标准库服务端能力不稳定，只替换 adapter，不改变业务路由。已评估的备选方案：
+  - `http.zig`（karlseguin）：纯 Zig 实现，无 C 依赖，API 简洁，适合作为 adapter 替换的首选。需自行实现 Range/流式文件发送。
+  - `zap`（基于 `facil.io`）：性能最优，但有 C 依赖且版本跟踪风险较高，不适合 MVP。
+  - 结论：MVP 使用 `std.http.Server`；若 M3 性能 spike 证明不足，优先评估 `http.zig`。
+- acceptor 与固定大小 worker pool 分离；大文件使用 `pread`/send loop 流式发送，不整体读入内存。
+- DHCP/TFTP 使用各自 UDP event loop；耗时 hash/文件任务提交到 worker pool，不阻塞收包。
+- 配置使用不可变 snapshot + 原子替换；runtime/state 由单 writer 串行落盘，事件追加有独立队列。
+- MVP 验收基线：并发 100 个 HTTP Range 下载、100 个 TFTP session 和每秒 200 个 DHCP 报文时无崩溃、无状态串扰；具体吞吐在目标 ARM VM 和 x86_64 机器记录，不先承诺生产数字。
+
+### 7.9 测试
+
+- `/healthz` 返回 OK。
+- Range 下载返回 206。
+- `If-Range`、无效 Range、连接中断后续传测试。
+- answer 渲染返回文本。
+- POST event 写入 JSONL。
+- runtime summary 与事件同步。
+
+### 7.10 阶段验收
+
+- installer/initrd 能通过 HTTP 拿到配置。
+- 事件能写入 `events.jsonl`。
+- 大文件下载支持 `Content-Length` 和 Range。
+- ISO 导入后无需手工建基础 repo 即可通过 HTTP 安装。
+
+## 9. M4：PXE 无人值守自动安装与基础后处理
+
+### 9.1 目标
+
+首先在当前 Rocky Linux 9.7 aarch64 开发环境跑通 Kickstart，再跑通 Ubuntu Server 22.04 LTS autoinstall；x86_64 是首个生产验收架构，两种架构从初始模型、资产命名和 fixture 层同时支持。
+
+### 8.2 代码任务
+
+| 模块 | 任务 |
+| --- | --- |
+| `profile/install.zig` | InstallConfig 校验和归一化 |
+| `profile/adapter/ubuntu.zig` | autoinstall user-data/meta-data 渲染 |
+| `profile/adapter/kickstart.zig` | kickstart ks.cfg 渲染 |
+| `profile/render.zig` | 通用模板变量 |
+| `boot/cmdline.zig` | install cmdline 渲染 |
+| `state/node_status.zig` | install 阶段状态 |
+| `provision/runner.zig` | 执行 repository、standard-packages、managed-file 三种基础步骤 |
+
+### 8.3 Ubuntu autoinstall 渲染
+
+输入：
+
+- `InstallConfig.storage`
+- `InstallConfig.bootloader`
+- packages/users/files/hooks
+- node hostname/IP/profile vars
+- `users.password` 明文密码
+
+输出：
+
+- `user-data`
+- `meta-data`
+
+必须映射：
+
+- storage -> `storage.config`
+- packages -> `packages`
+- user/ssh -> `identity` / `ssh`
+- hooks -> `late-commands`
+- event upload -> late command 或 firstboot script
+- provisioning bundle -> `late-commands` 调用统一 runner 的 `install_post` 阶段
+
+如果提供 `users.password = "asdf1234"`，Ubuntu adapter 在内存中生成安装器接受的 password hash；配置文件和 NodeForge 数据模型仍直接保存明文。
+
+实现策略：
+
+- 使用 Ubuntu Installer/Subiquity 的 `autoinstall`，不实现 preseed。
+- NodeForge HTTP 输出 cloud-init NoCloud-Net 数据源：`user-data` 和 `meta-data`。
+- PXE cmdline 追加 `autoinstall ds=nocloud-net;s={{answer_base_url}}/`。
+- `user-data` 顶层包含 `autoinstall.version = 1`。
+- 版本能力表和首个 fixture 先覆盖 22.04 LTS；后续 LTS 在 M6 按实际发布版本增加。
+
+版本支持：
+
+| 层级 | 版本 | 实现要求 |
+| --- | --- | --- |
+| MVP 必测 | Ubuntu Server 22.04 LTS aarch64、x86_64 | aarch64 开发 smoke test 与 x86_64 生产 smoke test 必须通过 |
+| 后续目标 | Ubuntu Server 22.04 之后的 LTS | 按版本增加 schema、installer 参数和 fixture，不预先假定字段完全兼容 |
+| 非目标 | Ubuntu Server 20.04 LTS 及更早版本 | 不实现 d-i/preseed，也不做存量兼容 |
+
+### 8.4 Kickstart 渲染
+
+输出 `ks.cfg`，至少包含：
+
+- `url` 或 `repo`
+- `clearpart`
+- `part` / `logvol`
+- bootloader
+- network
+- user/sshkey
+- `%packages`
+- `%post`
+
+`%post` 只负责挂载执行上下文并调用统一 provisioning runner，不在 Kickstart renderer 中重复实现软件包、文件和脚本逻辑。
+
+MVP 首先要求 Rocky Linux 9.7 aarch64 完整安装跑通；随后验证 Rocky Linux 9.x x86_64。RHEL、Alma、Fedora 复用 Rocky 优先模型，差异放入 M6。
+
+Kickstart 分区至少支持 `ext4`、`xfs`、`swap`、EFI System Partition 和 BIOS boot partition；默认 root 文件系统可由 profile 选择，Rocky 默认可用 xfs，但不得限制为 xfs。
+
+### 8.5 启动盘配置
+
+实现字段：
+
+```json
+{
+  "storage": {
+    "wipe": true,
+    "boot_disk": "/dev/sda",
+    "install_disks": ["/dev/sda"],
+    "boot_mode": "uefi",
+    "partition_table": "gpt",
+    "partitions": []
+  },
+  "bootloader": {
+    "install": true,
+    "target": "storage.boot_disk",
+    "set_firmware_boot_order": false
+  }
+}
+```
+
+校验：
+
+- UEFI 必须有 `/boot/efi` ESP。
+- BIOS + GPT 必须有 BIOS boot 分区。
+- `bootloader.install = true` 时 target 必须可解析。
+- `set_firmware_boot_order = true` 在 MVP 返回“不支持”或警告。已在 Rocky 9.7 aarch64 VMware EFI 虚拟机验证 `efibootmgr` 修改 BootOrder 的持久性和可靠性，但不同厂商固件存在兼容性差异，MVP 保持默认 `false` 避免阻塞安装。
+
+### 8.6 安装阶段状态
+
+阶段：
+
+```text
+pxe_seen
+bootfile_sent
+installer_started
+install_config_fetched
+install_started
+install_partitioning
+install_packages
+install_bootloader
+install_post
+install_rebooting
+installed
+failed
+```
+
+### 8.7 CLI 命令
+
+```bash
+nodeforge install render node-01
+nodeforge install status node-01
+nodeforge install logs node-01
+nodeforge install retry node-01
+```
+
+### 8.8 测试
+
+- Ubuntu autoinstall 渲染 fixture。
+- Kickstart 渲染 fixture。
+- storage 校验 fixture。
+- 未显式认领的节点禁止使用 install profile。
+- QEMU UEFI PXE autoinstall smoke test。
+
+### 8.9 阶段验收
+
+- Rocky Linux 9.7 aarch64 和 Ubuntu Server 22.04 LTS 能从 PXE 自动安装到本地磁盘。
+- 安装目标盘、ESP、root、swap、bootloader 配置生效。
+- 安装事件能更新 `node status`。
+- `install render` 可预览 answer file。
+- `bundle plan --node` 与安装器实际执行的 `install_post` 顺序一致。
+
+## 10. M5：内存无盘启动与基础后处理
+
+### 10.1 目标
+
+实现 NodeForge 小 initrd + HTTP rootfs 的无盘启动闭环。
+
+### 9.2 代码任务
+
+| 模块 | 任务 |
+| --- | --- |
+| `profile/diskless.zig` | DisklessConfig 校验 |
+| `assets/bundle.zig` | boot bundle manifest 校验 |
+| `rootfs/validate.zig` | rootfs 发布物校验 |
+| `initrd/validate.zig` | 小 initrd 能力校验 |
+| `http/routes.zig` | boot config/rootfs 路由完善 |
+| `state/node_status.zig` | diskless 阶段状态 |
+| `provision/runner.zig` | 在 rootfs 工作目录或 overlay upper 中执行基础步骤 |
+
+小 initrd 明确使用目标发行版的 `dracut` 定制构建，不手工拼 cpio，也不把 Zig 静态二进制作为 MVP 前置条件。`initrd/dracut/95nodeforge/` 提供标准 dracut module：
+
+- `module-setup.sh` 声明依赖并安装 hook、网络工具、HTTP 下载工具、SHA256、overlay/squashfs 所需模块。
+- `nodeforge-init.sh` 只执行 cmdline 解析、IPv4 联网、boot config 获取、rootfs 续传/校验、overlay 挂载和 `switch_root`。
+- 构建必须在与 rootfs 同发行版、同版本、同架构、同 `kernel_release` 的环境中运行；Rocky 9.7 aarch64 是第一条验证链路。
+- `nodeforge initrd build` 是 dracut 的稳定封装，记录 dracut 版本、命令、module 清单和输出 SHA256。
+
+### 9.3 boot bundle manifest
+
+必须记录：
+
+- name
+- distro
+- version
+- arch
+- kernel_release
+- kernel asset/path/sha256
+- NodeForge 小 initrd asset/path/sha256
+- rootfs asset/path/sha256/size
+- repository refs
+- build time
+- build spec
+
+### 9.4 小 initrd 行为
+
+流程：
+
+```text
+parse /proc/cmdline
+  -> read nodeforge.config_url
+  -> dhcp network already available or bring up network
+  -> GET boot config
+  -> POST initrd_started
+  -> inspect partial rootfs and download with HTTP Range
+  -> verify sha256
+  -> mount squashfs lower
+  -> mount tmpfs upper with configured size
+  -> mount overlay merged
+  -> write /run/nodeforge/boot.json
+  -> switch_root merged /sbin/init
+```
+
+rootfs 下载支持断点续传：
+
+- 临时文件使用 `<sha256>.part`，同时保存期望 URL、size、ETag 和已下载字节数。
+- 同一次 initrd 启动中发生网络中断并恢复后，以 `Range: bytes=<offset>-` 和 `If-Range: <etag>` 继续；服务返回 `206` 才追加。纯内存无盘节点重启后 partial 会丢失，因此不承诺跨重启续传。
+- 服务返回 `200`、ETag 改变、长度不符或局部文件超过目标大小时，从零覆盖下载。
+- 完成后必须校验完整 SHA256，再原子改名；hash 不匹配删除或隔离 partial，绝不挂载。
+- tmpfs 容量校验必须同时考虑 rootfs partial 文件和 overlay 上层，容量不足时在下载前明确失败。
+
+### 9.5 overlay 规则
+
+- `overlay.tmpfs_size` 必须传给 tmpfs `size=`。
+- `/var/log`、`/tmp` 等高写入路径先作为配置位，不强制 MVP 单独挂载。
+- 持久化 overlay 不进入 MVP。
+- rootfs 公共修改使用 `rootfs_build`；节点差异使用 `diskless_boot` 写入 overlay upper。两者复用 M4 的 provisioning runner。
+
+### 9.6 CLI 命令
+
+```bash
+nodeforge rootfs package rocky-9.7-aarch64 --format squashfs --version 20260706
+nodeforge rootfs validate rocky-9.7-aarch64-<kernel-release>-diskless-20260706.squashfs
+nodeforge initrd validate diskless/rocky/9.7/aarch64/<kernel-release>/initrd-nodeforge.img
+nodeforge boot-bundle publish rocky-9.7-aarch64-<kernel-release>-diskless-20260706 --kernel rocky-9.7-aarch64-kernel --initrd rocky-9.7-aarch64-nodeforge-initrd --rootfs rocky-9.7-aarch64-rootfs-20260706 --repo rocky-9.7-aarch64-dvd
+nodeforge diskless overlay update rocky-9.7-aarch64-diskless --tmpfs-size 50%
+nodeforge diskless status node-02
+```
+
+### 9.7 测试
+
+- boot bundle 一致性校验。
+- rootfs 缺少 `/sbin/init` 报错。
+- rootfs `/lib/modules` 与 kernel_release 不匹配报错。
+- overlay tmpfs size 解析。
+- QEMU UEFI diskless smoke test。
+
+### 9.8 阶段验收
+
+- 节点能 PXE 进入小 initrd。
+- 小 initrd 能拉取 boot config。
+- rootfs 下载和 SHA256 校验通过。
+- `squashfs_overlay` 挂载成功并 `switch_root`。
+- `nodeforge node status` 显示 `diskless_running`。
+
+## 11. M6：支持矩阵增强
+
+### 11.1 目标
+
+完善 MVP 周边兼容性和诊断能力。
+
+### 10.2 任务
+
+- Rocky Linux 9.x 优先的 RHEL 系 kickstart 版本能力表。
+- x86_64 生产验证记录和 aarch64 真机/QEMU PXE 验证记录。
+- BIOS x86 + PXELINUX 链路。
+- 安装错误分类。
+- ISO/repo/rootfs 资产更完整校验。
+- Proxy DHCP spike。
+- Secure Boot 风险评估。
+
+### 10.3 BIOS PXELINUX
+
+PXELINUX 只用于 BIOS x86。DHCP 返回 `pxelinux.0` 后，PXELINUX 从 TFTP 根目录下的 `pxelinux.cfg/` 查找配置。NodeForge 不使用 PXELINUX 私有 DHCP option 指定配置文件，遵循默认查找规则：
+
+1. 先按硬件类型和 MAC 查找，例如以太网 `52:54:00:12:34:01` 对应 `01-52-54-00-12-34-01`。
+2. 再按客户端 IPv4 的大写十六进制形式查找，例如 `192.168.50.101 -> C0A83265`。
+3. 找不到时逐位缩短为 `C0A8326`、`C0A832` 等，最后查找小写 `pxelinux.cfg/default`。
+
+生成策略：
+
+- `boot/pxelinux.zig` 是唯一 renderer，不在 DHCP/TFTP handler 中拼配置文本。
+- 已绑定 BIOS 节点以 MAC 为主要身份，生成 `pxelinux.cfg/01-<mac>`；具有保留 IP 时同时生成完整 8 位十六进制文件作为兼容入口，两者内容相同。
+- 节点配置由 `boot.resolver` 展开 node + profile，直接指向对应 installer kernel/initrd 或 diskless kernel/initrd。
+- `pxelinux.cfg/default` 只处理未匹配节点，严格服从 unknown policy；默认 `wait` 时不包含自动安装、擦盘或自动启动条目。
+- 为避免缩短 IP 前缀意外匹配其他节点，NodeForge 不生成前缀配置文件，只生成 MAC、完整 8 位 IP 和 `default`。
+- 所有路径相对 `pxelinux.0` 所在 TFTP root，生成前检查路径长度、资产存在性和目录穿越。
+- 配置写入临时文件，校验后 rename；node/profile/policy 变更时重新生成受影响文件。
+
+已绑定 install 节点示例：
+
+```text
+DEFAULT nodeforge
+PROMPT 0
+TIMEOUT 30
+ONTIMEOUT nodeforge
+
+LABEL nodeforge
+  KERNEL install/rocky/9.7/x86_64/vmlinuz
+  APPEND initrd=install/rocky/9.7/x86_64/initrd.img inst.ks=http://192.168.50.1:8080/api/v1/nodes/node-01/answer inst.repo=http://192.168.50.1:8080/repos/rocky-9.7-x86_64-dvd/
+```
+
+默认 `wait` 示例：
+
+```text
+PROMPT 1
+TIMEOUT 0
+DISPLAY pxelinux.cfg/wait.txt
+```
+
+如果管理员显式配置 safe discovery/diskless，`default` 可以增加相应条目；仍不得包含 install profile。
+
+实现和测试：
+
+- 新增 `boot/pxelinux.zig`、MAC 文件名和 IP 十六进制文件名转换测试。
+- fixture 覆盖 BIOS arch option、MAC 命中、完整 IP 命中、逐级 fallback 和 `default`。
+- 使用标准 TFTP client 验证配置可取，再用 QEMU BIOS PXE 验证 kernel/initrd 与 cmdline。
+- `nodeforge boot render <node> --format pxelinux` 可预览节点配置；`nodeforge boot default render --format pxelinux` 可预览安全兜底配置。
+
+### 10.4 错误分类
+
+错误类型：
+
+- `dhcp.no_available_lease`
+- `tftp.asset_not_found`
+- `http.asset_hash_mismatch`
+- `install.answer_render_failed`
+- `install.storage_invalid`
+- `install.bootloader_failed`
+- `diskless.rootfs_hash_mismatch`
+- `diskless.switch_root_failed`
+
+## 12. M7：补充包和后处理增强
+
+### 12.1 目标
+
+M4/M5 已交付 repository、standard-packages、managed-file 和统一 runner。本阶段补齐 archive、script、firstboot、CLI plan/status 和三条链路的完整回归。这里的“配置可视化”是指 CLI 按阶段、步骤和执行结果清晰组织输出，不引入 Web UI 或通用低代码配置系统。
+
+### 11.2 增强范围
+
+本阶段不新增第二套模型，继续使用 3.5：
+
+- 启用 archive 和 script action。
+- 增加 firstboot 执行入口。
+- 补齐 bundle `show/plan`、运行状态和错误摘要。
+- 对 Kickstart、autoinstall、rootfs build 和 diskless overlay 做同一 bundle 的回归。
+
+### 11.3 标准化步骤契约
+
+所有步骤统一接收执行上下文：
+
+```text
+node_id, profile, distro, distro_version, arch, phase,
+target_root, workspace, repository_base_url, event_url
+```
+
+统一返回：
+
+```json
+{
+  "changed": true,
+  "status": "succeeded",
+  "summary": "chrony installed",
+  "outputs": {},
+  "warnings": []
+}
+```
+
+规则：
+
+- 每种 action 使用 Zig 明确结构体和配置校验，不使用 JSON Schema 动态生成字段。
+- 所有步骤支持 `validate`；`plan` 预览将安装的包、修改的文件和执行的脚本，但不产生副作用。
+- 步骤执行必须幂等；重复执行应返回 `changed = false`。无法保证幂等的 script 必须明确标记并禁止用于自动重试。
+- 输出、事件和错误使用统一结构，不允许脚本自行定义不可解析的状态格式。
+- `script` 是最后的逃生口，不作为常规配置步骤；必须提供 summary 和影响范围，供命令输出展示。
+
+### 11.4 包类型和交付规则
+
+只支持两类补充包：
+
+- 标准包：RPM/DEB 不作为孤立文件逐个安装。它们必须进入额外 yum/dnf/apt repository，通过标准包名和包管理器安装；repository 由 HTTP `/repos/` 提供。
+- 非标准包：只支持 `tar.bz2`，manifest 必须包含 SHA256、解压目录和可选 `install.sh`。不在 MVP 增加 wheel、容器镜像或任意压缩格式的专用模型。
+
+`install.sh` 约定：以 bundle 解压目录为工作目录，参数固定为 `install --root <target-root>`，退出码 0 成功；必须可重复执行，禁止隐式下载未声明内容。
+
+### 11.5 统一后处理阶段
+
+阶段固定为：
+
+```text
+rootfs_build
+install_post
+firstboot
+diskless_boot
+```
+
+执行顺序固定：
+
+1. 挂载/确认目标 root。
+2. 配置基础 ISO repository 和额外 repository。
+3. 使用 yum/dnf/apt 安装 `standard_packages`。
+4. 下载并校验 `tar.bz2`，解压并执行其安装脚本。
+5. 原子写入 `files`，用于 `/etc/hosts`、chrony/systemd-timesyncd、resolver 和业务配置。
+6. 按声明顺序执行自定义 scripts/patch。
+7. 写入 `/opt/nodeforge/provisioned/<bundle>-<version>.json` 并上报结果。
+
+同一个 bundle 可用于：
+
+- Kickstart `%post` 或 Ubuntu `late-commands`：在目标 root 内执行 `install_post`。
+- rootfs build：打包 squashfs 前执行 `rootfs_build`。
+- diskless：通用内容尽量在 rootfs build 完成；节点专属配置在 overlay 上执行 `diskless_boot`，不修改只读 lower rootfs。
+- firstboot：需要 systemd、网络或目标硬件后才能完成的操作。
+
+### 11.6 CLI 配置展示与预览
+
+“可视化”完全通过命令输出实现：
+
+- `bundle list` 使用表格展示名称、版本、发行版、架构、步骤数和发布时间。
+- `bundle show` 先显示概要，再按 phase 分组，按数组顺序列出 step、action、required、enabled 和关键参数。
+- `bundle plan --node` 展示目标节点、安装方式、目标 root、最终执行顺序、软件包、文件目标、archive 和脚本摘要，并突出警告或不兼容项。
+- `provision status` 按 phase 和 step 展示 `PENDING/RUNNING/OK/WARN/FAILED/SKIPPED`、是否变更、耗时及摘要。
+- 默认输出面向人阅读；`--output json` 输出相同事实的结构化形式，不为展示另建一套数据模型。
+
+示例：
+
+```text
+Bundle  base-site@1    Rocky 9.7 aarch64    VALID
+
+PHASE         #  STEP              ACTION             REQUIRED  SUMMARY
+install_post  1  site-repository   repository         yes       site-extra
+install_post  2  base-packages     standard-packages  yes       chrony, vim
+install_post  3  hosts             managed-file       yes       -> /etc/hosts
+firstboot     1  vendor-agent      archive            yes       /opt/vendor-agent
+firstboot     2  site-patch        script             no        patch site config
+```
+
+Kickstart、autoinstall 和 diskless 对同一 bundle 使用相同的 `show/plan/status` 格式，只在概要中标明实际执行入口。
+
+### 11.7 安全与幂等
+
+- 每个 bundle/version/phase 记录执行状态和日志；同版本默认不重复执行，可用显式 `--force` 重跑。
+- script 使用固定环境变量、工作目录、超时和输出上限；required script 失败终止该阶段，optional script 只告警。
+- 文件更新采用临时文件 + rename，原文件可按 bundle 策略备份；禁止未声明的整目录覆盖。
+- 自动安装中的后处理继承 node + install profile 显式绑定；未知节点的 safe diskless 禁止执行 archive install script 和自定义 script。
+- bundle 变更生成新版本，不原地修改已发布内容；节点状态记录实际使用版本。
+
+### 11.8 CLI 与验收
+
+```bash
+nodeforge provision bundle list
+nodeforge provision bundle show base-site
+nodeforge provision bundle create base-site --distro rocky --distro-version 9.7 --arch aarch64
+nodeforge provision step add base-site --name site-repository --phase install_post --action repository --repository site-extra
+nodeforge provision step add base-site --name base-packages --phase install_post --action standard-packages --package chrony
+nodeforge provision step add base-site --name vendor-agent --phase firstboot --action archive --asset vendor-agent.tar.bz2 --extract-to /opt/vendor-agent
+nodeforge provision step add base-site --name hosts --phase install_post --action managed-file --source hosts --destination /etc/hosts
+nodeforge provision step add base-site --name site-patch --phase install_post --action script --asset patch.sh --required
+nodeforge provision bundle validate base-site
+nodeforge provision bundle publish base-site --version 1
+nodeforge provision bundle plan base-site --node node-01
+nodeforge provision run show <run-id>
+nodeforge provision status node-01
+```
+
+CLI 的 `bundle list/show/plan` 和 `status` 默认使用分组表格，`--output json` 返回同一模型。
+
+验收必须覆盖强类型步骤校验、确定性顺序、清晰的分组输出、plan 无副作用、RPM/DEB 额外源安装、tar.bz2 安装、hosts/时间同步配置更新、自定义脚本成功与回滚提示，以及 kickstart、autoinstall、diskless overlay 三条链路。
+
+## 13. 测试矩阵
+
+| 层级 | 内容 |
+| --- | --- |
+| 单元测试 | packet encode/decode、配置校验、模板渲染、路径 normalize、size expr 解析 |
+| fixture 测试 | DHCP 报文、TFTP 请求、answer 渲染、boot bundle manifest |
+| 集成测试 | DHCP client、TFTP client、HTTP client |
+| QEMU 测试 | UEFI PXE、Ubuntu autoinstall、diskless squashfs overlay |
+| 回归测试 | 关键事件、错误分类、CLI 输出 |
+
+测试目录：
+
+```text
+tests/
+  fixtures/
+    dhcp/
+    tftp/
+    profiles/
+    assets/
+  integration/
+  qemu/
+```
+
+## 14. 配置和事件兼容策略
+
+### 14.1 配置版本
+
+配置文件包含：
+
+```json
+{
+  "schema_version": 1
+}
+```
+
+MVP 只支持当前版本。后续升级时增加 migration。
+
+### 13.2 事件版本
+
+事件增加 `v` 字段：
+
+```json
+{"v":1,"ts":"2026-07-06T10:00:00Z","node":"node-01","type":"dhcp.discover"}
+```
+
+### 13.3 兼容原则
+
+- 新增字段必须有默认值。
+- 删除字段必须经过 migration。
+- CLI `--output json` 字段保持稳定。
+- 人类可读输出可优化，但不能丢失关键状态。
+
+## 15. 开发顺序和里程碑
+
+建议实际开发顺序：
+
+1. 搭建 repo、build.zig、基础 test harness。
+2. 实现 config model/load/validate/store。
+3. 固定接入 `zig-clap 0.12.0`，实现单 HTTP listener、本机 management route、CLI 库集成、formatter、端口/权限 preflight；`zig-args` 仅作为解析层备选。
+4. 实现 runtime state 和 events writer。
+5. 实现 TFTP packet/path/session/transfer/server 和 GRUB config，用标准 TFTP client 验证，完成 M1。
+6. 实现 DHCPv4 packet/options/lease/policy/server、boot resolver 和 vendor fixture，与 TFTP 联调后完成 M2。
+7. 实现 HTTP static/Range/API、ISO 导入和自动 repository，完成 M3。
+8. 实现 provisioning bundle、基础 runner 和 `show/plan/status` 输出。
+9. 实现 Rocky kickstart adapter，跑通 Rocky Linux 9.7 aarch64 安装与 `install_post`。
+10. 实现 Ubuntu adapter，跑通 Ubuntu Server 22.04 LTS 安装与 `install_post`，完成 M4。
+11. 实现 dracut module、boot bundle/rootfs/initrd 校验和断点续传。
+12. 跑通 diskless squashfs overlay 与 `rootfs_build`/`diskless_boot`，完成 M5，再实施 M6/M7 增强。
+
+## 16. MVP 最终交付清单
+
+二进制：
+
+- `nodeforged`
+- `nodeforge`
+
+配置：
+
+- `/opt/nodeforge/config/config.json`
+
+管理目录：
+
+- `/opt/nodeforge/catalog/catalog.json`
+
+运行态：
+
+- `/opt/nodeforge/state/runtime.json`
+- `/opt/nodeforge/logs/events.jsonl`
+
+资产目录：
+
+- `/opt/nodeforge/tftp`
+- `/opt/nodeforge/assets`
+- `/opt/nodeforge/repos`
+
+这些路径由代码中的统一默认路径模块派生；文档、示例配置和 systemd unit 必须与该定义保持一致。M0 默认安装根是 `/opt/nodeforge`，正常服务启动不再显式传 `--config`/`--catalog`，只在测试或临时排障时覆盖。
+
+必须可演示：
+
+- 未知 UEFI x86_64/aarch64 节点 DHCP wait/discovery 决策。
+- CLI 显式开启和关闭未知节点 safe/ephemeral diskless 策略。
+- profile 或 boot bundle show 能展开 distro、repository、install source、kernel、initrd、rootfs 的关系。
+- 已登记节点 PXE 启动。
+- Rocky Linux 9.7 aarch64 kickstart 到本地启动盘。
+- Ubuntu Server 22.04 LTS autoinstall 到本地启动盘。
+- macOS 宿主机 + Rocky Linux 9.7 ARM VM 可作为开发验证环境。
+- diskless `squashfs_overlay` 启动。
+- `nodeforge node status` 展示安装/无盘阶段。
+- `nodeforge runtime events tail` 展示事件流。
+- `nodeforge config validate` 校验配置。
+- `nodeforge check` 验证服务可用性。
+- `nodeforge provision bundle plan` 和 `provision status` 展示后处理计划与结果。
+
+## 17. 风险和前置 spike
+
+| 风险 | 建议 spike |
+| --- | --- |
+| Zig HTTP server 大文件 Range 实现细节 | M3 前做 1 个静态文件 Range demo |
+| TFTP option/GRUB 行为差异 | M1 使用标准 client 和 QEMU 拉取 GRUB 配置/kernel/initrd |
+| DHCP option 兼容性 | M2 前收集 UEFI x86_64/aarch64 DHCP fixtures |
+| Ubuntu autoinstall schema 差异 | M4 固定 Ubuntu Server 22.04 LTS 为 MVP 必测；后续 LTS 逐版本增加 fixture |
+| Rocky/aarch64 开发验证 | 当前开发宿主机是 macOS，验证环境为 Rocky Linux 9.7 ARM VM；生产初期仍优先 x86_64 | M4 先完成 aarch64 smoke，M6 补充 x86_64 生产记录 |
+| dracut module 差异 | M5 前在 Rocky 9.7 aarch64 完成 `95nodeforge` build/boot spike |
+| rootfs kernel module 匹配 | M5 前做 boot bundle validate prototype |
+| 固件启动顺序 | 明确 MVP 不保证修改 BootOrder，避免阻塞自动安装 |
+
+## 18. 开发期间文档同步要求
+
+每个阶段完成时更新：
+
+- `DESIGN.md`：仅当范围或关键决策变化时更新。
+- `DETAILED_DESIGN.md`：阶段任务、接口、字段变化时更新。
+- 示例配置：字段变化必须同步。
+- 测试 fixture：协议或模板变化必须同步。
+
+不允许出现：
+
+- CLI 命令和文档示例不一致。
+- 配置字段在 profile 示例、校验逻辑、renderer 中含义不同。
+- 安装和无盘 initrd 概念混用。
+- DHCP/TFTP 端口变成配置项。
+- diskless cmdline 重新塞回复杂 rootfs 参数。
+
+## 19. 最近变更记录
+
+### 2026-07-10 M0 代码完善与验证
+
+**代码质量改进**:
+- 完成 `model.zig` 核心数据类型的完整文档注释
+- `catalog/store.zig` 模块级注释说明默认路径、文件大小限制
+- `config/validate.zig` 明确校验顺序和非职责范围
+- `http/server.zig` 函数文档涵盖 `serveConnection`、`route`、`validationError`、`json`
+- `http/client.zig` `Status` 结构和 `probeAt` 函数文档
+- `state/runtime.zig` 和 `state/events.zig` 运行态模型说明
+- `observe/error.zig` 错误信封结构和响应格式文档
+
+**架构设计验证**:
+- M0 单 HTTP listener 绑定 `0.0.0.0:<http.port>` 验证通过
+- `server.server_ip` 作为 PXE 服务地址，不用于 HTTP bind 验证通过
+- CLI 管理客户端固定连接 `127.0.0.1:<http.port>` 验证通过
+- 管理路由不做 loopback peer 检查，安全边界为网络隔离验证通过
+
+**关键修复**:
+- 修复 `http/server.zig` `json()` 函数 use-after-free：日志记录必须在 `respond()` 之前
+- 清理 `catalog/store.zig` 重复注释
+
+**验证结果**:
+- Rocky Linux 9.7 aarch64 环境构建测试通过
+- 远程部署和 systemd 服务管理功能完整
+- 所有 M0 CLI 命令功能正常
+- HTTP 管理接口和 API 响应稳定

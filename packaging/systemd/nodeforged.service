@@ -1,0 +1,18 @@
+[Unit]
+Description=NodeForge PXE Provisioning Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nodeforge
+ExecStartPre=/opt/nodeforge/bin/nodeforged --check
+ExecStart=/opt/nodeforge/bin/nodeforged
+Restart=on-failure
+RestartSec=2s
+AmbientCapabilities=
+CapabilityBoundingSet=
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

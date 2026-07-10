@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "repositories": [
+    {
+      "name": "rocky-9.7-aarch64-dvd",
+      "distro": "rocky",
+      "version": "9.7",
+      "arch": "aarch64",
+      "manager": "dnf",
+      "base_url": "http://192.168.50.1:8080/repos/rocky/9.7/aarch64/dvd",
+      "gpg_check": false
+    }
+  ],
+  "assets": [
+    {
+      "name": "rocky-9.7-aarch64-dvd-iso",
+      "kind": "iso",
+      "path": "iso/Rocky-9.7-aarch64-dvd.iso",
+      "distro": "rocky",
+      "version": "9.7",
+      "arch": "aarch64"
+    },
+    {
+      "name": "rocky-9.7-aarch64-installer-kernel",
+      "kind": "kernel",
+      "path": "boot/rocky/9.7/aarch64/vmlinuz",
+      "distro": "rocky",
+      "version": "9.7",
+      "arch": "aarch64"
+    },
+    {
+      "name": "rocky-9.7-aarch64-installer-initrd",
+      "kind": "installer_initrd",
+      "path": "boot/rocky/9.7/aarch64/initrd.img",
+      "distro": "rocky",
+      "version": "9.7",
+      "arch": "aarch64"
+    }
+  ],
+  "install_sources": [
+    {
+      "name": "rocky-9.7-aarch64-dvd",
+      "distro": "rocky",
+      "version": "9.7",
+      "arch": "aarch64",
+      "source_asset": "rocky-9.7-aarch64-dvd-iso",
+      "installer_kernel": "rocky-9.7-aarch64-installer-kernel",
+      "installer_initrd": "rocky-9.7-aarch64-installer-initrd",
+      "repositories": ["rocky-9.7-aarch64-dvd"]
+    }
+  ],
+  "boot_bundles": []
+}

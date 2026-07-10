@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "server": {
+    "name": "nodeforge-dev",
+    "bind_interface": null,
+    "server_ip": "192.168.50.1",
+    "http_port": 8080
+  },
+  "http": {
+    "asset_root": "/opt/nodeforge/assets",
+    "repository_root": "/opt/nodeforge/repos"
+  },
+  "distros": [
+    {
+      "name": "rocky",
+      "family": "rhel",
+      "versions": [
+        {
+          "version": "9.7",
+          "archs": ["aarch64", "x86_64"],
+          "install_adapter": "kickstart",
+          "package_manager": "dnf"
+        }
+      ]
+    },
+    {
+      "name": "ubuntu",
+      "family": "ubuntu",
+      "versions": [
+        {
+          "version": "22.04",
+          "archs": ["aarch64", "x86_64"],
+          "install_adapter": "autoinstall",
+          "package_manager": "apt"
+        }
+      ]
+    }
+  ],
+  "policy": {
+    "default_action": "wait",
+    "allow_unknown_diskless": false
+  }
+}
