@@ -1,17 +1,19 @@
 //! NodeForge M0 唯一 HTTP listener。
-//! 管理路由和 PXE 数据路由共享同一 HTTP 实现，避免双 listener 生命周期分叉。
-//! 管理路由不做 loopback peer 检查——安全边界是网络隔离（PXE 管理网段本身是受控网络），
-//! CLI 固定连接 127.0.0.1:<http.port>。
+//! M0 先实现管理路由；M3 PXE 数据路由将复用此 HTTP 实现，避免双 listener 生命周期分叉。
+//! 管理路由接受唯一 listener 上所有可达客户端的请求，不做来源地址检查；
+//! `nodeforge` CLI 则固定连接 127.0.0.1:<http.port>，只管理同机 `nodeforged`。
 
 const std = @import("std");
 const model = @import("../model.zig");
 const config_validate = @import("../config/validate.zig");
 const runtime_state = @import("../state/runtime.zig");
 const observe_error = @import("../observe/error.zig");
+const observe_log = @import("../observe/log.zig");
 
 /// 在指定 IPv4 地址启动一个 HTTP listener。
-/// M0 调用方固定传入 0.0.0.0，使同一个 listener 同时服务外部数据路由和
-/// 127.0.0.1 管理路由。管理路由不做 peer 来源检查。
+/// M0 调用方固定传入 0.0.0.0，使管理路由可从唯一 listener 提供服务。
+/// M3 PXE 数据路由将在同一个 listener 中注册。
+/// 管理路由不做 peer 来源检查，因此可从任意能到达该 listener 的 IPv4 地址访问。
 pub fn serve(
     io: std.Io,
     ip: []const u8,
@@ -20,19 +22,18 @@ pub fn serve(
     catalog: *const model.Catalog,
     runtime: *const runtime_state.RuntimeState,
 ) !void {
-    _ = catalog;
     const address = try std.Io.net.IpAddress.parseIp4(ip, port);
     // 允许快速重启复用刚释放的地址；未启用 reuse_port，活跃实例仍会占住端口。
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.log.info("HTTP listening on http://{s}:{d}", .{ ip, port });
+    observe_log.info("http: listening on http://{s}:{d}", .{ ip, port });
     while (true) {
         {
             var stream = try listener.accept(io);
             defer stream.close(io);
-            std.log.debug("HTTP accepted connection", .{});
-            try serveConnection(io, stream, config, runtime);
+            observe_log.debug("http: accepted connection", .{});
+            try serveConnection(io, stream, config, catalog, runtime);
         }
     }
 }
@@ -45,6 +46,7 @@ fn serveConnection(
     io: std.Io,
     stream: std.Io.net.Stream,
     config: *const model.AppConfig,
+    catalog: *const model.Catalog,
     runtime: *const runtime_state.RuntimeState,
 ) !void {
     var send_buffer: [4096]u8 = undefined;
@@ -56,15 +58,15 @@ fn serveConnection(
     while (true) {
         var request = server.receiveHead() catch |err| switch (err) {
             error.HttpConnectionClosing => {
-                std.log.debug("HTTP connection closed by peer", .{});
+                observe_log.debug("http: connection closed by peer", .{});
                 return;
             },
             else => {
-                std.log.debug("HTTP receive failed: {t}", .{err});
+                observe_log.debug("http: receive failed: {t}", .{err});
                 return err;
             },
         };
-        try route(&request, config, runtime);
+        try route(&request, config, catalog, runtime);
         if (!request.head.keep_alive) return;
     }
 }
@@ -80,29 +82,27 @@ fn serveConnection(
 fn route(
     request: *std.http.Server.Request,
     config: *const model.AppConfig,
+    catalog: *const model.Catalog,
     runtime: *const runtime_state.RuntimeState,
 ) !void {
     const target = request.head.target;
     if (request.head.method == .GET and std.mem.eql(u8, target, "/healthz")) {
         return json(request, .ok, "{\"ok\":true,\"service\":\"nodeforge\"}\n");
     }
-    // 管理 API 与数据路由共用同一 listener。
-    // 管理路由不做 loopback peer 检查——安全边界是网络隔离。
-    if (request.head.method == .GET and std.mem.eql(u8, target, "/api/v1/management/config/status"))
-    {
+    // 管理 API 与数据路由共用同一 listener，不按 peer 地址过滤请求。
+    // 127.0.0.1 是 nodeforge CLI 的客户端约定，不是服务端访问控制规则。
+    if (request.head.method == .GET and std.mem.eql(u8, target, "/api/v1/management/config/status")) {
         return json(request, .ok, "{\"ok\":true,\"result\":{\"config\":\"valid\"}}\n");
     }
-    if (request.head.method == .POST and std.mem.eql(u8, target, "/api/v1/management/config/validate"))
-    {
+    if (request.head.method == .POST and std.mem.eql(u8, target, "/api/v1/management/config/validate")) {
         // curl 等客户端发送空 POST 时可能同时省略 Transfer-Encoding 和
         // Content-Length；Zig server 的 respond 会尝试丢弃请求体，因此先明确为空。
         if (request.head.transfer_encoding == .none and request.head.content_length == null)
             request.head.content_length = 0;
-        config_validate.validateConfig(config) catch |err| return validationError(request, err);
+        config_validate.validate(config, catalog) catch |err| return validationError(request, err);
         return json(request, .ok, "{\"ok\":true,\"result\":{}}\n");
     }
-    if (request.head.method == .GET and std.mem.eql(u8, target, "/api/v1/management/server/status"))
-    {
+    if (request.head.method == .GET and std.mem.eql(u8, target, "/api/v1/management/server/status")) {
         const body = switch (runtime.service) {
             .starting => "{\"ok\":true,\"result\":{\"service\":\"starting\"}}\n",
             .running => "{\"ok\":true,\"result\":{\"service\":\"running\"}}\n",
@@ -129,7 +129,7 @@ fn validationError(request: *std.http.Server.Request, err: anyerror) !void {
 /// 日志必须在 `respond()` 之前写入：`request.head.target` 借用连接内部读缓冲区，
 /// `respond()` 可能推进读位置或复用缓冲区，导致日志中格式化的 target 切片失效。
 fn json(request: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
-    std.log.info("HTTP {s} {s} -> {d}", .{
+    observe_log.info("http: {s} {s} -> {d}", .{
         methodName(request.head.method),
         request.head.target,
         @intFromEnum(status),

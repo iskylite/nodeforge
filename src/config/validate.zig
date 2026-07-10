@@ -43,7 +43,7 @@ pub const ValidationError = error{
 ///
 /// 执行顺序固定为 config → catalog → profiles → nodes → policy，
 /// 前置校验失败时不会继续后续检查。本函数不访问文件系统、不产生副作用，
-/// 适合在服务绑定端口、CLI 导入和运行期配置变更前调用。
+/// 适合在服务绑定端口、CLI 跨文件校验和运行期配置变更前调用。
 pub fn validate(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     try validateConfig(config);
     try validateCatalog(config, catalog);

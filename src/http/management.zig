@@ -1,14 +1,13 @@
-//! localhost 管理客户端约定。
-//! M0 只有一个服务端 listener；CLI 仍固定连接 IPv4 loopback。
-//! 本模块不实现远程管理、TLS 或鉴权——安全边界是网络隔离（PXE 管理网段是受控网络）。
-//! 后续若开放远程管理，必须另行设计 TLS、鉴权和审计，不能直接放宽此常量。
+//! `nodeforge` CLI 的本机管理客户端约定。
+//! 服务端唯一 listener 绑定所有 IPv4 接口，管理路由也不限制请求来源；这里只限定
+//! 官方 CLI 固定连接本机 `nodeforged`，不提供远程 endpoint 参数。
 
 const std = @import("std");
 
-/// CLI 管理客户端固定连接 IPv4 localhost，配置文件不能覆盖此值。
-pub const bind_ip = "127.0.0.1";
+/// CLI 管理客户端固定连接 IPv4 localhost，配置文件和命令行均不能覆盖此值。
+pub const client_ip = "127.0.0.1";
 
 test "management client is fixed to IPv4 localhost" {
     _ = std;
-    try std.testing.expectEqualStrings("127.0.0.1", bind_ip);
+    try std.testing.expectEqualStrings("127.0.0.1", client_ip);
 }

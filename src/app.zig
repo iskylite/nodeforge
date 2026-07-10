@@ -8,7 +8,7 @@ const model = @import("model.zig");
 const http_server = @import("http/server.zig");
 const runtime_state = @import("state/runtime.zig");
 
-/// 启动唯一 HTTP listener。管理路由和 PXE 数据路由共享同一端口。
+/// 启动唯一 HTTP listener。M0 提供管理路由；M3 PXE 数据路由将共享同一端口。
 pub fn run(
     io: std.Io,
     allocator: std.mem.Allocator,

@@ -1,0 +1,166 @@
+#!/bin/sh
+set -eu
+
+cli=$1
+daemon=$2
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+tmp=${TMPDIR:-/tmp}/nodeforge-cli-test-$$
+mkdir -p "$tmp"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
+"$cli" --help >"$tmp/root-help"
+grep -q "NodeForge administration CLI" "$tmp/root-help"
+grep -q "Available commands:" "$tmp/root-help"
+grep -q "catalog" "$tmp/root-help"
+grep -q -- "--version" "$tmp/root-help"
+if grep -Eq '^   .*--config' "$tmp/root-help"; then
+    echo "root help must not expose command-specific flags" >&2
+    exit 1
+fi
+if grep -Eq '^  (help|version)[[:space:]]' "$tmp/root-help"; then
+    echo "help/version must be flags, not subcommands" >&2
+    exit 1
+fi
+
+"$cli" config --help >"$tmp/config-help"
+grep -q "validate" "$tmp/config-help"
+grep -q "export" "$tmp/config-help"
+grep -q "import" "$tmp/config-help"
+if grep -q "Examples:" "$tmp/config-help"; then
+    echo "help must not embed examples" >&2
+    exit 1
+fi
+
+"$cli" config import --help >"$tmp/import-help"
+grep -q "Source config JSON path" "$tmp/import-help"
+grep -q "required" "$tmp/import-help"
+if grep -Eq '^   .*--catalog' "$tmp/import-help"; then
+    echo "config import must not expose catalog validation" >&2
+    exit 1
+fi
+
+for command in \
+    "status" \
+    "check" \
+    "config validate" \
+    "config export" \
+    "catalog" \
+    "catalog validate" \
+    "catalog export"; do
+    "$cli" $command --help >"$tmp/help-$(echo "$command" | tr ' ' '-')"
+    if grep -q "Examples:" "$tmp/help-$(echo "$command" | tr ' ' '-')"; then
+        echo "help must not embed examples: $command" >&2
+        exit 1
+    fi
+done
+
+"$cli" status --help >"$tmp/status-help"
+grep -q -- "--config" "$tmp/status-help"
+grep -q -- "--output" "$tmp/status-help"
+if grep -Eq '^   .*--catalog' "$tmp/status-help"; then
+    echo "status must not expose unused catalog flag" >&2
+    exit 1
+fi
+
+"$cli" config export --help >"$tmp/config-export-help"
+grep -q -- "--config" "$tmp/config-export-help"
+grep -q -- "--debug" "$tmp/config-export-help"
+if grep -Eq '^   .*--(catalog|output)' "$tmp/config-export-help"; then
+    echo "config export must expose only the flags it reads" >&2
+    exit 1
+fi
+
+"$cli" catalog export --help >"$tmp/catalog-export-help"
+grep -q -- "--catalog" "$tmp/catalog-export-help"
+if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
+    echo "catalog export must expose only the flags it reads" >&2
+    exit 1
+fi
+
+test "$("$cli" --version)" = "nodeforge 0.0.0"
+test "$("$cli" -v)" = "nodeforge 0.0.0"
+
+for removed_command in help version; do
+    if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then
+        echo "$removed_command subcommand unexpectedly succeeded" >&2
+        exit 1
+    else
+        test "$?" -eq 2
+    fi
+done
+
+# Each business flag belongs to its leaf command. This avoids silently carrying
+# unrelated root flags into subcommands that do not read them.
+"$cli" config validate -c "$root/config.example.json" -C "$root/catalog.example.json" -o json >"$tmp/validate"
+grep -q '"ok":true' "$tmp/validate"
+grep -q "$root/config.example.json" "$tmp/validate"
+
+if "$cli" --config "$root/config.example.json" config validate >"$tmp/root-config" 2>&1; then
+    echo "root config flag unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+
+if "$cli" config validate --version >"$tmp/nested-version" 2>&1; then
+    echo "nested version flag unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+
+if "$cli" config export -c "$tmp/missing.json" >"$tmp/load-error" 2>&1; then
+    echo "missing config unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 1
+fi
+grep -Fqx "error: config: file not found: $tmp/missing.json" "$tmp/load-error"
+
+if "$cli" config export -c "$tmp/missing.json" -d >"$tmp/load-debug" 2>&1; then
+    echo "missing debug config unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 1
+fi
+grep -q '^debug: config: load cause=FileNotFound$' "$tmp/load-debug"
+
+if "$cli" config unknown >"$tmp/unknown" 2>&1; then
+    echo "unknown command unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+grep -q "Unknown command: 'unknown'" "$tmp/unknown"
+
+if "$cli" config import >"$tmp/missing" 2>&1; then
+    echo "missing positional argument unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+grep -q "Missing 1 positional argument" "$tmp/missing"
+
+# Import is deliberately a single-file operation. A missing catalog must not
+# prevent staging a valid startup config for the next daemon restart.
+"$cli" config import -c "$tmp/imported.json" "$root/config.example.json" >"$tmp/imported"
+grep -q '^OK config imported ' "$tmp/imported"
+test -s "$tmp/imported.json"
+
+"$daemon" --help >"$tmp/daemon-help"
+grep -q "NodeForge daemon" "$tmp/daemon-help"
+grep -q -- "--check-config" "$tmp/daemon-help"
+grep -q -- "--debug" "$tmp/daemon-help"
+grep -q -- "-k, --check" "$tmp/daemon-help"
+grep -q -- "-K, --check-config" "$tmp/daemon-help"
+test "$("$daemon" --version)" = "nodeforged 0.0.0"
+test "$("$daemon" -v)" = "nodeforged 0.0.0"
+"$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" >"$tmp/daemon-check-config" 2>&1
+grep -q '^info: config: valid ' "$tmp/daemon-check-config"
+
+# Spinner support is available for future interactive commands, but no current
+# handler starts one or emits cursor-control sequences.
+if LC_ALL=C grep -q "$(printf '\033')\[?25h" "$tmp/validate"; then
+    echo "non-spinner command emitted a cursor-control sequence" >&2
+    exit 1
+fi

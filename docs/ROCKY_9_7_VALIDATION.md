@@ -29,6 +29,8 @@
   initrd/
   rootfs/
   bundles/
+  provisioned/
+  run/
   work/
 ```
 
@@ -38,7 +40,10 @@
 - `/usr/bin/nodeforge -> /opt/nodeforge/bin/nodeforge`
 - `/usr/bin/nodeforged -> /opt/nodeforge/bin/nodeforged`
 
-M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口，只允许 VM 本机通过 `127.0.0.1:8080` 访问；从宿主机访问管理路由应返回 403。
+M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CLI 固定通过
+`127.0.0.1:8080` 访问且不支持远程 endpoint，因此只能管理同机 `nodeforged`。服务端 listener
+绑定 `0.0.0.0:8080`，管理路由接受所有可达连接且不做 peer 来源检查；从宿主机访问应返回
+200。M0 尚无管理鉴权和 TLS，验证环境必须使用受信任网络。
 
 ## M1 TFTP 待验证
 

@@ -11,6 +11,8 @@ pub const AppConfig = struct {
     server: ServerConfig,
     /// HTTP 资产与仓库根目录。
     http: HttpConfig = .{},
+    /// 服务日志等级；daemon `--debug` 可在本次启动临时覆盖为 debug。
+    logging: LoggingConfig = .{},
     /// 受支持的发行版及版本矩阵。
     distros: []const DistroConfig = &.{},
     /// 节点可绑定的安装、无盘或发现策略。
@@ -45,7 +47,7 @@ pub const ServerConfig = struct {
     /// PXE 服务网对外 IPv4 地址；用于生成 HTTP/TFTP URL、DHCP next-server 等广告地址。
     /// HTTP M0 仍绑定 0.0.0.0，不把该字段作为 bind 地址。
     server_ip: []const u8,
-    /// 唯一 HTTP 监听端口；同时承载 PXE 数据路由和 loopback 管理路由。
+    /// 唯一 HTTP 监听端口；同时承载 PXE 数据路由和管理路由。CLI 固定使用 loopback 访问。
     http_port: u16 = 8080,
 };
 
@@ -56,6 +58,15 @@ pub const HttpConfig = struct {
     /// 通过 `/repos/` 只读发布的仓库根目录。
     repository_root: []const u8 = paths.repos_dir,
 };
+
+/// 服务日志配置。业务事件仍写入独立的 events.jsonl。
+pub const LoggingConfig = struct {
+    /// 日常输出 info；debug 额外输出连接和协议诊断。
+    level: LogLevel = .info,
+};
+
+/// 可配置的服务日志等级。
+pub const LogLevel = enum { info, debug };
 
 /// 首期支持的处理器架构；生产优先 x86_64，开发验证优先 aarch64。
 pub const Arch = enum { x86_64, aarch64 };

@@ -3,7 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const clap = b.dependency("clap", .{});
+    const zli = b.dependency("zli", .{});
 
     // 核心模块是两个二进制共享的唯一业务实现，避免 CLI 与守护进程行为分叉。
     const core = b.addModule("nodeforge", .{
@@ -19,7 +19,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/nodeforged.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "nodeforge", .module = core }},
+            .imports = &.{
+                .{ .name = "nodeforge", .module = core },
+                .{ .name = "zli", .module = zli.module("zli") },
+            },
         }),
     });
     b.installArtifact(daemon);
@@ -33,7 +36,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "nodeforge", .module = core },
-                .{ .name = "clap", .module = clap.module("clap") },
+                .{ .name = "zli", .module = zli.module("zli") },
             },
         }),
     });
@@ -54,4 +57,12 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run NodeForge tests");
     test_step.dependOn(&run_tests.step);
+
+    // CLI contract tests exercise the installed command tree, generated help,
+    // command-local flags, and parse-error exit codes end to end.
+    const cli_tests = b.addSystemCommand(&.{"sh"});
+    cli_tests.addFileArg(b.path("tests/cli.sh"));
+    cli_tests.addArtifactArg(cli);
+    cli_tests.addArtifactArg(daemon);
+    test_step.dependOn(&cli_tests.step);
 }

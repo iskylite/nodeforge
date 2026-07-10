@@ -14,7 +14,7 @@ pub const Status = struct {
 /// 探测管理接口 `/healthz`。
 /// 使用 `Connection: close` 保证能够以 EOF 作为响应结束，不实现通用 HTTP 客户端。
 pub fn health(io: std.Io, port: u16) Status {
-    return probeAt(io, management.bind_ip, port, "/healthz", "GET");
+    return probeAt(io, management.client_ip, port, "/healthz", "GET");
 }
 
 /// 探测指定 NodeForge IPv4 listener 的 `/healthz`。
@@ -27,7 +27,7 @@ pub fn healthAt(io: std.Io, ip: []const u8, port: u16) Status {
 pub fn managementStatus(io: std.Io, port: u16) Status {
     return probeAt(
         io,
-        management.bind_ip,
+        management.client_ip,
         port,
         "/api/v1/management/server/status",
         "GET",
@@ -38,7 +38,7 @@ pub fn managementStatus(io: std.Io, port: u16) Status {
 pub fn validateActiveConfig(io: std.Io, port: u16) Status {
     return probeAt(
         io,
-        management.bind_ip,
+        management.client_ip,
         port,
         "/api/v1/management/config/validate",
         "POST",

@@ -1,256 +1,391 @@
 //! `nodeforge` M0 管理命令行入口。
-//! 使用 zig-clap 解析全局参数；业务语义统一委托核心库处理。
-//! M0 只保留高频入口：`status` 查看详情，`check` 给自动化健康检查用；
-//! 不再保留 `server status/check` 这类重复层级，避免命令面膨胀。
+//! zli 持有唯一命令树并据此完成解析、校验和帮助生成；业务语义仍委托核心库。
+//! 退出码约定：0 表示成功，1 表示业务检查或运行失败，2 表示命令行用法错误。
 
 const std = @import("std");
-const clap = @import("clap");
+const zli = @import("zli");
 const nodeforge = @import("nodeforge");
 
-const CliOptions = struct {
-    /// 启动配置事实源。正常安装自动使用默认路径，测试和开发可覆盖。
-    config_path: []const u8 = nodeforge.config.default_path,
-    /// nodeforged 管理的 catalog 事实源。CLI M0 只读取/校验，不直接维护运行中 catalog。
-    catalog_path: []const u8 = nodeforge.catalog_store.default_path,
-    /// 机器消费输出必须显式开启，避免默认输出牺牲人工可读性。
-    output_json: bool = false,
-    /// zig-clap 已剥离全局参数后的命令路径。
-    positionals: []const []const u8,
+/// zli handler 共享的可变执行结果。
+/// handler 本身返回错误只用于传播内部故障；可预期的业务失败通过此状态返回退出码。
+const CliState = struct {
+    /// 最终进程退出码，默认成功。
+    exit_code: u8 = 0,
 };
 
+/// zli 用于 `--version` 元数据的编译期语义版本。
+const semantic_version = std.SemanticVersion.parse(nodeforge.version.version) catch unreachable;
+
+/// 初始化标准 IO，执行 CLI，并将命令结果转换为进程退出状态。
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file = std.Io.File.Writer.init(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file.interface;
+    var stdin_buffer: [1024]u8 = undefined;
+    var stdin_file = std.Io.File.Reader.init(.stdin(), init.io, &stdin_buffer);
 
-    const exit_code = run(init.io, allocator, init.minimal.args, out) catch |err| code: {
-        out.print("ERROR internal failure: {t}\n", .{err}) catch {};
-        break :code @as(u8, 1);
-    };
+    const exit_code = try run(init, out, &stdin_file.interface);
     out.flush() catch {};
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn run(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    args_iter: anytype,
-    out: *std.Io.Writer,
-) !u8 {
-    const params = comptime clap.parseParamsComptime(
-        \\-h, --help          Show help and exit.
-        \\-v, --version       Show version and exit.
-        \\--config <str>      Override config JSON path.
-        \\--catalog <str>     Override catalog JSON path.
-        \\--output <str>      Output format: json.
-        \\<str>...
-        \\
-    );
-    var diag = clap.Diagnostic{};
-    var parsed = clap.parse(clap.Help, &params, clap.parsers.default, args_iter, .{
-        .diagnostic = &diag,
-        .allocator = allocator,
-    }) catch |err| {
-        try diag.reportToFile(io, .stderr(), err);
-        return 2;
+/// 构建命令树并执行一次参数解析。
+/// zli 的语法错误统一映射为退出码 2，未分类内部错误映射为退出码 1。
+fn run(init: std.process.Init, out: *std.Io.Writer, in: *std.Io.Reader) !u8 {
+    const root = try buildCli(.{
+        .allocator = init.arena.allocator(),
+        .io = init.io,
+        .writer = out,
+        .reader = in,
+    });
+    defer root.deinit();
+
+    var state: CliState = .{};
+    var args_iter = init.minimal.args.iterate();
+    root.execute(&args_iter, .{ .data = &state }) catch |err| {
+        if (isUsageError(err)) return 2;
+        try out.print("error: internal: {t}\n", .{err});
+        return 1;
     };
-    defer parsed.deinit();
+    return state.exit_code;
+}
 
-    if (parsed.args.version != 0) {
-        try printVersion(out);
-        return 0;
-    }
-    if (parsed.args.help != 0 and parsed.positionals[0].len != 0) {
-        const options: CliOptions = .{
-            .config_path = parsed.args.config orelse nodeforge.config.default_path,
-            .catalog_path = parsed.args.catalog orelse nodeforge.catalog_store.default_path,
-            .output_json = false,
-            .positionals = parsed.positionals[0],
-        };
-        return dispatchHelp(options, out);
-    }
-    if (parsed.args.help != 0 or parsed.positionals[0].len == 0) {
-        try printHelp(out);
-        return 0;
-    }
-    const output_json = if (parsed.args.output) |value| blk: {
-        if (!std.mem.eql(u8, value, "json")) {
-            try out.print("ERROR unsupported output format: {s}\n", .{value});
-            return 2;
-        }
-        break :blk true;
-    } else false;
+/// 声明完整 `nodeforge` 命令树。
+/// `-v/--version` 仅属于根命令；业务参数只声明在实际读取它们的叶子命令上，避免无效 flags。
+fn buildCli(init_options: zli.InitOptions) !*zli.Command {
+    const root = try zli.Command.init(init_options, .{
+        .name = "nodeforge",
+        .description = "NodeForge administration CLI",
+        .version = semantic_version,
+        .usage = "nodeforge [-v|--version] <command> [options]",
+        .help = "Manage and inspect the local NodeForge daemon, startup configuration, and catalog.",
+    }, showRootHelp);
 
-    const options: CliOptions = .{
-        .config_path = parsed.args.config orelse nodeforge.config.default_path,
-        .catalog_path = parsed.args.catalog orelse nodeforge.catalog_store.default_path,
-        .output_json = output_json,
-        .positionals = parsed.positionals[0],
+    try root.addFlags(&.{
+        .{
+            .name = "version",
+            .shortcut = "v",
+            .description = "Show version and exit",
+            .type = .Bool,
+            .default_value = .{ .Bool = false },
+        },
+    });
+
+    const status = try zli.Command.init(init_options, .{
+        .name = "status",
+        .description = "Show daemon status",
+        .help = "Show detailed checks for the local daemon and configured HTTP service address.",
+    }, statusHandler);
+    try addConfigPathFlag(status);
+    try addOutputFlag(status);
+    try addDebugFlag(status);
+    const check = try zli.Command.init(init_options, .{
+        .name = "check",
+        .description = "Run health checks and set the exit code",
+        .help = "Print a concise health result and return a machine-readable exit code.",
+    }, checkHandler);
+    try addConfigPathFlag(check);
+    try addOutputFlag(check);
+    try addDebugFlag(check);
+
+    const config = try zli.Command.init(init_options, .{
+        .name = "config",
+        .description = "Validate or manage startup configuration",
+        .usage = "nodeforge config <command> [options]",
+        .help = "Manage startup configuration files. Changes are offline operations; restart nodeforged to load them.",
+    }, showCurrentHelp);
+    const config_validate = try zli.Command.init(init_options, .{
+        .name = "validate",
+        .description = "Validate startup config and catalog relationships",
+        .help = "Validate one config file together with one catalog file without modifying either file.",
+    }, configValidateHandler);
+    try addConfigPathFlag(config_validate);
+    try addCatalogPathFlag(config_validate);
+    try addOutputFlag(config_validate);
+    try addDebugFlag(config_validate);
+    const config_export = try zli.Command.init(init_options, .{
+        .name = "export",
+        .description = "Write the normalized startup config JSON to stdout",
+        .help = "Always writes normalized JSON to stdout; redirect it to create a file.",
+    }, configExportHandler);
+    try addConfigPathFlag(config_export);
+    try addDebugFlag(config_export);
+    try config.addCommands(&.{
+        config_validate,
+        config_export,
+        try configImportCommand(init_options),
+    });
+
+    const catalog = try zli.Command.init(init_options, .{
+        .name = "catalog",
+        .description = "Validate or inspect the nodeforged catalog",
+        .usage = "nodeforge catalog <command> [options]",
+        .help = "Inspect and validate local catalog files. M0 does not modify catalog contents.",
+    }, showCurrentHelp);
+    const catalog_validate = try zli.Command.init(init_options, .{
+        .name = "validate",
+        .description = "Validate catalog objects and config relationships",
+        .help = "Validate one catalog file against one startup configuration without modifying either file.",
+    }, catalogValidateHandler);
+    try addConfigPathFlag(catalog_validate);
+    try addCatalogPathFlag(catalog_validate);
+    try addOutputFlag(catalog_validate);
+    try addDebugFlag(catalog_validate);
+    const catalog_export = try zli.Command.init(init_options, .{
+        .name = "export",
+        .description = "Write the normalized catalog JSON to stdout",
+        .help = "Always writes normalized JSON to stdout; a missing catalog is exported as an empty catalog.",
+    }, catalogExportHandler);
+    try addCatalogPathFlag(catalog_export);
+    try addDebugFlag(catalog_export);
+    try catalog.addCommands(&.{
+        catalog_validate,
+        catalog_export,
+    });
+
+    try root.addCommands(&.{
+        status,
+        check,
+        config,
+        catalog,
+    });
+    return root;
+}
+
+/// 构建带必填 `source` 位置参数的 `config import` 命令。
+fn configImportCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{
+        .name = "import",
+        .description = "Validate and install a startup config",
+        .help = "Validate and atomically replace a config file; restart nodeforged to load the change.",
+    }, configImportHandler);
+    try addConfigPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
+    try command.addPositionalArg(.{
+        .name = "source",
+        .description = "Source config JSON path",
+        .required = true,
+    });
+    return command;
+}
+
+/// 根命令 handler：处理顶层 `--version`，否则显示根命令帮助。
+fn showRootHelp(ctx: zli.CommandContext) !void {
+    if (try showVersionIfRequested(ctx)) return;
+    try ctx.command.printHelp();
+}
+
+/// 资源级命令默认 handler：显示当前层帮助。
+fn showCurrentHelp(ctx: zli.CommandContext) !void {
+    try ctx.command.printHelp();
+}
+
+/// 执行详细状态查询，并把探测结果保存为进程退出码。
+fn statusHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    setExitCode(ctx, try statusCommand(ctx.io, ctx.allocator, ctx.flag("config", []const u8), output_json, debug, "status", ctx.writer));
+}
+
+/// 执行简洁健康检查，并把结果保存为适合自动化判断的退出码。
+fn checkHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    setExitCode(ctx, try statusCommand(ctx.io, ctx.allocator, ctx.flag("config", []const u8), output_json, debug, "check", ctx.writer));
+}
+
+/// 加载并联合校验启动配置与 catalog，不修改任何文件。
+fn configValidateHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    const config_path = ctx.flag("config", []const u8);
+    const catalog_path = ctx.flag("catalog", []const u8);
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
     };
-    return dispatch(io, allocator, options, out);
+    defer parsed_config.deinit();
+    var parsed_catalog = loadCatalogOrEmpty(ctx.io, ctx.allocator, catalog_path, ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_catalog.deinit();
+    nodeforge.config_validate.validate(&parsed_config.value, parsed_catalog.value()) catch |err| {
+        try printValidationError(ctx.writer, "config", config_path, err, debug);
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (output_json)
+        try ctx.writer.print("{{\"ok\":true,\"config\":\"{s}\",\"catalog\":\"{s}\"}}\n", .{ config_path, catalog_path })
+    else
+        try ctx.writer.print("OK config valid  {s}  catalog {s}\n", .{ config_path, catalog_path });
 }
 
-fn dispatchHelp(options: CliOptions, out: *std.Io.Writer) !u8 {
-    const command = options.positionals[0];
-    if (std.mem.eql(u8, command, "status") or
-        std.mem.eql(u8, command, "check"))
-        return statusHelp(out);
-    if (std.mem.eql(u8, command, "config"))
-        return configHelp(out);
-    if (std.mem.eql(u8, command, "catalog"))
-        return catalogHelp(out);
-    try printHelp(out);
-    return 0;
+/// 加载启动配置并将规范化 JSON 写到 stdout。
+fn configExportHandler(ctx: zli.CommandContext) !void {
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_config.deinit();
+    const bytes = try nodeforge.config_store.render(ctx.allocator, &parsed_config.value);
+    defer ctx.allocator.free(bytes);
+    try ctx.writer.writeAll(bytes);
 }
 
-/// 分发 M0 已实现命令。
-/// 这里故意不做通用 command table：M0 命令很少，显式分支更容易发现重复入口。
-fn dispatch(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    options: CliOptions,
-    out: *std.Io.Writer,
-) !u8 {
-    const command = options.positionals[0];
-    if (isHelp(command)) {
-        try printHelp(out);
-        return 0;
-    }
-    if (isVersion(command)) {
-        try printVersion(out);
-        return 0;
-    }
-    if (std.mem.eql(u8, command, "status"))
-        return statusCommand(io, allocator, options, "status", out);
-    if (std.mem.eql(u8, command, "check"))
-        return statusCommand(io, allocator, options, "check", out);
-    if (std.mem.eql(u8, command, "config"))
-        return configCommand(io, allocator, options, options.positionals[1..], out);
-    if (std.mem.eql(u8, command, "catalog"))
-        return catalogCommand(io, allocator, options, options.positionals[1..], out);
-
-    try out.print("ERROR unknown command: {s}\n\n", .{command});
-    try printHelp(out);
-    return 2;
+/// 校验源配置后原子写入 `--config` 指定的目标路径。
+fn configImportHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    const config_path = ctx.flag("config", []const u8);
+    const source = ctx.getArg("source") orelse unreachable;
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, source, ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_config.deinit();
+    nodeforge.config_validate.validateConfig(&parsed_config.value) catch |err| {
+        try printValidationError(ctx.writer, "config", source, err, debug);
+        setExitCode(ctx, 1);
+        return;
+    };
+    try nodeforge.config_store.save(ctx.io, ctx.allocator, config_path, &parsed_config.value);
+    if (output_json)
+        try ctx.writer.print("{{\"ok\":true,\"source\":\"{s}\",\"destination\":\"{s}\"}}\n", .{ source, config_path })
+    else
+        try ctx.writer.print("OK config imported  {s} -> {s}\n", .{ source, config_path });
 }
 
-fn configCommand(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    options: CliOptions,
-    args: []const []const u8,
-    out: *std.Io.Writer,
-) !u8 {
-    if (args.len == 0 or isHelp(args[0])) return configHelp(out);
-    if (containsHelp(args[1..])) return configHelp(out);
-    const action = args[0];
-    if (std.mem.eql(u8, action, "validate")) {
-        var parsed_config = loadConfig(io, allocator, options.config_path, out) orelse return 1;
-        defer parsed_config.deinit();
-        var parsed_catalog = loadCatalogOrEmpty(io, allocator, options.catalog_path, out) orelse return 1;
-        defer parsed_catalog.deinit();
-        nodeforge.config_validate.validate(&parsed_config.value, parsed_catalog.value()) catch |err| {
-            try out.print("ERROR config invalid: {t}\n", .{err});
-            return 1;
-        };
-        if (options.output_json)
-            try out.print("{{\"ok\":true,\"config\":\"{s}\",\"catalog\":\"{s}\"}}\n", .{ options.config_path, options.catalog_path })
-        else
-            try out.print("OK config valid  {s}  catalog {s}\n", .{ options.config_path, options.catalog_path });
-        return 0;
-    }
-    if (std.mem.eql(u8, action, "export")) {
-        var parsed_config = loadConfig(io, allocator, options.config_path, out) orelse return 1;
-        defer parsed_config.deinit();
-        const bytes = try nodeforge.config_store.render(allocator, &parsed_config.value);
-        defer allocator.free(bytes);
-        try out.writeAll(bytes);
-        return 0;
-    }
-    if (std.mem.eql(u8, action, "import")) {
-        if (args.len < 2) return commandError(out, "config import requires a source path");
-        var parsed_config = loadConfig(io, allocator, args[1], out) orelse return 1;
-        defer parsed_config.deinit();
-        try nodeforge.config_validate.validateConfig(&parsed_config.value);
-        try nodeforge.config_store.save(io, allocator, options.config_path, &parsed_config.value);
-        if (options.output_json)
-            try out.print("{{\"ok\":true,\"source\":\"{s}\",\"destination\":\"{s}\"}}\n", .{ args[1], options.config_path })
-        else
-            try out.print("OK config imported  {s} -> {s}\n", .{ args[1], options.config_path });
-        return 0;
-    }
-    return commandError(out, "unknown config action");
+/// 加载配置和 catalog 并校验 catalog 对象及跨文件关系。
+fn catalogValidateHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    const config_path = ctx.flag("config", []const u8);
+    const catalog_path = ctx.flag("catalog", []const u8);
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_config.deinit();
+    var parsed_catalog = loadCatalogOrEmpty(ctx.io, ctx.allocator, catalog_path, ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_catalog.deinit();
+    nodeforge.config_validate.validateCatalog(&parsed_config.value, parsed_catalog.value()) catch |err| {
+        try printValidationError(ctx.writer, "catalog", catalog_path, err, debug);
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (output_json)
+        try ctx.writer.print("{{\"ok\":true,\"catalog\":\"{s}\"}}\n", .{catalog_path})
+    else
+        try ctx.writer.print("OK catalog valid  {s}\n", .{catalog_path});
 }
 
-fn catalogCommand(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    options: CliOptions,
-    args: []const []const u8,
-    out: *std.Io.Writer,
-) !u8 {
-    if (args.len == 0 or isHelp(args[0])) return catalogHelp(out);
-    if (containsHelp(args[1..])) return catalogHelp(out);
-    const action = args[0];
-    if (std.mem.eql(u8, action, "validate")) {
-        var parsed_config = loadConfig(io, allocator, options.config_path, out) orelse return 1;
-        defer parsed_config.deinit();
-        var parsed_catalog = loadCatalogOrEmpty(io, allocator, options.catalog_path, out) orelse return 1;
-        defer parsed_catalog.deinit();
-        nodeforge.config_validate.validateCatalog(&parsed_config.value, parsed_catalog.value()) catch |err| {
-            try out.print("ERROR catalog invalid: {t}\n", .{err});
-            return 1;
-        };
-        if (options.output_json)
-            try out.print("{{\"ok\":true,\"catalog\":\"{s}\"}}\n", .{options.catalog_path})
-        else
-            try out.print("OK catalog valid  {s}\n", .{options.catalog_path});
-        return 0;
-    }
-    if (std.mem.eql(u8, action, "export")) {
-        var parsed_catalog = loadCatalogOrEmpty(io, allocator, options.catalog_path, out) orelse return 1;
-        defer parsed_catalog.deinit();
-        const bytes = try nodeforge.catalog_store.render(allocator, parsed_catalog.value());
-        defer allocator.free(bytes);
-        try out.writeAll(bytes);
-        return 0;
-    }
-    return commandError(out, "unknown catalog action");
+/// 加载 catalog 并将规范化 JSON 写到 stdout；文件缺失时导出空 catalog。
+fn catalogExportHandler(ctx: zli.CommandContext) !void {
+    var parsed_catalog = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_catalog.deinit();
+    const bytes = try nodeforge.catalog_store.render(ctx.allocator, parsed_catalog.value());
+    defer ctx.allocator.free(bytes);
+    try ctx.writer.writeAll(bytes);
 }
 
-/// 执行 `status` 或 `check`。
-///
-/// 二者检查同一组 M0 探针，但输出目的不同：
-/// - `status` 面向人，保留每项详细状态；
-/// - `check` 面向脚本，成功时只输出一行，并通过退出码表达结果。
+/// 读取当前命令的输出格式并校验其值。
+/// 返回 null 表示已输出可读错误并把退出码设为用法错误 2。
+fn outputJsonFromContext(ctx: zli.CommandContext) ?bool {
+    const output = ctx.flag("output", []const u8);
+    const output_json = if (std.mem.eql(u8, output, "json")) true else if (std.mem.eql(u8, output, "human")) false else {
+        ctx.writer.print("error: output: unsupported format '{s}' (expected human or json)\n", .{output}) catch {};
+        setExitCode(ctx, 2);
+        return null;
+    };
+    return output_json;
+}
+
+/// 实现仅属于根命令的 `--version` 提前返回语义。
+fn showVersionIfRequested(ctx: zli.CommandContext) !bool {
+    if (!ctx.flag("version", bool)) return false;
+    try printVersion(ctx.writer);
+    return true;
+}
+
+/// 更新本次 zli 执行共享的最终退出码。
+fn setExitCode(ctx: zli.CommandContext, code: u8) void {
+    ctx.getContextData(CliState).exit_code = code;
+}
+
+/// 为一个命令声明默认 config 路径覆盖参数。
+fn addConfigPathFlag(command: *zli.Command) !void {
+    try command.addFlag(.{
+        .name = "config",
+        .shortcut = "c",
+        .description = "Config JSON path",
+        .type = .String,
+        .default_value = .{ .String = nodeforge.config.default_path },
+    });
+}
+
+/// 为一个命令声明默认 catalog 路径覆盖参数。
+fn addCatalogPathFlag(command: *zli.Command) !void {
+    try command.addFlag(.{
+        .name = "catalog",
+        .shortcut = "C",
+        .description = "Catalog JSON path",
+        .type = .String,
+        .default_value = .{ .String = nodeforge.catalog_store.default_path },
+    });
+}
+
+/// 为支持 human 或 JSON 结果的命令声明输出格式参数。
+fn addOutputFlag(command: *zli.Command) !void {
+    try command.addFlag(.{
+        .name = "output",
+        .shortcut = "o",
+        .description = "Output format: human or json",
+        .type = .String,
+        .default_value = .{ .String = "human" },
+    });
+}
+
+/// 为可失败的本地命令声明简短的诊断输出开关。
+fn addDebugFlag(command: *zli.Command) !void {
+    try command.addFlag(.{
+        .name = "debug",
+        .shortcut = "d",
+        .description = "Show diagnostic error details",
+        .type = .Bool,
+        .default_value = .{ .Bool = false },
+    });
+}
+
+/// 执行 `status` 或 `check`。二者使用同一组探针，通过输出详细度区分用途。
+/// 管理探针固定连接本机 127.0.0.1；HTTP 数据面探针连接配置中的 `server_ip`。
 fn statusCommand(
     io: std.Io,
     allocator: std.mem.Allocator,
-    options: CliOptions,
+    config_path: []const u8,
+    output_json: bool,
+    debug: bool,
     action: []const u8,
     out: *std.Io.Writer,
 ) !u8 {
-    if (!std.mem.eql(u8, action, "status") and !std.mem.eql(u8, action, "check"))
-        return commandError(out, "unknown status action");
-
-    var parsed_config = loadConfig(io, allocator, options.config_path, out) orelse return 1;
+    var parsed_config = loadConfig(io, allocator, config_path, out, debug) orelse return 1;
     defer parsed_config.deinit();
-    const status = nodeforge.management_client.managementStatus(
-        io,
-        parsed_config.value.server.http_port,
-    );
-    const active_config = nodeforge.management_client.validateActiveConfig(
-        io,
-        parsed_config.value.server.http_port,
-    );
+    const status = nodeforge.management_client.managementStatus(io, parsed_config.value.server.http_port);
+    const active_config = nodeforge.management_client.validateActiveConfig(io, parsed_config.value.server.http_port);
     const health = nodeforge.management_client.healthAt(
         io,
         parsed_config.value.server.server_ip,
         parsed_config.value.server.http_port,
     );
     const ok = status.healthy and active_config.healthy and health.healthy;
-    if (options.output_json) {
+    if (output_json) {
         try out.print(
             "{{\"process\":{s},\"http\":{s},\"management\":{s},\"config\":{s}}}\n",
             .{ jsonBool(status.reachable), jsonBool(health.healthy), jsonBool(status.healthy), jsonBool(active_config.healthy) },
@@ -259,9 +394,9 @@ fn statusCommand(
     }
     if (std.mem.eql(u8, action, "check")) {
         if (ok) {
-            try out.print("OK nodeforge checks passed\n", .{});
+            try out.writeAll("OK nodeforge checks passed\n");
         } else {
-            try out.print("FAIL nodeforge checks failed\n", .{});
+            try out.writeAll("FAIL nodeforge checks failed\n");
             try printCheckLine(out, "Process", status.reachable);
             try printCheckLine(out, "HTTP", health.healthy);
             try printCheckLine(out, "Management", status.healthy);
@@ -270,7 +405,7 @@ fn statusCommand(
         return if (ok) 0 else 1;
     }
 
-    try out.print("NodeForge status\n", .{});
+    try out.writeAll("NodeForge status\n");
     try out.print("  Process     {s}\n", .{if (status.reachable) "OK reachable" else "FAIL unreachable"});
     try out.print("  HTTP        {s} http://{s}:{d}\n", .{
         if (health.healthy) "OK healthy" else "FAIL unhealthy",
@@ -285,185 +420,108 @@ fn statusCommand(
     return if (ok) 0 else 1;
 }
 
+/// 封装“已解析 catalog”或“文件缺失时的空 catalog”，统一生命周期管理。
 const CatalogLoad = struct {
+    /// 文件存在时持有 JSON parser 分配的所有权。
     parsed: ?std.json.Parsed(nodeforge.model.Catalog),
+    /// 文件缺失时提供只读空值。
     empty: nodeforge.model.Catalog,
 
+    /// 返回当前有效 catalog，不转移所有权。
     fn value(self: *const CatalogLoad) *const nodeforge.model.Catalog {
         if (self.parsed) |*parsed| return &parsed.value;
         return &self.empty;
     }
 
+    /// 仅在持有已解析 catalog 时释放 parser 分配。
     fn deinit(self: *CatalogLoad) void {
         if (self.parsed) |*parsed| parsed.deinit();
     }
 };
 
-/// 读取 catalog；文件不存在时返回空 catalog。
-/// M0 允许先只验证启动配置和服务骨架，catalog 可由后续导入/构建流程逐步生成。
+/// 加载 catalog；文件不存在按 M0 初始空 catalog 处理，其他错误输出后返回 null。
 fn loadCatalogOrEmpty(
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     out: *std.Io.Writer,
+    debug: bool,
 ) ?CatalogLoad {
     const parsed = nodeforge.catalog_store.load(io, allocator, path) catch |err| switch (err) {
         error.FileNotFound => return .{ .parsed = null, .empty = nodeforge.catalog_store.empty() },
         else => {
-            out.print("ERROR catalog load failed: {t}  {s}\n", .{ err, path }) catch {};
+            printLoadError(out, "catalog", path, err, debug) catch {};
             return null;
         },
     };
     return .{ .parsed = parsed, .empty = nodeforge.catalog_store.empty() };
 }
 
+/// 加载并执行单文件配置校验；失败时负责输出错误并释放已分配内容。
 fn loadConfig(
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     out: *std.Io.Writer,
+    debug: bool,
 ) ?std.json.Parsed(nodeforge.model.AppConfig) {
     var parsed = nodeforge.config.load(io, allocator, path) catch |err| {
-        out.print("ERROR config load failed: {t}  {s}\n", .{ err, path }) catch {};
+        printLoadError(out, "config", path, err, debug) catch {};
         return null;
     };
     nodeforge.config_validate.validateConfig(&parsed.value) catch |err| {
-        out.print("ERROR config invalid: {t}  {s}\n", .{ err, path }) catch {};
+        printValidationError(out, "config", path, err, debug) catch {};
         parsed.deinit();
         return null;
     };
     return parsed;
 }
 
-fn commandError(out: *std.Io.Writer, message: []const u8) !u8 {
-    try out.print("ERROR {s}\n", .{message});
-    return 2;
+/// 输出简短的文件加载错误；debug 模式追加底层 Zig 错误标签。
+fn printLoadError(out: *std.Io.Writer, subject: []const u8, path: []const u8, err: anyerror, debug: bool) !void {
+    if (err == error.FileNotFound)
+        try out.print("error: {s}: file not found: {s}\n", .{ subject, path })
+    else
+        try out.print("error: {s}: cannot load: {s}\n", .{ subject, path });
+    if (debug) try out.print("debug: {s}: load cause={t}\n", .{ subject, err });
 }
 
-fn isHelp(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "--help") or
-        std.mem.eql(u8, arg, "-h");
+/// 输出简短的配置或 catalog 校验错误；debug 模式追加校验器错误标签。
+fn printValidationError(out: *std.Io.Writer, subject: []const u8, path: []const u8, err: anyerror, debug: bool) !void {
+    try out.print("error: {s}: validation failed: {s}\n", .{ subject, path });
+    if (debug) try out.print("debug: {s}: validation cause={t}\n", .{ subject, err });
 }
 
-fn isVersion(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "--version") or
-        std.mem.eql(u8, arg, "-v");
+/// 判断错误是否属于用户可修正的 CLI 语法错误，用于稳定映射退出码 2。
+fn isUsageError(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidBooleanValue,
+        error.InvalidFlagValue,
+        error.InvalidFlagNegation,
+        error.InvalidFlagShortcut,
+        error.InvalidPositionalArgOrder,
+        error.MissingArgs,
+        error.MissingFlagValue,
+        error.TooManyArgs,
+        error.UnknownCommand,
+        error.UnknownFlag,
+        error.CommandDeprecated,
+        => true,
+        else => false,
+    };
 }
 
-fn containsHelp(args: []const []const u8) bool {
-    for (args) |arg| if (isHelp(arg)) return true;
-    return false;
-}
-
+/// 返回可直接嵌入 JSON 的布尔字面量。
 fn jsonBool(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
+/// 输出一行对齐的 human 健康检查结果。
 fn printCheckLine(out: *std.Io.Writer, label: []const u8, passed: bool) !void {
     try out.print("  {s:<12} {s}\n", .{ label, if (passed) "OK" else "FAIL" });
 }
 
+/// 输出稳定的 CLI 名称与项目版本。
 fn printVersion(out: *std.Io.Writer) !void {
     try out.print("nodeforge {s}\n", .{nodeforge.version.version});
-}
-
-fn printHelp(out: *std.Io.Writer) !void {
-    try out.print(
-        \\NodeForge administration CLI
-        \\
-        \\Usage:
-        \\  nodeforge [options] <command>
-        \\  nodeforge -h|--help
-        \\  nodeforge -v|--version
-        \\
-        \\Options:
-        \\  -h, --help              Show help and exit
-        \\  -v, --version           Show version and exit
-        \\  --config <path>         Override config JSON path [default: {s}]
-        \\  --catalog <path>        Override catalog JSON path [default: {s}]
-        \\  --output json           Machine-readable JSON output
-        \\
-        \\Commands:
-        \\  status                         Show daemon status
-        \\  check                          Run health checks and set exit code
-        \\  config validate|export|import  Validate or manage startup config
-        \\  catalog validate|export        Validate or inspect nodeforged catalog
-        \\  version                        Show version
-        \\  help                           Show this help
-        \\
-        \\Examples:
-        \\  nodeforge status
-        \\  nodeforge --output json status
-        \\  nodeforge config validate
-        \\  nodeforge --config ./config.example.json catalog validate
-        \\
-    , .{ nodeforge.config.default_path, nodeforge.catalog_store.default_path });
-}
-
-fn configHelp(out: *std.Io.Writer) !u8 {
-    try out.writeAll(
-        \\NodeForge config commands
-        \\
-        \\Usage:
-        \\  nodeforge config validate
-        \\  nodeforge config export
-        \\  nodeforge config import <source>
-        \\  nodeforge config -h|--help
-        \\
-        \\Options:
-        \\  --config <path>    Config JSON path
-        \\  --catalog <path>   Catalog JSON path used for relationship validation
-        \\  --output json      Machine-readable output for validate/import
-        \\
-        \\Examples:
-        \\  nodeforge config validate
-        \\  nodeforge --config ./config.example.json config export
-        \\
-    );
-    return 0;
-}
-
-fn catalogHelp(out: *std.Io.Writer) !u8 {
-    try out.writeAll(
-        \\NodeForge catalog commands
-        \\
-        \\Usage:
-        \\  nodeforge catalog validate
-        \\  nodeforge catalog export
-        \\  nodeforge catalog -h|--help
-        \\
-        \\Options:
-        \\  --config <path>    Config JSON path used for relationship validation
-        \\  --catalog <path>   Catalog JSON path
-        \\  --output json      Machine-readable output for validate
-        \\
-        \\Examples:
-        \\  nodeforge catalog validate
-        \\  nodeforge --catalog ./catalog.example.json catalog export
-        \\
-    );
-    return 0;
-}
-
-fn statusHelp(out: *std.Io.Writer) !u8 {
-    try out.writeAll(
-        \\NodeForge status/check commands
-        \\
-        \\Usage:
-        \\  nodeforge status
-        \\  nodeforge check
-        \\  nodeforge status -h|--help
-        \\  nodeforge check -h|--help
-        \\
-        \\Options:
-        \\  --config <path>    Config JSON path; HTTP port and advertised server IP are read from it
-        \\  --output json      Machine-readable result
-        \\
-        \\Examples:
-        \\  nodeforge status
-        \\  nodeforge check
-        \\  nodeforge --output json check
-        \\
-    );
-    return 0;
 }

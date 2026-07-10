@@ -10,6 +10,9 @@
     "asset_root": "/opt/nodeforge/assets",
     "repository_root": "/opt/nodeforge/repos"
   },
+  "logging": {
+    "level": "info"
+  },
   "distros": [
     {
       "name": "rocky",

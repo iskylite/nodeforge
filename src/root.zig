@@ -17,6 +17,7 @@ pub const management_client = @import("http/client.zig");
 pub const management = @import("http/management.zig");
 pub const http_server = @import("http/server.zig");
 pub const observe_error = @import("observe/error.zig");
+pub const observe_log = @import("observe/log.zig");
 
 test {
     _ = model;
@@ -35,4 +36,5 @@ test {
     _ = management;
     _ = http_server;
     _ = observe_error;
+    _ = observe_log;
 }

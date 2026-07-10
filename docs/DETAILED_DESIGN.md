@@ -16,7 +16,7 @@
 - 所有破坏性安装动作必须来自显式认领的 node + install profile。MVP 以 MAC 作为主要节点身份，DHCP client id 和 SN 作为辅助信息。
 - 未知节点默认进入等待/观察态；安全 discovery 或 safe/ephemeral diskless 必须显式配置，未知节点自动安装属于非法配置。
 - diskless 的 kernel、小 initrd、rootfs 必须以 boot bundle 方式校验一致性。
-- CLI 默认输出面向人，所有命令预留 `--output json`；命令解析和帮助信息优先使用成熟开源库，不长期维护手写 parser。启动配置、管理 catalog 和运行态分开：站点配置走 `config.json` 和重启加载；导入/构建/发布产生的 asset、repository、install source、rootfs、initrd、boot bundle 由 `nodeforged` 写入 catalog；运行期高频、批量和观测操作走 CLI/API。
+- CLI 默认输出面向人；只有需要 human/JSON 两种结果的命令声明 `--output json`。命令解析和帮助信息优先使用成熟开源库，不长期维护手写 parser。M0 中站点配置走 `config.json` 和重启加载，catalog 只读；M1+ 才由 `nodeforged` 写入导入/构建/发布产生的 asset、repository、install source、rootfs、initrd、boot bundle，并加入运行期高频、批量和观测 CLI/API。
 - 网络协议明确只支持 IPv4；配置、监听地址、DHCP option 和 initrd 网络逻辑均不接受 IPv6。
 - 密码直接以明文字符串配置和存储，包括系统用户密码（`users.password`）和 IPMI 凭据（`oob.ipmi.password`）；MVP 不引入 SecretRef、外部 secret store、临时密码状态或轮换流程。发行版 adapter 在渲染 answer file 时按安装器要求临时生成 hash，配置事实源仍只保留明文。
 
@@ -24,7 +24,7 @@
 
 | 阶段 | 名称 | 前置 | 核心结果 |
 | --- | --- | --- | --- |
-| M0 | 项目骨架、单 HTTP listener 和本机管理接口 | 无 | `nodeforged` / `nodeforge` 可启动，配置和端口可自检 |
+| M0 | 项目骨架、单 HTTP listener 和管理接口 | 无 | `nodeforged` / `nodeforge` 可启动，配置和端口可自检 |
 | M1 | TFTP 闭环 | M0 | 标准 TFTP client 可下载 x86_64/aarch64 启动文件 |
 | M2 | DHCP + PXE 闭环 | M0、M1 | 节点获得 lease 和正确 bootfile，并进入 bootloader |
 | M3 | HTTP 资产、ISO 仓库和事件接口 | M0、资产模型 | 节点可获取配置/answer/rootfs/ISO repo，并上报事件 |
@@ -56,9 +56,9 @@
 
 代码结构按"少模块、清边界、按需拆文件"设计。MVP 不需要一开始把所有未来目录铺开；先保证主链路短、依赖方向清楚，再在文件变大或职责变多时拆分。
 
-## 3. M0：项目骨架、单 HTTP listener 和本机管理接口
+## 3. M0：项目骨架、单 HTTP listener 和管理接口
 
-M0 目标是建立项目基础架构，实现可启动的守护进程和本机管理接口。当前已实现:
+M0 目标是建立项目基础架构，实现可启动的守护进程和管理接口；官方 CLI 固定从本机访问。当前已实现:
 
 ### 3.1 已完成的代码模块
 
@@ -76,7 +76,8 @@ M0 目标是建立项目基础架构，实现可启动的守护进程和本机�
 - `src/catalog/store.zig`: 目录管理和资产跟踪，支持导入/导出操作
 - `src/http/server.zig`: HTTP 服务器实现，包含请求处理和路由
 - `src/http/client.zig`: HTTP 客户端用于状态探测
-- `src/http/management.zig`: 管理接口实现
+- `src/http/server.zig`: HTTP listener 和管理路由实现
+- `src/http/management.zig`: `nodeforge` CLI 本机管理地址约定
 - `src/state/runtime.zig`: 运行状态管理
 - `src/state/events.zig`: 事件记录和追踪
 - `src/observe/error.zig`: 错误处理和响应格式化
@@ -177,8 +178,8 @@ cli
 | 项目 | MVP 约束 | 允许扩展时机 |
 | --- | --- | --- |
 | 数据模型 | `AppConfig` 表达启动/策略配置，`Catalog` 表达导入/构建/发布得到的管理目录，`RuntimeState` 表达运行态 | 配置迁移或 Web API 需要稳定 schema 时再拆 schema 包 |
-| 存储 | `/opt/nodeforge/config/config.json` + `/opt/nodeforge/catalog/catalog.json` + runtime/events；站点结构性配置修改后重启生效；DHCP discovery 策略和 catalog 变更支持运行期在线切换 | 并发写入、查询性能或多实例需求出现后再考虑数据库 |
-| 管理接口 | 复用唯一 HTTP listener；CLI 固定访问 `127.0.0.1:<http.port>`；管理路由不做 loopback peer 检查；不单设 `management_port` | MVP 不做远程管理 |
+| 存储 | M0 使用 `/opt/nodeforge/config/config.json` + `/opt/nodeforge/catalog/catalog.json`；站点配置修改后重启生效。M1+ 才支持 DHCP discovery 策略和 catalog 变更的运行期在线切换 | 并发写入、查询性能或多实例需求出现后再考虑数据库 |
+| 管理接口 | 复用唯一 HTTP listener；路由接受所有可达连接；CLI 固定访问 `127.0.0.1:<http.port>`，只管理同机服务；不单设 `management_port` | M0 不提供安全的远程管理客户端 |
 | 发行版 adapter | `ubuntu.zig`、`kickstart.zig` 两个文件 | 版本差异明显增多后再拆能力表文件 |
 | 带外管理 | 只保存 IPMI 信息，不实现控制动作 | 明确要做电源控制/启动设备控制时再加执行模块 |
 | 补充包和后处理 | M4/M5 实现强类型步骤和最小 runner；M7 补齐高级步骤与诊断 | 明确需要常驻任务后再考虑 agent |
@@ -193,10 +194,11 @@ cli
 
 ### 2.2 核心调用路径
 
-MVP 只保留三条主要业务路径：
+MVP 的目标业务路径如下；其中 M0 当前只实现 CLI 本地文件操作和 HTTP 管理路由，DHCP/TFTP/
+HTTP 数据路径按后续阶段交付：
 
 ```text
-CLI / 127.0.0.1 management HTTP
+M1+ CLI / 127.0.0.1 management HTTP
   -> runtime change / batch import / config validate / catalog operation
   -> nodeforged 校验并写入 config/catalog/runtime
   -> state/event
@@ -217,7 +219,7 @@ HTTP/TFTP request
 关键约束：
 
 - `boot.resolver` 返回明确的 `BootDecision`，例如 `wait`、`deny`、`discovery`、`install`、`diskless`，并携带 bootfile、profile、原因。
-- DHCP、TFTP、HTTP 数据路由不直接修改启动配置或 catalog；运行期高频变更和 catalog 操作才通过 CLI/本机 management HTTP 请求 `nodeforged` 执行。站点配置由 `config.json` 表达，重启服务后加载生效；导入、构建、发布产生的对象由 `nodeforged` 写入 catalog。
+- DHCP、TFTP、HTTP 数据路由不直接修改启动配置或 catalog。M0 的 `config import` 是 CLI 直接执行的离线原子写入，完成后需重启服务加载；M0 catalog 仅支持读取、导出和校验。M1+ 的运行期高频变更与 catalog 导入/构建/发布才通过 CLI 请求本机 `nodeforged` 执行，并由 daemon 写入。
 - 业务函数接收已经校验过的 `AppConfig` 和 `Catalog` 快照，避免服务处理过程中读取半更新配置或目录。
 - 所有对外错误转换为统一 `NodeForgeError`，CLI 和 API 只负责格式化。
 
@@ -259,8 +261,8 @@ MVP 不把所有对象都塞进单一手写配置文件，而是分为三类事�
 
 | 类型 | 文件 | 主要内容 | 修改入口 |
 | --- | --- | --- | --- |
-| 启动/策略配置 | `/opt/nodeforge/config/config.json` | server、dhcp/tftp/http 站点配置、安全默认值、profile、provisioning bundle | 手工编辑 + `config validate`，或 `config apply`；结构性配置重启生效，DHCP discovery 策略支持在线切换 |
-| 管理 catalog | `/opt/nodeforge/catalog/catalog.json` | asset、repository、install source、rootfs、initrd、boot bundle | CLI/API 发起请求，`nodeforged` import/build/package/publish 并写入 |
+| 启动/策略配置 | `/opt/nodeforge/config/config.json` | M0 为 server/http 启动配置；M1+ 扩展 dhcp/tftp、安全默认值、profile、provisioning bundle | M0 手工编辑 + `config validate` 或离线 `config import`，重启生效；M1+ 增加 `config apply` 和 DHCP discovery 在线切换 |
+| 管理 catalog | `/opt/nodeforge/catalog/catalog.json` | asset、repository、install source、rootfs、initrd、boot bundle | M0 只读校验/导出；M1+ CLI/API 请求 `nodeforged` import/build/package/publish 并写入 |
 | 运行态 | `/opt/nodeforge/state/runtime.json`、`/opt/nodeforge/logs/events.jsonl` | lease、unknown client、session、node status、事件 | 服务运行时更新 |
 
 MVP 不读取 YAML 配置文件；如果后续需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。catalog 是 `nodeforged` 的内部持久化文件，CLI 不直接写。配置和 catalog 明显变大后再评估拆分或引入数据库。
@@ -271,6 +273,7 @@ const AppConfig = struct {
     dhcp: DhcpConfig,
     tftp: TftpConfig,
     http: HttpConfig,
+    logging: LoggingConfig,
     nodes: []NodeConfig,
     distros: []DistroConfig,
     profiles: []ProfileConfig,
@@ -661,7 +664,7 @@ const NodeStatus = struct {
 
 ## 5. M0 验收标准与验证结果
 
-> 实现状态：M0 代码已按单 HTTP listener、config/catalog/runtime 分层和 `zig-clap 0.12.0`
+> 实现状态：M0 代码已按单 HTTP listener、config/catalog/runtime 分层和 `zli v5.1.2`
 > CLI 完成收敛。macOS 已完成构建、单元测试、管理 API、CLI 状态检查、
 > config/catalog 校验与导出、配置导入、运行中端口占用检查和管理路由。
 > Rocky 9.7 aarch64 可通过 `ssh root@r97n0` 做 systemd、端口、CLI 和 HTTP 实机验证；虚拟机缺包时可用 `dnf`/`yum` 安装验证工具。
@@ -670,9 +673,9 @@ const NodeStatus = struct {
 
 建立可运行骨架：
 
-- `nodeforged` 可启动、加载配置，并由唯一 HTTP listener 提供管理和 PXE 数据接口。
+- `nodeforged` 可启动、加载配置，并由唯一 HTTP listener 提供 `/healthz` 和管理接口；M3 再在同一 listener 接入 PXE 数据路由。
 - `nodeforge` CLI 固定通过 `127.0.0.1:<http.port>` 连接管理接口。
-- 启动配置和 catalog 可校验、导入、导出、原子写回。
+- 启动配置和 catalog 可校验、导出；启动配置可由 CLI 离线导入并原子写回，catalog 写入留待 M1+。
 - 日志、错误、输出格式和 CLI 帮助信息成型。
 - 启动前可检查 IPv4 监听地址和端口占用；目录权限、资产可读性、TFTP/DHCP 检查随对应阶段补齐。
 
@@ -680,7 +683,7 @@ const NodeStatus = struct {
 
 | 模块 | 任务 |
 | --- | --- |
-| `main.zig` | `nodeforge` CLI 入口、zig-clap 集成、命令分发和 human/json 输出格式 |
+| `main.zig` | `nodeforge` CLI 入口、zli 声明式命令树和 human/json 输出格式 |
 | `nodeforged.zig` | 守护进程入口，自动加载默认 config/catalog，处理 `--check`/`--check-config` |
 | `app.zig` | 初始化 allocator、config、catalog、state、统一 HTTP、日志 |
 | `model.zig` | 定义核心结构，包括 config、catalog、runtime、node、profile、asset、repository、install source、rootfs、boot bundle 关系 |
@@ -690,19 +693,19 @@ const NodeStatus = struct {
 | `config/validate.zig` | 实现基础校验和关系一致性校验 |
 | `config/store.zig` | 原子写回启动配置 JSON |
 | `http/server.zig` | 单 HTTP listener 生命周期、路由分发和 JSON 错误 |
-| `http/management.zig` | 管理路由定义 |
+| `http/management.zig` | `nodeforge` CLI 固定访问 `127.0.0.1` 的客户端约定 |
 | `observe/error.zig` | 统一错误类型和用户提示 |
 
 ### 4.3 统一 HTTP 与管理接口
 
 MVP 不实现第二套 RPC，也不再拆成 management listener 与 PXE listener。一个 HTTP server 实现复用路由、JSON 错误、状态和生命周期，只启动一个 IPv4 listener：
 
-- HTTP listener 固定绑定 `0.0.0.0:http.port`，提供 boot config、answer、repo/rootfs 下载、节点事件和管理 API。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。
+- HTTP listener 固定绑定 `0.0.0.0:http.port`。M0 只提供 `/healthz` 和管理 API；M3 将在同一 listener 提供 boot config、answer、repo/rootfs 下载和节点事件。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。
 - `server.bind_interface` 可选，用于表达 HTTP/DHCP/TFTP 共同归属的服务网卡。M0 只校验字段格式；M1/M2 接入 TFTP/DHCP 后必须校验该网卡存在，并拥有或可到达 `server.server_ip` 所在网段。
 - `nodeforge` CLI 管理客户端固定连接 `127.0.0.1:http.port`，不提供远程管理地址配置项。
 - MVP 不配置独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`；端口冲突时修改 `config.json` 并重启。
-- 管理路由与 PXE 数据路由逻辑分区；管理路由不做 loopback peer 检查——安全边界是网络隔离（PXE 管理网段本身是受控网络），CLI 固定连接 `127.0.0.1` 即可。
-- MVP 不做远程管理和管理鉴权；未来若开放远程管理，必须另行设计 TLS、鉴权和审计。
+- 管理路由与未来 PXE 数据路由逻辑分区；服务端不做 peer 来源检查，所有能到达该 listener 的 IPv4 客户端都可调用管理路由。
+- `nodeforge` CLI 固定连接 `127.0.0.1`，不提供远程 endpoint，只支持管理同机 `nodeforged`。MVP 不提供管理鉴权和 TLS；将 HTTP 路由作为正式远程管理接口前，必须另行设计 TLS、鉴权和审计。
 
 ```json
 {
@@ -736,15 +739,21 @@ MVP 不实现第二套 RPC，也不再拆成 management listener 与 PXE listene
 
 ### 4.4 CLI 命令
 
-CLI 解析、帮助信息、参数类型和默认值优先使用成熟开源库。当前项目声明 `minimum_zig_version = "0.16.0"`；M0 采用固定的 `zig-clap 0.12.0` 作为首选 CLI 解析层。该 release 面向 Zig 0.16 系列并已验证可在本项目 Zig 0.16.0 环境编译测试通过。不要直接跟随 `zig-clap` main 分支，因为 main 当前追 Zig 0.17-dev。若后续发现 `zig-clap` 无法满足嵌套帮助或错误输出要求，备选为支持 Zig 0.16.0 的 `zig-args`；再不满足时才保留极薄自研 command table。无论选择哪个库，都只负责 CLI 语法和帮助，不承载复杂业务配置模型。
+CLI 解析、帮助信息、参数类型和默认值使用 vendored `zli v5.1.2`。该 release 的 `minimum_zig_version` 为 `0.16.0`，与本项目一致。根命令、资源命令、动作命令、命令局部 flags 和位置参数组成唯一命令树；zli 从这棵树执行解析、校验和分级帮助，不再保留独立的 `dispatchHelp` 或手写 Usage/Options/Commands 清单。NodeForge 在 `vendor/zli/NODEFORGE_PATCHES.md` 记录少量上游兼容修补，并用 `tests/cli.sh` 固定命令局部参数不会泄漏到无关子命令。zli 只负责 CLI 语法和帮助，不承载复杂业务配置模型。
+
+zli 提供 spinner，但 M0 不启用。只有后续耗时交互命令同时处于 TTY、human 输出且存在明显等待时才可启动；`--output json`、重定向、管道和 systemd 场景禁止输出动画或终端控制序列。
+
+帮助和版本属于 CLI 通用控制能力，只提供 `-h/--help` 与 `-v/--version` 参数，不定义 `help`、`version` 同名子命令。`-v/--version` 只属于顶层 `nodeforge`；`-h/--help` 由每一级命令提供。`--config`、`--catalog`、`--output` 不作为全局参数，只挂在实际读取它们的叶子命令上，必须写在该命令之后。子命令集合只保留 status、check、config、catalog 等业务入口，避免同一操作存在两套写法。
+
+M0 短参数固定为：`nodeforge` 根命令 `-v`，叶子命令按需使用 `-c`（config）、`-C`（catalog）、`-o`（output）、`-d`（debug）；`-h` 由 zli 自动提供。`nodeforged` 为无子命令入口，使用 `-v/-c/-C/-d/-k/-K`（version/config/catalog/debug/check/check-config）。帮助页只展示用途、参数和默认值，不内嵌长示例。
 
 CLI 与配置文件分工：
 
-- 站点启动配置、默认策略、profile 和 provisioning bundle 通过 `config.json` 或 `config apply` 表达；结构性配置修改后重启生效，DHCP discovery 策略支持在线切换。
-- asset、repository、install source、rootfs、initrd、boot bundle 通过 CLI/API 发起导入、构建、校验和发布请求，由 `nodeforged` 写入 catalog。
-- CLI/API 主要处理运行期常变对象、批量导入、资产/catalog 管理、状态查看、事件和日志。
+- M0 站点启动配置通过 `config.json` 表达；`config import` 仅校验 source config 自身后离线原子写入，结构性修改后重启生效。跨文件引用关系由 `config validate`、`catalog validate` 和 daemon 启动校验负责。M0 catalog 只读，不提供导入、构建或在线更新命令。
+- M1+ 的 DHCP discovery 策略、asset、repository、install source、rootfs、initrd、boot bundle 和批量对象通过 CLI/API 请求 `nodeforged` 执行，daemon 负责写入 catalog 或运行态。
+- M0 CLI 只提供状态查看、健康检查、config/catalog 校验、JSON 导出和离线配置导入；事件、日志和资产管理随对应阶段加入。
 - 复杂人工策略对象创建和大范围修改优先接受文件、清单或 patch 输入，不为每个字段设计长参数。
-- 可提供融合式高频入口，例如 `nodeforge status`、`nodeforge check`、`nodeforge apply <file>`，但必须在帮助信息中说明覆盖范围。
+- M1+ 可评估融合式高频入口，例如 `nodeforge apply <file>`；必须在帮助信息中说明覆盖范围，不能与已有命令产生重复入口。
 
 所有命令层级必须支持帮助信息：
 
@@ -762,11 +771,15 @@ M0 实现：
 nodeforge status
 nodeforge check
 nodeforge config validate
-nodeforge config export --output json
+nodeforge config export
 nodeforge config import <path>
 nodeforge catalog validate
-nodeforge catalog export --output json
+nodeforge catalog export
 ```
+
+所有本地文件加载失败默认输出简短格式，例如 `error: config: file not found: ./config.json`；
+在叶子命令后追加 `-d/--debug` 才输出底层错误标签。服务端常驻日志由
+`config.logging.level`（`info` 或 `debug`）控制，`nodeforged -d` 可只覆盖本次启动。
 
 `status` 面向人工查看，输出进程、HTTP、管理路由和配置 API 的详细状态；`check`
 面向自动化健康检查，成功时只输出简短通过信息并依赖退出码表达结果。
@@ -814,16 +827,22 @@ TFTP 探针、DHCP resolver、repository 和 state 检查在对应阶段实现�
 - M0 HTTP 默认使用 8080，不申请 DHCP/TFTP 阶段才需要的 Linux capability。
 - systemd unit 本体放在 `/opt/nodeforge/systemd/nodeforged.service`；`/etc/systemd/system/nodeforged.service` 只是软链接。二进制主体安装在 `/opt/nodeforge/bin/`；`/usr/bin/nodeforge` 和 `/usr/bin/nodeforged` 也只是软链接。
 - 不在 NodeForge CLI 中重复封装 `systemctl`。
-- M0 需要在 Rocky 9.7 aarch64 上执行 systemd 启动、快速重启、CLI 管理接口和外部 HTTP 数据路由验证。
+- M0 需要在 Rocky 9.7 aarch64 上执行 systemd 启动、快速重启、CLI 管理接口和外部 HTTP 管理路由验证；PXE HTTP 数据路由验证属于 M3。
 
 `nodeforged` 正常安装时自动发现 `/opt/nodeforge/config/config.json` 和 `/opt/nodeforge/catalog/catalog.json`。`--config`、`--catalog` 仅作为开发测试、迁移验证和临时排障覆盖参数，不写入默认 systemd unit，避免把部署命令变成长参数清单。
+
+本机构建和 Rocky aarch64 交叉构建都通过根目录 `Makefile` 调用同一份 `build.zig`：
+`make build`、`make test`、`make release`、`make arm64`、`make arm64-debug`。`make arm64` 固定
+使用 `aarch64-linux-gnu` 与 `ReleaseSafe`，可用 `ARM64_TARGET=<zig-target>` 覆盖；交叉构建会
+替换 `zig-out/bin/` 中的本机产物，继续本机调试前执行 `make build`。
 
 M0 日志策略：
 
 - 默认日志后端使用 stderr；systemd 管理时进入 journal，不默认写 `/opt/nodeforge/logs/nodeforged.log`。
 - 日常 `info` 日志包括启动、配置加载/校验、preflight、监听地址，以及每个 HTTP 请求的 method、path 和 status。
-- `debug` 日志用于连接建立/关闭、协议细节、后续 DHCP/TFTP 报文摘要和排障信息；Debug 构建可打开这些细节，ReleaseSafe 默认保持日常噪声较低。
-- 节点事件、安装阶段、无盘阶段等业务事件进入 `events.jsonl`，不与服务进程日志混为一个文件。
+- `config.json` 的 `logging.level` 只接受 `info`（默认）和 `debug`。`nodeforged -d/--debug` 仅覆盖本次进程启动，优先于配置；它不写回配置文件。debug 日志用于连接建立/关闭、协议细节、后续 DHCP/TFTP 报文摘要和排障信息，ReleaseSafe 也可使用。
+- `nodeforge` 的每个 M0 叶子命令支持 `-d/--debug`。默认只输出一行 `error: <类别>: <简短原因>: <路径>`；debug 模式在下一行追加内部错误标签，便于定位但不泄漏请求体、token 或密码。
+- M1+ 节点事件、安装阶段、无盘阶段等业务事件进入 `events.jsonl`，不与服务进程日志混为一个文件；M0 仅提供其基础类型和追加工具。
 
 ### 4.7 测试
 
@@ -831,9 +850,10 @@ M0 日志策略：
 - 缺失必填字段返回结构化错误。
 - 原子写回不会损坏旧文件。
 - CLI `--output json` 输出可解析 JSON。
-- 顶层、资源级和动作级 `-h/--help` 可显示用途、参数和示例。
+- 顶层、资源级和动作级 `-h/--help` 可显示用途、参数和默认值；长示例只放在 README、设计文档和运维手册，避免帮助页冗长。
 - 模拟端口占用时 preflight 明确失败。
-- 管理路由不做 loopback peer 检查；CLI 固定连接 `127.0.0.1:<http.port>`。
+- 管理路由接受所有可达连接；CLI 固定连接 `127.0.0.1:<http.port>`，只管理同机服务。
+- `logging.level=debug` 和 daemon `-d` 能输出服务 debug 日志；CLI `-d` 能在简短错误后显示底层原因。
 
 ### 4.8 阶段验收
 
@@ -849,7 +869,7 @@ M0 日志策略：
 - [x] `nodeforge status/check` 固定访问 `127.0.0.1:<http.port>` 管理 API，并检查唯一 HTTP listener。
 - [x] 配置、catalog 加载、关系校验、格式化导出和原子导入通过。
 - [x] M0 命令默认输出面向人，显式 `--output json` 输出可解析 JSON。
-- [x] CLI 固定接入 `zig-clap 0.12.0`，顶层帮助可用；资源级帮助已覆盖 M0 命令。
+- [x] CLI 固定接入 `zli v5.1.2`，顶层、资源级和动作级帮助均由命令树自动生成。
 - [x] systemd 仅交付适配的 service 文件，不追加 Linux 环境验证。
 - [x] Rocky 9.7 aarch64 远程环境构建、部署和验证通过。
 - [x] HTTP 守护进程稳定性修复，use-after-free 问题已解决。
@@ -867,10 +887,10 @@ M0 日志策略：
 - 修复了 `http/server.zig` 中 `json()` 函数的 use-after-free 问题：将日志记录从 `respond()` 调用后移至调用前
 - 确保守护进程在处理 HTTP 请求时的稳定性
 - [x] 管理配置校验、配置状态和服务状态 API 可用。
-- [x] 管理路由不做 loopback peer 检查，CLI 固定连接 `127.0.0.1`。
+- [x] 管理路由接受所有可达连接，CLI 固定连接 `127.0.0.1` 且不提供远程 endpoint。
 - [x] 配置、catalog 加载、关系校验、格式化导出和原子导入通过。
 - [x] M0 命令默认输出面向人，显式 `--output json` 输出可解析 JSON。
-- [x] CLI 固定接入 `zig-clap 0.12.0`，顶层帮助可用；资源级帮助已覆盖 M0 命令。
+- [x] CLI 固定接入 `zli v5.1.2`，并通过端到端 CLI contract tests 覆盖自动帮助、命令局部 flags 和解析错误退出码。
 - [x] systemd 仅交付适配的 service 文件，不追加 Linux 环境验证。
 
 ## 6. M1：PXE TFTP 闭环
@@ -1742,7 +1762,7 @@ MVP 只支持当前版本。后续升级时增加 migration。
 
 1. 搭建 repo、build.zig、基础 test harness。
 2. 实现 config model/load/validate/store。
-3. 固定接入 `zig-clap 0.12.0`，实现单 HTTP listener、本机 management route、CLI 库集成、formatter、端口/权限 preflight；`zig-args` 仅作为解析层备选。
+3. 固定接入 `zli v5.1.2`，实现单 HTTP listener、management route、本机 CLI 客户端、声明式命令树、formatter、端口/权限 preflight，并以自动帮助和 CLI contract tests 防止语法/文档漂移。
 4. 实现 runtime state 和 events writer。
 5. 实现 TFTP packet/path/session/transfer/server 和 GRUB config，用标准 TFTP client 验证，完成 M1。
 6. 实现 DHCPv4 packet/options/lease/policy/server、boot resolver 和 vendor fixture，与 TFTP 联调后完成 M2。
@@ -1832,6 +1852,7 @@ MVP 只支持当前版本。后续升级时增加 migration。
 ### 2026-07-10 M0 代码完善与验证
 
 **代码质量改进**:
+- `main.zig` 和 `nodeforged.zig` 补齐命令树、命令局部 flags、handler、运行模式和退出码约定的文档注释
 - 完成 `model.zig` 核心数据类型的完整文档注释
 - `catalog/store.zig` 模块级注释说明默认路径、文件大小限制
 - `config/validate.zig` 明确校验顺序和非职责范围
@@ -1844,7 +1865,7 @@ MVP 只支持当前版本。后续升级时增加 migration。
 - M0 单 HTTP listener 绑定 `0.0.0.0:<http.port>` 验证通过
 - `server.server_ip` 作为 PXE 服务地址，不用于 HTTP bind 验证通过
 - CLI 管理客户端固定连接 `127.0.0.1:<http.port>` 验证通过
-- 管理路由不做 loopback peer 检查，安全边界为网络隔离验证通过
+- 管理路由可从 VM 外部地址访问并返回 200，CLI 仍固定连接本机 `127.0.0.1`，验证通过
 
 **关键修复**:
 - 修复 `http/server.zig` `json()` 函数 use-after-free：日志记录必须在 `respond()` 之前

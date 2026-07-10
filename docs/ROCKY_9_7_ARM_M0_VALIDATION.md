@@ -6,7 +6,7 @@ Validation target:
 - Login: `root@r97n0`
 - Address: `192.168.26.128`
 - OS: Rocky Linux 9.7, `aarch64`
-- Validation time: 2026-07-10 01:17 CST on the VM
+- Validation time: 2026-07-10 14:00 CST on the VM
 
 ## Deployed files
 
@@ -56,6 +56,7 @@ The deployed config uses:
 - `server.http_port = 8080`
 - `http.asset_root = "/opt/nodeforge/assets"`
 - `http.repository_root = "/opt/nodeforge/repos"`
+- `logging.level = "info"` in the current example configuration; `nodeforged -d` overrides it for one diagnostic start
 
 ## M0 validation result
 
@@ -69,13 +70,15 @@ Passed:
 - systemd unit symlink through `/etc/systemd/system`
 - system command symlinks through `/usr/bin`
 - `nodeforge --version` and `nodeforged --version`
+- zli-generated top-level, resource-level, and action-level CLI help
+- command-local zli flags on nested commands, for example `nodeforge config validate --config ... --catalog ... --output json`
 - local CLI `status` through `127.0.0.1:8080`
 - local CLI `check` prints a concise health result and uses the exit code for automation
 - duplicate `server status/check` CLI entry removed
 - VM-local `/healthz`
 - VM-local management route
 - host-to-VM `/healthz`
-- host-to-VM management route rejection
+- host-to-VM management route returns 200; routes accept every client that can reach the listener
 - systemd journal contains HTTP request summaries
 
 Observed expected results:
@@ -99,7 +102,10 @@ OK nodeforge checks passed
 
 ```text
 nodeforge server status
-ERROR unknown command: server
+Unknown command: 'server'
+
+Run: 'nodeforge --help'
+exit=2
 ```
 
 ```text
@@ -140,6 +146,13 @@ HTTP/1.1 200 OK
 ```
 
 ```text
+nodeforge config validate --config /opt/nodeforge/config/config.json --catalog /opt/nodeforge/catalog/catalog.json --output json
+{"ok":true,"config":"/opt/nodeforge/config/config.json","catalog":"/opt/nodeforge/catalog/catalog.json"}
+```
+
+Historical output from the 2026-07-10 deployment:
+
+```text
 journalctl -u nodeforged -n 30
 info: HTTP GET /healthz -> 200
 info: HTTP GET /api/v1/management/server/status -> 200
@@ -151,9 +164,22 @@ info: HTTP GET /api/v1/management/server/status -> 200
 - The listener binds `0.0.0.0:<http_port>`.
 - `server.server_ip` is the advertised PXE service address for generated URLs and future DHCP/TFTP advertisement; it is not the M0 HTTP bind address.
 - CLI management access is fixed to `127.0.0.1:<http_port>`.
+- The CLI has no remote endpoint option and therefore only manages `nodeforged` on the same host.
 - M0 does not define a separate `management_port`; management routes share `server.http_port`, currently `8080`.
-- Management routes do not check peer source; security boundary is network isolation.
+- Management routes accept every IPv4 client that can reach the listener and do not check peer source.
+- M0 management routes have no authentication or TLS, so validation and deployment must use a trusted network.
+- CLI parsing and generated help use vendored `zli v5.1.2`; command-local flags are verified through nested `config validate`.
 - HTTP request summaries are logged at info level to stderr/systemd journal.
 - The listener and preflight use `SO_REUSEADDR` so normal systemd fast restarts do not fail on a just-released socket.
 - The M0 systemd unit does not request DHCP/TFTP-oriented capabilities.
 - `nodeforged` auto-discovers default config/catalog paths under `/opt/nodeforge`; explicit `--config`/`--catalog` remain override-only.
+
+## Current-code follow-up
+
+The current workspace adds `logging.level`, daemon `-d/--debug`, command-local CLI `-d/--debug`, short flags,
+and Makefile cross-compilation targets after the historical VM deployment above. Before treating these as VM-verified,
+rebuild with `make arm64`, deploy the two binaries, then verify:
+
+- `nodeforge config export -c ./missing.json` prints one concise `error:` line; adding `-d` prints the cause line.
+- `nodeforged -d` emits `debug: http: accepted connection` for an HTTP request; `logging.level = "debug"` does the same without `-d`.
+- `nodeforge config validate -c ... -C ... -o json` and daemon `-K -c ... -C ...` succeed.
