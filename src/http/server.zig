@@ -1,19 +1,33 @@
-//! NodeForge M0 唯一 HTTP listener。
-//! M0 先实现管理路由；M3 PXE 数据路由将复用此 HTTP 实现，避免双 listener 生命周期分叉。
-//! 管理路由接受唯一 listener 上所有可达客户端的请求，不做来源地址检查；
-//! `nodeforge` CLI 则固定连接 127.0.0.1:<http.port>，只管理同机 `nodeforged`。
+//! NodeForge M0 唯一 HTTP listener，基于 Zap/facil.io。
+//! HTTP 协议解析、连接生命周期、keep-alive、并发调度和文件/Ranges 支持由 Zap 提供；
+//! 本模块仅注册 NodeForge 路由及其 JSON 响应语义。管理路由接受所有可达客户端，
+//! 官方 `nodeforge` CLI 仍固定连接 `127.0.0.1`。
 
 const std = @import("std");
+const zap = @import("zap");
 const model = @import("../model.zig");
 const config_validate = @import("../config/validate.zig");
 const runtime_state = @import("../state/runtime.zig");
 const observe_error = @import("../observe/error.zig");
 const observe_log = @import("../observe/log.zig");
 
-/// 在指定 IPv4 地址启动一个 HTTP listener。
-/// M0 调用方固定传入 0.0.0.0，使管理路由可从唯一 listener 提供服务。
-/// M3 PXE 数据路由将在同一个 listener 中注册。
-/// 管理路由不做 peer 来源检查，因此可从任意能到达该 listener 的 IPv4 地址访问。
+const RouteContext = struct {
+    config: *const model.AppConfig,
+    catalog: *const model.Catalog,
+    runtime: *const runtime_state.RuntimeState,
+};
+
+// Zap's low-level listener exposes one process-global request callback. NodeForge is
+// intentionally a single-process, single-listener appliance, so this pointer remains
+// valid for the full blocking lifetime of `zap.start` and is never mutated afterwards.
+var active_context: ?*const RouteContext = null;
+
+/// Starts the only NodeForge HTTP listener on every IPv4 interface.
+///
+/// `server.server_ip` is intentionally not used as a bind address. Zap delegates
+/// socket creation and HTTP protocol handling to facil.io; a bind conflict causes
+/// `listen` to fail before the process starts workers, preserving M0's one-listener
+/// invariant.
 pub fn serve(
     io: std.Io,
     ip: []const u8,
@@ -22,138 +36,87 @@ pub fn serve(
     catalog: *const model.Catalog,
     runtime: *const runtime_state.RuntimeState,
 ) !void {
-    const address = try std.Io.net.IpAddress.parseIp4(ip, port);
-    // 允许快速重启复用刚释放的地址；未启用 reuse_port，活跃实例仍会占住端口。
-    var listener = try address.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
+    _ = io;
+    if (!std.mem.eql(u8, ip, "0.0.0.0")) return error.InvalidHttpBindAddress;
 
-    observe_log.info("http: listening on http://{s}:{d}", .{ ip, port });
-    while (true) {
-        {
-            var stream = try listener.accept(io);
-            defer stream.close(io);
-            observe_log.debug("http: accepted connection", .{});
-            try serveConnection(io, stream, config, catalog, runtime);
-        }
-    }
+    const context = RouteContext{
+        .config = config,
+        .catalog = catalog,
+        .runtime = runtime,
+    };
+    if (active_context != null) return error.HttpAlreadyRunning;
+    active_context = &context;
+    defer active_context = null;
+
+    var listener = zap.HttpListener.init(.{
+        .interface = "0.0.0.0",
+        .port = port,
+        .on_request = route,
+        .log = false,
+    });
+    try listener.listen();
+    observe_log.info("http: listening on http://0.0.0.0:{d}", .{port});
+
+    // Zap owns the blocking event loop and worker lifecycle. One worker keeps M0's
+    // state model serial while eliminating the hand-written HTTP parser/connection loop.
+    zap.start(.{ .threads = 1, .workers = 1 });
 }
 
-/// 处理单个 keep-alive 连接。
-///
-/// M0 串行处理请求，后续可在 accept 层增加 worker pool。
-/// 每个连接使用栈上收发缓冲区，连接关闭时自动释放。
-fn serveConnection(
-    io: std.Io,
-    stream: std.Io.net.Stream,
-    config: *const model.AppConfig,
-    catalog: *const model.Catalog,
-    runtime: *const runtime_state.RuntimeState,
-) !void {
-    var send_buffer: [4096]u8 = undefined;
-    var recv_buffer: [4096]u8 = undefined;
-    var reader = stream.reader(io, &recv_buffer);
-    var writer = stream.writer(io, &send_buffer);
-    var server: std.http.Server = .init(&reader.interface, &writer.interface);
+/// Dispatches M0 management routes after Zap has parsed the request.
+/// The route table stays explicit until M3 adds static assets and PXE data paths.
+fn route(request: zap.Request) !void {
+    const context = active_context orelse return error.MissingRouteContext;
+    const path = request.path orelse return notFound(request);
+    const method = request.method orelse return notFound(request);
+    observe_log.debug("http: request received {s} {s}", .{ method, path });
 
-    while (true) {
-        var request = server.receiveHead() catch |err| switch (err) {
-            error.HttpConnectionClosing => {
-                observe_log.debug("http: connection closed by peer", .{});
-                return;
-            },
-            else => {
-                observe_log.debug("http: receive failed: {t}", .{err});
-                return err;
-            },
-        };
-        try route(&request, config, catalog, runtime);
-        if (!request.head.keep_alive) return;
-    }
-}
-
-/// 按 method + path 分发 HTTP 请求。
-///
-/// M0 路由表为显式分支，不做通用 pattern matching：
-/// - `GET /healthz` — 健康检查
-/// - `GET /api/v1/management/config/status` — 配置状态
-/// - `POST /api/v1/management/config/validate` — 触发配置校验
-/// - `GET /api/v1/management/server/status` — 服务运行态
-/// 其余路径返回 404。
-fn route(
-    request: *std.http.Server.Request,
-    config: *const model.AppConfig,
-    catalog: *const model.Catalog,
-    runtime: *const runtime_state.RuntimeState,
-) !void {
-    const target = request.head.target;
-    if (request.head.method == .GET and std.mem.eql(u8, target, "/healthz")) {
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/healthz"))
         return json(request, .ok, "{\"ok\":true,\"service\":\"nodeforge\"}\n");
-    }
-    // 管理 API 与数据路由共用同一 listener，不按 peer 地址过滤请求。
-    // 127.0.0.1 是 nodeforge CLI 的客户端约定，不是服务端访问控制规则。
-    if (request.head.method == .GET and std.mem.eql(u8, target, "/api/v1/management/config/status")) {
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/config/status"))
         return json(request, .ok, "{\"ok\":true,\"result\":{\"config\":\"valid\"}}\n");
-    }
-    if (request.head.method == .POST and std.mem.eql(u8, target, "/api/v1/management/config/validate")) {
-        // curl 等客户端发送空 POST 时可能同时省略 Transfer-Encoding 和
-        // Content-Length；Zig server 的 respond 会尝试丢弃请求体，因此先明确为空。
-        if (request.head.transfer_encoding == .none and request.head.content_length == null)
-            request.head.content_length = 0;
-        config_validate.validate(config, catalog) catch |err| return validationError(request, err);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/validate")) {
+        config_validate.validate(context.config, context.catalog) catch |err| return validationError(request, err);
         return json(request, .ok, "{\"ok\":true,\"result\":{}}\n");
     }
-    if (request.head.method == .GET and std.mem.eql(u8, target, "/api/v1/management/server/status")) {
-        const body = switch (runtime.service) {
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/server/status")) {
+        const body = switch (context.runtime.service) {
             .starting => "{\"ok\":true,\"result\":{\"service\":\"starting\"}}\n",
             .running => "{\"ok\":true,\"result\":{\"service\":\"running\"}}\n",
             .stopping => "{\"ok\":true,\"result\":{\"service\":\"stopping\"}}\n",
         };
         return json(request, .ok, body);
     }
-    try json(request, .not_found, "{\"ok\":false,\"error\":\"not_found\"}\n");
+    return notFound(request);
 }
 
-/// 将配置校验错误转换为结构化 JSON 错误响应。
-///
-/// 使用栈上固定缓冲区渲染，避免在错误路径中分配堆内存。
-fn validationError(request: *std.http.Server.Request, err: anyerror) !void {
+/// Renders configuration validation failures using NodeForge's stable error envelope.
+fn validationError(request: zap.Request, err: anyerror) !void {
     var buffer: [512]u8 = undefined;
     const body = observe_error.renderJson(&buffer, observe_error.fromValidation(err)) catch
         "{\"ok\":false,\"error\":{\"code\":\"internal.buffer\",\"message\":\"response too large\"}}\n";
     try json(request, .bad_request, body);
 }
 
-/// 写 JSON 响应并记录一行 access log。
-/// M0 日常日志只记录 method/path/status，不记录请求体，避免把后续 answer、token 或日志上传内容打进 journal。
-///
-/// 日志必须在 `respond()` 之前写入：`request.head.target` 借用连接内部读缓冲区，
-/// `respond()` 可能推进读位置或复用缓冲区，导致日志中格式化的 target 切片失效。
-fn json(request: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
+/// Emits a uniform JSON 404 envelope instead of bypassing the management error contract.
+fn notFound(request: zap.Request) !void {
+    try json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"http.not_found\",\"message\":\"route not found\"}}\n");
+}
+
+/// Sends a JSON response through Zap and logs only method, path, and status.
+/// Request bodies and credentials never enter the service log.
+fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8) !void {
+    request.setStatus(status);
     observe_log.info("http: {s} {s} -> {d}", .{
-        methodName(request.head.method),
-        request.head.target,
+        request.method orelse "OTHER",
+        request.path orelse "<missing>",
         @intFromEnum(status),
     });
-    try request.respond(body, .{
-        .status = status,
-        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
-    });
+    // Set the header directly instead of `sendJson`: Zap's helper emits its own
+    // debug line even when NodeForge is configured for info-level logging.
+    try request.setHeader("content-type", "application/json");
+    try request.sendBody(body);
 }
 
-/// 将 HTTP method 枚举转为大写字符串，用于 access log。
-fn methodName(method: std.http.Method) []const u8 {
-    return switch (method) {
-        .GET => "GET",
-        .POST => "POST",
-        .PUT => "PUT",
-        .DELETE => "DELETE",
-        .PATCH => "PATCH",
-        .HEAD => "HEAD",
-        .OPTIONS => "OPTIONS",
-        else => "OTHER",
-    };
-}
-
-test "single listener serves health" {
-    try std.testing.expect(true);
+test "Zap-backed route module compiles" {
+    try std.testing.expect(active_context == null);
 }

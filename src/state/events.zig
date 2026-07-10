@@ -8,9 +8,10 @@ pub const Event = struct {
     /// 事件信封版本；当前固定为 1。
     v: u8 = 1,
     /// ISO 8601 UTC 时间戳字符串。
-    timestamp: []const u8,
+    ts: []const u8,
     /// 事件类型，例如 `service.started`、`dhcp.lease.allocated`。
-    event_type: []const u8,
+    /// 字段名为 `type`，与设计文档 events.jsonl 格式一致。
+    @"type": []const u8,
     /// 人类可读的事件摘要。
     message: []const u8,
 };
@@ -45,8 +46,8 @@ test "event renders as one JSON line" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try std.json.Stringify.value(Event{
-        .timestamp = "2026-07-09T12:00:00Z",
-        .event_type = "service.started",
+        .ts = "2026-07-09T12:00:00Z",
+        .@"type" = "service.started",
         .message = "ready",
     }, .{}, &output.writer);
     try output.writer.writeByte('\n');

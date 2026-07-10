@@ -28,7 +28,7 @@ zig-out/bin/nodeforged --config config.example.json --catalog catalog.example.js
 
 ```bash
 make build          # 本机构建（Debug）
-make test           # 本机单元与 CLI 契约测试
+make test           # 本机单元、CLI 契约与 HTTP 集成测试
 make release        # 本机 ReleaseSafe 构建
 make arm64          # 交叉编译 Rocky Linux aarch64 ReleaseSafe 二进制
 make arm64-debug    # 交叉编译 aarch64 Debug 二进制
@@ -63,7 +63,7 @@ endpoint 参数，因此 CLI 只支持管理同机 `nodeforged`。M0 管理 API 
 `nodeforge` 叶子命令后使用 `-d` 显示底层错误原因。默认错误保持简短，例如
 `error: config: file not found: ./config.json`。
 
-Linux systemd unit 位于 `packaging/systemd/nodeforged.service`。
-当前 macOS 无法完成的 Linux/systemd/TFTP 系统级项目记录在
-[`docs/ROCKY_9_7_VALIDATION.md`](docs/ROCKY_9_7_VALIDATION.md)，部署 Rocky Linux
-9.7 虚拟机后逐项执行。
+Linux systemd unit 位于 `packaging/systemd/nodeforged.service`。M0 当前二进制已在 Rocky Linux
+9.7 aarch64 VM 完成部署、systemd、HTTP、CLI、端口独占和 debug 验证，验证结果见
+[`docs/DETAILED_DESIGN.md`](docs/DETAILED_DESIGN.md) 第 5 节。后续 TFTP/DHCP
+等系统级阶段验证清单见 [`docs/ROCKY_9_7_VALIDATION.md`](docs/ROCKY_9_7_VALIDATION.md)。

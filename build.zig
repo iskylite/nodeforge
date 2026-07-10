@@ -4,12 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const zli = b.dependency("zli", .{});
+    const zap = b.dependency("zap", .{ .target = target, .optimize = optimize });
 
     // 核心模块是两个二进制共享的唯一业务实现，避免 CLI 与守护进程行为分叉。
     const core = b.addModule("nodeforge", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zap", .module = zap.module("zap") },
+        },
     });
 
     // nodeforged 承载协议服务和本机管理接口。
@@ -65,4 +69,12 @@ pub fn build(b: *std.Build) void {
     cli_tests.addArtifactArg(cli);
     cli_tests.addArtifactArg(daemon);
     test_step.dependOn(&cli_tests.step);
+
+    // HTTP integration tests exercise the Zap-backed listener, management
+    // routes, and the M0 single-listener/port-preflight invariant.
+    const http_tests = b.addSystemCommand(&.{"sh"});
+    http_tests.addFileArg(b.path("tests/http.sh"));
+    http_tests.addArtifactArg(cli);
+    http_tests.addArtifactArg(daemon);
+    test_step.dependOn(&http_tests.step);
 }

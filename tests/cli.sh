@@ -147,6 +147,18 @@ grep -q "Missing 1 positional argument" "$tmp/missing"
 grep -q '^OK config imported ' "$tmp/imported"
 test -s "$tmp/imported.json"
 
+# A source that fails semantic validation must not replace a previously valid
+# destination. This guards the offline import's validate-before-atomic-save rule.
+checksum_before=$(cksum "$tmp/imported.json")
+printf '%s\n' '{"schema_version":1,"server":{"server_ip":"::1"}}' >"$tmp/invalid-source.json"
+if "$cli" config import -c "$tmp/imported.json" "$tmp/invalid-source.json" >"$tmp/invalid-import" 2>&1; then
+    echo "invalid config import unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 1
+fi
+test "$checksum_before" = "$(cksum "$tmp/imported.json")"
+
 "$daemon" --help >"$tmp/daemon-help"
 grep -q "NodeForge daemon" "$tmp/daemon-help"
 grep -q -- "--check-config" "$tmp/daemon-help"

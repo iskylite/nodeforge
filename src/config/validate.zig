@@ -24,6 +24,7 @@ pub const ValidationError = error{
     RepositoryManagerMismatch,
     MissingGpgKey,
     MissingAsset,
+    InvalidSha256,
     AssetKindMismatch,
     MissingRepository,
     MissingInstallSource,
@@ -113,6 +114,8 @@ fn validateDistros(config: *const model.AppConfig) ValidationError!void {
 fn validateAssets(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     for (catalog.assets) |asset| {
         if (asset.path.len == 0) return error.MissingAsset;
+        if (asset.sha256) |sha256|
+            if (!validSha256(sha256)) return error.InvalidSha256;
         if (asset.distro) |distro| {
             const version = asset.version orelse return error.UnsupportedDistroTuple;
             const arch = asset.arch orelse return error.UnsupportedDistroTuple;
@@ -266,6 +269,13 @@ fn validMac(value: []const u8) bool {
     return true;
 }
 
+fn validSha256(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |char|
+        if (!std.ascii.isHex(char)) return false;
+    return true;
+}
+
 test "最小配置和空 catalog 有效" {
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" } };
     const cat: model.Catalog = .{};
@@ -280,4 +290,17 @@ test "拒绝 IPv6 和非法 HTTP 端口" {
     config.server.server_ip = "192.168.50.1";
     config.server.http_port = 0;
     try std.testing.expectError(error.InvalidHttpPort, validate(&config, &cat));
+}
+
+test "拒绝格式错误的 SHA256" {
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" } };
+    const catalog: model.Catalog = .{
+        .assets = &.{.{
+            .name = "invalid-checksum",
+            .kind = .iso,
+            .path = "iso/test.iso",
+            .sha256 = "not-a-sha256",
+        }},
+    };
+    try std.testing.expectError(error.InvalidSha256, validate(&config, &catalog));
 }

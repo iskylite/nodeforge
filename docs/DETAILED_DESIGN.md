@@ -58,7 +58,7 @@
 
 ## 3. M0：项目骨架、单 HTTP listener 和管理接口
 
-M0 目标是建立项目基础架构，实现可启动的守护进程和管理接口；官方 CLI 固定从本机访问。当前已实现:
+M0 目标是建立项目基础架构，实现可启动的守护进程和管理接口；官方 CLI 固定从本机访问。
 
 ### 3.1 已完成的代码模块
 
@@ -73,31 +73,34 @@ M0 目标是建立项目基础架构，实现可启动的守护进程和管理�
 - `src/config/load.zig`: 配置加载功能
 - `src/config/validate.zig`: 配置校验，包含详细的错误处理和文档
 - `src/config/store.zig`: 配置存储管理
+- `src/catalog.zig`: 配置与 catalog 的只读查询函数，校验器和 CLI 共用
 - `src/catalog/store.zig`: 目录管理和资产跟踪，支持导入/导出操作
-- `src/http/server.zig`: HTTP 服务器实现，包含请求处理和路由
+- `src/http/server.zig`: 基于 Zap/facil.io 的唯一 HTTP listener 与管理路由
 - `src/http/client.zig`: HTTP 客户端用于状态探测
-- `src/http/server.zig`: HTTP listener 和管理路由实现
 - `src/http/management.zig`: `nodeforge` CLI 本机管理地址约定
 - `src/state/runtime.zig`: 运行状态管理
 - `src/state/events.zig`: 事件记录和追踪
 - `src/observe/error.zig`: 错误处理和响应格式化
+- `src/observe/log.zig`: 服务日志门面，支持 info/debug 等级
 
-### 3.2 代码质量改进
+### 3.2 代码质量
 
-所有公共类型和函数均已添加详细的 /// 文档注释:
+核心领域模型、对外入口和错误/日志协议均已添加文档注释；重点包括：
 
 - `model.zig` 中的结构体如 `Catalog`、`RepositoryConfig`、`AssetConfig`、`InstallSourceConfig`、`BootBundleConfig`、`ProfileConfig`、`NodeConfig`、`PolicyConfig` 等
 - `catalog/store.zig` 模块级注释说明默认路径、文件大小限制和函数职责
 - `config/validate.zig` 详细说明校验顺序和限制
-- `http/server.zig` 函数文档包括 `serveConnection`、`route`、`validationError`、`json` 等
+- `http/server.zig` 函数文档包括 `serve`、`route`、`validationError`、`json` 等
 - `http/client.zig` 的 `Status` 结构和 `probeAt` 函数
 - `state/runtime.zig` 和 `state/events.zig` 的运行态模型
 - `observe/error.zig` 的错误信封结构和响应格式
+- `observe/log.zig` 的日志等级和输出约定
 
-### 3.3 关键修复
+### 3.3 关键实现
 
-- **Use-after-free 修复**: `http/server.zig` 的 `json()` 函数中，将日志记录从 `respond()` 调用后移至调用前，避免访问已释放的 `request.head.target`
-- **重复注释清理**: 删除 `catalog/store.zig` 中重复的 `default_path` 注释
+- **Zap/facil.io 接入**: HTTP 报文解析、连接生命周期和 worker 调度不再由 NodeForge 手写；`http/server.zig` 只保留 M0 路由和统一 JSON 错误。
+- **端口预检**: 先连接本机端口识别活跃 listener，再以 `SO_REUSEADDR` bind，兼顾端口独占与 systemd 快速重启。
+- **catalog 完整性**: 已填写的 asset `sha256` 必须是 64 位十六进制字符串。
 
 当前 M0 目录：
 
@@ -125,6 +128,7 @@ src/
     events.zig
   observe/
     error.zig
+    log.zig
   preflight.zig
   version.zig
 ```
@@ -255,13 +259,19 @@ fn resolveBoot(
 
 ## 4. 核心数据模型
 
+本章描述 M1-M7 的目标模型，不等同于 M0 已实现 schema。M0 当前的 `src/model.zig` 已包含
+`server`、`http`、`logging`、`distros`、`profiles`、`nodes`、`policy` 及 catalog 的
+asset/repository/install source/boot bundle 基础引用，但采用直接 `install_source`/
+`boot_bundle` 字段，尚未包含本章后续示例中的 DHCP、TFTP、hooks、rootfs 或网络 override 等字段。
+M0 的可执行校验边界以第 5 节为准。
+
 ### 4.1 配置模型
 
 MVP 不把所有对象都塞进单一手写配置文件，而是分为三类事实源：
 
 | 类型 | 文件 | 主要内容 | 修改入口 |
 | --- | --- | --- | --- |
-| 启动/策略配置 | `/opt/nodeforge/config/config.json` | M0 为 server/http 启动配置；M1+ 扩展 dhcp/tftp、安全默认值、profile、provisioning bundle | M0 手工编辑 + `config validate` 或离线 `config import`，重启生效；M1+ 增加 `config apply` 和 DHCP discovery 在线切换 |
+| 启动/策略配置 | `/opt/nodeforge/config/config.json` | M0 为 server/http/logging、发行版矩阵、profile/node/policy 的基础配置；M1+ 扩展 dhcp/tftp、hooks、网络 override、provisioning bundle | M0 手工编辑 + `config validate` 或离线 `config import`，重启生效；M1+ 增加 `config apply` 和 DHCP discovery 在线切换 |
 | 管理 catalog | `/opt/nodeforge/catalog/catalog.json` | asset、repository、install source、rootfs、initrd、boot bundle | M0 只读校验/导出；M1+ CLI/API 请求 `nodeforged` import/build/package/publish 并写入 |
 | 运行态 | `/opt/nodeforge/state/runtime.json`、`/opt/nodeforge/logs/events.jsonl` | lease、unknown client、session、node status、事件 | 服务运行时更新 |
 
@@ -664,10 +674,7 @@ const NodeStatus = struct {
 
 ## 5. M0 验收标准与验证结果
 
-> 实现状态：M0 代码已按单 HTTP listener、config/catalog/runtime 分层和 `zli v5.1.2`
-> CLI 完成收敛。macOS 已完成构建、单元测试、管理 API、CLI 状态检查、
-> config/catalog 校验与导出、配置导入、运行中端口占用检查和管理路由。
-> Rocky 9.7 aarch64 可通过 `ssh root@r97n0` 做 systemd、端口、CLI 和 HTTP 实机验证；虚拟机缺包时可用 `dnf`/`yum` 安装验证工具。
+M0 代码按单 HTTP listener、config/catalog/runtime 分层和 `zli v5.1.2` CLI 实现。macOS 构建和单元测试通过，Rocky 9.7 aarch64 完成实机验证。
 
 ### 4.1 目标
 
@@ -677,7 +684,7 @@ const NodeStatus = struct {
 - `nodeforge` CLI 固定通过 `127.0.0.1:<http.port>` 连接管理接口。
 - 启动配置和 catalog 可校验、导出；启动配置可由 CLI 离线导入并原子写回，catalog 写入留待 M1+。
 - 日志、错误、输出格式和 CLI 帮助信息成型。
-- 启动前可检查 IPv4 监听地址和端口占用；目录权限、资产可读性、TFTP/DHCP 检查随对应阶段补齐。
+- 通过 `nodeforged --check` 可在启动前检查 IPv4 监听地址和端口占用；正常启动仍由实际 `listen()` 处理最终 bind 结果。目录权限、资产可读性、TFTP/DHCP 检查随对应阶段补齐。
 
 ### 4.2 代码任务
 
@@ -707,15 +714,18 @@ MVP 不实现第二套 RPC，也不再拆成 management listener 与 PXE listene
 - 管理路由与未来 PXE 数据路由逻辑分区；服务端不做 peer 来源检查，所有能到达该 listener 的 IPv4 客户端都可调用管理路由。
 - `nodeforge` CLI 固定连接 `127.0.0.1`，不提供远程 endpoint，只支持管理同机 `nodeforged`。MVP 不提供管理鉴权和 TLS；将 HTTP 路由作为正式远程管理接口前，必须另行设计 TLS、鉴权和审计。
 
-```json
-{
-  "method": "POST",
-  "path": "/api/v1/management/config/validate",
-  "body": {}
-}
-```
+M0 的完整路由表（路径和方法必须精确匹配）如下：
 
-响应：
+| 方法 | 路径 | 成功响应 |
+| --- | --- | --- |
+| `GET` | `/healthz` | `200 {"ok":true,"service":"nodeforge"}` |
+| `GET` | `/api/v1/management/config/status` | `200 {"ok":true,"result":{"config":"valid"}}` |
+| `POST` | `/api/v1/management/config/validate` | `200 {"ok":true,"result":{}}` |
+| `GET` | `/api/v1/management/server/status` | `200 {"ok":true,"result":{"service":"running"}}` |
+
+`config/validate` 不读取请求体；它只重新校验 daemon 已加载的 config/catalog 快照。未知路径或方法统一返回 `404` JSON 错误信封；校验失败返回 `400`，`code` 固定为 `config.invalid`，`message` 是校验错误标签，`hint` 固定提示使用 CLI 校验。
+
+成功响应示例：
 
 ```json
 {
@@ -731,8 +741,8 @@ MVP 不实现第二套 RPC，也不再拆成 management listener 与 PXE listene
   "ok": false,
   "error": {
     "code": "config.invalid",
-    "message": "profile rocky-9.7-aarch64-install references missing kernel asset",
-    "hint": "import the asset or update the profile"
+    "message": "MissingAsset",
+    "hint": "run nodeforge config validate and correct the referenced object"
   }
 }
 ```
@@ -791,29 +801,31 @@ nodeforge catalog export
 M0 至少校验：
 
 - JSON 格式和必填字段。
-- `server.server_ip` 格式合法；如配置 `server.bind_interface`，不能为空字符串；唯一 HTTP listener 的 `0.0.0.0:http.port` 未被占用。
-- HTTP listener 和预检均允许 `SO_REUSEADDR`，保证 systemd 快速重启不会被刚释放的 socket 窗口误伤；不启用 `SO_REUSEPORT`，活跃实例仍保持端口独占。
+- 静态 config/catalog 校验检查 `server.server_ip` 为 IPv4、`server.bind_interface`（如填写）非空、`http.port` 非零；M0 不校验网卡是否存在。
+- `nodeforged --check` 额外检查唯一 HTTP listener 的 `0.0.0.0:http.port` 是否可用；正常启动仍以 Zap `listen()` 的实际结果为准。
+- HTTP listener 与预检允许 `SO_REUSEADDR`，保证 systemd 快速重启不会被刚释放的 socket 窗口误伤；预检先连接本机端口以识别活跃 listener，避免 macOS 上两个启用该选项的 wildcard socket 共存。活跃实例仍保持端口独占。
 - node id、MAC、IP、arch 和 profile 引用。
 - distro/version/arch 支持矩阵格式。
 - profile mode 枚举。
-- profile `safety` 元数据必须与 mode 和 hooks 一致。
-- profile 的 `boot_source` 必须符合 mode：install 只引用 catalog 中的 install source，diskless 只引用 catalog 中的 boot bundle。
+- profile `safety` 元数据必须与 mode 一致；M0 尚无 hooks 字段或 hook 校验。
+- profile 的直接引用字段必须符合 mode：install 只填写 `install_source` 并引用 catalog 中的 install source，diskless 只填写 `boot_bundle` 并引用 catalog 中的 boot bundle，discovery 两者均为空。
 - `policy.default_action` 只能是 `wait`、`discovery`、`diskless`、`deny`，缺省值为 `wait`。
 - 未知节点默认 diskless 必须同时满足 `allow_unknown_diskless = true` 和目标 profile 的 `safety` 字段满足 safe/ephemeral 条件。
 - 未知节点默认 install 是非法配置。
 - 端口规则：DHCP/TFTP 端口不可配置。
-- 所有地址、CIDR、DNS、gateway 和监听地址只接受 IPv4。
+- M0 已有的 `server.server_ip` 和 `node.ip` 只接受 IPv4；M1+ 新增的 CIDR、DNS、gateway 和监听地址同样只接受 IPv4。
 - catalog JSON 格式、对象 ID、引用关系和 SHA256 字段格式。
 - catalog 中已有 repository 时，manager 必须匹配 distro family；仅当 `gpg_check = true` 时要求 GPG key asset 存在。
-- catalog 中已有 install source 时，必须能解析到 source asset 或 repository，并声明 installer kernel/initrd asset。
-- catalog 中已有 boot bundle 时，kernel、initrd、rootfs、repository 的 distro/version/arch/kernel_release 必须一致。
+- catalog 中已有 install source 时，必须能解析到必填的 ISO source asset、installer kernel/initrd asset；每个已声明 repository 都必须存在。
+- catalog 中已有 boot bundle 时，kernel、initrd、rootfs 的 distro/version/arch/kernel_release 必须一致；M0 的 `BootBundleConfig` 尚不包含 repository 字段。
 
 ### 4.6 启动自检、服务检查与 systemd
 
-M0 的 `nodeforged` 启动前执行 preflight：
+M0 将无副作用的 preflight 暴露为 `nodeforged --check`；正常启动不会以一次预检替代实际 bind：
 
-- 对唯一 HTTP 端口尝试 bind，明确报告端口占用。
-- `--check-config` 只校验配置和 catalog；`--check` 额外检查 M0 已实现的 HTTP 监听端口，但不长期启动。
+- `--check-config` 只校验配置和 catalog。
+- `--check` 在上述校验后，对唯一 HTTP 端口执行 connect-then-bind 预检，但不长期启动；活跃 listener 立即失败，刚释放的 socket 可借助 `SO_REUSEADDR` 快速重启。
+- 正常启动直接调用 Zap `listen()`；预检与实际启动间存在短暂竞态，bind 失败仍由启动路径返回。
 - UDP 69、UDP 67 和资产可读性检查分别随 M1、M2、M3 服务实现加入，避免未实现服务产生虚假的通过状态。
 
 M0 的 `nodeforge check` 在服务运行后通过 `127.0.0.1:<http.port>` 验证 process、HTTP、management route 和配置 API。
@@ -839,8 +851,8 @@ TFTP 探针、DHCP resolver、repository 和 state 检查在对应阶段实现�
 M0 日志策略：
 
 - 默认日志后端使用 stderr；systemd 管理时进入 journal，不默认写 `/opt/nodeforge/logs/nodeforged.log`。
-- 日常 `info` 日志包括启动、配置加载/校验、preflight、监听地址，以及每个 HTTP 请求的 method、path 和 status。
-- `config.json` 的 `logging.level` 只接受 `info`（默认）和 `debug`。`nodeforged -d/--debug` 仅覆盖本次进程启动，优先于配置；它不写回配置文件。debug 日志用于连接建立/关闭、协议细节、后续 DHCP/TFTP 报文摘要和排障信息，ReleaseSafe 也可使用。
+- 日常 `info` 日志包含成功监听地址、每个 HTTP 请求的 method/path/status，以及配置、校验或预检失败的错误摘要。
+- `config.json` 的 `logging.level` 只接受 `info`（默认）和 `debug`。`nodeforged -d/--debug` 仅覆盖本次进程启动，优先于配置；它不写回配置文件。M0 当前的 debug 请求日志为 method/path；连接建立/关闭、DHCP/TFTP 报文摘要和更细协议诊断随对应服务阶段补齐，ReleaseSafe 也可使用。
 - `nodeforge` 的每个 M0 叶子命令支持 `-d/--debug`。默认只输出一行 `error: <类别>: <简短原因>: <路径>`；debug 模式在下一行追加内部错误标签，便于定位但不泄漏请求体、token 或密码。
 - M1+ 节点事件、安装阶段、无盘阶段等业务事件进入 `events.jsonl`，不与服务进程日志混为一个文件；M0 仅提供其基础类型和追加工具。
 
@@ -854,44 +866,45 @@ M0 日志策略：
 - 模拟端口占用时 preflight 明确失败。
 - 管理路由接受所有可达连接；CLI 固定连接 `127.0.0.1:<http.port>`，只管理同机服务。
 - `logging.level=debug` 和 daemon `-d` 能输出服务 debug 日志；CLI `-d` 能在简短错误后显示底层原因。
+- `tests/http.sh` 覆盖全部 M0 HTTP 路由、统一 404、重复 listener 拒绝及 daemon `-d`。
 
 ### 4.8 阶段验收
 
 - 启动 `nodeforged --check-config` 能校验配置。
 - `nodeforge status` 能显示服务状态。
 - `nodeforge config validate` 能输出清晰错误。
-- `nodeforge check` 能区分进程存活与各协议实际可用。
+- `nodeforge check` 能区分进程存活与 M0 已实现的 HTTP/管理 API 可用性。
 
-当前结果：
+M0 验收结果：
 
 - [x] `nodeforged --check-config` 校验有效配置。
-- [x] `nodeforged --check` 改为检查 M0 的唯一 HTTP 独占端口。
+- [x] `nodeforged --check` 检查 M0 的唯一 HTTP 独占端口。
 - [x] `nodeforge status/check` 固定访问 `127.0.0.1:<http.port>` 管理 API，并检查唯一 HTTP listener。
 - [x] 配置、catalog 加载、关系校验、格式化导出和原子导入通过。
 - [x] M0 命令默认输出面向人，显式 `--output json` 输出可解析 JSON。
 - [x] CLI 固定接入 `zli v5.1.2`，顶层、资源级和动作级帮助均由命令树自动生成。
-- [x] systemd 仅交付适配的 service 文件，不追加 Linux 环境验证。
+- [x] systemd service 文件与 Rocky 9.7 aarch64 二进制部署、启动和快速重启验证通过。
 - [x] Rocky 9.7 aarch64 远程环境构建、部署和验证通过。
-- [x] HTTP 守护进程稳定性修复，use-after-free 问题已解决。
-- [x] 所有模块公共类型和函数均已添加详细的 /// 文档注释。
-
-### 4.9 最新验证更新
-
-**代码质量改进**:
-- 完整补全了 `model.zig` 核心数据类型的文档注释
-- `http/server.zig` 关键函数包含详细的行为说明
-- `config/validate.zig` 明确了校验顺序和限制条件
-- `catalog/store.zig` 说明了默认路径、文件大小限制和导入/导出机制
-
-**关键修复**:
-- 修复了 `http/server.zig` 中 `json()` 函数的 use-after-free 问题：将日志记录从 `respond()` 调用后移至调用前
-- 确保守护进程在处理 HTTP 请求时的稳定性
+- [x] Zap/facil.io 唯一 listener、结构化 HTTP 404、端口独占和快速重启通过集成测试及 Rocky 实机验证。
+- [x] 核心领域模型、对外入口和错误/日志协议已具备文档注释。
 - [x] 管理配置校验、配置状态和服务状态 API 可用。
 - [x] 管理路由接受所有可达连接，CLI 固定连接 `127.0.0.1` 且不提供远程 endpoint。
-- [x] 配置、catalog 加载、关系校验、格式化导出和原子导入通过。
-- [x] M0 命令默认输出面向人，显式 `--output json` 输出可解析 JSON。
-- [x] CLI 固定接入 `zli v5.1.2`，并通过端到端 CLI contract tests 覆盖自动帮助、命令局部 flags 和解析错误退出码。
-- [x] systemd 仅交付适配的 service 文件，不追加 Linux 环境验证。
+- [x] 通过 `tests/cli.sh` 端到端 CLI contract tests 覆盖自动帮助、命令局部 flags 和解析错误退出码。
+- [x] 通过 `tests/http.sh` 和 Rocky 9.7 aarch64 实机验证覆盖 HTTP 路由、端口预检和 systemd 快速重启。
+
+### 4.9 Rocky 9.7 aarch64 实机验证记录
+
+2026-07-11 在 `r97n0`（`192.168.26.128`，Rocky Linux 9.7 aarch64）部署当前 Zap/facil.io
+二进制后，完成以下验证：
+
+- `nodeforged --check-config`、空闲端口上的 `nodeforged --check`、`nodeforge config validate` 均成功。
+- systemd 正常启动，并连续快速重启两次；`ExecStartPre` 的 `--check` 与实际服务启动均成功。
+- VM 本机和 VM 外部访问 `/healthz`、`/api/v1/management/server/status` 均返回 200；`nodeforge status`、`nodeforge check` 通过本机管理地址成功。
+- 服务运行时，第二个 `nodeforged --check` 与第二个 daemon 都因 HTTP listener 已占用而失败。
+- `nodeforged -d` 和 `logging.level = "debug"` 均输出 M0 的 HTTP method/path debug 日志。
+
+M1+ 的 TFTP、DHCP 等尚未实现的系统级验证不在本节标记为完成，见
+[`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md)。
 
 ## 6. M1：PXE TFTP 闭环
 
@@ -1212,10 +1225,7 @@ nodeforge repository show rocky-9.7-aarch64-iso
 
 ### 7.8 并发与 HTTP 实现选择
 
-- MVP 先基于 Zig 标准库 HTTP 能力做可替换的 `HttpServer` adapter；在锁定 Zig 版本后，用 spike 验证请求解析、keep-alive、Range、流式文件和并发连接。若标准库服务端能力不稳定，只替换 adapter，不改变业务路由。已评估的备选方案：
-  - `http.zig`（karlseguin）：纯 Zig 实现，无 C 依赖，API 简洁，适合作为 adapter 替换的首选。需自行实现 Range/流式文件发送。
-  - `zap`（基于 `facil.io`）：性能最优，但有 C 依赖且版本跟踪风险较高，不适合 MVP。
-  - 结论：MVP 使用 `std.http.Server`；若 M3 性能 spike 证明不足，优先评估 `http.zig`。
+- HTTP 服务器基于 Zap/facil.io 固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力；M0 尚未注册静态资产或 Range 路由，M3 再将其接入。NodeForge 当前只维护业务路由、管理 API 和统一错误信封，不维护 HTTP 报文解析或连接循环。已评估的备选方案 `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，不作为依赖。
 - acceptor 与固定大小 worker pool 分离；大文件使用 `pread`/send loop 流式发送，不整体读入内存。
 - DHCP/TFTP 使用各自 UDP event loop；耗时 hash/文件任务提交到 worker pool，不阻塞收包。
 - 配置使用不可变 snapshot + 原子替换；runtime/state 由单 writer 串行落盘，事件追加有独立队列。
@@ -1846,33 +1856,3 @@ MVP 只支持当前版本。后续升级时增加 migration。
 - 安装和无盘 initrd 概念混用。
 - DHCP/TFTP 端口变成配置项。
 - diskless cmdline 重新塞回复杂 rootfs 参数。
-
-## 19. 最近变更记录
-
-### 2026-07-10 M0 代码完善与验证
-
-**代码质量改进**:
-- `main.zig` 和 `nodeforged.zig` 补齐命令树、命令局部 flags、handler、运行模式和退出码约定的文档注释
-- 完成 `model.zig` 核心数据类型的完整文档注释
-- `catalog/store.zig` 模块级注释说明默认路径、文件大小限制
-- `config/validate.zig` 明确校验顺序和非职责范围
-- `http/server.zig` 函数文档涵盖 `serveConnection`、`route`、`validationError`、`json`
-- `http/client.zig` `Status` 结构和 `probeAt` 函数文档
-- `state/runtime.zig` 和 `state/events.zig` 运行态模型说明
-- `observe/error.zig` 错误信封结构和响应格式文档
-
-**架构设计验证**:
-- M0 单 HTTP listener 绑定 `0.0.0.0:<http.port>` 验证通过
-- `server.server_ip` 作为 PXE 服务地址，不用于 HTTP bind 验证通过
-- CLI 管理客户端固定连接 `127.0.0.1:<http.port>` 验证通过
-- 管理路由可从 VM 外部地址访问并返回 200，CLI 仍固定连接本机 `127.0.0.1`，验证通过
-
-**关键修复**:
-- 修复 `http/server.zig` `json()` 函数 use-after-free：日志记录必须在 `respond()` 之前
-- 清理 `catalog/store.zig` 重复注释
-
-**验证结果**:
-- Rocky Linux 9.7 aarch64 环境构建测试通过
-- 远程部署和 systemd 服务管理功能完整
-- 所有 M0 CLI 命令功能正常
-- HTTP 管理接口和 API 响应稳定

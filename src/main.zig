@@ -365,7 +365,7 @@ fn addDebugFlag(command: *zli.Command) !void {
 }
 
 /// 执行 `status` 或 `check`。二者使用同一组探针，通过输出详细度区分用途。
-/// 管理探针固定连接本机 127.0.0.1；HTTP 数据面探针连接配置中的 `server_ip`。
+/// 所有 M0 探针固定连接本机 127.0.0.1；`server_ip` 只用于显示对 PXE 节点广告的地址。
 fn statusCommand(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -379,11 +379,7 @@ fn statusCommand(
     defer parsed_config.deinit();
     const status = nodeforge.management_client.managementStatus(io, parsed_config.value.server.http_port);
     const active_config = nodeforge.management_client.validateActiveConfig(io, parsed_config.value.server.http_port);
-    const health = nodeforge.management_client.healthAt(
-        io,
-        parsed_config.value.server.server_ip,
-        parsed_config.value.server.http_port,
-    );
+    const health = nodeforge.management_client.health(io, parsed_config.value.server.http_port);
     const ok = status.healthy and active_config.healthy and health.healthy;
     if (output_json) {
         try out.print(

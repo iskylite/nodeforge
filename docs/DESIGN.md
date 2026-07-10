@@ -101,37 +101,39 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 - **日志与排障**：M0 服务日志默认使用 `logging.level = "info"` 输出 stderr/journal；配置可设为 `debug`，`nodeforged -d/--debug` 可仅覆盖本次启动。CLI 叶子命令的 `-d/--debug` 在简短错误后显示内部原因。服务日志、业务事件和 CLI 错误分别输出，且任何等级都不得记录密码、token、完整请求体或节点上传的大日志。
 - **输出可读优先**：面向人的默认输出必须分组、对齐、标注状态和时间；机器消费使用显式 `--output json`。
 
-## 2.5 M0 当前实现状态
+## 2.5 M0 实现状态
 
-截至 2026 年 7 月 10 日，M0 项目骨架阶段已完成:
+M0 项目骨架阶段已完成，并在 Rocky 9.7 aarch64 环境完成实机验证。
 
-### 已实现的核心模块
+### 核心模块
 - **配置管理**: `config/load.zig`、`config/validate.zig`、`config/store.zig` 支持配置的加载、校验和原子保存
-- **目录管理**: `catalog/store.zig` 实现资产目录的管理和追踪
-- **HTTP 服务**: `http/server.zig` 提供单监听器 HTTP 服务和路由管理
+- **目录管理**: `catalog/store.zig` 实现资产目录的管理和追踪，`catalog.zig` 提供配置与 catalog 的只读查询函数
+- **HTTP 服务**: `http/server.zig` 通过 Zap/facil.io 提供单监听器 HTTP 服务和路由管理
 - **管理接口**: `http/server.zig` 实现管理路由，`http/management.zig` 定义 CLI 的本机访问约定
 - **状态管理**: `state/runtime.zig`、`state/events.zig` 提供运行态和事件持久化基础类型；M0 HTTP 服务尚未产生 DHCP/TFTP/节点业务事件
 - **错误处理**: `observe/error.zig` 提供统一的错误响应格式
-- **预检机制**: `preflight.zig` 实现端口占用和服务可用性检查
+- **服务日志**: `observe/log.zig` 提供 info/debug 等级的服务日志门面
+- **预检机制**: `preflight.zig` 实现唯一 HTTP 端口的可用性检查
 
-### 代码质量保证
-- 所有公共类型和函数均已添加详细的文档注释
+### 代码质量
+- 核心领域模型、对外入口和错误/日志协议均有文档注释；具体模块职责和公开接口见详细设计第 3 节
 - 遵循统一的错误处理模式
 - 实现了完整的配置和目录校验逻辑
 - HTTP 请求处理确保内存安全
 
-### 关键修复
-- 修复了 HTTP 响应处理中的 use-after-free 问题
-- 确保守护进程在串行 HTTP 请求处理中的响应缓冲区生命周期稳定；worker pool 随后续阶段设计
+### 关键实现
+- Zap/facil.io 接管 HTTP 报文解析、连接生命周期和 worker 调度；NodeForge 只维护业务路由
+- preflight 先识别活跃 listener、再允许 `SO_REUSEADDR` 快速重启，避免重复监听与重启窗口冲突
+- catalog 已填写的 SHA-256 字段会执行格式校验
 
-### 验证结果
-- ✓ `nodeforged --check-config` 配置校验通过
-- ✓ `nodeforge status` 状态查询功能正常  
-- ✓ `nodeforge config validate` 配置验证功能正常
-- ✓ `nodeforge check` 服务健康检查功能正常
-- ✓ Rocky Linux 9.7 aarch64 远程环境部署验证通过
-- ✓ systemd 服务启动、停止、重启功能正常
-- ✓ HTTP 管理接口和 API 路由响应正常
+### 已验证能力
+- `nodeforged --check-config` 配置校验通过
+- `nodeforge status` 状态查询功能正常
+- `nodeforge config validate` 配置验证功能正常
+- `nodeforge check` 服务健康检查功能正常
+- Rocky Linux 9.7 aarch64 远程环境部署验证通过
+- systemd 服务启动、停止、重启功能正常
+- HTTP 管理接口和 API 路由响应正常
 
 ### M0 CLI 边界
 
@@ -264,6 +266,10 @@ nodeforge.mode=diskless nodeforge.node_id={{node_id}} nodeforge.config_url={{con
 ## 6. 核心对象模型
 
 NodeForge 的对象模型保持简单：配置对象描述“应该怎样”，运行态对象描述“现在怎样”。
+
+本章描述 M1-M7 的目标模型。M0 当前代码只实现其中的最小子集；准确的 M0 字段、直接
+`install_source`/`boot_bundle` 引用方式和校验范围以详细设计第 5 节为准，不能把本章的 DHCP、
+TFTP、hooks、network override 或 provisioning 字段当作 M0 已支持的配置。
 
 ### 6.1 配置对象
 
@@ -756,7 +762,7 @@ HTTP 是 NodeForge 的主要数据通道，负责 TFTP 之后的所有大内容�
 
 MVP 不再拆分 management listener 和 PXE listener。管理路由与 M3 PXE 数据路由逻辑分区，但共享同一个 HTTP listener。M0 当前只注册 `/healthz` 和管理路由；M3 才在同一 socket 提供裸机可通过 `server.server_ip` 访问的数据路由。本 listener 固定绑定 `0.0.0.0:<http.port>`；`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址，不作为 M0 HTTP bind 地址。服务端不按 peer 地址过滤管理请求，所有能到达该 listener 的 IPv4 客户端都可直接调用管理路由；`nodeforge` CLI 则固定连接 `127.0.0.1:<http.port>`，不提供远程 endpoint，只支持管理同机 `nodeforged`。这样可以减少 socket 生命周期、端口自检、路由注册和 CLI 连接配置的复杂度，前期把精力集中在 provisioning 主链路。
 
-HTTP 服务器基于 Zig 标准库 `std.http.Server` 实现。已评估 `http.zig`（karlseguin，纯 Zig，无 C 依赖）和 `zap`（基于 `facil.io`，性能最优但有 C 依赖）作为备选；MVP 选择标准库方案以避免外部依赖和版本跟踪风险，Range/ETag/流式文件在 `http/range.zig` 中基于 `std.http.Server.Request.respond()` 实现。若 M3 性能 spike 证明标准库不足，优先评估 `http.zig` 作为无 C 依赖的 adapter 替换。
+HTTP 服务器基于 Zap/facil.io 的固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力；M0 尚未注册静态资产或 Range 路由，M3 再将这些能力接入 NodeForge 路由。NodeForge 当前只维护业务路由、管理 API 和统一错误信封。已评估的纯 Zig `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 
 ## 8. 核心能力 A：PXE 无人值守自动安装
 
@@ -1616,8 +1622,8 @@ node-02  52:54:00:12:34:02  192.168.50.102  diskless  rootfs_mounted    ubuntu-2
 
 - 只支持 IPv4；不定义 IPv6 配置字段，不监听 DHCPv6，不在 initrd 中加入 IPv6 分支。
 - 一个 HTTP 实现只启动一个 listener，绑定 `0.0.0.0:http.port`；管理路由接受该 listener 上所有可达连接；CLI 管理客户端固定连接 `127.0.0.1:http.port`，只支持同机 `nodeforged`；不设置独立 `management_port`；`server.server_ip` 用于对外 URL、DHCP next-server、TFTP/HTTP 广告地址。
-- HTTP 服务器基于 Zig 标准库 `std.http.Server` 实现；已评估 `http.zig`（karlseguin，纯 Zig，无 C 依赖）和 `zap`（基于 `facil.io`，性能最优但有 C 依赖）作为备选。MVP 选择标准库方案以避免外部依赖和版本跟踪风险；Range/ETag/流式文件在 `http/range.zig` 中基于 `std.http.Server.Request.respond()` 实现。若 M3 性能 spike 证明标准库不足，优先评估 `http.zig` 作为无 C 依赖的 adapter 替换。
-- M0 启动前只检查配置/catalog 和唯一 HTTP 端口；UDP 67/69、权限、资产目录、TFTP、DHCP resolver、repository 和 state 检查随对应阶段补齐。
+- HTTP 服务器基于 Zap/facil.io 的固定提交实现；Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力。M0 尚未注册静态资产或 Range 路由，M3 再接入；NodeForge 当前只维护业务路由、管理 API 和统一错误信封。纯 Zig `http.zig` 的 Zig 0.16 分支尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
+- M0 的 `nodeforged --check` 在启动前检查配置/catalog 和唯一 HTTP 端口；正常启动不以预检替代实际 bind，仍由 Zap `listen()` 处理竞态和端口冲突。UDP 67/69、权限、资产目录、TFTP、DHCP resolver、repository 和 state 检查随对应阶段补齐。
 - 随软件包提供 `packaging/systemd/nodeforged.service`；CLI 不重复封装 `systemctl`；M0 需要通过 Rocky 9.7 aarch64 systemd 验证。
 - ISO 导入自动发布本地 HTTP yum/dnf/apt 基础源并绑定 repository；repo GPG 检查默认关闭，只有显式启用才校验 key。
 - rootfs HTTP 下载支持 Range/If-Range 断点续传和最终 SHA256 校验。
@@ -1849,23 +1855,3 @@ NodeForge 的核心不是"写一个 DHCP/TFTP/HTTP 服务器"，而是把裸机�
 - RuntimeState 和 events.jsonl 负责让过程可诊断、可追踪。
 
 这样可以在较小实现面内完成 PXE 自动安装、无盘系统和补充后处理三条关键链路。
-
-## 20. 最近变更记录
-
-### 2026-07-10 M0 代码完善与验证
-
-**代码质量改进**:
-- 完成所有核心模块的详细文档注释
-- `model.zig` 公共类型和字段完整注释
-- `http/server.zig` 关键函数行为说明
-- `config/validate.zig` 校验顺序和限制条件明确化
-
-**关键修复**:
-- 修复 `http/server.zig` `json()` 函数 use-after-free 问题 - 确保守护进程处理 HTTP 请求的稳定性
-
-**验证结果**:
-- Rocky Linux 9.7 aarch64 远程环境部署验证通过
-- systemd 服务管理功能完整
-- 所有 M0 CLI 命令功能正常
-- HTTP 管理接口和 API 响应稳定
-- M0 单 HTTP listener 设计验证通过
