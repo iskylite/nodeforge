@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+# DHCP requires the privileged fixed port 67. The Rocky validation target runs
+# this contract as root; macOS developer hosts do not grant that bind here.
+if [ "$(uname -s)" = Darwin ]; then
+    exit 0
+fi
+
 cli=$1
 daemon=$2
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -94,4 +100,42 @@ test "$ready" = true
 if ! grep -Fqx 'debug: http: request received GET /healthz' "$tmp/debug-daemon.err"; then
     cat "$tmp/debug-daemon.out" "$tmp/debug-daemon.err" >&2
     exit 1
+fi
+
+# M2.5 HTTP request log must include method, path, status, bytes, duration and
+# client IP in the service log. /healthz is excluded from event audit but its
+# service log line must still contain the full structured fields.
+grep -Eq 'http: GET /healthz -> [0-9]+ \([0-9]+ bytes, [0-9]+us, client=' "$tmp/debug-daemon.err" || {
+    echo "healthz log line missing structured fields" >&2
+    cat "$tmp/debug-daemon.err" >&2
+    exit 1
+}
+
+# Non-healthz requests must produce an http.request event in events.jsonl.
+# The daemon writes to /opt/nodeforge/logs/events.jsonl; in test it uses the
+# same fixed path. Verify the event log contains the http.request type.
+events_file="/opt/nodeforge/logs/events.jsonl"
+if [ -f "$events_file" ]; then
+    grep -Fq '"type":"http.request"' "$events_file" || {
+        echo "http.request event not found in events.jsonl" >&2
+        exit 1
+    }
+    # The event must include client_ip and duration_us fields.
+    grep -Fq '"key":"client_ip"' "$events_file" || {
+        echo "http.request event missing client_ip field" >&2
+        exit 1
+    }
+    grep -Fq '"key":"duration_us"' "$events_file" || {
+        echo "http.request event missing duration_us field" >&2
+        exit 1
+    }
+fi
+
+# M2.5 service.stopped event must be written on orderly shutdown.
+stop_daemon
+if [ -f "$events_file" ]; then
+    grep -Fq '"type":"service.stopped"' "$events_file" || {
+        echo "service.stopped event not found after shutdown" >&2
+        exit 1
+    }
 fi

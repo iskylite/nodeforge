@@ -14,6 +14,7 @@ pub const preflight = @import("preflight.zig");
 pub const runtime_state = @import("state/runtime.zig");
 pub const catalog_runtime = @import("state/catalog_runtime.zig");
 pub const events = @import("state/events.zig");
+pub const event_types = @import("state/event_types.zig");
 pub const dhcp_store = @import("state/dhcp_store.zig");
 pub const management_client = @import("http/client.zig");
 pub const management = @import("http/management.zig");
@@ -28,6 +29,7 @@ pub const asset_validate = @import("assets/validate.zig");
 pub const grub = @import("boot/grub.zig");
 pub const observe_error = @import("observe/error.zig");
 pub const observe_log = @import("observe/log.zig");
+pub const log_backend = @import("observe/log_backend.zig");
 pub const cli_table = @import("cli/table.zig");
 pub const cli_output = @import("cli/output.zig");
 pub const cli_views = @import("cli/views.zig");
@@ -46,6 +48,7 @@ test {
     _ = runtime_state;
     _ = catalog_runtime;
     _ = events;
+    _ = event_types;
     _ = dhcp_store;
     _ = management_client;
     _ = management;
@@ -60,7 +63,12 @@ test {
     _ = grub;
     _ = observe_error;
     _ = observe_log;
+    _ = log_backend;
     _ = cli_table;
     _ = cli_output;
     _ = cli_views;
 }
+const std = @import("std");
+const log_backend_impl = @import("observe/log_backend.zig");
+
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = log_backend_impl.logFn };

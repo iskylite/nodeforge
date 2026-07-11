@@ -17,6 +17,8 @@ pub const AppConfig = struct {
     dhcp: DhcpConfig = .{},
     /// 服务日志等级；daemon `--debug` 可在本次启动临时覆盖为 debug。
     logging: LoggingConfig = .{},
+    /// 业务事件审计流的轮转策略。
+    events: EventsConfig = .{},
     /// 受支持的发行版及版本矩阵。
     distros: []const DistroConfig = &.{},
     /// 节点可绑定的安装、无盘或发现策略。
@@ -95,10 +97,39 @@ pub const DhcpConfig = struct {
 pub const LoggingConfig = struct {
     /// 日常输出 info；debug 额外输出连接和协议诊断。
     level: LogLevel = .info,
+    /// 可选的附加文件 sink；stderr/journal 始终保留。
+    file: ?FileLogConfig = null,
 };
 
 /// 可配置的服务日志等级。
-pub const LogLevel = enum { info, debug };
+pub const LogLevel = enum {
+    debug,
+    info,
+    warn,
+    err,
+
+    pub fn toStdLevel(self: LogLevel) @import("std").log.Level {
+        return switch (self) {
+            .debug => .debug,
+            .info => .info,
+            .warn => .warn,
+            .err => .err,
+        };
+    }
+};
+
+/// 追加写入的服务日志文件策略。
+pub const FileLogConfig = struct {
+    path: []const u8,
+    max_size_mb: u16 = 50,
+    keep: u8 = 3,
+};
+
+/// 追加型 Event v2 JSONL 审计流的轮转策略。
+pub const EventsConfig = struct {
+    max_size_mb: u16 = 100,
+    keep: u8 = 5,
+};
 
 /// 首期支持的处理器架构；生产优先 x86_64，开发验证优先 aarch64。
 pub const Arch = enum { x86_64, aarch64 };

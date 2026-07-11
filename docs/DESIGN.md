@@ -40,6 +40,7 @@ NodeForge 是一个面向小型 Linux 集群和实验室环境的轻量级 OS Pr
 | 节点差异化 | profile 提供部署默认值，node 提供身份、IP、hostname、网络和模板变量等覆盖；IP 本身不触发部署动作 |
 | 未知节点默认行为 | 默认进入等待/观察态；可显式配置安全 discovery 或临时无盘；未知节点永远不能直接自动安装 |
 | CLI | M0 只提供状态、健康检查和本地 config/catalog 工具；M1+ 按对象来源和生命周期加入 daemon 驱动的导入/构建/发布、运行期高频、批量和观测 CLI/API；使用成熟 CLI 解析库并支持分级帮助 |
+| 可观测性 | M2.5 统一服务日志、Event v2 和本机事件查询；服务日志是诊断输出，events JSONL 是可查询审计，后续阶段只能复用同一 writer/注册表 |
 | 输出 | 默认面向人类阅读，分组和表格化；机器消费显式使用 `--output json` |
 
 ## 2. 定位、边界与支持矩阵
@@ -98,7 +99,7 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 - **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 只做 status/check、config/catalog 校验与导出、离线 config import。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
 - **CLI 使用成熟库**：命令解析、帮助信息、参数类型、默认值和错误提示使用固定版本的开源 CLI 库。MVP 固定使用支持 Zig 0.16.0 的 `zli v5.1.2`；命令、子命令、flag、位置参数和说明只在命令树中声明一次，解析与分级帮助从同一份声明生成。zli 只承载 CLI 语法和展示，不承载复杂业务配置模型。
 - **CLI 帮助可达**：顶层、每个资源命令和每个子命令都必须支持 `-h/--help`，显示用途、参数和默认值；长示例保留在 README 和运维文档，不塞进帮助页。
-- **日志与排障**：M0 服务日志默认使用 `logging.level = "info"` 输出 stderr/journal；配置可设为 `debug`，`nodeforged -d/--debug` 可仅覆盖本次启动。CLI 叶子命令的 `-d/--debug` 在简短错误后显示内部原因。服务日志、业务事件和 CLI 错误分别输出，且任何等级都不得记录密码、token、完整请求体或节点上传的大日志。
+- **日志与排障**：M0–M2 的 stderr/journal 行为在 M2.5 统一迁移为带时间、等级、scope 的标准库日志后端；配置支持 `debug/info/warn/err` 和可选文件轮转，`nodeforged -d/--debug` 仅覆盖本次启动。M2.5 的 Event v2 是本地可查询审计契约，所有后续协议、installer、initrd 与 runner 复用同一注册表和 writer。服务日志、业务事件和 CLI 错误分别输出，且任何等级都不得记录密码、token、完整请求体或节点上传的大日志。
 - **输出可读优先**：面向人的默认输出必须分组、对齐、标注状态和时间；机器消费使用显式 `--output json`。
 
 ## 2.5 M0 实现状态
@@ -159,7 +160,7 @@ M0 参数规则是命令局部而非 persistent/global：`nodeforge` 根命令�
 | TFTP 启动资产 | `tftp`、`asset` | `tftp_session` | `tftp show`、`tftp session list` | 节点能拉取 bootloader、配置、kernel、initrd |
 | DHCP 地址分配 | `dhcp`、`node`、`policy` | `lease`、`unknown_client` | `dhcp network update`、`dhcp pool update`、`runtime leases list` | 未知节点可获临时 lease，已登记节点拿正确 IP |
 | PXE 启动入口 | `node`、`profile`、`asset` | `node_status`、`event` | `node status`、`asset list` | DHCP 返回正确 `next-server` 和 `bootfile` |
-| HTTP 配置和资产 | `http`、`asset`、`profile` | `event` | `asset import`、`runtime events tail` | initrd/installer 能获取配置并上报事件 |
+| HTTP 配置和资产 | `http`、`asset`、`profile` | `event` | `asset import`、`events list/follow` | initrd/installer 能获取配置并上报事件 |
 | 基础数据关系 | `distro`、`repository`、`install_source`、`asset`、`rootfs`、`boot_bundle` | `event` | `distro show`、`repository validate`、`install-source validate`、`boot-bundle show` | 能展开 OS 版本、repo、kernel、initrd、rootfs 的引用关系 |
 | 自动安装 | `profile.install` | `node_status`、`event` | `install render`、`install status` | Ubuntu Server autoinstall 跑通，Rocky Linux 9.x kickstart 模板可渲染 |
 | 本地启动盘配置 | `profile.install.storage`、`profile.install.bootloader` | `node_status`、`event` | `install render`、`install status` | 可选择安装目标盘，创建 EFI/BIOS 引导分区并安装 bootloader |
@@ -167,7 +168,7 @@ M0 参数规则是命令局部而非 persistent/global：`nodeforge` 根命令�
 | boot bundle 校验 | `asset`、`rootfs`、`profile` | `event` | `rootfs validate`、`initrd validate` | kernel/initrd/rootfs 的版本、架构、kernel ABI 一致 |
 | 补充包和后处理 | `provisioning_bundle` | `node_status`、`event` | `provision bundle show/plan`、`provision status` | Kickstart、autoinstall、rootfs build、diskless 共用强类型步骤和清晰输出 |
 | 配置与目录持久化 | `config.json`、`catalog.json` | `runtime.json`、`events.jsonl` | `config validate/export/apply`、`asset/install-source/rootfs/initrd/boot-bundle import/build/publish` | 启动配置可重启加载；导入/构建/发布请求由 `nodeforged` 原子写入 catalog 并更新内存视图 |
-| 观测输出 | 无 | `node_status`、`event` | `node status`、`logs tail` | 输出分组、表格化，错误有摘要和下一步建议 |
+| 观测输出 | `logging`、`events` | `node_status`、`event` | `node status`、`events list/follow/types` | 输出分组、表格化，错误有摘要和下一步建议 |
 
 ## 5. 总体架构与数据流
 
@@ -299,6 +300,7 @@ const AppConfig = struct {
     tftp: TftpConfig,
     http: HttpConfig,
     logging: LoggingConfig,
+    events: EventsConfig,
     nodes: []NodeConfig,
     distros: []DistroConfig,
     profiles: []ProfileConfig,
@@ -1095,7 +1097,7 @@ pxe_seen
 | 管理 catalog（M1+） | CLI 发起请求，`nodeforged` 导入、构建、扫描、发布 | `nodeforged` 写入 catalog 并更新内存视图，运行期可见 | asset、repository、install source、rootfs、initrd、boot bundle |
 | 批量初始化（M1+） | CLI 导入清单，`nodeforged` 校验和落盘 | `nodeforged` 按对象写入 config/catalog/runtime，必要时提示重启 | 批量导入节点、资产 manifest、repository/install source 清单 |
 | 运行期常变对象（M1+） | CLI/API 请求，`nodeforged` 执行 | 在线生效或写入 runtime/catalog 后由服务读取 | 节点认领、节点 profile 绑定、未知节点策略开关、租约/会话操作 |
-| 观测排障 | CLI/API | 只读 | status、node status、events tail、leases list、logs tail |
+| 观测排障 | CLI/API | 只读 | status、node status、events list/follow、leases list、journal 或本地文件日志 |
 
 CLI 不应为每个配置字段都设计一个长参数。对于复杂对象，优先支持：
 
@@ -1174,7 +1176,7 @@ sequenceDiagram
 
 `config.json` 是启动配置和人工声明策略的事实源，M0 当前实际读取 server、http、logging、distros、profiles、nodes 和 policy 字段；DHCP/TFTP 与 provisioning 字段属于 M1+ schema 扩展。`catalog.json` 是 NodeForge 管理目录的事实源，M0 只读取、导出和校验；M1+ 才记录 asset、repository、install source、rootfs、initrd、boot bundle 等导入、构建、扫描、发布结果。二者都使用 JSON、都必须整体校验并原子写回；catalog 写入始终只允许由 `nodeforged` 执行。
 
-MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。`runtime.json` 属于运行态，`events.jsonl` 属于事件历史；M0 服务日志只进入 stderr/systemd journal，文件日志输出属于后续阶段能力。
+MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。`runtime.json` 属于运行态，`events.jsonl` 属于事件历史；M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。服务日志默认进入 stderr/systemd journal，配置文件 sink 时同时写入受限权限的轮转文件。
 
 默认安装根为 `/opt/nodeforge`，代码中只在统一路径定义处声明一次，其他默认路径全部派生。完整的目录布局、系统集成点和仓库目录结构见第 14 章。
 
@@ -1184,16 +1186,23 @@ NodeForge 区分三类输出，避免把服务日志、业务事件和深度调�
 
 | 类型 | 默认位置 | 内容 | 日常级别 |
 | --- | --- | --- | --- |
-| 服务日志 | stderr / systemd journal | 启动、配置校验、preflight、监听地址、HTTP 请求摘要、错误摘要 | `info` 及以上 |
-| 业务事件（M1+） | `/opt/nodeforge/logs/events.jsonl` | 节点阶段、DHCP/TFTP/HTTP/install/diskless 事件，便于 `jq` 和采集工具处理 | 结构化事件 |
-| 深度调试 | `logging.level=debug` 或 `nodeforged -d` 的 stderr / journal | 连接建立/关闭、协议细节、后续 DHCP/TFTP 报文摘要、内部状态转移 | `debug` |
+| 服务日志 | stderr / systemd journal；可选 `/opt/nodeforge/logs/nodeforged.log` | 启动、配置校验、监听、协议与 HTTP 请求摘要、错误摘要 | `debug/info/warn/err` |
+| 业务事件（M2.5+） | `/opt/nodeforge/logs/events.jsonl` 及轮转文件 | DHCP/TFTP/HTTP/install/diskless/provisioning 事件，便于 CLI 和采集工具处理 | Event v2 结构化字段 |
+| CLI 错误 | 调用终端 stderr | 一行简短错误；`-d` 时附内部原因 | 不进入服务日志或事件 |
 
-M0 服务端必须输出 HTTP access log 摘要，至少包含 method、path 和 status。日常运行不记录完整请求体、不打印密钥/密码、不把节点上传的大日志直接写入服务日志；节点日志摘要走专用 API 或事件链路。
+M0 服务端必须输出 HTTP access log 摘要，至少包含 method、path 和 status；M2.5 将其扩展为 socket
+client IP、响应字节数、单调耗时和 `http.request` event。日常运行不记录完整请求体、不打印密钥/密码、
+不信任 `X-Forwarded-For`，也不把节点上传的大日志直接写入服务日志；M3 的节点日志摘要经长度、类型和
+身份校验后映射到受限 Event v2。
 
 M0 使用两个互补的 debug 开关：`config.json` 的 `logging.level` 控制常驻 daemon 日志等级；
 `nodeforged -d/--debug` 只覆盖本次启动，适合 systemd 外的临时诊断。`nodeforge` 叶子命令的
 `-d/--debug` 只影响该次命令的错误细节，不改变 daemon 等级。默认 CLI 错误格式为
 `error: <类别>: <简短原因>: <路径>`；debug 时另起一行输出底层 error tag。
+
+M2.5 后，`nodeforge events list/follow/types` 只读本机 events 文件和轮转文件；human view 复用 CLI
+formatter，`list --output json` 输出 JSON array，`follow --output json` 输出 JSONL。服务日志不提供新的
+远程采集或 NodeForge `logs tail` API：日常读取使用 journalctl 或已配置的本地文件。
 
 ### 9.7 最小配置示例
 
@@ -1207,6 +1216,10 @@ M0 使用两个互补的 debug 开关：`config.json` 的 `logging.level` 控制
   },
   "logging": {
     "level": "info"
+  },
+  "events": {
+    "max_size_mb": 100,
+    "keep": 5
   },
   "dhcp": {
     "mode": "authoritative",
@@ -1476,8 +1489,8 @@ M0 的实际命令面以 2.5 “M0 CLI 边界”为准。下表仅前两行是 M
 | `nodeforge diskless ...` | `diskless status/retry`、`diskless overlay update` | 查看无盘启动状态，配置 overlay |
 | `nodeforge boot ...` | `boot render <node>`、`boot default render` | 预览 GRUB/PXELINUX 节点配置和安全兜底配置 |
 | `nodeforge provision ...` | `provision bundle list/show/create/validate/publish/plan`、`provision step add/remove`、`provision status` | 管理补充包、文件和后处理步骤 |
-| `nodeforge runtime ...` | `runtime status`、`runtime events tail`、`runtime leases list`、`runtime unknown list`、`runtime sessions list` | 查看运行态和事件 |
-| `nodeforge logs ...` | `logs tail/show` | 查看守护进程和节点相关日志 |
+| `nodeforge runtime ...` | `runtime status`、`runtime leases list`、`runtime unknown list`、`runtime sessions list` | 查看运行态 |
+| `nodeforge events ...` | `events list/follow/types` | 本机读取 Event v1/v2 历史、实时跟踪并发现注册事件类型 |
 
 `profile` 和 `provisioning bundle` 的完整定义不强行拆成大量 `add/update --field` 参数；创建和大范围修改优先通过配置文件或配置片段完成。`repository`、`install-source`、`rootfs`、`initrd`、`boot-bundle` 则优先通过 CLI 的 import/build/package/publish 命令请求 `nodeforged` 生成和更新 catalog，并提供 `show/validate/plan/render` 等可视化和校验入口。
 
@@ -1512,9 +1525,9 @@ nodeforge boot-bundle publish ubuntu-22.04-x86_64-5.15.0-xx-diskless-20260706 --
 nodeforge diskless overlay update ubuntu-22.04-diskless --tmpfs-size 50%
 nodeforge diskless status node-01
 
-nodeforge runtime events tail --node node-01
+nodeforge events list --node node-01
+nodeforge events follow --type install.failed
 nodeforge runtime leases list
-nodeforge logs tail --node node-01
 nodeforge config validate
 ```
 
@@ -1580,46 +1593,17 @@ node-02  52:54:00:12:34:02  192.168.50.102  diskless  rootfs_mounted    ubuntu-2
 
 ### 10.7 events.jsonl
 
-`events.jsonl` 是 JSON Lines：文件中每一行都是一个独立 JSON 对象。
-
-使用 JSONL 的原因：
-
-- 追加写简单。
-- 单行损坏不影响其他事件。
-- 可用 `tail`、`jq`、日志采集工具查看。
-- 适合 CLI 回放节点流程和故障定位。
-
-示例：
+`events.jsonl` 是追加型 JSON Lines 审计流；M2.5 起由 daemon 内唯一 writer 写入 Event v2。每行具有
+`v`、RFC 3339 UTC `ts`、`type`、人类摘要 `message` 和字符串 key/value `fields`，例如：
 
 ```json
-{"ts":"unix:1783332000","node":"node-01","type":"dhcp.discover","mac":"52:54:00:12:34:01"}
-{"ts":"unix:1783332001","node":"node-01","type":"tftp.rrq","file":"grubx64.efi"}
-{"ts":"unix:1783332005","node":"node-01","type":"boot.initrd_started"}
-{"ts":"unix:1783332140","node":"node-01","type":"install.packages","progress":63}
+{"v":2,"ts":"2026-07-11T08:30:00Z","type":"dhcp.ack","message":"DISCOVER -> ACK","fields":[{"key":"mac","value":"52:54:00:aa:bb:cc"},{"key":"ip","value":"192.168.27.10"},{"key":"xid","value":"0x1234abcd"},{"key":"kind","value":"discover"}]}
 ```
 
-常见事件类型：
-
-- `config.updated`
-- `dhcp.discover`
-- `dhcp.offer`
-- `dhcp.ack`
-- `dhcp.release`
-- `dhcp.decline`
-- `dhcp.lease_expired`
-- `tftp.rrq`
-- `http.asset_download`
-- `boot.initrd_started`
-- `install.config_fetched`
-- `install.partitioning`
-- `install.packages`
-- `install.bootloader`
-- `install.completed`
-- `diskless.rootfs_download_started`
-- `diskless.rootfs_verified`
-- `diskless.rootfs_mounted`
-- `diskless.running`
-- `node.error`
+活动文件按大小轮转为 `events.jsonl.N`；读取器兼容 M2 产生的 v1 `unix:<seconds>` 记录，忽略活动文件
+末尾的崩溃半行。`nodeforge events list/follow/types` 是唯一的 NodeForge 查询入口：list 扫描保留文件，
+follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、写入顺序和节点上报 DTO 由详细设计 §7.5
+统一规定；M3–M7 不得直接 append 原始客户端 JSON 或建立新的事件格式。
 
 ## 11. 安全设计
 
@@ -1712,7 +1696,8 @@ node-02  52:54:00:12:34:02  192.168.50.102  diskless  rootfs_mounted    ubuntu-2
     runtime.json
   logs/
     events.jsonl
-    nodeforged.log          # M1+ 可选文件日志；M0 只输出 stderr/systemd journal
+    events.jsonl.1          # M2.5+ 轮转文件，最多保留 events.keep 个
+    nodeforged.log          # M2.5+ 可选文件 sink；默认仍输出 stderr/systemd journal
   assets/
     iso/
     images/
@@ -1805,8 +1790,8 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 - 无盘 `squashfs_overlay` 的 overlay tmpfs 大小限制能通过 profile 配置控制，并在 initrd 挂载时生效。
 - 至少能导入或打包一个 boot bundle，记录 kernel/initrd/rootfs 的 SHA256、版本和 profile 引用关系。
 - 至少能校验一个 initrd/rootfs 组合，包括 rootfs init 入口、kernel modules 匹配和 initrd 早期网络/overlay 能力。
-- `events.jsonl` 能记录 DHCP、TFTP、HTTP、install、diskless 关键事件。
-- `nodeforge` CLI 能查看节点状态、启动阶段、租约、最近事件、安装/无盘错误摘要和服务日志。
+- `events.jsonl` 能以 Event v2 记录 DHCP、TFTP、HTTP、install、diskless、provisioning 关键事件，并兼容读取历史 v1。
+- `nodeforge events list/follow/types` 能查看最近事件、安装/无盘错误摘要和注册事件类型；服务日志通过 journal 或可选本地文件查看。
 - 配置文件校验通过后能被 `nodeforged` 启动加载；通过 CLI/API 应用的运行期变更需要写回 JSON 时保持原子性，重启后保持一致。
 - discovery profile 默认不执行破坏性安装。
 - `nodeforge check` 能验证唯一 HTTP listener、管理路由、TFTP、DHCP 配置、repository 和状态存储。

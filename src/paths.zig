@@ -39,6 +39,7 @@ pub const config_path = config_dir ++ "/config.json";
 pub const catalog_path = catalog_dir ++ "/catalog.json";
 pub const runtime_path = state_dir ++ "/runtime.json";
 pub const events_path = logs_dir ++ "/events.jsonl";
+pub const service_log_path = logs_dir ++ "/nodeforged.log";
 pub const service_path = systemd_dir ++ "/nodeforged.service";
 
 test "default paths are derived from the install root" {

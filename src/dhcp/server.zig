@@ -10,6 +10,7 @@ const runtime_state = @import("../state/runtime.zig");
 const dhcp_store = @import("../state/dhcp_store.zig");
 const events = @import("../state/events.zig");
 const observe_log = @import("../observe/log.zig");
+const log = std.log.scoped(.dhcp);
 pub const port = packet.server_port;
 /// Linux delivers `255.255.255.255:67` DHCP broadcasts only to a wildcard
 /// socket, not to one bound solely to `server.server_ip`.  Bind wildcard on
@@ -36,20 +37,24 @@ pub fn bind(io: std.Io, server_ip: []const u8, bind_interface: ?[]const u8) !std
     return socket;
 }
 pub const Persistence = struct { allocator: std.mem.Allocator, runtime_path: []const u8, events_path: []const u8, writer: *events.Writer };
-pub fn serveSocket(io: std.Io, owned: std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence) !void {
+pub fn serveSocket(io: std.Io, owned: std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned;
     defer socket.close(io);
-    try serveSocketOn(io, &socket, config, runtime, persistence);
+    try serveSocketOn(io, &socket, config, runtime, persistence, stop);
 }
-pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence) !void {
+pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence, stop: ?*const std.atomic.Value(bool)) !void {
     while (true) {
+        if (if (stop) |flag| flag.load(.acquire) else false) return;
         var bytes: [1500]u8 = undefined;
-        const incoming = try socket.receive(io, &bytes);
+        const incoming = socket.receiveTimeout(io, &bytes, .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } }) catch |err| {
+            if (err == error.Timeout) continue;
+            return err;
+        };
         const request = packet.parse(incoming.data) catch |err| {
-            observe_log.debug("dhcp: dropped malformed packet: {t}", .{err});
+            log.debug("dropped malformed packet: {t}", .{err});
             continue;
         };
-        audit(io, persistence, requestEvent(request.message_type orelse .inform), request.message_type orelse .inform, request.mac(), 0);
+        audit(io, persistence, config, requestEvent(request.message_type orelse .inform), request.message_type orelse .inform, request.message_type orelse .inform, request.mac(), 0, request.xid, request.architecture);
         const reply = offerAfterProbe(io, config, runtime, &request, persistence) orelse {
             persist(io, persistence, runtime);
             continue;
@@ -64,14 +69,16 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const mode
             continue;
         };
         try socket.send(io, &target, encoded);
-        audit(io, persistence, switch (reply.kind) {
+        audit(io, persistence, config, switch (reply.kind) {
             .offer => "dhcp.offer",
             .ack => "dhcp.ack",
             .nak => "dhcp.nak",
-            else => "dhcp.reply",
-        }, reply.kind, request.mac(), reply.yiaddr);
+            else => "dhcp.request",
+        }, request.message_type orelse .inform, reply.kind, request.mac(), reply.yiaddr, request.xid, request.architecture);
         persist(io, persistence, runtime);
-        observe_log.info("dhcp: {t} -> {t} yiaddr={x}", .{ request.message_type orelse .inform, reply.kind, reply.yiaddr });
+        var reply_ip: [16]u8 = undefined;
+        const readable_ip = formatIp(&reply_ip, reply.yiaddr) catch "0.0.0.0";
+        observe_log.info("dhcp: {t} -> {t} yiaddr={s}", .{ request.message_type orelse .inform, reply.kind, readable_ip });
     }
 }
 
@@ -87,7 +94,7 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
             .clear => return reply,
             .occupied => {
                 _ = runtime.dhcp.decline(request.mac(), now(), config.dhcp.abandon_seconds);
-                audit(io, persistence, "dhcp.abandoned", .decline, request.mac(), reply.yiaddr);
+                audit(io, persistence, config, "dhcp.abandoned", request.message_type orelse .inform, .decline, request.mac(), reply.yiaddr, request.xid, request.architecture);
             },
             .unavailable => {
                 observe_log.err("dhcp: ping probe unavailable; refusing offer", .{});
@@ -163,14 +170,33 @@ fn persist(io: std.Io, persistence: ?*const Persistence, runtime: *runtime_state
     const p = persistence orelse return;
     dhcp_store.save(io, p.allocator, p.runtime_path, &runtime.dhcp, now()) catch |err| observe_log.err("dhcp: runtime persistence failed: {t}", .{err});
 }
-fn audit(io: std.Io, persistence: ?*const Persistence, event_type: []const u8, kind: packet.MessageType, mac: []const u8, ip: u32) void {
+fn audit(io: std.Io, persistence: ?*const Persistence, config: *const model.AppConfig, event_type: []const u8, request_kind: packet.MessageType, reply_kind: packet.MessageType, mac: []const u8, ip: u32, xid: u32, architecture: packet.Architecture) void {
     const p = persistence orelse return;
-    var msg: [160]u8 = undefined;
-    const text = std.fmt.bufPrint(&msg, "kind={t} mac={x} ip={x}", .{ kind, mac, ip }) catch return;
-    var ts: [32]u8 = undefined;
-    const stamp = std.fmt.bufPrint(&ts, "{s}{d}", .{ events.unix_timestamp_prefix, now() }) catch return;
-    p.writer.append(io, p.allocator, p.events_path, .{ .ts = stamp, .type = event_type, .message = text }) catch |err| observe_log.err("dhcp: event append failed: {t}", .{err});
+    var ip_text: [16]u8 = undefined;
+    const rendered_ip = std.fmt.bufPrint(&ip_text, "{d}.{d}.{d}.{d}", .{ (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255 }) catch return;
+    var xid_text: [12]u8 = undefined;
+    const rendered_xid = std.fmt.bufPrint(&xid_text, "0x{x:0>8}", .{xid}) catch return;
+    var mac_text: [17]u8 = undefined;
+    if (mac.len != 6) return;
+    const rendered_mac = std.fmt.bufPrint(&mac_text, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch return;
+    const decision = resolver.resolve(config, mac, architecture);
+    var fields = [_]events.Field{
+        .{ .key = "mac", .value = rendered_mac },
+        .{ .key = "ip", .value = rendered_ip },
+        .{ .key = "xid", .value = rendered_xid },
+        .{ .key = "kind", .value = @tagName(request_kind) },
+        .{ .key = "arch", .value = @tagName(architecture) },
+        .{ .key = "node_id", .value = "" },
+    };
+    const field_slice = if (decision.node_id) |node_id| blk: {
+        fields[fields.len - 1] = .{ .key = "node_id", .value = node_id };
+        break :blk fields[0..];
+    } else fields[0 .. fields.len - 1];
+    var message: [128]u8 = undefined;
+    const text = std.fmt.bufPrint(&message, "{t} -> {t} yiaddr={s}", .{ request_kind, reply_kind, rendered_ip }) catch return;
+    p.writer.appendWithFields(io, p.allocator, p.events_path, event_type, text, field_slice) catch |err| observe_log.err("dhcp: event append failed: {t}", .{err});
 }
+fn formatIp(buffer: *[16]u8, ip: u32) ![]const u8 { return std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{ (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255 }); }
 fn poolContains(config: *const model.AppConfig, ip: u32) bool {
     const first = parseIp(config.dhcp.pool_start) orelse return false;
     const last = parseIp(config.dhcp.pool_end) orelse return false;

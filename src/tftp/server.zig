@@ -18,6 +18,9 @@ const model = @import("../model.zig");
 const catalog_runtime = @import("../state/catalog_runtime.zig");
 const packet = @import("packet.zig");
 const runtime_state = @import("../state/runtime.zig");
+const events = @import("../state/events.zig");
+const observe_log = @import("../observe/log.zig");
+const log = std.log.scoped(.tftp);
 
 /// TFTP 标准监听端口（RFC 1350）；不暴露为配置或 CLI 参数。
 pub const port: u16 = 69;
@@ -33,9 +36,9 @@ const max_retries = 3;
 ///
 /// `config` 提供 TFTP asset root 路径；`catalog` 提供资产白名单快照；
 /// `runtime` 记录会话计数和活动列表。三者必须在 `serve` 的整个生命周期内保持有效。
-pub fn serve(io: std.Io, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState) !void {
+pub fn serve(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, stop: ?*const std.atomic.Value(bool)) !void {
     const socket = try bind(io, config.server.server_ip);
-    try serveSocket(io, socket, config, catalog, runtime);
+    try serveSocket(io, allocator, socket, config, catalog, runtime, event_writer, stop);
 }
 
 /// 绑定固定 UDP 69；供 daemon 在启动其他 listener 前确认 TFTP 可用。
@@ -49,13 +52,17 @@ pub fn bind(io: std.Io, server_ip: []const u8) !std.Io.net.Socket {
 ///
 /// 主循环：接收 UDP datagram -> 解析 TFTP 报文 -> 如果是 RRQ 则启动文件传输 ->
 /// 传输在当前线程串行完成（M1 单 worker 模型）。WRQ 返回 ERROR；其他类型返回 ERROR。
-pub fn serveSocket(io: std.Io, owned_socket: std.Io.net.Socket, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState) !void {
+pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned_socket;
     defer socket.close(io);
 
     while (true) {
+        if (if (stop) |flag| flag.load(.acquire) else false) return;
         var recv_buffer: [2048]u8 = undefined;
-        const incoming = try socket.receive(io, &recv_buffer);
+        const incoming = socket.receiveTimeout(io, &recv_buffer, .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } }) catch |err| {
+            if (err == error.Timeout) continue;
+            return err;
+        };
         var options: [max_options]packet.Option = undefined;
         const message = packet.parse(incoming.data, &options) catch {
             try sendError(&socket, io, &incoming.from, .illegal_operation, "invalid TFTP request");
@@ -64,8 +71,17 @@ pub fn serveSocket(io: std.Io, owned_socket: std.Io.net.Socket, config: *const m
         switch (message) {
             .rrq => |request| {
                 const session = runtime.tftp.begin(request.filename);
-                transfer(io, &incoming.from, request, config.tftp.asset_root, catalog) catch |err| {
+                log.info("RRQ {s}", .{request.filename});
+                const started = std.Io.Clock.awake.now(io);
+                emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.rrq", "TFTP read requested", 0, 0);
+                const bytes_sent = transfer(io, &incoming.from, request, config.tftp.asset_root, catalog) catch |err| {
                     runtime.tftp.finish(session, false);
+                    switch (err) {
+                        error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption =>
+                            observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, incoming.from, err }),
+                        else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
+                    }
+                    emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds());
                     const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
                         error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
                         error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
@@ -76,6 +92,8 @@ pub fn serveSocket(io: std.Io, owned_socket: std.Io.net.Socket, config: *const m
                     continue;
                 };
                 runtime.tftp.finish(session, true);
+                observe_log.info("tftp: transfer completed {s} ({d} bytes)", .{ request.filename, bytes_sent });
+                emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds());
             },
             .wrq => try sendError(&socket, io, &incoming.from, .access_violation, "write requests are disabled"),
             else => try sendError(&socket, io, &incoming.from, .illegal_operation, "expected RRQ"),
@@ -99,7 +117,7 @@ fn transfer(
     request: packet.Request,
     asset_root: []const u8,
     catalog: *catalog_runtime.CatalogRuntime,
-) !void {
+) !u64 {
     if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
     if (!isSafeRelativePath(request.filename) or !isManifestPath(catalog, request.filename))
         return error.FileNotAllowed;
@@ -141,6 +159,7 @@ fn transfer(
             awaitAck(&socket, io, remote, block, settings.timeout) catch |err| {
                 if (err == error.Timeout and attempts < max_retries) {
                     attempts += 1;
+                    log.warn("retransmit {s} block {d} attempt {d}/{d}", .{ request.filename, block, attempts, max_retries });
                     continue;
                 }
                 return err;
@@ -148,7 +167,7 @@ fn transfer(
             break;
         }
         offset += read;
-        if (read < settings.block_size) return;
+        if (read < settings.block_size) return offset;
         block +%= 1;
     }
 }
@@ -235,6 +254,21 @@ fn awaitAck(socket: *std.Io.net.Socket, io: std.Io, remote: *const std.Io.net.Ip
 fn sendError(socket: *std.Io.net.Socket, io: std.Io, remote: *const std.Io.net.IpAddress, code: packet.ErrorCode, message: []const u8) !void {
     var buffer: [512]u8 = undefined;
     try socket.send(io, remote, try packet.encodeError(&buffer, code, message));
+}
+
+fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remote: *const std.Io.net.IpAddress, filename: []const u8, event_type: []const u8, message: []const u8, bytes_sent: u64, duration_us: i64) void {
+    const target = writer orelse return;
+    var bytes_text: [20]u8 = undefined;
+    var duration_text: [20]u8 = undefined;
+    var client_ip: [64]u8 = undefined;
+    const fields = [_]events.Field{
+        .{ .key = "filename", .value = filename },
+        .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{bytes_sent}) catch "0" },
+        .{ .key = "client_ip", .value = std.fmt.bufPrint(&client_ip, "{f}", .{remote}) catch "unknown" },
+        .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
+    };
+    target.appendWithFields(io, allocator, @import("../paths.zig").events_path, event_type, message, &fields) catch |err|
+        observe_log.err("tftp: event append failed: {t}", .{err});
 }
 
 /// 拒绝绝对路径、空组件、`.`、`..` 和 Windows 分隔符。

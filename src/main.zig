@@ -8,6 +8,8 @@ const nodeforge = @import("nodeforge");
 const views = @import("nodeforge").cli_views;
 const cli_output = @import("nodeforge").cli_output;
 
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = nodeforge.log_backend.logFn };
+
 /// zli handler 共享的可变执行结果。
 /// handler 本身返回错误只用于传播内部故障；可预期的业务失败通过此状态返回退出码。
 const CliState = struct {
@@ -204,6 +206,20 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     }, showCurrentHelp);
     try asset.addCommands(&.{ try assetImportCommand(init_options), try assetListCommand(init_options), try assetShowCommand(init_options), try assetValidateCommand(init_options) });
 
+    const events = try zli.Command.init(init_options, .{
+        .name = "events",
+        .description = "Query local Event v1/v2 audit history",
+        .usage = "nodeforge events <list|follow|types> [options]",
+        .help = "Read the local daemon event stream and retained rotations without contacting the management API.",
+    }, showCurrentHelp);
+    const events_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List retained events" }, eventsListHandler);
+    try addEventsFilterFlags(events_list, true);
+    const events_follow = try zli.Command.init(init_options, .{ .name = "follow", .description = "Follow new events from the active file" }, eventsFollowHandler);
+    try addEventsFilterFlags(events_follow, false);
+    const events_types = try zli.Command.init(init_options, .{ .name = "types", .description = "List registered event types" }, eventsTypesHandler);
+    try addOutputFlag(events_types);
+    try events.addCommands(&.{ events_list, events_follow, events_types });
+
     try root.addCommands(&.{
         status,
         check,
@@ -214,6 +230,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         runtime,
         node,
         asset,
+        events,
     });
     return root;
 }
@@ -561,6 +578,235 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     if (config.value.nodes.len > rows.len) return error.TooManyNodes;
     for (config.value.nodes, 0..) |item, i| rows[i] = .{ .id = item.id, .mac = item.mac, .ip = item.ip orelse "-", .profile = item.profile };
     try views.nodes(ctx.writer, rows[0..config.value.nodes.len]);
+}
+
+const EventFilters = struct {
+    event_type: []const u8,
+    node: []const u8,
+    since: ?i64,
+    until: ?i64,
+    limit: usize,
+};
+
+fn eventsListHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const filters = eventFiltersFromContext(ctx, true) orelse return;
+    var rows: [1000]nodeforge.events.ReadEvent = undefined;
+    const result = readEvents(ctx.io, ctx.allocator, &filters, &rows) catch |err| {
+        try ctx.writer.print("error: events: cannot read local history ({t})\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (result.skipped != 0) {
+        var stderr_buffer: [128]u8 = undefined;
+        var stderr = std.Io.File.Writer.init(.stderr(), ctx.io, &stderr_buffer);
+        stderr.interface.print("warn: events: skipped {d} invalid record(s)\n", .{result.skipped}) catch {};
+        stderr.interface.flush() catch {};
+    }
+    if (output_json) {
+        try ctx.writer.writeByte('[');
+        for (rows[0..result.count], 0..) |event, index| {
+            if (index != 0) try ctx.writer.writeByte(',');
+            try std.json.Stringify.value(event, .{}, ctx.writer);
+        }
+        try ctx.writer.writeAll("]\n");
+        return;
+    }
+    var display: [1000]views.EventRow = undefined;
+    for (rows[0..result.count], 0..) |event, index| display[index] = .{
+        .ts = event.ts,
+        .event_type = event.@"type",
+        .node = eventNode(event) orelse "-",
+        .message = event.message,
+        .fields = try eventFields(ctx.allocator, event.fields),
+    };
+    try views.events(ctx.writer, display[0..result.count]);
+}
+
+/// A deliberately small follow implementation: it streams only newly appended
+/// records. On EOF it waits briefly, then reopens the path so rotations follow
+/// the new active inode without retaining an invalid descriptor.
+fn eventsFollowHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const filters = eventFiltersFromContext(ctx, false) orelse return;
+    const path = nodeforge.paths.events_path;
+    var offset: u64 = blk: {
+        var file = std.Io.Dir.cwd().openFile(ctx.io, path, .{}) catch |err| {
+            try ctx.writer.print("error: events: active file unavailable ({t})\n", .{err});
+            setExitCode(ctx, 1);
+            return;
+        };
+        defer file.close(ctx.io);
+        break :blk (try file.stat(ctx.io)).size;
+    };
+    while (true) {
+        var file = std.Io.Dir.cwd().openFile(ctx.io, path, .{}) catch |err| {
+            try ctx.writer.print("error: events: active file unavailable ({t})\n", .{err});
+            setExitCode(ctx, 1);
+            return;
+        };
+        defer file.close(ctx.io);
+        const stat = try file.stat(ctx.io);
+        if (stat.size < offset) offset = 0;
+        if (stat.size == offset) {
+            std.Io.sleep(ctx.io, .fromMilliseconds(200), .awake) catch {};
+            continue;
+        }
+        const length: usize = @intCast(stat.size - offset);
+        const bytes = try ctx.allocator.alloc(u8, length);
+        defer ctx.allocator.free(bytes);
+        _ = try file.readPositionalAll(ctx.io, bytes, offset);
+        offset = stat.size;
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var parsed = std.json.parseFromSlice(nodeforge.events.ReadEvent, ctx.allocator, line, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch continue;
+            defer parsed.deinit();
+            const event = parsed.value;
+            if (!eventMatches(event, &filters)) continue;
+            if (output_json) {
+                try std.json.Stringify.value(event, .{}, ctx.writer);
+                try ctx.writer.writeByte('\n');
+            } else try views.eventLine(ctx.writer, event.ts, event.@"type", try eventFields(ctx.allocator, event.fields), event.message);
+            try ctx.writer.flush();
+        }
+    }
+}
+
+fn eventsTypesHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    if (output_json) {
+        try ctx.writer.writeByte('[');
+        for (nodeforge.event_types.definitions, 0..) |definition, index| {
+            if (index != 0) try ctx.writer.writeByte(',');
+            try ctx.writer.print("{{\"name\":{f},\"description\":{f},\"default_level\":{f}}}", .{ std.json.fmt(definition.name, .{}), std.json.fmt(definition.description, .{}), std.json.fmt(@tagName(definition.default_level), .{}) });
+        }
+        try ctx.writer.writeAll("]\n");
+        return;
+    }
+    var rows: [nodeforge.event_types.definitions.len]views.EventTypeRow = undefined;
+    for (nodeforge.event_types.definitions, 0..) |definition, index| rows[index] = .{ .name = definition.name, .description = definition.description, .level = @tagName(definition.default_level) };
+    try views.eventTypes(ctx.writer, &rows);
+}
+
+fn addEventsFilterFlags(command: *zli.Command, comptime include_limit: bool) !void {
+    try command.addFlags(&.{
+        .{ .name = "type", .description = "Registered event type", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "node", .description = "Filter by node_id", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "since", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "until", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
+    });
+    if (include_limit) try command.addFlag(.{ .name = "limit", .description = "Latest matching records (1-1000)", .type = .Int, .default_value = .{ .Int = 100 } });
+    try addOutputFlag(command);
+}
+
+fn eventFiltersFromContext(ctx: zli.CommandContext, comptime has_limit: bool) ?EventFilters {
+    const event_type = ctx.flag("type", []const u8);
+    if (event_type.len != 0 and nodeforge.event_types.fromName(event_type) == null) {
+        ctx.writer.print("error: events: unknown event type '{s}'\n", .{event_type}) catch {};
+        setExitCode(ctx, 2);
+        return null;
+    }
+    const since_text = ctx.flag("since", []const u8);
+    const until_text = ctx.flag("until", []const u8);
+    const since = if (since_text.len == 0) null else parseEventTime(since_text) catch {
+        ctx.writer.print("error: events: invalid --since timestamp\n", .{}) catch {};
+        setExitCode(ctx, 2);
+        return null;
+    };
+    const until = if (until_text.len == 0) null else parseEventTime(until_text) catch {
+        ctx.writer.print("error: events: invalid --until timestamp\n", .{}) catch {};
+        setExitCode(ctx, 2);
+        return null;
+    };
+    const limit: usize = if (has_limit) @intCast(ctx.flag("limit", i32)) else 1000;
+    if (limit == 0 or limit > 1000) {
+        ctx.writer.print("error: events: --limit must be 1..1000\n", .{}) catch {};
+        setExitCode(ctx, 2);
+        return null;
+    }
+    return .{ .event_type = event_type, .node = ctx.flag("node", []const u8), .since = since, .until = until, .limit = limit };
+}
+
+const ReadResult = struct { count: usize, skipped: usize };
+
+fn readEvents(io: std.Io, allocator: std.mem.Allocator, filters: *const EventFilters, rows: []nodeforge.events.ReadEvent) !ReadResult {
+    var count: usize = 0;
+    var skipped: usize = 0;
+    var rotation: u8 = 20;
+    while (rotation > 0) : (rotation -= 1) {
+        const path = try std.fmt.allocPrint(allocator, "{s}.{d}", .{ nodeforge.paths.events_path, rotation });
+        defer allocator.free(path);
+        readEventFile(io, allocator, path, filters, rows, &count, &skipped) catch |err| if (err != error.FileNotFound) return err;
+    }
+    readEventFile(io, allocator, nodeforge.paths.events_path, filters, rows, &count, &skipped) catch |err| if (err != error.FileNotFound) return err;
+    if (count > filters.limit) {
+        const start = count - filters.limit;
+        std.mem.copyForwards(nodeforge.events.ReadEvent, rows[0..filters.limit], rows[start..count]);
+        count = filters.limit;
+    }
+    return .{ .count = count, .skipped = skipped };
+}
+
+fn readEventFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, filters: *const EventFilters, rows: []nodeforge.events.ReadEvent, count: *usize, skipped: *usize) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(100 * 1024 * 1024));
+    defer allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const event = std.json.parseFromSliceLeaky(nodeforge.events.ReadEvent, allocator, line, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+            skipped.* += 1;
+            continue;
+        };
+        if (!eventMatches(event, filters)) continue;
+        if (count.* == rows.len) return error.TooManyEvents;
+        rows[count.*] = event;
+        count.* += 1;
+    }
+}
+
+fn eventMatches(event: nodeforge.events.ReadEvent, filters: *const EventFilters) bool {
+    if (filters.event_type.len != 0 and !std.mem.eql(u8, event.@"type", filters.event_type)) return false;
+    if (filters.node.len != 0 and !(if (eventNode(event)) |node| std.mem.eql(u8, node, filters.node) else false)) return false;
+    const stamp = parseEventTime(event.ts) catch return false;
+    if (filters.since) |since| if (stamp < since) return false;
+    if (filters.until) |until| if (stamp > until) return false;
+    return true;
+}
+
+fn eventNode(event: nodeforge.events.ReadEvent) ?[]const u8 {
+    if (event.node) |node| return node;
+    for (event.fields) |field| if (std.mem.eql(u8, field.key, "node_id")) return field.value;
+    return null;
+}
+
+fn eventFields(allocator: std.mem.Allocator, fields: []const nodeforge.events.Field) ![]const u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    for (fields, 0..) |field, index| {
+        if (index != 0) try output.writer.writeByte(' ');
+        try output.writer.print("{s}={s}", .{ field.key, field.value });
+    }
+    return output.toOwnedSlice();
+}
+
+fn parseEventTime(value: []const u8) !i64 {
+    if (std.mem.startsWith(u8, value, nodeforge.events.unix_timestamp_prefix)) return std.fmt.parseInt(i64, value[nodeforge.events.unix_timestamp_prefix.len..], 10);
+    if (value.len != 20 or value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':' or value[19] != 'Z') return error.InvalidTimestamp;
+    const year = try std.fmt.parseInt(u16, value[0..4], 10);
+    const month = try std.fmt.parseInt(u8, value[5..7], 10);
+    const day = try std.fmt.parseInt(u8, value[8..10], 10);
+    const hour = try std.fmt.parseInt(u8, value[11..13], 10);
+    const minute = try std.fmt.parseInt(u8, value[14..16], 10);
+    const second = try std.fmt.parseInt(u8, value[17..19], 10);
+    if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 59) return error.InvalidTimestamp;
+    var days: i64 = 0;
+    var current: u16 = 1970;
+    while (current < year) : (current += 1) days += if (std.time.epoch.isLeapYear(current)) 366 else 365;
+    const month_days = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    for (month_days[0..month - 1], 0..) |count, index| days += @as(i64, count) + if (index == 1 and std.time.epoch.isLeapYear(year)) @as(i64, 1) else @as(i64, 0);
+    const maximum_day: u8 = month_days[month - 1] + if (month == 2 and std.time.epoch.isLeapYear(year)) @as(u8, 1) else @as(u8, 0);
+    if (day > maximum_day) return error.InvalidTimestamp;
+    return days * 86400 + @as(i64, day - 1) * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
 }
 
 /// 读取当前命令的输出格式并校验其值。

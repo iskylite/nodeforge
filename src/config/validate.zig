@@ -28,6 +28,9 @@ pub const ValidationError = error{
     InvalidDhcpOfferTime,
     InvalidDhcpAbandonTime,
     InvalidDhcpPingTimeout,
+    InvalidLogRotation,
+    InvalidEventsRotation,
+    InvalidLogFilePath,
     DhcpPoolOutsideSubnet,
     DhcpPoolOrder,
     NodeOutsideDhcpSubnet,
@@ -86,10 +89,21 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     if (config.http.asset_root.len == 0 or config.http.repository_root.len == 0)
         return error.EmptyAssetRoot;
     if (config.tftp.asset_root.len == 0) return error.EmptyTftpAssetRoot;
+    try validateObservability(config);
     try validateDhcp(&config.dhcp);
     try uniqueNamed(model.DistroConfig, config.distros);
     try uniqueNamed(model.ProfileConfig, config.profiles);
     try validateDistros(config);
+}
+
+fn validateObservability(config: *const model.AppConfig) ValidationError!void {
+    if (config.events.max_size_mb == 0 or config.events.keep == 0 or config.events.keep > 20)
+        return error.InvalidEventsRotation;
+    if (config.logging.file) |file| {
+        if (file.path.len == 0 or file.path[0] != '/') return error.InvalidLogFilePath;
+        if (file.max_size_mb == 0 or file.keep == 0 or file.keep > 20)
+            return error.InvalidLogRotation;
+    }
 }
 
 fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {

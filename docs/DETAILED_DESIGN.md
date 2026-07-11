@@ -28,6 +28,7 @@
 | M1 | TFTP 闭环 | M0 | 标准 TFTP client 可下载 x86_64/aarch64 启动文件 |
 | M1.5 | CLI 输出统一架构 | M0、M1 | human 输出统一分组/表格/详情格式，JSON 保持稳定机器接口 |
 | M2 | DHCP + PXE 闭环 | M0、M1 | 节点获得 lease 和正确 bootfile，并进入 bootloader |
+| M2.5 | 结构化日志与事件系统改进 | M0、M2 | 服务日志线程安全、结构化；事件 v2 带字段；CLI 事件查询 |
 | M3 | HTTP 资产、ISO 仓库和事件接口 | M0、资产模型 | 节点可获取配置/answer/rootfs/ISO repo，并上报事件 |
 | M4 | PXE 无人值守安装与基础后处理 | M1-M3 | Rocky Linux 9.7 aarch64、Ubuntu Server 22.04 LTS 安装和 `install_post` 跑通 |
 | M5 | 内存无盘启动与基础后处理 | M1-M3、基础 runner | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
@@ -52,6 +53,9 @@
 - M1 先实现正式 TFTP 只读服务，并用标准 TFTP client 验证 RRQ/OACK、重传和路径安全。
 - M1.5 在 M2 前收敛 CLI 展示层；它不改变 daemon API、配置或协议语义，但 M2+ 新命令必须复用其 formatter。
 - M2 再实现 DHCP 地址、架构识别和 bootfile 决策，最后与 M1 联调完整 PXE 入口。
+- M2.5 在 M2 后、M3 前改进日志和事件系统：将 `observe/log.zig` 迁移到 `std.log.scoped`，
+  引入 Event v2 结构化字段，补全 TFTP/HTTP 日志，并新增 CLI 事件查询命令。它不改变
+  daemon API 或协议语义，但为 M3+ 的 HTTP 事件接口和运行态审计提供基础。
 - M4/M5 交付基础 provisioning runner；M7 只增强 archive、script、firstboot 和诊断，不是安装或无盘链路的前置阻塞。
 
 ## 2. 代码结构总览
@@ -286,6 +290,7 @@ const AppConfig = struct {
     tftp: TftpConfig,
     http: HttpConfig,
     logging: LoggingConfig,
+    events: EventsConfig,
     nodes: []NodeConfig,
     distros: []DistroConfig,
     profiles: []ProfileConfig,
@@ -852,11 +857,17 @@ TFTP 探针、DHCP resolver、repository 和 state 检查在对应阶段实现�
 
 M0 日志策略：
 
+以下条目描述 M0 已交付时的行为；M2.5 会在不改变 M0 管理 API 和 CLI 错误契约的前提下替换其共享
+日志后端，并把 `LoggingConfig` 的可选字段和 `EventsConfig` 作为向后兼容的默认配置加载。
+
 - 默认日志后端使用 stderr；systemd 管理时进入 journal，不默认写 `/opt/nodeforge/logs/nodeforged.log`。
 - 日常 `info` 日志包含成功监听地址、每个 HTTP 请求的 method/path/status，以及配置、校验或预检失败的错误摘要。
 - `config.json` 的 `logging.level` 只接受 `info`（默认）和 `debug`。`nodeforged -d/--debug` 仅覆盖本次进程启动，优先于配置；它不写回配置文件。M0 当前的 debug 请求日志为 method/path；连接建立/关闭、DHCP/TFTP 报文摘要和更细协议诊断随对应服务阶段补齐，ReleaseSafe 也可使用。
 - `nodeforge` 的每个 M0 叶子命令支持 `-d/--debug`。默认只输出一行 `error: <类别>: <简短原因>: <路径>`；debug 模式在下一行追加内部错误标签，便于定位但不泄漏请求体、token 或密码。
 - M1+ 节点事件、安装阶段、无盘阶段等业务事件进入 `events.jsonl`，不与服务进程日志混为一个文件；M0 仅提供其基础类型和追加工具。
+
+M2.5 回归 M0 的 `--check-config`、`--check`、`status`、HTTP integration 与 systemd 快速重启用例，
+验证新后端不会改变已有 stdout/stderr CLI 错误、HTTP error envelope、端口预检或启动失败退出码。
 
 ### 4.7 测试
 
@@ -1020,6 +1031,10 @@ M1 的 `asset list`、`tftp session list` 等命令已经证明，直接在 hand
 以下内容**不**属于 formatter：服务端 journal 日志、`events.jsonl`、HTTP JSON error envelope、
 `config export`/`catalog export` 的原始 JSON，以及 `--output json`。这些输出保留既有
 机器消费语义，不能为了好看而重排或加 ANSI 控制字符。
+
+M2.5 新增的 `nodeforge events list/follow/types` 是该规则的边界案例：磁盘上的 JSONL 仍不经过
+formatter；只有 CLI 解析后的 EventRow human view 使用 `cli/table.zig` 或单行 renderer，JSON 模式保持
+v1/v2 事件的机器契约。
 
 ### 6.5.2 模块与依赖
 
@@ -1290,10 +1305,682 @@ daemon 变更 DHCP/node 声明；在线变更属于后续配置管理阶段。
 - 未知节点默认不执行安装或无盘启动。
 - 已登记节点能获得指定 IP。
 - DHCP 按 option 93 返回启动文件：UEFI x86_64 使用 `grubx64.efi`，UEFI aarch64 使用 `grubaa64.efi`。
-- `events.jsonl` 出现 `dhcp.discover`、`dhcp.offer`、`dhcp.ack`。
+- M2 已完成验收时，`events.jsonl` 出现 v1 的 `dhcp.discover`、`dhcp.offer`、`dhcp.ack`；M2.5 迁移后
+  同一验收改为验证对应 v2 事件及 `mac`、`ip`、`xid`、`kind` 字段，历史 v1 fixture 保留为兼容测试。
 - `r97n0` 受控验证另确认 `dhcp.abandoned` 与 `dhcp.release`；见 Rocky 验证记录。
 - 独立 VMware ARM UEFI 客户端在 `192.168.27.0/24` 实际消费 option 67 的
   `efi/grubaa64.efi`、完成 TFTP bootloader 传输并进入 GRUB 2.06；该实机记录见 Rocky 验证文档。
+
+## 7.5 M2.5：结构化日志与事件系统改进
+
+> **完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0` 完成验证。**
+> Event v2 writer、注册表、日志后端、DHCP/TFTP/HTTP 接线和 `nodeforge events` 本机查询均已落地；
+> 验证记录见 [`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md#m25-结构化日志与事件验证)。
+
+### 7.5.0 跨阶段重构范围与实施门槛
+
+M2.5 是对 M0–M2 共同基础设施的**横切重构**，不是仅向 DHCP 增加几个日志调用。它不改变
+DHCP/TFTP/HTTP 的线协议、配置/catalog 事实源或 M0 管理路由语义，但会替换这些阶段共享的日志、
+事件、应用生命周期和 CLI 读取边界。后续 M3–M7 必须建立在该契约上，不得各自创建新的 event writer、
+JSONL 格式或节点日志文件。
+
+| 阶段 | 必须调整的既有边界 | M2.5 完成后的责任 |
+| --- | --- | --- |
+| M0 / 公共骨架 | `model.zig`、配置校验、`paths.zig`、三个 root module、`app.zig` 生命周期 | 配置并初始化日志后端和唯一 EventWriter；在启动所有 worker 前完成初始化，在可控退出时 flush/close 并写 `service.stopped` |
+| M1 / TFTP | `tftp/server.zig`、session 状态和 M1 集成测试 | 使用 `.tftp` scope 和共享 writer；RRQ、成功、超时/重传、失败与路径拒绝遵守 v2 字段和等级契约 |
+| M1.5 / CLI | `cli/views.zig`、`cli/output.zig`、CLI contract tests | 原始 JSONL 不经过 formatter；`nodeforge events` 把解析后的 EventRow 作为新的 typed view，human 输出复用 formatter |
+| M2 / DHCP | `dhcp/server.zig` 的 `audit()`、持久化错误路径和 M2 fixture | 删除 v1 message 拼接；共享 writer 写 v2，保留协议响应语义；M2 已完成验收中的 v1 文件样例作为升级兼容 fixture |
+| M3 / HTTP | access log、节点事件/日志摘要接收、静态资产路由 | HTTP access 只产生 `http.request`；节点上报经受限 DTO 验证后映射到注册事件，不能把客户端 JSON 原样追加到 JSONL |
+| M4 / M5 | installer hook、firstboot、小 initrd、`node_status` | 安装和无盘阶段从注册表选择事件类型；先更新运行态，再尝试追加事件；失败摘要受同一长度与脱敏限制 |
+| M6 / M7 | 错误分类、provision runner、script/archive 输出 | 错误 code 映射为 err/warn 与稳定事件；脚本 stdout/stderr 只保留有界摘要，不能绕过事件/服务日志边界 |
+
+共享依赖方向固定如下：
+
+```text
+protocol / runner
+  -> std.log.scoped(service diagnostics)
+  -> Observability.emit(EventType, message, fields)
+       -> state/events.Writer (唯一 JSONL writer)
+
+CLI events reader
+  -> rotated events.jsonl files (只读、兼容 v1/v2)
+```
+
+`Observability` 由 `app.zig` 创建并把 writer 指针传给 DHCP、TFTP、HTTP 和后续 runner；协议模块不得
+自行打开日志文件、创建第二个 mutex 或依赖 CLI 包。日志/事件写入失败只记录诊断和计数，**不得**改变
+已经确定的 DHCP reply、TFTP ERROR、HTTP response 或运行态状态转移，避免可观测性故障反向造成 PXE
+服务不可用。
+
+M0 当前 worker 可 detach 的实现不能满足“关闭时 drain/写 stopped event”的新契约。M2.5 的前置改造是
+引入最小 shutdown coordinator：收到退出请求后停止接收新工作、关闭 listener/socket、等待已启动 worker
+退出、flush 日志和事件 writer，最后释放后端。`service.started` 只能在 HTTP、TFTP、DHCP 均成功就绪后
+写入；初始化失败或不可控进程终止不伪造 `service.stopped`。这项生命周期改造先于任何协议日志迁移。
+
+### 7.5.1 背景与问题
+
+M0–M2 阶段建立了基础日志（`observe/log.zig`）和事件写入器（`state/events.zig`），但随着
+DHCP/TFTP/HTTP 三个协议 worker 并发运行，暴露出以下不足：
+
+**服务日志（`observe/log.zig`）：**
+
+| 问题 | 说明 |
+| --- | --- |
+| 使用 `std.debug.print` | 虽然 Zig 0.16 会串行化 stderr，但没有统一的 scope、时间戳、运行期过滤或可组合后端；无法保证 stderr 与文件 sink 作为同一条记录写入 |
+| 无时间戳 | 日志行不含时间，无法关联事件和排查时序 |
+| 无模块/作用域标识 | 所有日志混在一起，无法区分来源（dhcp/http/tftp/app） |
+| 只有 info/debug 两级 | 缺少 warn 级别；error 级别不与 `std.log` 体系对齐 |
+| 无文件后端 | 仅输出到 stderr，systemd 下依赖 journal；无法独立轮转文件日志 |
+| 无轮转 | 事件文件 `events.jsonl` 无限增长，无大小限制和自动截断 |
+
+**事件日志（`state/events.zig`）：**
+
+| 问题 | 说明 |
+| --- | --- |
+| 事件缺少结构化字段 | DHCP 事件把 `mac`、`ip`、`kind` 拼接进 `message` 字符串，无法被消费者程序化过滤 |
+| 时间戳格式非标准 | 使用 `unix:<UTC seconds>` 字符串，不是 ISO 8601，外部工具解析不便 |
+| HTTP 请求无事件 | HTTP 请求仅记 info 日志，不写事件，无法审计请求历史 |
+| TFTP 完全无日志/事件 | TFTP 传输成功和失败均无任何记录 |
+| 无查询接口 | `events.jsonl` 只能手动 `tail -f` / `grep`，无法按类型、节点、时间范围过滤 |
+
+**HTTP 请求日志：**
+
+| 问题 | 说明 |
+| --- | --- |
+| 缺少客户端 IP | 当前仅记录 method/path/status，无法定位请求来源 |
+| 缺少响应大小和耗时 | 无法评估传输性能和诊断慢请求 |
+| Zap 内置 `http_write_log` 未启用 | facil.io 有完整的 access log 实现，但被禁用 |
+
+### 7.5.2 设计目标
+
+1. **线程安全**：多 worker 并发日志与事件不交错；正常运行中，后端接受的记录不被静默丢弃。
+2. **结构化**：服务日志带时间戳、级别、作用域；事件日志带结构化 key-value 字段。
+3. **可配置**：日志级别、输出后端（stderr/file/journal）、文件轮转大小可配置。
+4. **可查询**：提供 CLI 命令查询和过滤事件，支持 human 和 JSON 两种输出。
+5. **不引入外部依赖**：自研实现，基于 Zig 标准库 `std.log`、`std.Io`、`std.fs` 和 `std.json`；不引入 `zlog`、Zap/facil.io 日志或其他日志库。
+6. **边界清晰**：服务日志用于进程诊断；`events.jsonl` 用于可查询的业务审计。两者可以描述同一次操作，但不得互相作为事实源或恢复来源。
+
+本阶段不增加 daemon HTTP 管理 API。`nodeforge events` 是本机只读文件消费者，直接读取
+`/opt/nodeforge/logs/events.jsonl` 及其轮转文件；它不写入事件文件、不绕过 daemon 修改任何运行态。
+安装包必须让执行 `nodeforge` 的受信任运维用户对日志目录具有只读权限。
+
+### 7.5.3 服务日志改进
+
+#### 7.5.3.1 基于 `std.log.scoped` 的日志门面
+
+将 `observe/log.zig` 从 `std.debug.print` 迁移到 `std.log.scoped`：
+
+```zig
+const std = @import("std");
+
+pub const log = std.log.scoped(.nodeforge);
+
+pub fn info(comptime format: []const u8, args: anytype) void {
+    log.info(format, args);
+}
+
+pub fn warn(comptime format: []const u8, args: anytype) void {
+    log.warn(format, args);
+}
+
+pub fn err(comptime format: []const u8, args: anytype) void {
+    log.err(format, args);
+}
+
+pub fn debug(comptime format: []const u8, args: anytype) void {
+    log.debug(format, args);
+}
+```
+
+`std.log.scoped` 只负责把编译期 scope 和 level 传给后端。Zig 0.16 的默认后端会安全地串行
+stderr，但默认格式不含时间戳，也不提供文件轮转；NodeForge 必须安装自定义 `std.options.logFn`，
+统一渲染时间戳、scope 和两个 sink。
+
+各协议 worker 使用独立 scope：
+
+| 模块 | scope |
+| --- | --- |
+| `dhcp/server.zig` | `std.log.scoped(.dhcp)` |
+| `http/server.zig` | `std.log.scoped(.http)` |
+| `tftp/server.zig` | `std.log.scoped(.tftp)` |
+| `app.zig` / `nodeforged.zig` | `std.log.scoped(.nodeforge)` |
+
+`observe/log.zig` 作为通用门面保留 `.nodeforge` scope，供非协议模块使用。
+
+#### 7.5.3.2 日志级别
+
+从 `info`/`debug` 两级扩展为标准四级：
+
+```zig
+pub const LogLevel = enum { debug, info, warn, err };
+```
+
+- **debug**：协议包解析细节、连接建立/关闭、候选 IP 选择过程。
+- **info**：正常服务事件（DHCP DISCOVER→OFFER、HTTP 请求摘要、TFTP 传输完成）。
+- **warn**：可恢复异常（地址冲突探测失败后重试、TFTP 超时重传、配置降级）。
+- **err**：不可恢复错误（响应编码失败、文件写入失败、运行态持久化失败）。
+
+`std.log.Level` 的严重度顺序是 `err`、`warn`、`info`、`debug`。配置模型可保持对用户友好的
+`LogLevel` 枚举，但必须显式映射到 `std.log.Level`，不得依赖两个枚举的声明顺序。
+
+每个会链接 NodeForge 日志调用的 root module（`nodeforged.zig`、`main.zig` 和核心 test root）均设置：
+
+```zig
+pub const std_options: std.Options = .{
+    // 保留 debug 调用，之后才能由运行期阈值决定是否输出。
+    .log_level = .debug,
+    .logFn = log_backend.logFn,
+};
+```
+
+编译期阈值固定为 `.debug`；`log_backend` 使用原子 `u8` 保存映射后的运行期阈值，并以
+`@intFromEnum(level) <= @intFromEnum(runtime_threshold)` 判断是否输出。这样 `logging.level` 与
+daemon `--debug` 可在启动完成前设置，且不会让 debug 调用在 release 构建中被裁掉。M2.5 不提供
+在线修改日志级别的 API；“运行期”仅指同一二进制在启动参数和已加载配置之间选择阈值。
+
+#### 7.5.3.3 日志后端与轮转
+
+| 后端 | 触发条件 | 说明 |
+| --- | --- | --- |
+| stderr | 默认 | 前台运行或 `--foreground` 时直接输出到 stderr |
+| systemd journal | `systemd` unit 启动 | stderr 自动被 journald 捕获，无需额外代码 |
+| 文件 | 配置 `logging.file` | 写入指定路径，支持按大小轮转 |
+
+文件日志轮转策略：
+
+```json
+{
+  "logging": {
+    "level": "info",
+    "file": {
+      "path": "/opt/nodeforge/logs/nodeforged.log",
+      "max_size_mb": 50,
+      "keep": 3
+    }
+  },
+  "events": {
+    "max_size_mb": 100,
+    "keep": 5
+  }
+}
+```
+
+- `file` 是 stderr 的**附加** sink；配置后每条服务日志同时写 stderr 和文件。journal 仍通过
+  stderr 采集，不需要也不得启动独立的 journald/syslog client。
+- 在同一 sink mutex 内，以“当前文件大小 + 已渲染行长度”判断是否轮转；因此除单条超限记录外，
+  活动文件不会超过阈值。单条超限记录写入空的新文件，并在消息末尾加 `truncated=true`。
+- 轮转顺序为删除最旧 `.keep`、从大到小移动 `.N`、将活动文件 rename 为 `.1`、创建新活动文件。
+  所有 rename 都在同一目录内执行；写入器只在成功创建新文件后继续写入。
+- `keep` 的有效范围是 `1..20`，`max_size_mb` 必须大于零。文件路径必须为绝对路径，父目录必须在
+  daemon 启动前存在且可写；文件以服务用户可读写、其他用户不可读的权限创建。
+- `file` 未配置或为 `null` 时，不启用文件 sink，仅输出 stderr。文件打开、轮转或写入失败时，
+  服务继续向 stderr 输出，并以节流的固定错误行报告后端降级；不得通过同一失效后端递归记录错误。
+
+自定义 `logFn` 实现（覆盖 `std.log` 默认行为）：
+
+```zig
+// src/observe/log_backend.zig
+pub fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // 1. std.options.log_level 固定为 .debug；这里只做原子运行期过滤。
+    if (!enabled(level)) return;
+
+    // 2. 渲染日志行：<ISO8601> <LEVEL> [<scope>] <message>\n
+    var buf: [max_line_bytes]u8 = undefined;
+    const line = renderLogLineBounded(&buf, level, scope, format, args);
+
+    // 3. 同一 mutex 覆盖 stderr、文件大小检查、轮转和整行写入。
+    sink_mutex.lockUncancelable(io);
+    defer sink_mutex.unlock(io);
+    writeStderr(line);
+    if (file_backend) |*backend| backend.writeOrReportDegraded(line);
+}
+```
+
+`max_line_bytes` 固定为 8 KiB，包含时间戳、metadata 和换行。格式化超过上限时后端保留合法的一行，
+在可用尾部追加 `… [truncated]`；不得 panic、分多行写入或分配无上限内存。日志调用中的动态字符串仍由
+调用方限制，特别是不得把 HTTP body、token、密码、cookie、Authorization 或节点上传原始日志传入格式化参数。
+
+服务日志是诊断输出而非逐条持久化审计：M2.5 在每条写入后 flush，但不对每条调用 `fsync`；断电时最后
+少量已接受记录可能丢失。需要可靠查询的业务动作必须同时尝试写入事件文件，并在事件写入失败时记录 err。
+
+#### 7.5.3.4 配置模型变更
+
+`LoggingConfig` 扩展：
+
+```zig
+pub const LoggingConfig = struct {
+    /// 服务日志等级。
+    level: LogLevel = .info,
+    /// 文件日志后端配置；为 null 时仅输出到 stderr。
+    file: ?FileLogConfig = null,
+};
+
+pub const FileLogConfig = struct {
+    /// 日志文件路径。
+    path: []const u8,
+    /// 单文件最大大小（MB），达到后触发轮转。
+    max_size_mb: u16 = 50,
+    /// 保留的历史轮转文件数量。
+    keep: u8 = 3,
+};
+
+/// 用户配置的阈值；toStdLevel() 显式映射到 std.log.Level。
+pub const LogLevel = enum {
+    debug,
+    info,
+    warn,
+    err,
+
+    pub fn toStdLevel(self: LogLevel) std.log.Level {
+        return switch (self) {
+            .debug => .debug,
+            .info => .info,
+            .warn => .warn,
+            .err => .err,
+        };
+    }
+};
+
+pub const EventsConfig = struct {
+    /// 活动 events.jsonl 的最大大小；达到前按下一行长度预检查。
+    max_size_mb: u16 = 100,
+    /// 保留的历史 events.jsonl.N 数量。
+    keep: u8 = 5,
+};
+```
+
+`AppConfig` 新增 `events: EventsConfig = .{}`。校验器拒绝 `max_size_mb == 0` 和不在 `1..20`
+范围内的 `keep`；日志与事件轮转参数均在 daemon 启动时固定，配置热更新属于后续阶段。
+
+### 7.5.4 事件日志改进
+
+#### 7.5.4.1 Event v2 结构化字段
+
+引入 `v: 2` 事件格式，增加 `fields` 数组承载结构化字段。事件格式是对外稳定的本地读取契约：
+新增字段只能以默认值扩展，既有字段不得改名或改变语义。
+
+```zig
+pub const Event = struct {
+    /// 事件信封版本。
+    v: u8 = 2,
+    /// ISO 8601 UTC 时间戳，例如 `2026-07-11T08:30:00Z`。
+    ts: []const u8,
+    /// 事件类型。
+    @"type": []const u8,
+    /// 人类可读摘要。
+    message: []const u8,
+    /// 结构化字段列表；v2 新增。
+    fields: []const Field = &.{},
+};
+
+pub const Field = struct {
+    key: []const u8,
+    value: []const u8,
+};
+```
+
+v2 事件 JSONL 示例：
+
+```json
+{"v":2,"ts":"2026-07-11T08:30:00Z","type":"dhcp.ack","message":"DISCOVER -> ACK yiaddr=192.168.27.10","fields":[{"key":"mac","value":"52:54:00:aa:bb:cc"},{"key":"ip","value":"192.168.27.10"},{"key":"xid","value":"0x1234abcd"},{"key":"kind","value":"discover"}]}
+```
+
+#### 7.5.4.2 预定义字段约定
+
+| 字段 key | 说明 | 出现的事件类型 |
+| --- | --- | --- |
+| `mac` | 客户端 MAC 地址 | `dhcp.*`、`tftp.*` |
+| `ip` | 分配/请求的 IP 地址 | `dhcp.*` |
+| `xid` | DHCP 事务 ID | `dhcp.*` |
+| `kind` | DHCP message type | `dhcp.*` |
+| `node_id` | 节点标识 | `dhcp.*`、`http.*`、`tftp.*` |
+| `source` | 产生者：`server`、`initrd`、`installer`、`agent` 或 `runner` | 所有由 M3+ 节点/runner 上报的事件 |
+| `stage` | 安装或无盘启动阶段 | `install.*`、`diskless.*` |
+| `reason` | 稳定错误 code 或有限摘要 | `*.failed`、`*.error` |
+| `method` | HTTP 方法 | `http.request` |
+| `path` | HTTP 路径 | `http.request` |
+| `status` | HTTP 状态码 | `http.request` |
+| `client_ip` | HTTP 客户端 IP | `http.request` |
+| `duration_us` | 请求耗时（微秒） | `http.request` |
+| `bytes_sent` | 传输字节数 | `http.request`、`tftp.transfer` |
+| `filename` | 传输的文件名 | `tftp.transfer` |
+| `arch` | 客户端架构 | `dhcp.*` |
+| `phase` | provisioning 阶段 | `provision.*` |
+| `step` | provisioning step 名称 | `provision.*` |
+| `run_id` | provisioning 执行标识 | `provision.*` |
+
+字段值为字符串类型；数值在渲染时转为字符串。这避免了 JSON 类型混合导致的解析复杂度，
+同时保持 JSONL 行的扁平性和可 grep 性。
+
+字段约束：每个事件最多 32 个 field，key 最长 64 bytes、value 最长 1024 bytes、message 最长
+2048 bytes，整行不得超过 8 KiB。key 必须匹配 `[a-z][a-z0-9_]*` 且在同一事件内唯一；不认识的
+key 可以保留以支持后续阶段，但不得覆盖表中已定义 key 的含义。JSON encoder 负责转义控制字符，
+调用方不得自行拼接 JSON。路径字段只记录路由模板或经过净化的相对资产路径，不记录 query string。
+
+`ts` 固定使用 UTC RFC 3339 秒精度格式 `YYYY-MM-DDTHH:MM:SSZ`。写入器无法取得实时时钟或无法
+格式化时间时返回错误并由调用方记录服务 err，绝不伪造 `unix:0` 或本地时区时间。
+
+#### 7.5.4.3 事件写入器改进
+
+`state/events.zig` 的 `Writer` 保持单一 mutex 串行写入模型，增加 `fields` 支持。mutex 覆盖整行
+渲染后的大小检查、轮转和追加操作，不能只保护 `write()`；这样同一进程中的 DHCP、TFTP 和 HTTP
+worker 不会相互覆盖文件尾部。
+
+```zig
+pub fn appendWithFields(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    event_type: []const u8,
+    message: []const u8,
+    fields: []const Field,
+) !void {
+    // 1. 验证 event_type、message 和 fields 的长度、key 格式与唯一性
+    // 2. 生成 RFC 3339 UTC 时间戳并构建 Event v2
+    // 3. 一次性渲染为不超过 8 KiB 的 JSON 行
+    // 4. 持有 Writer mutex，按“size + line.len”轮转后以 append 模式写入整行
+}
+```
+
+底层文件以 append 模式打开，单个 JSON 行只执行一次完整写入；同进程互斥不替代跨进程锁，因此
+`nodeforged` 是 events 文件唯一 writer，禁止运维脚本和 CLI 直接追加。事件写入同样不逐条 `fsync`，
+其保证是“函数成功返回时数据已交给本地文件系统”；进程崩溃或断电可以留下最后一条不完整记录。
+读取器必须忽略活动文件的**最后一条**无效 JSON 行并在 human 模式给出 warning；历史轮转文件中出现
+无效行则跳过该行并计数，不能让一次损坏阻断后续有效事件。
+
+DHCP `audit()` 函数改为传递结构化字段而非拼接字符串：
+
+```zig
+// 改进前（v1）：
+fn audit(..., mac: []const u8, ip: u32) void {
+    const text = bufPrint("kind={t} mac={x} ip={x}", .{kind, mac, ip});
+    writer.append(..., .{ .ts = stamp, .type = event_type, .message = text });
+}
+
+// 改进后（v2）：
+fn audit(..., mac: []const u8, ip: u32, xid: u32) void {
+    const fields = [_]Field{
+        .{ .key = "mac", .value = mac },
+        .{ .key = "ip", .value = formatIp(ip) },
+        .{ .key = "xid", .value = formatXid(xid) },
+        .{ .key = "kind", .value = @tagName(kind) },
+    };
+    writer.appendWithFields(..., event_type, message, &fields);
+}
+```
+
+#### 7.5.4.4 事件类型注册表
+
+建立事件类型注册表，确保事件类型的稳定性和可发现性。注册表是含 `name`、`description` 和
+`default_level` 的静态表；`EventType.definition()` 覆盖所有枚举值，禁止遗漏映射。
+服务端写事件通过 `EventType`，CLI `events types` 从同一张表渲染，避免字符串散落在协议模块。
+
+```zig
+// src/state/event_types.zig
+pub const EventType = enum {
+    service_started,
+    service_stopped,
+    config_loaded,
+    config_updated,
+    dhcp_discover,
+    dhcp_offer,
+    dhcp_request,
+    dhcp_ack,
+    dhcp_nak,
+    dhcp_release,
+    dhcp_decline,
+    dhcp_abandoned,
+    tftp_rrq,
+    tftp_transfer_complete,
+    tftp_transfer_error,
+    http_request,
+    install_installer_started,
+    install_config_fetched,
+    install_started,
+    install_partitioning,
+    install_packages,
+    install_bootloader,
+    install_post,
+    install_rebooting,
+    install_completed,
+    install_failed,
+    diskless_initrd_started,
+    diskless_rootfs_download_started,
+    diskless_rootfs_verified,
+    diskless_rootfs_mounted,
+    diskless_switch_root,
+    diskless_running,
+    diskless_failed,
+    provision_step_started,
+    provision_step_succeeded,
+    provision_step_warned,
+    provision_step_failed,
+
+    pub fn definition(self: EventType) EventDefinition {
+        return switch (self) {
+            .service_started => .{ .name = "service.started", .description = "all listeners ready" },
+            .service_stopped => .{ .name = "service.stopped", .description = "orderly shutdown complete" },
+            .config_loaded => .{ .name = "config.loaded", .description = "validated configuration loaded" },
+            .config_updated => .{ .name = "config.updated", .description = "configuration atomically updated" },
+            .dhcp_discover => .{ .name = "dhcp.discover", .description = "DHCP DISCOVER received" },
+            .dhcp_offer => .{ .name = "dhcp.offer", .description = "DHCP OFFER sent" },
+            .dhcp_request => .{ .name = "dhcp.request", .description = "DHCP REQUEST received" },
+            .dhcp_ack => .{ .name = "dhcp.ack", .description = "DHCP ACK sent" },
+            .dhcp_nak => .{ .name = "dhcp.nak", .description = "DHCP NAK sent" },
+            .dhcp_release => .{ .name = "dhcp.release", .description = "lease released" },
+            .dhcp_decline => .{ .name = "dhcp.decline", .description = "address declined" },
+            .dhcp_abandoned => .{ .name = "dhcp.abandoned", .description = "probe found conflict" },
+            .tftp_rrq => .{ .name = "tftp.rrq", .description = "TFTP read requested" },
+            .tftp_transfer_complete => .{ .name = "tftp.transfer.complete", .description = "TFTP transfer completed" },
+            .tftp_transfer_error => .{ .name = "tftp.transfer.error", .description = "TFTP transfer failed" },
+            .http_request => .{ .name = "http.request", .description = "HTTP request completed" },
+            .install_installer_started => .{ .name = "install.installer_started", .description = "installer started" },
+            .install_config_fetched => .{ .name = "install.config_fetched", .description = "install config fetched" },
+            .install_started => .{ .name = "install.started", .description = "installation started" },
+            .install_partitioning => .{ .name = "install.partitioning", .description = "partitioning in progress" },
+            .install_packages => .{ .name = "install.packages", .description = "package installation in progress" },
+            .install_bootloader => .{ .name = "install.bootloader", .description = "bootloader installation in progress" },
+            .install_post => .{ .name = "install.post", .description = "post-install phase in progress" },
+            .install_rebooting => .{ .name = "install.rebooting", .description = "installer rebooting" },
+            .install_completed => .{ .name = "install.completed", .description = "installation completed" },
+            .install_failed => .{ .name = "install.failed", .description = "installation failed", .default_level = .err },
+            .diskless_initrd_started => .{ .name = "diskless.initrd_started", .description = "diskless initrd started" },
+            .diskless_rootfs_download_started => .{ .name = "diskless.rootfs_download_started", .description = "rootfs download started" },
+            .diskless_rootfs_verified => .{ .name = "diskless.rootfs_verified", .description = "rootfs verified" },
+            .diskless_rootfs_mounted => .{ .name = "diskless.rootfs_mounted", .description = "rootfs mounted" },
+            .diskless_switch_root => .{ .name = "diskless.switch_root", .description = "switch_root started" },
+            .diskless_running => .{ .name = "diskless.running", .description = "diskless system running" },
+            .diskless_failed => .{ .name = "diskless.failed", .description = "diskless boot failed", .default_level = .err },
+            .provision_step_started => .{ .name = "provision.step.started", .description = "provisioning step started" },
+            .provision_step_succeeded => .{ .name = "provision.step.succeeded", .description = "provisioning step succeeded" },
+            .provision_step_warned => .{ .name = "provision.step.warned", .description = "optional provisioning step warned", .default_level = .warn },
+            .provision_step_failed => .{ .name = "provision.step.failed", .description = "required provisioning step failed", .default_level = .err },
+        };
+    }
+};
+
+pub const EventDefinition = struct {
+    name: []const u8,
+    description: []const u8,
+    default_level: LogLevel = .info,
+};
+```
+
+#### 7.5.4.5 事件文件轮转、读取与保留
+
+`events.jsonl` 增加基于大小的轮转：
+
+- 配置项 `events.max_size_mb`（默认 100 MB）与 `events.keep`（默认 5）。日志文件相同的阈值、
+  同目录 rename、从大到小移动和写入失败降级规则同样适用。
+- `events list` 默认从最旧保留文件到活动文件扫描，因而在不使用索引的前提下仍能得到时间顺序结果。
+  `--limit` 默认 100、最大 1000；实现使用有界结果缓存，不能因日志总量无限占用内存。
+- v1 的 `unix:<seconds>` 与 v2 的 RFC 3339 时间都先解析为 UTC epoch 再进行 `--since`/`--until`
+  比较，不能按原始字符串排序。CLI 参数接受 RFC 3339 UTC；为排障兼容 v1，也接受 `unix:<seconds>`。
+- `events follow` 从调用时活动文件的末尾开始；轮转后保持已打开的旧文件读到 EOF，再按文件身份检测
+  并打开新的活动文件，语义等价 `tail -F`，不重复已输出行。它只跟踪新事件，不回放历史文件。
+
+### 7.5.5 HTTP 请求日志增强
+
+#### 7.5.5.1 请求级日志
+
+在 `http/server.zig` 的响应完成后，记录结构化请求日志：
+
+```zig
+// 记录到服务日志（std.log）
+http_log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s})", .{
+    method, path, status, bytes_sent, duration_us, client_ip,
+});
+
+// 同时写入事件
+events.appendWithFields(..., "http.request", message, &.{
+    .{ .key = "method", .value = method },
+    .{ .key = "path", .value = path },
+    .{ .key = "status", .value = formatStatus(status) },
+    .{ .key = "client_ip", .value = client_ip },
+    .{ .key = "bytes_sent", .value = formatBytes(bytes_sent) },
+    .{ .key = "duration_us", .value = formatDuration(duration_us) },
+});
+```
+
+客户端 IP 只取 Zap socket 的 `remote_ip`；当前 listener 没有可信反向代理边界，绝不信任客户端可
+伪造的 `X-Forwarded-For`。以后若引入反向代理，必须单独配置可信 proxy CIDR，才可解析该 header。
+耗时使用单调时钟的开始/结束差值计算，再转换为微秒，不能用可能被 NTP 校正的 wall clock。
+
+`path` 只记录已匹配的路由模板（如 `/api/v1/management/assets/import`），或经过规范化并确认位于
+资产根目录内的相对文件名；不记录 query string、Authorization、Cookie、请求体和原始节点日志。
+`/healthz` 可记录 debug 服务日志，但不写业务事件，避免探针淹没审计文件。
+
+#### 7.5.5.2 不启用 Zap 内置 access log
+
+经分析，facil.io 的 `http_write_log` 是 C 级别实现，输出格式固定且难以与 Zig 的 `std.log`
+体系统一。M2.5 不启用 Zap 内置 access log，而是在 Zig 层自行实现请求日志，保证格式一致性和
+结构化字段控制。
+
+### 7.5.6 TFTP 日志补全
+
+`tftp/server.zig` 当前完全没有日志输出。M2.5 补全以下日志点：
+
+| 日志点 | 级别 | 内容 |
+| --- | --- | --- |
+| RRQ 收到 | info | 客户端 IP、规范化后的请求文件名、blksize |
+| 传输完成 | info | 文件名、传输字节数、耗时 |
+| 传输超时/重传 | warn | 文件名、重传次数 |
+| 传输失败 | err | 文件名、错误原因 |
+| 非法路径 | warn | 客户端 IP、经长度限制的请求路径摘要、拒绝原因 |
+
+同时，TFTP 传输完成和失败写入事件：
+
+```json
+{"v":2,"ts":"...","type":"tftp.transfer.complete","message":"sent grubaa64.efi (348160 bytes)","fields":[{"key":"filename","value":"efi/grubaa64.efi"},{"key":"bytes_sent","value":"348160"},{"key":"client_ip","value":"192.168.27.10"},{"key":"duration_us","value":"125000"}]}
+```
+
+### 7.5.7 CLI 事件查询命令
+
+新增 `nodeforge events` 命令组，提供事件查询和过滤能力：
+
+```
+nodeforge events list [--type <type>] [--node <node_id>] [--since <ts>] [--until <ts>] [--limit <n>]
+nodeforge events follow [--type <type>]
+nodeforge events types
+```
+
+这些命令只读 `paths.events_path` 及同目录轮转文件，不能使用 `--config` 或远程 endpoint 改写日志
+位置。文件不存在时 `events list` 输出空列表并成功返回；`events follow` 输出简短错误并返回非零。
+目录或文件权限不足也是明确错误，不回退为读取任意用户提供的路径。
+
+| 命令 | 说明 |
+| --- | --- |
+| `events list` | 查询历史事件，支持按类型、节点、时间范围过滤 |
+| `events follow` | 实时跟踪事件流（`tail -f` 语义） |
+| `events types` | 列出所有已注册事件类型及说明 |
+
+`--type` 是注册表中的精确事件名；未知名称是参数错误。`--node` 在 v2 中匹配 `node_id` field，在
+v1 中只匹配已有顶层 `node` 字段，不能从 message 猜测。`--since` 和 `--until` 是包含边界；
+`--limit` 取最新匹配的 N 条。解析或过滤失败的单行按事件读取规则处理，CLI 最终在 stderr 报告跳过数，
+而 JSON stdout 始终只含有效 JSON 数组。
+
+**Human 输出**（表格格式，复用 M1.5 formatter）：
+
+```
+TIME                  TYPE                    NODE       MESSAGE                         FIELDS
+2026-07-11T08:30:00Z  dhcp.ack                r97n0      DISCOVER -> ACK yiaddr=...      mac=52:54:00:aa:bb:cc ip=192.168.27.10 xid=0x1234abcd
+2026-07-11T08:30:05Z  tftp.transfer.complete  r97n0      sent grubaa64.efi (348160 bytes) filename=efi/grubaa64.efi bytes=348160
+```
+
+**JSON 输出**（`--output json`）：
+
+```json
+[
+  {"v":2,"ts":"2026-07-11T08:30:00Z","type":"dhcp.ack","message":"...","fields":[...]}
+]
+```
+
+`events follow` 的 human 模式输出每行一条事件，不使用表格（因为终端宽度和滚动场景）；JSON 模式
+输出 JSONL，而非 JSON array，便于流式消费：
+
+```
+2026-07-11T08:30:00Z  dhcp.ack   mac=52:54:00:aa:bb:cc ip=192.168.27.10  DISCOVER -> ACK
+2026-07-11T08:30:05Z  tftp.transfer.complete  filename=efi/grubaa64.efi  sent grubaa64.efi (348160 bytes)
+```
+
+### 7.5.8 代码任务
+
+| 模块 | 任务 |
+| --- | --- |
+| `observe/log.zig` | 迁移到 `std.log.scoped`；扩展为四级日志；保留运行期级别控制 |
+| `observe/log_backend.zig` | `std.options.logFn` 后端；8 KiB 有界渲染；原子阈值、stderr + 文件双 sink、轮转和降级报告 |
+| `state/events.zig` | Event v2 字段校验；RFC 3339 UTC；单 writer append、尾部损坏容忍和事件轮转 |
+| `state/event_types.zig` | 完整事件类型注册表（name/description/default_level），供 writer 与 CLI 共用 |
+| `dhcp/server.zig` | `audit()` 改为传递结构化字段；日志增加 xid/arch 上下文 |
+| `http/server.zig` | 请求日志增加 client_ip/duration/bytes；写入 http.request 事件 |
+| `tftp/server.zig` | 补全 RRQ/传输/失败日志和事件 |
+| `cli/events.zig` | 本地只读 `events list/follow/types`；轮转感知 follow、v1/v2 时间归一化和 human/JSON 输出 |
+| `model.zig` | `LoggingConfig` 扩展 file 后端和四级 level；新增 `EventsConfig`、范围校验与显式 level 映射 |
+| `paths.zig` | 新增 `service_log_path` 常量 |
+| `nodeforged.zig`、`main.zig`、`root.zig` | 在每个 root module 安装 `std_options.logFn` 和 `.debug` 编译期阈值 |
+
+### 7.5.9 事件兼容策略
+
+- v1 事件（`v: 1`，`ts: "unix:..."`）和 v2 事件（`v: 2`，`ts: RFC 3339 UTC`，`fields: [...]`）
+  在同一 `events.jsonl` 文件中共存。
+- CLI `events list` 同时兼容 v1 和 v2 事件：v1 事件的 fields 列显示为空，只使用其已有顶层字段，
+  不从 message 解析。
+- daemon 升级到 M2.5 后只写入 v2 事件，不做历史 v1 事件的迁移。
+- `events.jsonl` 轮转时不区分版本，按文件大小统一轮转。
+- v1 的 message 不被重新解析为 fields；只使用其已有顶层字段和时间，避免把不稳定的人类文本误当成
+  机器契约。
+- v2 的未知 field 和未知事件类型在读取时保留并显示；写入端只允许注册表事件类型，防止拼写漂移。
+
+### 7.5.10 测试与验收
+
+| 测试项 | 方法 |
+| --- | --- |
+| root module 接线 | daemon、CLI 和 core test root 都编译为 `std_options.log_level = .debug` 且实际调用同一 `logFn` |
+| 日志线程安全 | 多线程交错写入长短消息，验证每行完整、stderr/file 内容一致且无半行 |
+| 日志级别过滤 | 验证四个阈值的包含关系，尤其是 info 排除 debug、`--debug` 恢复 debug 而无需重编译 |
+| 有界渲染与脱敏 | 输入超长字符串、换行和敏感字段，验证单行最多 8 KiB、合法转义且 token/password/body 从不出现 |
+| 文件轮转与降级 | 验证临界大小、单条超限、`.1`/`.N` 保留、`keep` 边界、rename/重开失败时 stderr 连续可用 |
+| Event v2 字段 | 构造 DHCP ACK，验证 RFC 3339、mac/ip/xid/kind、重复/非法 key 和超限值均按契约处理 |
+| 事件轮转与恢复 | 并发 writer 验证无覆盖；模拟末尾半行和历史坏行，验证有效事件仍可读且有 skipped 计数 |
+| CLI events list | 生成跨轮转的混合 v1/v2 文件，验证时间归一化、过滤、最新 limit、human 表格和 JSON 数组 |
+| CLI events follow | 在 follow 中触发写入与轮转，验证旧 inode 读尽后重开新文件且不丢行/不重复；JSON 输出为 JSONL |
+| TFTP 日志补全 | 执行成功、重传、非法路径和失败传输，验证等级、字段和事件类型 |
+| HTTP 请求日志 | 验证 socket client IP、单调耗时、bytes、路由模板；伪造 X-Forwarded-For、query/token/body 均不进入记录 |
+
+### 7.5.11 不做的事
+
+- **不启用 Zap/facil.io 内置日志**：C 级别 `fio_log_*` 和 `http_write_log` 格式固定、
+  难以结构化，与 Zig `std.log` 体系不兼容。
+- **不实现远程日志收集**：MVP 不支持 syslog/UDP 日志转发，日志仅本地文件和 stderr/journal。
+- **不引入日志库**：不接入 `zlog` 等第三方库。结构化服务日志、双 sink 和轮转仅使用 Zig 标准库实现，
+  避免其异步丢弃策略、额外生命周期和版本兼容性成为 daemon 基础路径的一部分。
+- **不实现日志搜索索引**：事件查询基于顺序扫描 `events.jsonl`，不构建倒排索引；
+  对于 MVP 规模（单网段几十台节点）足够。
+- **不做 v1 历史事件迁移**：旧 `events.jsonl` 中的 v1 事件保持原样，CLI 兼容读取。
 
 ## 8. M3：HTTP 配置、资产、ISO 仓库和事件接口
 
@@ -1316,7 +2003,8 @@ HTTP 成为 TFTP 之后的主要数据通道：
 | `http/range.zig` | Range / Content-Length / ETag |
 | `http/api.zig` | JSON API handler |
 | `profile/render.zig` | 模板渲染入口 |
-| `state/events.zig` | JSONL append writer |
+| `http/node_events.zig` | 节点事件/日志摘要 DTO 校验、认证结果绑定和 EventType 映射；不直接操作文件 |
+| `state/events.zig` | 复用 M2.5 唯一 JSONL writer，不新增第二个 append 路径 |
 
 ### 8.3 路由
 
@@ -1326,8 +2014,8 @@ HTTP 成为 TFTP 之后的主要数据通道：
 | `/boot/config/:node_id` | GET | boot config JSON |
 | `/api/v1/nodes/:id/config` | GET | 节点配置 JSON |
 | `/api/v1/nodes/:id/answer` | GET | autoinstall/kickstart |
-| `/api/v1/nodes/:id/events` | POST | 事件写入 |
-| `/api/v1/nodes/:id/logs` | POST | 日志摘要 |
+| `/api/v1/nodes/:id/events` | POST | 受限节点阶段事件上报 |
+| `/api/v1/nodes/:id/logs` | POST | 有界失败日志摘要上报 |
 | `/rootfs/:name` | GET | rootfs 文件 |
 | `/images/:name` | GET | ISO/image |
 | `/repos/:name/*` | GET | repo 文件 |
@@ -1366,32 +2054,30 @@ diskless boot config 示例：
 }
 ```
 
-### 8.6 事件写入
+### 8.6 节点事件与日志摘要接收
 
-事件格式：
+M3 不接受客户端提交完整 Event JSON，也不让客户端指定 `ts`、`node_id`、`source` 或任意字段。
+请求 DTO 只包含已注册的 node-origin event type、有限 stage/reason、简短 message 与允许字段；HTTP
+handler 根据已认证的 URL node id 和服务端时间构建 v2 Event，固定增加 `node_id` 与 `source` field。
+节点请求不能伪造 `dhcp.*`、`tftp.*`、`http.request`、`service.*` 或其他 server-origin 类型。
 
-```json
-{
-  "ts": "unix:1783332005",
-  "node": "node-01",
-  "type": "boot.initrd_started",
-  "stage": "initrd_started",
-  "message": "initrd started"
-}
-```
+`/logs` 仅用于失败诊断摘要：body 最大 4 KiB、摘要截断到 2048 bytes，并映射为对应的
+`install.failed`、`diskless.failed` 或 `provision.step.failed` event；禁止上传完整 installer log、
+shell stdout/stderr、token、cookie 或任意文件。原始日志由节点本地保存，NodeForge 只保留安全的
+可查询摘要。HTTP body 超限、非法 event type、未知 field 或认证失败返回明确 4xx，且不会写事件。
 
-事件写入要求：
-
-- 单行 JSON。
-- append only。
-- 写入失败返回明确错误。
-- 同步更新 `node_status`。
+写入顺序固定为：验证请求与 node 身份 -> 更新 `node_status` -> 追加 domain Event -> 返回响应。
+EventWriter 失败时状态更新不回滚，响应返回 5xx 并记录服务 err，调用方可以重试；M3 的上报语义是
+at-least-once，重复 domain event 可出现，但 node_status transition 必须幂等。跨请求事件去重需要持久化
+event id，超出 M3，不得以猜测 message 相同来去重。同一次 POST 无论成功或失败都各自产生一条服务侧
+`http.request`，但它不替代 domain Event。
 
 ### 8.7 CLI 命令
 
 ```bash
 nodeforge runtime status
-nodeforge runtime events tail --node node-01
+nodeforge events list --node node-01
+nodeforge events follow --type install.failed
 nodeforge node status node-01
 nodeforge install render node-01
 nodeforge install-source import Rocky-9.7-aarch64-dvd.iso --distro rocky --version 9.7 --arch aarch64
@@ -1403,7 +2089,8 @@ nodeforge repository show rocky-9.7-aarch64-iso
 - HTTP 服务器基于 Zap/facil.io 固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力；M0 尚未注册静态资产或 Range 路由，M3 再将其接入。NodeForge 当前只维护业务路由、管理 API 和统一错误信封，不维护 HTTP 报文解析或连接循环。已评估的备选方案 `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，不作为依赖。
 - acceptor 与固定大小 worker pool 分离；大文件使用 `pread`/send loop 流式发送，不整体读入内存。
 - DHCP/TFTP 使用各自 UDP event loop；耗时 hash/文件任务提交到 worker pool，不阻塞收包。
-- 配置使用不可变 snapshot + 原子替换；runtime/state 由单 writer 串行落盘，事件追加有独立队列。
+- 配置使用不可变 snapshot + 原子替换；runtime/state 由单 writer 串行落盘，事件通过 M2.5 的唯一
+  mutex 保护 writer 追加和轮转，不再引入独立队列或第二个文件后端。
 - MVP 验收基线：并发 100 个 HTTP Range 下载、100 个 TFTP session 和每秒 200 个 DHCP 报文时无崩溃、无状态串扰；具体吞吐在目标 ARM VM 和 x86_64 机器记录，不先承诺生产数字。
 
 ### 8.9 测试
@@ -1412,13 +2099,15 @@ nodeforge repository show rocky-9.7-aarch64-iso
 - Range 下载返回 206。
 - `If-Range`、无效 Range、连接中断后续传测试。
 - answer 渲染返回文本。
-- POST event 写入 JSONL。
-- runtime summary 与事件同步。
+- POST 合法节点 event DTO 后更新 runtime 并写入受限 Event v2；伪造 server type、node_id、source、
+  超长 body/summary 或未知 field 都返回 4xx 且不写文件。
+- POST 日志摘要只保留有界失败摘要，不能把完整 installer/initrd log 写入 JSONL 或服务日志。
+- runtime summary 与事件同步；EventWriter 写入失败时状态不回滚、请求返回 5xx 且可幂等重试。
 
 ### 8.10 阶段验收
 
 - installer/initrd 能通过 HTTP 拿到配置。
-- 事件能写入 `events.jsonl`。
+- 合法节点事件能按 Event v2 写入 `events.jsonl`，非法节点 body 不会污染审计文件。
 - 大文件下载支持 `Content-Length` 和 Range。
 - ISO 导入后无需手工建基础 repo 即可通过 HTTP 安装。
 
@@ -1549,6 +2238,11 @@ installed
 failed
 ```
 
+每次阶段上报都映射为 M2.5 注册表中的 `install.*` event，并带 `source=installer`、`node_id`、
+`stage`。`failed` 还必须带稳定 `reason`（例如 M6 错误分类）和不超过 2048 bytes 的安全摘要；
+`node_status.last_event_at` 与 `last_error` 从已验证的上报更新，不能从服务日志文本反推。`install logs`
+命令展示这些事件摘要，不读取或声称保存 installer 的完整原始日志。
+
 ### 9.7 CLI 命令
 
 ```bash
@@ -1564,6 +2258,7 @@ nodeforge install retry node-01
 - Kickstart 渲染 fixture。
 - storage 校验 fixture。
 - 未显式认领的节点禁止使用 install profile。
+- installer hook 的合法/非法 Event v2 DTO、阶段到 node_status 映射和失败摘要脱敏。
 - QEMU UEFI PXE autoinstall smoke test。
 
 ### 9.9 阶段验收
@@ -1624,7 +2319,7 @@ parse /proc/cmdline
   -> read nodeforge.config_url
   -> dhcp network already available or bring up network
   -> GET boot config
-  -> POST initrd_started
+  -> POST diskless.initrd_started
   -> inspect partial rootfs and download with HTTP Range
   -> verify sha256
   -> mount squashfs lower
@@ -1641,6 +2336,11 @@ rootfs 下载支持断点续传：
 - 服务返回 `200`、ETag 改变、长度不符或局部文件超过目标大小时，从零覆盖下载。
 - 完成后必须校验完整 SHA256，再原子改名；hash 不匹配删除或隔离 partial，绝不挂载。
 - tmpfs 容量校验必须同时考虑 rootfs partial 文件和 overlay 上层，容量不足时在下载前明确失败。
+
+小 initrd 只上报注册的 `diskless.*` 状态：启动、rootfs 下载开始、校验完成、挂载完成、切根开始、
+运行成功或失败。每次请求由 M3 的 node event DTO 限制为 stage、reason、rootfs 名称/校验摘要等小字段；
+失败摘要不得包含下载 URL query、Authorization、完整 dracut journal 或 debug shell 输出。`node_status` 与
+event 的更新顺序遵循 §8.6，断网时 initrd 只保留本地失败信息，不因为事件上报失败而中断已完成的切根。
 
 ### 10.5 overlay 规则
 
@@ -1666,6 +2366,7 @@ nodeforge diskless status node-02
 - rootfs 缺少 `/sbin/init` 报错。
 - rootfs `/lib/modules` 与 kernel_release 不匹配报错。
 - overlay tmpfs size 解析。
+- initrd 上报 diskless 事件、断网时事件失败不阻断切根、失败摘要长度限制。
 - QEMU UEFI diskless smoke test。
 
 ### 10.8 阶段验收
@@ -1753,6 +2454,9 @@ DISPLAY pxelinux.cfg/wait.txt
 - `diskless.rootfs_hash_mismatch`
 - `diskless.switch_root_failed`
 
+这些 error code 既是 CLI/状态显示的稳定分类，也是 `install.failed`、`diskless.failed` 等 v2 event 的
+`reason` field 值；不要把自由文本错误或 Zig error tag 当作跨版本事件字段。
+
 ## 12. M7：补充包和后处理增强
 
 ### 12.1 目标
@@ -1796,6 +2500,11 @@ target_root, workspace, repository_base_url, event_url
 - 步骤执行必须幂等；重复执行应返回 `changed = false`。无法保证幂等的 script 必须明确标记并禁止用于自动重试。
 - 输出、事件和错误使用统一结构，不允许脚本自行定义不可解析的状态格式。
 - `script` 是最后的逃生口，不作为常规配置步骤；必须提供 summary 和影响范围，供命令输出展示。
+
+runner 在调用每个 step 前后分别产生 `provision.step.started` 与 `succeeded`/`warned`/`failed`，fields
+固定包含 `source=runner`、`node_id`（适用时）、`phase`、`step`、`run_id`、action 和稳定 reason。脚本
+stdout/stderr 仅保留最后 2048 bytes 的转义摘要；秘密环境变量、命令行中的 token 和未声明输出均不得进入
+服务日志、Event.message 或 Event.fields。
 
 ### 12.4 包类型和交付规则
 
@@ -1887,7 +2596,7 @@ nodeforge provision status node-01
 
 CLI 的 `bundle list/show/plan` 和 `status` 默认使用分组表格，`--output json` 返回同一模型。
 
-验收必须覆盖强类型步骤校验、确定性顺序、清晰的分组输出、plan 无副作用、RPM/DEB 额外源安装、tar.bz2 安装、hosts/时间同步配置更新、自定义脚本成功与回滚提示，以及 kickstart、autoinstall、diskless overlay 三条链路。
+验收必须覆盖强类型步骤校验、确定性顺序、清晰的分组输出、plan 无副作用、RPM/DEB 额外源安装、tar.bz2 安装、hosts/时间同步配置更新、自定义脚本成功与回滚提示、每个 step 的注册 Event v2 与 stdout/stderr 有界脱敏摘要，以及 kickstart、autoinstall、diskless overlay 三条链路。
 
 ## 13. 测试矩阵
 
@@ -1897,6 +2606,7 @@ CLI 的 `bundle list/show/plan` 和 `status` 默认使用分组表格，`--outpu
 | fixture 测试 | DHCP 报文、TFTP 请求、answer 渲染、boot bundle manifest |
 | 集成测试 | DHCP client、TFTP client、HTTP client |
 | QEMU 测试 | UEFI PXE、Ubuntu autoinstall、diskless squashfs overlay |
+| 可观测性契约 | root module logFn 接线、M0 生命周期关闭、日志/事件轮转、v1/v2 reader、节点 DTO、脱敏和事件注册表 |
 | 回归测试 | 关键事件、错误分类、CLI 输出 |
 
 测试目录：
@@ -1934,12 +2644,20 @@ MVP 只支持当前版本。后续升级时增加 migration。
 {"v":1,"ts":"unix:1783332000","node":"node-01","type":"dhcp.discover"}
 ```
 
+M2.5 引入 Event v2 格式，增加 `fields` 结构化字段和 RFC 3339 UTC 时间戳：
+
+```json
+{"v":2,"ts":"2026-07-11T08:30:00Z","type":"dhcp.ack","message":"DISCOVER -> ACK yiaddr=192.168.27.10","fields":[{"key":"mac","value":"52:54:00:aa:bb:cc"},{"key":"ip","value":"192.168.27.10"}]}
+```
+
+v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 §7.5。
+
 ### 14.3 兼容原则
 
 - 新增字段必须有默认值。
 - 删除字段必须经过 migration。
-- v1 daemon 生成的 `ts` 固定使用 `unix:<UTC seconds>`；如需 ISO 8601，必须在新版本事件格式中
-  明确迁移规则，不能静默改变既有消费者的解析方式。
+- v1 daemon 生成的 `ts` 固定使用 `unix:<UTC seconds>`；v2 事件使用 ISO 8601 UTC（如
+  `2026-07-11T08:30:00Z`）。两种格式在同一文件中共存，CLI 必须同时兼容。
 - CLI `--output json` 字段保持稳定。
 - 人类可读输出可优化，但不能丢失关键状态。
 
@@ -1953,6 +2671,9 @@ MVP 只支持当前版本。后续升级时增加 migration。
 4. 实现 runtime state 和 events writer。
 5. 实现 TFTP packet/path/session/transfer/server 和 GRUB config，用标准 TFTP client 验证，完成 M1。
 6. 实现 DHCPv4 packet/options/lease/policy/server、boot resolver 和 vendor fixture，与 TFTP 联调后完成 M2。
+6.5. 先完成 M0 生命周期 coordinator、配置/路径/root module 日志接线，再将 `observe/log.zig` 迁移到
+    `std.log.scoped`，迁移 M1 TFTP 与 M2 DHCP 的 v1 事件，建立 Event v2 注册表、轮转 reader 和 CLI
+    查询；最后补全 HTTP access 日志，完成 M2.5。
 7. 实现 HTTP static/Range/API、ISO 导入和自动 repository，完成 M3。
 8. 实现 provisioning bundle、基础 runner 和 `show/plan/status` 输出。
 9. 实现 Rocky kickstart adapter，跑通 Rocky Linux 9.7 aarch64 安装与 `install_post`。
@@ -1999,7 +2720,7 @@ MVP 只支持当前版本。后续升级时增加 migration。
 - macOS 宿主机 + Rocky Linux 9.7 ARM VM 可作为开发验证环境。
 - diskless `squashfs_overlay` 启动。
 - `nodeforge node status` 展示安装/无盘阶段。
-- `nodeforge runtime events tail` 展示事件流。
+- `nodeforge events list/follow/types` 展示历史、实时事件流和注册表。
 - `nodeforge config validate` 校验配置。
 - `nodeforge check` 验证服务可用性。
 - `nodeforge provision bundle plan` 和 `provision status` 展示后处理计划与结果。

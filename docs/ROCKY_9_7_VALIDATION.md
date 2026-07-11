@@ -162,6 +162,23 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 
 ## M2 DHCP 验证
 
+## M2.5 结构化日志与事件验证
+
+### 2026-07-11：Event v2 与本机查询
+
+- 目标为 `root@r97n0`（Rocky Linux 9.7 aarch64）；使用 `192.168.27.128/24` 的安全 discovery
+  fixture 启动 M2.5 二进制，`nodeforged --check-config` 与空闲端口 `nodeforged --check` 均通过。
+- daemon 正常监听 DHCP `0.0.0.0%enp26s0:67`、TFTP `192.168.27.128:69` 和 HTTP `:18080`；服务日志
+  使用 RFC 3339 UTC 时间、等级和 `nodeforge` scope，例如 `2026-07-11T12:55:12Z info [nodeforge]`。
+- 启动产生 `config.loaded`、`service.started` Event v2；`GET /api/v1/management/config/status` 产生
+  `http.request` v2，含 `method`、净化后的 `path`、`status` 与 `bytes_sent`。
+- `nodeforge events types --output json`、`events list --type service.started --output json` 和
+  `events list --type http.request --output json` 都由 `python3 -m json.tool` 验证为合法 JSON；读取器同时
+  扫描并保留历史 v1 `unix:<seconds>` DHCP 记录。
+- 通过绑定 `enp26s0` 的独立 DHCP UDP client 完成未知安全 discovery 的
+  `DISCOVER -> OFFER -> REQUEST -> ACK`，获得 `192.168.27.200`。`dhcp.ack` 为 Event v2，字段包含
+  `mac=02:aa:bb:cc:dd:ee`、`ip=192.168.27.200`、`xid=0x6ecc6b78`、`kind=ack` 和 `arch=aarch64`。
+
 ### 2026-07-11：DHCPv4 原型基线
 
 - 已完成的仅是构建与本机 UDP `DISCOVER/OFFER` 基线；这不能证明 DHCP 生命周期、租约持久化、

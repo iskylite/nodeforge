@@ -6,6 +6,8 @@ const std = @import("std");
 const zli = @import("zli");
 const nodeforge = @import("nodeforge");
 
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = nodeforge.log_backend.logFn };
+
 /// zli 用于 `--version` 元数据的编译期语义版本。
 const semantic_version = std.SemanticVersion.parse(nodeforge.version.version) catch unreachable;
 
@@ -120,8 +122,10 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     if (!debug) nodeforge.observe_log.setLevel(switch (parsed.value.logging.level) {
-        .info => .info,
         .debug => .debug,
+        .info => .info,
+        .warn => .warn,
+        .err => .err,
     });
 
     var parsed_catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path) catch |err| switch (err) {

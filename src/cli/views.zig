@@ -10,6 +10,8 @@ pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const 
 pub const TftpSessionRow = struct { id: []const u8, phase: []const u8, filename: []const u8 };
 pub const DhcpLeaseRow = struct { ip: []const u8, mac: []const u8, phase: []const u8, expires_at: []const u8 };
 pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8 };
+pub const EventRow = struct { ts: []const u8, event_type: []const u8, node: []const u8, message: []const u8, fields: []const u8 };
+pub const EventTypeRow = struct { name: []const u8, description: []const u8, level: []const u8 };
 
 /// 渲染 asset 列表表格。`rows` 使用借用 slice；超过 64 行返回 `error.TooManyRows`。
 pub fn assets(writer: *std.Io.Writer, rows: []const AssetRow) !void {
@@ -64,6 +66,30 @@ pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
     if (rows.len > table_rows.len) return error.TooManyRows;
     for (rows, 0..) |row, i| { cells[i] = .{ row.id, row.mac, row.ip, row.profile }; table_rows[i] = .{ .cells = &cells[i] }; }
     try table.render(writer, &columns, table_rows[0..rows.len], "No nodes registered.", .{});
+}
+
+pub fn events(writer: *std.Io.Writer, rows: []const EventRow) !void {
+    const columns = [_]table.Column{ .{ .key = "time", .title = "TIME" }, .{ .key = "type", .title = "TYPE" }, .{ .key = "node", .title = "NODE" }, .{ .key = "message", .title = "MESSAGE", .max_width = 48 }, .{ .key = "fields", .title = "FIELDS", .max_width = 64 } };
+    var cells: [1000][5][]const u8 = undefined;
+    var table_rows: [1000]table.Row = undefined;
+    if (rows.len > table_rows.len) return error.TooManyRows;
+    for (rows, 0..) |row, index| { cells[index] = .{ row.ts, row.event_type, row.node, row.message, row.fields }; table_rows[index] = .{ .cells = &cells[index] }; }
+    try table.render(writer, &columns, table_rows[0..rows.len], "No events recorded.", .{});
+}
+
+pub fn eventLine(writer: *std.Io.Writer, ts: []const u8, event_type: []const u8, fields: []const u8, message: []const u8) !void {
+    try writer.print("{s}  {s}", .{ ts, event_type });
+    if (fields.len != 0) try writer.print("  {s}", .{fields});
+    try writer.print("  {s}\n", .{message});
+}
+
+pub fn eventTypes(writer: *std.Io.Writer, rows: []const EventTypeRow) !void {
+    const columns = [_]table.Column{ .{ .key = "name", .title = "TYPE" }, .{ .key = "level", .title = "LEVEL" }, .{ .key = "description", .title = "DESCRIPTION" } };
+    var cells: [64][3][]const u8 = undefined;
+    var table_rows: [64]table.Row = undefined;
+    if (rows.len > table_rows.len) return error.TooManyRows;
+    for (rows, 0..) |row, index| { cells[index] = .{ row.name, row.level, row.description }; table_rows[index] = .{ .cells = &cells[index] }; }
+    try table.render(writer, &columns, table_rows[0..rows.len], "No event types registered.", .{});
 }
 
 /// 输出统一的成功摘要和可选键值事实。短摘要保留已有 `OK` 运维习惯，字段

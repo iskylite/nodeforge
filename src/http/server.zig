@@ -14,6 +14,9 @@ const runtime_state = @import("../state/runtime.zig");
 const catalog_runtime = @import("../state/catalog_runtime.zig");
 const observe_error = @import("../observe/error.zig");
 const observe_log = @import("../observe/log.zig");
+const events = @import("../state/events.zig");
+const paths = @import("../paths.zig");
+const log = std.log.scoped(.http);
 
 const RouteContext = struct {
     io: std.Io,
@@ -21,6 +24,15 @@ const RouteContext = struct {
     config: *const model.AppConfig,
     catalog: *catalog_runtime.CatalogRuntime,
     runtime: *const runtime_state.RuntimeState,
+    event_writer: *events.Writer,
+};
+
+/// Per-request metadata captured at route entry and threaded through to `json`
+/// for structured logging and event emission.
+const RequestMeta = struct {
+    io: std.Io,
+    client_ip: []const u8,
+    started: std.Io.Timestamp,
 };
 
 // Zap's low-level listener exposes one process-global request callback. NodeForge is
@@ -42,6 +54,7 @@ pub fn serve(
     config: *const model.AppConfig,
     catalog: *catalog_runtime.CatalogRuntime,
     runtime: *const runtime_state.RuntimeState,
+    event_writer: *events.Writer,
 ) !void {
     if (!std.mem.eql(u8, ip, "0.0.0.0")) return error.InvalidHttpBindAddress;
 
@@ -51,6 +64,7 @@ pub fn serve(
         .config = config,
         .catalog = catalog,
         .runtime = runtime,
+        .event_writer = event_writer,
     };
     if (active_context != null) return error.HttpAlreadyRunning;
     active_context = &context;
@@ -63,11 +77,22 @@ pub fn serve(
         .log = false,
     });
     try listener.listen();
-    observe_log.info("http: listening on http://0.0.0.0:{d}", .{port});
+    log.info("listening on http://0.0.0.0:{d}", .{port});
+    event_writer.appendWithFields(io, allocator, paths.events_path, "service.started", "all protocol listeners ready", &.{}) catch |err|
+        log.err("unable to record service start: {t}", .{err});
 
     // Zap owns the blocking event loop and worker lifecycle. One worker keeps M0's
     // state model serial while eliminating the hand-written HTTP parser/connection loop.
     zap.start(.{ .threads = 1, .workers = 1 });
+}
+
+/// Extracts the client IP from the underlying facil.io socket. Only the direct
+/// peer address is used; X-Forwarded-For is never trusted without a configured
+/// proxy CIDR boundary.
+fn getClientIp(request: zap.Request) []const u8 {
+    const addr = zap.fio.http_peer_addr(request.h);
+    if (addr.len == 0 or addr.data == null) return "unknown";
+    return addr.data[0..addr.len];
 }
 
 /// Dispatches management routes after Zap has parsed the request.
@@ -86,19 +111,23 @@ pub fn serve(
 /// - `POST /api/v1/management/assets/import`      — M1 资产导入（daemon 写入 catalog）
 fn route(request: zap.Request) !void {
     const context = active_context orelse return error.MissingRouteContext;
-    const path = request.path orelse return notFound(request);
-    const method = request.method orelse return notFound(request);
+    const path = request.path orelse return notFound(request, undefined_meta(context));
+    const method = request.method orelse return notFound(request, undefined_meta(context));
+    const started = std.Io.Clock.awake.now(context.io);
+    const client_ip = getClientIp(request);
+    const meta = RequestMeta{ .io = context.io, .client_ip = client_ip, .started = started };
+
     observe_log.debug("http: request received {s} {s}", .{ method, path });
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/healthz"))
-        return json(request, .ok, "{\"ok\":true,\"service\":\"nodeforge\"}\n");
+        return json(request, .ok, "{\"ok\":true,\"service\":\"nodeforge\"}\n", meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/config/status"))
-        return json(request, .ok, "{\"ok\":true,\"result\":{\"config\":\"valid\"}}\n");
+        return json(request, .ok, "{\"ok\":true,\"result\":{\"config\":\"valid\"}}\n", meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/validate")) {
         context.catalog.lock();
         defer context.catalog.unlock();
-        config_validate.validate(context.config, &context.catalog.value) catch |err| return validationError(request, err);
-        return json(request, .ok, "{\"ok\":true,\"result\":{}}\n");
+        config_validate.validate(context.config, &context.catalog.value) catch |err| return validationError(request, err, meta);
+        return json(request, .ok, "{\"ok\":true,\"result\":{}}\n", meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/server/status")) {
         const body = switch (context.runtime.service) {
@@ -106,74 +135,79 @@ fn route(request: zap.Request) !void {
             .running => "{\"ok\":true,\"result\":{\"service\":\"running\"}}\n",
             .stopping => "{\"ok\":true,\"result\":{\"service\":\"stopping\"}}\n",
         };
-        return json(request, .ok, body);
+        return json(request, .ok, body, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/tftp/status")) {
-        return tftpStatus(request, context.runtime);
+        return tftpStatus(request, context.runtime, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/tftp/sessions")) {
-        return tftpSessions(request, context.runtime);
+        return tftpSessions(request, context.runtime, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/dhcp/leases")) {
-        return dhcpLeases(request, context.allocator, context.runtime, false);
+        return dhcpLeases(request, context.allocator, context.runtime, false, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/dhcp/unknown")) {
-        return dhcpLeases(request, context.allocator, context.runtime, true);
+        return dhcpLeases(request, context.allocator, context.runtime, true, meta);
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/assets/import")) {
-        return importAsset(request, context);
+        return importAsset(request, context, meta);
     }
-    return notFound(request);
+    return notFound(request, meta);
+}
+
+/// Constructs a placeholder meta for early exits where timing is not meaningful.
+fn undefined_meta(context: *const RouteContext) RequestMeta {
+    return .{ .io = context.io, .client_ip = "unknown", .started = std.Io.Clock.awake.now(context.io) };
 }
 
 /// Registers an already-present asset via the daemon, which alone publishes a
 /// new catalog snapshot.  Query fields intentionally accept the constrained M1
 /// CLI vocabulary; arbitrary file paths and decoded URL strings are rejected by
 /// the same asset validator used by direct TFTP serving.
-fn importAsset(request: zap.Request, context: *const RouteContext) !void {
-    const name = request.getParamSlice("name") orelse return assetInputError(request, "missing name");
-    const path = request.getParamSlice("path") orelse return assetInputError(request, "missing path");
-    const kind_text = request.getParamSlice("kind") orelse return assetInputError(request, "missing kind");
-    const kind = std.meta.stringToEnum(model.AssetKind, kind_text) orelse return assetInputError(request, "invalid kind");
+fn importAsset(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const name = request.getParamSlice("name") orelse return assetInputError(request, "missing name", meta);
+    const path = request.getParamSlice("path") orelse return assetInputError(request, "missing path", meta);
+    const kind_text = request.getParamSlice("kind") orelse return assetInputError(request, "missing kind", meta);
+    const kind = std.meta.stringToEnum(model.AssetKind, kind_text) orelse return assetInputError(request, "invalid kind", meta);
     const distro = request.getParamSlice("distro");
     const version = request.getParamSlice("version");
     const arch_text = request.getParamSlice("arch");
     const has_tuple = distro != null or version != null or arch_text != null;
-    if (has_tuple and (distro == null or version == null or arch_text == null)) return assetInputError(request, "incomplete distro tuple");
-    const arch = if (arch_text) |value| std.meta.stringToEnum(model.Arch, value) orelse return assetInputError(request, "invalid arch") else null;
+    if (has_tuple and (distro == null or version == null or arch_text == null)) return assetInputError(request, "incomplete distro tuple", meta);
+    const arch = if (arch_text) |value| std.meta.stringToEnum(model.Arch, value) orelse return assetInputError(request, "invalid arch", meta) else null;
     var checksum: [64]u8 = undefined;
     @import("../assets/validate.zig").sha256File(context.io, context.config.tftp.asset_root, path, &checksum) catch |err| {
         observe_log.err("asset: import failed for {s}: {t}", .{ path, err });
-        return assetInputError(request, "unreadable asset");
+        return assetInputError(request, "unreadable asset", meta);
     };
     context.catalog.addAsset(context.io, context.config, .{
         .name = name, .kind = kind, .path = path, .distro = distro, .version = version, .arch = arch,
         .kernel_release = request.getParamSlice("kernel_release"), .sha256 = &checksum,
-    }) catch |err| return assetInputError(request, @errorName(err));
-    try json(request, .ok, "{\"ok\":true}\n");
+    }) catch |err| return assetInputError(request, @errorName(err), meta);
+    try json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
-fn assetInputError(request: zap.Request, message: []const u8) !void {
+fn assetInputError(request: zap.Request, message: []const u8, meta: RequestMeta) !void {
     var buffer: [256]u8 = undefined;
     const body = try std.fmt.bufPrint(&buffer, "{{\"ok\":false,\"error\":{{\"code\":\"asset.invalid\",\"message\":{f}}}}}\n", .{std.json.fmt(message, .{})});
-    try json(request, .bad_request, body);
+    try json(request, .bad_request, body, meta);
 }
 
 /// 渲染 M1 TFTP 会话计数；读取使用原子 load，不阻塞 UDP transfer worker。
-fn tftpStatus(request: zap.Request, runtime: *const runtime_state.RuntimeState) !void {
+fn tftpStatus(request: zap.Request, runtime: *const runtime_state.RuntimeState, meta: RequestMeta) !void {
     var buffer: [192]u8 = undefined;
     const body = try std.fmt.bufPrint(&buffer, "{{\"ok\":true,\"result\":{{\"started\":{d},\"completed\":{d},\"failed\":{d}}}}}\n", .{
         runtime.tftp.started.load(.monotonic),
         runtime.tftp.completed.load(.monotonic),
         runtime.tftp.failed.load(.monotonic),
     });
-    try json(request, .ok, body);
+    try json(request, .ok, body, meta);
 }
 
 /// Renders the bounded M1 transfer activity list.  Entries are intentionally
 /// short-lived operational state; audit history belongs to `events.jsonl` in a
 /// later stage, not an unbounded HTTP response.
-fn tftpSessions(request: zap.Request, runtime: *const runtime_state.RuntimeState) !void {
+fn tftpSessions(request: zap.Request, runtime: *const runtime_state.RuntimeState, meta: RequestMeta) !void {
     var sessions: [runtime_state.TftpState.max_sessions]runtime_state.TftpSession = undefined;
     @constCast(&runtime.tftp).snapshot(&sessions);
     var buffer: [8192]u8 = undefined;
@@ -191,10 +225,10 @@ fn tftpSessions(request: zap.Request, runtime: *const runtime_state.RuntimeState
         });
     }
     try writer.writeAll("]}}\n");
-    try json(request, .ok, writer.buffered());
+    try json(request, .ok, writer.buffered(), meta);
 }
 
-fn dhcpLeases(request: zap.Request, allocator: std.mem.Allocator, runtime: *const runtime_state.RuntimeState, unknown_only: bool) !void {
+fn dhcpLeases(request: zap.Request, allocator: std.mem.Allocator, runtime: *const runtime_state.RuntimeState, unknown_only: bool, meta: RequestMeta) !void {
     var leases: [runtime_state.DhcpState.max_leases]runtime_state.DhcpLease = undefined;
     @constCast(&runtime.dhcp).snapshot(&leases);
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -217,31 +251,57 @@ fn dhcpLeases(request: zap.Request, allocator: std.mem.Allocator, runtime: *cons
         });
     }
     try output.writer.writeAll("]}}\n");
-    try json(request, .ok, output.written());
+    try json(request, .ok, output.written(), meta);
 }
 
 /// Renders configuration validation failures using NodeForge's stable error envelope.
-fn validationError(request: zap.Request, err: anyerror) !void {
+fn validationError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
     var buffer: [512]u8 = undefined;
     const body = observe_error.renderJson(&buffer, observe_error.fromValidation(err)) catch
         "{\"ok\":false,\"error\":{\"code\":\"internal.buffer\",\"message\":\"response too large\"}}\n";
-    try json(request, .bad_request, body);
+    try json(request, .bad_request, body, meta);
 }
 
 /// Emits a uniform JSON 404 envelope instead of bypassing the management error contract.
-fn notFound(request: zap.Request) !void {
-    try json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"http.not_found\",\"message\":\"route not found\"}}\n");
+fn notFound(request: zap.Request, meta: RequestMeta) !void {
+    try json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"http.not_found\",\"message\":\"route not found\"}}\n", meta);
 }
 
-/// Sends a JSON response through Zap and logs only method, path, and status.
-/// Request bodies and credentials never enter the service log.
-fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8) !void {
+/// Sends a JSON response through Zap and logs method, path, status, bytes,
+/// duration and client IP. Request bodies and credentials never enter the log.
+fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, meta: RequestMeta) !void {
     request.setStatus(status);
-    observe_log.info("http: {s} {s} -> {d}", .{
+    const duration_us = meta.started.durationTo(std.Io.Clock.awake.now(meta.io)).toMicroseconds();
+    const is_health = std.mem.eql(u8, request.path orelse "", "/healthz");
+    if (is_health) log.debug("{s} {s} -> {d} ({d} bytes, {d}us, client={s})", .{
+        request.method orelse "OTHER", request.path orelse "<missing>", @intFromEnum(status), body.len, duration_us, meta.client_ip,
+    }) else log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s})", .{
         request.method orelse "OTHER",
         request.path orelse "<missing>",
         @intFromEnum(status),
+        body.len,
+        duration_us,
+        meta.client_ip,
     });
+    if (active_context) |context| {
+        const method = request.method orelse "OTHER";
+        const path = request.path orelse "<missing>";
+        if (!std.mem.eql(u8, path, "/healthz")) {
+            var status_text: [4]u8 = undefined;
+            var bytes_text: [20]u8 = undefined;
+            var duration_text: [20]u8 = undefined;
+            const fields = [_]events.Field{
+                .{ .key = "method", .value = method },
+                .{ .key = "path", .value = path },
+                .{ .key = "status", .value = std.fmt.bufPrint(&status_text, "{d}", .{@intFromEnum(status)}) catch "0" },
+                .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{body.len}) catch "0" },
+                .{ .key = "client_ip", .value = meta.client_ip },
+                .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
+            };
+            context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "http.request", "HTTP request completed", &fields) catch |err|
+                observe_log.err("http: event append failed: {t}", .{err});
+        }
+    }
     // Set the header directly instead of `sendJson`: Zap's helper emits its own
     // debug line even when NodeForge is configured for info-level logging.
     try request.setHeader("content-type", "application/json");

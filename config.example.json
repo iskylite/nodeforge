@@ -27,6 +27,10 @@
   "logging": {
     "level": "info"
   },
+  "events": {
+    "max_size_mb": 100,
+    "keep": 5
+  },
   "distros": [
     {
       "name": "rocky",
