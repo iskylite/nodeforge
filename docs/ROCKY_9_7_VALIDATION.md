@@ -97,3 +97,67 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 - 最近一次并发验证结果为 `started=20, completed=20, failed=0`；会话 CLI 显示
   ID、状态和文件名。资产导入也已通过 daemon 管理 API 在目标机计算 SHA-256、原子写入
   catalog 并立即发布 TFTP 白名单。
+
+## M1.5 CLI 输出验证
+
+### 2026-07-11：完成
+
+- 构建：Zig 0.16.0，`aarch64-linux-gnu ReleaseSafe`；最新 `nodeforge` 和
+  `nodeforged` 已部署，systemd 为 `active`。
+- `nodeforge asset list` 输出带 `NAME`、`KIND`、`PATH` 的自动宽度对齐表格；六个长度不同的
+  asset 名称未再使用 tab 作为布局。
+- `asset show` 输出 `Asset` 分组键值块；`tftp show` 输出统一的计数块；完成一次标准 TFTP
+  下载后，`tftp session list` 输出 `ID`、`PHASE`、`FILENAME` 对齐表格。
+- `asset list --output json` 已由 `jq` 解析并确认至少四个资产；human 表格没有改变 JSON 结构。
+- 重定向 human 输出与 `--no-color` 输出逐字节一致，且使用 `LC_ALL=C grep` 确认没有 ANSI
+  escape 字节。
+- M1.5 后续回归确认所有 human 业务命令遵循同一 formatter：`asset list` 与 TFTP 会话表在表头
+  后输出列宽匹配的 `-` 分隔线；config/catalog/asset 校验和 import 输出统一 `OK` 摘要与键值块；
+  `check` 成功仍保留单行稳定摘要。JSON、export、help、错误和 debug 输出保持各自契约。
+
+### 2026-07-11：M1 + M1.5 重新编译回归验证
+
+- 目标：`root@r97n0`（Rocky Linux 9.7 aarch64，内核 `5.14.0-611.5.1.el9_7.aarch64`）；
+  构建：Zig 0.16.0，`aarch64-linux-gnu ReleaseSafe`（本地交叉编译后 `scp` 部署）。
+- 部署后 `systemctl start nodeforged` 返回 `active`，`ss -lunp` 确认 `nodeforged` 独占
+  `0.0.0.0:69`；`nodeforge --version` 与 `nodeforged --version` 均输出 `0.1.0`。
+
+#### M1 回归
+
+- **`--check` 预检**：daemon 运行时 `nodeforged --check --debug` 因 HTTP 端口被自身占用
+  报 `HttpAddressUnavailable`（预期行为）；手动以 Python 占用 UDP 69 后独立进程执行
+  `--check` 报 `TftpAddressUnavailable`（exit 1）；以 `nobody` 用户运行报
+  `TftpAddressUnavailable`（权限不足）；用 `server_ip=192.0.2.123` 配置报
+  `TftpAdvertiseAddressUnavailable`。四种场景全部正确识别。
+- **TFTP 下载**：`tftp -m octet 192.168.26.128 -c get` 下载 `grubaa64.efi`、
+  `grubx64.efi` 和 `boot/vmlinuz-test`，三对 SHA-256 与源文件完全一致：
+  - `grubaa64.efi`: `cd96fa95b930cafc33dcd48b6af204141614c7d571525667c332cce26193c2ed`
+  - `grubx64.efi`: `57cb26b1ce42a21e3d1d254e9f8c744322c58c1c4f28be1c741c4d407636d37d`
+  - `vmlinuz-test`: `cc3cce58e624edca805bf4ce719b6b5344d0ac288bb5e53c8c3bf0b363ec3fb5`
+- **OACK**：独立 Python UDP 客户端发送 `blksize=1024,timeout=1,tsize=0`，服务器返回
+  OACK `{'blksize':'1024','timeout':'1','tsize':'27'}`；使用 `blksize=512` 完整下载
+  27 字节文件，SHA-256 与源一致。
+- **重传**：对 block 1 不回 ACK，收到初始 DATA + 3 次重传（共 4 个相同 block=1 包），
+  随后会话标记 `failed`。
+- **路径安全**：`../etc/passwd` → `ERROR code=1 file not found`；`/etc/passwd`
+  （绝对路径）→ `ERROR code=1`；`nonexistent/file.bin` → `ERROR code=1`。
+- **WRQ**：返回 `ERROR code=2 write requests are disabled`，`/opt/nodeforge/tftp/`
+  下无 `write-test` 文件产生。
+- **并发压测**：20 个线程同时发起 RRQ 下载 `grubaa64.efi`，全部成功且 SHA-256 一致；
+  会话计数器 `started=30, completed=26, failed=4`（4 个 failed 对应路径穿越、绝对路径、
+  不存在文件和重传超时），会话列表正确显示 ID、PHASE 和 FILENAME。
+
+#### M1.5 回归
+
+- `asset list`（human）输出 `NAME / KIND / PATH` 三列自动宽度对齐表格，表头后跟 `-`
+  分隔线，无 tab 布局；`asset list --output json` 输出可被 `json.tool` 解析的 4 资产 JSON。
+- `asset show grub-uefi-aarch64`（human）输出 `Asset` 分组键值块（Name/Kind/Path/SHA-256）；
+  `--output json` 输出单资产 JSON（含 sha256 字段）。
+- `tftp show`（human）输出 `TFTP` 计数块；`--output json` 输出 `{"started":30,"completed":26,"failed":4}`。
+- `tftp session list`（human）输出 `ID / PHASE / FILENAME` 对齐表格；`--output json` 输出
+  `{"ok":true,"result":{"sessions":[...]}}` 结构。
+- `nodeforge status` 输出 `NodeForge status` 键值块（Process/HTTP/Management/Config API）；
+  `nodeforge check` 输出单行 `OK nodeforge checks passed`（exit 0）。
+- `config validate`、`catalog validate`、`asset validate` 均输出 `OK` 摘要 + 键值块。
+- `--no-color` 与管道重定向输出逐字节一致；`LC_ALL=C grep -c $'\033'` 返回 `0`，确认
+  human 输出无 ANSI escape 字节。

@@ -23,6 +23,9 @@ pub const asset_validate = @import("assets/validate.zig");
 pub const grub = @import("boot/grub.zig");
 pub const observe_error = @import("observe/error.zig");
 pub const observe_log = @import("observe/log.zig");
+pub const cli_table = @import("cli/table.zig");
+pub const cli_output = @import("cli/output.zig");
+pub const cli_views = @import("cli/views.zig");
 
 test {
     _ = model;
@@ -47,4 +50,7 @@ test {
     _ = grub;
     _ = observe_error;
     _ = observe_log;
+    _ = cli_table;
+    _ = cli_output;
+    _ = cli_views;
 }

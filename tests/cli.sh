@@ -39,6 +39,11 @@ if grep -Eq '^   .*--catalog' "$tmp/import-help"; then
     exit 1
 fi
 
+"$cli" asset import --help >"$tmp/asset-import-help"
+grep -Fq 'Distro name, used with --version and --arch; e.g. rocky' "$tmp/asset-import-help"
+grep -Fq 'Distro version, used with --distro and --arch; e.g. 9.7' "$tmp/asset-import-help"
+grep -Fq 'Architecture, used with --distro and --version; e.g. aarch64' "$tmp/asset-import-help"
+
 for command in \
     "status" \
     "check" \
@@ -95,6 +100,21 @@ done
 grep -q '"ok":true' "$tmp/validate"
 grep -q "$root/config.example.json" "$tmp/validate"
 
+# M1.5 human output is an aligned, headered table rather than tabs. The
+# contract runs with stdout redirected, so it also proves no ANSI bytes leak
+# into scripts and snapshots; JSON retains its machine-readable shape.
+"$cli" asset list -C "$root/catalog.example.json" >"$tmp/asset-list"
+grep -Eq '^NAME[[:space:]]+KIND[[:space:]]+PATH[[:space:]]*$' "$tmp/asset-list"
+grep -F 'rocky-9.7-aarch64-installer-kernel' "$tmp/asset-list" | grep -Fq 'kernel'
+if LC_ALL=C grep -q "$(printf '\033')" "$tmp/asset-list"; then
+    echo "human asset list must not emit ANSI outside a TTY" >&2
+    exit 1
+fi
+"$cli" asset list -C "$root/catalog.example.json" --no-color >"$tmp/asset-list-no-color"
+cmp "$tmp/asset-list" "$tmp/asset-list-no-color"
+"$cli" asset list -C "$root/catalog.example.json" -o json >"$tmp/asset-list-json"
+grep -Fq '"assets":[' "$tmp/asset-list-json"
+
 if "$cli" --config "$root/config.example.json" config validate >"$tmp/root-config" 2>&1; then
     echo "root config flag unexpectedly succeeded" >&2
     exit 1
@@ -144,7 +164,9 @@ grep -q "Missing 1 positional argument" "$tmp/missing"
 # Import is deliberately a single-file operation. A missing catalog must not
 # prevent staging a valid startup config for the next daemon restart.
 "$cli" config import -c "$tmp/imported.json" "$root/config.example.json" >"$tmp/imported"
-grep -q '^OK config imported ' "$tmp/imported"
+grep -Fqx 'OK config imported' "$tmp/imported"
+grep -q '^  Source' "$tmp/imported"
+grep -q '^  Destination' "$tmp/imported"
 test -s "$tmp/imported.json"
 
 # A source that fails semantic validation must not replace a previously valid

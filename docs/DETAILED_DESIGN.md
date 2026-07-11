@@ -26,6 +26,7 @@
 | --- | --- | --- | --- |
 | M0 | 项目骨架、单 HTTP listener 和管理接口 | 无 | `nodeforged` / `nodeforge` 可启动，配置和端口可自检 |
 | M1 | TFTP 闭环 | M0 | 标准 TFTP client 可下载 x86_64/aarch64 启动文件 |
+| M1.5 | CLI 输出统一架构 | M0、M1 | human 输出统一分组/表格/详情格式，JSON 保持稳定机器接口 |
 | M2 | DHCP + PXE 闭环 | M0、M1 | 节点获得 lease 和正确 bootfile，并进入 bootloader |
 | M3 | HTTP 资产、ISO 仓库和事件接口 | M0、资产模型 | 节点可获取配置/answer/rootfs/ISO repo，并上报事件 |
 | M4 | PXE 无人值守安装与基础后处理 | M1-M3 | Rocky Linux 9.7 aarch64、Ubuntu Server 22.04 LTS 安装和 `install_post` 跑通 |
@@ -47,8 +48,9 @@
 
 ### 1.4 阅读顺序与阶段依赖
 
-- M0-M7 是可验收的产品阶段，按章节顺序阅读和交付。
+- M0-M7（含 M1.5）是可验收的产品阶段，按章节顺序阅读和交付。
 - M1 先实现正式 TFTP 只读服务，并用标准 TFTP client 验证 RRQ/OACK、重传和路径安全。
+- M1.5 在 M2 前收敛 CLI 展示层；它不改变 daemon API、配置或协议语义，但 M2+ 新命令必须复用其 formatter。
 - M2 再实现 DHCP 地址、架构识别和 bootfile 决策，最后与 M1 联调完整 PXE 入口。
 - M4/M5 交付基础 provisioning runner；M7 只增强 archive、script、firstboot 和诊断，不是安装或无盘链路的前置阻塞。
 
@@ -755,7 +757,7 @@ zli 提供 spinner，但 M0 不启用。只有后续耗时交互命令同时处�
 
 帮助和版本属于 CLI 通用控制能力，只提供 `-h/--help` 与 `-v/--version` 参数，不定义 `help`、`version` 同名子命令。`-v/--version` 只属于顶层 `nodeforge`；`-h/--help` 由每一级命令提供。`--config`、`--catalog`、`--output` 不作为全局参数，只挂在实际读取它们的叶子命令上，必须写在该命令之后。子命令集合只保留 status、check、config、catalog 等业务入口，避免同一操作存在两套写法。
 
-M0 短参数固定为：`nodeforge` 根命令 `-v`，叶子命令按需使用 `-c`（config）、`-C`（catalog）、`-o`（output）、`-d`（debug）；`-h` 由 zli 自动提供。`nodeforged` 为无子命令入口，使用 `-v/-c/-C/-d/-k/-K`（version/config/catalog/debug/check/check-config）。帮助页只展示用途、参数和默认值，不内嵌长示例。
+M0 短参数固定为：`nodeforge` 根命令 `-v`，叶子命令按需使用 `-c`（config）、`-C`（catalog）、`-o`（output）、`-d`（debug）；`-h` 由 zli 自动提供。`nodeforged` 为无子命令入口，使用 `-v/-c/-C/-d/-k/-K`（version/config/catalog/debug/check/check-config）。帮助页不内嵌长命令示例，但每个枚举、关联或格式不直观的参数必须在 description 中给出一个字段级 `e.g.` 值，并说明其关联参数。
 
 CLI 与配置文件分工：
 
@@ -1000,6 +1002,137 @@ nodeforge asset validate
 - [x] `nodeforge asset validate` 校验所有资产的文件可读性和 SHA-256。
 - [x] `nodeforged --check` 预检包含 UDP 69 TFTP 端口可用性。
 - [x] systemd 快速重启正常，TFTP 与 HTTP listener 并行启动。
+
+## 6.5 M1.5：CLI 输出统一架构
+
+**完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0`
+完成验证。** `asset list/show`、`tftp show/session list` 与 `status` 已迁移到统一 view/table
+层；JSON 输出、退出码及 daemon API 保持兼容。验证记录见
+[`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md#m15-cli-输出验证)。
+
+### 6.5.1 目标与边界
+
+M1 的 `asset list`、`tftp session list` 等命令已经证明，直接在 handler 中使用
+`writer.print("{s}\t...`)` 会随字段长度产生不稳定的对齐。M1.5 建立唯一的 CLI 展示层，
+让默认 human 输出像运维工具而不是调试日志；它是 M2+ DHCP、node、bundle 和 runtime 命令的
+共同前置，不改变任何管理 API、catalog/config 事实源、退出码或 TFTP/DHCP 协议行为。
+
+以下内容**不**属于 formatter：服务端 journal 日志、`events.jsonl`、HTTP JSON error envelope、
+`config export`/`catalog export` 的原始 JSON，以及 `--output json`。这些输出保留既有
+机器消费语义，不能为了好看而重排或加 ANSI 控制字符。
+
+### 6.5.2 模块与依赖
+
+新增目录仅归属 `nodeforge` CLI 二进制，不进入 daemon/core 领域模型：
+
+```text
+src/cli/
+  output.zig    # OutputMode、TTY/颜色策略、成功/错误/详情入口
+  table.zig     # 列定义、两遍宽度计算、截断和渲染
+  views.zig     # AssetRow、TftpSessionRow、StatusView 等展示模型
+```
+
+依赖方向固定为：`main.zig handler -> cli/views -> cli/output/table -> std.Io.Writer`。
+`cli/*` 可以读取已经获得的 domain 值，但不得加载文件、调用 HTTP、修改 catalog/config 或定义
+另一套业务类型。handler 负责查询和构造 typed view；formatter 只决定布局。禁止通过反射或
+字段名猜测列：列标题、顺序、对齐和隐藏规则是每种 view 的显式契约。
+
+### 6.5.3 输出模型与接口
+
+每个有 human/JSON 双输出的命令先构造同一事实模型；JSON 从该模型直接序列化，human 再通过
+`render()` 渲染为表格或通过 `detailField()` 渲染为详情键值块。不得为展示重新读取 catalog，也不得让 JSON 经过表格渲染。
+
+```zig
+const Mode = enum { human, json };
+const Alignment = enum { left, right };
+
+const Column = struct {
+    key: []const u8,       // stable view key; not necessarily the JSON field name
+    title: []const u8,
+    alignment: Alignment = .left,
+    min_width: usize = 0,
+    max_width: ?usize = null,
+    // priority: u8 = 0,   // M2+: larger value is truncated first on narrow terminals
+};
+
+// render(writer, columns, rows, empty_message, options) is the table API;
+// M1.5 does not use a Table wrapper struct.
+// writeEscaped(writer, value) escapes control chars for detail/section views.
+```
+
+`views.zig` 至少定义 `AssetRow { name, kind, path }`、
+`TftpSessionRow { id, phase, filename }` 和 `StatusView`。详情页使用键值块，而非一列表格；
+同一命令的成功摘要由 `output.zig` 输出稳定的 `OK ...` 文本。错误仍沿用
+`error: <category>: <brief reason>` 和 `-d/--debug` 的两层约定，不由 table 包吞掉。
+
+### 6.5.4 Human 渲染规则
+
+- 表格总是输出稳定的全大写表头；空列表输出明确的领域消息，例如 `No assets registered.`，不输出空表头。
+- 表头之后必须输出与列宽一致的 `-` 分隔线；分隔线和列间两个空格由 table renderer 统一生成，
+  handler 禁止自行插入 tab、空格或 ASCII 表格边框。
+- formatter 先收集所有 cell 的可显示宽度，再统一输出；文本左对齐，ID、计数和大小右对齐。
+- 宽度按 Unicode display width 而非字节数计算；ANSI SGR 序列不计入宽度。M1.5 不支持不确定宽度的控制序列。
+- 检测到 TTY 时可使用颜色强调 `OK`/`WARN`/`ERROR`/`PENDING`，但颜色绝不表达唯一语义；非 TTY、
+  `--output json` 和 `--no-color` 必须无 ANSI 字节。
+- 若表格超过终端可用宽度，按 `max_width` 截断低价值 cell 并以 `…` 表示；名称、ID 和状态列不得静默截断。
+  终端宽度不可获得时采用无颜色、无截断的安全布局。按列 `priority` 优先级截断为 M2+ 计划。
+- 值中的换行、制表符和控制字符必须转义为可见文本，避免一个 catalog 字段破坏整张表。
+- 不使用 `\t` 作为列布局机制；列间使用 formatter 计算出的空格。
+
+`nodeforge asset list` 的目标输出为：
+
+```text
+NAME                    KIND        PATH
+grub-uefi-aarch64       bootloader  efi/grubaa64.efi
+grub-uefi-x86_64        bootloader  efi/grubx64.efi
+test-kernel             kernel      boot/vmlinuz-test
+grub-uefi-aarch64-v2    bootloader  efi/grubaa64-v2.efi
+```
+
+`asset show`、`status` 等详情型命令统一使用分组键值块：
+
+```text
+Asset
+  Name       grub-uefi-aarch64
+  Kind       bootloader
+  Path       efi/grubaa64.efi
+  SHA-256    <digest>
+```
+
+### 6.5.5 CLI 参数与迁移
+
+`--output human|json` 继续是各叶子命令的局部参数，默认 `human`；M1.5 不添加 CSV、YAML 或
+自动探测机器模式。`--color`/`--no-color` 作为首个通用展示 flag 已挂载，但 M1.5 暂不输出 ANSI
+颜色；该 flag 为 M2+ TTY 颜色支持预留入口，不改变 JSON、help、export 或 daemon 日志。
+
+迁移按以下顺序进行：
+
+1. 实现 `cli/output.zig`、`cli/table.zig` 和单元测试，不修改命令语义。
+2. 迁移 `asset list/show`、`tftp show`、`tftp session list`；删除这些 handler 中的 tab 和手写对齐。
+3. 迁移 `status`/`check`，保持其既有退出码和 `OK` 成功摘要。
+4. M2 及以后新增 list/show/status/plan 命令只能构造 view 并调用统一 renderer；code review 禁止 handler 直接拼多列 human 输出。
+
+M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过 `cli/output.zig` 或
+`cli/views.zig`：列表使用 table、详情使用分组键值块、成功/失败摘要使用统一块。仅有以下明确例外：
+
+- zli 自动生成的 `--help`/usage 和顶层 version；
+- `config export`、`catalog export` 的原始 JSON；
+- `--output json` 的机器结果；
+- 一行 CLI 错误和 `-d` debug 原因（它们遵循独立、稳定的错误契约）；
+- daemon journal、HTTP error envelope、events JSONL（均非 `nodeforge` human view）。
+
+因此新增命令的 review 项目是“是否构造了 typed view 并调用 formatter”，而不是“是否手工排好了空格”。
+
+### 6.5.6 测试与验收
+
+- table 单元测试覆盖空表、单行/多行、可变列宽、右对齐数值、Unicode 宽字符、控制字符转义、
+  窄终端截断和 `--no-color`。控制字符和无效 UTF-8 的 display width 统一为 4（`\xNN`）；
+  `writeEscaped` 为详情/状态块提供与 `writeCell` 一致的转义。
+- CLI 契约测试覆盖 `asset list`、`asset show`、`tftp session list` 和 `status` 的 human 快照；
+  快照在非 TTY 下运行，确保没有 ANSI 字节。
+- 每个迁移命令的 `--output json` 必须可解析，字段、退出码和事实值与迁移前一致；human 版允许优化布局，
+  但不得删除关键状态。
+- 检查同一数据在长短字段下列首对齐，且空列表、错误和 debug 输出不被表格 renderer 改写。
 
 ## 7. M2：DHCP + PXE 闭环
 

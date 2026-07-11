@@ -5,6 +5,8 @@
 const std = @import("std");
 const zli = @import("zli");
 const nodeforge = @import("nodeforge");
+const views = @import("nodeforge").cli_views;
+const cli_output = @import("nodeforge").cli_output;
 
 /// zli handler 共享的可变执行结果。
 /// handler 本身返回错误只用于传播内部故障；可预期的业务失败通过此状态返回退出码。
@@ -204,13 +206,13 @@ fn assetImportCommand(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(command);
     try addDebugFlag(command);
     try command.addFlags(&.{
-        .{ .name = "type", .description = "Asset type (bootloader, kernel, installer_initrd, nodeforge_initrd, rootfs, iso, gpg_key)", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "name", .description = "Unique catalog asset name", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "path", .description = "Path relative to tftp.asset_root", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "distro", .description = "Optional distro name", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "version", .description = "Optional distro version", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "Optional architecture: x86_64 or aarch64", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "kernel-release", .description = "Optional kernel release", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "type", .description = "Asset kind; e.g. bootloader (also kernel, installer_initrd, nodeforge_initrd, rootfs, iso, gpg_key)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "name", .description = "Unique catalog name; e.g. rocky-9.7-aarch64-kernel", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "path", .description = "Path relative to tftp.asset_root; e.g. boot/rocky/9.7/aarch64/vmlinuz", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "distro", .description = "Distro name, used with --version and --arch; e.g. rocky", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "version", .description = "Distro version, used with --distro and --arch; e.g. 9.7", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Architecture, used with --distro and --version; e.g. aarch64 (or x86_64)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "kernel-release", .description = "Kernel uname release for bundle matching; e.g. 5.14.0-611.el9.aarch64", .type = .String, .default_value = .{ .String = "" } },
     });
     return command;
 }
@@ -290,7 +292,7 @@ fn configValidateHandler(ctx: zli.CommandContext) !void {
     if (output_json)
         try ctx.writer.print("{{\"ok\":true,\"config\":\"{s}\",\"catalog\":\"{s}\"}}\n", .{ config_path, catalog_path })
     else
-        try ctx.writer.print("OK config valid  {s}  catalog {s}\n", .{ config_path, catalog_path });
+        try views.success(ctx.writer, "config valid", &.{ .{ .label = "Config", .value = config_path }, .{ .label = "Catalog", .value = catalog_path } });
 }
 
 /// 加载启动配置并将规范化 JSON 写到 stdout。
@@ -325,7 +327,7 @@ fn configImportHandler(ctx: zli.CommandContext) !void {
     if (output_json)
         try ctx.writer.print("{{\"ok\":true,\"source\":\"{s}\",\"destination\":\"{s}\"}}\n", .{ source, config_path })
     else
-        try ctx.writer.print("OK config imported  {s} -> {s}\n", .{ source, config_path });
+        try views.success(ctx.writer, "config imported", &.{ .{ .label = "Source", .value = source }, .{ .label = "Destination", .value = config_path } });
 }
 
 /// 加载配置和 catalog 并校验 catalog 对象及跨文件关系。
@@ -352,7 +354,7 @@ fn catalogValidateHandler(ctx: zli.CommandContext) !void {
     if (output_json)
         try ctx.writer.print("{{\"ok\":true,\"catalog\":\"{s}\"}}\n", .{catalog_path})
     else
-        try ctx.writer.print("OK catalog valid  {s}\n", .{catalog_path});
+        try views.success(ctx.writer, "catalog valid", &.{.{ .label = "Catalog", .value = catalog_path }});
 }
 
 /// 加载 catalog 并将规范化 JSON 写到 stdout；文件缺失时导出空 catalog。
@@ -392,7 +394,7 @@ fn assetImportHandler(ctx: zli.CommandContext) !void {
         .kernel_release = if (ctx.flag("kernel-release", []const u8).len == 0) null else ctx.flag("kernel-release", []const u8),
     }) catch |err| { try ctx.writer.print("error: asset: import request failed\n", .{}); if (debug) try ctx.writer.print("debug: asset: cause={t}\n", .{err}); setExitCode(ctx, 1); return; };
     if (!imported) { try ctx.writer.writeAll("error: asset: daemon rejected import\n"); setExitCode(ctx, 1); return; }
-    if (output_json) try ctx.writer.print("{{\"ok\":true,\"name\":\"{s}\"}}\n", .{name}) else try ctx.writer.print("OK asset imported  {s}\n", .{name});
+    if (output_json) try ctx.writer.print("{{\"ok\":true,\"name\":\"{s}\"}}\n", .{name}) else try views.success(ctx.writer, "asset imported", &.{.{ .label = "Name", .value = name }});
 }
 
 fn assetListHandler(ctx: zli.CommandContext) !void {
@@ -403,7 +405,12 @@ fn assetListHandler(ctx: zli.CommandContext) !void {
         try ctx.writer.writeAll("{\"assets\":[");
         for (loaded.value().assets, 0..) |item, i| { if (i != 0) try ctx.writer.writeByte(','); try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\"}}", .{ item.name, item.kind, item.path }); }
         try ctx.writer.writeAll("]}\n");
-    } else for (loaded.value().assets) |item| try ctx.writer.print("{s}\t{t}\t{s}\n", .{ item.name, item.kind, item.path });
+    } else {
+        var rows: [64]views.AssetRow = undefined;
+        if (loaded.value().assets.len > rows.len) return error.TooManyAssets;
+        for (loaded.value().assets, 0..) |item, i| rows[i] = .{ .name = item.name, .kind = @tagName(item.kind), .path = item.path };
+        try views.assets(ctx.writer, rows[0..loaded.value().assets.len]);
+    }
 }
 
 fn assetShowHandler(ctx: zli.CommandContext) !void {
@@ -411,7 +418,7 @@ fn assetShowHandler(ctx: zli.CommandContext) !void {
     var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
     defer loaded.deinit();
     const name = ctx.getArg("name") orelse unreachable;
-    for (loaded.value().assets) |item| if (std.mem.eql(u8, item.name, name)) { if (output_json) try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\",\"sha256\":{f}}}\n", .{ item.name, item.kind, item.path, std.json.fmt(item.sha256, .{}) }) else try ctx.writer.print("name: {s}\nkind: {t}\npath: {s}\nsha256: {s}\n", .{ item.name, item.kind, item.path, item.sha256 orelse "" }); return; };
+    for (loaded.value().assets) |item| if (std.mem.eql(u8, item.name, name)) { if (output_json) try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\",\"sha256\":{f}}}\n", .{ item.name, item.kind, item.path, std.json.fmt(item.sha256, .{}) }) else try views.assetDetail(ctx.writer, item.name, @tagName(item.kind), item.path, item.sha256 orelse ""); return; };
     try ctx.writer.print("error: asset: not found: {s}\n", .{name}); setExitCode(ctx, 1);
 }
 
@@ -422,7 +429,10 @@ fn assetValidateHandler(ctx: zli.CommandContext) !void {
     var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
     defer loaded.deinit();
     for (loaded.value().assets) |item| { var digest: [64]u8 = undefined; nodeforge.asset_validate.sha256File(ctx.io, parsed_config.value.tftp.asset_root, item.path, &digest) catch { try ctx.writer.print("error: asset: unreadable: {s}\n", .{item.path}); setExitCode(ctx, 1); return; }; if (item.sha256 == null or !std.mem.eql(u8, item.sha256.?, &digest)) { try ctx.writer.print("error: asset: checksum mismatch: {s}\n", .{item.name}); setExitCode(ctx, 1); return; } }
-    if (output_json) try ctx.writer.writeAll("{\"ok\":true}\n") else try ctx.writer.print("OK {d} assets valid\n", .{loaded.value().assets.len});
+    if (output_json) try ctx.writer.writeAll("{\"ok\":true}\n") else {
+        var count: [20]u8 = undefined;
+        try views.success(ctx.writer, "assets valid", &.{.{ .label = "Assets", .value = try std.fmt.bufPrint(&count, "{d}", .{loaded.value().assets.len}) }});
+    }
 }
 
 fn tftpShowHandler(ctx: zli.CommandContext) !void {
@@ -431,7 +441,7 @@ fn tftpShowHandler(ctx: zli.CommandContext) !void {
     defer parsed_config.deinit();
     const status = nodeforge.management_client.tftpCounters(ctx.io, parsed_config.value.server.http_port);
     if (!status.healthy) { try ctx.writer.writeAll("error: tftp: local daemon status unavailable\n"); setExitCode(ctx, 1); return; }
-    if (output_json) try ctx.writer.print("{{\"started\":{d},\"completed\":{d},\"failed\":{d}}}\n", .{ status.started, status.completed, status.failed }) else try ctx.writer.print("TFTP sessions\n  started    {d}\n  completed  {d}\n  failed     {d}\n", .{ status.started, status.completed, status.failed });
+    if (output_json) try ctx.writer.print("{{\"started\":{d},\"completed\":{d},\"failed\":{d}}}\n", .{ status.started, status.completed, status.failed }) else try views.tftpCounters(ctx.writer, status.started, status.completed, status.failed);
 }
 
 fn tftpSessionListHandler(ctx: zli.CommandContext) !void {
@@ -449,20 +459,30 @@ fn tftpSessionListHandler(ctx: zli.CommandContext) !void {
     const SessionResponse = struct { ok: bool, result: struct { sessions: []const struct { id: u64, phase: nodeforge.runtime_state.TftpSessionPhase, filename: []const u8 } } };
     var parsed = std.json.parseFromSlice(SessionResponse, ctx.allocator, body.?, .{ .allocate = .alloc_always }) catch |err| { try ctx.writer.print("error: tftp: malformed daemon response ({t})\n", .{err}); setExitCode(ctx, 1); return; };
     defer parsed.deinit();
-    if (parsed.value.result.sessions.len == 0) { try ctx.writer.writeAll("No TFTP sessions recorded.\n"); return; }
-    for (parsed.value.result.sessions) |session| try ctx.writer.print("{d}\t{t}\t{s}\n", .{ session.id, session.phase, session.filename });
+    var rows: [32]views.TftpSessionRow = undefined;
+    if (parsed.value.result.sessions.len > rows.len) return error.TooManyTftpSessions;
+    var ids: [32][20]u8 = undefined;
+    for (parsed.value.result.sessions, 0..) |session, i| rows[i] = .{ .id = try std.fmt.bufPrint(&ids[i], "{d}", .{session.id}), .phase = @tagName(session.phase), .filename = session.filename };
+    try views.tftpSessions(ctx.writer, rows[0..parsed.value.result.sessions.len]);
 }
 
 /// 读取当前命令的输出格式并校验其值。
 /// 返回 null 表示已输出可读错误并把退出码设为用法错误 2。
 fn outputJsonFromContext(ctx: zli.CommandContext) ?bool {
+    const output = outputFromContext(ctx) orelse return null;
+    return output.mode == .json;
+}
+
+/// 将命令局部展示 flags 收敛为 M1.5 的 `Output` 值。后续有状态色、终端宽度或
+/// pager 时只能扩展此入口，业务 handler 不得自行读取 `--no-color`。
+fn outputFromContext(ctx: zli.CommandContext) ?cli_output.Output {
     const output = ctx.flag("output", []const u8);
-    const output_json = if (std.mem.eql(u8, output, "json")) true else if (std.mem.eql(u8, output, "human")) false else {
+    const mode: cli_output.Mode = if (std.mem.eql(u8, output, "json")) .json else if (std.mem.eql(u8, output, "human")) .human else {
         ctx.writer.print("error: output: unsupported format '{s}' (expected human or json)\n", .{output}) catch {};
         setExitCode(ctx, 2);
         return null;
     };
-    return output_json;
+    return .{ .mode = mode, .no_color = !ctx.flag("color", bool) };
 }
 
 /// 实现仅属于根命令的 `--version` 提前返回语义。
@@ -508,6 +528,12 @@ fn addOutputFlag(command: *zli.Command) !void {
         .type = .String,
         .default_value = .{ .String = "human" },
     });
+    try command.addFlag(.{
+        .name = "color",
+        .description = "Reserved for future ANSI color support; M1.5 outputs without color regardless",
+        .type = .Bool,
+        .default_value = .{ .Bool = true },
+    });
 }
 
 /// 为可失败的本地命令声明简短的诊断输出开关。
@@ -547,29 +573,14 @@ fn statusCommand(
     }
     if (std.mem.eql(u8, action, "check")) {
         if (ok) {
-            try out.writeAll("OK nodeforge checks passed\n");
+            try views.success(out, "nodeforge checks passed", &.{});
         } else {
-            try out.writeAll("FAIL nodeforge checks failed\n");
-            try printCheckLine(out, "Process", status.reachable);
-            try printCheckLine(out, "HTTP", health.healthy);
-            try printCheckLine(out, "Management", status.healthy);
-            try printCheckLine(out, "Config API", active_config.healthy);
+            try views.checkFailure(out, status.reachable, health.healthy, status.healthy, active_config.healthy);
         }
         return if (ok) 0 else 1;
     }
 
-    try out.writeAll("NodeForge status\n");
-    try out.print("  Process     {s}\n", .{if (status.reachable) "OK reachable" else "FAIL unreachable"});
-    try out.print("  HTTP        {s} http://{s}:{d}\n", .{
-        if (health.healthy) "OK healthy" else "FAIL unhealthy",
-        parsed_config.value.server.server_ip,
-        parsed_config.value.server.http_port,
-    });
-    try out.print("  Management  {s} http://127.0.0.1:{d}\n", .{
-        if (status.healthy) "OK route" else "FAIL route",
-        parsed_config.value.server.http_port,
-    });
-    try out.print("  Config API  {s}\n", .{if (active_config.healthy) "OK config valid" else "FAIL config unavailable"});
+    try views.status(out, status.reachable, health.healthy, status.healthy, active_config.healthy, parsed_config.value.server.server_ip, parsed_config.value.server.http_port);
     return if (ok) 0 else 1;
 }
 
@@ -667,11 +678,6 @@ fn isUsageError(err: anyerror) bool {
 /// 返回可直接嵌入 JSON 的布尔字面量。
 fn jsonBool(value: bool) []const u8 {
     return if (value) "true" else "false";
-}
-
-/// 输出一行对齐的 human 健康检查结果。
-fn printCheckLine(out: *std.Io.Writer, label: []const u8, passed: bool) !void {
-    try out.print("  {s:<12} {s}\n", .{ label, if (passed) "OK" else "FAIL" });
 }
 
 /// 输出稳定的 CLI 名称与项目版本。

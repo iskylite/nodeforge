@@ -1402,7 +1402,7 @@ CLI 是 NodeForge MVP 的主要运维界面。M0 仅提供状态、健康检查�
 - 使用 vendored `zli v5.1.2`，不长期维护手写参数 parser、字符串命令分发或重复帮助文本。命令树是 CLI 语法的唯一事实源；新增 flag 时同时声明名称、类型、默认值和说明，自动进入解析和对应层级的帮助。
 - 顶层、资源级和动作级都必须支持 `-h/--help`，例如 `nodeforge --help`、`nodeforge config --help`、`nodeforge config validate --help`。
 - 帮助和版本只使用 `-h/--help`、`-v/--version` 参数，不设置 `help`、`version` 同名子命令；子命令仅表达业务动作。
-- 每个帮助页面至少包含用途、参数、默认值和输出语义；长示例只维护在 README、运维手册和验收文档。
+- 每个帮助页面至少包含用途、参数、默认值和输出语义；长命令示例只维护在 README、运维手册和验收文档。对于 enum、格式约束或必须成组使用的参数，flag description 必须直接给出字段级 `e.g.` 值并说明关联参数，例如 `--distro rocky`、`--version 9.7`、`--arch aarch64`。
 - 解析层只负责命令树、参数类型和帮助信息；配置语义、路径关系和安全规则仍由 core validator 负责。
 - M1+ 对复杂对象优先接受文件、清单或 patch 输入，例如 `config apply <file>`、`node import <file>`、`asset import <path>`，避免设计几十个长参数。
 - `-v/--version` 只在顶层命令使用；`-h/--help` 由 zli 自动提供给根、资源和动作层级。
@@ -1527,6 +1527,26 @@ nodeforge config validate
 - 错误输出必须包含错误摘要、影响范围和下一步建议。
 - 彩色输出只在 TTY 默认开启；`--no-color` 必须关闭颜色。
 - 所有命令支持 `--output json`，字段名与内部 API 保持稳定。
+
+#### 10.6.1 统一 formatter
+
+CLI 使用独立展示层统一渲染 human 输出：handler 先构造 typed view，`cli/output.zig` 决定
+分组、成功/错误样式和颜色策略，`cli/table.zig` 根据显式 column 定义计算宽度、对齐和截断。
+formatter 不读取或修改 config/catalog/runtime，不调用 HTTP，也不猜测业务字段；JSON 直接从同一
+事实模型序列化，绝不先渲染为表格再解析。
+
+列表固定使用稳定表头和空列表消息，详情固定使用分组键值块。文本列左对齐，计数/大小/ID 等数值列右对齐；
+实现按 Unicode display width 计算列宽并忽略 ANSI 序列。TTY 的 human 输出可以使用辅助颜色，
+但非 TTY、`--output json` 或 `--no-color` 必须没有 ANSI 控制字符，颜色不能承载唯一语义。
+窄终端按列优先级截断低价值 cell 并显示 `…`，不静默截断资源 ID 或状态。
+
+所有 human 业务输出均必须通过此 formatter；表格在表头后输出与列宽对应的 `-` 分隔线。
+唯一例外是自动 help/version、原始 JSON export、JSON 模式以及一行错误/debug 诊断，它们各自保持
+稳定的机器或错误契约。handler 不得自行使用 tab、手算空格或 ASCII 表格边框。
+
+这是 M1.5 的公共 CLI 基础设施；M2+ 的 list/show/status/plan 命令必须复用它，不能在 handler
+中以 `\t` 或手算空格拼接多列表格。服务日志、HTTP error envelope、JSON export 和 `events.jsonl`
+不经过 formatter，继续保持各自的机器接口契约。
 
 `nodeforge node status` 示例：
 
