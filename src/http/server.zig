@@ -81,6 +81,8 @@ pub fn serve(
 /// - `GET  /api/v1/management/server/status`      — 守护进程生命周期阶段
 /// - `GET  /api/v1/management/tftp/status`        — M1 TFTP 传输计数
 /// - `GET  /api/v1/management/tftp/sessions`      — M1 TFTP 会话列表
+/// - `GET  /api/v1/management/dhcp/leases`        — M2 DHCP lease 列表
+/// - `GET  /api/v1/management/dhcp/unknown`       — M2 未认领节点列表
 /// - `POST /api/v1/management/assets/import`      — M1 资产导入（daemon 写入 catalog）
 fn route(request: zap.Request) !void {
     const context = active_context orelse return error.MissingRouteContext;
@@ -111,6 +113,12 @@ fn route(request: zap.Request) !void {
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/tftp/sessions")) {
         return tftpSessions(request, context.runtime);
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/dhcp/leases")) {
+        return dhcpLeases(request, context.allocator, context.runtime, false);
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/dhcp/unknown")) {
+        return dhcpLeases(request, context.allocator, context.runtime, true);
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/assets/import")) {
         return importAsset(request, context);
@@ -184,6 +192,32 @@ fn tftpSessions(request: zap.Request, runtime: *const runtime_state.RuntimeState
     }
     try writer.writeAll("]}}\n");
     try json(request, .ok, writer.buffered());
+}
+
+fn dhcpLeases(request: zap.Request, allocator: std.mem.Allocator, runtime: *const runtime_state.RuntimeState, unknown_only: bool) !void {
+    var leases: [runtime_state.DhcpState.max_leases]runtime_state.DhcpLease = undefined;
+    @constCast(&runtime.dhcp).snapshot(&leases);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"leases\":[");
+    var first = true;
+    for (leases) |lease| {
+        if (!lease.used() or (unknown_only and lease.known)) continue;
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        try output.writer.print("{{\"phase\":\"{t}\",\"known\":{s},\"ip\":\"{d}.{d}.{d}.{d}\",\"mac\":\"{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\",\"expires_at\":{d}}}", .{
+            lease.phase,
+            if (lease.known) "true" else "false",
+            (lease.ip >> 24) & 255,
+            (lease.ip >> 16) & 255,
+            (lease.ip >> 8) & 255,
+            lease.ip & 255,
+            lease.mac[0], lease.mac[1], lease.mac[2], lease.mac[3], lease.mac[4], lease.mac[5],
+            lease.expires_at,
+        });
+    }
+    try output.writer.writeAll("]}}\n");
+    try json(request, .ok, output.written());
 }
 
 /// Renders configuration validation failures using NodeForge's stable error envelope.

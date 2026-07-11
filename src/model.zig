@@ -13,6 +13,8 @@ pub const AppConfig = struct {
     http: HttpConfig = .{},
     /// TFTP 只读启动资产根目录；监听端口固定为 UDP 69。
     tftp: TftpConfig = .{},
+    /// PXE 管理网 DHCPv4 策略；监听端口固定为 UDP 67。
+    dhcp: DhcpConfig = .{},
     /// 服务日志等级；daemon `--debug` 可在本次启动临时覆盖为 debug。
     logging: LoggingConfig = .{},
     /// 受支持的发行版及版本矩阵。
@@ -44,7 +46,8 @@ pub const Catalog = struct {
 pub const ServerConfig = struct {
     /// 用于日志和状态输出的实例名称。
     name: []const u8 = "nodeforge",
-    /// PXE 服务网卡名称。M0 可为空；M1/M2 接入 TFTP/DHCP 后用于约束三类服务在同一网卡/网段。
+    /// PXE 服务网卡名称。当前 DHCPv4 Linux 服务要求该字段非空，并以它限制广播收发；示例中的
+    /// `enp1s0` 只是占位值，部署前必须替换为承载 `server_ip` 的实际网卡。
     bind_interface: ?[]const u8 = null,
     /// PXE 服务网对外 IPv4 地址；用于生成 HTTP/TFTP URL、DHCP next-server 等广告地址。
     /// HTTP M0 仍绑定 0.0.0.0，不把该字段作为 bind 地址。
@@ -68,6 +71,24 @@ pub const HttpConfig = struct {
 pub const TftpConfig = struct {
     /// bootloader、GRUB 配置、kernel 和 initrd 的只读根目录。
     asset_root: []const u8 = paths.tftp_dir,
+};
+
+/// M2 authoritative DHCPv4 的最小站点级地址池。端口不会进入配置。
+pub const DhcpConfig = struct {
+    subnet: []const u8 = "192.168.50.0/24",
+    pool_start: []const u8 = "192.168.50.100",
+    pool_end: []const u8 = "192.168.50.200",
+    router: ?[]const u8 = null,
+    dns: []const []const u8 = &.{},
+    lease_seconds: u32 = 1800,
+    /// An OFFER is short lived until the client confirms it with REQUEST.
+    offer_seconds: u32 = 60,
+    /// A declined address is quarantined before it may re-enter the pool.
+    abandon_seconds: u32 = 3600,
+    /// ICMP Echo Reply wait before an address is offered. Zero is invalid.
+    /// The daemon requires CAP_NET_RAW; when probing is unavailable it withholds
+    /// the OFFER instead of treating the candidate as clear.
+    ping_timeout_ms: u16 = 500,
 };
 
 /// 服务日志配置。业务事件仍写入独立的 events.jsonl。

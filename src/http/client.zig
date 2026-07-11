@@ -104,12 +104,21 @@ pub fn tftpCounters(io: std.Io, port: u16) TftpCounters {
 /// 调用方负责格式化输出；本函数只负责固定路由的 HTTP GET 和响应体提取。
 /// 仅连接 `127.0.0.1`，不接受远程端点。
 pub fn tftpSessionsJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    return managementJson(io, port, "/api/v1/management/tftp/sessions", output);
+}
+
+/// Retrieves M2 DHCP lease observations from the local management listener.
+pub fn dhcpLeasesJson(io: std.Io, port: u16, unknown_only: bool, output: []u8) !?[]const u8 {
+    return managementJson(io, port, if (unknown_only) "/api/v1/management/dhcp/unknown" else "/api/v1/management/dhcp/leases", output);
+}
+
+fn managementJson(io: std.Io, port: u16, path: []const u8, output: []u8) !?[]const u8 {
     const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return null;
     var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return null;
     defer stream.close(io);
     var send_buffer: [512]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
-    try writer.interface.writeAll("GET /api/v1/management/tftp/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    try writer.interface.print("GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{path});
     try writer.interface.flush();
     var recv_buffer: [12 * 1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);

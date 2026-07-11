@@ -7,13 +7,29 @@ const std = @import("std");
 pub const Event = struct {
     /// 事件信封版本；当前固定为 1。
     v: u8 = 1,
-    /// ISO 8601 UTC 时间戳字符串。
+    /// `unix:<UTC seconds>` timestamp. Version 1 daemon-generated events use
+    /// this compact, timezone-unambiguous form; consumers must not assume an
+    /// ISO 8601 string until a versioned event-format migration is introduced.
     ts: []const u8,
     /// 事件类型，例如 `service.started`、`dhcp.lease.allocated`。
     /// 字段名为 `type`，与设计文档 events.jsonl 格式一致。
     @"type": []const u8,
     /// 人类可读的事件摘要。
     message: []const u8,
+};
+
+/// Stable timestamp marker for version 1 daemon-generated audit events.
+pub const unix_timestamp_prefix = "unix:";
+
+/// Process-local serialiser for concurrent protocol workers.  It intentionally
+/// owns no queue: a successful call means the audit line reached the file.
+pub const Writer = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    pub fn append(self: *Writer, io: std.Io, allocator: std.mem.Allocator, path: []const u8, event: Event) !void {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        try @import("events.zig").append(io, allocator, path, event);
+    }
 };
 
 /// 以单行 JSON 追加事件。
@@ -46,7 +62,7 @@ test "event renders as one JSON line" {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try std.json.Stringify.value(Event{
-        .ts = "2026-07-09T12:00:00Z",
+        .ts = "unix:1783598400",
         .@"type" = "service.started",
         .message = "ready",
     }, .{}, &output.writer);

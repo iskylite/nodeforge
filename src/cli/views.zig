@@ -8,6 +8,8 @@ const table = @import("table.zig");
 
 pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const u8 };
 pub const TftpSessionRow = struct { id: []const u8, phase: []const u8, filename: []const u8 };
+pub const DhcpLeaseRow = struct { ip: []const u8, mac: []const u8, phase: []const u8, expires_at: []const u8 };
+pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8 };
 
 /// 渲染 asset 列表表格。`rows` 使用借用 slice；超过 64 行返回 `error.TooManyRows`。
 pub fn assets(writer: *std.Io.Writer, rows: []const AssetRow) !void {
@@ -35,6 +37,33 @@ pub fn tftpCounters(writer: *std.Io.Writer, started: u64, completed: u64, failed
     try writer.print("{d}\n", .{completed});
     try writeLabel(writer, "Failed");
     try writer.print("{d}\n", .{failed});
+}
+
+pub fn dhcpConfig(writer: *std.Io.Writer, subnet: []const u8, pool_start: []const u8, pool_end: []const u8, lease_seconds: u32) !void {
+    try writer.writeAll("DHCP\n");
+    try detailField(writer, "Subnet", subnet);
+    try writeLabel(writer, "Pool");
+    try writer.print("{s}-{s}\n", .{ pool_start, pool_end });
+    try writeLabel(writer, "Lease seconds");
+    try writer.print("{d}\n", .{lease_seconds});
+}
+
+pub fn dhcpLeases(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_only: bool) !void {
+    const columns = [_]table.Column{ .{ .key = "ip", .title = "IP" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "phase", .title = "PHASE" }, .{ .key = "expires", .title = "EXPIRES" } };
+    var cells: [256][4][]const u8 = undefined;
+    var table_rows: [256]table.Row = undefined;
+    if (rows.len > table_rows.len) return error.TooManyRows;
+    for (rows, 0..) |row, i| { cells[i] = .{ row.ip, row.mac, row.phase, row.expires_at }; table_rows[i] = .{ .cells = &cells[i] }; }
+    try table.render(writer, &columns, table_rows[0..rows.len], if (unknown_only) "No unknown clients." else "No DHCP leases.", .{});
+}
+
+pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
+    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" } };
+    var cells: [256][4][]const u8 = undefined;
+    var table_rows: [256]table.Row = undefined;
+    if (rows.len > table_rows.len) return error.TooManyRows;
+    for (rows, 0..) |row, i| { cells[i] = .{ row.id, row.mac, row.ip, row.profile }; table_rows[i] = .{ .cells = &cells[i] }; }
+    try table.render(writer, &columns, table_rows[0..rows.len], "No nodes registered.", .{});
 }
 
 /// 输出统一的成功摘要和可选键值事实。短摘要保留已有 `OK` 运维习惯，字段

@@ -93,7 +93,7 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 - **启动加载与在线更新分层**：M0 中，`nodeforged` 启动时读取并校验 `config.json`，形成内存配置快照；站点结构性配置修改后重启生效，`config import` 只是离线原子写入。M1+ 才引入 DHCP discovery 策略和 catalog 变更的在线 API，由 `nodeforged` 原子更新内存快照并持久化。
 - **端口固定**：DHCP 固定监听 `UDP 67`，TFTP 固定监听 `UDP 69`。这两个端口是源码常量，不提供配置项、CLI 参数或运行时覆盖参数。
 - **发现安全**：未知节点身份可以从租约池获得临时 IP，并按 `dhcp.discovery.default_action` 进入等待、discovery 或显式允许的临时无盘；未知节点不能执行自动安装。MVP 以 MAC 为主要身份，保留 DHCP client id 和 SN 作为辅助信息。
-- **HTTP 单监听简化**：MVP 只启动一个 HTTP listener，固定绑定 `0.0.0.0:<http.port>`。M0 先提供健康检查和管理 API，M3 的 PXE 数据 API 将复用同一 HTTP 实现、连接循环和路由入口。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。`server.bind_interface` 可选，用于表达 HTTP/DHCP/TFTP 共同归属的服务网卡；CLI 管理客户端写死访问 `127.0.0.1:<http.port>`，不做远程管理发现和多管理端点配置。
+- **HTTP 单监听简化**：MVP 只启动一个 HTTP listener，固定绑定 `0.0.0.0:<http.port>`。M0 先提供健康检查和管理 API，M3 的 PXE 数据 API 将复用同一 HTTP 实现、连接循环和路由入口。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。DHCPv4 Linux 部署必须设置 `server.bind_interface`，用于以 `SO_BINDTODEVICE` 约束 DHCP 广播；CLI 管理客户端写死访问 `127.0.0.1:<http.port>`，不做远程管理发现和多管理端点配置。
 - **管理端口约定**：MVP 不引入独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`。listener 绑定所有 IPv4 接口，管理路由不检查 peer 来源，因此接受所有能到达该端口的连接。`nodeforge` CLI 固定连接 `127.0.0.1:<http.port>` 且不提供远程 endpoint，只支持管理同机 `nodeforged`。端口冲突时修改 `config.json` 后重启服务。
 - **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 只做 status/check、config/catalog 校验与导出、离线 config import。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
 - **CLI 使用成熟库**：命令解析、帮助信息、参数类型、默认值和错误提示使用固定版本的开源 CLI 库。MVP 固定使用支持 Zig 0.16.0 的 `zli v5.1.2`；命令、子命令、flag、位置参数和说明只在命令树中声明一次，解析与分级帮助从同一份声明生成。zli 只承载 CLI 语法和展示，不承载复杂业务配置模型。
@@ -1592,10 +1592,10 @@ node-02  52:54:00:12:34:02  192.168.50.102  diskless  rootfs_mounted    ubuntu-2
 示例：
 
 ```json
-{"ts":"2026-07-06T10:00:00Z","node":"node-01","type":"dhcp.discover","mac":"52:54:00:12:34:01"}
-{"ts":"2026-07-06T10:00:01Z","node":"node-01","type":"tftp.rrq","file":"grubx64.efi"}
-{"ts":"2026-07-06T10:00:05Z","node":"node-01","type":"boot.initrd_started"}
-{"ts":"2026-07-06T10:02:20Z","node":"node-01","type":"install.packages","progress":63}
+{"ts":"unix:1783332000","node":"node-01","type":"dhcp.discover","mac":"52:54:00:12:34:01"}
+{"ts":"unix:1783332001","node":"node-01","type":"tftp.rrq","file":"grubx64.efi"}
+{"ts":"unix:1783332005","node":"node-01","type":"boot.initrd_started"}
+{"ts":"unix:1783332140","node":"node-01","type":"install.packages","progress":63}
 ```
 
 常见事件类型：

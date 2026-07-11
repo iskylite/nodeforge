@@ -7,9 +7,13 @@ const std = @import("std");
 const model = @import("model.zig");
 const http_server = @import("http/server.zig");
 const tftp_server = @import("tftp/server.zig");
+const dhcp_server = @import("dhcp/server.zig");
 const runtime_state = @import("state/runtime.zig");
 const catalog_runtime = @import("state/catalog_runtime.zig");
 const observe_log = @import("observe/log.zig");
+const paths = @import("paths.zig");
+const dhcp_store = @import("state/dhcp_store.zig");
+const events = @import("state/events.zig");
 
 /// 启动 M1 TFTP 与唯一 HTTP listener。
 ///
@@ -26,11 +30,29 @@ pub fn run(
         .service = .running,
         .config_generation = 1,
     };
+    var clock: std.posix.timespec = undefined;
+    const current_time: i64 = if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) == .SUCCESS) @intCast(clock.sec) else 0;
+    dhcp_store.load(io, allocator, paths.runtime_path, &runtime.dhcp, current_time) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => observe_log.err("dhcp: ignoring invalid runtime snapshot: {t}", .{err}),
+    };
+    var event_writer: events.Writer = .{};
+    const persistence: dhcp_server.Persistence = .{ .allocator = allocator, .runtime_path = paths.runtime_path, .events_path = paths.events_path, .writer = &event_writer };
     var live_catalog = catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
-    const tftp_socket = try tftp_server.bind(io);
+    // DHCP needs a wildcard receive socket for client broadcasts.  The DHCP
+    // server applies the configured PXE NIC as a Linux socket-level boundary;
+    // TFTP remains bound to the advertised unicast address below.
+    const dhcp_socket = try dhcp_server.bind(io, config.server.server_ip, config.server.bind_interface);
+    var dhcp_thread = try std.Thread.spawn(.{}, runDhcp, .{ io, dhcp_socket, config, &runtime, &persistence });
+    // M2 has no daemon reload/shutdown coordinator: workers are detached and
+    // process exit closes their sockets. Add cooperative cancellation before
+    // introducing config reload or independently stoppable protocol services.
+    dhcp_thread.detach();
+    observe_log.info("dhcp: listening on udp://{s}:{d}", .{ config.server.server_ip, dhcp_server.port });
+    const tftp_socket = try tftp_server.bind(io, config.server.server_ip);
     var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, tftp_socket, config, &live_catalog, &runtime });
     tftp_thread.detach();
-    observe_log.info("tftp: listening on udp://0.0.0.0:{d} (advertise {s})", .{ tftp_server.port, config.server.server_ip });
+    observe_log.info("tftp: listening on udp://{s}:{d}", .{ config.server.server_ip, tftp_server.port });
 
     // HTTP 明确绑定所有 IPv4 地址。`server.server_ip` 是给裸机节点使用的
     // 对外广告地址，不参与 bind；后续 DHCP/TFTP 接入时也要保持这个区分。
@@ -43,6 +65,10 @@ pub fn run(
         &live_catalog,
         &runtime,
     );
+}
+
+fn runDhcp(io: std.Io, socket: std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: *const dhcp_server.Persistence) void {
+    dhcp_server.serveSocket(io, socket, config, runtime, persistence) catch |err| observe_log.err("dhcp: stopped: {t}", .{err});
 }
 
 fn runTftp(

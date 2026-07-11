@@ -163,6 +163,39 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try tftp_session.addCommands(&.{tftp_session_list});
     try tftp.addCommands(&.{ tftp_show, tftp_session });
 
+    const dhcp = try zli.Command.init(init_options, .{
+        .name = "dhcp",
+        .description = "Inspect the DHCPv4 service configuration",
+        .usage = "nodeforge dhcp show [options]",
+    }, showCurrentHelp);
+    const dhcp_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show DHCP subnet and pool configuration" }, dhcpShowHandler);
+    try addConfigPathFlag(dhcp_show);
+    try addOutputFlag(dhcp_show);
+    try addDebugFlag(dhcp_show);
+    try dhcp.addCommands(&.{dhcp_show});
+
+    const runtime = try zli.Command.init(init_options, .{ .name = "runtime", .description = "Inspect current DHCP runtime state" }, showCurrentHelp);
+    const leases = try zli.Command.init(init_options, .{ .name = "leases", .description = "Inspect DHCP leases" }, showCurrentHelp);
+    const leases_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List active DHCP leases" }, runtimeLeasesHandler);
+    try addConfigPathFlag(leases_list);
+    try addOutputFlag(leases_list);
+    try addDebugFlag(leases_list);
+    const unknown = try zli.Command.init(init_options, .{ .name = "unknown", .description = "Inspect unclaimed DHCP clients" }, showCurrentHelp);
+    const unknown_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List unclaimed DHCP clients" }, runtimeUnknownHandler);
+    try addConfigPathFlag(unknown_list);
+    try addOutputFlag(unknown_list);
+    try addDebugFlag(unknown_list);
+    try leases.addCommands(&.{leases_list});
+    try unknown.addCommands(&.{unknown_list});
+    try runtime.addCommands(&.{ leases, unknown });
+
+    const node = try zli.Command.init(init_options, .{ .name = "node", .description = "Inspect registered nodes" }, showCurrentHelp);
+    const node_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List registered nodes" }, nodeListHandler);
+    try addConfigPathFlag(node_list);
+    try addOutputFlag(node_list);
+    try addDebugFlag(node_list);
+    try node.addCommands(&.{node_list});
+
     const asset = try zli.Command.init(init_options, .{
         .name = "asset",
         .description = "Inspect and register TFTP boot assets",
@@ -177,6 +210,9 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         config,
         catalog,
         tftp,
+        dhcp,
+        runtime,
+        node,
         asset,
     });
     return root;
@@ -464,6 +500,67 @@ fn tftpSessionListHandler(ctx: zli.CommandContext) !void {
     var ids: [32][20]u8 = undefined;
     for (parsed.value.result.sessions, 0..) |session, i| rows[i] = .{ .id = try std.fmt.bufPrint(&ids[i], "{d}", .{session.id}), .phase = @tagName(session.phase), .filename = session.filename };
     try views.tftpSessions(ctx.writer, rows[0..parsed.value.result.sessions.len]);
+}
+
+fn dhcpShowHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer config.deinit();
+    const dhcp = config.value.dhcp;
+    if (output_json) {
+        try ctx.writer.print("{{\"subnet\":{f},\"pool_start\":{f},\"pool_end\":{f},\"lease_seconds\":{d}}}\n", .{ std.json.fmt(dhcp.subnet, .{}), std.json.fmt(dhcp.pool_start, .{}), std.json.fmt(dhcp.pool_end, .{}), dhcp.lease_seconds });
+    } else try views.dhcpConfig(ctx.writer, dhcp.subnet, dhcp.pool_start, dhcp.pool_end, dhcp.lease_seconds);
+}
+
+fn runtimeLeasesHandler(ctx: zli.CommandContext) !void {
+    try runtimeLeaseList(ctx, false);
+}
+
+fn runtimeUnknownHandler(ctx: zli.CommandContext) !void {
+    try runtimeLeaseList(ctx, true);
+}
+
+fn runtimeLeaseList(ctx: zli.CommandContext, unknown_only: bool) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer config.deinit();
+    var response: [64 * 1024]u8 = undefined;
+    const body = try nodeforge.management_client.dhcpLeasesJson(ctx.io, config.value.server.http_port, unknown_only, &response);
+    if (body == null) {
+        try ctx.writer.writeAll("error: runtime: local daemon DHCP API unavailable\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    if (output_json) { try ctx.writer.writeAll(body.?); return; }
+    const Response = struct { ok: bool, result: struct { leases: []const struct { phase: nodeforge.runtime_state.LeasePhase, known: bool, ip: []const u8, mac: []const u8, expires_at: i64 } } };
+    var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always }) catch |err| { try ctx.writer.print("error: runtime: malformed daemon response ({t})\n", .{err}); setExitCode(ctx, 1); return; };
+    defer parsed.deinit();
+    var rows: [256]views.DhcpLeaseRow = undefined;
+    var expiration: [256][24]u8 = undefined;
+    if (parsed.value.result.leases.len > rows.len) return error.TooManyDhcpLeases;
+    for (parsed.value.result.leases, 0..) |lease, i| rows[i] = .{ .ip = lease.ip, .mac = lease.mac, .phase = @tagName(lease.phase), .expires_at = try std.fmt.bufPrint(&expiration[i], "{d}", .{lease.expires_at}) };
+    try views.dhcpLeases(ctx.writer, rows[0..parsed.value.result.leases.len], unknown_only);
+}
+
+fn nodeListHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer config.deinit();
+    if (output_json) {
+        try ctx.writer.writeAll("{\"nodes\":[");
+        for (config.value.nodes, 0..) |item, i| {
+            if (i != 0) try ctx.writer.writeByte(',');
+            try ctx.writer.print("{{\"id\":{f},\"mac\":{f},\"ip\":", .{ std.json.fmt(item.id, .{}), std.json.fmt(item.mac, .{}) });
+            if (item.ip) |ip| try ctx.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try ctx.writer.writeAll("null");
+            try ctx.writer.print(",\"profile\":{f}}}", .{std.json.fmt(item.profile, .{})});
+        }
+        try ctx.writer.writeAll("]}\n");
+        return;
+    }
+    var rows: [256]views.NodeRow = undefined;
+    if (config.value.nodes.len > rows.len) return error.TooManyNodes;
+    for (config.value.nodes, 0..) |item, i| rows[i] = .{ .id = item.id, .mac = item.mac, .ip = item.ip orelse "-", .profile = item.profile };
+    try views.nodes(ctx.writer, rows[0..config.value.nodes.len]);
 }
 
 /// 读取当前命令的输出格式并校验其值。

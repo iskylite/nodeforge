@@ -23,7 +23,10 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 sed \
-    -e 's/192.168.50.1/127.0.0.1/' \
+    -e 's/192.168.50.1/127.0.0.1/g' \
+    -e 's/192.168.50.0\/24/127.0.0.0\/24/' \
+    -e 's/192.168.50.100/127.0.0.100/' \
+    -e 's/192.168.50.200/127.0.0.200/' \
     -e "s/\"http_port\": 8080/\"http_port\": $port/" \
     "$root/config.example.json" > "$tmp/config.json"
 
@@ -47,6 +50,17 @@ curl --silent --fail "http://127.0.0.1:$port/api/v1/management/server/status" >"
 grep -Fqx '{"ok":true,"result":{"service":"running"}}' "$tmp/status"
 curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/validate" >"$tmp/validate"
 grep -Fqx '{"ok":true,"result":{}}' "$tmp/validate"
+
+# M2 read-only DHCP/runtime commands consume the validated local config and
+# daemon management routes. The empty pool is still a useful contract check.
+"$cli" dhcp show -c "$tmp/config.json" >"$tmp/dhcp-show"
+grep -Fqx '  Subnet       127.0.0.0/24' "$tmp/dhcp-show"
+"$cli" runtime leases list -c "$tmp/config.json" >"$tmp/dhcp-leases"
+grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No DHCP leases\.)' "$tmp/dhcp-leases"
+"$cli" runtime unknown list -c "$tmp/config.json" >"$tmp/dhcp-unknown"
+grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No unknown clients\.)' "$tmp/dhcp-unknown"
+"$cli" node list -c "$tmp/config.json" >"$tmp/node-list"
+grep -Fqx 'No nodes registered.' "$tmp/node-list"
 
 "$cli" check -c "$tmp/config.json" >"$tmp/check"
 grep -Fqx 'OK nodeforge checks passed' "$tmp/check"

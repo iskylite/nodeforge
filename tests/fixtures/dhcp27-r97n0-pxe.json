@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "server": {
+    "name": "nodeforge-dhcp27-pxe-test",
+    "bind_interface": "enp26s0",
+    "server_ip": "192.168.27.128",
+    "http_port": 18080
+  },
+  "http": { "asset_root": "/opt/nodeforge/assets", "repository_root": "/opt/nodeforge/repos" },
+  "tftp": { "asset_root": "/opt/nodeforge/tftp" },
+  "distros": [
+    { "name": "rocky", "family": "rhel", "versions": [
+      { "version": "9.7", "archs": ["aarch64", "x86_64"], "install_adapter": "kickstart", "package_manager": "dnf" }
+    ] },
+    { "name": "ubuntu", "family": "ubuntu", "versions": [
+      { "version": "22.04", "archs": ["aarch64", "x86_64"], "install_adapter": "autoinstall", "package_manager": "apt" }
+    ] }
+  ],
+  "dhcp": {
+    "subnet": "192.168.27.0/24",
+    "pool_start": "192.168.27.200",
+    "pool_end": "192.168.27.254",
+    "router": "192.168.27.128",
+    "dns": ["192.168.27.128"],
+    "lease_seconds": 120,
+    "offer_seconds": 30,
+    "abandon_seconds": 120
+  },
+  "profiles": [
+    {
+      "name": "pxe-discovery-aarch64",
+      "mode": "discovery",
+      "distro": "rocky",
+      "version": "9.7",
+      "arch": "aarch64",
+      "safety": { "safe_for_unknown": true, "destructive": false, "persistent_writes": false }
+    }
+  ],
+  "policy": {
+    "default_action": "discovery",
+    "default_profile": "pxe-discovery-aarch64",
+    "allow_unknown_diskless": false
+  }
+}

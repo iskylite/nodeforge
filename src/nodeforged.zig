@@ -153,7 +153,7 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
                 nodeforge.observe_log.debug("preflight: cause={t}", .{err});
             return err;
         };
-        nodeforge.observe_log.info("preflight: config, HTTP and TFTP ports available", .{});
+        nodeforge.observe_log.info("preflight: config, HTTP, TFTP and DHCP ports available", .{});
         return;
     }
 

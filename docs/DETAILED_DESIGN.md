@@ -710,7 +710,7 @@ M0 代码按单 HTTP listener、config/catalog/runtime 分层和 `zli v5.1.2` CL
 MVP 不实现第二套 RPC，也不再拆成 management listener 与 PXE listener。一个 HTTP server 实现复用路由、JSON 错误、状态和生命周期，只启动一个 IPv4 listener：
 
 - HTTP listener 固定绑定 `0.0.0.0:http.port`。M0 只提供 `/healthz` 和管理 API；M3 将在同一 listener 提供 boot config、answer、repo/rootfs 下载和节点事件。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。
-- `server.bind_interface` 可选，用于表达 HTTP/DHCP/TFTP 共同归属的服务网卡。M0 只校验字段格式；M1/M2 接入 TFTP/DHCP 后必须校验该网卡存在，并拥有或可到达 `server.server_ip` 所在网段。
+- `server.bind_interface` 是 DHCPv4 Linux 服务的必填 PXE 网卡字段，用于约束 DHCP 广播收发；示例的 `enp1s0` 只是占位值，部署前必须替换为承载 `server.server_ip` 的实际接口。静态校验拒绝空值；实际 bind 继续验证接口存在且可用。
 - `nodeforge` CLI 管理客户端固定连接 `127.0.0.1:http.port`，不提供远程管理地址配置项。
 - MVP 不配置独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`；端口冲突时修改 `config.json` 并重启。
 - 管理路由与未来 PXE 数据路由逻辑分区；服务端不做 peer 来源检查，所有能到达该 listener 的 IPv4 客户端都可调用管理路由。
@@ -803,7 +803,7 @@ nodeforge catalog export
 M0 至少校验：
 
 - JSON 格式和必填字段。
-- 静态 config/catalog 校验检查 `server.server_ip` 为 IPv4、`server.bind_interface`（如填写）非空、`http.port` 非零；M0 不校验网卡是否存在。
+- 静态 config/catalog 校验检查 `server.server_ip` 为 IPv4、`server.bind_interface` 非空、`http.port` 非零；实际启动时由 socket 绑定验证网卡存在与权限。
 - `nodeforged --check` 额外检查唯一 HTTP listener 的 `0.0.0.0:http.port` 是否可用；正常启动仍以 Zap `listen()` 的实际结果为准。
 - HTTP listener 与预检允许 `SO_REUSEADDR`，保证 systemd 快速重启不会被刚释放的 socket 窗口误伤；预检先连接本机端口以识别活跃 listener，避免 macOS 上两个启用该选项的 wildcard socket 共存。活跃实例仍保持端口独占。
 - node id、MAC、IP、arch 和 profile 引用。
@@ -1136,6 +1136,13 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 
 ## 7. M2：DHCP + PXE 闭环
 
+**完成状态（2026-07-11）：M2 DHCPv4 与 UEFI PXE/TFTP 闭环完成。** 已实现 DHCP
+生命周期、option 53/50/54/60/61/82/93/97、relay 回包路由、静态保留地址排除、运行态持久化、
+未知节点观察、PXE bootfile 决策和 ICMP Ping Probe。`r97n0` 的
+`192.168.27.0/24` 已完成 DISCOVER/OFFER/REQUEST/ACK、RELEASE、冲突隔离和管理 CLI/API
+验证。独立 VMware ARM UEFI 客户端已实际消费 DHCP option 67 的 `efi/grubaa64.efi`，经 TFTP
+进入 GRUB 2.06；详情见 [`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md#m2-dhcp-验证)。
+
 ### 7.1 目标
 
 在 PXE 管理网段内提供 authoritative DHCP：
@@ -1145,7 +1152,7 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 - DHCP 返回 `next-server` 和 bootfile。
 - 租约和事件进入运行态。
 
-### 6.2 代码任务
+### 7.2 代码任务
 
 | 模块 | 任务 |
 | --- | --- |
@@ -1154,7 +1161,7 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 | `boot/resolver.zig` | 节点身份到 node/profile/bootfile 的唯一决策入口 |
 | `state/runtime.zig` | 运行态 lease 写入 |
 
-### 6.3 DHCP 行为
+### 7.3 DHCP 行为
 
 必须处理：
 
@@ -1179,8 +1186,19 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 - 基础报文遵循 RFC 2131/2132；PXE 架构识别遵循 RFC 4578，优先使用 option 93，不从 vendor class 字符串猜架构。
 - option 60 仅用于识别 `PXEClient`、HTTPClient 等标准 vendor class；MVP 不定义私有 option 43 子选项。
 - option 61 是客户端标识辅助信息，不替代 MAC 与显式 node 绑定。
+- **Linux DHCP 广播接收边界**：客户端在获得地址前向 `255.255.255.255:67` 广播。Linux 不会把这类
+  datagram 投递给只绑定 `server.server_ip` 的 socket，因此 DHCP listener 必须绑定 wildcard
+  UDP/67；同时必须以 `SO_BINDTODEVICE(server.bind_interface)` 限定接收/发送接口，避免多网卡主机
+  在管理网段回答请求。TFTP 仍只绑定 `server.server_ip:69`，因为 DHCP 已明确将该地址作为
+  `next-server` 广告给客户端。
+- **ACK 归属约束**：动态地址（未知节点和没有静态保留地址的已登记节点）必须先存在同一 MAC 的未过期
+  OFFER，才会转换为 ACK；任意 REQUEST 不能取得池内地址。唯一例外是已登记节点声明的静态保留地址，
+  它可在服务重启后没有内存 OFFER 的情况下确认其配置 IP。
+- **M2 生命周期边界**：DHCP/TFTP worker 当前为 detached 长循环；进程退出会关闭 socket 终止 worker，
+  尚无配置热重载或独立 graceful shutdown 协调器。引入运行期重载或独立停服能力前必须添加取消信号、
+  worker join 与 listener drain，这属于后续生命周期管理工作。
 - **`giaddr` 处理（RFC 2131 标准行为）**：当收到的 DHCP 报文 `giaddr` 非零时，表示报文经由外部 relay agent（路由器 IP Helper 或 `dhcrelay`）转发。服务器基于 `giaddr` 或 option 82 中的 RFC 3527 Link Selection 子选项定位目标 subnet，而非使用接收接口的 subnet。回复报文按 RFC 2131 Section 4.1 发送到 `giaddr:67`（relay agent 的 UDP 67 端口），而非广播或直接发给客户端。这是任何 RFC 2131 合规 DHCP 服务器的基本行为，不是独立功能特性。NodeForge 自身不实现 relay agent。参考 ISC DHCP `locate_network()`（`server/dhcp.c`）和 `bootp()`（`server/bootp.c`）的实现。
-- **服务器端地址冲突检测（Ping Probe）**：在发送 DHCPOFFER 前，对候选 IP 发送 ICMP Echo Request。在配置的超时内（默认 500ms）未收到 Echo Reply 才正式分配；收到回复则调用 `abandon_lease()` 标记该 IP 为 abandoned 状态（保持 `abandon_lease_time`，默认 1 小时），并尝试分配下一个候选 IP。参考 ISC DHCP `do_ping_check()`/`lease_pinged()`/`abandon_lease()` 实现。
+- **服务器端地址冲突检测（Ping Probe）**：在发送 DHCPOFFER 前，对候选 IP 发送 ICMP Echo Request。在配置的超时内（默认 500ms）未收到与该请求匹配的 Echo Reply 才发送 OFFER；Linux raw socket 收到自身发出的 Echo Request 或其他无关 ICMP 报文时，必须继续等待同一个绝对 deadline，不能提前判定地址空闲。收到匹配回复则调用 `abandon_lease()` 标记该 IP 为 abandoned 状态（保持 `abandon_lease_time`，默认 1 小时），并尝试下一个候选 IP。raw socket 打开、发送或接收失败时必须取消该 pending OFFER 并不回复，绝不能把 `unavailable` 当成 `clear`。Linux 服务单元需要 `CAP_NET_RAW` 和 `CAP_NET_BIND_SERVICE`。参考 ISC DHCP `do_ping_check()`/`lease_pinged()`/`abandon_lease()` 实现。
 - 未识别 option 必须安全跳过并保留报文边界；编码顺序稳定，必须正确写 end option 255。
 - `vendor/dhcp/` 保存去标识化的真实 DHCPv4 fixture、来源说明和期望解析结果。基于 ISC DHCP 源码重构实现，不直接链接 C 代码。
 - 只实现 DHCPv4；不监听 UDP 546/547，不解析 DHCPv6，也不输出 IPv6 地址。
@@ -1199,7 +1217,7 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 - `next-server`
 - `bootfile`
 
-### 6.4 DHCP 决策
+### 7.4 DHCP 决策
 
 ```text
 收到 DHCP 请求
@@ -1222,37 +1240,43 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
          仅当 allow_unknown_diskless=true 且 profile safety 满足 safe/ephemeral 时返回 diskless bootfile
        deny:
          不返回 PXE bootfile 或按策略拒绝
-  -> 写 lease/state/event
-  -> 返回 OFFER/ACK
+  -> DISCOVER 的候选地址执行 Ping Probe
+       clear: 写 OFFER/state/event 并回复
+       occupied: abandon 当前地址，选择下一个候选
+       unavailable: 取消 pending OFFER，只记录诊断，不回复
+  -> REQUEST/RELEASE/DECLINE 写 lease/state/event
+  -> 返回 ACK/NAK 或无回复
 ```
 
-### 6.5 CLI 命令
+### 7.5 CLI 命令
 
 ```bash
 nodeforge dhcp show
-nodeforge dhcp network update --mode authoritative --subnet 192.168.50.0/24 --router 192.168.50.1
-nodeforge dhcp pool update --range 192.168.50.100-192.168.50.200 --lease 30m
-nodeforge dhcp discovery enable --action wait --profile discovery-pxe
-nodeforge dhcp discovery update --action diskless --profile rocky-9.7-aarch64-diskless --allow-unknown-diskless
-nodeforge dhcp discovery update --action wait --disallow-unknown-diskless
 nodeforge runtime leases list
 nodeforge runtime unknown list
 nodeforge node list
-nodeforge node add node-01 --identity mac:52:54:00:12:34:01 --ip 192.168.50.101 --profile rocky-9.7-aarch64-install
-nodeforge node update node-01 --tag rack:r1 --tag gpu --var cluster_id=lab-a --override network.mode=static --override network.address=192.168.50.101 --override network.prefix_len=24 --override diskless.overlay.tmpfs_size=50%
-nodeforge node oob update node-01 --ipmi-address 192.168.10.51 --ipmi-netmask 255.255.255.0 --ipmi-gateway 192.168.10.1 --ipmi-username admin --ipmi-password 111111
 ```
 
-### 6.6 测试
+这四个命令是当前 M2 的只读运维面：`dhcp show` 从启动配置读取站点地址池，
+`runtime leases/unknown list` 从 daemon 运行态读取租约，`node list` 从已加载配置读取 MAC、
+保留地址和 profile。它们同时支持 `--output json`。
+
+`dhcp network/pool/discovery update`、`node add/update` 和 `node oob update` 需要 daemon 原子
+配置写入、重载策略以及 tags/vars/OOB 的事实模型；当前 schema 没有这些字段，因此它们不是已实现
+命令，也不得在文档或 help 中宣称可用。管理员目前通过 `config validate`、`config import` 和重启
+daemon 变更 DHCP/node 声明；在线变更属于后续配置管理阶段。
+
+### 7.6 测试
 
 单元测试：
 
 - DHCP packet decode/encode。
-- option 60/82/93/97 解析。
+- option 60/61/82/93/97 解析，含 RFC 3527 Link Selection。
 - `giaddr` 非零时的 subnet 定位和回复路由。
-- 租约池分配、续租、释放、DECLINE。
+- 租约池分配、ACK、释放、DECLINE、过期回收和持久化恢复。
 - 静态 IP 冲突检测。
-- 服务器端 ICMP Ping Probe 冲突检测和 lease abandon 流程。
+- 服务器端 ICMP Ping Probe：raw socket 自回显忽略、共享 deadline、冲突 abandon、替代地址 ACK，
+  以及 probe 不可用时 pending OFFER 回滚。
 
 集成测试：
 
@@ -1260,13 +1284,16 @@ nodeforge node oob update node-01 --ipmi-address 192.168.10.51 --ipmi-netmask 25
 - 使用虚拟网络或测试 UDP client 完成 DISCOVER/REQUEST。
 - 未知节点身份默认进入等待认领；显式配置后可进入非破坏性 discovery 或 safe/ephemeral diskless。
 
-### 6.7 阶段验收
+### 7.7 阶段验收
 
 - 未知节点能获得临时 IP。
 - 未知节点默认不执行安装或无盘启动。
 - 已登记节点能获得指定 IP。
 - DHCP 按 option 93 返回启动文件：UEFI x86_64 使用 `grubx64.efi`，UEFI aarch64 使用 `grubaa64.efi`。
 - `events.jsonl` 出现 `dhcp.discover`、`dhcp.offer`、`dhcp.ack`。
+- `r97n0` 受控验证另确认 `dhcp.abandoned` 与 `dhcp.release`；见 Rocky 验证记录。
+- 独立 VMware ARM UEFI 客户端在 `192.168.27.0/24` 实际消费 option 67 的
+  `efi/grubaa64.efi`、完成 TFTP bootloader 传输并进入 GRUB 2.06；该实机记录见 Rocky 验证文档。
 
 ## 8. M3：HTTP 配置、资产、ISO 仓库和事件接口
 
@@ -1279,7 +1306,7 @@ HTTP 成为 TFTP 之后的主要数据通道：
 - 提供大文件下载和 Range。
 - 接收事件和日志摘要。
 
-### 7.2 代码任务
+### 8.2 代码任务
 
 | 模块 | 任务 |
 | --- | --- |
@@ -1291,7 +1318,7 @@ HTTP 成为 TFTP 之后的主要数据通道：
 | `profile/render.zig` | 模板渲染入口 |
 | `state/events.zig` | JSONL append writer |
 
-### 7.3 路由
+### 8.3 路由
 
 | 路由 | 方法 | 输出 |
 | --- | --- | --- |
@@ -1306,7 +1333,7 @@ HTTP 成为 TFTP 之后的主要数据通道：
 | `/repos/:name/*` | GET | repo 文件 |
 | `/api/v1/management/runtime` | GET | 本机 CLI 使用的运行态摘要 |
 
-### 7.4 ISO 自动仓库
+### 8.4 ISO 自动仓库
 
 `nodeforge install-source import <iso>` 执行以下流程：
 
@@ -1319,7 +1346,7 @@ HTTP 成为 TFTP 之后的主要数据通道：
 
 ISO 中通过元数据校验的仓库是默认基础源，用户可以追加 mirror/额外源。GPG 检查默认关闭，仅在 repository 明确 `gpg_check = true` 时启用。
 
-### 7.5 boot config
+### 8.5 boot config
 
 diskless boot config 示例：
 
@@ -1339,13 +1366,13 @@ diskless boot config 示例：
 }
 ```
 
-### 7.6 事件写入
+### 8.6 事件写入
 
 事件格式：
 
 ```json
 {
-  "ts": "2026-07-06T10:00:05Z",
+  "ts": "unix:1783332005",
   "node": "node-01",
   "type": "boot.initrd_started",
   "stage": "initrd_started",
@@ -1360,7 +1387,7 @@ diskless boot config 示例：
 - 写入失败返回明确错误。
 - 同步更新 `node_status`。
 
-### 7.7 CLI 命令
+### 8.7 CLI 命令
 
 ```bash
 nodeforge runtime status
@@ -1371,7 +1398,7 @@ nodeforge install-source import Rocky-9.7-aarch64-dvd.iso --distro rocky --versi
 nodeforge repository show rocky-9.7-aarch64-iso
 ```
 
-### 7.8 并发与 HTTP 实现选择
+### 8.8 并发与 HTTP 实现选择
 
 - HTTP 服务器基于 Zap/facil.io 固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力；M0 尚未注册静态资产或 Range 路由，M3 再将其接入。NodeForge 当前只维护业务路由、管理 API 和统一错误信封，不维护 HTTP 报文解析或连接循环。已评估的备选方案 `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，不作为依赖。
 - acceptor 与固定大小 worker pool 分离；大文件使用 `pread`/send loop 流式发送，不整体读入内存。
@@ -1379,7 +1406,7 @@ nodeforge repository show rocky-9.7-aarch64-iso
 - 配置使用不可变 snapshot + 原子替换；runtime/state 由单 writer 串行落盘，事件追加有独立队列。
 - MVP 验收基线：并发 100 个 HTTP Range 下载、100 个 TFTP session 和每秒 200 个 DHCP 报文时无崩溃、无状态串扰；具体吞吐在目标 ARM VM 和 x86_64 机器记录，不先承诺生产数字。
 
-### 7.9 测试
+### 8.9 测试
 
 - `/healthz` 返回 OK。
 - Range 下载返回 206。
@@ -1388,7 +1415,7 @@ nodeforge repository show rocky-9.7-aarch64-iso
 - POST event 写入 JSONL。
 - runtime summary 与事件同步。
 
-### 7.10 阶段验收
+### 8.10 阶段验收
 
 - installer/initrd 能通过 HTTP 拿到配置。
 - 事件能写入 `events.jsonl`。
@@ -1401,7 +1428,7 @@ nodeforge repository show rocky-9.7-aarch64-iso
 
 首先在当前 Rocky Linux 9.7 aarch64 开发环境跑通 Kickstart，再跑通 Ubuntu Server 22.04 LTS autoinstall；x86_64 是首个生产验收架构，两种架构从初始模型、资产命名和 fixture 层同时支持。
 
-### 8.2 代码任务
+### 9.2 代码任务
 
 | 模块 | 任务 |
 | --- | --- |
@@ -1413,7 +1440,7 @@ nodeforge repository show rocky-9.7-aarch64-iso
 | `state/node_status.zig` | install 阶段状态 |
 | `provision/runner.zig` | 执行 repository、standard-packages、managed-file 三种基础步骤 |
 
-### 8.3 Ubuntu autoinstall 渲染
+### 9.3 Ubuntu autoinstall 渲染
 
 输入：
 
@@ -1455,7 +1482,7 @@ nodeforge repository show rocky-9.7-aarch64-iso
 | 后续目标 | Ubuntu Server 22.04 之后的 LTS | 按版本增加 schema、installer 参数和 fixture，不预先假定字段完全兼容 |
 | 非目标 | Ubuntu Server 20.04 LTS 及更早版本 | 不实现 d-i/preseed，也不做存量兼容 |
 
-### 8.4 Kickstart 渲染
+### 9.4 Kickstart 渲染
 
 输出 `ks.cfg`，至少包含：
 
@@ -1474,7 +1501,7 @@ MVP 首先要求 Rocky Linux 9.7 aarch64 完整安装跑通；随后验证 Rocky
 
 Kickstart 分区至少支持 `ext4`、`xfs`、`swap`、EFI System Partition 和 BIOS boot partition；默认 root 文件系统可由 profile 选择，Rocky 默认可用 xfs，但不得限制为 xfs。
 
-### 8.5 启动盘配置
+### 9.5 启动盘配置
 
 实现字段：
 
@@ -1503,7 +1530,7 @@ Kickstart 分区至少支持 `ext4`、`xfs`、`swap`、EFI System Partition 和 
 - `bootloader.install = true` 时 target 必须可解析。
 - `set_firmware_boot_order = true` 在 MVP 返回“不支持”或警告。已在 Rocky 9.7 aarch64 VMware EFI 虚拟机验证 `efibootmgr` 修改 BootOrder 的持久性和可靠性，但不同厂商固件存在兼容性差异，MVP 保持默认 `false` 避免阻塞安装。
 
-### 8.6 安装阶段状态
+### 9.6 安装阶段状态
 
 阶段：
 
@@ -1522,7 +1549,7 @@ installed
 failed
 ```
 
-### 8.7 CLI 命令
+### 9.7 CLI 命令
 
 ```bash
 nodeforge install render node-01
@@ -1531,7 +1558,7 @@ nodeforge install logs node-01
 nodeforge install retry node-01
 ```
 
-### 8.8 测试
+### 9.8 测试
 
 - Ubuntu autoinstall 渲染 fixture。
 - Kickstart 渲染 fixture。
@@ -1539,7 +1566,7 @@ nodeforge install retry node-01
 - 未显式认领的节点禁止使用 install profile。
 - QEMU UEFI PXE autoinstall smoke test。
 
-### 8.9 阶段验收
+### 9.9 阶段验收
 
 - Rocky Linux 9.7 aarch64 和 Ubuntu Server 22.04 LTS 能从 PXE 自动安装到本地磁盘。
 - 安装目标盘、ESP、root、swap、bootloader 配置生效。
@@ -1553,7 +1580,7 @@ nodeforge install retry node-01
 
 实现 NodeForge 小 initrd + HTTP rootfs 的无盘启动闭环。
 
-### 9.2 代码任务
+### 10.2 代码任务
 
 | 模块 | 任务 |
 | --- | --- |
@@ -1572,7 +1599,7 @@ nodeforge install retry node-01
 - 构建必须在与 rootfs 同发行版、同版本、同架构、同 `kernel_release` 的环境中运行；Rocky 9.7 aarch64 是第一条验证链路。
 - `nodeforge initrd build` 是 dracut 的稳定封装，记录 dracut 版本、命令、module 清单和输出 SHA256。
 
-### 9.3 boot bundle manifest
+### 10.3 boot bundle manifest
 
 必须记录：
 
@@ -1588,7 +1615,7 @@ nodeforge install retry node-01
 - build time
 - build spec
 
-### 9.4 小 initrd 行为
+### 10.4 小 initrd 行为
 
 流程：
 
@@ -1615,14 +1642,14 @@ rootfs 下载支持断点续传：
 - 完成后必须校验完整 SHA256，再原子改名；hash 不匹配删除或隔离 partial，绝不挂载。
 - tmpfs 容量校验必须同时考虑 rootfs partial 文件和 overlay 上层，容量不足时在下载前明确失败。
 
-### 9.5 overlay 规则
+### 10.5 overlay 规则
 
 - `overlay.tmpfs_size` 必须传给 tmpfs `size=`。
 - `/var/log`、`/tmp` 等高写入路径先作为配置位，不强制 MVP 单独挂载。
 - 持久化 overlay 不进入 MVP。
 - rootfs 公共修改使用 `rootfs_build`；节点差异使用 `diskless_boot` 写入 overlay upper。两者复用 M4 的 provisioning runner。
 
-### 9.6 CLI 命令
+### 10.6 CLI 命令
 
 ```bash
 nodeforge rootfs package rocky-9.7-aarch64 --format squashfs --version 20260706
@@ -1633,7 +1660,7 @@ nodeforge diskless overlay update rocky-9.7-aarch64-diskless --tmpfs-size 50%
 nodeforge diskless status node-02
 ```
 
-### 9.7 测试
+### 10.7 测试
 
 - boot bundle 一致性校验。
 - rootfs 缺少 `/sbin/init` 报错。
@@ -1641,7 +1668,7 @@ nodeforge diskless status node-02
 - overlay tmpfs size 解析。
 - QEMU UEFI diskless smoke test。
 
-### 9.8 阶段验收
+### 10.8 阶段验收
 
 - 节点能 PXE 进入小 initrd。
 - 小 initrd 能拉取 boot config。
@@ -1655,7 +1682,7 @@ nodeforge diskless status node-02
 
 完善 MVP 周边兼容性和诊断能力。
 
-### 10.2 任务
+### 11.2 任务
 
 - Rocky Linux 9.x 优先的 RHEL 系 kickstart 版本能力表。
 - x86_64 生产验证记录和 aarch64 真机/QEMU PXE 验证记录。
@@ -1665,7 +1692,7 @@ nodeforge diskless status node-02
 - Proxy DHCP spike。
 - Secure Boot 风险评估。
 
-### 10.3 BIOS PXELINUX
+### 11.3 BIOS PXELINUX
 
 PXELINUX 只用于 BIOS x86。DHCP 返回 `pxelinux.0` 后，PXELINUX 从 TFTP 根目录下的 `pxelinux.cfg/` 查找配置。NodeForge 不使用 PXELINUX 私有 DHCP option 指定配置文件，遵循默认查找规则：
 
@@ -1713,7 +1740,7 @@ DISPLAY pxelinux.cfg/wait.txt
 - 使用标准 TFTP client 验证配置可取，再用 QEMU BIOS PXE 验证 kernel/initrd 与 cmdline。
 - `nodeforge boot render <node> --format pxelinux` 可预览节点配置；`nodeforge boot default render --format pxelinux` 可预览安全兜底配置。
 
-### 10.4 错误分类
+### 11.4 错误分类
 
 错误类型：
 
@@ -1732,7 +1759,7 @@ DISPLAY pxelinux.cfg/wait.txt
 
 M4/M5 已交付 repository、standard-packages、managed-file 和统一 runner。本阶段补齐 archive、script、firstboot、CLI plan/status 和三条链路的完整回归。这里的“配置可视化”是指 CLI 按阶段、步骤和执行结果清晰组织输出，不引入 Web UI 或通用低代码配置系统。
 
-### 11.2 增强范围
+### 12.2 增强范围
 
 本阶段不新增第二套模型，继续使用 3.5：
 
@@ -1741,7 +1768,7 @@ M4/M5 已交付 repository、standard-packages、managed-file 和统一 runner�
 - 补齐 bundle `show/plan`、运行状态和错误摘要。
 - 对 Kickstart、autoinstall、rootfs build 和 diskless overlay 做同一 bundle 的回归。
 
-### 11.3 标准化步骤契约
+### 12.3 标准化步骤契约
 
 所有步骤统一接收执行上下文：
 
@@ -1770,7 +1797,7 @@ target_root, workspace, repository_base_url, event_url
 - 输出、事件和错误使用统一结构，不允许脚本自行定义不可解析的状态格式。
 - `script` 是最后的逃生口，不作为常规配置步骤；必须提供 summary 和影响范围，供命令输出展示。
 
-### 11.4 包类型和交付规则
+### 12.4 包类型和交付规则
 
 只支持两类补充包：
 
@@ -1779,7 +1806,7 @@ target_root, workspace, repository_base_url, event_url
 
 `install.sh` 约定：以 bundle 解压目录为工作目录，参数固定为 `install --root <target-root>`，退出码 0 成功；必须可重复执行，禁止隐式下载未声明内容。
 
-### 11.5 统一后处理阶段
+### 12.5 统一后处理阶段
 
 阶段固定为：
 
@@ -1807,7 +1834,7 @@ diskless_boot
 - diskless：通用内容尽量在 rootfs build 完成；节点专属配置在 overlay 上执行 `diskless_boot`，不修改只读 lower rootfs。
 - firstboot：需要 systemd、网络或目标硬件后才能完成的操作。
 
-### 11.6 CLI 配置展示与预览
+### 12.6 CLI 配置展示与预览
 
 “可视化”完全通过命令输出实现：
 
@@ -1832,7 +1859,7 @@ firstboot     2  site-patch        script             no        patch site confi
 
 Kickstart、autoinstall 和 diskless 对同一 bundle 使用相同的 `show/plan/status` 格式，只在概要中标明实际执行入口。
 
-### 11.7 安全与幂等
+### 12.7 安全与幂等
 
 - 每个 bundle/version/phase 记录执行状态和日志；同版本默认不重复执行，可用显式 `--force` 重跑。
 - script 使用固定环境变量、工作目录、超时和输出上限；required script 失败终止该阶段，optional script 只告警。
@@ -1840,7 +1867,7 @@ Kickstart、autoinstall 和 diskless 对同一 bundle 使用相同的 `show/plan
 - 自动安装中的后处理继承 node + install profile 显式绑定；未知节点的 safe diskless 禁止执行 archive install script 和自定义 script。
 - bundle 变更生成新版本，不原地修改已发布内容；节点状态记录实际使用版本。
 
-### 11.8 CLI 与验收
+### 12.8 CLI 与验收
 
 ```bash
 nodeforge provision bundle list
@@ -1899,18 +1926,20 @@ tests/
 
 MVP 只支持当前版本。后续升级时增加 migration。
 
-### 13.2 事件版本
+### 14.2 事件版本
 
 事件增加 `v` 字段：
 
 ```json
-{"v":1,"ts":"2026-07-06T10:00:00Z","node":"node-01","type":"dhcp.discover"}
+{"v":1,"ts":"unix:1783332000","node":"node-01","type":"dhcp.discover"}
 ```
 
-### 13.3 兼容原则
+### 14.3 兼容原则
 
 - 新增字段必须有默认值。
 - 删除字段必须经过 migration。
+- v1 daemon 生成的 `ts` 固定使用 `unix:<UTC seconds>`；如需 ISO 8601，必须在新版本事件格式中
+  明确迁移规则，不能静默改变既有消费者的解析方式。
 - CLI `--output json` 字段保持稳定。
 - 人类可读输出可优化，但不能丢失关键状态。
 

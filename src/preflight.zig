@@ -15,6 +15,7 @@ pub const Error = error{
     HttpAddressUnavailable,
     TftpAdvertiseAddressUnavailable,
     TftpAddressUnavailable,
+    DhcpAddressUnavailable,
 };
 
 /// TFTP 标准监听端口；不暴露为配置或 CLI 参数。
@@ -40,6 +41,7 @@ pub fn checkPorts(io: std.Io, config: *const model.AppConfig) Error!void {
         return error.TftpAdvertiseAddressUnavailable;
     checkUdpBind(io, config.server.server_ip, tftp_port) catch
         return error.TftpAddressUnavailable;
+    checkUdpBind(io, config.server.server_ip, 67) catch return error.DhcpAddressUnavailable;
 }
 
 fn checkTcpBind(io: std.Io, ip: []const u8, port: u16) !void {

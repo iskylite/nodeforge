@@ -34,14 +34,14 @@ const max_retries = 3;
 /// `config` 提供 TFTP asset root 路径；`catalog` 提供资产白名单快照；
 /// `runtime` 记录会话计数和活动列表。三者必须在 `serve` 的整个生命周期内保持有效。
 pub fn serve(io: std.Io, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState) !void {
-    const socket = try bind(io);
+    const socket = try bind(io, config.server.server_ip);
     try serveSocket(io, socket, config, catalog, runtime);
 }
 
 /// 绑定固定 UDP 69；供 daemon 在启动其他 listener 前确认 TFTP 可用。
 /// 返回的 socket 由调用方负责关闭（通过 `serveSocket` 或手动 `close`）。
-pub fn bind(io: std.Io) !std.Io.net.Socket {
-    const address = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
+pub fn bind(io: std.Io, server_ip: []const u8) !std.Io.net.Socket {
+    const address = try std.Io.net.IpAddress.parseIp4(server_ip, port);
     return address.bind(io, .{ .mode = .dgram, .protocol = .udp });
 }
 

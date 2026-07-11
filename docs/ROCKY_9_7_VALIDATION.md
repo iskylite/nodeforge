@@ -159,5 +159,59 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 - `nodeforge status` 输出 `NodeForge status` 键值块（Process/HTTP/Management/Config API）；
   `nodeforge check` 输出单行 `OK nodeforge checks passed`（exit 0）。
 - `config validate`、`catalog validate`、`asset validate` 均输出 `OK` 摘要 + 键值块。
+
+## M2 DHCP 验证
+
+### 2026-07-11：DHCPv4 原型基线
+
+- 已完成的仅是构建与本机 UDP `DISCOVER/OFFER` 基线；这不能证明 DHCP 生命周期、租约持久化、
+  relay、冲突检测或 PXE/TFTP 闭环。
+- vmnet2 PXE 客户端没有完成 `REQUEST/ACK`，且当时服务广告网段与实际 vmnet2 网段不一致；该结果
+  明确标记为失败证据，不得用于 M2 阶段验收。
+- 后续验收必须仅使用 `192.168.27.0/24`：r97n0 的 `enp26s0` 静态地址、NodeForge DHCP、独立
+  客户端的 `dhclient` 和 PXE/TFTP 抓包均在该网段完成；不得绑定或影响 `192.168.26.0/24`。
 - `--no-color` 与管道重定向输出逐字节一致；`LC_ALL=C grep -c $'\033'` 返回 `0`，确认
   human 输出无 ANSI escape 字节。
+
+### 2026-07-11：27 网段 DHCP 数据面完成
+
+- 验证机：`root@r97n0`，Rocky Linux 9.7 aarch64，Zig 0.16.0；PXE 网卡 `enp26s0` 仅使用
+  `192.168.27.128/24`。DHCP 监听 `0.0.0.0%enp26s0:67`，以 `SO_BINDTODEVICE` 收取且只收取
+  27 网段的广播；TFTP 监听 `192.168.27.128:69`，HTTP 为 `:18080`；`192.168.26.0/24` 未参与
+  DHCP/TFTP 验证。
+- systemd 单元为 DHCP 使用 `CAP_NET_BIND_SERVICE` 与 `CAP_NET_RAW`。后者是 Ping Probe 的必要条件：
+  raw ICMP 不可用时 daemon 不发送未经冲突检查的 OFFER，并取消刚创建的 pending offer。
+- 独立 UDP DHCP 客户端完成未知 MAC 的 `DISCOVER -> OFFER -> REQUEST -> ACK`，获得
+  `192.168.27.100`；`nodeforge runtime leases list`、`runtime unknown list`、`dhcp show`、
+  `node list` 和 DHCP 管理 API 都返回与运行态一致的结果。
+- 为验证冲突分支，临时在同一 `enp26s0` 添加 `192.168.27.101/24` 后发起第二个 DISCOVER。
+  Ping Probe 收到匹配 Echo Reply，将 `.101` 写为 `abandoned`，返回 `.102`；第二个 REQUEST 收到
+  ACK。测试随后删除临时地址并发送 RELEASE，活动租约被释放，`.101` 按 120 秒配置隔离。
+- `events.jsonl` 确认顺序事件 `dhcp.discover`、`dhcp.offer`、`dhcp.request`、`dhcp.ack`、
+  `dhcp.abandoned` 和 `dhcp.release`。同机完整 `zig build test` 与 39 个 Zig 单元测试通过。
+- relay Link Selection/`giaddr`、静态保留地址跳过、option 60/61/82/93/97 和 Probe 自回显行为由
+  单元测试覆盖；前两者不在单一子网的实机拓扑中伪造 relay。
+
+### 2026-07-11：独立 UEFI PXE/TFTP 闭环完成
+
+- 使用 VMware Fusion 创建独立 `pxe27-uefi`（Rocky Linux 64-bit Arm、UEFI、单网卡 `vmnet2`），
+  并在 Fusion 的 Startup Disk 选择 Network Adapter；服务节点仍为 `r97n0/enp26s0`
+  `192.168.27.128/24`。两台 VM 与抓包均只在 `192.168.27.0/24`。
+- 实机发现 DHCP 广播虽已到达 `enp26s0`，但原先只绑定 `192.168.27.128:67` 的 socket 不会收到
+  `255.255.255.255:67`。修复为 Linux wildcard UDP/67 + `SO_BINDTODEVICE(enp26s0)` 后，`ss` 显示
+  `0.0.0.0%enp26s0:67`，没有扩大到 26 网段。
+- 为避免未知节点执行任何破坏性动作，PXE 夹具只配置 `discovery` profile；其 catalog 仅登记真实
+  Rocky `grubaa64.efi`（SHA-256
+  `109f17c8f7cd2fd92862945c9db59c6f2f83fd7674ac596225ce84903c98fd3f`）。
+- `tcpdump` 记录 ARM UEFI `option 93 = 11`、`DHCPOFFER` 和 `DHCPACK` 均分配
+  `192.168.27.200`，并在 option 67 中携带 `efi/grubaa64.efi`；随后固件从
+  `192.168.27.200` 对 `192.168.27.128:69` 发起该文件的 TFTP RRQ。运行态显示对应 TFTP session
+  `completed`，Fusion 控制台实际进入 `GRUB version 2.06` 提示符。
+- GRUB 随后尝试查找其常规 `grub.cfg` 与模块清单；该最小 M2 夹具未发布这些 M3+/完整启动菜单资产，
+  因而相关 RRQ 返回 `file not found`。这不影响本项对 DHCP bootfile、TFTP bootloader 下载和进入
+  bootloader 的验收边界。
+
+### M2 系统级验收
+
+- [x] 使用独立 UEFI PXE 固件客户端在 `192.168.27.0/24` 从网络启动，确认它实际消费 DHCP
+  bootfile、经 TFTP 下载对应 GRUB 文件并进入 bootloader；此前 vmnet2 的失败基线未计入本结果。

@@ -41,6 +41,10 @@ make arm64-debug    # 交叉编译 aarch64 Debug 二进制
 `/opt/nodeforge/catalog/catalog.json`，无需传 `--config`/`--catalog`；这些参数主要用于
 开发、测试和临时排障覆盖路径。
 
+`config.example.json` 中的 `server.bind_interface = "enp1s0"` 是 Linux PXE 网卡占位值；部署
+DHCP 前必须替换为承载 `server.server_ip` 的实际接口。当前 DHCPv4 服务会拒绝空值，避免 wildcard
+UDP/67 在多网卡主机上失去接口边界。
+
 CLI 使用仓库内固定的 `zli v5.1.2`。命令、参数、默认值和说明由同一命令树生成，
 新增参数不需要再同步维护手写 help。zli 的 spinner 能力暂未启用；未来只在 TTY 的
 耗时 human 输出命令中按需使用，JSON、管道和 systemd 场景保持无动画输出。
@@ -63,7 +67,10 @@ endpoint 参数，因此 CLI 只支持管理同机 `nodeforged`。M0 管理 API 
 `nodeforge` 叶子命令后使用 `-d` 显示底层错误原因。默认错误保持简短，例如
 `error: config: file not found: ./config.json`。
 
-Linux systemd unit 位于 `packaging/systemd/nodeforged.service`。M0 当前二进制已在 Rocky Linux
-9.7 aarch64 VM 完成部署、systemd、HTTP、CLI、端口独占和 debug 验证，验证结果见
-[`docs/DETAILED_DESIGN.md`](docs/DETAILED_DESIGN.md) 第 5 节。后续 TFTP/DHCP
-等系统级阶段验证清单见 [`docs/ROCKY_9_7_VALIDATION.md`](docs/ROCKY_9_7_VALIDATION.md)。
+Linux systemd unit 位于 `packaging/systemd/nodeforged.service`。DHCP 使用 UDP/67 和发送
+Ping Probe 所需的 raw ICMP，因此 unit 同时授予 `CAP_NET_BIND_SERVICE` 与 `CAP_NET_RAW`；当
+Probe 不可用时服务会拒绝 OFFER，而不会把地址当作空闲。Linux 上 DHCP 以 wildcard UDP/67
+接收客户端广播，并通过 `SO_BINDTODEVICE` 限定 `server.bind_interface`，不会回答管理网卡请求。
+Rocky Linux 9.7 aarch64 的 `192.168.27.0/24` 已完成 DHCP 生命周期、冲突隔离、M2 CLI/API 和
+独立 UEFI 固件到 GRUB 的 PXE/TFTP 闭环验证。完整记录见
+[`docs/ROCKY_9_7_VALIDATION.md`](docs/ROCKY_9_7_VALIDATION.md)。

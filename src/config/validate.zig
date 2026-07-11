@@ -15,10 +15,22 @@ pub const ValidationError = error{
     UnsupportedSchemaVersion,
     EmptyServerName,
     EmptyBindInterface,
+    DhcpBindInterfaceRequired,
     InvalidServerIpv4,
     InvalidHttpPort,
     EmptyAssetRoot,
     EmptyTftpAssetRoot,
+    InvalidDhcpSubnet,
+    InvalidDhcpPool,
+    InvalidDhcpRouter,
+    InvalidDhcpDns,
+    InvalidDhcpLeaseTime,
+    InvalidDhcpOfferTime,
+    InvalidDhcpAbandonTime,
+    InvalidDhcpPingTimeout,
+    DhcpPoolOutsideSubnet,
+    DhcpPoolOrder,
+    NodeOutsideDhcpSubnet,
     EmptyObjectName,
     DuplicateObjectName,
     UnsupportedDistroTuple,
@@ -63,17 +75,41 @@ pub fn validate(config: *const model.AppConfig, catalog: *const model.Catalog) V
 pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     if (config.schema_version != 1) return error.UnsupportedSchemaVersion;
     if (config.server.name.len == 0) return error.EmptyServerName;
-    if (config.server.bind_interface) |iface|
+    if (config.server.bind_interface) |iface| {
         if (iface.len == 0) return error.EmptyBindInterface;
+    } else {
+        return error.DhcpBindInterfaceRequired;
+    }
     _ = std.Io.net.IpAddress.parseIp4(config.server.server_ip, 0) catch
         return error.InvalidServerIpv4;
     if (config.server.http_port == 0) return error.InvalidHttpPort;
     if (config.http.asset_root.len == 0 or config.http.repository_root.len == 0)
         return error.EmptyAssetRoot;
     if (config.tftp.asset_root.len == 0) return error.EmptyTftpAssetRoot;
+    try validateDhcp(&config.dhcp);
     try uniqueNamed(model.DistroConfig, config.distros);
     try uniqueNamed(model.ProfileConfig, config.profiles);
     try validateDistros(config);
+}
+
+fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
+    const slash = std.mem.indexOfScalar(u8, dhcp.subnet, '/') orelse return error.InvalidDhcpSubnet;
+    const network = std.Io.net.IpAddress.parseIp4(dhcp.subnet[0..slash], 0) catch return error.InvalidDhcpSubnet;
+    const prefix = std.fmt.parseInt(u6, dhcp.subnet[slash + 1 ..], 10) catch return error.InvalidDhcpSubnet;
+    if (prefix > 30) return error.InvalidDhcpSubnet;
+    const start = std.Io.net.IpAddress.parseIp4(dhcp.pool_start, 0) catch return error.InvalidDhcpPool;
+    const end = std.Io.net.IpAddress.parseIp4(dhcp.pool_end, 0) catch return error.InvalidDhcpPool;
+    const network_value = ipv4Value(network);
+    const mask = prefixMask(prefix);
+    if ((ipv4Value(start) & mask) != (network_value & mask) or (ipv4Value(end) & mask) != (network_value & mask))
+        return error.DhcpPoolOutsideSubnet;
+    if (ipv4Value(start) > ipv4Value(end)) return error.DhcpPoolOrder;
+    if (dhcp.lease_seconds == 0) return error.InvalidDhcpLeaseTime;
+    if (dhcp.offer_seconds == 0) return error.InvalidDhcpOfferTime;
+    if (dhcp.abandon_seconds == 0) return error.InvalidDhcpAbandonTime;
+    if (dhcp.ping_timeout_ms == 0) return error.InvalidDhcpPingTimeout;
+    if (dhcp.router) |router| _ = std.Io.net.IpAddress.parseIp4(router, 0) catch return error.InvalidDhcpRouter;
+    for (dhcp.dns) |dns| _ = std.Io.net.IpAddress.parseIp4(dns, 0) catch return error.InvalidDhcpDns;
 }
 
 /// 校验 catalog 的格式、对象唯一性和对 config 的引用关系。
@@ -219,13 +255,30 @@ fn validateNodes(config: *const model.AppConfig) ValidationError!void {
         if (!validMac(node.mac)) return error.InvalidNodeMac;
         const profile = lookup.findProfile(config, node.profile) orelse return error.MissingProfile;
         if (profile.arch != node.arch) return error.InvalidProfileSource;
-        if (node.ip) |ip| _ = std.Io.net.IpAddress.parseIp4(ip, 0) catch
-            return error.InvalidNodeIpv4;
+        if (node.ip) |ip| {
+            const parsed_ip = std.Io.net.IpAddress.parseIp4(ip, 0) catch return error.InvalidNodeIpv4;
+            if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed_ip))) return error.NodeOutsideDhcpSubnet;
+        }
         for (config.nodes[i + 1 ..]) |other| {
             if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
             if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
         }
     }
+}
+
+fn inDhcpSubnet(cidr: []const u8, ip: u32) bool {
+    const slash = std.mem.indexOfScalar(u8, cidr, '/') orelse return false;
+    const network = std.Io.net.IpAddress.parseIp4(cidr[0..slash], 0) catch return false;
+    const prefix = std.fmt.parseInt(u6, cidr[slash + 1 ..], 10) catch return false;
+    return (ip & prefixMask(prefix)) == (ipv4Value(network) & prefixMask(prefix));
+}
+
+fn ipv4Value(address: std.Io.net.IpAddress) u32 {
+    return switch (address) { .ip4 => |ip| std.mem.readInt(u32, &ip.bytes, .big), else => unreachable };
+}
+
+fn prefixMask(prefix: u6) u32 {
+    return if (prefix == 0) 0 else @as(u32, 0xffffffff) << @as(u5, @intCast(32 - prefix));
 }
 
 fn validatePolicy(config: *const model.AppConfig) ValidationError!void {
@@ -281,13 +334,18 @@ fn validSha256(value: []const u8) bool {
 }
 
 test "最小配置和空 catalog 有效" {
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" } };
+    const config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
     const cat: model.Catalog = .{};
     try validate(&config, &cat);
 }
 
+test "DHCP requires an explicit PXE interface" {
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" } };
+    try std.testing.expectError(error.DhcpBindInterfaceRequired, validateConfig(&config));
+}
+
 test "拒绝 IPv6 和非法 HTTP 端口" {
-    var config: model.AppConfig = .{ .server = .{ .server_ip = "::1" } };
+    var config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "::1" } };
     const cat: model.Catalog = .{};
     try std.testing.expectError(error.InvalidServerIpv4, validate(&config, &cat));
 
@@ -296,8 +354,17 @@ test "拒绝 IPv6 和非法 HTTP 端口" {
     try std.testing.expectError(error.InvalidHttpPort, validate(&config, &cat));
 }
 
+test "DHCP 地址池和静态保留必须位于服务子网" {
+    var config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
+    config.dhcp.pool_end = "192.168.51.10";
+    try std.testing.expectError(error.DhcpPoolOutsideSubnet, validateConfig(&config));
+    config.dhcp.pool_end = "192.168.50.10";
+    config.dhcp.pool_start = "192.168.50.20";
+    try std.testing.expectError(error.DhcpPoolOrder, validateConfig(&config));
+}
+
 test "拒绝格式错误的 SHA256" {
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" } };
+    const config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
     const catalog: model.Catalog = .{
         .assets = &.{.{
             .name = "invalid-checksum",
