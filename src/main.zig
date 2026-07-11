@@ -143,11 +143,39 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         catalog_export,
     });
 
+    const tftp = try zli.Command.init(init_options, .{
+        .name = "tftp",
+        .description = "Inspect the local TFTP service",
+        .usage = "nodeforge tftp <command> [options]",
+        .help = "Read M1 TFTP runtime state from the local nodeforged management listener.",
+    }, showCurrentHelp);
+    const tftp_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show TFTP transfer counters" }, tftpShowHandler);
+    try addConfigPathFlag(tftp_show);
+    try addOutputFlag(tftp_show);
+    try addDebugFlag(tftp_show);
+    const tftp_session = try zli.Command.init(init_options, .{ .name = "session", .description = "Inspect TFTP transfer sessions" }, showCurrentHelp);
+    const tftp_session_list = try zli.Command.init(init_options, .{ .name = "list", .description = "Show recent TFTP transfer sessions" }, tftpSessionListHandler);
+    try addConfigPathFlag(tftp_session_list);
+    try addOutputFlag(tftp_session_list);
+    try addDebugFlag(tftp_session_list);
+    try tftp_session.addCommands(&.{tftp_session_list});
+    try tftp.addCommands(&.{ tftp_show, tftp_session });
+
+    const asset = try zli.Command.init(init_options, .{
+        .name = "asset",
+        .description = "Inspect and register TFTP boot assets",
+        .usage = "nodeforge asset <command> [options]",
+        .help = "M1 asset paths are relative to config.tftp.asset_root and are integrity checked before catalog registration.",
+    }, showCurrentHelp);
+    try asset.addCommands(&.{ try assetImportCommand(init_options), try assetListCommand(init_options), try assetShowCommand(init_options), try assetValidateCommand(init_options) });
+
     try root.addCommands(&.{
         status,
         check,
         config,
         catalog,
+        tftp,
+        asset,
     });
     return root;
 }
@@ -167,6 +195,49 @@ fn configImportCommand(init_options: zli.InitOptions) !*zli.Command {
         .description = "Source config JSON path",
         .required = true,
     });
+    return command;
+}
+
+fn assetImportCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{ .name = "import", .description = "Register an existing TFTP asset and its SHA-256" }, assetImportHandler);
+    try addConfigPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
+    try command.addFlags(&.{
+        .{ .name = "type", .description = "Asset type (bootloader, kernel, installer_initrd, nodeforge_initrd, rootfs, iso, gpg_key)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "name", .description = "Unique catalog asset name", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "path", .description = "Path relative to tftp.asset_root", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "distro", .description = "Optional distro name", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "version", .description = "Optional distro version", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Optional architecture: x86_64 or aarch64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "kernel-release", .description = "Optional kernel release", .type = .String, .default_value = .{ .String = "" } },
+    });
+    return command;
+}
+
+fn assetListCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{ .name = "list", .description = "List registered assets" }, assetListHandler);
+    try addCatalogPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
+    return command;
+}
+
+fn assetShowCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{ .name = "show", .description = "Show one registered asset" }, assetShowHandler);
+    try addCatalogPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
+    try command.addPositionalArg(.{ .name = "name", .description = "Asset name", .required = true });
+    return command;
+}
+
+fn assetValidateCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{ .name = "validate", .description = "Verify TFTP asset files and SHA-256 digests" }, assetValidateHandler);
+    try addConfigPathFlag(command);
+    try addCatalogPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
     return command;
 }
 
@@ -294,6 +365,92 @@ fn catalogExportHandler(ctx: zli.CommandContext) !void {
     const bytes = try nodeforge.catalog_store.render(ctx.allocator, parsed_catalog.value());
     defer ctx.allocator.free(bytes);
     try ctx.writer.writeAll(bytes);
+}
+
+/// Imports an existing root-confined file, computes its digest, validates the
+/// candidate catalog and atomically publishes the new manifest.  This offline
+/// path is also useful during initial provisioning before nodeforged exists.
+fn assetImportHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, debug) orelse { setExitCode(ctx, 1); return; };
+    defer parsed_config.deinit();
+    const kind = std.meta.stringToEnum(nodeforge.model.AssetKind, ctx.flag("type", []const u8)) orelse { try ctx.writer.writeAll("error: asset: unsupported --type\n"); setExitCode(ctx, 2); return; };
+    const name = ctx.flag("name", []const u8);
+    const path = ctx.flag("path", []const u8);
+    if (name.len == 0 or path.len == 0) { try ctx.writer.writeAll("error: asset: --name and --path are required\n"); setExitCode(ctx, 2); return; }
+    const distro_value = ctx.flag("distro", []const u8);
+    const version_value = ctx.flag("version", []const u8);
+    const arch_value = ctx.flag("arch", []const u8);
+    const has_tuple = distro_value.len != 0 or version_value.len != 0 or arch_value.len != 0;
+    if (has_tuple and (distro_value.len == 0 or version_value.len == 0 or arch_value.len == 0)) { try ctx.writer.writeAll("error: asset: --distro, --version and --arch must be used together\n"); setExitCode(ctx, 2); return; }
+    const arch = if (has_tuple) std.meta.stringToEnum(nodeforge.model.Arch, arch_value) orelse { try ctx.writer.writeAll("error: asset: unsupported --arch\n"); setExitCode(ctx, 2); return; } else null;
+    const imported = nodeforge.management_client.importAsset(ctx.io, parsed_config.value.server.http_port, .{
+        .name = name, .kind = @tagName(kind), .path = path,
+        .distro = if (has_tuple) distro_value else null, .version = if (has_tuple) version_value else null,
+        .arch = if (arch) |value| @tagName(value) else null,
+        .kernel_release = if (ctx.flag("kernel-release", []const u8).len == 0) null else ctx.flag("kernel-release", []const u8),
+    }) catch |err| { try ctx.writer.print("error: asset: import request failed\n", .{}); if (debug) try ctx.writer.print("debug: asset: cause={t}\n", .{err}); setExitCode(ctx, 1); return; };
+    if (!imported) { try ctx.writer.writeAll("error: asset: daemon rejected import\n"); setExitCode(ctx, 1); return; }
+    if (output_json) try ctx.writer.print("{{\"ok\":true,\"name\":\"{s}\"}}\n", .{name}) else try ctx.writer.print("OK asset imported  {s}\n", .{name});
+}
+
+fn assetListHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer loaded.deinit();
+    if (output_json) {
+        try ctx.writer.writeAll("{\"assets\":[");
+        for (loaded.value().assets, 0..) |item, i| { if (i != 0) try ctx.writer.writeByte(','); try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\"}}", .{ item.name, item.kind, item.path }); }
+        try ctx.writer.writeAll("]}\n");
+    } else for (loaded.value().assets) |item| try ctx.writer.print("{s}\t{t}\t{s}\n", .{ item.name, item.kind, item.path });
+}
+
+fn assetShowHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer loaded.deinit();
+    const name = ctx.getArg("name") orelse unreachable;
+    for (loaded.value().assets) |item| if (std.mem.eql(u8, item.name, name)) { if (output_json) try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\",\"sha256\":{f}}}\n", .{ item.name, item.kind, item.path, std.json.fmt(item.sha256, .{}) }) else try ctx.writer.print("name: {s}\nkind: {t}\npath: {s}\nsha256: {s}\n", .{ item.name, item.kind, item.path, item.sha256 orelse "" }); return; };
+    try ctx.writer.print("error: asset: not found: {s}\n", .{name}); setExitCode(ctx, 1);
+}
+
+fn assetValidateHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer parsed_config.deinit();
+    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer loaded.deinit();
+    for (loaded.value().assets) |item| { var digest: [64]u8 = undefined; nodeforge.asset_validate.sha256File(ctx.io, parsed_config.value.tftp.asset_root, item.path, &digest) catch { try ctx.writer.print("error: asset: unreadable: {s}\n", .{item.path}); setExitCode(ctx, 1); return; }; if (item.sha256 == null or !std.mem.eql(u8, item.sha256.?, &digest)) { try ctx.writer.print("error: asset: checksum mismatch: {s}\n", .{item.name}); setExitCode(ctx, 1); return; } }
+    if (output_json) try ctx.writer.writeAll("{\"ok\":true}\n") else try ctx.writer.print("OK {d} assets valid\n", .{loaded.value().assets.len});
+}
+
+fn tftpShowHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer parsed_config.deinit();
+    const status = nodeforge.management_client.tftpCounters(ctx.io, parsed_config.value.server.http_port);
+    if (!status.healthy) { try ctx.writer.writeAll("error: tftp: local daemon status unavailable\n"); setExitCode(ctx, 1); return; }
+    if (output_json) try ctx.writer.print("{{\"started\":{d},\"completed\":{d},\"failed\":{d}}}\n", .{ status.started, status.completed, status.failed }) else try ctx.writer.print("TFTP sessions\n  started    {d}\n  completed  {d}\n  failed     {d}\n", .{ status.started, status.completed, status.failed });
+}
+
+fn tftpSessionListHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer parsed_config.deinit();
+    var response: [8192]u8 = undefined;
+    const body = try nodeforge.management_client.tftpSessionsJson(ctx.io, parsed_config.value.server.http_port, &response);
+    if (body == null) {
+        try ctx.writer.writeAll("error: tftp: local daemon session API unavailable\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    if (output_json) { try ctx.writer.writeAll(body.?); return; }
+    const SessionResponse = struct { ok: bool, result: struct { sessions: []const struct { id: u64, phase: nodeforge.runtime_state.TftpSessionPhase, filename: []const u8 } } };
+    var parsed = std.json.parseFromSlice(SessionResponse, ctx.allocator, body.?, .{ .allocate = .alloc_always }) catch |err| { try ctx.writer.print("error: tftp: malformed daemon response ({t})\n", .{err}); setExitCode(ctx, 1); return; };
+    defer parsed.deinit();
+    if (parsed.value.result.sessions.len == 0) { try ctx.writer.writeAll("No TFTP sessions recorded.\n"); return; }
+    for (parsed.value.result.sessions) |session| try ctx.writer.print("{d}\t{t}\t{s}\n", .{ session.id, session.phase, session.filename });
 }
 
 /// 读取当前命令的输出格式并校验其值。

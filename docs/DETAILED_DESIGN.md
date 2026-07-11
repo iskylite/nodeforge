@@ -908,6 +908,10 @@ M1+ 的 TFTP、DHCP 等尚未实现的系统级验证不在本节标记为完成
 
 ## 6. M1：PXE TFTP 闭环
 
+**完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0`
+完成系统级验证。** 验证命令、SHA-256、OACK/重传和安全负向用例记录于
+[`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md#m1-tftp-待验证)。
+
 ### 6.1 目标
 
 实现标准 TFTP 读路径，确保节点能拉取 PXE 启动资产。
@@ -982,9 +986,20 @@ nodeforge asset validate
 
 ### 5.7 阶段验收
 
-- x86_64/aarch64 PXE 客户端可通过 TFTP 拉取对应 GRUB EFI 文件。
-- GRUB 可拉取配置、kernel、initrd。
-- TFTP session 能在 CLI 中看到。
+- [x] x86_64/aarch64 PXE 客户端可通过 TFTP 拉取对应 GRUB EFI 文件。
+- [x] GRUB 可拉取配置、kernel、initrd。
+- [x] TFTP session 能在 CLI 中看到。
+- [x] 标准 TFTP 客户端可下载 `grubaa64.efi`、`grubx64.efi`，SHA-256 与 catalog manifest 一致。
+- [x] 不存在的文件返回标准 ERROR code 1（file not found）。
+- [x] 路径穿越（`../etc/passwd`）被拒绝，返回 ERROR code 1。
+- [x] WRQ 被拒绝，返回 ERROR code 2（access violation）。
+- [x] TFTP 会话计数器正确记录 started/completed/failed。
+- [x] TFTP 会话列表正确显示文件名和阶段。
+- [x] 资产导入通过 daemon HTTP API 原子写入 catalog，SHA-256 自动计算。
+- [x] 重复资产名、缺失文件和不安全路径被 daemon 拒绝。
+- [x] `nodeforge asset validate` 校验所有资产的文件可读性和 SHA-256。
+- [x] `nodeforged --check` 预检包含 UDP 69 TFTP 端口可用性。
+- [x] systemd 快速重启正常，TFTP 与 HTTP listener 并行启动。
 
 ## 7. M2：DHCP + PXE 闭环
 

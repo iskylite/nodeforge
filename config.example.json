@@ -10,6 +10,9 @@
     "asset_root": "/opt/nodeforge/assets",
     "repository_root": "/opt/nodeforge/repos"
   },
+  "tftp": {
+    "asset_root": "/opt/nodeforge/tftp"
+  },
   "logging": {
     "level": "info"
   },

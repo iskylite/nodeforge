@@ -101,7 +101,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 }
 
 /// 加载并联合校验 config/catalog，然后按 flag 选择运行模式。
-/// `--check-config` 只校验文件，`--check` 再执行端口预检，无 flag 时启动唯一 HTTP listener。
+/// `--check-config` 只校验文件，`--check` 再执行 HTTP/TFTP 端口预检，无 flag 时启动服务。
 fn daemonHandler(ctx: zli.CommandContext) !void {
     if (ctx.flag("version", bool)) {
         try printVersion(ctx.writer);
@@ -147,17 +147,17 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         return;
     }
     if (ctx.flag("check", bool)) {
-        nodeforge.preflight.checkHttpPorts(ctx.io, &parsed.value) catch |err| {
+        nodeforge.preflight.checkPorts(ctx.io, &parsed.value) catch |err| {
             nodeforge.observe_log.err("preflight: failed", .{});
             if (debug or parsed.value.logging.level == .debug)
                 nodeforge.observe_log.debug("preflight: cause={t}", .{err});
             return err;
         };
-        nodeforge.observe_log.info("preflight: config and M0 HTTP port available", .{});
+        nodeforge.observe_log.info("preflight: config, HTTP and TFTP ports available", .{});
         return;
     }
 
-    try nodeforge.app.run(ctx.io, ctx.allocator, &parsed.value, catalog);
+    try nodeforge.app.run(ctx.io, ctx.allocator, &parsed.value, catalog, catalog_path);
 }
 
 /// 输出稳定的 daemon 名称与项目版本。

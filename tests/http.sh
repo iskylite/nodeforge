@@ -77,4 +77,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     sleep 0.1
 done
 test "$ready" = true
-grep -Fqx 'debug: http: request received GET /healthz' "$tmp/debug-daemon.err"
+if ! grep -Fqx 'debug: http: request received GET /healthz' "$tmp/debug-daemon.err"; then
+    cat "$tmp/debug-daemon.out" "$tmp/debug-daemon.err" >&2
+    exit 1
+fi

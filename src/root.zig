@@ -12,10 +12,15 @@ pub const config_store = @import("config/store.zig");
 pub const config_validate = @import("config/validate.zig");
 pub const preflight = @import("preflight.zig");
 pub const runtime_state = @import("state/runtime.zig");
+pub const catalog_runtime = @import("state/catalog_runtime.zig");
 pub const events = @import("state/events.zig");
 pub const management_client = @import("http/client.zig");
 pub const management = @import("http/management.zig");
 pub const http_server = @import("http/server.zig");
+pub const tftp_packet = @import("tftp/packet.zig");
+pub const tftp_server = @import("tftp/server.zig");
+pub const asset_validate = @import("assets/validate.zig");
+pub const grub = @import("boot/grub.zig");
 pub const observe_error = @import("observe/error.zig");
 pub const observe_log = @import("observe/log.zig");
 
@@ -31,10 +36,15 @@ test {
     _ = config_validate;
     _ = preflight;
     _ = runtime_state;
+    _ = catalog_runtime;
     _ = events;
     _ = management_client;
     _ = management;
     _ = http_server;
+    _ = tftp_packet;
+    _ = tftp_server;
+    _ = asset_validate;
+    _ = grub;
     _ = observe_error;
     _ = observe_log;
 }

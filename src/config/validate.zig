@@ -6,6 +6,7 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const lookup = @import("../catalog.zig");
+const asset_validate = @import("../assets/validate.zig");
 
 /// 配置校验错误码。
 /// 所有错误均为编译期已知集合，不包含动态字符串——
@@ -17,6 +18,7 @@ pub const ValidationError = error{
     InvalidServerIpv4,
     InvalidHttpPort,
     EmptyAssetRoot,
+    EmptyTftpAssetRoot,
     EmptyObjectName,
     DuplicateObjectName,
     UnsupportedDistroTuple,
@@ -25,6 +27,7 @@ pub const ValidationError = error{
     MissingGpgKey,
     MissingAsset,
     InvalidSha256,
+    UnsafeAssetPath,
     AssetKindMismatch,
     MissingRepository,
     MissingInstallSource,
@@ -67,6 +70,7 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     if (config.server.http_port == 0) return error.InvalidHttpPort;
     if (config.http.asset_root.len == 0 or config.http.repository_root.len == 0)
         return error.EmptyAssetRoot;
+    if (config.tftp.asset_root.len == 0) return error.EmptyTftpAssetRoot;
     try uniqueNamed(model.DistroConfig, config.distros);
     try uniqueNamed(model.ProfileConfig, config.profiles);
     try validateDistros(config);
@@ -113,7 +117,7 @@ fn validateDistros(config: *const model.AppConfig) ValidationError!void {
 
 fn validateAssets(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     for (catalog.assets) |asset| {
-        if (asset.path.len == 0) return error.MissingAsset;
+        asset_validate.validateRelativePath(asset.path) catch return error.UnsafeAssetPath;
         if (asset.sha256) |sha256|
             if (!validSha256(sha256)) return error.InvalidSha256;
         if (asset.distro) |distro| {

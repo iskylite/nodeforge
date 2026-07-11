@@ -6,12 +6,14 @@ const std = @import("std");
 /// 服务日志等级。M0 只区分日常信息与深度诊断。
 pub const Level = enum { info, debug };
 
-var current_level: Level = .info;
+/// HTTP/TFTP worker 与启动线程都会读取此值，必须使用原子变量避免 debug
+/// 配置在 worker 线程中出现数据竞争或不可见。
+var current_level = std.atomic.Value(u8).init(@intFromEnum(Level.info));
 
 /// 设置当前进程的服务日志等级。
 /// M0 单进程启动期设置一次，后续运行期日志读取该值。
 pub fn setLevel(level: Level) void {
-    current_level = level;
+    current_level.store(@intFromEnum(level), .release);
 }
 
 /// 输出日常服务日志。
@@ -26,5 +28,6 @@ pub fn err(comptime format: []const u8, args: anytype) void {
 
 /// 仅在 debug 等级输出协议和连接诊断。
 pub fn debug(comptime format: []const u8, args: anytype) void {
-    if (current_level == .debug) std.debug.print("debug: " ++ format ++ "\n", args);
+    if (current_level.load(.acquire) == @intFromEnum(Level.debug))
+        std.debug.print("debug: " ++ format ++ "\n", args);
 }

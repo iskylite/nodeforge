@@ -11,6 +11,8 @@ pub const AppConfig = struct {
     server: ServerConfig,
     /// HTTP 资产与仓库根目录。
     http: HttpConfig = .{},
+    /// TFTP 只读启动资产根目录；监听端口固定为 UDP 69。
+    tftp: TftpConfig = .{},
     /// 服务日志等级；daemon `--debug` 可在本次启动临时覆盖为 debug。
     logging: LoggingConfig = .{},
     /// 受支持的发行版及版本矩阵。
@@ -57,6 +59,15 @@ pub const HttpConfig = struct {
     asset_root: []const u8 = paths.assets_dir,
     /// 通过 `/repos/` 只读发布的仓库根目录。
     repository_root: []const u8 = paths.repos_dir,
+};
+
+/// TFTP 启动小文件配置。
+///
+/// 端口是 PXE 协议约定，固定在服务实现中；此处只允许声明只读根目录，
+/// 防止把每项传输参数扩散为难以维护的 CLI 参数。
+pub const TftpConfig = struct {
+    /// bootloader、GRUB 配置、kernel 和 initrd 的只读根目录。
+    asset_root: []const u8 = paths.tftp_dir,
 };
 
 /// 服务日志配置。业务事件仍写入独立的 events.jsonl。

@@ -11,6 +11,29 @@ pub const Status = struct {
     healthy: bool,
 };
 
+/// M1 TFTP 传输计数器，由 daemon 的本机管理路由返回。
+/// 字段全部通过简单 JSON 解析提取，不依赖通用 JSON 库以保持 CLI 轻量。
+pub const TftpCounters = struct {
+    reachable: bool = false,
+    healthy: bool = false,
+    started: u64 = 0,
+    completed: u64 = 0,
+    failed: u64 = 0,
+};
+
+/// M1 资产导入请求的受约束元数据。由 CLI 构造，通过本地 HTTP POST 发送给 daemon。
+/// daemon 负责计算 SHA-256、校验路径安全性和原子写入 catalog。
+/// 所有字段在发送前经过 `querySafe` 检查，拒绝包含 URL 特殊字符的值。
+pub const AssetImport = struct {
+    name: []const u8,
+    kind: []const u8,
+    path: []const u8,
+    distro: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    arch: ?[]const u8 = null,
+    kernel_release: ?[]const u8 = null,
+};
+
 /// 探测管理接口 `/healthz`。
 /// 使用 `Connection: close` 保证能够以 EOF 作为响应结束，不实现通用 HTTP 客户端。
 pub fn health(io: std.Io, port: u16) Status {
@@ -45,10 +68,114 @@ pub fn validateActiveConfig(io: std.Io, port: u16) Status {
     );
 }
 
+/// 探测 M1 TFTP 运行态路由。仅由本机 daemon 提供，不接受远程地址。
+pub fn tftpStatus(io: std.Io, port: u16) Status {
+    return probeAt(io, management.client_ip, port, "/api/v1/management/tftp/status", "GET");
+}
+
+/// 读取 M1 TFTP 计数器响应并解析为 `TftpCounters`。
+///
+/// 这是一个固定路由的小型 HTTP 客户端，不实现通用远程管理。
+/// 解析使用简单的字符串查找提取 `started`/`completed`/`failed` 三个数字字段，
+/// 不依赖通用 JSON 库以保持 CLI 依赖最小化。
+pub fn tftpCounters(io: std.Io, port: u16) TftpCounters {
+    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return .{};
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return .{};
+    defer stream.close(io);
+    var send_buffer: [512]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    writer.interface.print("GET /api/v1/management/tftp/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{}) catch return .{ .reachable = true };
+    writer.interface.flush() catch return .{ .reachable = true };
+    var recv_buffer: [2048]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    const status_line = reader.interface.takeDelimiterInclusive('\n') catch return .{ .reachable = true };
+    if (std.mem.findPosLinear(u8, status_line, 0, " 200 ") == null) return .{ .reachable = true };
+    while (true) {
+        const line = reader.interface.takeDelimiterInclusive('\n') catch return .{ .reachable = true };
+        if (std.mem.eql(u8, line, "\r\n") or std.mem.eql(u8, line, "\n")) break;
+    }
+    const body = reader.interface.takeDelimiterInclusive('\n') catch return .{ .reachable = true };
+    return .{ .reachable = true, .healthy = true, .started = jsonCounter(body, "\"started\":"), .completed = jsonCounter(body, "\"completed\":"), .failed = jsonCounter(body, "\"failed\":") };
+}
+
+/// 获取 daemon 生成的 TFTP 会话列表 JSON，并写入调用方提供的缓冲区。
+///
+/// 返回写入的字节切片；如果响应超过 `output` 容量则返回 `error.ResponseTooLarge`。
+/// 调用方负责格式化输出；本函数只负责固定路由的 HTTP GET 和响应体提取。
+/// 仅连接 `127.0.0.1`，不接受远程端点。
+pub fn tftpSessionsJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return null;
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return null;
+    defer stream.close(io);
+    var send_buffer: [512]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    try writer.interface.writeAll("GET /api/v1/management/tftp/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+    var recv_buffer: [12 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    const status_line = reader.interface.takeDelimiterInclusive('\n') catch return null;
+    if (std.mem.findPosLinear(u8, status_line, 0, " 200 ") == null) return null;
+    while (true) {
+        const line = reader.interface.takeDelimiterInclusive('\n') catch return null;
+        if (std.mem.eql(u8, line, "\r\n") or std.mem.eql(u8, line, "\n")) break;
+    }
+    const body = reader.interface.takeDelimiterInclusive('\n') catch return null;
+    if (body.len > output.len) return error.ResponseTooLarge;
+    @memcpy(output[0..body.len], body);
+    return output[0..body.len];
+}
+
+/// 请求 daemon 导入资产并写入 catalog。
+///
+/// 所有字段在发送前经过 `querySafe` 检查，拒绝包含 `&=?#%\r\n` 的值，
+/// 防止 URL 注入。请求通过 `POST /api/v1/management/assets/import` 发送，
+/// 参数放在 query string 中，Content-Length 为 0。
+/// daemon 负责计算 SHA-256、校验路径和原子写入 catalog。
+/// 返回 `true` 表示 daemon 接受了导入（HTTP 200），`false` 表示拒绝或连接失败。
+pub fn importAsset(io: std.Io, port: u16, asset: AssetImport) !bool {
+    inline for ([_][]const u8{ asset.name, asset.kind, asset.path }) |value|
+        if (!querySafe(value)) return error.InvalidAssetField;
+    inline for ([_]?[]const u8{ asset.distro, asset.version, asset.arch, asset.kernel_release }) |optional|
+        if (optional) |value| if (!querySafe(value)) return error.InvalidAssetField;
+    const address = try std.Io.net.IpAddress.parseIp4(management.client_ip, port);
+    var stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+    var send_buffer: [2048]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    try writer.interface.print("POST /api/v1/management/assets/import?name={s}&kind={s}&path={s}", .{ asset.name, asset.kind, asset.path });
+    if (asset.distro) |value| try writer.interface.print("&distro={s}", .{value});
+    if (asset.version) |value| try writer.interface.print("&version={s}", .{value});
+    if (asset.arch) |value| try writer.interface.print("&arch={s}", .{value});
+    if (asset.kernel_release) |value| try writer.interface.print("&kernel_release={s}", .{value});
+    try writer.interface.writeAll(" HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+    var recv_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    const status = reader.interface.takeDelimiterInclusive('\n') catch return false;
+    return std.mem.findPosLinear(u8, status, 0, " 200 ") != null;
+}
+
+/// 检查值是否可安全嵌入 HTTP query string。
+/// 拒绝空字符串和包含 `&=?#%\r\n` 的值，防止 URL 参数注入。
+fn querySafe(value: []const u8) bool {
+    return value.len != 0 and std.mem.indexOfAny(u8, value, "&=?#%\r\n") == null;
+}
+
+/// 从简单 JSON 响应体中提取数字字段的值。
+/// 使用字符串查找定位 `key`，然后解析到下一个 `,` 或 `}` 为止的数字。
+/// 解析失败时返回 0，不产生错误——计数器是尽力而为的运行态摘要。
+fn jsonCounter(body: []const u8, key: []const u8) u64 {
+    const start = std.mem.indexOf(u8, body, key) orelse return 0;
+    const value = body[start + key.len ..];
+    const end = std.mem.indexOfAny(u8, value, ",}") orelse value.len;
+    return std.fmt.parseInt(u64, value[0..end], 10) catch 0;
+}
+
 /// 向指定 IPv4:port 发送一个原始 HTTP 请求并检查首行状态码。
 ///
 /// 使用 `Connection: close` 保证能够以 EOF 作为响应结束，不实现通用 HTTP 客户端。
 /// 收发缓冲区在栈上分配，函数返回后自动释放。
+/// 返回的 `Status` 区分 TCP 连接可达性（`reachable`）和 HTTP 200 响应（`healthy`）。
 fn probeAt(io: std.Io, ip: []const u8, port: u16, path: []const u8, method: []const u8) Status {
     const address = std.Io.net.IpAddress.parseIp4(ip, port) catch
         return .{ .reachable = false, .healthy = false };

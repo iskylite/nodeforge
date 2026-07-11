@@ -77,8 +77,8 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-test "$("$cli" --version)" = "nodeforge 0.0.0"
-test "$("$cli" -v)" = "nodeforge 0.0.0"
+test "$("$cli" --version)" = "nodeforge 0.1.0"
+test "$("$cli" -v)" = "nodeforge 0.1.0"
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then
@@ -165,8 +165,8 @@ grep -q -- "--check-config" "$tmp/daemon-help"
 grep -q -- "--debug" "$tmp/daemon-help"
 grep -q -- "-k, --check" "$tmp/daemon-help"
 grep -q -- "-K, --check-config" "$tmp/daemon-help"
-test "$("$daemon" --version)" = "nodeforged 0.0.0"
-test "$("$daemon" -v)" = "nodeforged 0.0.0"
+test "$("$daemon" --version)" = "nodeforged 0.1.0"
+test "$("$daemon" -v)" = "nodeforged 0.1.0"
 "$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" >"$tmp/daemon-check-config" 2>&1
 grep -q '^info: config: valid ' "$tmp/daemon-check-config"
 
