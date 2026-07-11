@@ -98,6 +98,18 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
             .type = .Bool,
             .default_value = .{ .Bool = false },
         },
+        .{
+            .name = "log-output",
+            .description = "Service log destination: auto, terminal, file, or both (e.g. file)",
+            .type = .String,
+            .default_value = .{ .String = "auto" },
+        },
+        .{
+            .name = "log-file",
+            .description = "Override the file destination for --log-output file/both (e.g. /opt/nodeforge/logs/nodeforged.log)",
+            .type = .String,
+            .default_value = .{ .String = "" },
+        },
     });
     return root;
 }
@@ -111,6 +123,14 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     }
 
     const debug = ctx.flag("debug", bool);
+    const requested_log_output = std.meta.stringToEnum(LogOutput, ctx.flag("log-output", []const u8)) orelse
+        return error.InvalidFlagValue;
+    const log_file_override = ctx.flag("log-file", []const u8);
+    if (log_file_override.len != 0 and (requested_log_output == .auto or requested_log_output == .terminal))
+        return error.InvalidFlagValue;
+    if (log_file_override.len != 0 and log_file_override[0] != '/') return error.InvalidFlagValue;
+    const default_logging: nodeforge.model.LoggingConfig = .{};
+    configureLogOutput(ctx.io, requested_log_output, log_file_override, &default_logging);
     if (debug) nodeforge.observe_log.setLevel(.debug);
     const config_path = ctx.flag("config", []const u8);
     const catalog_path = ctx.flag("catalog", []const u8);
@@ -146,6 +166,8 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         return err;
     };
 
+    configureLogOutput(ctx.io, requested_log_output, log_file_override, &parsed.value.logging);
+
     if (ctx.flag("check-config", bool)) {
         nodeforge.observe_log.info("config: valid {s}; catalog {s}", .{ config_path, catalog_path });
         return;
@@ -162,6 +184,42 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     }
 
     try nodeforge.app.run(ctx.io, ctx.allocator, &parsed.value, catalog, catalog_path);
+}
+
+const LogOutput = enum {
+    auto,
+    terminal,
+    file,
+    both,
+};
+
+fn configureLogOutput(
+    io: std.Io,
+    requested: LogOutput,
+    file_override: []const u8,
+    logging: *const nodeforge.model.LoggingConfig,
+) void {
+    const mode: nodeforge.log_backend.OutputMode = switch (requested) {
+        .auto => if (logging.file == null) .terminal else .both,
+        .terminal => .terminal,
+        .file => .file,
+        .both => .both,
+    };
+    if (mode == .terminal) {
+        nodeforge.log_backend.configure(io, mode, null);
+        return;
+    }
+
+    const configured_file: nodeforge.model.FileLogConfig = logging.file orelse .{
+        .path = nodeforge.paths.service_log_path,
+        .max_size_mb = 50,
+        .keep = 3,
+    };
+    nodeforge.log_backend.configure(io, mode, .{
+        .path = if (file_override.len == 0) configured_file.path else file_override,
+        .max_size_mb = configured_file.max_size_mb,
+        .keep = configured_file.keep,
+    });
 }
 
 /// 输出稳定的 daemon 名称与项目版本。

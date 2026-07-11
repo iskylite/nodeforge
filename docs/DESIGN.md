@@ -40,7 +40,7 @@ NodeForge 是一个面向小型 Linux 集群和实验室环境的轻量级 OS Pr
 | 节点差异化 | profile 提供部署默认值，node 提供身份、IP、hostname、网络和模板变量等覆盖；IP 本身不触发部署动作 |
 | 未知节点默认行为 | 默认进入等待/观察态；可显式配置安全 discovery 或临时无盘；未知节点永远不能直接自动安装 |
 | CLI | M0 只提供状态、健康检查和本地 config/catalog 工具；M1+ 按对象来源和生命周期加入 daemon 驱动的导入/构建/发布、运行期高频、批量和观测 CLI/API；使用成熟 CLI 解析库并支持分级帮助 |
-| 可观测性 | M2.5 统一服务日志、Event v2 和本机事件查询；服务日志是诊断输出，events JSONL 是可查询审计，后续阶段只能复用同一 writer/注册表 |
+| 可观测性 | M2.5 统一服务日志、Event v2 和本机事件查询；M2.5.1 以进程内 `boot_session_id` 串联同一次节点启动，并以 `daemon_instance_id` 显示重启边界；服务日志是诊断输出，events JSONL 是可查询审计，后续阶段只能复用同一 writer/注册表 |
 | 输出 | 默认面向人类阅读，分组和表格化；机器消费显式使用 `--output json` |
 
 ## 2. 定位、边界与支持矩阵
@@ -99,7 +99,7 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 - **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 只做 status/check、config/catalog 校验与导出、离线 config import。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
 - **CLI 使用成熟库**：命令解析、帮助信息、参数类型、默认值和错误提示使用固定版本的开源 CLI 库。MVP 固定使用支持 Zig 0.16.0 的 `zli v5.1.2`；命令、子命令、flag、位置参数和说明只在命令树中声明一次，解析与分级帮助从同一份声明生成。zli 只承载 CLI 语法和展示，不承载复杂业务配置模型。
 - **CLI 帮助可达**：顶层、每个资源命令和每个子命令都必须支持 `-h/--help`，显示用途、参数和默认值；长示例保留在 README 和运维文档，不塞进帮助页。
-- **日志与排障**：M0–M2 的 stderr/journal 行为在 M2.5 统一迁移为带时间、等级、scope 的标准库日志后端；配置支持 `debug/info/warn/err` 和可选文件轮转，`nodeforged -d/--debug` 仅覆盖本次启动。M2.5 的 Event v2 是本地可查询审计契约，所有后续协议、installer、initrd 与 runner 复用同一注册表和 writer。服务日志、业务事件和 CLI 错误分别输出，且任何等级都不得记录密码、token、完整请求体或节点上传的大日志。
+- **日志与排障**：M0–M2 的 stderr/journal 行为在 M2.5 统一迁移为带时间、等级、scope 的标准库日志后端；`nodeforged --log-output auto|terminal|file|both` 控制本次输出目标，systemd 默认写入 `/opt/nodeforge/logs/nodeforged.log`，配置支持 `debug/info/warn/err` 和文件轮转，`nodeforged -d/--debug` 仅覆盖本次启动。M2.5 的 Event v2 是本地可查询审计契约，所有后续协议、installer、initrd 与 runner 复用同一注册表和 writer。服务日志、业务事件和 CLI 错误分别输出，且任何等级都不得记录密码、token、完整请求体或节点上传的大日志。
 - **输出可读优先**：面向人的默认输出必须分组、对齐、标注状态和时间；机器消费使用显式 `--output json`。
 
 ## 2.5 M0 实现状态
@@ -762,6 +762,12 @@ HTTP 是 NodeForge 的主要数据通道，负责 TFTP 之后的所有大内容�
 - 可选 `ETag`。
 - 并发连接上限作为内部常量；MVP 不设计限速策略。
 
+M3 的节点侧 HTTP 认证结果必须绑定已认领 node、活动 `boot_session_id` 与 DHCP lease 的直连 peer IP；
+`boot_session_id` 仅用于关联，不是 capability。首次 boot config/answer 以该绑定完成 bootstrap，随后 rootfs、
+事件和日志摘要使用独立的、仅进程内有效的 session capability，并只能置于 HTTP header。token 不得进入 URL、
+kernel cmdline、日志、事件或持久 runtime；daemon 重启后旧 session 必须失效。`/images` 与 `/repos` 可以只读
+公开，但只能发布 catalog allowlist 的资源；`/rootfs` 和所有节点 API 必须经过 session 认证。
+
 MVP 不再拆分 management listener 和 PXE listener。管理路由与 M3 PXE 数据路由逻辑分区，但共享同一个 HTTP listener。M0 当前只注册 `/healthz` 和管理路由；M3 才在同一 socket 提供裸机可通过 `server.server_ip` 访问的数据路由。本 listener 固定绑定 `0.0.0.0:<http.port>`；`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址，不作为 M0 HTTP bind 地址。服务端不按 peer 地址过滤管理请求，所有能到达该 listener 的 IPv4 客户端都可直接调用管理路由；`nodeforge` CLI 则固定连接 `127.0.0.1:<http.port>`，不提供远程 endpoint，只支持管理同机 `nodeforged`。这样可以减少 socket 生命周期、端口自检、路由注册和 CLI 连接配置的复杂度，前期把精力集中在 provisioning 主链路。
 
 HTTP 服务器基于 Zap/facil.io 的固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力；M0 尚未注册静态资产或 Range 路由，M3 再将这些能力接入 NodeForge 路由。NodeForge 当前只维护业务路由、管理 API 和统一错误信封。已评估的纯 Zig `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
@@ -1176,7 +1182,7 @@ sequenceDiagram
 
 `config.json` 是启动配置和人工声明策略的事实源，M0 当前实际读取 server、http、logging、distros、profiles、nodes 和 policy 字段；DHCP/TFTP 与 provisioning 字段属于 M1+ schema 扩展。`catalog.json` 是 NodeForge 管理目录的事实源，M0 只读取、导出和校验；M1+ 才记录 asset、repository、install source、rootfs、initrd、boot bundle 等导入、构建、扫描、发布结果。二者都使用 JSON、都必须整体校验并原子写回；catalog 写入始终只允许由 `nodeforged` 执行。
 
-MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。`runtime.json` 属于运行态，`events.jsonl` 属于事件历史；M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。服务日志默认进入 stderr/systemd journal，配置文件 sink 时同时写入受限权限的轮转文件。
+MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。`runtime.json` 属于运行态，`events.jsonl` 属于事件历史；M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。交互式启动默认写 stderr，systemd 显式选择受限权限的轮转文件 `/opt/nodeforge/logs/nodeforged.log`；`--log-output both` 才同时写入 stderr/journal。
 
 默认安装根为 `/opt/nodeforge`，代码中只在统一路径定义处声明一次，其他默认路径全部派生。完整的目录布局、系统集成点和仓库目录结构见第 14 章。
 
@@ -1186,7 +1192,7 @@ NodeForge 区分三类输出，避免把服务日志、业务事件和深度调�
 
 | 类型 | 默认位置 | 内容 | 日常级别 |
 | --- | --- | --- | --- |
-| 服务日志 | stderr / systemd journal；可选 `/opt/nodeforge/logs/nodeforged.log` | 启动、配置校验、监听、协议与 HTTP 请求摘要、错误摘要 | `debug/info/warn/err` |
+| 服务日志 | 交互式 stderr；systemd 默认 `/opt/nodeforge/logs/nodeforged.log`；`both` 时也进入 journal | 启动、配置校验、监听、协议与 HTTP 请求摘要、错误摘要 | `debug/info/warn/err` |
 | 业务事件（M2.5+） | `/opt/nodeforge/logs/events.jsonl` 及轮转文件 | DHCP/TFTP/HTTP/install/diskless/provisioning 事件，便于 CLI 和采集工具处理 | Event v2 结构化字段 |
 | CLI 错误 | 调用终端 stderr | 一行简短错误；`-d` 时附内部原因 | 不进入服务日志或事件 |
 
@@ -1196,7 +1202,7 @@ client IP、响应字节数、单调耗时和 `http.request` event。日常运�
 身份校验后映射到受限 Event v2。
 
 M0 使用两个互补的 debug 开关：`config.json` 的 `logging.level` 控制常驻 daemon 日志等级；
-`nodeforged -d/--debug` 只覆盖本次启动，适合 systemd 外的临时诊断。`nodeforge` 叶子命令的
+`nodeforged -d/--debug` 只覆盖本次启动，适合 systemd 外的临时诊断，并沿用 `--log-output` 选择的目标。`nodeforge` 叶子命令的
 `-d/--debug` 只影响该次命令的错误细节，不改变 daemon 等级。默认 CLI 错误格式为
 `error: <类别>: <简短原因>: <路径>`；debug 时另起一行输出底层 error tag。
 
@@ -1628,6 +1634,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 - 一个 HTTP 实现只启动一个 listener，绑定 `0.0.0.0:http.port`；管理路由接受该 listener 上所有可达连接；CLI 管理客户端固定连接 `127.0.0.1:http.port`，只支持同机 `nodeforged`；不设置独立 `management_port`；`server.server_ip` 用于对外 URL、DHCP next-server、TFTP/HTTP 广告地址。
 - HTTP 服务器基于 Zap/facil.io 的固定提交实现；Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力。M0 尚未注册静态资产或 Range 路由，M3 再接入；NodeForge 当前只维护业务路由、管理 API 和统一错误信封。纯 Zig `http.zig` 的 Zig 0.16 分支尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 - M0 的 `nodeforged --check` 在启动前检查配置/catalog 和唯一 HTTP 端口；正常启动不以预检替代实际 bind，仍由 Zap `listen()` 处理竞态和端口冲突。UDP 67/69、权限、资产目录、TFTP、DHCP resolver、repository 和 state 检查随对应阶段补齐。
+- M3 把每个节点请求归一化为 server-side `AuthenticatedNodeSession`，再决定 node、profile、mode、状态更新与 Event fields；URL、body、`X-Forwarded-For` 和客户端 event type 绝不直接成为事实。`node_status` 是持久 runtime 投影，Event v2 是审计；daemon 重启保留最后投影但使旧 session 失效，由 trace 显示重启边界。
 - 随软件包提供 `packaging/systemd/nodeforged.service`；CLI 不重复封装 `systemctl`；M0 需要通过 Rocky 9.7 aarch64 systemd 验证。
 - ISO 导入自动发布本地 HTTP yum/dnf/apt 基础源并绑定 repository；repo GPG 检查默认关闭，只有显式启用才校验 key。
 - rootfs HTTP 下载支持 Range/If-Range 断点续传和最终 SHA256 校验。
@@ -1697,7 +1704,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
   logs/
     events.jsonl
     events.jsonl.1          # M2.5+ 轮转文件，最多保留 events.keep 个
-    nodeforged.log          # M2.5+ 可选文件 sink；默认仍输出 stderr/systemd journal
+    nodeforged.log          # M2.5+ systemd 默认服务日志；交互式启动按 --log-output 选择
   assets/
     iso/
     images/
@@ -1724,8 +1731,8 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 - `/etc/systemd/system/nodeforged.service -> /opt/nodeforge/systemd/nodeforged.service`
 - `/usr/bin/nodeforge -> /opt/nodeforge/bin/nodeforge`
 - `/usr/bin/nodeforged -> /opt/nodeforge/bin/nodeforged`
-- `ExecStart=/opt/nodeforge/bin/nodeforged`
-- `ExecStartPre=/opt/nodeforge/bin/nodeforged --check`
+- `ExecStart=/opt/nodeforge/bin/nodeforged --log-output file`
+- `ExecStartPre=/opt/nodeforge/bin/nodeforged --check --log-output file`
 
 仓库目录：
 

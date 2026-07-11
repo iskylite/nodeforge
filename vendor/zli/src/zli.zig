@@ -836,6 +836,8 @@ fn parseArgs(self: *Command, argsIterator: *std.process.Args.Iterator) CommandPa
     const prog_name = argsIterator.next() orelse unreachable; // always the program name as first arg
 
     var remaining_args: []const []const u8 = &.{};
+    var positional_args = ArrayList([]const u8).empty;
+    errdefer positional_args.deinit(allocator);
 
     outer: while (argsIterator.next()) |arg| {
         try current_cmd.init_options.writer.flush();
@@ -867,18 +869,8 @@ fn parseArgs(self: *Command, argsIterator: *std.process.Args.Iterator) CommandPa
                 }
 
                 if (current_cmd.positional_args.items.len > 0) {
-                    const rest = argsIterator.inner.remaining;
-
-                    var converted = try allocator.alloc([]const u8, rest.len + 1);
-                    errdefer allocator.free(converted);
-
-                    converted[0] = arg;
-
-                    for (rest, 0..) |item, i| {
-                        converted[i + 1] = std.mem.span(item);
-                    }
-
-                    remaining_args = converted;
+                    try positional_args.append(allocator, arg);
+                    continue :outer;
                 } else {
                     try current_cmd.init_options.writer.print("Unknown command: '{s}'\n", .{arg});
                     try current_cmd.displayCommandError();
@@ -1016,6 +1008,9 @@ fn parseArgs(self: *Command, argsIterator: *std.process.Args.Iterator) CommandPa
             },
         }
     }
+
+    remaining_args = try positional_args.toOwnedSlice(allocator);
+    errdefer if (remaining_args.len > 0) allocator.free(remaining_args);
 
     const help_requested = blk: {
         if (current_cmd.flag_values.get("help")) |flagValue| {

@@ -14,7 +14,7 @@ pub const config_dir = install_root ++ "/config";
 pub const catalog_dir = install_root ++ "/catalog";
 /// 运行态快照目录，不能反向成为启动配置事实源。
 pub const state_dir = install_root ++ "/state";
-/// 结构化事件和可选文件日志目录；默认服务日志仍走 stderr/systemd journal。
+/// 结构化事件和服务日志目录；systemd 默认写入这里，交互式模式可选 stderr。
 pub const logs_dir = install_root ++ "/logs";
 /// ISO、kernel、initrd、rootfs 等大文件资产根目录。
 pub const assets_dir = install_root ++ "/assets";

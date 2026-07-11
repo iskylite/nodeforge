@@ -9,6 +9,8 @@ NodeForge carries compatibility patches in `src/zli.zig` and
 - continue command discovery after a flag, so root flags may precede a
   subcommand;
 - propagate values of persistent flags into the selected child command.
+- continue flag parsing after a positional argument, so documented commands
+  such as `nodeforge trace node-01 --session ID` retain conventional ordering.
 - treat the built-in help flag as persistent and let a conventional boolean
   version flag bypass leaf positional validation.
 - avoid writing the ANSI “show cursor” sequence when a spinner was initialized

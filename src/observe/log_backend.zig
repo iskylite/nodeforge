@@ -1,5 +1,5 @@
 //! Process-wide std.log backend with runtime severity threshold, bounded
-//! rendering, stderr + optional file dual sink, rotation and degradation.
+//! rendering, selectable terminal/file sinks, rotation and degradation.
 //!
 //! The backend renders each record into an 8 KiB stack buffer. When the
 //! formatted message exceeds the budget the line is truncated with
@@ -14,7 +14,20 @@ const events = @import("../state/events.zig");
 pub const max_line_bytes = 8 * 1024;
 const truncation_suffix = "… [truncated]";
 
+pub const OutputMode = enum(u8) {
+    terminal,
+    file,
+    both,
+};
+
+pub const FileSinkConfig = struct {
+    path: []const u8,
+    max_size_mb: u16,
+    keep: u8,
+};
+
 var threshold = std.atomic.Value(u8).init(@intFromEnum(std.log.Level.info));
+var output_mode = std.atomic.Value(u8).init(@intFromEnum(OutputMode.terminal));
 var sink_mutex: std.atomic.Mutex = .unlocked;
 var file_backend: ?FileSink = null;
 var config_io: ?std.Io = null;
@@ -27,17 +40,18 @@ pub fn enabled(comptime level: std.log.Level) bool {
     return @intFromEnum(level) <= threshold.load(.acquire);
 }
 
-/// Configures the optional file sink. Called once at daemon startup before
-/// workers spawn; afterwards the pointer is read atomically without locking.
-pub fn configureFileSink(io: std.Io, path: []const u8, max_size_mb: u16, keep: u8) void {
+/// Configures log destinations once at daemon startup, before workers spawn.
+/// A file mode without a usable file sink degrades each record to stderr.
+pub fn configure(io: std.Io, mode: OutputMode, file: ?FileSinkConfig) void {
     while (!sink_mutex.tryLock()) std.Thread.yield() catch {};
     defer sink_mutex.unlock();
     config_io = io;
-    file_backend = .{
-        .path = path,
-        .max_size_bytes = @as(u64, max_size_mb) * 1024 * 1024,
-        .keep = keep,
-    };
+    output_mode.store(@intFromEnum(mode), .release);
+    file_backend = if (file) |file_config| .{
+        .path = file_config.path,
+        .max_size_bytes = @as(u64, file_config.max_size_mb) * 1024 * 1024,
+        .keep = file_config.keep,
+    } else null;
 }
 
 const FileSink = struct {
@@ -46,7 +60,7 @@ const FileSink = struct {
     keep: u8,
     degraded_count: u64 = 0,
 
-    fn writeOrReportDegraded(self: *FileSink, io: std.Io, line: []const u8) void {
+    fn writeOrReportDegraded(self: *FileSink, io: std.Io, line: []const u8) bool {
         self.writeLine(io, line) catch {
             self.degraded_count += 1;
             // Throttle: only report every 32 failures to avoid recursive noise.
@@ -58,7 +72,10 @@ const FileSink = struct {
             if (self.degraded_count > 1000) {
                 file_backend = null;
             }
+            return false;
         };
+        self.degraded_count = 0;
+        return true;
     }
 
     fn writeLine(self: *FileSink, io: std.Io, line: []const u8) !void {
@@ -160,12 +177,17 @@ pub fn logFn(
     while (!sink_mutex.tryLock()) std.Thread.yield() catch {};
     defer sink_mutex.unlock();
 
-    // stderr sink — direct write to fd 2.
-    _ = std.posix.system.write(2, line.ptr, line.len);
+    const mode: OutputMode = @enumFromInt(output_mode.load(.acquire));
+    const write_terminal = mode == .terminal or mode == .both;
+    if (write_terminal) _ = std.posix.system.write(2, line.ptr, line.len);
 
-    // Optional file sink.
-    if (file_backend) |*backend| {
-        const io = config_io orelse return;
-        backend.writeOrReportDegraded(io, line);
+    if (mode == .file or mode == .both) {
+        const wrote_file = if (file_backend) |*backend| blk: {
+            const io = config_io orelse break :blk false;
+            break :blk backend.writeOrReportDegraded(io, line);
+        } else false;
+        if (!wrote_file and !write_terminal) {
+            _ = std.posix.system.write(2, line.ptr, line.len);
+        }
     }
 }

@@ -8,6 +8,7 @@ const probe = @import("probe.zig");
 const resolver = @import("../boot/resolver.zig");
 const runtime_state = @import("../state/runtime.zig");
 const dhcp_store = @import("../state/dhcp_store.zig");
+const boot_session = @import("../state/boot_session.zig");
 const events = @import("../state/events.zig");
 const observe_log = @import("../observe/log.zig");
 const log = std.log.scoped(.dhcp);
@@ -36,7 +37,19 @@ pub fn bind(io: std.Io, server_ip: []const u8, bind_interface: ?[]const u8) !std
     }
     return socket;
 }
-pub const Persistence = struct { allocator: std.mem.Allocator, runtime_path: []const u8, events_path: []const u8, writer: *events.Writer };
+pub const Persistence = struct {
+    allocator: std.mem.Allocator,
+    runtime_path: []const u8,
+    events_path: []const u8,
+    writer: *events.Writer,
+    sessions: *boot_session.Store,
+};
+
+/// 在同一 UDP worker 中处理 DHCP 和 session 生命周期。
+///
+/// DISCOVER/REQUEST 才会创建或刷新 session；RELEASE/DECLINE 仅撤销其 lease-IP
+/// 关联。这样不会把客户端的释放包误解为新的启动尝试，并让之后的 TFTP 只能按
+/// 已 ACK 的唯一 IP 找到 session。
 pub fn serveSocket(io: std.Io, owned: std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned;
     defer socket.close(io);
@@ -47,15 +60,25 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const mode
         if (if (stop) |flag| flag.load(.acquire) else false) return;
         var bytes: [1500]u8 = undefined;
         const incoming = socket.receiveTimeout(io, &bytes, .{ .duration = .{ .raw = .fromMilliseconds(200), .clock = .awake } }) catch |err| {
-            if (err == error.Timeout) continue;
+            if (err == error.Timeout) {
+                expireSessions(io, persistence);
+                continue;
+            }
             return err;
         };
         const request = packet.parse(incoming.data) catch |err| {
             log.debug("dropped malformed packet: {t}", .{err});
             continue;
         };
-        audit(io, persistence, config, requestEvent(request.message_type orelse .inform), request.message_type orelse .inform, request.message_type orelse .inform, request.mac(), 0, request.xid, request.architecture);
-        const reply = offerAfterProbe(io, config, runtime, &request, persistence) orelse {
+        expireSessions(io, persistence);
+        var session_link: ?boot_session.Link = null;
+        const request_kind = request.message_type orelse .inform;
+        if (request_kind == .discover or request_kind == .request) session_link = acquireSession(io, persistence, config, &request);
+        audit(io, persistence, config, requestEvent(request_kind), request_kind, request_kind, request.mac(), 0, request.xid, request.architecture, if (session_link) |*link| link else null);
+        if (request_kind == .release or request_kind == .decline) {
+            if (persistence) |p| p.sessions.clearLease(request.mac(), request.xid, boot_session.monotonicNow(), now());
+        }
+        const reply = offerAfterProbe(io, config, runtime, &request, persistence, if (session_link) |*link| link else null) orelse {
             persist(io, persistence, runtime);
             continue;
         };
@@ -69,23 +92,31 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const mode
             continue;
         };
         try socket.send(io, &target, encoded);
+        if (session_link) |link| {
+            const phase: boot_session.Phase = switch (reply.kind) {
+                .offer => .dhcp_offer,
+                .ack => .dhcp_ack,
+                else => .dhcp_discover,
+            };
+            if (reply.kind == .offer or reply.kind == .ack) {
+                if (persistence) |p| p.sessions.updateDhcp(link, phase, reply.yiaddr, boot_session.monotonicNow(), now());
+            }
+        }
         audit(io, persistence, config, switch (reply.kind) {
             .offer => "dhcp.offer",
             .ack => "dhcp.ack",
             .nak => "dhcp.nak",
             else => "dhcp.request",
-        }, request.message_type orelse .inform, reply.kind, request.mac(), reply.yiaddr, request.xid, request.architecture);
+        }, request_kind, reply.kind, request.mac(), reply.yiaddr, request.xid, request.architecture, if (session_link) |*link| link else null);
         persist(io, persistence, runtime);
-        var reply_ip: [16]u8 = undefined;
-        const readable_ip = formatIp(&reply_ip, reply.yiaddr) catch "0.0.0.0";
-        observe_log.info("dhcp: {t} -> {t} yiaddr={s}", .{ request.message_type orelse .inform, reply.kind, readable_ip });
+        logReply(config, &request, reply, session_link);
     }
 }
 
 /// Ensure an offer is conflict-free before it can leave the process. A failed
 /// raw ICMP probe produces no DHCP reply; treating it as a clear probe would
 /// allow a lease collision on hosts lacking CAP_NET_RAW.
-fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, persistence: ?*const Persistence) ?packet.Reply {
+fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, persistence: ?*const Persistence, session_link: ?*const boot_session.Link) ?packet.Reply {
     var attempts: usize = 0;
     while (attempts < runtime_state.DhcpState.max_leases) : (attempts += 1) {
         const reply = process(config, runtime, request) orelse return null;
@@ -94,7 +125,7 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
             .clear => return reply,
             .occupied => {
                 _ = runtime.dhcp.decline(request.mac(), now(), config.dhcp.abandon_seconds);
-                audit(io, persistence, config, "dhcp.abandoned", request.message_type orelse .inform, .decline, request.mac(), reply.yiaddr, request.xid, request.architecture);
+                audit(io, persistence, config, "dhcp.abandoned", request.message_type orelse .inform, .decline, request.mac(), reply.yiaddr, request.xid, request.architecture, session_link);
             },
             .unavailable => {
                 observe_log.err("dhcp: ping probe unavailable; refusing offer", .{});
@@ -170,7 +201,12 @@ fn persist(io: std.Io, persistence: ?*const Persistence, runtime: *runtime_state
     const p = persistence orelse return;
     dhcp_store.save(io, p.allocator, p.runtime_path, &runtime.dhcp, now()) catch |err| observe_log.err("dhcp: runtime persistence failed: {t}", .{err});
 }
-fn audit(io: std.Io, persistence: ?*const Persistence, config: *const model.AppConfig, event_type: []const u8, request_kind: packet.MessageType, reply_kind: packet.MessageType, mac: []const u8, ip: u32, xid: u32, architecture: packet.Architecture) void {
+/// 追加 DHCP 审计事件。
+///
+/// `session_link` 是本包处理时取得的关联结果：成功时写 boot_session_id，无法
+/// 安全关联时写 session_link_state。此处不得仅凭 `ip`、MAC 或 node 配置重新
+/// 查找 session，否则会掩盖容量耗尽和地址歧义。
+fn audit(io: std.Io, persistence: ?*const Persistence, config: *const model.AppConfig, event_type: []const u8, request_kind: packet.MessageType, reply_kind: packet.MessageType, mac: []const u8, ip: u32, xid: u32, architecture: packet.Architecture, session_link: ?*const boot_session.Link) void {
     const p = persistence orelse return;
     var ip_text: [16]u8 = undefined;
     const rendered_ip = std.fmt.bufPrint(&ip_text, "{d}.{d}.{d}.{d}", .{ (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255 }) catch return;
@@ -180,23 +216,137 @@ fn audit(io: std.Io, persistence: ?*const Persistence, config: *const model.AppC
     if (mac.len != 6) return;
     const rendered_mac = std.fmt.bufPrint(&mac_text, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch return;
     const decision = resolver.resolve(config, mac, architecture);
-    var fields = [_]events.Field{
+    var fields: [8]events.Field = .{
         .{ .key = "mac", .value = rendered_mac },
         .{ .key = "ip", .value = rendered_ip },
         .{ .key = "xid", .value = rendered_xid },
         .{ .key = "kind", .value = @tagName(request_kind) },
         .{ .key = "arch", .value = @tagName(architecture) },
-        .{ .key = "node_id", .value = "" },
+        .{ .key = "", .value = "" },
+        .{ .key = "", .value = "" },
+        .{ .key = "", .value = "" },
     };
-    const field_slice = if (decision.node_id) |node_id| blk: {
-        fields[fields.len - 1] = .{ .key = "node_id", .value = node_id };
-        break :blk fields[0..];
-    } else fields[0 .. fields.len - 1];
+    var count: usize = 5;
+    if (decision.node_id) |node_id| {
+        fields[count] = .{ .key = "node_id", .value = node_id };
+        count += 1;
+    }
+    if (session_link) |link| {
+        if (link.id()) |id| {
+            fields[count] = .{ .key = "boot_session_id", .value = id };
+            count += 1;
+        } else if (link.state()) |state| {
+            fields[count] = .{ .key = "session_link_state", .value = state };
+            count += 1;
+        }
+    }
     var message: [128]u8 = undefined;
     const text = std.fmt.bufPrint(&message, "{t} -> {t} yiaddr={s}", .{ request_kind, reply_kind, rendered_ip }) catch return;
-    p.writer.appendWithFields(io, p.allocator, p.events_path, event_type, text, field_slice) catch |err| observe_log.err("dhcp: event append failed: {t}", .{err});
+    p.writer.appendWithFields(io, p.allocator, p.events_path, event_type, text, fields[0..count]) catch |err| observe_log.err("dhcp: event append failed: {t}", .{err});
 }
-fn formatIp(buffer: *[16]u8, ip: u32) ![]const u8 { return std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{ (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255 }); }
+
+/// 从 DISCOVER/REQUEST 获取 session，并将被新 XID 替换的旧 session 立即审计。
+///
+/// session 分配失败不会中断 DHCP；返回 `capacity_exhausted` 让事件消费者看见
+/// 关联缺口，而非错误地把本次请求接到另一条活动记录上。
+fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const model.AppConfig, request: *const packet.Packet) boot_session.Link {
+    const p = persistence orelse return .capacity_exhausted;
+    const decision = resolver.resolve(config, request.mac(), request.architecture);
+    const result = p.sessions.acquireDhcp(io, .{
+        .mac = request.mac(),
+        .xid = request.xid,
+        .node_id = decision.node_id,
+        .profile = decision.profile,
+        .mode = decision.mode,
+    }, boot_session.monotonicNow(), now()) catch |err| {
+        observe_log.warn("dhcp: boot session allocation unavailable: {t}", .{err});
+        return .capacity_exhausted;
+    };
+    if (result.retired) |session| emitSessionTermination(io, p, session);
+    return result.link;
+}
+
+/// 在空闲 receive timeout 和请求处理后清理过期 session，避免低流量环境中
+/// session 只能等到下一次 DHCP 包才终止。
+fn expireSessions(io: std.Io, persistence: ?*const Persistence) void {
+    const p = persistence orelse return;
+    var expired: [boot_session.max_sessions]boot_session.Session = undefined;
+    const count = p.sessions.expire(boot_session.monotonicNow(), now(), &expired);
+    for (expired[0..count]) |session| emitSessionTermination(io, p, session);
+}
+
+/// 用已复制的终态 session 记录唯一的 `boot.session.terminated` 事件。
+///
+/// 调用时 session 已从 Store 移除，因此事件写入失败不会使终态 session 重新变活。
+pub fn emitSessionTermination(io: std.Io, persistence: *const Persistence, session: boot_session.Session) void {
+    var mac: [17]u8 = undefined;
+    var ip: [16]u8 = undefined;
+    const mac_text = std.fmt.bufPrint(&mac, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ session.mac[0], session.mac[1], session.mac[2], session.mac[3], session.mac[4], session.mac[5] }) catch return;
+    const ip_text = formatIp(&ip, session.lease_ip) catch "0.0.0.0";
+    var fields: [7]events.Field = .{
+        .{ .key = "boot_session_id", .value = session.idSlice() },
+        .{ .key = "mac", .value = mac_text },
+        .{ .key = "ip", .value = ip_text },
+        .{ .key = "phase", .value = @tagName(session.phase) },
+        .{ .key = "reason", .value = @tagName(session.terminal_reason orelse .failed) },
+        .{ .key = "", .value = "" },
+        .{ .key = "", .value = "" },
+    };
+    var count: usize = 5;
+    if (session.node_id) |node_id| {
+        fields[count] = .{ .key = "node_id", .value = node_id };
+        count += 1;
+    }
+    if (session.profile) |profile| {
+        fields[count] = .{ .key = "profile", .value = profile };
+        count += 1;
+    }
+    persistence.writer.appendWithFields(io, persistence.allocator, persistence.events_path, "boot.session.terminated", "boot session terminated", fields[0..count]) catch |err|
+        observe_log.err("dhcp: boot session termination event failed: {t}", .{err});
+}
+
+/// 服务日志与 audit 字段保持相同的关联语义，方便 journal 排障时交叉核对。
+fn logReply(config: *const model.AppConfig, request: *const packet.Packet, reply: packet.Reply, session_link: ?boot_session.Link) void {
+    var reply_ip: [16]u8 = undefined;
+    var mac_text: [17]u8 = undefined;
+    const readable_ip = formatIp(&reply_ip, reply.yiaddr) catch "0.0.0.0";
+    const mac = request.mac();
+    const readable_mac = std.fmt.bufPrint(&mac_text, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch "unknown";
+    const decision = resolver.resolve(config, mac, request.architecture);
+    if (session_link) |*link| {
+        if (link.id()) |session| {
+            observe_log.info("dhcp: {t} -> {t} yiaddr={s} node_id={s} session={s} mac={s} xid=0x{x:0>8}", .{
+                request.message_type orelse .inform,
+                reply.kind,
+                readable_ip,
+                decision.node_id orelse "-",
+                session,
+                readable_mac,
+                request.xid,
+            });
+            return;
+        }
+        observe_log.warn("dhcp: {t} -> {t} yiaddr={s} mac={s} xid=0x{x:0>8} session_link_state={s}", .{
+            request.message_type orelse .inform,
+            reply.kind,
+            readable_ip,
+            readable_mac,
+            request.xid,
+            link.state() orelse "unknown",
+        });
+        return;
+    }
+    observe_log.info("dhcp: {t} -> {t} yiaddr={s} mac={s} xid=0x{x:0>8}", .{
+        request.message_type orelse .inform,
+        reply.kind,
+        readable_ip,
+        readable_mac,
+        request.xid,
+    });
+}
+fn formatIp(buffer: *[16]u8, ip: u32) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{d}.{d}.{d}.{d}", .{ (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255 });
+}
 fn poolContains(config: *const model.AppConfig, ip: u32) bool {
     const first = parseIp(config.dhcp.pool_start) orelse return false;
     const last = parseIp(config.dhcp.pool_end) orelse return false;

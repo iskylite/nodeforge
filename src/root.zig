@@ -12,6 +12,7 @@ pub const config_store = @import("config/store.zig");
 pub const config_validate = @import("config/validate.zig");
 pub const preflight = @import("preflight.zig");
 pub const runtime_state = @import("state/runtime.zig");
+pub const boot_session = @import("state/boot_session.zig");
 pub const catalog_runtime = @import("state/catalog_runtime.zig");
 pub const events = @import("state/events.zig");
 pub const event_types = @import("state/event_types.zig");
@@ -33,6 +34,7 @@ pub const log_backend = @import("observe/log_backend.zig");
 pub const cli_table = @import("cli/table.zig");
 pub const cli_output = @import("cli/output.zig");
 pub const cli_views = @import("cli/views.zig");
+pub const cli_events = @import("cli/events.zig");
 
 test {
     _ = model;
@@ -46,6 +48,7 @@ test {
     _ = config_validate;
     _ = preflight;
     _ = runtime_state;
+    _ = boot_session;
     _ = catalog_runtime;
     _ = events;
     _ = event_types;
@@ -67,6 +70,7 @@ test {
     _ = cli_table;
     _ = cli_output;
     _ = cli_views;
+    _ = cli_events;
 }
 const std = @import("std");
 const log_backend_impl = @import("observe/log_backend.zig");

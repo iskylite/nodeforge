@@ -7,6 +7,7 @@ const zli = @import("zli");
 const nodeforge = @import("nodeforge");
 const views = @import("nodeforge").cli_views;
 const cli_output = @import("nodeforge").cli_output;
+const cli_events = @import("nodeforge").cli_events;
 
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = nodeforge.log_backend.logFn };
 
@@ -219,6 +220,20 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const events_types = try zli.Command.init(init_options, .{ .name = "types", .description = "List registered event types" }, eventsTypesHandler);
     try addOutputFlag(events_types);
     try events.addCommands(&.{ events_list, events_follow, events_types });
+    // trace 是只读的因果重建视图：只消费 daemon 审计流，不连接管理 API，
+    // 更不会因查询而创建或推进 boot session。
+    const trace = try zli.Command.init(init_options, .{
+        .name = "trace",
+        .description = "Reconstruct one node boot-session timeline from local events",
+        .usage = "nodeforge trace <node_id> [--session <boot_session_id>] [--latest] [options]",
+    }, traceHandler);
+    try trace.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try trace.addFlags(&.{
+        .{ .name = "session", .description = "Exact 32-character boot session identifier", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "latest", .description = "Select the latest retained session (default when --session is omitted)", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.events_path } },
+    });
+    try addOutputFlag(trace);
 
     try root.addCommands(&.{
         status,
@@ -231,6 +246,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         node,
         asset,
         events,
+        trace,
     });
     return root;
 }
@@ -428,35 +444,72 @@ fn catalogExportHandler(ctx: zli.CommandContext) !void {
 fn assetImportHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const debug = ctx.flag("debug", bool);
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, debug) orelse { setExitCode(ctx, 1); return; };
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer parsed_config.deinit();
-    const kind = std.meta.stringToEnum(nodeforge.model.AssetKind, ctx.flag("type", []const u8)) orelse { try ctx.writer.writeAll("error: asset: unsupported --type\n"); setExitCode(ctx, 2); return; };
+    const kind = std.meta.stringToEnum(nodeforge.model.AssetKind, ctx.flag("type", []const u8)) orelse {
+        try ctx.writer.writeAll("error: asset: unsupported --type\n");
+        setExitCode(ctx, 2);
+        return;
+    };
     const name = ctx.flag("name", []const u8);
     const path = ctx.flag("path", []const u8);
-    if (name.len == 0 or path.len == 0) { try ctx.writer.writeAll("error: asset: --name and --path are required\n"); setExitCode(ctx, 2); return; }
+    if (name.len == 0 or path.len == 0) {
+        try ctx.writer.writeAll("error: asset: --name and --path are required\n");
+        setExitCode(ctx, 2);
+        return;
+    }
     const distro_value = ctx.flag("distro", []const u8);
     const version_value = ctx.flag("version", []const u8);
     const arch_value = ctx.flag("arch", []const u8);
     const has_tuple = distro_value.len != 0 or version_value.len != 0 or arch_value.len != 0;
-    if (has_tuple and (distro_value.len == 0 or version_value.len == 0 or arch_value.len == 0)) { try ctx.writer.writeAll("error: asset: --distro, --version and --arch must be used together\n"); setExitCode(ctx, 2); return; }
-    const arch = if (has_tuple) std.meta.stringToEnum(nodeforge.model.Arch, arch_value) orelse { try ctx.writer.writeAll("error: asset: unsupported --arch\n"); setExitCode(ctx, 2); return; } else null;
+    if (has_tuple and (distro_value.len == 0 or version_value.len == 0 or arch_value.len == 0)) {
+        try ctx.writer.writeAll("error: asset: --distro, --version and --arch must be used together\n");
+        setExitCode(ctx, 2);
+        return;
+    }
+    const arch = if (has_tuple) std.meta.stringToEnum(nodeforge.model.Arch, arch_value) orelse {
+        try ctx.writer.writeAll("error: asset: unsupported --arch\n");
+        setExitCode(ctx, 2);
+        return;
+    } else null;
     const imported = nodeforge.management_client.importAsset(ctx.io, parsed_config.value.server.http_port, .{
-        .name = name, .kind = @tagName(kind), .path = path,
-        .distro = if (has_tuple) distro_value else null, .version = if (has_tuple) version_value else null,
+        .name = name,
+        .kind = @tagName(kind),
+        .path = path,
+        .distro = if (has_tuple) distro_value else null,
+        .version = if (has_tuple) version_value else null,
         .arch = if (arch) |value| @tagName(value) else null,
         .kernel_release = if (ctx.flag("kernel-release", []const u8).len == 0) null else ctx.flag("kernel-release", []const u8),
-    }) catch |err| { try ctx.writer.print("error: asset: import request failed\n", .{}); if (debug) try ctx.writer.print("debug: asset: cause={t}\n", .{err}); setExitCode(ctx, 1); return; };
-    if (!imported) { try ctx.writer.writeAll("error: asset: daemon rejected import\n"); setExitCode(ctx, 1); return; }
+    }) catch |err| {
+        try ctx.writer.print("error: asset: import request failed\n", .{});
+        if (debug) try ctx.writer.print("debug: asset: cause={t}\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (!imported) {
+        try ctx.writer.writeAll("error: asset: daemon rejected import\n");
+        setExitCode(ctx, 1);
+        return;
+    }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"name\":\"{s}\"}}\n", .{name}) else try views.success(ctx.writer, "asset imported", &.{.{ .label = "Name", .value = name }});
 }
 
 fn assetListHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
-    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer loaded.deinit();
     if (output_json) {
         try ctx.writer.writeAll("{\"assets\":[");
-        for (loaded.value().assets, 0..) |item, i| { if (i != 0) try ctx.writer.writeByte(','); try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\"}}", .{ item.name, item.kind, item.path }); }
+        for (loaded.value().assets, 0..) |item, i| {
+            if (i != 0) try ctx.writer.writeByte(',');
+            try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\"}}", .{ item.name, item.kind, item.path });
+        }
         try ctx.writer.writeAll("]}\n");
     } else {
         var rows: [64]views.AssetRow = undefined;
@@ -468,20 +521,45 @@ fn assetListHandler(ctx: zli.CommandContext) !void {
 
 fn assetShowHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
-    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer loaded.deinit();
     const name = ctx.getArg("name") orelse unreachable;
-    for (loaded.value().assets) |item| if (std.mem.eql(u8, item.name, name)) { if (output_json) try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\",\"sha256\":{f}}}\n", .{ item.name, item.kind, item.path, std.json.fmt(item.sha256, .{}) }) else try views.assetDetail(ctx.writer, item.name, @tagName(item.kind), item.path, item.sha256 orelse ""); return; };
-    try ctx.writer.print("error: asset: not found: {s}\n", .{name}); setExitCode(ctx, 1);
+    for (loaded.value().assets) |item| if (std.mem.eql(u8, item.name, name)) {
+        if (output_json) try ctx.writer.print("{{\"name\":\"{s}\",\"kind\":\"{t}\",\"path\":\"{s}\",\"sha256\":{f}}}\n", .{ item.name, item.kind, item.path, std.json.fmt(item.sha256, .{}) }) else try views.assetDetail(ctx.writer, item.name, @tagName(item.kind), item.path, item.sha256 orelse "");
+        return;
+    };
+    try ctx.writer.print("error: asset: not found: {s}\n", .{name});
+    setExitCode(ctx, 1);
 }
 
 fn assetValidateHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer parsed_config.deinit();
-    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer loaded.deinit();
-    for (loaded.value().assets) |item| { var digest: [64]u8 = undefined; nodeforge.asset_validate.sha256File(ctx.io, parsed_config.value.tftp.asset_root, item.path, &digest) catch { try ctx.writer.print("error: asset: unreadable: {s}\n", .{item.path}); setExitCode(ctx, 1); return; }; if (item.sha256 == null or !std.mem.eql(u8, item.sha256.?, &digest)) { try ctx.writer.print("error: asset: checksum mismatch: {s}\n", .{item.name}); setExitCode(ctx, 1); return; } }
+    for (loaded.value().assets) |item| {
+        var digest: [64]u8 = undefined;
+        nodeforge.asset_validate.sha256File(ctx.io, parsed_config.value.tftp.asset_root, item.path, &digest) catch {
+            try ctx.writer.print("error: asset: unreadable: {s}\n", .{item.path});
+            setExitCode(ctx, 1);
+            return;
+        };
+        if (item.sha256 == null or !std.mem.eql(u8, item.sha256.?, &digest)) {
+            try ctx.writer.print("error: asset: checksum mismatch: {s}\n", .{item.name});
+            setExitCode(ctx, 1);
+            return;
+        }
+    }
     if (output_json) try ctx.writer.writeAll("{\"ok\":true}\n") else {
         var count: [20]u8 = undefined;
         try views.success(ctx.writer, "assets valid", &.{.{ .label = "Assets", .value = try std.fmt.bufPrint(&count, "{d}", .{loaded.value().assets.len}) }});
@@ -490,16 +568,26 @@ fn assetValidateHandler(ctx: zli.CommandContext) !void {
 
 fn tftpShowHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer parsed_config.deinit();
     const status = nodeforge.management_client.tftpCounters(ctx.io, parsed_config.value.server.http_port);
-    if (!status.healthy) { try ctx.writer.writeAll("error: tftp: local daemon status unavailable\n"); setExitCode(ctx, 1); return; }
+    if (!status.healthy) {
+        try ctx.writer.writeAll("error: tftp: local daemon status unavailable\n");
+        setExitCode(ctx, 1);
+        return;
+    }
     if (output_json) try ctx.writer.print("{{\"started\":{d},\"completed\":{d},\"failed\":{d}}}\n", .{ status.started, status.completed, status.failed }) else try views.tftpCounters(ctx.writer, status.started, status.completed, status.failed);
 }
 
 fn tftpSessionListHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer parsed_config.deinit();
     var response: [8192]u8 = undefined;
     const body = try nodeforge.management_client.tftpSessionsJson(ctx.io, parsed_config.value.server.http_port, &response);
@@ -508,9 +596,16 @@ fn tftpSessionListHandler(ctx: zli.CommandContext) !void {
         setExitCode(ctx, 1);
         return;
     }
-    if (output_json) { try ctx.writer.writeAll(body.?); return; }
+    if (output_json) {
+        try ctx.writer.writeAll(body.?);
+        return;
+    }
     const SessionResponse = struct { ok: bool, result: struct { sessions: []const struct { id: u64, phase: nodeforge.runtime_state.TftpSessionPhase, filename: []const u8 } } };
-    var parsed = std.json.parseFromSlice(SessionResponse, ctx.allocator, body.?, .{ .allocate = .alloc_always }) catch |err| { try ctx.writer.print("error: tftp: malformed daemon response ({t})\n", .{err}); setExitCode(ctx, 1); return; };
+    var parsed = std.json.parseFromSlice(SessionResponse, ctx.allocator, body.?, .{ .allocate = .alloc_always }) catch |err| {
+        try ctx.writer.print("error: tftp: malformed daemon response ({t})\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
     defer parsed.deinit();
     var rows: [32]views.TftpSessionRow = undefined;
     if (parsed.value.result.sessions.len > rows.len) return error.TooManyTftpSessions;
@@ -521,7 +616,10 @@ fn tftpSessionListHandler(ctx: zli.CommandContext) !void {
 
 fn dhcpShowHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
-    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer config.deinit();
     const dhcp = config.value.dhcp;
     if (output_json) {
@@ -539,7 +637,10 @@ fn runtimeUnknownHandler(ctx: zli.CommandContext) !void {
 
 fn runtimeLeaseList(ctx: zli.CommandContext, unknown_only: bool) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
-    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer config.deinit();
     var response: [64 * 1024]u8 = undefined;
     const body = try nodeforge.management_client.dhcpLeasesJson(ctx.io, config.value.server.http_port, unknown_only, &response);
@@ -548,9 +649,16 @@ fn runtimeLeaseList(ctx: zli.CommandContext, unknown_only: bool) !void {
         setExitCode(ctx, 1);
         return;
     }
-    if (output_json) { try ctx.writer.writeAll(body.?); return; }
+    if (output_json) {
+        try ctx.writer.writeAll(body.?);
+        return;
+    }
     const Response = struct { ok: bool, result: struct { leases: []const struct { phase: nodeforge.runtime_state.LeasePhase, known: bool, ip: []const u8, mac: []const u8, expires_at: i64 } } };
-    var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always }) catch |err| { try ctx.writer.print("error: runtime: malformed daemon response ({t})\n", .{err}); setExitCode(ctx, 1); return; };
+    var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always }) catch |err| {
+        try ctx.writer.print("error: runtime: malformed daemon response ({t})\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
     defer parsed.deinit();
     var rows: [256]views.DhcpLeaseRow = undefined;
     var expiration: [256][24]u8 = undefined;
@@ -561,7 +669,10 @@ fn runtimeLeaseList(ctx: zli.CommandContext, unknown_only: bool) !void {
 
 fn nodeListHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
-    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer config.deinit();
     if (output_json) {
         try ctx.writer.writeAll("{\"nodes\":[");
@@ -580,19 +691,13 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     try views.nodes(ctx.writer, rows[0..config.value.nodes.len]);
 }
 
-const EventFilters = struct {
-    event_type: []const u8,
-    node: []const u8,
-    since: ?i64,
-    until: ?i64,
-    limit: usize,
-};
+const EventFilters = cli_events.Filters;
 
 fn eventsListHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const filters = eventFiltersFromContext(ctx, true) orelse return;
     var rows: [1000]nodeforge.events.ReadEvent = undefined;
-    const result = readEvents(ctx.io, ctx.allocator, &filters, &rows) catch |err| {
+    const result = cli_events.read(ctx.io, ctx.allocator, ctx.flag("events-path", []const u8), &filters, &rows) catch |err| {
         try ctx.writer.print("error: events: cannot read local history ({t})\n", .{err});
         setExitCode(ctx, 1);
         return;
@@ -615,10 +720,10 @@ fn eventsListHandler(ctx: zli.CommandContext) !void {
     var display: [1000]views.EventRow = undefined;
     for (rows[0..result.count], 0..) |event, index| display[index] = .{
         .ts = event.ts,
-        .event_type = event.@"type",
-        .node = eventNode(event) orelse "-",
+        .event_type = event.type,
+        .node = cli_events.node(event) orelse "-",
         .message = event.message,
-        .fields = try eventFields(ctx.allocator, event.fields),
+        .fields = try cli_events.fieldsText(ctx.allocator, event.fields),
     };
     try views.events(ctx.writer, display[0..result.count]);
 }
@@ -629,7 +734,7 @@ fn eventsListHandler(ctx: zli.CommandContext) !void {
 fn eventsFollowHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const filters = eventFiltersFromContext(ctx, false) orelse return;
-    const path = nodeforge.paths.events_path;
+    const path = ctx.flag("events-path", []const u8);
     var offset: u64 = blk: {
         var file = std.Io.Dir.cwd().openFile(ctx.io, path, .{}) catch |err| {
             try ctx.writer.print("error: events: active file unavailable ({t})\n", .{err});
@@ -663,14 +768,201 @@ fn eventsFollowHandler(ctx: zli.CommandContext) !void {
             var parsed = std.json.parseFromSlice(nodeforge.events.ReadEvent, ctx.allocator, line, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
             const event = parsed.value;
-            if (!eventMatches(event, &filters)) continue;
+            if (!cli_events.matches(event, &filters)) continue;
             if (output_json) {
                 try std.json.Stringify.value(event, .{}, ctx.writer);
                 try ctx.writer.writeByte('\n');
-            } else try views.eventLine(ctx.writer, event.ts, event.@"type", try eventFields(ctx.allocator, event.fields), event.message);
+            } else try views.eventLine(ctx.writer, event.ts, event.type, try cli_events.fieldsText(ctx.allocator, event.fields), event.message);
             try ctx.writer.flush();
         }
     }
+}
+
+const TraceGap = struct {
+    kind: []const u8,
+    start: []const u8,
+    end: []const u8,
+    summary: []const u8,
+};
+
+/// 从本地 events JSONL 重建一个 node 的最新或指定 boot session 时间线。
+///
+/// 结果只报告由 boot_session_id 直接证明的事件；关联容量耗尽、损坏事件和 daemon
+/// 重启边界以 `gaps` 输出，避免 human 或 JSON 视图将不完整历史表述为完整事实。
+fn traceHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const node_id = ctx.getArg("node_id") orelse return;
+    const requested_session = ctx.flag("session", []const u8);
+    const events_path = ctx.flag("events-path", []const u8);
+    _ = ctx.flag("latest", bool);
+    if (requested_session.len != 0 and !nodeforge.events.validCorrelationId(requested_session)) {
+        try ctx.writer.writeAll("error: trace: --session must be 32 lowercase hexadecimal characters\n");
+        setExitCode(ctx, 2);
+        return;
+    }
+
+    var node_events: [cli_events.max_records]nodeforge.events.ReadEvent = undefined;
+    const node_result = cli_events.read(ctx.io, ctx.allocator, events_path, &.{ .node = node_id, .limit = node_events.len }, &node_events) catch |err| {
+        try ctx.writer.print("error: trace: cannot read local history ({t})\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    sortTraceEvents(node_events[0..node_result.count]);
+
+    var selected_session: ?[]const u8 = if (requested_session.len != 0) requested_session else null;
+    // 输入未指定 session 时，已排序的 node 事件中最后一个显式 session 就是
+    // 保留历史可见的最新 session；`--latest` 保留为明确的 CLI 契约别名。
+    if (selected_session == null) {
+        for (node_events[0..node_result.count]) |event| {
+            if (cli_events.session(event)) |value| selected_session = value;
+        }
+    }
+
+    var trace_events: [cli_events.max_records]nodeforge.events.ReadEvent = undefined;
+    var trace_count: usize = 0;
+    var skipped = node_result.skipped;
+    if (selected_session) |session| {
+        const result = cli_events.read(ctx.io, ctx.allocator, events_path, &.{ .session = session, .limit = trace_events.len }, &trace_events) catch |err| {
+            try ctx.writer.print("error: trace: cannot read session history ({t})\n", .{err});
+            setExitCode(ctx, 1);
+            return;
+        };
+        trace_count = result.count;
+        skipped += result.skipped;
+        sortTraceEvents(trace_events[0..trace_count]);
+    }
+
+    var gaps: [8]TraceGap = undefined;
+    var gap_count: usize = 0;
+    for (node_events[0..node_result.count]) |event| {
+        const state = cli_events.field(event, "session_link_state") orelse continue;
+        if (std.mem.eql(u8, state, "capacity_exhausted")) addTraceGap(&gaps, &gap_count, .{
+            .kind = "capacity_exhausted",
+            .start = event.ts,
+            .end = event.ts,
+            .summary = "DHCP continued without a trackable boot session because the active registry was full",
+        });
+    }
+    if (skipped != 0) addTraceGap(&gaps, &gap_count, .{
+        .kind = "event_corrupt",
+        .start = "",
+        .end = "",
+        .summary = "one or more retained event records could not be parsed",
+    });
+
+    var phase: []const u8 = "unknown";
+    var evidence: []const u8 = if (selected_session == null) "unable_to_determine" else "observed";
+    var terminal_reason: ?[]const u8 = null;
+    var last_timestamp: ?[]const u8 = null;
+    var instance_id: ?[]const u8 = null;
+    for (trace_events[0..trace_count]) |event| {
+        phase = tracePhase(event) orelse phase;
+        if (std.mem.startsWith(u8, event.type, "tftp.")) evidence = "unique_safe_association";
+        if (std.mem.eql(u8, event.type, "boot.session.terminated")) terminal_reason = cli_events.field(event, "reason") orelse "unknown";
+        last_timestamp = event.ts;
+        if (instance_id == null) instance_id = cli_events.field(event, "daemon_instance_id");
+    }
+
+    if (selected_session != null and terminal_reason == null and last_timestamp != null) {
+        var starts: [cli_events.max_records]nodeforge.events.ReadEvent = undefined;
+        const start_result = cli_events.read(ctx.io, ctx.allocator, events_path, &.{ .event_type = "service.started", .limit = starts.len }, &starts) catch |err| {
+            try ctx.writer.print("error: trace: cannot read service history ({t})\n", .{err});
+            setExitCode(ctx, 1);
+            return;
+        };
+        skipped += start_result.skipped;
+        sortTraceEvents(starts[0..start_result.count]);
+        for (starts[0..start_result.count]) |event| {
+            if (compareTraceTime(event.ts, last_timestamp.?) == .lt) continue;
+            const started_instance = cli_events.field(event, "daemon_instance_id") orelse continue;
+            if (instance_id == null or !std.mem.eql(u8, started_instance, instance_id.?)) {
+                addTraceGap(&gaps, &gap_count, .{
+                    .kind = "daemon_restart_gap",
+                    .start = last_timestamp.?,
+                    .end = event.ts,
+                    .summary = "a new daemon instance started after this non-terminal session was last observed",
+                });
+                break;
+            }
+        }
+    }
+
+    if (output_json) {
+        try ctx.writer.writeAll("{\"node_id\":");
+        try ctx.writer.print("{f}", .{std.json.fmt(node_id, .{})});
+        try ctx.writer.writeAll(",\"boot_session_id\":");
+        if (selected_session) |session| try ctx.writer.print("{f}", .{std.json.fmt(session, .{})}) else try ctx.writer.writeAll("null");
+        try ctx.writer.writeAll(",\"status\":{\"phase\":");
+        try ctx.writer.print("{f}", .{std.json.fmt(phase, .{})});
+        try ctx.writer.writeAll(",\"terminal_reason\":");
+        if (terminal_reason) |reason| try ctx.writer.print("{f}", .{std.json.fmt(reason, .{})}) else try ctx.writer.writeAll("null");
+        try ctx.writer.writeAll(",\"evidence\":");
+        try ctx.writer.print("{f}", .{std.json.fmt(evidence, .{})});
+        try ctx.writer.writeAll("},\"events\":[");
+        for (trace_events[0..trace_count], 0..) |event, index| {
+            if (index != 0) try ctx.writer.writeByte(',');
+            try std.json.Stringify.value(event, .{}, ctx.writer);
+        }
+        try ctx.writer.writeAll("],\"gaps\":[");
+        for (gaps[0..gap_count], 0..) |gap, index| {
+            if (index != 0) try ctx.writer.writeByte(',');
+            try ctx.writer.writeAll("{\"kind\":");
+            try ctx.writer.print("{f}", .{std.json.fmt(gap.kind, .{})});
+            try ctx.writer.writeAll(",\"start\":");
+            try ctx.writer.print("{f}", .{std.json.fmt(gap.start, .{})});
+            try ctx.writer.writeAll(",\"end\":");
+            try ctx.writer.print("{f}", .{std.json.fmt(gap.end, .{})});
+            try ctx.writer.writeAll(",\"summary\":");
+            try ctx.writer.print("{f}", .{std.json.fmt(gap.summary, .{})});
+            try ctx.writer.writeByte('}');
+        }
+        try ctx.writer.writeAll("]}\n");
+        return;
+    }
+
+    try ctx.writer.writeAll("Trace\n");
+    try ctx.writer.print("  Node         {s}\n", .{node_id});
+    try ctx.writer.print("  Session      {s}\n", .{selected_session orelse "-"});
+    try ctx.writer.print("  Phase        {s}\n", .{phase});
+    try ctx.writer.print("  Evidence     {s}\n", .{evidence});
+    if (terminal_reason) |reason| try ctx.writer.print("  Terminal     {s}\n", .{reason});
+    if (trace_count == 0) try ctx.writer.writeAll("No safely associated events recorded.\n") else {
+        try ctx.writer.writeAll("Events\n");
+        for (trace_events[0..trace_count]) |event| try views.eventLine(ctx.writer, event.ts, event.type, try cli_events.fieldsText(ctx.allocator, event.fields), event.message);
+    }
+    if (gap_count != 0) {
+        try ctx.writer.writeAll("Gaps\n");
+        for (gaps[0..gap_count]) |gap| try ctx.writer.print("  {s}  {s} {s}  {s}\n", .{ gap.kind, gap.start, gap.end, gap.summary });
+    }
+}
+
+/// 有界地收集诊断缺口；溢出不改变 trace 的已证明事件集合。
+fn addTraceGap(gaps: *[8]TraceGap, count: *usize, gap: TraceGap) void {
+    if (count.* == gaps.len) return;
+    gaps[count.*] = gap;
+    count.* += 1;
+}
+
+/// 优先采用终态事件携带的 phase；否则从 M2.5.1 已定义的协议事件推导展示值。
+fn tracePhase(event: nodeforge.events.ReadEvent) ?[]const u8 {
+    if (cli_events.field(event, "phase")) |phase| return phase;
+    return if (std.mem.eql(u8, event.type, "dhcp.discover")) "dhcp_discover" else if (std.mem.eql(u8, event.type, "dhcp.offer")) "dhcp_offer" else if (std.mem.eql(u8, event.type, "dhcp.ack")) "dhcp_ack" else if (std.mem.eql(u8, event.type, "tftp.rrq")) "tftp_rrq" else if (std.mem.eql(u8, event.type, "tftp.transfer.complete")) "tftp_complete" else if (std.mem.eql(u8, event.type, "tftp.transfer.error")) "failed" else null;
+}
+
+fn sortTraceEvents(values: []nodeforge.events.ReadEvent) void {
+    var index: usize = 1;
+    while (index < values.len) : (index += 1) {
+        const value = values[index];
+        var insert = index;
+        while (insert > 0 and compareTraceTime(value.ts, values[insert - 1].ts) == .lt) : (insert -= 1) values[insert] = values[insert - 1];
+        values[insert] = value;
+    }
+}
+
+fn compareTraceTime(left: []const u8, right: []const u8) std.math.Order {
+    const left_time = cli_events.parseTime(left) catch return .eq;
+    const right_time = cli_events.parseTime(right) catch return .eq;
+    return std.math.order(left_time, right_time);
 }
 
 fn eventsTypesHandler(ctx: zli.CommandContext) !void {
@@ -693,8 +985,10 @@ fn addEventsFilterFlags(command: *zli.Command, comptime include_limit: bool) !vo
     try command.addFlags(&.{
         .{ .name = "type", .description = "Registered event type", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "node", .description = "Filter by node_id", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "session", .description = "Filter by boot_session_id", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "since", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "until", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.events_path } },
     });
     if (include_limit) try command.addFlag(.{ .name = "limit", .description = "Latest matching records (1-1000)", .type = .Int, .default_value = .{ .Int = 100 } });
     try addOutputFlag(command);
@@ -709,12 +1003,12 @@ fn eventFiltersFromContext(ctx: zli.CommandContext, comptime has_limit: bool) ?E
     }
     const since_text = ctx.flag("since", []const u8);
     const until_text = ctx.flag("until", []const u8);
-    const since = if (since_text.len == 0) null else parseEventTime(since_text) catch {
+    const since = if (since_text.len == 0) null else cli_events.parseTime(since_text) catch {
         ctx.writer.print("error: events: invalid --since timestamp\n", .{}) catch {};
         setExitCode(ctx, 2);
         return null;
     };
-    const until = if (until_text.len == 0) null else parseEventTime(until_text) catch {
+    const until = if (until_text.len == 0) null else cli_events.parseTime(until_text) catch {
         ctx.writer.print("error: events: invalid --until timestamp\n", .{}) catch {};
         setExitCode(ctx, 2);
         return null;
@@ -725,88 +1019,13 @@ fn eventFiltersFromContext(ctx: zli.CommandContext, comptime has_limit: bool) ?E
         setExitCode(ctx, 2);
         return null;
     }
-    return .{ .event_type = event_type, .node = ctx.flag("node", []const u8), .since = since, .until = until, .limit = limit };
-}
-
-const ReadResult = struct { count: usize, skipped: usize };
-
-fn readEvents(io: std.Io, allocator: std.mem.Allocator, filters: *const EventFilters, rows: []nodeforge.events.ReadEvent) !ReadResult {
-    var count: usize = 0;
-    var skipped: usize = 0;
-    var rotation: u8 = 20;
-    while (rotation > 0) : (rotation -= 1) {
-        const path = try std.fmt.allocPrint(allocator, "{s}.{d}", .{ nodeforge.paths.events_path, rotation });
-        defer allocator.free(path);
-        readEventFile(io, allocator, path, filters, rows, &count, &skipped) catch |err| if (err != error.FileNotFound) return err;
+    const session = ctx.flag("session", []const u8);
+    if (session.len != 0 and !nodeforge.events.validCorrelationId(session)) {
+        ctx.writer.print("error: events: --session must be 32 lowercase hexadecimal characters\n", .{}) catch {};
+        setExitCode(ctx, 2);
+        return null;
     }
-    readEventFile(io, allocator, nodeforge.paths.events_path, filters, rows, &count, &skipped) catch |err| if (err != error.FileNotFound) return err;
-    if (count > filters.limit) {
-        const start = count - filters.limit;
-        std.mem.copyForwards(nodeforge.events.ReadEvent, rows[0..filters.limit], rows[start..count]);
-        count = filters.limit;
-    }
-    return .{ .count = count, .skipped = skipped };
-}
-
-fn readEventFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, filters: *const EventFilters, rows: []nodeforge.events.ReadEvent, count: *usize, skipped: *usize) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(100 * 1024 * 1024));
-    defer allocator.free(bytes);
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const event = std.json.parseFromSliceLeaky(nodeforge.events.ReadEvent, allocator, line, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-            skipped.* += 1;
-            continue;
-        };
-        if (!eventMatches(event, filters)) continue;
-        if (count.* == rows.len) return error.TooManyEvents;
-        rows[count.*] = event;
-        count.* += 1;
-    }
-}
-
-fn eventMatches(event: nodeforge.events.ReadEvent, filters: *const EventFilters) bool {
-    if (filters.event_type.len != 0 and !std.mem.eql(u8, event.@"type", filters.event_type)) return false;
-    if (filters.node.len != 0 and !(if (eventNode(event)) |node| std.mem.eql(u8, node, filters.node) else false)) return false;
-    const stamp = parseEventTime(event.ts) catch return false;
-    if (filters.since) |since| if (stamp < since) return false;
-    if (filters.until) |until| if (stamp > until) return false;
-    return true;
-}
-
-fn eventNode(event: nodeforge.events.ReadEvent) ?[]const u8 {
-    if (event.node) |node| return node;
-    for (event.fields) |field| if (std.mem.eql(u8, field.key, "node_id")) return field.value;
-    return null;
-}
-
-fn eventFields(allocator: std.mem.Allocator, fields: []const nodeforge.events.Field) ![]const u8 {
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    for (fields, 0..) |field, index| {
-        if (index != 0) try output.writer.writeByte(' ');
-        try output.writer.print("{s}={s}", .{ field.key, field.value });
-    }
-    return output.toOwnedSlice();
-}
-
-fn parseEventTime(value: []const u8) !i64 {
-    if (std.mem.startsWith(u8, value, nodeforge.events.unix_timestamp_prefix)) return std.fmt.parseInt(i64, value[nodeforge.events.unix_timestamp_prefix.len..], 10);
-    if (value.len != 20 or value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':' or value[19] != 'Z') return error.InvalidTimestamp;
-    const year = try std.fmt.parseInt(u16, value[0..4], 10);
-    const month = try std.fmt.parseInt(u8, value[5..7], 10);
-    const day = try std.fmt.parseInt(u8, value[8..10], 10);
-    const hour = try std.fmt.parseInt(u8, value[11..13], 10);
-    const minute = try std.fmt.parseInt(u8, value[14..16], 10);
-    const second = try std.fmt.parseInt(u8, value[17..19], 10);
-    if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 59) return error.InvalidTimestamp;
-    var days: i64 = 0;
-    var current: u16 = 1970;
-    while (current < year) : (current += 1) days += if (std.time.epoch.isLeapYear(current)) 366 else 365;
-    const month_days = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    for (month_days[0..month - 1], 0..) |count, index| days += @as(i64, count) + if (index == 1 and std.time.epoch.isLeapYear(year)) @as(i64, 1) else @as(i64, 0);
-    const maximum_day: u8 = month_days[month - 1] + if (month == 2 and std.time.epoch.isLeapYear(year)) @as(u8, 1) else @as(u8, 0);
-    if (day > maximum_day) return error.InvalidTimestamp;
-    return days * 86400 + @as(i64, day - 1) * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
+    return .{ .event_type = event_type, .node = ctx.flag("node", []const u8), .session = session, .since = since, .until = until, .limit = limit };
 }
 
 /// 读取当前命令的输出格式并校验其值。

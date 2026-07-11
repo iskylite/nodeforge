@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/nodeforge
-ExecStartPre=/opt/nodeforge/bin/nodeforged --check
-ExecStart=/opt/nodeforge/bin/nodeforged
+ExecStartPre=/opt/nodeforge/bin/nodeforged --check --log-output file
+ExecStart=/opt/nodeforge/bin/nodeforged --log-output file
 Restart=on-failure
 RestartSec=2s
 # TFTP/DHCP use privileged UDP ports; DHCP also sends raw ICMP Echo before OFFER.

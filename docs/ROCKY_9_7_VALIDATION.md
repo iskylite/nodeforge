@@ -232,3 +232,37 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 
 - [x] 使用独立 UEFI PXE 固件客户端在 `192.168.27.0/24` 从网络启动，确认它实际消费 DHCP
   bootfile、经 TFTP 下载对应 GRUB 文件并进入 bootloader；此前 vmnet2 的失败基线未计入本结果。
+
+## M2.5.1 启动关联与 trace 验证
+
+### 2026-07-11：完成
+
+- 构建：本地 `zig build test`、`aarch64-linux-gnu ReleaseSafe` 均通过；ARM64 `nodeforge` 与
+  `nodeforged` 部署到 `/opt/nodeforge/work/`，以 `m251-config.json` 的安全 discovery 夹具运行。
+- 已认领的 `node-m251`（MAC `02:aa:bb:cc:dd:ee`）经真实 UDP DHCP 完成
+  `DISCOVER -> OFFER -> REQUEST -> ACK`，同一 32 字符 `boot_session_id` 出现在全部 DHCP
+  Event v2 中；事件同时包含自动注入的 `daemon_instance_id`、`node_id`、MAC 和 XID。
+- 从获配地址 `192.168.27.200` 发起真实 TFTP RRQ，成功下载 2,693,464-byte
+  `efi/grubaa64.efi`；SHA-256 与服务端资产一致，RRQ/完成事件与 DHCP 使用同一
+  `boot_session_id`。`nodeforge events list --node node-m251 --session <id>` 与
+  `nodeforge trace node-m251 --session <id>` 的 human/JSON 输出均已解析验证。
+- 从非 lease-IP 发起的标准 TFTP 下载仍成功传输相同 SHA-256 文件，但 RRQ 与完成事件均固定为
+  `session_link_state = no_active_lease_match`，不伪造 session 归属。
+- SIGTERM 有序停止会在 `service.stopped` 之前写入每个活动 session 的
+  `boot.session.terminated(reason=daemon_shutdown)`，随后确认 UDP/67、UDP/69 和 HTTP/18080
+  全部释放；终态 trace 不产生 `daemon_restart_gap`。
+- SIGKILL 中断一个未终止 session 后启动新实例，`nodeforge trace` 检出
+  `daemon_restart_gap`；同秒时间戳的实例切换也由 CLI fixture 覆盖，避免 RFC3339 秒级精度掩盖重启。
+- 最终 ARM64 二进制再次完成启动/健康检查/有序停止 smoke；`service.started` 与
+  `service.stopped` 的 `daemon_instance_id` 一致，验证机最终没有残留 NodeForge listener。
+
+### 2026-07-12：服务日志输出模式
+
+- 本地 `zig build test`、`git diff --check` 与 `aarch64-linux-gnu ReleaseSafe` 构建通过；新 ARM64
+  `nodeforged` 和 systemd unit 副本部署到 `/opt/nodeforge/work/`，`systemd-analyze verify` 通过。
+- `--log-output file --log-file <work-path>` 下，`--check-config` 的成功记录只写入指定文件；缺失配置的
+  `err [nodeforge] config: cannot load` 同样写入该文件，证明启动早期失败不依赖 journal 才可诊断。
+- 以 `systemd-run --wait` 执行 `--log-output file`，成功记录写入
+  `/opt/nodeforge/logs/nodeforged.log`，临时 unit 的 journal 不含重复的 `[nodeforge]` 服务日志。正式 unit
+  已固定 `ExecStartPre=... --check --log-output file` 和 `ExecStart=... --log-output file`；验证后
+  `nodeforged` 保持 inactive，未留下监听 socket。

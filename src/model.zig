@@ -97,7 +97,7 @@ pub const DhcpConfig = struct {
 pub const LoggingConfig = struct {
     /// 日常输出 info；debug 额外输出连接和协议诊断。
     level: LogLevel = .info,
-    /// 可选的附加文件 sink；stderr/journal 始终保留。
+    /// 可选文件路径与轮转策略；`--log-output auto` 配置它时选择双写。
     file: ?FileLogConfig = null,
 };
 

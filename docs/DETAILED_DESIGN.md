@@ -29,7 +29,8 @@
 | M1.5 | CLI 输出统一架构 | M0、M1 | human 输出统一分组/表格/详情格式，JSON 保持稳定机器接口 |
 | M2 | DHCP + PXE 闭环 | M0、M1 | 节点获得 lease 和正确 bootfile，并进入 bootloader |
 | M2.5 | 结构化日志与事件系统改进 | M0、M2 | 服务日志线程安全、结构化；事件 v2 带字段；CLI 事件查询 |
-| M3 | HTTP 资产、ISO 仓库和事件接口 | M0、资产模型 | 节点可获取配置/answer/rootfs/ISO repo，并上报事件 |
+| M2.5.1 | 节点部署端到端关联契约 | M2.5 | 一次启动拥有稳定 `boot_session_id`，DHCP/TFTP/HTTP/installer/initrd/runner 可按 node 与 session 追踪 |
+| M3 | HTTP 资产、ISO 仓库和事件接口 | M0、资产模型、M2.5.1 | 节点可获取配置/answer/rootfs/ISO repo，并按已绑定 session 上报事件 |
 | M4 | PXE 无人值守安装与基础后处理 | M1-M3 | Rocky Linux 9.7 aarch64、Ubuntu Server 22.04 LTS 安装和 `install_post` 跑通 |
 | M5 | 内存无盘启动与基础后处理 | M1-M3、基础 runner | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
 | M6 | 支持矩阵增强 | M4、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
@@ -762,7 +763,7 @@ zli 提供 spinner，但 M0 不启用。只有后续耗时交互命令同时处�
 
 帮助和版本属于 CLI 通用控制能力，只提供 `-h/--help` 与 `-v/--version` 参数，不定义 `help`、`version` 同名子命令。`-v/--version` 只属于顶层 `nodeforge`；`-h/--help` 由每一级命令提供。`--config`、`--catalog`、`--output` 不作为全局参数，只挂在实际读取它们的叶子命令上，必须写在该命令之后。子命令集合只保留 status、check、config、catalog 等业务入口，避免同一操作存在两套写法。
 
-M0 短参数固定为：`nodeforge` 根命令 `-v`，叶子命令按需使用 `-c`（config）、`-C`（catalog）、`-o`（output）、`-d`（debug）；`-h` 由 zli 自动提供。`nodeforged` 为无子命令入口，使用 `-v/-c/-C/-d/-k/-K`（version/config/catalog/debug/check/check-config）。帮助页不内嵌长命令示例，但每个枚举、关联或格式不直观的参数必须在 description 中给出一个字段级 `e.g.` 值，并说明其关联参数。
+M0 短参数固定为：`nodeforge` 根命令 `-v`，叶子命令按需使用 `-c`（config）、`-C`（catalog）、`-o`（output）、`-d`（debug）；`-h` 由 zli 自动提供。`nodeforged` 为无子命令入口，使用 `-v/-c/-C/-d/-k/-K`（version/config/catalog/debug/check/check-config），并提供 `--log-output auto|terminal|file|both` 与 `--log-file <absolute-path>`。帮助页不内嵌长命令示例，但每个枚举、关联或格式不直观的参数必须在 description 中给出一个字段级 `e.g.` 值，并说明其关联参数。
 
 CLI 与配置文件分工：
 
@@ -840,8 +841,8 @@ TFTP 探针、DHCP resolver、repository 和 state 检查在对应阶段实现�
 
 提供 `packaging/systemd/nodeforged.service`：
 
-- `ExecStart=/opt/nodeforge/bin/nodeforged`
-- `ExecStartPre=/opt/nodeforge/bin/nodeforged --check`
+- `ExecStart=/opt/nodeforge/bin/nodeforged --log-output file`
+- `ExecStartPre=/opt/nodeforge/bin/nodeforged --check --log-output file`
 - `Restart=on-failure`、`RestartSec=2s`
 - M0 HTTP 默认使用 8080，不申请 DHCP/TFTP 阶段才需要的 Linux capability。
 - systemd unit 本体放在 `/opt/nodeforge/systemd/nodeforged.service`；`/etc/systemd/system/nodeforged.service` 只是软链接。二进制主体安装在 `/opt/nodeforge/bin/`；`/usr/bin/nodeforge` 和 `/usr/bin/nodeforged` 也只是软链接。
@@ -860,7 +861,7 @@ M0 日志策略：
 以下条目描述 M0 已交付时的行为；M2.5 会在不改变 M0 管理 API 和 CLI 错误契约的前提下替换其共享
 日志后端，并把 `LoggingConfig` 的可选字段和 `EventsConfig` 作为向后兼容的默认配置加载。
 
-- 默认日志后端使用 stderr；systemd 管理时进入 journal，不默认写 `/opt/nodeforge/logs/nodeforged.log`。
+- 直接执行 `nodeforged` 默认输出到 stderr。systemd unit 显式传入 `--log-output file`，默认写入 `/opt/nodeforge/logs/nodeforged.log`；目录必须由安装过程创建并对服务用户可写。需要 journal 的部署使用 `--log-output both` 覆盖 unit，或通过 systemd drop-in 替换 `ExecStart`。
 - 日常 `info` 日志包含成功监听地址、每个 HTTP 请求的 method/path/status，以及配置、校验或预检失败的错误摘要。
 - `config.json` 的 `logging.level` 只接受 `info`（默认）和 `debug`。`nodeforged -d/--debug` 仅覆盖本次进程启动，优先于配置；它不写回配置文件。M0 当前的 debug 请求日志为 method/path；连接建立/关闭、DHCP/TFTP 报文摘要和更细协议诊断随对应服务阶段补齐，ReleaseSafe 也可使用。
 - `nodeforge` 的每个 M0 叶子命令支持 `-d/--debug`。默认只输出一行 `error: <类别>: <简短原因>: <路径>`；debug 模式在下一行追加内部错误标签，便于定位但不泄漏请求体、token 或密码。
@@ -1481,9 +1482,9 @@ daemon `--debug` 可在启动完成前设置，且不会让 debug 调用在 rele
 
 | 后端 | 触发条件 | 说明 |
 | --- | --- | --- |
-| stderr | 默认 | 前台运行或 `--foreground` 时直接输出到 stderr |
-| systemd journal | `systemd` unit 启动 | stderr 自动被 journald 捕获，无需额外代码 |
-| 文件 | 配置 `logging.file` | 写入指定路径，支持按大小轮转 |
+| terminal | `--log-output terminal`，或未配置文件 sink 时的 `auto` | 直接输出到 stderr |
+| file | `--log-output file` | 仅写入文件；默认路径为 `/opt/nodeforge/logs/nodeforged.log` |
+| both | `--log-output both`，或配置文件 sink 时的 `auto` | 同时写 stderr 和文件；systemd 会采集 stderr 到 journal |
 
 文件日志轮转策略：
 
@@ -1504,8 +1505,9 @@ daemon `--debug` 可在启动完成前设置，且不会让 debug 调用在 rele
 }
 ```
 
-- `file` 是 stderr 的**附加** sink；配置后每条服务日志同时写 stderr 和文件。journal 仍通过
-  stderr 采集，不需要也不得启动独立的 journald/syslog client。
+- `--log-output auto` 是交互式默认值：配置 `logging.file` 时选择 `both`，否则选择 `terminal`，保持已有配置兼容。
+- `--log-output file` 或 `both` 使用 `--log-file` 的绝对路径；未指定时优先使用 `logging.file.path`，再回退到 `/opt/nodeforge/logs/nodeforged.log`。轮转大小和保留数量取 `logging.file`，未配置时为 50 MiB 和 3 个历史文件。
+- 文件 sink 失败时当前记录回退到 stderr，并节流报告后端降级；不得启动独立的 journald/syslog client。
 - 在同一 sink mutex 内，以“当前文件大小 + 已渲染行长度”判断是否轮转；因此除单条超限记录外，
   活动文件不会超过阈值。单条超限记录写入空的新文件，并在消息末尾加 `truncated=true`。
 - 轮转顺序为删除最旧 `.keep`、从大到小移动 `.N`、将活动文件 rename 为 `.1`、创建新活动文件。
@@ -1738,6 +1740,7 @@ pub const EventType = enum {
     tftp_transfer_complete,
     tftp_transfer_error,
     http_request,
+    boot_config_fetched,
     install_installer_started,
     install_config_fetched,
     install_started,
@@ -1778,6 +1781,7 @@ pub const EventType = enum {
             .tftp_transfer_complete => .{ .name = "tftp.transfer.complete", .description = "TFTP transfer completed" },
             .tftp_transfer_error => .{ .name = "tftp.transfer.error", .description = "TFTP transfer failed" },
             .http_request => .{ .name = "http.request", .description = "HTTP request completed" },
+            .boot_config_fetched => .{ .name = "boot.config.fetched", .description = "authenticated boot config issued" },
             .install_installer_started => .{ .name = "install.installer_started", .description = "installer started" },
             .install_config_fetched => .{ .name = "install.config_fetched", .description = "install config fetched" },
             .install_started => .{ .name = "install.started", .description = "installation started" },
@@ -1982,9 +1986,183 @@ TIME                  TYPE                    NODE       MESSAGE                
   对于 MVP 规模（单网段几十台节点）足够。
 - **不做 v1 历史事件迁移**：旧 `events.jsonl` 中的 v1 事件保持原样，CLI 兼容读取。
 
+### 7.5.12 M2.5.1：节点部署端到端关联与可追踪性契约
+
+> **状态：M2.5.1 server-side 已实施并在 Rocky 9.7 aarch64 验证。** 本节不把日志文本当成状态机，
+> 也不要求未实现的 M3–M7 伪造事件；后续阶段必须继续遵守这里固定的关联身份、状态投影和查询语义。
+
+#### 7.5.12.1 问题与目标
+
+M2.5 已经能分别观察 DHCP、TFTP 和 HTTP 请求，但单独的 MAC、IP、XID、客户端 IP 或文件名都不能
+稳定回答“这台节点这一次启动最终在哪一步失败”：DHCP XID 只在一个事务内有效，IP 可复用，TFTP 没有
+节点身份，installer/initrd 又发生在后续 HTTP 链路。M2.5.1 定义一个由服务端创建的、跨协议贯穿的
+`boot_session_id`，让运维人员能从 `node_id` 或 session 得到按时间排序的完整因果链。
+
+设计目标：
+
+- 同一节点的每次网络启动都有不同、不可猜测且不可复用的 session；重启、重新 PXE 或并发启动绝不合并。
+- 已认领节点可按 `node_id + boot_session_id` 追踪 DHCP、TFTP、HTTP、安装、无盘和 runner 阶段；未知节点
+  只保留 MAC/IP/session 的受限观察记录，不能借此获得安装权限。
+- `node_status` 是当前投影，Event v2 是不可变审计；查询从事件重建时间线，不从服务日志猜测阶段。
+- session id 仅是关联标识，**不是**认证 token、授权凭据或可用于读取节点配置的 capability。
+
+#### 7.5.12.2 统一身份与生命周期
+
+`boot_session_id` 是服务端生成的 128-bit 随机值，编码为固定 32 个小写十六进制字符；不得使用 MAC、
+IP、XID、时间戳、递增计数或可预测 hash 派生。Event v2 新增的保留字段为 `boot_session_id` 与
+`daemon_instance_id`；两者长度均为 32，且只允许 `[0-9a-f]`。前者与既有 `node_id`、`mac`、`ip`、
+`xid` 并列，不取代其中任何一个字段；后者只标识产生事件的 daemon 进程实例，绝不参与节点关联或认证。
+`session_link_state` 是仅服务端写入的受控诊断字段：正常唯一关联时省略该字段并携带
+`boot_session_id`；无法安全关联时只能取 `capacity_exhausted`、`no_active_lease_match` 或
+`ambiguous_lease_match`，不得由 HTTP DTO、installer、initrd 或 runner 提交。
+
+```text
+DHCP DISCOVER (MAC, XID)
+  -> server creates/resumes BootSession
+  -> DHCP / TFTP events carry boot_session_id
+  -> M3 authenticated boot-config response embeds boot_session_id
+  -> installer or initrd echoes it in a restricted event DTO
+  -> server validates node_id/session binding, updates node_status, appends Event v2
+  -> terminal event closes session; audit history remains queryable
+```
+
+`BootSession` 是运行态对象，至少包含：
+
+| 字段 | 语义 |
+| --- | --- |
+| `id` | `boot_session_id`；不可变主键 |
+| `node_id` | 已认领节点的稳定 ID；未知节点为 null |
+| `mac` | 创建 session 时的客户端 MAC；不可变 |
+| `lease_ip` | 当前或最后一次 DHCP 地址；可随 ACK/RELEASE 更新 |
+| `dhcp_xid` | 创建 session 的 XID；只作诊断，不作关联主键 |
+| `profile` / `mode` | 服务端 resolver 决定的 profile 与目标模式快照 |
+| `created_at` / `last_seen_at` | 服务端 UTC 时间 |
+| `phase` | 当前规范化阶段；见下表 |
+| `terminal_reason` | 完成、失败、过期或被新 session 取代的稳定原因 |
+
+DHCP DISCOVER 为同一 MAC 创建新 session，唯一例外是该 MAC 已有未终止、且仍处于 DHCP early phase 的
+session：在短暂重传窗口内按 MAC + XID 复用，避免同一个 DHCP 重传生成多条链。收到不同 XID 的新的
+DISCOVER、session 进入 terminal 状态、或超过 early-phase TTL 后，必须新建 session。地址租约过期不删除
+历史 session，只将其标记为 `expired`；保留和轮转仍由 events 文件策略决定。
+
+`BootSession` 注册表是**仅进程内、固定上限**的活动关联索引，不写入 `runtime.json`，也不在 daemon
+重启后恢复。这个选择是刻意的：重启已经中断 DHCP/TFTP 服务，恢复旧 session 会让 MAC、IP 或 XID 的
+后续巧合命中被误当成同一次启动。每个进程启动生成新的 `daemon_instance_id`（同样为服务端随机 128-bit
+小写十六进制值）；EventWriter 在所有服务端 Event 上附加该保留字段，调用方不得提交或覆盖它。优雅停止时，
+服务必须在 `service.stopped` 前将仍活动的 session 以 `daemon_shutdown` 终止并追加审计事件；崩溃后无法
+补写时，下一次 `service.started` 的新 `daemon_instance_id` 是 `trace` 必须显示的 `daemon_restart_gap`，而
+不是“部署成功”或“session 已恢复”的证据。
+
+活动 session 上限与 DHCP lease 上限一致，初始固定为 256；注册表以 mutex 保护，并按 session id、
+MAC+XID 和 lease IP 建立有界索引。过期或终态条目可立即从活动索引回收，历史查询始终扫描 Event v2，
+不依赖该索引保留旧对象。达到上限时，DHCP 必须继续按 resolver 正常应答，不得因观测容量导致 PXE 不可用；
+该请求写入不含 `boot_session_id` 的 DHCP Event，并固定携带
+`session_link_state = "capacity_exhausted"`，同时做限频 warn。`trace` 对此显示明确 `gap`，不得临时生成
+无法由 TFTP 或后续 HTTP 验证的假 session。
+
+TTL 和重传窗口只能使用服务端单调时钟判断，防止 NTP 校时或客户端时间影响关联；写入 Event 的
+`created_at`、`last_seen_at` 与 `ts` 使用服务端 UTC，仅用于显示和排序。同一 MAC+XID 的 DHCP 重传及
+同 phase 的重复节点上报是幂等刷新，不是非法状态迁移；随机 id 若极低概率碰撞，服务端必须重试生成，绝不
+覆盖现有 session。
+
+#### 7.5.12.3 协议关联规则
+
+| 边界 | 服务端如何关联 | 必带 Event 字段 | 禁止的推断 |
+| --- | --- | --- | --- |
+| DHCP | MAC + XID 命中/创建 BootSession | 正常时为 `boot_session_id`、`mac`、`xid`、`ip`、`node_id`（已知时）；容量降级时为 `session_link_state` | 不能仅按 IP 认定节点 |
+| TFTP | 仅以客户端 IP 查找未终止、且 lease IP 匹配的 session；零或多条匹配时不猜测 | 唯一匹配时为 `boot_session_id`、`client_ip`、`filename`、`bytes_sent`；否则为对应的 `session_link_state` | 不能从文件名、TID 或最近 DHCP 事件强行绑定 |
+| M3 HTTP boot config/answer/rootfs | 已认证 URL node id 与 active session 的 `node_id` 必须一致；服务端把 id 写入响应 | `node_id`、`boot_session_id`、`path`、`client_ip` | `boot_session_id` 不能替代节点认证 |
+| installer/initrd 上报 | DTO 的 session 必须等于服务端已签发且绑定该 node 的 active session | `node_id`、`boot_session_id`、`source`、`stage` | 客户端不得指定其他 node、source、服务端事件类型或时间 |
+| runner/firstboot | 从受验证的 node config/运行上下文继承 session；无 session 时创建显式 `run_id` 关联但不得伪称 boot session | `node_id`、`boot_session_id`（适用时）、`run_id`、`phase`、`step` | 不能用相同 message 合并两次执行 |
+
+TFTP 无法进行节点认证，因此它的关联仅是诊断级 best effort；只有 DHCP lease 与活动 session 唯一匹配时才
+写 `boot_session_id`。零个匹配写 `session_link_state = "no_active_lease_match"`，多个匹配写
+`session_link_state = "ambiguous_lease_match"`；该状态在同一传输的 RRQ、完成、超时和失败事件中保持一致。
+这避免 NAT、IP 复用或并发 PXE 时把错误 bootloader 传输归到另一台节点。
+
+#### 7.5.12.4 阶段状态机与状态投影
+
+M2.5.1 统一阶段名，事件类型仍表达具体动作。合法的单 session 主路径如下；`failed` 可从任一非终态
+进入，`expired` 可从非终态由服务端超时进入：
+
+```text
+dhcp_discover -> dhcp_offer -> dhcp_ack -> tftp_rrq -> boot_config_fetched
+  -> installer_started -> installing -> installed -> provisioning -> completed
+  OR
+  -> initrd_started -> rootfs_downloading -> rootfs_verified -> rootfs_mounted
+     -> switching_root -> diskless_running
+```
+
+| 规范化 phase | 产生者 | 对应事件 |
+| --- | --- | --- |
+| `dhcp_discover` / `dhcp_offer` / `dhcp_ack` | M2 DHCP | `dhcp.*` |
+| `tftp_rrq` / `tftp_complete` | M1 TFTP | `tftp.rrq` / `tftp.transfer.complete` |
+| `boot_config_fetched` | M3 | 已认证 boot config HTTP 请求 |
+| `installer_started` / `installing` / `installed` | M4 installer | `install.*` |
+| `initrd_started` 至 `diskless_running` | M5 initrd | `diskless.*` |
+| `provisioning` / `completed` | M4–M7 runner | `provision.step.*` |
+| `failed` / `expired` | 服务端或节点 | `*.failed`、稳定 `reason` 或 server expiry event |
+
+`node_status` 最少增加 `boot_session_id`、`phase`、`last_event_at`、`last_error`、`last_reason`。更新顺序固定：
+验证身份与 session binding -> 校验 phase transition -> 原子更新 `node_status`/BootSession -> append Event v2。
+writer 失败不回滚状态；返回 5xx 并允许节点按 at-least-once 重试。重复上报同一阶段是幂等状态更新，但仍可
+保留重复审计事件；只有显式 event id 的持久化去重才可改变该语义，超出 M2.5.1。
+
+#### 7.5.12.5 查询、日志与故障定位
+
+M2.5.1 扩展本机只读查询，而不建立远程日志 API：
+
+```text
+nodeforge events list --node node-01 --session <boot_session_id>
+nodeforge trace node-01 [--session <boot_session_id>] [--latest]
+nodeforge node status node-01
+```
+
+`trace` 默认选择该 node 最新的非过期 session；输出以 Event v2 的服务端 `ts` 排序，显示 phase、event type、
+安全摘要、reason、session 和缺失边界。它必须明确标注 `unlinked`（由 `no_active_lease_match` 或
+`ambiguous_lease_match` 产生）和 `gap`（例如 installer 未上报、事件文件轮转或损坏），不得把缺失事件
+渲染为成功。除 session 事件外，trace 必须读取相关时间窗内的全局 `service.started`/`service.stopped` 事件：
+若一个未终止 session 的最后事件之后出现新的 `daemon_instance_id` 的 `service.started`，插入
+`daemon_restart_gap`；Event v2 的 UTC 时间精度为秒，因此同一秒内实例 ID 变化也必须视为该边界，
+不能因显示时间相等而丢失 gap。已经以 `daemon_shutdown` 终止的 session 不产生该 gap。
+
+`gap.kind` 固定为 `capacity_exhausted`、`session_unlinked`、`session_ambiguous`、`daemon_restart_gap`、
+`missing_phase`、`event_retention_gap` 或 `event_corrupt`，不得通过自由文本扩展。`--output json` 输出稳定的
+`{node_id, boot_session_id, status, events, gaps}` 对象；每项 `gap` 都包含稳定 `kind`、服务端时间范围与
+安全诊断摘要。human view 给出当前 phase、失败点与下一步建议，并区分“已观察到”“唯一安全关联”“未关联”和
+“无法判断”四种证据等级。
+
+服务日志只补充 `node_id=<...>`、`session=<...>`、`mac=<...>`、`xid=<...>` 等有限诊断键；它不是 trace
+的事实源。日志、Event.message 和 fields 一律不得记录认证 token、cookie、完整 answer file、HTTP body、
+完整 installer/initrd journal 或脚本 stdout/stderr。
+
+#### 7.5.12.6 接口与安全边界
+
+- M3 boot config、answer 和节点事件 DTO 必须由同一个认证结果决定 `node_id`；客户端提供的 node id、
+  session、source 和 event type 都是待验证输入，不能直接写入 Event。
+- `boot_session_id` 出现在 boot config/answer 中仅用于关联；泄露它不会授予 HTTP 读取、事件写入或 profile
+  选择权限。认证材料与 session id 分离。
+- 服务器只接受当前或可重试窗口内、绑定同一 node 的 session。未知、过期、已被新启动取代或 node 不匹配的
+  session 返回 409，且记录服务 warn；不得产生 domain Event 或覆盖 `node_status`。
+- 安装器和 initrd 失败上报仅允许稳定 `reason`、受限 stage 和最多 2048 bytes 的净化摘要；原始日志仍在节点本地。
+- 发生 session binding 冲突时宁可形成 `unlinked` 诊断事件，也不得把事件归属到错误节点。
+
+#### 7.5.12.7 实施拆分与验收
+
+M2.5.1 先实现 server-side `BootSession` runtime、`daemon_instance_id`、DHCP 创建/更新、优雅停止的
+session 终止、TFTP 唯一关联和 `events --session`；M3 实现经认证的 boot config 签发、节点 DTO binding
+与 `node_status`；M4/M5/M7 分别接入 installer、initrd 与 runner 的阶段事件。各阶段不得另行定义 session
+格式或旁路 writer。
+
+验收至少包括：DHCP 重传复用、同 MAC 新 XID 新建 session、IP 复用不误关联、并发 PXE 的 TFTP ambiguous
+标记、活动注册表满时 DHCP 仍成功且 trace 显示 `capacity_exhausted`、优雅停止写入每个活动 session 的
+`daemon_shutdown`、崩溃后的新实例显示 `daemon_restart_gap`、过期/错绑 session 409、installer 与 initrd
+的合法/非法 DTO、状态幂等重试、`trace` 跨轮转时间顺序、失败摘要脱敏以及从 `nodeforge trace` 定位到失败
+phase 的端到端 fixture。
+
 ## 8. M3：HTTP 配置、资产、ISO 仓库和事件接口
 
-### 8.1 目标
+### 8.1 目标与阶段边界
 
 HTTP 成为 TFTP 之后的主要数据通道：
 
@@ -1992,6 +2170,57 @@ HTTP 成为 TFTP 之后的主要数据通道：
 - 提供 answer file。
 - 提供大文件下载和 Range。
 - 接收事件和日志摘要。
+
+M3 交付的是受控 HTTP 数据面、ISO 到 catalog 的原子发布路径，以及节点状态上报入口；它不提前交付
+M4 的 Kickstart/Autoinstall 语义，也不提前交付 M5 的 dracut module。`profile/render.zig` 在 M3 只负责
+受限模板变量、内容类型和认证上下文注入；发行版 adapter、存储布局、用户、软件包和 firstboot 逻辑仍由
+M4 负责。这样 M3 可以用受控 fixture 验证 answer 路由，M4 才把它替换为真实安装器输出。
+
+M3 还必须完成 M2.5.1 定义的三项服务端责任：认证后的 boot config 签发、`node_status` 状态投影，以及
+`boot.config.fetched` 事件。它不把服务日志当作状态来源，也不创建新的 Event JSONL writer。
+
+#### 8.1.1 认证结果与 session 生命周期
+
+所有节点侧请求先归一化为服务端唯一的 `AuthenticatedNodeSession`：
+
+```text
+{ node_id, boot_session_id, profile, mode, peer_ipv4, daemon_instance_id }
+```
+
+它只能由下列两种证明产生，随后由 handler 使用该结果，而不是重新信任 URL、body 或 header 中的 node id：
+
+1. **bootstrap proof**：请求 URL 中的 `node_id` 与已认领节点一致，直接 TCP peer IPv4 等于活动
+   `BootSession.lease_ip`，且 session 的 `node_id` 相同。只接受直连 peer；绝不信任
+   `X-Forwarded-For`、DHCP 以外的“最近 IP”或 TFTP 文件名。未知节点、无 lease 匹配或 node 不匹配不获得
+   boot config/answer。
+2. **capability proof**：bootstrap 成功后，daemon 为该活动 session 生成 256-bit 随机
+   `node_access_token`，仅保存在进程内 `BootSession`，并只在已认证的 boot config/answer 输出中注入。
+   客户端以 `Authorization: Bearer <token>` 和 `X-NodeForge-Session: <boot_session_id>` 提交；两者必须
+   同时匹配活动 session。`boot_session_id` 只是关联键，单独永远不能授权。
+
+token 不持久化、不得出现在 URL path/query、kernel cmdline、HTTP access log、服务日志、Event fields、错误
+响应或 `/run/nodeforge/boot.json`。它只可作为 M4/M5 生成脚本或 initrd 内存中的 HTTP header 值；daemon
+重启、session supersede/expire/terminate 后立即失效。pre-bootstrap 保持 M2.5.1 的 15 分钟 TTL；一次成功的
+boot config/answer 或受认证的 event/rootfs 请求进入 delivery 状态并将 TTL 延长为最近成功请求起 2 小时。
+M4/M5 的合法阶段事件会续期；过期或旧 daemon 的 session 一律返回 `409 session_inactive`。
+
+#### 8.1.2 `node_status` 投影
+
+M3 新增每节点一个受 mutex 保护、单 writer 持久化的 `NodeStatus`：
+
+```text
+{ node_id, boot_session_id, daemon_instance_id, phase, last_event_at,
+  last_error, last_reason, session_active }
+```
+
+它在校验 `AuthenticatedNodeSession` 和 phase transition 后更新，并与 DHCP runtime 一起原子写入
+`runtime.json`。EventWriter 失败不回滚该投影，HTTP 返回 5xx 以允许 at-least-once 重试。daemon 重启时，
+历史投影保留供 `node status` 查看，但所有 `session_active` 置为 false；旧 session 不会被重新打开，trace
+继续用 `daemon_restart_gap` 表达该断点。
+
+`boot.config.fetched` 是 M3 新增的 server-origin EventType。有效 bootstrap 不因缺少 TFTP 诊断事件而被
+拒绝：它从当前 DHCP/TFTP phase 转入 `boot_config_fetched`，而 `trace` 负责将缺失的 TFTP phase 显式显示为
+gap，而不是把可用性错误伪装成认证错误。
 
 ### 8.2 代码任务
 
@@ -2001,48 +2230,97 @@ HTTP 成为 TFTP 之后的主要数据通道：
 | `http/routes.zig` | 路由表 |
 | `http/static.zig` | 静态资产发送 |
 | `http/range.zig` | Range / Content-Length / ETag |
+| `http/auth.zig` | bootstrap/capability proof，产出 `AuthenticatedNodeSession`；不得写 Event |
+| `http/contracts.zig` | BootConfig、NodeEvent、LogSummary 的有界 DTO 解析和稳定错误码 |
 | `http/api.zig` | JSON API handler |
 | `profile/render.zig` | 模板渲染入口 |
 | `http/node_events.zig` | 节点事件/日志摘要 DTO 校验、认证结果绑定和 EventType 映射；不直接操作文件 |
+| `state/node_status.zig` | `node_status` 状态机、原子投影与 runtime 序列化 |
+| `state/boot_session.zig` | 活动 node/session 查询、capability 生命周期和 phase 推进；不持久化 token |
+| `state/catalog_runtime.zig` | 多对象 candidate 校验、catalog 原子发布和已发布资源查询 |
+| `catalog/iso_import.zig` | ISO staging、元数据检查、解包与 publication plan；不直接暴露 HTTP 路由 |
 | `state/events.zig` | 复用 M2.5 唯一 JSONL writer，不新增第二个 append 路径 |
 
 ### 8.3 路由
 
-| 路由 | 方法 | 输出 |
-| --- | --- | --- |
-| `/healthz` | GET | 健康状态 |
-| `/boot/config/:node_id` | GET | boot config JSON |
-| `/api/v1/nodes/:id/config` | GET | 节点配置 JSON |
-| `/api/v1/nodes/:id/answer` | GET | autoinstall/kickstart |
-| `/api/v1/nodes/:id/events` | POST | 受限节点阶段事件上报 |
-| `/api/v1/nodes/:id/logs` | POST | 有界失败日志摘要上报 |
-| `/rootfs/:name` | GET | rootfs 文件 |
-| `/images/:name` | GET | ISO/image |
-| `/repos/:name/*` | GET | repo 文件 |
-| `/api/v1/management/runtime` | GET | 本机 CLI 使用的运行态摘要 |
+| 路由 | 方法 | 访问条件 | 输出 |
+| --- | --- | --- | --- |
+| `/healthz` | GET | public | 健康状态 |
+| `/boot/config/:node_id` | GET | bootstrap 或 capability proof | BootConfig v1 JSON |
+| `/api/v1/nodes/:id/config` | GET | bootstrap 或 capability proof | 节点配置 JSON |
+| `/api/v1/nodes/:id/answer` | GET | bootstrap 或 capability proof | 受限模板渲染文本 |
+| `/api/v1/nodes/:id/events` | POST | capability proof | 受限节点阶段事件上报 |
+| `/api/v1/nodes/:id/logs` | POST | capability proof | 有界失败日志摘要上报 |
+| `/rootfs/:name` | GET | capability proof 且 asset 属于 session profile | rootfs 文件 |
+| `/images/:name` | GET | public、catalog allowlist | ISO/image |
+| `/repos/:name/*` | GET | public、catalog allowlist | repo 文件 |
+| `/api/v1/management/runtime` | GET | 本机管理入口 | 本机 CLI 使用的运行态摘要 |
+
+`/images` 与 `/repos` 只读公开是为了不把 capability 放入安装器 repo URL；它们只能解析当前 catalog 发布的
+对象，不能按磁盘路径访问。节点配置、answer、rootfs、events 与 logs 均不因为 URL 中出现 node id 就获得
+访问权。认证或绑定失败统一使用稳定语义：语法/未知字段为 400，缺 proof 为 401，proof 与 node/profile/asset
+不符为 403，未知 allowlist 对象为 404，session 失效或非法 phase 为 409，body 过大为 413，Range 无效为 416。
+
+#### 8.3.1 静态资源命名空间与 Range
+
+`AssetConfig.path` 不再被解释为任意服务器路径。M3 的 resolver 按对象类型选择唯一根目录：bootloader、kernel
+和两类 initrd 继续相对 `tftp.asset_root`；rootfs 与 ISO/image 相对 `http.asset_root`；repo tree 只能相对
+`http.repository_root/<install-source>/`。`/rootfs/:name` 只接受 kind=`rootfs`，`/images/:name` 只接受
+kind=`iso`（将来新增 image kind 前不得扩大），`/repos/:name/*` 的 `name` 必须是 catalog 中已发布的 install
+source/repository。每一段 path 均拒绝空段、`.`、`..`、反斜杠、NUL 和解码后变化的分隔符；打开文件后必须
+再次 `fstat`，不得跟随根目录外的 symlink。
+
+所有 M3 大文件响应必须流式读取，不得整体读入内存；成功响应带 `Content-Length`、`Accept-Ranges: bytes` 和
+以受管 SHA256 派生的强 ETag。只支持单一 `bytes=` Range（含 suffix）；合法范围返回 206 与
+`Content-Range`，无效/多段范围返回 416 和 `Content-Range: bytes */<size>`。`If-Range` 与当前 ETag 相等时
+才续传，否则返回完整 200。静态访问日志只记录路由模板、catalog object name、状态、字节数和耗时，不记录
+repo tail、query、Authorization 或 capability。
 
 ### 8.4 ISO 自动仓库
 
-`nodeforge install-source import <iso>` 执行以下流程：
+`nodeforge install-source import <filename>` 只接受管理员预先放入
+`/opt/nodeforge/work/import/` 的单个常规 ISO 文件名；CLI 传递相对此目录的名称，daemon 不接受任意绝对路径、
+symlink 或 URL。这样本机管理 API 即使被误暴露，也不会以服务用户权限读取任意宿主机文件。M3 将 `xorriso`
+作为明确的安装前置工具：缺失时 `nodeforged --check` 返回稳定的 `InstallSourceToolUnavailable` 并提示安装，
+不使用 loop mount，也不执行 ISO 内的任何文件。
 
-1. 校验 ISO 类型、SHA256、发行版、版本和架构。
-2. 解包到临时目录，提取 installer kernel/initrd，校验成功后 rename 到版本化目录。
-3. 在 `/opt/nodeforge/repos/<install-source>/` 发布完整 ISO 内容。
-4. Rocky/RHEL 系校验 `.treeinfo`、`repodata/repomd.xml`；Ubuntu 校验 installer media，并单独判断是否具备 apt repository 元数据。
-5. 元数据完整时自动创建 `RepositoryConfig`，`base_url` 指向 `/repos/<install-source>/` 并关联 install source；不完整时只创建 install source。
-6. renderer 使用已关联 repository 输出 Kickstart `url/repo` 或 Ubuntu apt 配置；缺少必要外部 mirror 时在 profile validate 阶段报错。
+导入在独立 import worker 中执行，HTTP worker 与 DHCP/TFTP 收包线程不得同步计算大 ISO 的 hash 或解包。CLI
+等待该本地请求完成并得到成功/失败摘要；M3 不引入可恢复的后台 job API。流程固定如下：
 
-ISO 中通过元数据校验的仓库是默认基础源，用户可以追加 mirror/额外源。GPG 检查默认关闭，仅在 repository 明确 `gpg_check = true` 时启用。
+1. 打开并 `fstat` staging ISO，校验普通文件、类型、SHA256、管理员声明的 distro/version/arch 及 ISO 元数据一致。
+2. 在 `/opt/nodeforge/work/iso-import-<random>/` 用 `xorriso` 解包，拒绝根目录外链接和不安全路径；提取 installer
+   kernel/initrd，并计算所有即将发布资产的 SHA256。
+3. Rocky/RHEL 系必须校验 `.treeinfo` 和 `repodata/repomd.xml`；Ubuntu 必须校验 installer media，并单独检查
+   `dists/`、`pool/` 与 apt 元数据是否完整。
+4. 构建 publication plan：ISO/installer kernel/initrd asset、一个 `InstallSourceConfig`，以及仅在元数据完整时
+   创建的 `RepositoryConfig`。所有名字先检查冲突，绝不覆盖已发布对象。
+5. 将完成的目录移动到受管 roots（repo tree 到 `/opt/nodeforge/repos/<install-source>/`，TFTP 小启动文件到
+   对应 `tftp.asset_root` 路径）。这些文件在 catalog 发布前不被 HTTP/TFTP resolver 暴露。
+6. 以一个 candidate 完整校验 catalog、原子写入 catalog 文件并替换内存 snapshot；只有这一步成功后资源才
+   对外可见。任一前置步骤失败不得发布 catalog；清理失败只留下不可访问的 work orphan，并记录服务 err。
+
+跨根目录的文件 rename 不能提供文件系统级单事务，因此“对节点原子”以 catalog publication 为边界：路由永远
+先查当前 snapshot，再打开文件。ISO 中通过元数据校验的仓库是默认基础源，用户可以追加 mirror/额外源。GPG
+检查默认关闭，仅在 repository 明确 `gpg_check = true` 时启用。Ubuntu media 不完整时只创建 install source；
+任何需要 apt 基础源的 profile 必须显式引用外部 mirror，否则 profile validate 失败。
 
 ### 8.5 boot config
+
+所有 boot config 使用 `schema_version = 1`，由 `AuthenticatedNodeSession` 与已验证的 profile/catalog snapshot
+构造。响应中共同字段为 `node_id`、`boot_session_id`、`profile`、`mode`、`config_url`、`event_url` 和 `access`；
+不能从请求 body 复制这些字段。`access` 仅在此受认证响应中包含 session id 与 capability token，客户端必须把
+它转为 header，不能拼回 URL。
 
 diskless boot config 示例：
 
 ```json
 {
+  "schema_version": 1,
   "node_id": "node-02",
+  "boot_session_id": "0123456789abcdef0123456789abcdef",
   "mode": "diskless",
   "profile": "rocky-9.7-aarch64-diskless",
+  "config_url": "http://192.168.50.1:8080/api/v1/nodes/node-02/config",
   "rootfs_url": "http://192.168.50.1:8080/rootfs/rocky-9.7-aarch64-<kernel-release>.squashfs",
   "rootfs_sha256": "...",
   "rootfs_mode": "squashfs_overlay",
@@ -2050,27 +2328,62 @@ diskless boot config 示例：
     "tmpfs_size": "50%",
     "tmpfs_mode": "0755"
   },
-  "event_url": "http://192.168.50.1:8080/api/v1/nodes/node-02/events"
+  "event_url": "http://192.168.50.1:8080/api/v1/nodes/node-02/events",
+  "access": {
+    "session_header": "X-NodeForge-Session",
+    "session_id": "0123456789abcdef0123456789abcdef",
+    "authorization_header": "Authorization",
+    "bearer_token": "<opaque 256-bit token>"
+  }
 }
 ```
 
+install mode 的同一对象改为包含 `answer_url`、已发布的 `repository_urls` 与 installer source 元数据；不在
+BootConfig 内嵌 answer file、repo 元数据或完整模板。`/api/v1/nodes/:id/answer` 使用 bootstrap proof 兼容
+`inst.ks=` 和 NoCloud-Net 这类不能附加 header 的安装器 URL；renderer 仅在输出内容中提供
+`nodeforge_boot_session_id`、`nodeforge_access_token`、`nodeforge_event_url` 三个只读变量，供 M4 的
+hook/late-command 使用 header 上报。answer 内容、token 和渲染变量不得进入日志、Event 或错误响应。
+
+M3 的渲染器只允许显式声明的标量变量和固定模板 asset，不执行 shell、表达式、文件 include 或任意用户模板
+路径。M4 的 distro adapter 决定 Kickstart/Autoinstall 的字段与语义；M3 遇到尚未注册的 adapter 时返回
+`409 renderer_unavailable`，不伪造可安装 answer。每次成功签发 boot config 先更新 phase/status，再写
+`boot.config.fetched` Event；EventWriter 失败返回 5xx，但不回滚已经更新的状态。
+
 ### 8.6 节点事件与日志摘要接收
 
-M3 不接受客户端提交完整 Event JSON，也不让客户端指定 `ts`、`node_id`、`source` 或任意字段。
-请求 DTO 只包含已注册的 node-origin event type、有限 stage/reason、简短 message 与允许字段；HTTP
-handler 根据已认证的 URL node id 和服务端时间构建 v2 Event，固定增加 `node_id` 与 `source` field。
-节点请求不能伪造 `dhcp.*`、`tftp.*`、`http.request`、`service.*` 或其他 server-origin 类型。
+M3 不接受客户端提交完整 Event JSON，也不让客户端指定 `ts`、`node_id`、`source`、`type` 或任意 fields。
+`POST /events` 的唯一 DTO 为：
 
-`/logs` 仅用于失败诊断摘要：body 最大 4 KiB、摘要截断到 2048 bytes，并映射为对应的
-`install.failed`、`diskless.failed` 或 `provision.step.failed` event；禁止上传完整 installer log、
-shell stdout/stderr、token、cookie 或任意文件。原始日志由节点本地保存，NodeForge 只保留安全的
-可查询摘要。HTTP body 超限、非法 event type、未知 field 或认证失败返回明确 4xx，且不会写事件。
+```json
+{
+  "v": 1,
+  "boot_session_id": "0123456789abcdef0123456789abcdef",
+  "stage": "rootfs_verified",
+  "reason": "optional.stable_reason",
+  "message": "optional safe summary"
+}
+```
 
-写入顺序固定为：验证请求与 node 身份 -> 更新 `node_status` -> 追加 domain Event -> 返回响应。
-EventWriter 失败时状态更新不回滚，响应返回 5xx 并记录服务 err，调用方可以重试；M3 的上报语义是
-at-least-once，重复 domain event 可出现，但 node_status transition 必须幂等。跨请求事件去重需要持久化
-event id，超出 M3，不得以猜测 message 相同来去重。同一次 POST 无论成功或失败都各自产生一条服务侧
-`http.request`，但它不替代 domain Event。
+`v` 必须为 1；`boot_session_id` 同时必须与 capability proof 匹配；`stage` 只能是服务端按 profile mode
+允许的闭枚举。install 允许 `installer_started`、`config_fetched`、`started`、`partitioning`、`packages`、
+`bootloader`、`post`、`rebooting`、`completed`、`failed`，并映射为 `install.*`；diskless 允许
+`initrd_started`、`rootfs_download_started`、`rootfs_verified`、`rootfs_mounted`、`switch_root`、`running`、
+`failed`，并映射为 `diskless.*`。handler 从认证结果固定 `source=installer|initrd`、`node_id`、session 和
+服务端时间，再按固定表选择 EventType；节点不能伪造 `dhcp.*`、`tftp.*`、`http.request`、`service.*` 或其他
+server-origin 类型。`reason` 是至多 128 bytes 的稳定 machine code，`message` 至多 1024 bytes 且必须为单行
+安全摘要；未知 key 一律 400。
+
+`/logs` 的 DTO 仅为 `{ "v": 1, "boot_session_id": "...", "reason": "...", "summary": "..." }`。body
+最大 4 KiB，服务端将 summary 截断到 2048 bytes，并依认证 mode 映射为 `install.failed`、`diskless.failed`
+或未来已注册的 `provision.step.failed`；禁止上传完整 installer log、shell stdout/stderr、token、cookie 或
+任意文件。原始日志由节点本地保存，NodeForge 只保留安全的可查询摘要。body 超限、非法 stage/reason、未知
+field 或认证失败返回明确 4xx/409，且不会写 domain Event。
+
+写入顺序固定为：验证 capability、URL node 与活动 session -> 校验 mode/stage transition -> 原子更新
+`node_status`/BootSession -> 追加 domain Event -> 返回响应。EventWriter 失败时状态更新不回滚，响应返回 5xx
+并记录服务 err，调用方可以重试；M3 的上报语义是 at-least-once，重复 domain event 可出现，但
+`node_status` transition 必须幂等。跨请求事件去重需要持久化 event id，超出 M3，不得以猜测 message 相同来
+去重。同一次 POST 无论成功或失败都各自产生一条服务侧 `http.request`，但它不替代 domain Event。
 
 ### 8.7 CLI 命令
 
@@ -2079,37 +2392,74 @@ nodeforge runtime status
 nodeforge events list --node node-01
 nodeforge events follow --type install.failed
 nodeforge node status node-01
-nodeforge install render node-01
 nodeforge install-source import Rocky-9.7-aarch64-dvd.iso --distro rocky --version 9.7 --arch aarch64
 nodeforge repository show rocky-9.7-aarch64-iso
 ```
+
+`install-source import` 的 ISO 文件名相对 `/opt/nodeforge/work/import/`；CLI 不隐式复制、移动或删除用户传入的
+任意路径。`nodeforge install render` 归 M4，因为只有该阶段拥有发行版 adapter；M3 只提供它所依赖的
+`/answer` transport、模板安全边界和认证上下文。
 
 ### 8.8 并发与 HTTP 实现选择
 
 - HTTP 服务器基于 Zap/facil.io 固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力；M0 尚未注册静态资产或 Range 路由，M3 再将其接入。NodeForge 当前只维护业务路由、管理 API 和统一错误信封，不维护 HTTP 报文解析或连接循环。已评估的备选方案 `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，不作为依赖。
 - acceptor 与固定大小 worker pool 分离；大文件使用 `pread`/send loop 流式发送，不整体读入内存。
-- DHCP/TFTP 使用各自 UDP event loop；耗时 hash/文件任务提交到 worker pool，不阻塞收包。
-- 配置使用不可变 snapshot + 原子替换；runtime/state 由单 writer 串行落盘，事件通过 M2.5 的唯一
+- DHCP/TFTP 使用各自 UDP event loop；ISO hash、解包和 publication plan 提交到单独受限的 import worker，
+  不阻塞收包或 HTTP response worker。静态下载持有已打开 fd，不在整个传输期间占 catalog mutex。
+- 配置使用不可变 snapshot + 原子替换；catalog 仅在 candidate 通过完整校验和原子落盘后替换；runtime/state
+  由单 writer 串行落盘，事件通过 M2.5 的唯一
   mutex 保护 writer 追加和轮转，不再引入独立队列或第二个文件后端。
 - MVP 验收基线：并发 100 个 HTTP Range 下载、100 个 TFTP session 和每秒 200 个 DHCP 报文时无崩溃、无状态串扰；具体吞吐在目标 ARM VM 和 x86_64 机器记录，不先承诺生产数字。
 
 ### 8.9 测试
 
 - `/healthz` 返回 OK。
-- Range 下载返回 206。
-- `If-Range`、无效 Range、连接中断后续传测试。
-- answer 渲染返回文本。
+- bootstrap proof 只接受 active lease 的直连 peer，node/IP/session 错配、daemon 重启、过期/superseded session
+  均返回 409 且不更新 `node_status`；capability 缺失、错误、泄露到 query 或跨 node 使用均被拒绝。
+- rootfs 的未认证/跨 profile 请求返回 401/403；images/repos 只可读取 catalog allowlist，目录穿越、symlink、
+  不存在 asset 和未发布 staging 文件均不可读。
+- Range 下载返回 206；覆盖 suffix Range、`If-Range` 命中/不命中、无效/多段 Range 的 416、连接中断后的
+  `Range` 续传、ETag 与 Content-Length。
+- BootConfig v1 fixture 验证 node/profile/session/rootfs/repo 字段；answer 渲染返回文本且 token/answer body
+  不进入 HTTP event、服务日志或错误响应。
 - POST 合法节点 event DTO 后更新 runtime 并写入受限 Event v2；伪造 server type、node_id、source、
-  超长 body/summary 或未知 field 都返回 4xx 且不写文件。
+  超长 body/summary、非法 stage/reason 或未知 field 都返回 4xx 且不写文件。
 - POST 日志摘要只保留有界失败摘要，不能把完整 installer/initrd log 写入 JSONL 或服务日志。
-- runtime summary 与事件同步；EventWriter 写入失败时状态不回滚、请求返回 5xx 且可幂等重试。
+- runtime summary 与事件同步；EventWriter 写入失败时状态不回滚、请求返回 5xx 且可幂等重试；daemon restart
+  后保留的 status 不接受旧 session。
+- 使用 Rocky 与 Ubuntu ISO fixture 验证 `xorriso` 缺失、损坏 ISO、tuple/metadata 不匹配、repo 元数据完整/缺失、
+  candidate 发布失败和名字冲突均不改变 catalog；成功导入后 repo 与 installer assets 同时可解析。
 
 ### 8.10 阶段验收
 
-- installer/initrd 能通过 HTTP 拿到配置。
-- 合法节点事件能按 Event v2 写入 `events.jsonl`，非法节点 body 不会污染审计文件。
-- 大文件下载支持 `Content-Length` 和 Range。
-- ISO 导入后无需手工建基础 repo 即可通过 HTTP 安装。
+- 已认领节点能从活动 session 获取 BootConfig/answer；session、token、URL node 或 peer IP 任一不匹配均不能读写。
+- 合法节点事件能按 Event v2 写入 `events.jsonl` 并更新持久 `node_status`，非法 body 或旧 session 不会污染审计文件。
+- rootfs/ISO/repo 大文件下载支持 `Content-Length`、ETag、单 Range 和 `If-Range`，全程受 catalog 路径沙箱限制。
+- ISO 导入后无需手工建基础 repo 即可通过 HTTP 安装；导入失败不会发布半个 catalog 或可访问的半成品。
+- 在 `r97n0` 完成真实 Rocky 9.7 aarch64 ISO 导入、Range/续传、节点 config/answer 和 capability 上报验证，并记录
+  100 HTTP Range、100 TFTP、200 DHCP 报文/秒并发基线。
+
+### 8.11 实施顺序与文档同步
+
+M3 按以下批次实施，前一批的 contract test 必须通过后才能进入下一批；不得以能返回 200 的临时路由跳过
+认证、catalog 或 Event 约束：
+
+1. **M3.0 contract fixture**：固定 BootConfig v1、`AuthenticatedNodeSession`、capability header、NodeEvent/
+   LogSummary DTO、错误码、`boot.config.fetched` registry 与 `node_status` phase table；先为合法/非法 JSON 和
+   session 组合建立 fixture。
+2. **M3.1 state/auth**：扩展 `BootSession`、实现 capability 生命周期与持久 `node_status`，将 HTTP context 接入
+   session/status store；验证 lease/node/peer、token、过期、supersede 和 daemon restart。
+3. **M3.2 static/Range**：完成 catalog resolver、路径沙箱、fd 流式读取、ETag/Range/If-Range；先完成风险表中的
+   独立 Range spike，再接入唯一 HTTP listener。
+4. **M3.3 node API**：实现 boot config、config、answer、events、logs 和 runtime summary，所有 domain event 都走
+   M2.5 Writer；此批只交付受控 answer fixture，不实现 M4/M5 adapter。
+5. **M3.4 ISO publication**：实现 staging/import worker、`xorriso` 检查、Rocky/Ubuntu 元数据分支和 catalog
+   多对象原子 publication，再开放 `install-source import`/`repository show`。
+6. **M3.5 integration**：合并 HTTP、ISO、DHCP/TFTP 并发测试；在 `r97n0` 用真实 ISO 与已认领 node 验证所有
+   M3 验收项，并把实际命令、hash、并发结果与未覆盖的限制同步到验证记录。
+
+任何批次改变路由、DTO、认证材料、EventType、catalog 字段或 M4/M5 消费内容时，先更新本节、§7.5.12、
+`DESIGN.md` 的 HTTP 边界和相应 fixture；实现与文档不得分别演进。
 
 ## 9. M4：PXE 无人值守自动安装与基础后处理
 
@@ -2170,6 +2520,17 @@ nodeforge repository show rocky-9.7-aarch64-iso
 | MVP 必测 | Ubuntu Server 22.04 LTS aarch64、x86_64 | aarch64 开发 smoke test 与 x86_64 生产 smoke test 必须通过 |
 | 后续目标 | Ubuntu Server 22.04 之后的 LTS | 按版本增加 schema、installer 参数和 fixture，不预先假定字段完全兼容 |
 | 非目标 | Ubuntu Server 20.04 LTS 及更早版本 | 不实现 d-i/preseed，也不做存量兼容 |
+
+#### 9.3.1 M3 answer 与上报约束
+
+M4 kernel cmdline 只携带 node-specific answer/config URL，绝不携带 `boot_session_id` 或 capability token。
+`/answer` 以 M3 bootstrap proof 兼容 `inst.ks=` 与 NoCloud-Net；M4 renderer 可在受认证的 answer 内容中注入
+`nodeforge_boot_session_id`、`nodeforge_access_token` 与 `nodeforge_event_url`，但不得将它们写到服务日志、
+Event、安装器 debug 输出或 URL。Kickstart `%post`、Ubuntu late-command/firstboot 通过
+`Authorization: Bearer` 和 `X-NodeForge-Session` header 上报阶段；body 只使用 §8.6 的 DTO。
+
+M4 不自行更新 `node_status`、选择 EventType 或解释 session 生命周期。它把 source-specific stage 交给 M3
+映射；session 已失效时收到 409，安装器保留本地安全摘要并继续本地可恢复路径，不得以旧 session 重试写入。
 
 ### 9.4 Kickstart 渲染
 
@@ -2242,6 +2603,10 @@ failed
 `stage`。`failed` 还必须带稳定 `reason`（例如 M6 错误分类）和不超过 2048 bytes 的安全摘要；
 `node_status.last_event_at` 与 `last_error` 从已验证的上报更新，不能从服务日志文本反推。`install logs`
 命令展示这些事件摘要，不读取或声称保存 installer 的完整原始日志。
+
+实际映射由 M3 `http/node_events.zig` 根据认证 profile 和 §8.6 stage allowlist 执行；M4 只能提交
+`installer_started`、`config_fetched`、`started`、`partitioning`、`packages`、`bootloader`、`post`、
+`rebooting`、`completed` 或 `failed`，不能提交 `type`、`source`、`node_id` 或自由 fields。
 
 ### 9.7 CLI 命令
 
@@ -2318,8 +2683,9 @@ nodeforge install retry node-01
 parse /proc/cmdline
   -> read nodeforge.config_url
   -> dhcp network already available or bring up network
-  -> GET boot config
-  -> POST diskless.initrd_started
+  -> GET boot config (bootstrap proof)
+  -> keep session/token only in memory
+  -> POST diskless.initrd_started (capability proof)
   -> inspect partial rootfs and download with HTTP Range
   -> verify sha256
   -> mount squashfs lower
@@ -2336,11 +2702,18 @@ rootfs 下载支持断点续传：
 - 服务返回 `200`、ETag 改变、长度不符或局部文件超过目标大小时，从零覆盖下载。
 - 完成后必须校验完整 SHA256，再原子改名；hash 不匹配删除或隔离 partial，绝不挂载。
 - tmpfs 容量校验必须同时考虑 rootfs partial 文件和 overlay 上层，容量不足时在下载前明确失败。
+- 每个 rootfs 请求都携带 BootConfig 给出的 `Authorization: Bearer` 与 `X-NodeForge-Session` header；不得把
+  token 放入 rootfs URL、`/proc/cmdline`、partial metadata、下载日志或持久 rootfs。发生 401/403/409 时停止
+  下载并保留本地安全错误，不尝试降级为未认证下载。
 
 小 initrd 只上报注册的 `diskless.*` 状态：启动、rootfs 下载开始、校验完成、挂载完成、切根开始、
 运行成功或失败。每次请求由 M3 的 node event DTO 限制为 stage、reason、rootfs 名称/校验摘要等小字段；
 失败摘要不得包含下载 URL query、Authorization、完整 dracut journal 或 debug shell 输出。`node_status` 与
 event 的更新顺序遵循 §8.6，断网时 initrd 只保留本地失败信息，不因为事件上报失败而中断已完成的切根。
+
+`/run/nodeforge/boot.json` 只保存 node/profile/rootfs/event URL 等非 secret 元数据，权限为 0600，且不保存
+capability token；initrd 在成功 `switch_root` 前清零内存中的 token。M5 不绕过 M3 的认证、状态机或
+EventWriter，也不因为 session 失效重建一个伪造的 boot session。
 
 ### 10.5 overlay 规则
 
@@ -2730,6 +3103,7 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
 | 风险 | 建议 spike |
 | --- | --- |
 | Zig HTTP server 大文件 Range 实现细节 | M3 前做 1 个静态文件 Range demo |
+| M3 节点 session/capability 与安装器 URL 兼容 | M3 前用 active DHCP lease 模拟 bootstrap，验证 token 只走 header、旧 session 返回 409 |
 | TFTP option/GRUB 行为差异 | M1 使用标准 client 和 QEMU 拉取 GRUB 配置/kernel/initrd |
 | DHCP option 兼容性 | M2 前收集 UEFI x86_64/aarch64 DHCP fixtures |
 | Ubuntu autoinstall schema 差异 | M4 固定 Ubuntu Server 22.04 LTS 为 MVP 必测；后续 LTS 逐版本增加 fixture |
@@ -2746,6 +3120,10 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
 - `DETAILED_DESIGN.md`：阶段任务、接口、字段变化时更新。
 - 示例配置：字段变化必须同步。
 - 测试 fixture：协议或模板变化必须同步。
+
+M3 的路由、DTO、认证、Range、资产 publication 或 EventType 任一变化，还必须同步检查：`DESIGN.md` 的 HTTP
+安全边界、本文件第 8 节、M2.5.1 session/trace 契约、M4/M5 的 answer/initrd 消费方式、CLI help/fixture 与
+Rocky 9.7 验证记录。未经这些同步，不得把接口变化标记为 M3 完成。
 
 不允许出现：
 

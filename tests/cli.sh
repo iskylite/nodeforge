@@ -185,12 +185,43 @@ test "$checksum_before" = "$(cksum "$tmp/imported.json")"
 grep -q "NodeForge daemon" "$tmp/daemon-help"
 grep -q -- "--check-config" "$tmp/daemon-help"
 grep -q -- "--debug" "$tmp/daemon-help"
+grep -q -- "--log-output" "$tmp/daemon-help"
+grep -q -- "--log-file" "$tmp/daemon-help"
 grep -q -- "-k, --check" "$tmp/daemon-help"
 grep -q -- "-K, --check-config" "$tmp/daemon-help"
 test "$("$daemon" --version)" = "nodeforged 0.1.0"
 test "$("$daemon" -v)" = "nodeforged 0.1.0"
 "$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" >"$tmp/daemon-check-config" 2>&1
 grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* info \[nodeforge\] config: valid ' "$tmp/daemon-check-config"
+
+# Service log routing is selected per invocation. File mode keeps normal
+# terminal stderr quiet, while both mode duplicates the bounded service line.
+service_log="$tmp/nodeforged.log"
+"$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" --log-output file --log-file "$service_log" >"$tmp/daemon-file-out" 2>"$tmp/daemon-file-err"
+if grep -Fq '[nodeforge]' "$tmp/daemon-file-err"; then
+    echo "file log mode unexpectedly wrote a service log to stderr" >&2
+    exit 1
+fi
+grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* info \[nodeforge\] config: valid ' "$service_log"
+
+failed_service_log="$tmp/nodeforged-failure.log"
+if "$daemon" -K -c "$tmp/missing-daemon-config.json" -C "$root/catalog.example.json" --log-output file --log-file "$failed_service_log" >"$tmp/daemon-failure-out" 2>"$tmp/daemon-failure-err"; then
+    echo "missing daemon config unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 1
+fi
+grep -Fq 'err [nodeforge] config: cannot load' "$failed_service_log"
+
+"$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" --log-output both --log-file "$service_log" >"$tmp/daemon-both-out" 2>"$tmp/daemon-both-err"
+grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* info \[nodeforge\] config: valid ' "$tmp/daemon-both-err"
+
+if "$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" --log-output nowhere >"$tmp/daemon-invalid-log-output" 2>&1; then
+    echo "invalid --log-output unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
 
 # Spinner support is available for future interactive commands, but no current
 # handler starts one or emits cursor-control sequences.
@@ -210,6 +241,7 @@ grep -Fq 'service.started' "$tmp/events-types"
 grep -Fq 'dhcp.ack' "$tmp/events-types"
 grep -Fq 'tftp.transfer.complete' "$tmp/events-types"
 grep -Fq 'http.request' "$tmp/events-types"
+grep -Fq 'boot.session.terminated' "$tmp/events-types"
 grep -Eq '^TYPE[[:space:]]+LEVEL[[:space:]]+DESCRIPTION' "$tmp/events-types"
 
 "$cli" events types -o json >"$tmp/events-types-json"
@@ -241,19 +273,41 @@ else
     test "$?" -eq 2
 fi
 
-# Create a minimal v2 events file and verify events list reads it.
+# M2.5.1 session filters and trace read a supplied local JSONL fixture, including
+# a rotated file. This avoids requiring write access to /opt during host tests.
 events_dir="$tmp/logs"
 mkdir -p "$events_dir"
-cat >"$events_dir/events.jsonl" <<'EOF'
-{"v":2,"ts":"2026-07-11T08:30:00Z","type":"dhcp.ack","message":"DISCOVER -> ACK yiaddr=192.168.50.10","fields":[{"key":"mac","value":"52:54:00:aa:bb:cc"},{"key":"ip","value":"192.168.50.10"}]}
-{"v":2,"ts":"2026-07-11T08:31:00Z","type":"service.started","message":"protocol listeners initialized","fields":[]}
+session_id=0123456789abcdef0123456789abcdef
+instance_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+instance_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+cat >"$events_dir/events.jsonl.1" <<EOF
+{"v":2,"ts":"2026-07-11T08:30:00Z","type":"dhcp.discover","message":"discover received","fields":[{"key":"node_id","value":"node-01"},{"key":"boot_session_id","value":"$session_id"},{"key":"daemon_instance_id","value":"$instance_a"}]}
+{"v":2,"ts":"2026-07-11T08:30:01Z","type":"dhcp.offer","message":"offer sent","fields":[{"key":"node_id","value":"node-01"},{"key":"boot_session_id","value":"$session_id"},{"key":"daemon_instance_id","value":"$instance_a"}]}
+{"v":2,"ts":"2026-07-11T08:30:02Z","type":"dhcp.ack","message":"ack sent","fields":[{"key":"node_id","value":"node-01"},{"key":"boot_session_id","value":"$session_id"},{"key":"daemon_instance_id","value":"$instance_a"}]}
 EOF
-
-# Override the events path by creating a symlink or using the daemon path.
-# Since the CLI reads a fixed path, we test via the daemon if available.
-# For CLI-only testing, verify the table format is correct when events exist.
-# The events list command reads from /opt/nodeforge/logs/events.jsonl which
-# may not exist in dev; the empty-list test above covers that case.
+cat >"$events_dir/events.jsonl" <<EOF
+{"v":2,"ts":"2026-07-11T08:30:03Z","type":"tftp.rrq","message":"TFTP read requested","fields":[{"key":"filename","value":"efi/grubaa64.efi"},{"key":"boot_session_id","value":"$session_id"},{"key":"daemon_instance_id","value":"$instance_a"}]}
+{"v":2,"ts":"2026-07-11T08:30:04Z","type":"tftp.transfer.complete","message":"TFTP transfer completed","fields":[{"key":"filename","value":"efi/grubaa64.efi"},{"key":"boot_session_id","value":"$session_id"},{"key":"daemon_instance_id","value":"$instance_a"}]}
+{"v":2,"ts":"2026-07-11T08:30:04Z","type":"service.started","message":"protocol listeners initialized","fields":[{"key":"daemon_instance_id","value":"$instance_b"}]}
+{"v":2,"ts":"2026-07-11T08:32:00Z","type":"dhcp.discover","message":"untracked due to capacity","fields":[{"key":"node_id","value":"node-02"},{"key":"session_link_state","value":"capacity_exhausted"},{"key":"daemon_instance_id","value":"$instance_b"}]}
+EOF
+"$cli" events list --events-path "$events_dir/events.jsonl" --session "$session_id" -o json >"$tmp/events-session-json"
+python3 -m json.tool "$tmp/events-session-json" >/dev/null
+grep -Fq '"type":"tftp.transfer.complete"' "$tmp/events-session-json"
+"$cli" trace node-01 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-session-json"
+python3 -m json.tool "$tmp/trace-session-json" >/dev/null
+grep -Fq '"boot_session_id":"'"$session_id"'"' "$tmp/trace-session-json"
+grep -Fq '"kind":"daemon_restart_gap"' "$tmp/trace-session-json"
+"$cli" trace node-01 --events-path "$events_dir/events.jsonl" >"$tmp/trace-session-human"
+grep -Fq 'daemon_restart_gap' "$tmp/trace-session-human"
+"$cli" trace node-02 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-capacity-json"
+grep -Fq '"kind":"capacity_exhausted"' "$tmp/trace-capacity-json"
+if "$cli" events list --session invalid --events-path "$events_dir/events.jsonl" >"$tmp/events-invalid-session" 2>&1; then
+    echo "invalid session filter unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
 
 # events follow on a missing file is an error (non-zero exit).
 if "$cli" events follow >"$tmp/events-follow-missing" 2>&1; then

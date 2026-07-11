@@ -19,6 +19,7 @@ const catalog_runtime = @import("../state/catalog_runtime.zig");
 const packet = @import("packet.zig");
 const runtime_state = @import("../state/runtime.zig");
 const events = @import("../state/events.zig");
+const boot_session = @import("../state/boot_session.zig");
 const observe_log = @import("../observe/log.zig");
 const log = std.log.scoped(.tftp);
 
@@ -36,9 +37,9 @@ const max_retries = 3;
 ///
 /// `config` 提供 TFTP asset root 路径；`catalog` 提供资产白名单快照；
 /// `runtime` 记录会话计数和活动列表。三者必须在 `serve` 的整个生命周期内保持有效。
-pub fn serve(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, stop: ?*const std.atomic.Value(bool)) !void {
+pub fn serve(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
     const socket = try bind(io, config.server.server_ip);
-    try serveSocket(io, allocator, socket, config, catalog, runtime, event_writer, stop);
+    try serveSocket(io, allocator, socket, config, catalog, runtime, event_writer, sessions, stop);
 }
 
 /// 绑定固定 UDP 69；供 daemon 在启动其他 listener 前确认 TFTP 可用。
@@ -52,7 +53,7 @@ pub fn bind(io: std.Io, server_ip: []const u8) !std.Io.net.Socket {
 ///
 /// 主循环：接收 UDP datagram -> 解析 TFTP 报文 -> 如果是 RRQ 则启动文件传输 ->
 /// 传输在当前线程串行完成（M1 单 worker 模型）。WRQ 返回 ERROR；其他类型返回 ERROR。
-pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, stop: ?*const std.atomic.Value(bool)) !void {
+pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned_socket;
     defer socket.close(io);
 
@@ -71,17 +72,24 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
         switch (message) {
             .rrq => |request| {
                 const session = runtime.tftp.begin(request.filename);
-                log.info("RRQ {s}", .{request.filename});
+                // TFTP 没有 MAC/XID；只接受活动 session 中唯一的已 ACK lease-IP。
+                // 零个或多个命中均保留 session_link_state，绝不能按文件名、TID
+                // 或最近 DHCP 日志猜测关联。
+                var session_link: ?boot_session.Link = null;
+                if (sessions) |store| session_link = store.associateTftp(clientIpv4(&incoming.from) orelse 0, boot_session.monotonicNow(), now());
+                if (session_link) |*link| {
+                    if (link.id()) |id| log.info("RRQ {s} session={s}", .{ request.filename, id }) else log.warn("RRQ {s} session_link_state={s}", .{ request.filename, link.state().? });
+                } else log.info("RRQ {s}", .{request.filename});
                 const started = std.Io.Clock.awake.now(io);
-                emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.rrq", "TFTP read requested", 0, 0);
+                emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, if (session_link) |*link| link else null);
                 const bytes_sent = transfer(io, &incoming.from, request, config.tftp.asset_root, catalog) catch |err| {
                     runtime.tftp.finish(session, false);
+                    if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
                     switch (err) {
-                        error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption =>
-                            observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, incoming.from, err }),
+                        error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, incoming.from, err }),
                         else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
                     }
-                    emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds());
+                    emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
                     const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
                         error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
                         error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
@@ -92,8 +100,11 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
                     continue;
                 };
                 runtime.tftp.finish(session, true);
-                observe_log.info("tftp: transfer completed {s} ({d} bytes)", .{ request.filename, bytes_sent });
-                emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds());
+                if (session_link) |link| if (sessions) |store| store.updateTftp(link, .tftp_complete, boot_session.monotonicNow(), now());
+                if (session_link) |*link| {
+                    if (link.id()) |boot_id| observe_log.info("tftp: transfer completed {s} ({d} bytes) session={s}", .{ request.filename, bytes_sent, boot_id }) else observe_log.info("tftp: transfer completed {s} ({d} bytes) session_link_state={s}", .{ request.filename, bytes_sent, link.state().? });
+                } else observe_log.info("tftp: transfer completed {s} ({d} bytes)", .{ request.filename, bytes_sent });
+                emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
             },
             .wrq => try sendError(&socket, io, &incoming.from, .access_violation, "write requests are disabled"),
             else => try sendError(&socket, io, &incoming.from, .illegal_operation, "expected RRQ"),
@@ -256,19 +267,48 @@ fn sendError(socket: *std.Io.net.Socket, io: std.Io, remote: *const std.Io.net.I
     try socket.send(io, remote, try packet.encodeError(&buffer, code, message));
 }
 
-fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remote: *const std.Io.net.IpAddress, filename: []const u8, event_type: []const u8, message: []const u8, bytes_sent: u64, duration_us: i64) void {
+/// 追加 TFTP 审计事件并保留本次 RRQ 的关联结果。
+///
+/// 关联结果在传输开始时确定，同一 RRQ 的 success/error 事件复用它；传输期间
+/// 不重新查询 Store，避免 session 过期或新 lease 把一条传输拆到不同 session。
+fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remote: *const std.Io.net.IpAddress, filename: []const u8, event_type: []const u8, message: []const u8, bytes_sent: u64, duration_us: i64, session_link: ?*const boot_session.Link) void {
     const target = writer orelse return;
     var bytes_text: [20]u8 = undefined;
     var duration_text: [20]u8 = undefined;
     var client_ip: [64]u8 = undefined;
-    const fields = [_]events.Field{
+    var fields: [6]events.Field = .{
         .{ .key = "filename", .value = filename },
         .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{bytes_sent}) catch "0" },
         .{ .key = "client_ip", .value = std.fmt.bufPrint(&client_ip, "{f}", .{remote}) catch "unknown" },
         .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
+        .{ .key = "", .value = "" },
+        .{ .key = "", .value = "" },
     };
-    target.appendWithFields(io, allocator, @import("../paths.zig").events_path, event_type, message, &fields) catch |err|
+    var count: usize = 4;
+    if (session_link) |link| {
+        if (link.id()) |id| {
+            fields[count] = .{ .key = "boot_session_id", .value = id };
+            count += 1;
+        } else if (link.state()) |state| {
+            fields[count] = .{ .key = "session_link_state", .value = state };
+            count += 1;
+        }
+    }
+    target.appendWithFields(io, allocator, @import("../paths.zig").events_path, event_type, message, fields[0..count]) catch |err|
         observe_log.err("tftp: event append failed: {t}", .{err});
+}
+
+/// 返回与 DHCP lease 相同字节序的 IPv4 值；IPv6 不参与当前 DHCPv4 关联。
+fn clientIpv4(remote: *const std.Io.net.IpAddress) ?u32 {
+    return switch (remote.*) {
+        .ip4 => |address| (@as(u32, address.bytes[0]) << 24) | (@as(u32, address.bytes[1]) << 16) | (@as(u32, address.bytes[2]) << 8) | address.bytes[3],
+        .ip6 => null,
+    };
+}
+
+fn now() i64 {
+    var timestamp: std.posix.timespec = undefined;
+    return if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &timestamp)) == .SUCCESS) @intCast(timestamp.sec) else 0;
 }
 
 /// 拒绝绝对路径、空组件、`.`、`..` 和 Windows 分隔符。

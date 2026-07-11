@@ -74,3 +74,26 @@ Probe 不可用时服务会拒绝 OFFER，而不会把地址当作空闲。Linux
 Rocky Linux 9.7 aarch64 的 `192.168.27.0/24` 已完成 DHCP 生命周期、冲突隔离、M2 CLI/API 和
 独立 UEFI 固件到 GRUB 的 PXE/TFTP 闭环验证。完整记录见
 [`docs/ROCKY_9_7_VALIDATION.md`](docs/ROCKY_9_7_VALIDATION.md)。
+
+## M2.5.1 启动追踪
+
+每次 DHCP `DISCOVER`/`REQUEST` 会在 daemon 进程内创建或复用一个不可预测的
+32 字符小写十六进制 `boot_session_id`（128-bit）。同一启动尝试的 DHCP 与经唯一 lease-IP 安全关联的
+TFTP 事件都会记录该 id；每条 daemon Event v2 同时带有 `daemon_instance_id`，用于识别
+服务重启边界。session 仅存在于当前进程：超时、被新 XID 替换或有序停机时，daemon 会追加
+`boot.session.terminated`，不会在重启后恢复旧关联。
+
+TFTP 不会根据文件名、传输端口或“最近 DHCP 记录”猜测节点归属。若活动 lease-IP 没有唯一
+匹配，事件保留 `session_link_state`（例如 `no_active_lease_match`、`ambiguous_lease_match`
+或 `capacity_exhausted`），而不是伪造 `boot_session_id`。
+
+本机排障可直接读取审计流，不会访问管理 API 或改变服务状态：
+
+```bash
+nodeforge events list --node node-01 --session 0123456789abcdef0123456789abcdef
+nodeforge trace node-01 --latest
+nodeforge trace node-01 --session 0123456789abcdef0123456789abcdef --output json
+```
+
+`trace` 仅展示具有直接 session 证据的事件，并把容量耗尽、损坏 JSONL 记录和 daemon
+重启等不连续情况写入 `gaps`；因此它是审计重建工具，而不是会在信息不足时补全事实的状态机。
