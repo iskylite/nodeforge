@@ -169,10 +169,10 @@ fn writeCell(writer: *std.Io.Writer, value: []const u8, maximum: ?usize) !void {
     if (maximum) |limit| if (needs_truncate and limit >= 1) try writer.writeAll("…");
 }
 
-/// Write `value` with control characters (U+0000–U+001F, U+007F) and invalid
-/// UTF-8 bytes escaped as literal `\xNN`. This matches the width returned by
-/// `displayWidth` and the escaping in `writeCell`, but performs no truncation.
-/// Use this for detail/section views where column width is not constrained.
+/// 将 `value` 中的控制字符（U+0000–U+001F, U+007F）和无效 UTF-8 字节
+/// 转义为字面量 `\xNN`。此函数的转义行为与 `displayWidth` 的宽度计算
+/// 和 `writeCell` 的转义逻辑一致，但不执行截断。
+/// 适用于详情/分区视图等不受列宽约束的场景。
 pub fn writeEscaped(writer: *std.Io.Writer, value: []const u8) !void {
     var index: usize = 0;
     while (index < value.len) {

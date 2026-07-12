@@ -15,8 +15,8 @@ pub const max_sessions = 256;
 pub const retransmit_window_seconds: i64 = 30;
 /// 未继续推进的 bootstrap session 的存活时间。
 pub const bootstrap_ttl_seconds: i64 = 15 * 60;
-/// A successfully authenticated delivery may continue for two hours.  The
-/// capability itself remains process-local and expires with the session.
+/// 成功认证后的投递 session 可持续两小时。capability 本身保持进程内存在，
+/// 随 session 一起过期。这允许安装器在长时间安装过程中持续上报事件。
 pub const delivery_ttl_seconds: i64 = 2 * 60 * 60;
 pub const capability_len = 64;
 
@@ -81,8 +81,9 @@ pub const Session = struct {
     }
 };
 
-/// The sole node-side authorization result consumed by M3 handlers.  It is a
-/// value copy so no request keeps the session mutex while rendering or I/O.
+/// 节点侧授权结果的唯一类型，由 M3 handler 消费。它是值拷贝，
+/// 因此没有请求会在渲染或 I/O 期间持有 session mutex。
+/// 包含 node_id/boot_session_id/profile/mode/lease_ip/capability 等身份字段。
 pub const Authenticated = struct {
     node_id: []const u8,
     boot_session_id: [id_len]u8,
@@ -91,6 +92,18 @@ pub const Authenticated = struct {
     lease_ip: u32,
     capability: [capability_len]u8,
     capability_issued: bool,
+};
+
+/// M3.5 只读 TFTP boot 身份。由 `resolveTftpBoot` 返回的安全值拷贝，
+/// 使 TFTP handler 能在不持有 session mutex 的情况下渲染虚拟 GRUB 配置。
+/// 所有字段都是从活动 session 复制的快照，不会在 I/O 期间被并发修改。
+pub const TftpBootIdentity = struct {
+    boot_session_id: [id_len]u8,
+    node_id: []const u8,
+    profile: []const u8,
+    mode: model.ProfileMode,
+    mac: [6]u8,
+    lease_ip: u32,
 };
 
 /// 协议事件到 session 的关联结果。
@@ -144,8 +157,16 @@ pub const Store = struct {
     sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions,
     mutex: std.atomic.Mutex = .unlocked,
 
-    /// Creates a session for a new MAC/XID pair or refreshes only a bounded
-    /// DHCP retransmission. A different XID supersedes the old active session.
+    /// 为新的 MAC/XID 对创建 session，或仅在有界 DHCP 重传窗口内刷新同一 session。
+    /// 不同 XID 会取代旧的活动 session（标记为 superseded）。
+    ///
+    /// 关联策略：
+    /// - 相同 MAC + 相同 XID 且处于 DHCP 早期阶段（discover/offer/ack）且在
+    ///   重传窗口内：刷新时间戳，复用同一 session，返回 `linked`。
+    /// - 相同 MAC 但不同 XID：终止旧 session（superseded），创建新 session。
+    /// - 相同 MAC + 相同 XID 但已超出重传窗口或已进入 TFTP 阶段：终止旧 session
+    ///   （expired），创建新 session。
+    /// - 注册表已满：返回 `capacity_exhausted`，不创建新 session。
     pub fn acquireDhcp(self: *Store, io: std.Io, identity: DhcpIdentity, mono_now: i64, utc_now: i64) !AcquireResult {
         if (identity.mac.len != 6) return .{ .link = .capacity_exhausted };
         lock(&self.mutex);
@@ -177,8 +198,11 @@ pub const Store = struct {
         return .{ .link = .capacity_exhausted, .retired = retired };
     }
 
-    /// Advances the session already associated with a DHCP packet. A degraded
-    /// capacity result intentionally has no mutable session.
+    /// 推进已与 DHCP 包关联的 session 阶段。降级的容量结果有意不提供可变 session。
+    ///
+    /// 根据 `link` 中的 session id 查找活动 session，更新其 phase、lease_ip
+    /// 和时间戳。如果 link 不是 `linked`（如 `capacity_exhausted`），则直接返回，
+    /// 不执行任何变更——降级结果不应有可变 session。
     pub fn updateDhcp(self: *Store, link: Link, phase: Phase, lease_ip: u32, mono_now: i64, utc_now: i64) void {
         const id = link.id() orelse return;
         lock(&self.mutex);
@@ -193,7 +217,11 @@ pub const Store = struct {
         }
     }
 
-    /// Removes the lease-IP association without ending the diagnostic session.
+    /// 移除 lease-IP 关联但不终止诊断 session。用于 DHCP DECLINE 或 NAK 场景。
+    ///
+    /// 当客户端发送 DHCP DECLINE 或收到 NAK 时，IP 地址不再有效，但 session
+    /// 仍保留用于诊断。此函数清除 lease_ip 字段，保持 session 活动，
+    /// 以便后续 TFTP 或 HTTP 请求仍可关联到该 MAC。
     pub fn clearLease(self: *Store, mac: []const u8, xid: u32, mono_now: i64, utc_now: i64) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -206,7 +234,13 @@ pub const Store = struct {
         }
     }
 
-    /// Associates a TFTP RRQ only when one active lease-IP match exists.
+    /// 仅当存在唯一的活动 lease-IP 匹配时关联 TFTP RRQ。
+    /// 零个或多个匹配均返回降级 Link，绝不能按文件名、TID 或最近 DHCP 日志猜测关联。
+    ///
+    /// 这是 TFTP 虚拟配置安全模型的基础：只有经过 DHCP ACK 的客户端才能
+    /// 获取 GRUB 配置。ambiguous（多个 session 匹配同一 IP）或
+    /// no_active_lease_match（无匹配）都返回降级结果，TFTP handler 不会
+    /// 为这些情况渲染任何配置。
     pub fn associateTftp(self: *Store, client_ip: u32, mono_now: i64, utc_now: i64) Link {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -223,12 +257,55 @@ pub const Store = struct {
         return .{ .linked = session.id };
     }
 
+    /// M3.5/M3.6：为已 ACK 的客户端解析只读 TFTP boot 身份。
+    ///
+    /// 返回 null 的条件（任一满足）：
+    /// - 没有活动 session 匹配该 lease IP
+    /// - 多个活动 session 匹配该 lease IP（ambiguous）
+    /// - session 缺少 node_id/profile/mode（未注册节点的诊断 lease）
+    /// - session 已过期（bootstrap TTL 或 delivery TTL 超时）
+    ///
+    /// 调用方收到值拷贝，在 I/O 期间不持有 mutex。
+    /// 这使 TFTP 虚拟配置渲染能在不阻塞 DHCP session 管理的情况下进行。
+    pub fn resolveTftpBoot(self: *Store, client_ip: u32, mono_now: i64) ?TftpBootIdentity {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var found: ?*Session = null;
+        for (&self.sessions) |*session| {
+            if (!session.active() or session.lease_ip != client_ip) continue;
+            if (found != null) return null; // 多个 session 匹配同一 lease IP，ambiguous
+            found = session;
+        }
+        const session = found orelse return null;
+        if (sessionExpired(session, mono_now)) return null;
+        if (session.node_id == null or session.profile == null or session.mode == null) return null;
+        return .{
+            .boot_session_id = session.id,
+            .node_id = session.node_id.?,
+            .profile = session.profile.?,
+            .mode = session.mode.?,
+            .mac = session.mac,
+            .lease_ip = session.lease_ip,
+        };
+    }
+
+    /// 推进已关联的 TFTP session 阶段。委托给 `updateDhcp`，但不更新 lease_ip
+    ///（传 0 表示不变更）。用于 TFTP 传输完成等阶段推进。
     pub fn updateTftp(self: *Store, link: Link, phase: Phase, mono_now: i64, utc_now: i64) void {
         self.updateDhcp(link, phase, 0, mono_now, utc_now);
     }
 
-    /// Verifies the bootstrap proof using only the direct TCP peer and the
-    /// active DHCP lease.  The caller's node id is never trusted by itself.
+    /// 仅使用 direct TCP peer 和活动 DHCP lease 验证 bootstrap proof。
+    /// 调用方的 node id 本身永远不被单独信任，必须与 session 中的 lease IP 匹配。
+    ///
+    /// 验证逻辑：
+    /// 1. 查找活动且未过期的 session，其 node_id 与参数匹配。
+    /// 2. 检查 session.lease_ip 是否等于 peer_ip（direct TCP 连接的对端 IP）。
+    /// 3. 匹配成功返回 `Authenticated` 值拷贝；lease_ip 不匹配返回 `ProofMismatch`。
+    /// 4. 无匹配 session 返回 `SessionInactive`。
+    ///
+    /// 这是 HTTP bootstrap 端点的第一道认证：只有从 DHCP 分配的 IP 发起的
+    /// 连接才能获取安装配置和 capability token。
     pub fn authenticateBootstrap(self: *Store, node_id: []const u8, peer_ip: u32, mono_now: i64) !Authenticated {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -242,8 +319,18 @@ pub const Store = struct {
         return error.SessionInactive;
     }
 
-    /// Verifies the bearer capability and explicit correlation header.  A
-    /// session id alone is intentionally never a proof.
+    /// 验证 bearer capability 和显式关联 header。session id 本身有意永远不是 proof，
+    /// 必须同时提供正确的 capability token。
+    ///
+    /// 验证逻辑：
+    /// 1. session_id 长度必须是 32 字符的十六进制，token 长度必须是 64 字符。
+    /// 2. 查找活动 session，其 id 与参数匹配。
+    /// 3. session 必须已过期检查通过，且 node_id、profile、mode 均非 null。
+    /// 4. node_id 必须匹配，capability_issued 必须为 true，token 必须完全匹配。
+    /// 5. 任一条件不满足返回 `ProofMismatch`；无匹配 session 返回 `SessionInactive`。
+    ///
+    /// 这用于安装器上报进度的 HTTP 端点：安装器在 bootstrap 认证后获得
+    /// capability token，后续请求必须携带 session_id + token 才能继续操作。
     pub fn authenticateCapability(self: *Store, node_id: []const u8, session_id: []const u8, token: []const u8, mono_now: i64) !Authenticated {
         if (!validId(session_id) or token.len != capability_len) return error.ProofMismatch;
         lock(&self.mutex);
@@ -258,9 +345,14 @@ pub const Store = struct {
         return error.SessionInactive;
     }
 
-    /// Capability-only proof for a catalog-scoped URL such as `/rootfs/:name`.
-    /// The route has no node id segment, so the resolved session supplies the
-    /// identity and the caller must perform the profile/asset binding.
+    /// 用于 catalog 范围 URL（如 `/rootfs/:name`）的仅 capability proof。
+    /// 该路由没有 node id 段，因此由解析出的 session 提供身份，
+    /// 调用方必须执行 profile/asset 绑定检查。
+    ///
+    /// 与 `authenticateCapability` 的区别：此方法不验证 node_id 参数，
+    /// 因为 URL 路径中没有 node id 段。但它仍要求 session 有完整的身份信息
+    ///（node_id/profile/mode 非 null），且 capability token 必须匹配。
+    /// 调用方负责检查请求的 asset 是否属于该 session profile 允许的范围。
     pub fn authenticateCapabilityAny(self: *Store, session_id: []const u8, token: []const u8, mono_now: i64) !Authenticated {
         if (!validId(session_id) or token.len != capability_len) return error.ProofMismatch;
         lock(&self.mutex);
@@ -274,8 +366,13 @@ pub const Store = struct {
         return error.SessionInactive;
     }
 
-    /// Generates a 256-bit bearer token only after bootstrap authentication.
-    /// It is kept exclusively in the in-memory Session and is never persisted.
+    /// 仅在 bootstrap 认证后生成 256-bit bearer token。
+    /// token 只保存在内存 Session 中，永远不会持久化到磁盘。
+    ///
+    /// 如果 session 已有 capability（capability_issued=true），直接返回现有值；
+    /// 否则从安全随机源生成 256-bit token，写入 session.capability，
+    /// 标记 capability_issued=true，并推进 phase 到 boot_config_fetched。
+    /// daemon 重启后所有 capability 失效，客户端必须重新完成 bootstrap 认证。
     pub fn issueCapability(self: *Store, io: std.Io, session_id: []const u8, mono_now: i64, utc_now: i64) !Authenticated {
         if (!validId(session_id)) return error.SessionInactive;
         lock(&self.mutex);
@@ -294,8 +391,11 @@ pub const Store = struct {
         return error.SessionInactive;
     }
 
-    /// A valid delivery extends the session's delivery TTL, without altering its
-    /// identity or minting a new token.
+    /// 有效的投递会延长 session 的 delivery TTL，但不改变其身份或生成新 token。
+    ///
+    /// 每次安装器成功下载一个文件（如 kernel、initrd、rootfs）后调用此方法，
+    /// 更新 last_seen_mono/last_seen_at，使 session 在长时间安装过程中不会过期。
+    /// 这不会改变 session 的任何身份字段或 capability。
     pub fn touchDelivery(self: *Store, session_id: []const u8, mono_now: i64, utc_now: i64) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -308,8 +408,13 @@ pub const Store = struct {
         }
     }
 
-    /// Expires inactive bootstrap attempts and copies their terminal records for
-    /// the caller to append through the sole EventWriter.
+    /// 过期清理不活跃的 bootstrap session，并拷贝终态记录供调用方通过唯一
+    /// EventWriter 追加审计事件。
+    ///
+    /// 遍历所有活动 session，将超过 TTL 的标记为 expired 并拷贝到 destination。
+    /// 调用方负责将 destination 中的记录写入事件日志。过期不影响已获得
+    /// capability 的 session（它们使用更长的 delivery TTL），只影响
+    /// 未完成 bootstrap 的 session。
     pub fn expire(self: *Store, mono_now: i64, utc_now: i64, destination: *[max_sessions]Session) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -323,7 +428,7 @@ pub const Store = struct {
         return count;
     }
 
-    /// Terminates all active sessions before an orderly daemon stop.
+    /// 在 daemon 有序停止前终止所有活动 session，拷贝终态记录供事件日志使用。
     pub fn terminateAll(self: *Store, mono_now: i64, utc_now: i64, destination: *[max_sessions]Session) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -354,6 +459,9 @@ pub fn generateId(io: std.Io, destination: *[id_len]u8) !void {
     }
 }
 
+/// 从安全随机源生成 256-bit（64 字符十六进制）bearer capability token。
+/// 与 session id 不同，capability token 用于后续 HTTP 请求的持续认证，
+/// 只有 bootstrap 认证通过后才会生成。
 pub fn generateCapability(io: std.Io, destination: *[capability_len]u8) !void {
     var random: [32]u8 = undefined;
     try io.randomSecure(&random);
@@ -370,6 +478,9 @@ pub fn validId(value: []const u8) bool {
     return true;
 }
 
+/// 创建新 session，生成不与现有活动 session 冲突的 128-bit 随机 id。
+/// 从 DhcpIdentity 拷贝 MAC 地址，借用 node_id/profile/mode 的生命周期
+///（它们指向已验证的 config 字符串，Store 不拥有这些字符串）。
 fn newSession(io: std.Io, identity: DhcpIdentity, mono_now: i64, utc_now: i64, existing: []const Session) !Session {
     var id: [id_len]u8 = undefined;
     while (true) {
@@ -399,6 +510,8 @@ fn newSession(io: std.Io, identity: DhcpIdentity, mono_now: i64, utc_now: i64, e
     };
 }
 
+/// 在 mutex 已锁定的情况下标记 session 终态并返回终态快照。
+/// 不清理 session 槽位（调用方负责置零），只设置 terminal_reason 和时间戳。
 fn terminateLocked(session: *Session, reason: TerminalReason, mono_now: i64, utc_now: i64) Session {
     session.terminal_reason = reason;
     session.last_seen_mono = mono_now;
@@ -407,6 +520,8 @@ fn terminateLocked(session: *Session, reason: TerminalReason, mono_now: i64, utc
     return session.*;
 }
 
+/// 从已验证的活动 session 构造 Authenticated 值拷贝。
+/// 调用方获得的是快照，在 I/O 期间不持有 mutex。
 fn authenticated(session: *const Session) Authenticated {
     return .{
         .node_id = session.node_id.?,
@@ -419,11 +534,15 @@ fn authenticated(session: *const Session) Authenticated {
     };
 }
 
+/// 判断 session 是否已过期。已获得 capability 的 session 使用 delivery TTL（2 小时），
+/// 未获得 capability 的使用 bootstrap TTL（15 分钟）。
 fn sessionExpired(session: *const Session, mono_now: i64) bool {
     const ttl = if (session.capability_issued) delivery_ttl_seconds else bootstrap_ttl_seconds;
     return mono_now - session.last_seen_mono >= ttl;
 }
 
+/// 判断 phase 是否属于 DHCP 早期阶段（discover/offer/ack）。
+/// 只有早期阶段的重传才能复用同一 session。
 fn isDhcpEarly(phase: Phase) bool {
     return switch (phase) {
         .dhcp_discover, .dhcp_offer, .dhcp_ack => true,
@@ -431,10 +550,13 @@ fn isDhcpEarly(phase: Phase) bool {
     };
 }
 
+/// 将 4-bit 值映射为小写十六进制字符（0-9, a-f）。
 fn hex(value: u8) u8 {
     return if (value < 10) '0' + value else 'a' + value - 10;
 }
 
+/// 自旋等待获取 mutex，通过 Thread.yield 让出 CPU 而非忙等。
+/// session 操作时间极短，自旋比系统 futex 更高效。
 fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }
@@ -469,6 +591,45 @@ test "TFTP links only a unique active lease address" {
     store.updateDhcp(second.link, .dhcp_ack, 0xc0a83264, 3, 3);
     try std.testing.expectEqual(Link.ambiguous_lease_match, store.associateTftp(0xc0a83264, 4, 4));
     try std.testing.expectEqual(Link.no_active_lease_match, store.associateTftp(0xc0a83265, 4, 4));
+}
+
+test "resolveTftpBoot returns identity for a unique ACK'd session" {
+    var store: Store = .{};
+    const acquired = try store.acquireDhcp(std.testing.io, .{
+        .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xef },
+        .xid = 0x12345678,
+        .node_id = "m3-node",
+        .profile = "rocky-install",
+        .mode = .install,
+    }, 10, 10);
+    store.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 11, 11);
+    const identity = store.resolveTftpBoot(0xc0a81bc8, 12).?;
+    try std.testing.expectEqualStrings("m3-node", identity.node_id);
+    try std.testing.expectEqualStrings("rocky-install", identity.profile);
+    try std.testing.expectEqual(model.ProfileMode.install, identity.mode);
+    try std.testing.expectEqual(@as(u32, 0xc0a81bc8), identity.lease_ip);
+}
+
+test "resolveTftpBoot returns null for ambiguous lease" {
+    var store: Store = .{};
+    const first = try store.acquireDhcp(std.testing.io, .{ .mac = &.{ 1, 2, 3, 4, 5, 6 }, .xid = 1, .node_id = "a", .profile = "p", .mode = .install }, 1, 1);
+    const second = try store.acquireDhcp(std.testing.io, .{ .mac = &.{ 7, 8, 9, 10, 11, 12 }, .xid = 2, .node_id = "b", .profile = "p", .mode = .install }, 1, 1);
+    store.updateDhcp(first.link, .dhcp_ack, 0xc0a83264, 2, 2);
+    store.updateDhcp(second.link, .dhcp_ack, 0xc0a83264, 3, 3);
+    try std.testing.expect(store.resolveTftpBoot(0xc0a83264, 4) == null);
+}
+
+test "resolveTftpBoot returns null for session without node_id" {
+    var store: Store = .{};
+    const acquired = try store.acquireDhcp(std.testing.io, .{
+        .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xf0 },
+        .xid = 0x99999999,
+        .node_id = null,
+        .profile = null,
+        .mode = null,
+    }, 10, 10);
+    store.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc9, 11, 11);
+    try std.testing.expect(store.resolveTftpBoot(0xc0a81bc9, 12) == null);
 }
 
 test "capacity exhaustion remains explicit and bootstrap sessions expire" {

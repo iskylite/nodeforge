@@ -1,6 +1,7 @@
-//! M3 node-facing HTTP contracts.  These types deliberately keep client input
-//! small: node identity, event type, timestamps and audit fields are derived on
-//! the server rather than accepted from JSON.
+//! M3 面向节点的 HTTP 契约。
+//!
+//! 这些类型有意保持客户端输入的最小化：节点身份、事件类型、时间戳和审计
+//! 字段都由服务端推导而非从 JSON 接受。这减少攻击面，防止节点伪造身份。
 
 const std = @import("std");
 const boot_session = @import("../state/boot_session.zig");
@@ -11,7 +12,8 @@ pub const max_reason_bytes = 128;
 pub const max_message_bytes = 1024;
 pub const max_log_summary_bytes = 2048;
 
-/// Stable capability transport names. Tokens are never valid in query strings.
+/// 稳定的 capability 传输 header 名称。token 永远不允许出现在 query string 中，
+/// 只通过 HTTP header 传输，防止通过 URL 日志泄漏。
 pub const authorization_header = "authorization";
 pub const session_header = "x-nodeforge-session";
 

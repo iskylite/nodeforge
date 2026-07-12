@@ -190,7 +190,7 @@ cli
 | --- | --- | --- |
 | 数据模型 | `AppConfig` 表达启动/策略配置，`Catalog` 表达导入/构建/发布得到的管理目录，`RuntimeState` 表达运行态 | 配置迁移或 Web API 需要稳定 schema 时再拆 schema 包 |
 | 存储 | M0 使用 `/opt/nodeforge/config/config.json` + `/opt/nodeforge/catalog/catalog.json`；站点配置修改后重启生效。M1+ 才支持 DHCP discovery 策略和 catalog 变更的运行期在线切换 | 并发写入、查询性能或多实例需求出现后再考虑数据库 |
-| 管理接口 | 复用唯一 HTTP listener；路由接受所有可达连接；CLI 固定访问 `127.0.0.1:<http.port>`，只管理同机服务；不单设 `management_port` | M0 不提供安全的远程管理客户端 |
+| 管理接口 | 复用唯一 HTTP listener；M3.6 起管理路由仅接受 `127.0.0.1` direct peer；CLI 固定访问该地址，只管理同机服务；不单设 `management_port` | M0 不提供远程管理客户端 |
 | 发行版 adapter | `ubuntu.zig`、`kickstart.zig` 两个文件 | 版本差异明显增多后再拆能力表文件 |
 | 带外管理 | 只保存 IPMI 信息，不实现控制动作 | 明确要做电源控制/启动设备控制时再加执行模块 |
 | 补充包和后处理 | M4/M5 实现强类型步骤和最小 runner；M7 补齐高级步骤与诊断 | 明确需要常驻任务后再考虑 agent |
@@ -720,7 +720,7 @@ MVP 不实现第二套 RPC，也不再拆成 management listener 与 PXE listene
 - `server.bind_interface` 是 DHCPv4 Linux 服务的必填 PXE 网卡字段，用于约束 DHCP 广播收发；示例的 `enp1s0` 只是占位值，部署前必须替换为承载 `server.server_ip` 的实际接口。静态校验拒绝空值；实际 bind 继续验证接口存在且可用。
 - `nodeforge` CLI 管理客户端固定连接 `127.0.0.1:http.port`，不提供远程管理地址配置项。
 - MVP 不配置独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`；端口冲突时修改 `config.json` 并重启。
-- 管理路由与未来 PXE 数据路由逻辑分区；服务端不做 peer 来源检查，所有能到达该 listener 的 IPv4 客户端都可调用管理路由。
+- 管理路由与未来 PXE 数据路由逻辑分区；M3.6 在 route 入口仅允许 direct peer `127.0.0.1` 调用 `/api/v1/management/`，不信任 `X-Forwarded-For`。
 - `nodeforge` CLI 固定连接 `127.0.0.1`，不提供远程 endpoint，只支持管理同机 `nodeforged`。MVP 不提供管理鉴权和 TLS；将 HTTP 路由作为正式远程管理接口前，必须另行设计 TLS、鉴权和审计。
 
 M0 的完整路由表（路径和方法必须精确匹配）如下：
@@ -879,7 +879,7 @@ M2.5 回归 M0 的 `--check-config`、`--check`、`status`、HTTP integration �
 - CLI `--output json` 输出可解析 JSON。
 - 顶层、资源级和动作级 `-h/--help` 可显示用途、参数和默认值；长示例只放在 README、设计文档和运维手册，避免帮助页冗长。
 - 模拟端口占用时 preflight 明确失败。
-- 管理路由接受所有可达连接；CLI 固定连接 `127.0.0.1:<http.port>`，只管理同机服务。
+- 管理路由仅接受 loopback direct peer；CLI 固定连接 `127.0.0.1:<http.port>`，只管理同机服务。
 - `logging.level=debug` 和 daemon `-d` 能输出服务 debug 日志；CLI `-d` 能在简短错误后显示底层原因。
 - `tests/http.sh` 覆盖全部 M0 HTTP 路由、统一 404、重复 listener 拒绝及 daemon `-d`。
 
@@ -903,7 +903,7 @@ M0 验收结果：
 - [x] Zap/facil.io 唯一 listener、结构化 HTTP 404、端口独占和快速重启通过集成测试及 Rocky 实机验证。
 - [x] 核心领域模型、对外入口和错误/日志协议已具备文档注释。
 - [x] 管理配置校验、配置状态和服务状态 API 可用。
-- [x] 管理路由接受所有可达连接，CLI 固定连接 `127.0.0.1` 且不提供远程 endpoint。
+- [x] M3.6 管理路由只接受 `127.0.0.1` direct peer，CLI 固定连接该地址且不提供远程 endpoint。
 - [x] 通过 `tests/cli.sh` 端到端 CLI contract tests 覆盖自动帮助、命令局部 flags 和解析错误退出码。
 - [x] 通过 `tests/http.sh` 和 Rocky 9.7 aarch64 实机验证覆盖 HTTP 路由、端口预检和 systemd 快速重启。
 
@@ -936,9 +936,11 @@ M1+ 的 TFTP、DHCP 等尚未实现的系统级验证不在本节标记为完成
 | 模块 | 任务 |
 | --- | --- |
 | `tftp/packet.zig` | RRQ/DATA/ACK/ERROR/OACK 编解码 |
-| `tftp/server.zig` | UDP 69 dispatcher、option 协商、路径 normalize、session 状态机 |
+| `tftp/server.zig` | UDP 69 dispatcher、option 协商、路径 normalize、session 状态机、虚拟 GRUB 配置拦截 |
 | `assets/store.zig` | asset manifest 读写，bootloader/kernel/initrd/ISO/rootfs 等资产导入 |
 | `assets/validate.zig` | asset 类型、路径、SHA256 校验 |
+| `boot/grub.zig` | UEFI GRUB 配置渲染（`linux`/`initrd` 指令，架构无关） |
+| `boot/target.zig` | 从 TFTP boot 身份 + config/catalog 展开 kernel/initrd/cmdline |
 | `state/runtime.zig` | TFTP session 运行态 |
 
 ### 5.3 TFTP 行为
@@ -964,17 +966,43 @@ M1+ 的 TFTP、DHCP 等尚未实现的系统级验证不在本节标记为完成
 
 ### 5.4 bootloader 配置生成
 
-GRUB 配置由 `boot/grub.zig` 生成：
+GRUB 配置由 `boot/grub.zig` 渲染，`boot/target.zig` 负责从 TFTP boot 身份和
+catalog/config 快照展开 kernel/initrd 路径和 cmdline：
 
 ```text
 set timeout=5
 menuentry 'NodeForge {{node_id}}' {
-  linuxefi {{kernel_path}} {{cmdline}}
-  initrdefi {{initrd_path}}
+  linux {{kernel_path}} {{cmdline}}
+  initrd {{initrd_path}}
 }
 ```
 
-MVP 同时支持 UEFI x86_64 和 UEFI aarch64 GRUB，分别使用 `grubx64.efi`、`grubaa64.efi`。BIOS PXELINUX 在 M6 完整化。
+**架构指令选择**：ARM64 `grubaa64.efi` 和 x86_64 `grubx64.efi` 均使用标准 `linux`/
+`initrd` 指令。不使用 `linuxefi`/`initrdefi`——前者只在特定发行版的 GRUB 构建中
+可用，不能作为默认假设。
+
+**虚拟 GRUB 配置发布（M3.5）**：`grub.cfg` 不落盘、不进入 catalog，而是在 TFTP
+RRQ 时即时渲染。GRUB 按 PXE 标准查找规则请求配置文件名，TFTP handler 在 catalog
+manifest gate 之前拦截这些请求：
+
+1. `efi/grub.cfg-01-<MAC>` — 以客户端 MAC 地址查找（连字符分隔，小写）。
+2. `efi/grub.cfg-<IP>` — 以客户端 IPv4 的大写十六进制形式查找（如 `C0A81BC8`）。
+3. `efi/grub.cfg` — fallback。
+
+拦截后通过 `boot_session.resolveTftpBoot` 从 Peer IP 检索已 ACK 的 boot session，
+获取 `TftpBootIdentity`（node_id, profile, mode, mac, lease_ip），再由
+`boot/target.resolve` 展开为 `BootTarget`（kernel_path, initrd_path, cmdline, arch），
+最终调用 `grub.render` 生成配置文本并从内存传输。
+
+未认领节点、无活动 session、会话不唯一或 discovery mode 不渲染任何 kernel/initrd
+条目。它们不是磁盘文件缺失：M3.6 返回 TFTP ERROR code 2（access violation）及不含
+身份资料的 `boot configuration requires an active DHCP lease` 或
+`boot configuration unavailable for this node`，而不是 ERROR code 1 / `file not found`。
+真正不存在、未纳管的静态文件仍返回 ERROR code 1。配置文本不含 `boot_session_id` 或
+capability token。
+
+MVP 同时支持 UEFI x86_64 和 UEFI aarch64 GRUB，分别使用 `grubx64.efi`、
+`grubaa64.efi`。BIOS PXELINUX 在 M6 完整化。
 
 ### 5.5 CLI 命令
 
@@ -1002,7 +1030,7 @@ nodeforge asset validate
 ### 5.7 阶段验收
 
 - [x] x86_64/aarch64 PXE 客户端可通过 TFTP 拉取对应 GRUB EFI 文件。
-- [x] GRUB 可拉取配置、kernel、initrd。
+- [ ] GRUB 可拉取配置、kernel、initrd。  <!-- M3.5: grub.cfg 虚拟发布已实现，kernel/initrd 需 M3.5 实机闭环验证 -->
 - [x] TFTP session 能在 CLI 中看到。
 - [x] 标准 TFTP 客户端可下载 `grubaa64.efi`、`grubx64.efi`，SHA-256 与 catalog manifest 一致。
 - [x] 不存在的文件返回标准 ERROR code 1（file not found）。
@@ -2328,13 +2356,17 @@ source/repository。每一段 path 均拒绝空段、`.`、`..`、反斜杠、NU
 以受管 SHA256 派生的强 ETag。只支持单一 `bytes=` Range（含 suffix）；合法范围返回 206 与
 `Content-Range`，无效/多段范围返回 416 和 `Content-Range: bytes */<size>`。`If-Range` 与当前 ETag 相等时
 才续传，否则返回完整 200。静态访问日志只记录路由模板、catalog object name、状态、字节数和耗时，不记录
-repo tail、query、Authorization 或 capability。
+repo tail、query、Authorization 或 capability。非 debug 至少记录每个 HTTP 下载请求的对象、Range、请求字节数
+和 client；debug 额外记录精确的 Range chunk queue progress。当前 Zap/facil.io `sendfile` 是异步内核发送，服务端
+只能诚实记录“已排队”的 chunk，不能把它伪装成对端已接收；客户端若续传会以新的 Range 请求形成下一条可观测进度。
+TFTP 则在每个 ACK 后于 debug 输出约 10% 间隔的已确认字节进度，普通 info 保留 RRQ 和最终结果。
 
 ### 8.4 ISO 自动仓库
 
-`nodeforge install-source import <filename>` 只接受管理员预先放入
-`/opt/nodeforge/work/import/` 的单个常规 ISO 文件名；CLI 传递相对此目录的名称，daemon 不接受任意绝对路径、
-symlink 或 URL。这样本机管理 API 即使被误暴露，也不会以服务用户权限读取任意宿主机文件。M3 使用 Linux
+`nodeforge install-source import <iso-path>` 接受管理员选择的任意本地常规文件。CLI 将其原子复制到
+`/opt/nodeforge/work/import/<random>-<basename>` 后只传递该 basename；daemon 不接受任意绝对路径、symlink
+或 URL。这样本机管理 API 即使被误暴露，也不会以服务用户权限读取任意宿主机文件，同时管理员不再需要先把 ISO
+手工放入固定目录。M3 使用 Linux
 内核的只读 loop mount：ISO 不需要额外提取工具，但 daemon 必须具有 `CAP_SYS_ADMIN`，并且
 `nodeforged --check` 必须检查 `mount`/`umount`、私有挂载根和该 capability。导入只挂载 ISO9660/UDF，使用
 `ro,nosuid,nodev,noexec,loop`；不执行 ISO 内任何文件，也不把挂载树直接暴露给 HTTP/TFTP。
@@ -2342,10 +2374,14 @@ symlink 或 URL。这样本机管理 API 即使被误暴露，也不会以服务
 `CapabilityBoundingSet`；不具备该 capability 的容器或 sandbox 不是可导入 ISO 的 NodeForge 部署目标，
 而应在预检中返回稳定错误。
 
-导入在独立 import worker 中执行，HTTP worker 与 DHCP/TFTP 收包线程不得同步计算大 ISO 的 hash 或解包。CLI
-等待该本地请求完成并得到成功/失败摘要；M3 不引入可恢复的后台 job API。流程固定如下：
+导入在独立且 daemon-wide 串行的 import worker 中执行，HTTP callback 不同步计算大 ISO 的 hash 或解包。为了保持
+CLI 的同步成功/失败语义，发起请求的一个 HTTP worker 等待该 worker；Zap 保留第二个 HTTP worker 处理 health、下载和
+节点 callback。并发导入返回 `409 install_source.busy`，不排队、不创建后台 job；DHCP/TFTP 收包线程始终不等待。
+流程固定如下：
 
-1. 打开并 `fstat` staging ISO，校验普通文件、类型、SHA256、管理员声明的 distro/version/arch 及 ISO 元数据一致。
+1. CLI 打开并 `fstat` 任意用户输入 ISO，确认它是普通文件后原子 stage；daemon 再以受限 root 打开 staged ISO、
+   校验普通文件和 SHA256。Rocky 从 `.treeinfo`、Ubuntu 从 `.disk/info` 检测 distro/version/arch；三个 CLI flag
+   是可选断言，存在时必须与检测 tuple 一致。
 2. 在 `/opt/nodeforge/work/iso-import-<random>/mnt` 创建权限收紧的随机私有挂载点，以
    `mount -t iso9660 -o ro,nosuid,nodev,noexec,loop` 挂载该 ISO；只有 ISO9660 挂载失败且明确检测到
    UDF 文件系统时才以同一组选项重试 `-t udf`。遍历挂载树时拒绝不安全路径、
@@ -2458,20 +2494,34 @@ nodeforge runtime status
 nodeforge events list --node node-01
 nodeforge events follow --type install.failed
 nodeforge node status node-01
-nodeforge install-source import Rocky-9.7-aarch64-dvd.iso --distro rocky --version 9.7 --arch aarch64
+nodeforge install-source import /srv/iso/Rocky-9.7-aarch64-dvd.iso
+nodeforge install-source import /srv/iso/ubuntu-22.04.5-live-server-arm64.iso --distro ubuntu --version 22.04 --arch aarch64
 nodeforge repository show rocky-9.7-aarch64-iso
 ```
 
-`install-source import` 的 ISO 文件名相对 `/opt/nodeforge/work/import/`；CLI 不隐式复制、移动或删除用户传入的
-任意路径。`nodeforge install render` 归 M4，因为只有该阶段拥有发行版 adapter；M3 只提供它所依赖的
-`/answer` transport、模板安全边界和认证上下文。
+`install-source import` 接受任意可读本地 ISO 路径（绝对或相对当前目录）。CLI 先验证它是普通文件，原子复制到
+`/opt/nodeforge/work/import/<random>-<basename>`，仅把这个受管 basename 交给本机 daemon；导入请求结束后删除临时
+copy，绝不移动或删除原始 ISO。这样既不把任意主机路径授权给常驻 daemon，又不把管理员的工作流限制在固定目录。
+
+`--distro`、`--version`、`--arch` 均改为可选的**断言**：Rocky 从 `.treeinfo`，Ubuntu 从 `.disk/info`
+和 ISO 架构元数据检测 tuple；任一显式值与检测结果不一致即拒绝。Rocky `arch` 采用 `aarch64`/`x86_64`，Ubuntu
+媒体的 `arm64`/`amd64` 在导入器中规范化到相同模型值；Ubuntu `22.04.5` 规范化为 profile/catalog 使用的 `22.04`。
+这三个 flag 不再是重复、容易填错的必填元数据。
+
+`asset import --path` 仍刻意是相对于 `tftp.asset_root` 的 catalog 注册路径，而不是“导入任意文件”的 CLI；它不会复制
+数据且 daemon 需要在固定 root 内计算 digest。`config import <path>` 本来就接受任意源 JSON 路径。因此 M3.6 审计后，
+只有 `install-source import` 存在把用户输入误当作固定 staging basename 的问题。
+
+`nodeforge install render` 归 M4，因为只有该阶段拥有发行版 adapter；M3 只提供它所依赖的 `/answer` transport、模板
+安全边界和认证上下文。
 
 ### 8.8 并发与 HTTP 实现选择
 
 - HTTP 服务器基于 Zap/facil.io 固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile；M3 在向 sendfile 交付已验证 descriptor 前自行解析单 Range/`If-Range`、设置 SHA256 ETag，并拒绝多段/无效 Range。这样不依赖 facil.io 的文件时间/长度 ETag 或其 `If-Range` 行为。M0 尚未注册静态资产或 Range 路由，M3 再将其接入。NodeForge 当前只维护业务路由、管理 API 和统一错误信封，不维护 HTTP 报文解析或连接循环。已评估的备选方案 `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，不作为依赖。
 - acceptor 与固定大小 worker pool 分离；大文件使用 `pread`/send loop 流式发送，不整体读入内存。
-- DHCP/TFTP 使用各自 UDP event loop；ISO hash、只读挂载/复制和 publication plan 提交到单独受限的 import worker，
-  不阻塞收包或 HTTP response worker。静态下载持有已打开 fd，不在整个传输期间占 catalog mutex。
+- DHCP/TFTP 使用各自 UDP event loop；ISO hash、只读挂载/复制和 publication plan 提交到一个受限 import worker，
+  不阻塞收包；同步等待 import 的管理 handler 最多占用一个 HTTP worker，第二个 worker 仍服务 HTTP 数据面。静态下载
+  持有已打开 fd，不在整个传输期间占 catalog mutex。
 - 配置使用不可变 snapshot + 原子替换；catalog 仅在 candidate 通过完整校验和原子落盘后替换。M3.1 的
   `leases.json` 与 `node-status.json` 按恢复域分别保存：DHCP checkpoint worker 最多每秒一次且不阻塞收包，
   HTTP status 转移同步保存且不争 DHCP I/O 锁；有序 shutdown 分别补写最终快照。Event v2 则通过 M2.5 的唯一
@@ -2554,6 +2604,123 @@ M3 按以下批次实施，前一批的 contract test 必须通过后才能进�
 
 任何批次改变路由、DTO、认证材料、EventType、catalog 字段或 M4/M5 消费内容时，先更新本节、§7.5.12、
 `DESIGN.md` 的 HTTP 边界和相应 fixture；实现与文档不得分别演进。
+
+### 8.12 M3.5 TFTP 虚拟 GRUB 配置补全
+
+M3.5 实机验证发现 PXE 链路在 GRUB 获取配置处中断：TFTP 只能提供 catalog 静态资产，
+无法按节点身份动态生成 `grub.cfg`，导致 GRUB 拿不到 kernel/initrd 路径。同时发现
+`grub.zig` 硬编码 `linuxefi`/`initrdefi` 指令，ARM64 `grubaa64.efi` 不含这两个模块
+导致指令不可用。本节记录补全方案。
+
+#### 8.12.1 问题根因
+
+1. **`grub.cfg` 从未被 TFTP 提供**：`grub.zig` 的渲染器存在但无调用方。TFTP handler
+   的 `transfer` 函数只检查 catalog manifest 白名单，虚拟配置请求被当作不存在的文件拒绝。
+2. **ARM64 GRUB 指令不兼容**：`linuxefi`/`initrdefi` 是 RHEL 补丁 GRUB 的扩展指令，
+   ARM64 上游 GRUB 只支持 `linux`/`initrd`。x86_64 上游 GRUB 同样默认支持 `linux`/
+   `initrd`，`linuxefi`/`initrdefi` 可用性取决于发行版构建。
+3. **TFTP 缺少身份解析**：TFTP handler 只有 `associateTftp`（用于 session 关联审计），
+   无法从 Peer IP 获取 node_id/profile/mode 来渲染个性化配置。
+
+#### 8.12.2 补全实现
+
+| 模块 | 变更 |
+| --- | --- |
+| `boot/grub.zig` | `linuxefi`/`initrdefi` 改为 `linux`/`initrd`；`timeout` 保持 5（PXE 菜单可见，便于调试） |
+| `boot/target.zig` | **新增**。从 `TftpBootIdentity` + `AppConfig` + `Catalog` 展开 `BootTarget`（kernel_path, initrd_path, cmdline, arch） |
+| `state/boot_session.zig` | 新增 `TftpBootIdentity` 结构体和 `resolveTftpBoot` 方法（只读，返回值副本，锁内不 I/O） |
+| `tftp/server.zig` | 新增 `isVirtualGrubConfig` 文件名匹配 + `transferVirtualConfig` 内存渲染传输；在 `transfer` 调用前拦截 |
+
+#### 8.12.3 虚拟配置拦截流程
+
+```
+TFTP RRQ 到达
+  │
+  ├─ isVirtualGrubConfig(filename)?  ──否──→  transfer (catalog manifest gate)
+  │
+  是
+  │
+  ├─ resolveTftpBoot(peer_ip)  ──null──→  ERROR code 2 (active DHCP lease required)
+  │
+  ├─ boot_target.resolve(identity, config, catalog)  ──null──→  ERROR code 2 (boot target unavailable)
+  │
+  ├─ grub.render(target) → config_buf[2048]
+  │
+  └─ transferFromMemory(config_buf)  →  OACK/DATA/ACK
+```
+
+#### 8.12.4 安全约束
+
+- 虚拟配置只在 Peer IP 有唯一已 ACK lease 时渲染；零个或多个匹配均以 TFTP ERROR code 2 拒绝。
+- `discovery` mode 返回 null（不渲染 kernel/initrd），未认领节点拿不到配置，并以 ERROR code 2 表达策略拒绝。
+- 配置文本不含 `boot_session_id` 或 capability token；这些只通过 HTTP 认证通道下发。
+- `cmdline` 不携带 `inst.ks=`（M4 Kickstart 渲染后追加）或 NoCloud URL（M4 Ubuntu 后追加）。
+- RHEL-family M3 install cmdline 为 `ip=dhcp rd.neednet=1 inst.repo=<repository_url>`；Ubuntu live-server
+  为 `root=/dev/ram0 ramdisk_size=1500000 cloud-config-url=/dev/null ip=dhcp url=<published ISO URL>`。
+  `inst.repo` 不传给 Ubuntu；M4 才追加 `autoinstall ds=nocloud-net;...`。
+- M3 diskless cmdline 只包含 `ip=dhcp nodeforge.config=<config_url>`。
+- 文件名匹配严格限定长度和字符集：MAC 形式固定 33 字符，IP 形式固定 8 位十六进制。
+
+#### 8.12.5 验收状态
+
+| 验收项 | 状态 | 说明 |
+| --- | --- | --- |
+| `grub.zig` 使用 `linux`/`initrd` 指令 | ✅ 已实现 | 单元测试验证两种架构均不含 `linuxefi` |
+| `boot/target.zig` 解析 install/diskless target | ✅ 已实现 | 单元测试覆盖 install/diskless/discovery 三种 mode |
+| `boot_session.resolveTftpBoot` 只读身份解析 | ✅ 已实现 | 单元测试覆盖正常/ambiguous/无 node_id 场景 |
+| TFTP 虚拟 `grub.cfg` 拦截与内存传输 | ✅ 已实现 | 单元测试覆盖文件名匹配规则 |
+| GRUB 可拉取配置 | ⬜ 待实机验证 | 需 VMware PXE 证据 |
+| GRUB 可拉取 kernel/initrd | ⬜ 待实机验证 | kernel/initrd 通过 catalog manifest gate 正常提供，但需端到端验证 |
+
+### 8.13 M3.6: GRUB policy、ISO import 与下载可观测性修正
+
+M3.6 收敛 M3.5 代码审计发现的六项契约问题：动态 GRUB 错误语义、ISO 生命周期、任意 ISO 路径、tuple
+自动检测、下载进度和 Ubuntu casper 参数。它不改变 catalog 的受管根目录或 daemon-only publication 边界。
+
+| 问题 | M3.6 决策与实现 |
+| --- | --- |
+| 无 DHCP session 请求虚拟 `grub.cfg` | 这是 authorization/policy rejection，不是文件缺失；严格匹配的虚拟名字返回 TFTP ERROR code 2（access violation），无关静态路径才继续返回 code 1。MAC/IP 名称同时校验格式及大小写，允许 GRUB 常见的单个前导 `/`。 |
+| ISO CLI 强制 `/opt/nodeforge/work/import/` basename | CLI 现在接受任意本地普通 ISO 路径，临时 stage 到受管目录后向 daemon 仅传 opaque basename，完成后清除临时 copy。既改善 UX，又不把任意 host path 交给常驻特权服务。 |
+| 重复输入 distro/version/arch | 三个 flag 改为可选一致性断言；Rocky 以 `.treeinfo`，Ubuntu 以 `.disk/info` 和 ISO metadata 检测并规范化 tuple。 |
+| Ubuntu install cmdline | `inst.repo` 只供 Anaconda/RHEL；Ubuntu live-server 由 casper 下载 ISO，使用 `root=/dev/ram0 ramdisk_size=1500000 cloud-config-url=/dev/null ip=dhcp url=http://<server>:<port>/images/<iso-asset>`。不加入旧式 `boot=casper netboot=url`：Canonical 当前 UEFI netboot 文档（涵盖 20.04+）以 `url=` 作为 live ISO 定位参数；M4 再附加 autoinstall NoCloud 参数。 |
+| HTTP/TFTP 下载日志 | HTTP 的每个请求和 Range 在 info 记录对象、范围、字节数、client；debug 记录已排队的 Range chunk。TFTP info 记录 RRQ/完成/失败，debug 在 ACK 后按 10% 记录确认进度；重传仍为 warn。 |
+| 管理 API 的权限边界 | `/api/v1/management/` 能写 catalog、触发 loop mount，故虽与 PXE HTTP 共用 listener，仍只接受 direct peer `127.0.0.1`；远端请求 403，不能通过 `X-Forwarded-For` 伪造。CLI 也没有远程 endpoint。 |
+| profile/source/bundle 关联 | config 校验现在要求 install profile 与 `InstallSourceConfig`、diskless profile 与 `BootBundleConfig` 的 distro/version/arch 三元组完全相同；install profile 还必须显式标记 `destructive=true` 与 `persistent_writes=true`。这拒绝“Ubuntu profile 引 Rocky source”或未声明持久写入的配置。 |
+| DHCP 架构一致性 | 已登记节点的 RFC 4578 PXE 架构必须与 node/profile arch 相同；不一致仍可完成 DHCP 诊断 lease，但不下发 GRUB bootfile，防止跨架构 loader 再加载错误内核。 |
+| Ubuntu live 介质完整性 | 除 `.disk/info`、`casper/vmlinuz` 与 `casper/initrd` 外，导入还必须存在 `casper/filesystem.squashfs`，避免发布一个能下载 kernel 却无法进入 live installer 的 ISO。 |
+| loop mount 隔离 | systemd unit 启用 `PrivateMounts=true`；结合 `CAP_SYS_ADMIN`、只读挂载和 worker cleanup，ISO mount 不进入 host mount namespace。 |
+
+ISO 导入从用户路径到发布的完整责任链是：`CLI fstat → atomic staging copy → daemon constrained open/hash → readonly loop mount → distro detection/optional assertion → kernel/initrd/repo staging → checksums → catalog candidate validation + atomic replacement → stage cleanup`。catalog 是对 HTTP/TFTP 可见性的唯一提交点；任何未发布文件都不能经 resolver 访问。导入不会实现后台 job：CLI 等待本地 daemon 的有界 worker 结果。
+
+#### 8.13.1 Rocky 9.7 / Ubuntu 22.04 的 M3.6 实际启用顺序
+
+1. 在 PXE 服务机安装 NodeForge，并让 `server.server_ip` 已配置在 `bind_interface` 上；systemd unit 以
+   `CAP_NET_BIND_SERVICE`、`CAP_NET_RAW`、`CAP_SYS_ADMIN` 与 `PrivateMounts=true` 启动。先运行
+   `nodeforged --check`，它会检查 HTTP/DHCP/TFTP bind、mount/umount 和 capability。
+2. 先使用**不引用 install source** 的基础 config 启动 daemon（例如只有 distro matrix、DHCP 和
+   `policy.default_action=wait`）。这是必要顺序：config/catalog 在 daemon 启动时整体校验，尚不存在的 source
+   不能被 profile 提前引用。
+3. 通过本机 CLI 导入媒体：
+
+   ```bash
+   nodeforge install-source import /srv/iso/Rocky-9.7-aarch64-dvd.iso
+   nodeforge install-source import /srv/iso/ubuntu-22.04.5-live-server-arm64.iso
+   ```
+
+   Rocky 自动发现 `.treeinfo` 的 `rocky/9.7/aarch64`、提取 `images/pxeboot/*` 并发布 DNF repo；Ubuntu 自动发现
+   `ubuntu/22.04/aarch64`、提取 `casper/*`、校验 squashfs，并发布 ISO URL（以及完整 APT metadata 存在时的 repo）。
+4. 停止 daemon，使用 `config import` 写入与已发布 source 三元组完全一致的 install profiles 和 nodes，然后执行
+   `config validate -c <config> -C <catalog>` 并重启 daemon。此时管理 API 仍只能从服务机本机访问，PXE 节点只访问
+   TFTP、`/images` 和 `/repos`。
+5. 已登记 ARM64 节点以 RFC 4578 aarch64 发起 DHCP：收到 `grubaa64.efi`、唯一 ACK session，再由 GRUB 拉取虚拟
+   `efi/grub.cfg-*`、installer kernel/initrd。Rocky cmdline 使用 `inst.repo=<published DNF URL>`；Ubuntu cmdline
+   使用 `url=<published ISO URL>`。架构、profile/source tuple、租约或策略任一不满足时，链路在对应边界停止且给出
+   明确日志/协议错误。
+6. 该阶段的终点是**进入 installer**。M3.6 尚未渲染 Rocky Kickstart 或 Ubuntu autoinstall NoCloud；因此不能把
+   当前状态称作“无人值守安装完成”。它们由 M4 增加，届时分别追加 `inst.ks=` 与
+   `autoinstall ds=nocloud-net;s=...`。
+
+Ubuntu 参数判断以 Canonical 的 [UEFI PXE netboot 指引](https://documentation.ubuntu.com/server/how-to/installation/netboot-the-server-installer-via-uefi-pxe-on-arm-aarch64-arm64-and-x86-64-amd64/index.html) 和更新的 [amd64 netboot 指引](https://documentation.ubuntu.com/server/how-to/installation/how-to-netboot-the-server-installer-on-amd64/) 为准；两者都描述 initrd 从 `url=` 下载并挂载 live ISO。该结论是文档核验后的实现选择，不以 ISO 文件名或过时博客示例猜测。
 
 ## 9. M4：PXE 无人值守自动安装与基础后处理
 

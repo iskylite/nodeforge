@@ -1,7 +1,7 @@
 //! NodeForge 唯一 HTTP listener，基于 Zap/facil.io。
 //! HTTP 协议解析、连接生命周期、keep-alive、并发调度和文件/Ranges 支持由 Zap 提供；
-//! 本模块仅注册 NodeForge 路由及其 JSON 响应语义。管理路由接受所有可达客户端，
-//! 官方 `nodeforge` CLI 仍固定连接 `127.0.0.1`。
+//! 本模块仅注册 NodeForge 路由及其 JSON 响应语义。管理路由只接受 loopback peer，
+//! 官方 `nodeforge` CLI 固定连接 `127.0.0.1`。
 //!
 //! M0 提供健康检查、配置状态和服务器状态路由；M1 增加只读 TFTP 会话计数、
 //! 会话列表和资产导入路由。所有路由在同一个 `0.0.0.0:http_port` listener 上分发。
@@ -36,31 +36,34 @@ const RouteContext = struct {
     sessions: *boot_session.Store,
     statuses: *node_status.Store,
     daemon_instance_id: *const [boot_session.id_len]u8,
-    /// M3.1 separate I/O lock for `node-status.json`; never contends with the
-    /// DHCP checkpoint worker's lease file lock.
+    /// M3.1 独立的 I/O 锁，用于 `node-status.json`；永远不与 DHCP checkpoint
+    /// worker 的 lease 文件锁竞争。
     status_io_mutex: *std.atomic.Mutex,
     node_status_path: []const u8,
 };
 
-/// Per-request metadata captured at route entry and threaded through to `json`
-/// for structured logging and event emission.
+/// 路由入口捕获的每请求元数据，传递给 `json` 用于结构化日志和事件追加。
 const RequestMeta = struct {
     io: std.Io,
+    /// 客户端 IP 地址，仅使用 direct peer，不信任 X-Forwarded-For。
     client_ip: []const u8,
+    /// 请求开始时间戳，用于计算响应延迟。
     started: std.Io.Timestamp,
 };
 
-// Zap's low-level listener exposes one process-global request callback. NodeForge is
-// intentionally a single-process, single-listener appliance, so this pointer remains
-// valid for the full blocking lifetime of `zap.start` and is never mutated afterwards.
+// Zap 的底层 listener 暴露一个进程全局请求回调。NodeForge 有意设计为
+// 单进程、单 listener 设备，因此此指针在 `zap.start` 的整个阻塞生命周期内
+// 保持有效，且之后永远不会被修改。
 var active_context: ?*const RouteContext = null;
+/// ISO 导入互斥锁。ISO 导入需要 loop-mount 能力并发布多对象 catalog 候选，
+/// 限制为 daemon 范围内单一 worker，防止并发本地 CLI 请求耗尽 mount 或竞争发布。
+var iso_import_mutex: std.atomic.Mutex = .unlocked;
 
-/// Starts the only NodeForge HTTP listener on every IPv4 interface.
+/// 在所有 IPv4 接口上启动唯一的 NodeForge HTTP listener。
 ///
-/// `server.server_ip` is intentionally not used as a bind address. Zap delegates
-/// socket creation and HTTP protocol handling to facil.io; a bind conflict causes
-/// `listen` to fail before the process starts workers, preserving M0's one-listener
-/// invariant.
+/// `server.server_ip` 有意不用作 bind 地址。Zap 将 socket 创建和 HTTP 协议
+/// 处理委托给 facil.io；bind 冲突会导致 `listen` 在进程启动 worker 之前失败，
+/// 保持 M0 的单 listener 不变量。
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -106,21 +109,21 @@ pub fn serve(
     event_writer.appendWithFields(io, allocator, paths.events_path, "service.started", "all protocol listeners ready", &.{}) catch |err|
         log.err("unable to record service start: {t}", .{err});
 
-    // Zap owns the blocking event loop and worker lifecycle. One worker keeps M0's
-    // state model serial while eliminating the hand-written HTTP parser/connection loop.
-    zap.start(.{ .threads = 1, .workers = 1 });
+    // One management import handler waits for its bounded worker by API
+    // contract. Keep another HTTP worker available for downloads, health and
+    // node callbacks; shared publication is separately serialized.
+    zap.start(.{ .threads = 1, .workers = 2 });
 }
 
-/// Extracts the client IP from the underlying facil.io socket. Only the direct
-/// peer address is used; X-Forwarded-For is never trusted without a configured
-/// proxy CIDR boundary.
+/// 从底层 facil.io socket 提取客户端 IP。只使用 direct peer 地址；
+/// 不信任 X-Forwarded-For，除非有已配置的代理 CIDR 边界。
 fn getClientIp(request: zap.Request) []const u8 {
     const addr = zap.fio.http_peer_addr(request.h);
     if (addr.len == 0 or addr.data == null) return "unknown";
     return addr.data[0..addr.len];
 }
 
-/// Dispatches management routes after Zap has parsed the request.
+/// 在 Zap 解析请求后分发管理路由。
 /// 路由表保持显式匹配，不引入动态路由框架；M3 将在同一 listener 增加
 /// PXE 数据路由（boot config、answer file、repo/rootfs 下载）。
 ///
@@ -143,6 +146,13 @@ fn route(request: zap.Request) !void {
     const meta = RequestMeta{ .io = context.io, .client_ip = client_ip, .started = started };
 
     observe_log.debug("http: request received {s} {s}", .{ method, path });
+
+    // M3.6 管理平面安全边界：管理 API 能写 catalog 状态并触发特权 ISO mount，
+    // 它与 PXE HTTP 数据路由共用 listener 只是为了部署便利，永远不用于远程管理。
+    // 在分发之前执行此检查，使所有当前和未来的管理端点都继承相同的安全边界。
+    // 不信任 X-Forwarded-For，只接受 direct peer 127.0.0.1。
+    if (std.mem.startsWith(u8, path, "/api/v1/management/") and !isLoopbackPeer(client_ip))
+        return json(request, .forbidden, "{\"ok\":false,\"error\":{\"code\":\"management.local_only\",\"message\":\"management API accepts loopback clients only\"}}\n", meta);
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/healthz"))
         return json(request, .ok, "{\"ok\":true,\"service\":\"nodeforge\"}\n", meta);
@@ -205,10 +215,19 @@ fn route(request: zap.Request) !void {
     return notFound(request, meta);
 }
 
+/// M3.6：检查客户端 IP 是否为 loopback peer（127.0.0.1）。
+/// HTTP listener 仅支持 IPv4。精确匹配 127.0.0.1 并 fail closed，
+/// 而非信任 X-Forwarded-For 或接受任意私有子网。
+fn isLoopbackPeer(client_ip: []const u8) bool {
+    // The HTTP listener is IPv4-only. Keep this exact and fail closed rather
+    // than trusting X-Forwarded-For or accepting an arbitrary private subnet.
+    return std.mem.eql(u8, client_ip, "127.0.0.1");
+}
+
 const NodeRoute = struct { node_id: []const u8, suffix: []const u8 };
 
-/// Returns only an unescaped single URL segment.  A node id with a slash,
-/// percent encoding or a second path component is never routed as identity.
+/// 只返回未转义的单个 URL 段。包含斜杠、百分号编码或第二个路径组件的
+/// node id 永远不会被路由为身份。
 fn nodePath(path: []const u8, prefix: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, path, prefix)) return null;
     const node_id = path[prefix.len..];
@@ -284,10 +303,14 @@ fn repositoryAsset(request: zap.Request, context: *const RouteContext, name: []c
     return staticFile(request, context, root, tail, null, meta);
 }
 
-/// NodeForge parses the one supported Range form before handing a verified
-/// descriptor to facil.io's fd-backed sendfile path.  This keeps the managed
-/// checksum ETag authoritative: facil.io's path helper has incompatible
-/// `If-Range` behavior and generates a second, filesystem-derived ETag.
+/// M3.6 下载可观测性：NodeForge 解析唯一支持的 Range 形式后，将验证过的
+/// 描述符交给 facil.io 的 fd-backed sendfile 路径。这保证了受管 checksum ETag
+/// 的权威性：facil.io 的路径助手有不兼容的 `If-Range` 行为并会生成第二个
+/// 文件系统派生的 ETag。
+///
+/// M3.6 日志策略：info 记录每个请求的对象、范围、字节数和客户端；
+/// debug 记录已排队的 Range chunk。这使操作员能在 info 级别看到所有下载活动，
+/// 在 debug 级别看到更细粒度的分块进度。
 fn staticFile(request: zap.Request, context: *const RouteContext, root: []const u8, relative: []const u8, checksum: ?[]const u8, meta: RequestMeta) !void {
     var file = asset_validate.openRegularFile(context.io, root, relative) catch return notFound(request, meta);
     errdefer file.close(context.io);
@@ -316,19 +339,25 @@ fn sendRangedFile(request: zap.Request, context: *const RouteContext, file: *std
     var content_range: [96]u8 = undefined;
     const value = try std.fmt.bufPrint(&content_range, "bytes {d}-{d}/{d}", .{ range.offset, range.offset + range.length - 1, size });
     try request.setHeader("content-range", value);
-    try sendManagedFile(request, file, range, relative, meta);
+    try sendManagedFile(request, file, range, size, relative, meta);
 }
 
 fn sendWholeFile(request: zap.Request, file: *std.Io.File, size: u64, relative: []const u8, meta: RequestMeta) !void {
-    try sendManagedFile(request, file, .{ .offset = 0, .length = size }, relative, meta);
+    try sendManagedFile(request, file, .{ .offset = 0, .length = size }, size, relative, meta);
 }
 
-fn sendManagedFile(request: zap.Request, file: *std.Io.File, range: ByteRange, relative: []const u8, meta: RequestMeta) !void {
+fn sendManagedFile(request: zap.Request, file: *std.Io.File, range: ByteRange, total_size: u64, relative: []const u8, meta: RequestMeta) !void {
     try request.setHeader("accept-ranges", "bytes");
     request.setContentTypeFromFilename(relative) catch try request.setHeader("content-type", "application/octet-stream");
+    // M3.6 下载日志：info 记录每个 HTTP 下载请求的对象、范围、字节数和客户端 IP。
+    log.info("HTTP download request GET {s} (range={d}+{d}/{d}, client={s})", .{ relative, range.offset, range.length, total_size, meta.client_ip });
     const result = zap.fio.http_sendfile(request.h, file.handle, @intCast(range.length), @intCast(range.offset));
     if (result != 0) return error.SendFile;
     request.markAsFinished(true);
+    // M3.6 下载日志：facil.io 拥有异步 sendfile 完成回调。我们有意将其标记为
+    // queued progress 而非声称是 peer ACK progress；每个 HTTP Range 请求
+    // 仍被记录为一个精确的 chunk。
+    log.debug("HTTP download queued {s}: {d}/{d} bytes (range {d}+{d})", .{ relative, range.offset + range.length, total_size, range.offset, range.length });
     log.info("GET static -> {d} (asset={s}, bytes={d}, client={s})", .{ request.h.*.status, relative, range.length, meta.client_ip });
 }
 
@@ -363,9 +392,9 @@ fn parseSingleRange(value: []const u8, size: u64) !ByteRange {
     return .{ .offset = offset, .length = actual_last - offset + 1 };
 }
 
-/// Issues the M3 BootConfig v1 document after either DHCP peer bootstrap or a
-/// previously issued bearer capability.  The secret only appears in this
-/// authenticated response, never in an Event, error envelope, URL or log.
+/// 在 DHCP peer bootstrap 或先前签发的 bearer capability 认证通过后，
+/// 签发 M3 BootConfig v1 文档。密钥只出现在此认证响应中，永远不会出现在
+/// 事件、错误信封、URL 或日志中。
 fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticate(
         context.sessions,
@@ -437,9 +466,8 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
     return json(request, .ok, output.written(), meta);
 }
 
-/// M3 intentionally returns a transport fixture rather than an installer
-/// dialect. M4 replaces this with a Kickstart/Autoinstall renderer, but the
-/// capability delivery and answer URL contract are already exercised here.
+/// M3 有意返回一个传输夹具而非安装器方言。M4 将替换为 Kickstart/Autoinstall
+/// 渲染器，但 capability 投递和 answer URL 契约已在此处验证。
 fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
@@ -638,15 +666,14 @@ fn persistStatus(context: *const RouteContext) bool {
     return true;
 }
 
-/// Constructs a placeholder meta for early exits where timing is not meaningful.
+/// 为时间不重要的提前退出构造占位 meta。
 fn undefined_meta(context: *const RouteContext) RequestMeta {
     return .{ .io = context.io, .client_ip = "unknown", .started = std.Io.Clock.awake.now(context.io) };
 }
 
-/// Registers an already-present asset via the daemon, which alone publishes a
-/// new catalog snapshot.  Query fields intentionally accept the constrained M1
-/// CLI vocabulary; arbitrary file paths and decoded URL strings are rejected by
-/// the same asset validator used by direct TFTP serving.
+/// 通过 daemon 注册一个已存在的资产，只有 daemon 能发布新的 catalog 快照。
+/// 查询字段有意只接受受约束的 M1 CLI 词汇表；任意文件路径和已解码的 URL
+/// 字符串会被与直接 TFTP 服务相同的资产校验器拒绝。
 fn importAsset(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     const name = request.getParamSlice("name") orelse return assetInputError(request, "missing name", meta);
     const path = request.getParamSlice("path") orelse return assetInputError(request, "missing path", meta);
@@ -676,16 +703,19 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
     try json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
-/// The local management request waits for one bounded import worker, but the
-/// expensive mount/copy/hash work itself never runs on the HTTP callback
-/// thread.  Publication remains here so catalog replacement is serialized by
-/// `CatalogRuntime` only after the worker produced a complete candidate.
+/// M3.6：本地管理请求等待一个有界 import worker，但昂贵的 mount/copy/hash
+/// 工作本身永远不在 HTTP callback 线程上执行。等待中的 handler 占用两个
+/// HTTP worker 之一，而 daemon 范围内的 import mutex 拒绝并发 import 并
+/// 保留另一个 worker 供数据面请求使用。Publication 保留在此处，使 catalog
+/// 替换仅在完整候选存在后才被序列化。
 fn importInstallSource(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     const filename = request.getParamSlice("filename") orelse return assetInputError(request, "missing filename", meta);
-    const distro = request.getParamSlice("distro") orelse return assetInputError(request, "missing distro", meta);
-    const version = request.getParamSlice("version") orelse return assetInputError(request, "missing version", meta);
-    const arch_text = request.getParamSlice("arch") orelse return assetInputError(request, "missing arch", meta);
-    const arch = std.meta.stringToEnum(model.Arch, arch_text) orelse return assetInputError(request, "invalid arch", meta);
+    const distro = request.getParamSlice("distro");
+    const version = request.getParamSlice("version");
+    const arch_text = request.getParamSlice("arch");
+    const arch = if (arch_text) |value| std.meta.stringToEnum(model.Arch, value) orelse return assetInputError(request, "invalid arch", meta) else null;
+    if (!iso_import_mutex.tryLock()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install_source.busy\",\"message\":\"another ISO import is running\"}}\n", meta);
+    defer iso_import_mutex.unlock();
     var task: IsoImportTask = .{
         .io = context.io,
         .allocator = context.allocator,
@@ -741,7 +771,7 @@ fn managementNodePath(path: []const u8) ?[]const u8 {
     return if (auth.nodeIdSafe(node_id)) node_id else null;
 }
 
-/// Exposes the bounded M3 state projection without reading the event stream.
+/// 暴露有界的 M3 状态投影，不读取事件流。
 fn runtimeSummary(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     var statuses: [node_status.max_statuses]node_status.Status = undefined;
     context.statuses.snapshot(&statuses);
@@ -783,9 +813,8 @@ fn tftpStatus(request: zap.Request, runtime: *const runtime_state.RuntimeState, 
     try json(request, .ok, body, meta);
 }
 
-/// Renders the bounded M1 transfer activity list.  Entries are intentionally
-/// short-lived operational state; audit history belongs to `events.jsonl` in a
-/// later stage, not an unbounded HTTP response.
+/// 渲染有界的 M1 传输活动列表。条目有意设计为短生命周期操作状态；
+/// 审计历史属于后续阶段的 `events.jsonl`，不是无界的 HTTP 响应。
 fn tftpSessions(request: zap.Request, runtime: *const runtime_state.RuntimeState, meta: RequestMeta) !void {
     var sessions: [runtime_state.TftpState.max_sessions]runtime_state.TftpSession = undefined;
     @constCast(&runtime.tftp).snapshot(&sessions);
@@ -838,7 +867,7 @@ fn dhcpLeases(request: zap.Request, allocator: std.mem.Allocator, runtime: *cons
     try json(request, .ok, output.written(), meta);
 }
 
-/// Renders configuration validation failures using NodeForge's stable error envelope.
+/// 使用 NodeForge 的稳定错误信封渲染配置校验失败。
 fn validationError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
     var buffer: [512]u8 = undefined;
     const body = observe_error.renderJson(&buffer, observe_error.fromValidation(err)) catch
@@ -846,13 +875,13 @@ fn validationError(request: zap.Request, err: anyerror, meta: RequestMeta) !void
     try json(request, .bad_request, body, meta);
 }
 
-/// Emits a uniform JSON 404 envelope instead of bypassing the management error contract.
+/// 发出统一的 JSON 404 信封，而非绕过管理错误契约。
 fn notFound(request: zap.Request, meta: RequestMeta) !void {
     try json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"http.not_found\",\"message\":\"route not found\"}}\n", meta);
 }
 
-/// Sends a JSON response through Zap and logs method, path, status, bytes,
-/// duration and client IP. Request bodies and credentials never enter the log.
+/// 通过 Zap 发送 JSON 响应并记录方法、路径、状态码、字节数、持续时间和
+/// 客户端 IP。请求体和凭据永远不会进入日志。
 fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, meta: RequestMeta) !void {
     request.setStatus(status);
     const duration_us = meta.started.durationTo(std.Io.Clock.awake.now(meta.io)).toMicroseconds();
@@ -894,6 +923,8 @@ fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, met
 
 test "Zap-backed route module compiles" {
     try std.testing.expect(active_context == null);
+    try std.testing.expect(isLoopbackPeer("127.0.0.1"));
+    try std.testing.expect(!isLoopbackPeer("192.168.50.9"));
 }
 
 test "single byte ranges cover bounded, open-ended and suffix forms" {

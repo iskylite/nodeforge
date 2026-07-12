@@ -34,13 +34,20 @@ pub const AssetImport = struct {
     kernel_release: ?[]const u8 = null,
 };
 
-/// M3.4 import request. The ISO filename is relative to the fixed daemon
-/// staging root and never describes a host path.
+/// M3.6 ISO 导入请求。CLI 先将管理员拥有的任意 ISO 原子复制到 daemon
+/// 管控的 staging 目录；只有生成的不透明文件名被发送到本机管理端点。
+/// distro/version/arch 三个字段是可选的一致性断言，因为 daemon 会从 ISO
+/// 元数据（.treeinfo 或 .disk/info）自动检测并规范化三元组。如果操作员
+/// 提供了断言值但与检测结果不一致，daemon 拒绝导入。
 pub const InstallSourceImport = struct {
+    /// 已暂存到 import_dir 的 ISO 文件名（不含路径前缀），由 CLI 生成。
     filename: []const u8,
-    distro: []const u8,
-    version: []const u8,
-    arch: []const u8,
+    /// 可选的发行版断言；daemon 从 ISO 元数据检测后与之比对。
+    distro: ?[]const u8 = null,
+    /// 可选的版本断言；daemon 从 ISO 元数据检测后与之比对。
+    version: ?[]const u8 = null,
+    /// 可选的架构断言；daemon 从 ISO 元数据检测后与之比对。
+    arch: ?[]const u8 = null,
 };
 
 /// 探测管理接口 `/healthz`。
@@ -116,7 +123,9 @@ pub fn tftpSessionsJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
     return managementJson(io, port, "/api/v1/management/tftp/sessions", output);
 }
 
-/// Retrieves M2 DHCP lease observations from the local management listener.
+/// 从本机管理路由获取 M2 DHCP lease 观测数据。
+/// `unknown_only` 为 true 时只返回未认领节点的 lease，false 返回全部。
+/// 仅连接 `127.0.0.1`，不接受远程端点。
 pub fn dhcpLeasesJson(io: std.Io, port: u16, unknown_only: bool, output: []u8) !?[]const u8 {
     return managementJson(io, port, if (unknown_only) "/api/v1/management/dhcp/unknown" else "/api/v1/management/dhcp/leases", output);
 }
@@ -173,15 +182,31 @@ pub fn importAsset(io: std.Io, port: u16, asset: AssetImport) !bool {
     return std.mem.findPosLinear(u8, status, 0, " 200 ") != null;
 }
 
+/// 请求 daemon 导入已暂存的 ISO 并发布 install source。
+///
+/// M3.6 安全设计：此函数只接受不透明文件名（不含路径前缀），
+/// 因为 ISO 已由 CLI 复制到 daemon 管控的 import_dir。
+/// daemon 在受管根内打开文件，不会接触任意 host 路径。
+///
+/// 所有字段在发送前经过 `querySafe` 检查，拒绝包含 `&=?#%\r\n` 的值，
+/// 防止 URL 参数注入。请求通过 `POST /api/v1/management/install-sources/import`
+/// 发送，参数放在 query string 中，Content-Length 为 0。
+/// 返回 `true` 表示 daemon 接受了导入（HTTP 200），`false` 表示拒绝或连接失败。
 pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) !bool {
-    inline for ([_][]const u8{ request.filename, request.distro, request.version, request.arch }) |value|
-        if (!querySafe(value)) return error.InvalidInstallSourceField;
+    if (!querySafe(request.filename)) return error.InvalidInstallSourceField;
+    inline for ([_]?[]const u8{ request.distro, request.version, request.arch }) |optional|
+        if (optional) |value|
+            if (!querySafe(value)) return error.InvalidInstallSourceField;
     const address = try std.Io.net.IpAddress.parseIp4(management.client_ip, port);
     var stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
     defer stream.close(io);
     var send_buffer: [2048]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
-    try writer.interface.print("POST /api/v1/management/install-sources/import?filename={s}&distro={s}&version={s}&arch={s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{ request.filename, request.distro, request.version, request.arch });
+    try writer.interface.print("POST /api/v1/management/install-sources/import?filename={s}", .{request.filename});
+    if (request.distro) |value| try writer.interface.print("&distro={s}", .{value});
+    if (request.version) |value| try writer.interface.print("&version={s}", .{value});
+    if (request.arch) |value| try writer.interface.print("&arch={s}", .{value});
+    try writer.interface.writeAll(" HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     try writer.interface.flush();
     var recv_buffer: [1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);

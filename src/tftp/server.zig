@@ -20,6 +20,8 @@ const packet = @import("packet.zig");
 const runtime_state = @import("../state/runtime.zig");
 const events = @import("../state/events.zig");
 const boot_session = @import("../state/boot_session.zig");
+const boot_target = @import("../boot/target.zig");
+const grub = @import("../boot/grub.zig");
 const observe_log = @import("../observe/log.zig");
 const log = std.log.scoped(.tftp);
 
@@ -82,23 +84,60 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
                 } else log.info("RRQ {s}", .{request.filename});
                 const started = std.Io.Clock.awake.now(io);
                 emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, if (session_link) |*link| link else null);
-                const bytes_sent = transfer(io, &incoming.from, request, config.tftp.asset_root, catalog) catch |err| {
-                    runtime.tftp.finish(session, false);
-                    if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
-                    switch (err) {
-                        error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, incoming.from, err }),
-                        else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
+
+                // M3.5/M3.6：在 catalog manifest 白名单检查之前拦截虚拟 GRUB 配置请求。
+                // 只有严格匹配的文件名才是虚拟配置候选；仍需要一个有效的已 ACK
+                // session 才能渲染和传输配置。虚拟名称是动态策略端点而非磁盘文件，
+                // 因此访问拒绝必须返回 TFTP ERROR code 2（access violation）
+                // 而非 code 1（file not found）。这区分了“策略拒绝”和“文件不存在”，
+                // 使 PXE 客户端和操作员能正确诊断启动失败原因。
+                const is_virtual = isVirtualGrubConfig(request.filename);
+                const bytes_sent = if (is_virtual)
+                    transferVirtualConfig(io, &incoming.from, request, config, catalog, sessions) catch |err| {
+                        runtime.tftp.finish(session, false);
+                        if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
+                        switch (err) {
+                            error.BootAccessDenied, error.BootTargetUnavailable, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected virtual config {s} from {f}: {t}", .{ request.filename, incoming.from, err }),
+                            else => observe_log.err("tftp: virtual config transfer failed for {s}: {t}", .{ request.filename, err }),
+                        }
+                        emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+                        // M3.6 错误语义：虚拟 GRUB 配置请求的失败是授权/策略拒绝，
+                        // 不是文件缺失。返回 TFTP ERROR code 2（access violation）
+                        // 而非 code 1（file not found）。
+                        // - BootAccessDenied：无活动 DHCP lease 或 session 已过期
+                        // - BootTargetUnavailable：有 session 但 profile/catalog 引用无效
+                        // - UnsupportedMode/InvalidOption：TFTP mode 非 octet 或 option 非法
+                        const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
+                            error.BootAccessDenied => .{ .code = .access_violation, .message = "boot configuration requires an active DHCP lease" },
+                            error.BootTargetUnavailable => .{ .code = .access_violation, .message = "boot configuration unavailable for this node" },
+                            error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
+                            else => .{ .code = .undefined, .message = "transfer failed" },
+                        };
+                        try sendError(&socket, io, &incoming.from, response.code, response.message);
+                        continue;
                     }
-                    emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
-                    const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
-                        error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
-                        error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
-                        error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => .{ .code = .access_violation, .message = "access denied" },
-                        else => .{ .code = .undefined, .message = "transfer failed" },
+                else
+                    transfer(io, &incoming.from, request, config.tftp.asset_root, catalog) catch |err| {
+                        runtime.tftp.finish(session, false);
+                        if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
+                        switch (err) {
+                            error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, incoming.from, err }),
+                            else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
+                        }
+                        emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+                        // 静态文件传输的错误语义遵循 RFC 1350 标准：
+                        // - FileNotAllowed/FileNotFound → code 1（file not found）
+                        // - UnsupportedMode/InvalidOption → code 4（illegal operation）
+                        // - AccessDenied/PermissionDenied/SymLinkLoop → code 2（access violation）
+                        const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
+                            error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
+                            error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
+                            error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => .{ .code = .access_violation, .message = "access denied" },
+                            else => .{ .code = .undefined, .message = "transfer failed" },
+                        };
+                        try sendError(&socket, io, &incoming.from, response.code, response.message);
+                        continue;
                     };
-                    try sendError(&socket, io, &incoming.from, response.code, response.message);
-                    continue;
-                };
                 runtime.tftp.finish(session, true);
                 if (session_link) |link| if (sessions) |store| store.updateTftp(link, .tftp_complete, boot_session.monotonicNow(), now());
                 if (session_link) |*link| {
@@ -109,6 +148,166 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
             .wrq => try sendError(&socket, io, &incoming.from, .access_violation, "write requests are disabled"),
             else => try sendError(&socket, io, &incoming.from, .illegal_operation, "expected RRQ"),
         }
+    }
+}
+
+/// M3.5/M3.6：识别严格匹配的虚拟 GRUB 配置请求。
+///
+/// 只有以下精确模式被识别为虚拟配置候选：
+/// - `efi/grub.cfg-01-<客户端 MAC 的小写连字符形式>`
+///   例如 `efi/grub.cfg-01-02-aa-bb-cc-dd-ef`
+///   MAC 各字节必须是小写 hex，用连字符分隔（GRUB 的标准 MAC 格式）。
+/// - `efi/grub.cfg-<客户端 IPv4 的大写十六进制形式>`
+///   例如 `efi/grub.cfg-C0A81BC8`（对应 192.168.27.200）
+///   IP 各字节必须是大写 hex，无分隔符（GRUB 的标准 IP hex 格式）。
+/// - `efi/grub.cfg`（GRUB 回退名称）
+///
+/// 其他路径继续走正常的 catalog asset 白名单检查。
+/// 文件名本身不决定响应内容；调用方还必须拥有该 peer IP 的有效已 ACK session
+/// 才能渲染和传输配置。允许 GRUB 常见的单个前导 `/`（如 `/efi/grub.cfg-...`）。
+fn isVirtualGrubConfig(filename: []const u8) bool {
+    const normalized = trimLeadingSlash(filename);
+    // MAC form: efi/grub.cfg-01-<6 hex pairs separated by hyphens>
+    // Total length: "efi/grub.cfg-01-" (16) + "XX-XX-XX-XX-XX-XX" (17) = 33
+    if (std.mem.startsWith(u8, normalized, "efi/grub.cfg-01-")) {
+        const suffix = normalized["efi/grub.cfg-01-".len..];
+        if (suffix.len != 17) return false;
+        for (suffix, 0..) |c, i| {
+            if (i % 3 == 2) {
+                if (c != '-') return false;
+            } else if (!(std.ascii.isDigit(c) or (c >= 'a' and c <= 'f'))) return false;
+        }
+        return true;
+    }
+    if (std.mem.startsWith(u8, normalized, "efi/grub.cfg-")) {
+        // Hex IP form: grub.cfg-<8 hex chars> (e.g. C0A81BC8)
+        const suffix = normalized["efi/grub.cfg-".len..];
+        if (suffix.len == 8) {
+            for (suffix) |c| if (!(std.ascii.isDigit(c) or (c >= 'A' and c <= 'F'))) return false;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, normalized, "efi/grub.cfg")) return true;
+    return false;
+}
+
+/// 去除 GRUB/PXE 客户端可能发送的单个前导 `/`。
+/// PXE 客户端（GRUB、PXELINUX）经常发送以 `/` 开头的路径；
+/// 去除后使路径相对于 TFTP asset root 进行后续匹配和文件打开。
+fn trimLeadingSlash(filename: []const u8) []const u8 {
+    return if (filename.len > 0 and filename[0] == '/') filename[1..] else filename;
+}
+
+/// M3.5/M3.6：从内存渲染并传输虚拟 GRUB 配置。
+///
+/// 配置根据已 ACK session 的身份和当前 catalog/config 快照动态生成。
+/// 它永远不会持久化到磁盘、不会加入 catalog、不包含 token 或 boot_session_id。
+/// 这确保了即使 TFTP root 被入侵，也无法从磁盘文件获取其他节点的启动配置。
+///
+/// 责任链：
+/// 1. 验证 TFTP mode 为 octet
+/// 2. 从 peer IP 解析唯一的已 ACK boot session 身份
+/// 3. 在 catalog 锁内：调用 boot_target.resolve 展开 kernel/initrd/cmdline
+/// 4. 在 catalog 锁内：为路径补充前导 `/` 并调用 grub.render 生成配置文本
+/// 5. 释放 catalog 锁后，通过 transferFromMemory 传输渲染好的配置
+///
+/// 返回已发送的字节数；如果 session 无法解析、profile/catalog 引用无效
+/// 或传输失败，返回对应错误。
+fn transferVirtualConfig(
+    io: std.Io,
+    remote: *const std.Io.net.IpAddress,
+    request: packet.Request,
+    config: *const model.AppConfig,
+    catalog: *catalog_runtime.CatalogRuntime,
+    sessions: ?*boot_session.Store,
+) !u64 {
+    if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
+
+    const client_ip = clientIpv4(remote) orelse return error.BootAccessDenied;
+    const store = sessions orelse return error.BootAccessDenied;
+    const identity = store.resolveTftpBoot(client_ip, boot_session.monotonicNow()) orelse return error.BootAccessDenied;
+
+    var cmdline_buf: [512]u8 = undefined;
+    catalog.lock();
+    var config_buf: [2048]u8 = undefined;
+    var kernel_grub: [256]u8 = undefined;
+    var initrd_grub: [256]u8 = undefined;
+    const rendered = blk: {
+        defer catalog.unlock();
+        // 在 catalog 锁内解析 boot target 并渲染 GRUB 配置。
+        // 渲染结果写入栈缓冲区，在 TFTP I/O 开始前就已完成自包含，
+        // 因此慢速客户端不会长时间持有 catalog mutex。
+        const target = boot_target.resolve(identity, config, &catalog.value, config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
+        // 为路径补充前导 `/` 以符合 GRUB 语法（GRUB 路径以 `/` 开头）。
+        // 此操作在 catalog 锁内完成，确保路径切片引用的 catalog 数据有效。
+        const kernel_path = std.fmt.bufPrint(&kernel_grub, "/{s}", .{target.kernel_path}) catch return error.BootTargetUnavailable;
+        const initrd_path = std.fmt.bufPrint(&initrd_grub, "/{s}", .{target.initrd_path}) catch return error.BootTargetUnavailable;
+        break :blk grub.render(&config_buf, .{
+            .node_id = identity.node_id,
+            .kernel_path = kernel_path,
+            .initrd_path = initrd_path,
+            .cmdline = target.cmdline,
+            .arch = target.arch,
+        }) catch return error.BootTargetUnavailable;
+    };
+
+    return transferFromMemory(io, remote, request, rendered);
+}
+
+/// 使用与文件传输相同的 TFTP OACK/DATA/ACK 逻辑传输内存缓冲区。
+///
+/// 与文件传输的唯一区别是数据源是内存切片而非磁盘文件。
+/// 这确保了虚拟 GRUB 配置和静态文件在 TFTP 协议层面行为一致，
+/// 包括 option 协商、分块传输、超时重传等。
+fn transferFromMemory(
+    io: std.Io,
+    remote: *const std.Io.net.IpAddress,
+    request: packet.Request,
+    content: []const u8,
+) !u64 {
+    const file_size: u64 = content.len;
+    const settings = try negotiate(request.options, file_size);
+
+    const local = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 0);
+    var socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+
+    if (settings.hasOptions()) {
+        var out: [1024]u8 = undefined;
+        var option_values: [3][20]u8 = undefined;
+        var accepted: [3]packet.Option = undefined;
+        const oack = try packet.encodeOack(&out, settings.oackOptions(file_size, &option_values, &accepted));
+        try socket.send(io, remote, oack);
+        try awaitAck(&socket, io, remote, 0, settings.timeout);
+    }
+
+    var block: u16 = 1;
+    var offset: u64 = 0;
+    while (true) {
+        const end = @min(offset + settings.block_size, content.len);
+        const chunk = content[offset..end];
+        var out: [max_block_size + 4]u8 = undefined;
+        const datagram = try packet.encodeData(&out, block, chunk);
+        // 超时重传：最多重试 max_retries 次，每次重传后等待 ACK。
+        // 这处理 UDP 丢包和客户端处理延迟，但不无限重试以避免资源浪费。
+        var attempts: usize = 0;
+        while (true) {
+            try socket.send(io, remote, datagram);
+            awaitAck(&socket, io, remote, block, settings.timeout) catch |err| {
+                if (err == error.Timeout and attempts < max_retries) {
+                    attempts += 1;
+                    log.warn("retransmit virtual config block {d} attempt {d}/{d}", .{ block, attempts, max_retries });
+                    continue;
+                }
+                return err;
+            };
+            break;
+        }
+        offset += chunk.len;
+        // 最后一个 DATA 的负载小于 block_size 时传输完成（RFC 1350 标准）。
+        if (chunk.len < settings.block_size) return offset;
+        block +%= 1;
     }
 }
 
@@ -130,12 +329,15 @@ fn transfer(
     catalog: *catalog_runtime.CatalogRuntime,
 ) !u64 {
     if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
-    if (!isSafeRelativePath(request.filename) or !isManifestPath(catalog, request.filename))
+    // PXE clients (GRUB, PXELINUX) often send paths with a leading '/';
+    // strip it so the path is relative to the TFTP asset root.
+    const filename = trimLeadingSlash(request.filename);
+    if (!isSafeRelativePath(filename) or !isManifestPath(catalog, filename))
         return error.FileNotAllowed;
 
     var root = try std.Io.Dir.openDirAbsolute(io, asset_root, .{ .access_sub_paths = true });
     defer root.close(io);
-    var file = try root.openFile(io, request.filename, .{
+    var file = try root.openFile(io, filename, .{
         .follow_symlinks = false,
         .resolve_beneath = true,
     });
@@ -158,12 +360,17 @@ fn transfer(
 
     var block: u16 = 1;
     var offset: u64 = 0;
+    // M3.6 下载可观测性：debug 进度在 ACK 之后输出，因此每个数字反映的是
+    // 对端已确认接收的字节数，而非仅仅已排入 UDP 发送队列的字节数。
+    // 按 10% 增量输出进度日志（debug 级别），避免在 info 级别产生过多日志。
+    var next_progress: u64 = if (file_size < 10) file_size else @max(@as(u64, 1), file_size / 10);
     var data: [max_block_size]u8 = undefined;
     while (true) {
         const capacity = data[0..settings.block_size];
         const read = try file.readPositionalAll(io, capacity, offset);
         var out: [max_block_size + 4]u8 = undefined;
         const datagram = try packet.encodeData(&out, block, capacity[0..read]);
+        // 超时重传逻辑与虚拟配置传输相同。
         var attempts: usize = 0;
         while (true) {
             try socket.send(io, remote, datagram);
@@ -178,6 +385,13 @@ fn transfer(
             break;
         }
         offset += read;
+        // 按 10% 增量输出 debug 级别的下载进度日志。
+        while (file_size != 0 and offset >= next_progress) : (next_progress += @max(@as(u64, 1), file_size / 10)) {
+            const reported = @min(offset, file_size);
+            log.debug("download progress {s}: {d}/{d} bytes ({d}%)", .{ request.filename, reported, file_size, (reported * 100) / file_size });
+            if (reported == file_size) break;
+        }
+        // 最后一个 DATA 的负载小于 block_size 时传输完成（RFC 1350 标准）。
         if (read < settings.block_size) return offset;
         block +%= 1;
     }
@@ -336,4 +550,23 @@ test "rejects unsafe TFTP paths" {
     try std.testing.expect(!isSafeRelativePath("../etc/passwd"));
     try std.testing.expect(!isSafeRelativePath("/etc/passwd"));
     try std.testing.expect(!isSafeRelativePath("efi\\grubx64.efi"));
+}
+
+test "identifies virtual GRUB config filenames" {
+    // MAC form
+    try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-ef"));
+    // Hex IP form (uppercase)
+    try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg-C0A81BC8"));
+    // Fallback
+    try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg"));
+    try std.testing.expect(isVirtualGrubConfig("/efi/grub.cfg-C0A81BC8"));
+    // Non-matching
+    try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-ef-extra"));
+    try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-XYZ"));
+    try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-c0a81bc8"));
+    try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-01-02-AA-bb-cc-dd-ef"));
+    try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-gg"));
+    try std.testing.expect(!isVirtualGrubConfig("efi/grubaa64.efi"));
+    try std.testing.expect(!isVirtualGrubConfig("grub.cfg"));
+    try std.testing.expect(!isVirtualGrubConfig("../etc/grub.cfg"));
 }

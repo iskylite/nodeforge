@@ -236,6 +236,14 @@ fn validateBootBundles(config: *const model.AppConfig, catalog: *const model.Cat
     }
 }
 
+/// M3.6：校验 install profile 与 InstallSourceConfig、diskless profile 与
+/// BootBundleConfig 的 distro/version/arch 三元组完全相同。
+/// 这拒绝“Ubuntu profile 引 Rocky source”或“aarch64 profile 引 x86_64 source”
+/// 等配置错误，防止启动时加载不兼容的 kernel/initrd。
+///
+/// install profile 还必须显式标记 destructive=true 与 persistent_writes=true，
+/// 因为安装会擦写磁盘。diskless profile 不允许 destructive=true，
+/// 因为无盘模式不应写本地磁盘。
 fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     for (config.profiles) |profile| {
         _ = lookup.findDistroVersion(config, profile.distro, profile.version, profile.arch) orelse
@@ -249,18 +257,26 @@ fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalo
             },
             .install => {
                 const name = profile.install_source orelse return error.MissingInstallSource;
-                if (profile.boot_bundle != null or lookup.findInstallSource(catalog, name) == null)
+                const source = lookup.findInstallSource(catalog, name) orelse return error.InvalidProfileSource;
+                if (profile.boot_bundle != null or !sameTuple(profile.distro, profile.version, profile.arch, source.distro, source.version, source.arch))
                     return error.InvalidProfileSource;
-                if (!profile.safety.destructive) return error.InvalidProfileSafety;
+                if (!profile.safety.destructive or !profile.safety.persistent_writes) return error.InvalidProfileSafety;
             },
             .diskless => {
                 const name = profile.boot_bundle orelse return error.MissingBootBundle;
-                if (profile.install_source != null or lookup.findBootBundle(catalog, name) == null)
+                const bundle = lookup.findBootBundle(catalog, name) orelse return error.InvalidProfileSource;
+                if (profile.install_source != null or !sameTuple(profile.distro, profile.version, profile.arch, bundle.distro, bundle.version, bundle.arch))
                     return error.InvalidProfileSource;
                 if (profile.safety.destructive) return error.InvalidProfileSafety;
             },
         }
     }
+}
+
+/// 比较两组 distro/version/arch 三元组是否完全相同。
+/// M3.6 要求 profile 与其引用的 source/bundle 三元组严格匹配。
+fn sameTuple(distro: []const u8, version: []const u8, arch: model.Arch, other_distro: []const u8, other_version: []const u8, other_arch: model.Arch) bool {
+    return std.mem.eql(u8, distro, other_distro) and std.mem.eql(u8, version, other_version) and arch == other_arch;
 }
 
 fn validateNodes(config: *const model.AppConfig) ValidationError!void {
@@ -288,7 +304,10 @@ fn inDhcpSubnet(cidr: []const u8, ip: u32) bool {
 }
 
 fn ipv4Value(address: std.Io.net.IpAddress) u32 {
-    return switch (address) { .ip4 => |ip| std.mem.readInt(u32, &ip.bytes, .big), else => unreachable };
+    return switch (address) {
+        .ip4 => |ip| std.mem.readInt(u32, &ip.bytes, .big),
+        else => unreachable,
+    };
 }
 
 fn prefixMask(prefix: u6) u32 {
@@ -356,6 +375,26 @@ test "最小配置和空 catalog 有效" {
 test "DHCP requires an explicit PXE interface" {
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" } };
     try std.testing.expectError(error.DhcpBindInterfaceRequired, validateConfig(&config));
+}
+
+test "install profile must match its install source tuple" {
+    const config: model.AppConfig = .{
+        .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" },
+        .distros = &.{
+            .{ .name = "rocky", .family = .rhel, .versions = &.{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }} },
+            .{ .name = "ubuntu", .family = .ubuntu, .versions = &.{.{ .version = "22.04", .archs = &.{.aarch64}, .install_adapter = .autoinstall, .package_manager = .apt }} },
+        },
+        .profiles = &.{.{ .name = "wrong-profile", .mode = .install, .distro = "ubuntu", .version = "22.04", .arch = .aarch64, .install_source = "rocky-source", .safety = .{ .destructive = true } }},
+    };
+    const catalog: model.Catalog = .{
+        .assets = &.{
+            .{ .name = "rocky-iso", .kind = .iso, .path = "iso/rocky.iso", .distro = "rocky", .version = "9.7", .arch = .aarch64 },
+            .{ .name = "rocky-kernel", .kind = .kernel, .path = "install/rocky/vmlinuz", .distro = "rocky", .version = "9.7", .arch = .aarch64 },
+            .{ .name = "rocky-initrd", .kind = .installer_initrd, .path = "install/rocky/initrd.img", .distro = "rocky", .version = "9.7", .arch = .aarch64 },
+        },
+        .install_sources = &.{.{ .name = "rocky-source", .distro = "rocky", .version = "9.7", .arch = .aarch64, .source_asset = "rocky-iso", .installer_kernel = "rocky-kernel", .installer_initrd = "rocky-initrd" }},
+    };
+    try std.testing.expectError(error.InvalidProfileSource, validate(&config, &catalog));
 }
 
 test "拒绝 IPv6 和非法 HTTP 端口" {

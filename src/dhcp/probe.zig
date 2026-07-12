@@ -1,10 +1,9 @@
-//! Minimal ICMP Echo probe used before advertising a DHCPv4 address.
+//! 在广告 DHCPv4 地址前使用的最小化 ICMP Echo 探测器。
 //!
-//! The DHCP server has already selected a candidate when it calls this module,
-//! but it must not send the OFFER until this probe is clear. A matching Echo
-//! Reply means another host owns the address. Raw-socket or I/O failure is not
-//! the same as a clear result: the caller must withhold the OFFER and cancel
-//! that pending allocation rather than risk an address collision.
+//! DHCP server 调用本模块时已选定候选地址，但在探测通过前不得发送 OFFER。
+//! 收到匹配的 Echo Reply 表示另一台主机已占用该地址。Raw socket 或 I/O
+//! 失败不等同于探测通过：调用方必须扣留 OFFER 并取消该待定分配，
+//! 而非冒地址碰撞的风险。
 const std = @import("std");
 
 pub const Result = enum {
@@ -16,10 +15,9 @@ pub const Result = enum {
     unavailable,
 };
 
-/// Send one ICMPv4 Echo Request and wait no longer than `timeout_ms` in total.
-/// The sequence derives from the candidate IPv4 address; together with the
-/// fixed identifier it prevents unrelated ICMP traffic being treated as proof
-/// that this particular address is occupied.
+/// 发送一个 ICMPv4 Echo Request，总等待时间不超过 `timeout_ms`。
+/// 序列号从候选 IPv4 地址派生；与固定标识符一起，防止无关 ICMP 流量
+/// 被误判为该地址已被占用的证据。
 pub fn ping(io: std.Io, ip: u32, timeout_ms: u16) Result {
     const source = std.Io.net.IpAddress.parseIp4("0.0.0.0", 0) catch return .unavailable;
     var socket = source.bind(io, .{ .mode = .raw, .protocol = .icmp }) catch return .unavailable;

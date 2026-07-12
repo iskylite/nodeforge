@@ -24,8 +24,8 @@ pub const Event = struct {
     fields: []const Field = &.{},
 };
 
-/// Version-neutral reader representation. v1 has no `fields` in the current
-/// writer format, but older manually-created records may retain a top-level node.
+/// 版本无关的读取器表示。v1 在当前写入格式中没有 `fields`，
+/// 但旧的手动创建记录可能保留顶层 node 字段。
 pub const ReadEvent = struct {
     v: u8 = 1,
     ts: []const u8,

@@ -17,9 +17,9 @@ pub const LeasesFile = struct {
     leases: []const runtime.DhcpLease,
 };
 
-/// Legacy `runtime.json` schema (schema 1/2) accepted only for migration.
-/// Contains both leases and statuses; the loader extracts leases and ignores
-/// the status portion (handled independently by `status_store.zig`).
+/// 旧版 `runtime.json` schema（schema 1/2），仅用于迁移时接受。
+/// 同时包含 lease 和 status；加载器只提取 lease 并忽略 status 部分
+///（status 由 `status_store.zig` 独立处理）。
 pub const LegacyRuntimeFile = struct {
     schema_version: u32 = 2,
     saved_at: i64 = 0,
@@ -27,9 +27,8 @@ pub const LegacyRuntimeFile = struct {
     statuses: []const node_status.Status = &.{},
 };
 
-/// Atomically saves the DHCP lease snapshot to `leases.json`.
-/// The caller must have already obtained a consistent snapshot under the
-/// DhcpState mutex (via `snapshotWithGeneration`).
+/// 原子保存 DHCP lease 快照到 `leases.json`。
+/// 调用方必须已在 DhcpState mutex 下获取一致快照（通过 `snapshotWithGeneration`）。
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, leases: *const [runtime.DhcpState.max_leases]runtime.DhcpLease, now: i64) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -38,7 +37,7 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, leases: 
     try atomicWrite(io, path, output.written());
 }
 
-/// Loads `leases.json` and restores non-expired leases into `state`.
+/// 加载 `leases.json` 并将未过期的 lease 恢复到 `state` 中。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, state: *runtime.DhcpState, now: i64) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
@@ -52,8 +51,8 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, state: *
     state.restore(&snapshot);
 }
 
-/// Migrates leases from a legacy `runtime.json` file.  Only the lease portion
-/// is extracted; the status portion is handled by `status_store.zig`.
+/// 从旧版 `runtime.json` 文件迁移 lease。只提取 lease 部分；
+/// status 部分由 `status_store.zig` 处理。
 pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8, state: *runtime.DhcpState, now: i64) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
@@ -67,8 +66,8 @@ pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
     state.restore(&snapshot);
 }
 
-/// Shared single-file durability protocol: write temp, fsync temp, rename,
-/// fsync parent directory.
+/// 共享的单文件持久化协议：写入临时文件、fsync 临时文件、rename、
+/// fsync 父目录。
 pub fn atomicWrite(io: std.Io, path: []const u8, content: []const u8) !void {
     const dir = std.Io.Dir.cwd();
     const temp = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp", .{path});
@@ -84,9 +83,8 @@ pub fn atomicWrite(io: std.Io, path: []const u8, content: []const u8) !void {
     try syncParentDirectory(io, path);
 }
 
-/// Persists the directory entry created by `rename`, completing the atomic
-/// replacement protocol on filesystems that require an explicit directory
-/// sync after file data has reached disk.
+/// 持久化 `rename` 创建的目录项，完成原子替换协议。
+/// 某些文件系统在文件数据到达磁盘后需要显式同步目录才能使 rename 生效。
 fn syncParentDirectory(io: std.Io, path: []const u8) !void {
     const parent_path = std.fs.path.dirname(path) orelse return;
     var parent = try std.Io.Dir.openFileAbsolute(io, parent_path, .{ .allow_directory = true });

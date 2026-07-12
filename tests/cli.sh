@@ -44,6 +44,14 @@ grep -Fq 'Distro name, used with --version and --arch; e.g. rocky' "$tmp/asset-i
 grep -Fq 'Distro version, used with --distro and --arch; e.g. 9.7' "$tmp/asset-import-help"
 grep -Fq 'Architecture, used with --distro and --version; e.g. aarch64' "$tmp/asset-import-help"
 
+"$cli" install-source import --help >"$tmp/install-source-import-help"
+grep -Fq 'Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso' "$tmp/install-source-import-help"
+grep -Fq 'Optional detected-distro check; e.g. ubuntu' "$tmp/install-source-import-help"
+if grep -Fq 'relative to /opt/nodeforge/work/import' "$tmp/install-source-import-help"; then
+    echo "install-source import must accept an arbitrary ISO path" >&2
+    exit 1
+fi
+
 for command in \
     "status" \
     "check" \

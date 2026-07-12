@@ -51,7 +51,7 @@ CLI 使用仓库内固定的 `zli v5.1.2`。命令、参数、默认值和说明
 
 M0 只有一个 HTTP listener，默认端口 `8080`，当前提供健康检查和管理 API；M3 的 PXE HTTP
 数据路由将复用该端口。
-listener 绑定 `0.0.0.0:<http_port>`，管理路由接受所有能到达该端口的 IPv4 客户端，不做
+listener 绑定 `0.0.0.0:<http_port>`，管理路由只接受本机 `127.0.0.1`，不做
 peer 来源检查。`nodeforge` CLI 固定通过 `127.0.0.1:<http_port>` 调用管理接口，不提供远程
 endpoint 参数，因此 CLI 只支持管理同机 `nodeforged`。M0 管理 API 尚无鉴权和 TLS，部署时
 必须限制在受信任网络；后续若作为正式远程管理接口使用，需要单独设计鉴权、TLS 和审计。

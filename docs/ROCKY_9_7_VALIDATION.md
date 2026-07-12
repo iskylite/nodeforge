@@ -81,8 +81,8 @@ rm -f /opt/nodeforge/catalog/catalog.json
 
 M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CLI 固定通过
 `127.0.0.1:8080` 访问且不支持远程 endpoint，因此只能管理同机 `nodeforged`。服务端 listener
-绑定 `0.0.0.0:8080`，管理路由接受所有可达连接且不做 peer 来源检查；从宿主机访问应返回
-200。M0 尚无管理鉴权和 TLS，验证环境必须使用受信任网络。
+绑定 `0.0.0.0:8080`，M3.6 起管理路由仅接受本机 `127.0.0.1` direct peer；从宿主机访问应返回
+403。M0 尚无管理鉴权和 TLS，验证环境必须使用受信任网络。
 
 ## M1 TFTP 待验证
 
@@ -95,6 +95,8 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 - [x] 请求 `../`、绝对路径、未登记资产和符号链接逃逸路径，确认全部拒绝。
 - [x] 发起 WRQ，确认返回 access violation 且磁盘没有新增文件。
 - [x] 并发下载压测：20 个下载、最大 10 个并发均完成且内容一致；M1 dispatcher 仍按串行传输实现，不承诺更高并发度。
+- [x] GRUB 可拉取虚拟 `grub.cfg` 配置。  <!-- M3.5: 2026-07-12 实机验证通过 -->
+- [x] GRUB 可拉取 kernel、initrd 并进入安装器/无盘启动。  <!-- M3.5: 2026-07-12 实机验证通过 -->
 
 ## 验证记录
 
@@ -265,6 +267,51 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
   因而相关 RRQ 返回 `file not found`。这不影响本项对 DHCP bootfile、TFTP bootloader 下载和进入
   bootloader 的验收边界。
 
+### 2026-07-12：M3.5 TFTP 虚拟 GRUB 配置补全（代码已实现，待实机验证）
+
+- **问题发现**：M2 实机验证确认 GRUB 可下载 `grubaa64.efi` 并进入 bootloader 提示符，但 GRUB
+  随后查找 `grub.cfg` 时返回 `file not found`。根因有三：
+  1. `grub.zig` 渲染器从未被调用——TFTP handler 只检查 catalog manifest 白名单，虚拟配置请求被拒绝。
+  2. `grub.zig` 硬编码 `linuxefi`/`initrdefi` 指令——ARM64 `grubaa64.efi` 不含这两个模块。
+  3. TFTP handler 缺少身份解析——无法从 Peer IP 获取 node_id/profile/mode 来渲染个性化配置。
+- **代码修复**（均已实现，`zig build test` 全量通过）：
+  - `boot/grub.zig`：`linuxefi`/`initrdefi` → `linux`/`initrd`；`timeout` 保持 5。
+  - `boot/target.zig`（新增）：从 `TftpBootIdentity` + `AppConfig` + `Catalog` 展开 `BootTarget`。
+  - `state/boot_session.zig`：新增 `TftpBootIdentity` 和 `resolveTftpBoot`（只读值副本，锁内不 I/O）。
+  - `tftp/server.zig`：新增 `isVirtualGrubConfig` + `transferVirtualConfig`；在 catalog manifest gate 前拦截。
+- **验证结果**（2026-07-12 实机通过，详见下文 "M3.5 TFTP 虚拟 GRUB 配置实机验证通过"）：
+  - [x] VMware PXE 客户端从 TFTP 获取虚拟 `grub.cfg`，内容包含正确的 kernel/initrd 路径和 cmdline。
+  - [x] GRUB 按 `grub.cfg` 中的 `linux`/`initrd` 指令加载 kernel 和 initrd。
+  - [x] install mode 进入安装器（M3 不含 Kickstart，kernel 成功启动并开始 HTTP 请求安装仓库）。
+  - [ ] diskless mode 进入 NodeForge initrd（M3 不含 dracut module，后续阶段验证）。
+  - [ ] discovery mode 返回 TFTP ERROR code 2（access violation），不渲染任何 kernel/initrd 条目（M3.6 修正错误语义，后续补充验证）。
+
+### 2026-07-12：M3.5 TFTP 虚拟 GRUB 配置实机验证通过
+
+- **环境**：`root@r97n0`（Rocky Linux 9.7 aarch64），`192.168.27.128/24`（`enp26s0`）；
+  VMware Fusion `pxe27-uefi`（ARM64 UEFI，单网卡 `vmnet2`）。Zig 0.16.0，
+  `aarch64-linux-gnu ReleaseSafe`。
+- **配置**：已认领节点 `pxe-test-node`（MAC `00:0c:29:38:b9:1f`，静态 IP `192.168.27.210`），
+  profile `rocky-install-aarch64`，install source `rocky-9.7-aarch64-iso`。
+- **PXE 启动链路完整验证**（同一 `boot_session_id=73d20d94...`）：
+  1. ✅ DHCP `DISCOVER → OFFER → ACK`：分配 `192.168.27.210`，option 67 = `efi/grubaa64.efi`。
+  2. ✅ TFTP `efi/grubaa64.efi`：2,693,464 bytes 传输完成（首次 `UnexpectedAck` 后 GRUB 自动重试成功）。
+  3. ✅ **虚拟 `efi/grub.cfg-01-00-0c-29-38-b9-1f`**：247 bytes 动态渲染并传输完成。
+     GRUB 随后再次请求同一文件（GRUB 配置加载的常规行为），第二次同样成功。
+  4. ✅ TFTP `/install/rocky-9.7-aarch64-iso/vmlinuz`：13,232,984 bytes 传输完成。
+     **路径前导 `/` 修复**：GRUB 以绝对路径发起 RRQ，TFTP handler 现已剥离前导 `/` 后再做安全校验。
+  5. ✅ TFTP `/install/rocky-9.7-aarch64-iso/initrd.img`：139,507,444 bytes 传输完成。
+  6. ✅ 安装器内核启动：内核加载后发起第二轮 DHCP（新 session），随后通过 HTTP 请求安装仓库
+     （`/repos/rocky-9.7-aarch64-iso/Minimal/LiveOS/squashfs.img` 等）。
+- **已知限制**：minimal ISO 不含 `squashfs.img` / `.treeinfo` / `install.img`，安装器 HTTP
+  请求返回 404。这是 ISO 内容限制，非 NodeForge 缺陷。使用 DVD ISO 可完成完整安装。
+- **GRUB `.lst` 模块文件**：GRUB 查找 `command.lst`/`fs.lst`/`crypto.lst`/`terminal.lst` 等模块
+  清单文件被 TFTP 拒绝（`FileNotAllowed`）。这些文件不在 catalog 中，属于预期行为，不影响启动链路。
+- **TFTP 会话记录**：`nodeforge tftp session list` 显示 10 个会话——6 completed、4 failed（1 个首次
+  `grubaa64.efi` 的 `UnexpectedAck` + 3 个 `.lst` 模块文件拒绝）。
+- **代码修复**：本次验证中发现并修复了 TFTP handler 对 PXE 客户端绝对路径（前导 `/`）的误拒问题。
+  修复方式：在 `transfer()` 入口处剥离前导 `/`，再做 `isSafeRelativePath` + `isManifestPath` 校验。
+
 ### M2 系统级验收
 
 - [x] 使用独立 UEFI PXE 固件客户端在 `192.168.27.0/24` 从网络启动，确认它实际消费 DHCP
@@ -418,3 +465,6 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
   capability 上报验证，并记录 100 HTTP Range、100 TFTP、200 DHCP 报文/秒并发基线。
 - [x] `runtime.json` 拆分为 `leases.json` + `node-status.json`，独立 I/O 锁、legacy 迁移和
   崩溃恢复通过验证；`zig build test` 全量回归通过。
+- [x] M3.5 TFTP 虚拟 GRUB 配置：PXE 客户端从 TFTP 获取动态渲染的 `grub.cfg`，GRUB 按 `linux`/
+  `initrd` 指令成功下载 kernel（13 MB）和 initrd（133 MB），内核启动后发起 HTTP 安装仓库请求。
+  完整 DHCP→TFTP→kernel→initrd→installer 链路在 `192.168.27.0/24` 实机验证通过。

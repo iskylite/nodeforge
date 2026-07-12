@@ -34,21 +34,31 @@ pub const provisioned_dir = install_root ++ "/provisioned";
 pub const run_dir = install_root ++ "/run";
 /// 构建、导入、解包等可清理工作目录。
 pub const work_dir = install_root ++ "/work";
-/// Administrator-staged ISO input directory. M3 import accepts only a single
-/// relative regular filename below this root.
+/// Daemon 管控的 ISO 临时暂存目录。
+///
+/// M3.6 安全设计：CLI 接受管理员指定的任意本地 ISO 路径后，先将文件原子复制
+/// 到此受管目录，然后仅向本机 daemon 的管理端点传递生成的不透明文件名
+///（不含路径前缀）。这样常驻特权 daemon 永远不会接触任意 host 路径，
+/// 既改善了 UX（用户不用手动把 ISO 放到固定位置），又不把任意文件系统
+/// 访问能力交给网络服务。CLI 完成导入后负责删除临时副本。
 pub const import_dir = work_dir ++ "/import";
 
 pub const config_path = config_dir ++ "/config.json";
 pub const catalog_path = catalog_dir ++ "/catalog.json";
 pub const runtime_path = state_dir ++ "/runtime.json";
-/// M3.1 DHCP lease snapshot; replaces the lease portion of `runtime.json`.
+/// M3.1 DHCP lease 快照文件路径；取代了 `runtime.json` 中的 lease 部分。
+/// 该文件由 DHCP checkpoint worker 周期性写入，用于持久化当前活动租约。
 pub const leases_path = state_dir ++ "/leases.json";
-/// M3.1 node-status snapshot; replaces the status portion of `runtime.json`.
+/// M3.1 节点状态快照文件路径；取代了 `runtime.json` 中的状态部分。
+/// 该文件由 HTTP 管理路由在节点状态变更时写入，使用独立的 I/O 锁避免
+/// 与 DHCP checkpoint worker 的 lease 文件锁竞争。
 pub const node_status_path = state_dir ++ "/node-status.json";
 pub const events_path = logs_dir ++ "/events.jsonl";
 pub const service_log_path = logs_dir ++ "/nodeforged.log";
 pub const service_path = systemd_dir ++ "/nodeforged.service";
 
+// 验证所有派生路径都以安装根 `/opt/nodeforge` 为前缀。
+// 这是防止路径拼接错误导致文件写入非预期位置的基础回归测试。
 test "default paths are derived from the install root" {
     const std = @import("std");
 

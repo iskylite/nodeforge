@@ -28,7 +28,7 @@ NodeForge 是一个面向小型 Linux 集群和实验室环境的轻量级 OS Pr
 | 主题 | 收敛结论 |
 | --- | --- |
 | 产品形态 | 单机单进程 PXE Boot Provisioning appliance，不做完整集群管理平台 |
-| 内置服务 | Zig 实现 DHCP/TFTP/HTTP，HTTP 只保留一个 listener；管理路由接受所有可达连接，CLI 固定通过 `127.0.0.1` 管理同机服务 |
+| 内置服务 | Zig 实现 DHCP/TFTP/HTTP，HTTP 只保留一个 listener；PXE 数据路由对服务网开放，管理路由只接受 loopback，CLI 固定通过 `127.0.0.1` 管理同机服务 |
 | PXE 链路 | MVP 支持 UEFI x86_64 和 UEFI aarch64；当前先在 Rocky Linux 9.7 ARM 环境开发验证，生产验收优先 x86_64；BIOS x86 后续补齐 |
 | 发行版范围 | 只适配 Ubuntu Server 22.04 及之后版本和 RHEL 系；RHEL/CentOS 系优先 Rocky Linux，再兼容 RHEL、Alma、Fedora |
 | 安装机制 | Ubuntu Server 使用 autoinstall / cloud-init NoCloud-Net；RHEL 系使用 kickstart，优先 Rocky Linux |
@@ -52,7 +52,7 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 核心目标：
 
 - 在独立 PXE 管理网段或 PXE VLAN 中为裸机节点提供 DHCP 地址分配和 PXE 启动入口。
-- 通过 TFTP 分发 bootloader、bootloader 配置、kernel 和 initrd。
+- 通过 TFTP 分发 bootloader、虚拟 bootloader 配置（按节点身份即时渲染）、kernel 和 initrd。
 - M0 通过唯一 HTTP listener 提供健康检查和管理接口；M3 在同一 listener 分发无人值守安装配置、rootfs、ISO、repo、系统镜像和节点事件。
 - 支持两条一等公民路径：
   - PXE 无人值守自动安装到本地磁盘。
@@ -95,7 +95,7 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 - **端口固定**：DHCP 固定监听 `UDP 67`，TFTP 固定监听 `UDP 69`。这两个端口是源码常量，不提供配置项、CLI 参数或运行时覆盖参数。
 - **发现安全**：未知节点身份可以从租约池获得临时 IP，并按 `dhcp.discovery.default_action` 进入等待、discovery 或显式允许的临时无盘；未知节点不能执行自动安装。MVP 以 MAC 为主要身份，保留 DHCP client id 和 SN 作为辅助信息。
 - **HTTP 单监听简化**：MVP 只启动一个 HTTP listener，固定绑定 `0.0.0.0:<http.port>`。M0 先提供健康检查和管理 API，M3 的 PXE 数据 API 将复用同一 HTTP 实现、连接循环和路由入口。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。DHCPv4 Linux 部署必须设置 `server.bind_interface`，用于以 `SO_BINDTODEVICE` 约束 DHCP 广播；CLI 管理客户端写死访问 `127.0.0.1:<http.port>`，不做远程管理发现和多管理端点配置。
-- **管理端口约定**：MVP 不引入独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`。listener 绑定所有 IPv4 接口，管理路由不检查 peer 来源，因此接受所有能到达该端口的连接。`nodeforge` CLI 固定连接 `127.0.0.1:<http.port>` 且不提供远程 endpoint，只支持管理同机 `nodeforged`。端口冲突时修改 `config.json` 后重启服务。
+- **管理端口约定**：MVP 不引入独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`；listener 绑定所有 IPv4 接口，但 `/api/v1/management/` 仅接受 direct peer `127.0.0.1`，远端请求稳定返回 403。`nodeforge` CLI 固定连接 `127.0.0.1:<http.port>` 且不提供远程 endpoint，只支持管理同机 `nodeforged`。端口冲突时修改 `config.json` 后重启服务。
 - **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 只做 status/check、config/catalog 校验与导出、离线 config import。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
 - **CLI 使用成熟库**：命令解析、帮助信息、参数类型、默认值和错误提示使用固定版本的开源 CLI 库。MVP 固定使用支持 Zig 0.16.0 的 `zli v5.1.2`；命令、子命令、flag、位置参数和说明只在命令树中声明一次，解析与分级帮助从同一份声明生成。zli 只承载 CLI 语法和展示，不承载复杂业务配置模型。
 - **CLI 帮助可达**：顶层、每个资源命令和每个子命令都必须支持 `-h/--help`，显示用途、参数和默认值；长示例保留在 README 和运维文档，不塞进帮助页。
@@ -157,7 +157,7 @@ M0 参数规则是命令局部而非 persistent/global：`nodeforge` 根命令�
 
 | 能力 | 配置对象 | 运行态对象 | 主要命令 | MVP 验收点 |
 | --- | --- | --- | --- | --- |
-| TFTP 启动资产 | `tftp`、`asset` | `tftp_session` | `tftp show`、`tftp session list` | 节点能拉取 bootloader、配置、kernel、initrd |
+| TFTP 启动资产 | `tftp`、`asset` | `tftp_session` | `tftp show`、`tftp session list` | 节点能拉取 bootloader、虚拟 `grub.cfg`、kernel、initrd（M3.5 代码已实现，待实机验证） |
 | DHCP 地址分配 | `dhcp`、`node`、`policy` | `lease`、`unknown_client` | `dhcp network update`、`dhcp pool update`、`runtime leases list` | 未知节点可获临时 lease，已登记节点拿正确 IP |
 | PXE 启动入口 | `node`、`profile`、`asset` | `node_status`、`event` | `node status`、`asset list` | DHCP 返回正确 `next-server` 和 `bootfile` |
 | HTTP 配置和资产 | `http`、`asset`、`profile` | `event` | `asset import`、`events list/follow` | initrd/installer 能获取配置并上报事件 |
@@ -219,7 +219,7 @@ flowchart TD
   B --> C["NodeForge DHCP 分配 IP 并返回 next-server / bootfile"]
   C --> D["TFTP 获取 bootloader"]
   D --> E["进入 GRUB 或 PXELINUX"]
-  E --> F["TFTP 获取 bootloader 配置 / kernel / initrd"]
+  E --> F["TFTP 获取虚拟 grub.cfg / kernel / initrd"]
   F --> G["HTTP 获取节点配置或 answer file"]
   G --> H{"profile.mode"}
   H --> I["install: 进入发行版 installer"]
@@ -773,7 +773,7 @@ M3 的节点侧 HTTP 认证结果必须绑定已认领 node、活动 `boot_sessi
 kernel cmdline、日志、事件或持久 runtime；daemon 重启后旧 session 必须失效。`/images` 与 `/repos` 可以只读
 公开，但只能发布 catalog allowlist 的资源；`/rootfs` 和所有节点 API 必须经过 session 认证。
 
-MVP 不再拆分 management listener 和 PXE listener。管理路由与 M3 PXE 数据路由逻辑分区，但共享同一个 HTTP listener。M0 当前只注册 `/healthz` 和管理路由；M3 才在同一 socket 提供裸机可通过 `server.server_ip` 访问的数据路由。本 listener 固定绑定 `0.0.0.0:<http.port>`；`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址，不作为 M0 HTTP bind 地址。服务端不按 peer 地址过滤管理请求，所有能到达该 listener 的 IPv4 客户端都可直接调用管理路由；`nodeforge` CLI 则固定连接 `127.0.0.1:<http.port>`，不提供远程 endpoint，只支持管理同机 `nodeforged`。这样可以减少 socket 生命周期、端口自检、路由注册和 CLI 连接配置的复杂度，前期把精力集中在 provisioning 主链路。
+MVP 不再拆分 management listener 和 PXE listener。管理路由与 M3 PXE 数据路由逻辑分区，但共享同一个 HTTP listener。M0 当前只注册 `/healthz` 和管理路由；M3 才在同一 socket 提供裸机可通过 `server.server_ip` 访问的数据路由。本 listener 固定绑定 `0.0.0.0:<http.port>`；`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址，不作为 M0 HTTP bind 地址。`/api/v1/management/` 在 route 入口按 direct peer 严格限制为 `127.0.0.1`，不能由 `X-Forwarded-For` 绕过；`nodeforge` CLI 固定连接该地址，不提供远程 endpoint。这样保留唯一 socket，同时不把 catalog 写入和 loop-mount 权限暴露到 PXE 网段。
 
 HTTP 服务器基于 Zap/facil.io 的固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile；M3 在把已验证 descriptor 交给 sendfile 前解析单 Range/`If-Range`，并只使用受管 SHA256 ETag，不依赖 facil.io 的文件时间/长度 ETag。M0 尚未注册静态资产或 Range 路由，M3 再将这些能力接入 NodeForge 路由。NodeForge 当前只维护业务路由、管理 API 和统一错误信封。已评估的纯 Zig `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 
@@ -1094,7 +1094,7 @@ pxe_seen
 
 `catalog.json` 是 NodeForge 管理的资产和语义目录事实源，不鼓励手写。M0 只支持其读取、导出和跨文件校验；不提供 catalog 修改命令。M1+ 中它记录通过导入、构建、扫描和发布产生的 asset、repository、install source、rootfs、initrd、boot bundle；届时由 `asset import`、`install-source import`、`rootfs package`、`initrd build`、`boot-bundle publish` 等命令发起，而实际扫描、校验、原子写回和内存视图更新仍由 `nodeforged` 完成。
 
-管理接口复用唯一 HTTP listener，并接受该 listener 上所有可达连接，不按来源地址过滤。`nodeforge` CLI 的管理客户端固定请求 `127.0.0.1:<http.port>`，不读取配置中的管理地址，也不支持远程管理地址参数，因此只支持管理同机 `nodeforged`。其他客户端可以直接调用可达的 HTTP 管理路由，但 M0 不将其作为具备鉴权、TLS 和审计的正式远程管理方案。MVP 不再并列设计 Unix socket、独立 RPC、第二个 HTTP listener 或独立 `management_port`，减少协议、端口和客户端实现分叉。
+管理接口复用唯一 HTTP listener，但 `/api/v1/management/` 仅接受 direct peer `127.0.0.1`；`nodeforge` CLI 的管理客户端也固定请求该地址，不读取配置中的管理地址，也不支持远程管理地址参数。远程管理需要未来明确的 TLS、认证和授权设计，不能借用 PXE listener 绕过。MVP 不再并列设计 Unix socket、独立 RPC、第二个 HTTP listener 或独立 `management_port`，减少协议、端口和客户端实现分叉。
 
 ### 9.2 配置与 CLI 分工
 
@@ -1618,10 +1618,10 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 
 ## 11. 安全设计
 
-- M0 的 HTTP listener 固定绑定 `0.0.0.0:<http.port>`；管理路由接受所有可达连接且不做 peer 来源检查；CLI 固定连接 `127.0.0.1:<http.port>`，只支持管理同机 `nodeforged`。
+- M0 的 HTTP listener 固定绑定 `0.0.0.0:<http.port>`；M3.6 起管理路由仅接受 `127.0.0.1` direct peer；CLI 固定连接该地址，只支持管理同机 `nodeforged`。
 - 不建议在办公网或已有生产 DHCP 网络上直接开启 authoritative 模式。
 - DHCP/TFTP 固定标准端口，需要 root 权限或 Linux capability；启动后可降权。
-- 管理 API 复用唯一 HTTP listener，不检查 peer 来源且没有鉴权或 TLS，部署时必须限制在受信任网络。
+- 管理 API 复用唯一 HTTP listener，但 M3.6 在 route 入口限制为 `127.0.0.1` direct peer；远端管理需要未来明确的 TLS、认证和授权设计。
 - TFTP 只读，路径沙箱，禁止目录穿越。
 - HTTP asset 路径基于 manifest 和 root 目录映射，不直接暴露任意文件。
 - discovery profile 默认不执行擦盘、格式化或自动安装。
@@ -1636,7 +1636,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 实现约束：
 
 - 只支持 IPv4；不定义 IPv6 配置字段，不监听 DHCPv6，不在 initrd 中加入 IPv6 分支。
-- 一个 HTTP 实现只启动一个 listener，绑定 `0.0.0.0:http.port`；管理路由接受该 listener 上所有可达连接；CLI 管理客户端固定连接 `127.0.0.1:http.port`，只支持同机 `nodeforged`；不设置独立 `management_port`；`server.server_ip` 用于对外 URL、DHCP next-server、TFTP/HTTP 广告地址。
+- 一个 HTTP 实现只启动一个 listener，绑定 `0.0.0.0:http.port`；管理路由只接受 `127.0.0.1` direct peer，CLI 管理客户端固定连接同一地址；不设置独立 `management_port`；`server.server_ip` 用于对外 URL、DHCP next-server、TFTP/HTTP 广告地址。
 - HTTP 服务器基于 Zap/facil.io 的固定提交实现；Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile。M3 在交给 sendfile 前自行解析单 Range/`If-Range`，并只发出受管 SHA256 ETag，避免采用 facil.io 的文件时间/长度 ETag。M0 尚未注册静态资产或 Range 路由，M3 再接入；NodeForge 当前只维护业务路由、管理 API 和统一错误信封。纯 Zig `http.zig` 的 Zig 0.16 分支尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 - M0 的 `nodeforged --check` 在启动前检查配置/catalog 和唯一 HTTP 端口；正常启动不以预检替代实际 bind，仍由 Zap `listen()` 处理竞态和端口冲突。UDP 67/69、权限、资产目录、TFTP、DHCP resolver、repository 和 state 检查随对应阶段补齐。
 - M3 把每个节点请求归一化为 server-side `AuthenticatedNodeSession`，再决定 node、profile、mode、状态更新与 Event fields；URL、body、`X-Forwarded-For` 和客户端 event type 绝不直接成为事实。`node_status` 是持久 runtime 投影，Event v2 是审计；daemon 重启保留最后投影但使旧 session 失效，由 trace 显示重启边界。
@@ -1853,7 +1853,7 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 | 发行版支持范围 | 只适配 Ubuntu Server 22.04+ 和 RHEL/CentOS 系；RHEL/CentOS 系优先 Rocky Linux |
 | 配置是否上数据库 | 否，MVP 使用内存结构体 + `config.json` + `catalog.json`；M3.1 的 leases/node-status snapshots 与 events.jsonl 独立 |
 | 配置文件格式 | MVP 的 config、catalog、runtime 事实源均为 JSON；YAML 后续最多作为导入/导出格式，不作为内部事实源 |
-| 管理接口 | 复用唯一 HTTP listener，接受所有可达连接；CLI 固定访问 `127.0.0.1:<http.port>`，只支持管理同机 `nodeforged` |
+| 管理接口 | 复用唯一 HTTP listener；M3.6 起仅接受 `127.0.0.1` direct peer；CLI 固定访问该地址，只支持管理同机 `nodeforged` |
 | DHCP/TFTP 端口是否可配 | 否，`UDP 67` 和 `UDP 69` 固定，除非改源码 |
 | 是否做无盘系统 | 是，作为核心能力；rootfs 通过 HTTP 获取 |
 | rootfs 推荐模式 | MVP 优先 `squashfs_overlay` |

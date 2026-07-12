@@ -12,13 +12,13 @@ const events = @import("../state/events.zig");
 const observe_log = @import("../observe/log.zig");
 const log = std.log.scoped(.dhcp);
 pub const port = packet.server_port;
-/// Linux delivers `255.255.255.255:67` DHCP broadcasts only to a wildcard
-/// socket, not to one bound solely to `server.server_ip`.  Bind wildcard on
-/// Linux and restrict the socket to the configured PXE NIC so a multihomed
-/// host cannot accidentally answer requests received on its management LAN.
+/// Linux 只将 `255.255.255.255:67` 的 DHCP 广播投递到 wildcard socket，
+/// 而非绑定到 `server.server_ip` 的 socket。在 Linux 上绑定 wildcard 并将
+/// socket 限制到已配置的 PXE NIC，防止多接口主机意外响应管理 LAN 上
+/// 收到的请求。
 ///
-/// Other platforms retain the advertised-address bind for local development;
-/// production DHCP is currently validated and supported on Linux only.
+/// 其他平台保留 advertised-address bind 用于本地开发；
+/// 生产 DHCP 目前仅在 Linux 上验证和支持。
 pub fn bind(io: std.Io, server_ip: []const u8, bind_interface: ?[]const u8) !std.Io.net.Socket {
     const address_text = if (builtin.os.tag == .linux) "0.0.0.0" else server_ip;
     const address = try std.Io.net.IpAddress.parseIp4(address_text, port);
@@ -115,9 +115,9 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const mode
     }
 }
 
-/// Ensure an offer is conflict-free before it can leave the process. A failed
-/// raw ICMP probe produces no DHCP reply; treating it as a clear probe would
-/// allow a lease collision on hosts lacking CAP_NET_RAW.
+/// 确保 OFFER 在离开进程前是无冲突的。原始 ICMP 探测失败时不产生
+/// DHCP 回复；将其视为探测通过将允许在缺少 CAP_NET_RAW 的主机上发生
+/// lease 碰撞。
 fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, persistence: ?*const Persistence, session_link: ?*const boot_session.Link) ?packet.Reply {
     var attempts: usize = 0;
     while (attempts < runtime_state.DhcpState.max_leases) : (attempts += 1) {

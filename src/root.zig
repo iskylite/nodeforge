@@ -1,44 +1,102 @@
 //! NodeForge 核心库入口。
-//! 统一导出配置事实模型、校验器和服务实现，业务模块不得重复定义影子结构。
+//!
+//! 统一导出配置事实模型、校验器和服务实现。业务模块不得重复定义影子结构，
+//! 所有类型和函数都从本模块或其子模块引用。
+//!
+//! 模块层次：
+//! - `model` / `paths` / `version`：编译期已知的事实模型和路径常量。
+//! - `config` / `config_store` / `config_validate`：启动配置的加载、持久化和校验。
+//! - `catalog` / `catalog_store` / `iso_import`：节点 catalog 的管理、持久化和 ISO 导入。
+//! - `app` / `preflight`：daemon 应用入口和启动前预检。
+//! - `state/*`：进程内运行时状态（session、lease、event、catalog 快照）。
+//! - `http/*`：管理 API、PXE HTTP 数据路由和客户端。
+//! - `tftp/*` / `dhcp/*`：PXE 协议服务端实现。
+//! - `boot/*`：启动解析器、GRUB 虚拟配置和内核命令行渲染。
+//! - `assets/validate`：TFTP 资产完整性校验。
+//! - `observe/*`：结构化日志和错误渲染后端。
+//! - `cli/*`：CLI 输出格式化（表格、视图、事件展示）。
 
+const std = @import("std");
+
+/// 配置事实模型：定义 AppConfig、Catalog、Asset、Profile 等核心结构体。
 pub const model = @import("model.zig");
+/// 受管路径常量：定义 import_dir、work_dir、events_path 等安全边界路径。
 pub const paths = @import("paths.zig");
+/// 项目版本字符串，从 build.zon 注入。
 pub const version = @import("version.zig");
+/// Catalog 查找工具：按名称查找 distro/profile/asset/repository 等对象。
 pub const catalog = @import("catalog.zig");
+/// Catalog JSON 存储器：加载、保存和渲染 catalog 文件。
 pub const catalog_store = @import("catalog/store.zig");
+/// M3 ISO 导入器：通过只读 loop mount 从 DVD ISO 提取安装介质并发布到 catalog。
 pub const iso_import = @import("catalog/iso_import.zig");
+/// Daemon 应用入口：绑定端口、启动 DHCP/TFTP/HTTP 服务和管理信号处理。
 pub const app = @import("app.zig");
+/// 启动配置加载器：从 JSON 文件解析 AppConfig，失败时返回结构化错误。
 pub const config = @import("config/load.zig");
+/// 启动配置存储器：原子写入和规范化渲染配置 JSON。
 pub const config_store = @import("config/store.zig");
+/// 配置和 catalog 校验器：纯函数校验所有不变量和跨文件引用关系。
 pub const config_validate = @import("config/validate.zig");
+/// 启动前预检：检查端口可用性、目录权限和必需的系统 capability。
 pub const preflight = @import("preflight.zig");
+/// 进程内运行时状态：DHCP lease 表、TFTP 传输计数器和 catalog 运行时快照。
 pub const runtime_state = @import("state/runtime.zig");
+/// PXE boot session 注册表：关联 DHCP→TFTP→HTTP 启动链路的进程内状态。
 pub const boot_session = @import("state/boot_session.zig");
+/// 节点状态跟踪：记录已注册节点的当前启动阶段和终态。
 pub const node_status = @import("state/node_status.zig");
+/// Catalog 运行时快照：管理 catalog 的原子替换和只读引用计数。
 pub const catalog_runtime = @import("state/catalog_runtime.zig");
+/// Event v2 审计日志写入器：追加式 JSONL 事件流和滚动管理。
 pub const events = @import("state/events.zig");
+/// 事件类型定义：所有已注册事件类型的名称、描述和默认级别。
 pub const event_types = @import("state/event_types.zig");
+/// DHCP lease 持久化存储：磁盘上的 lease 表和重载支持。
 pub const dhcp_store = @import("state/dhcp_store.zig");
+/// 节点状态持久化存储：磁盘上的节点状态和终态记录。
 pub const status_store = @import("state/status_store.zig");
+/// CLI 管理客户端：通过本机 HTTP 管理 API 与 daemon 通信。
 pub const management_client = @import("http/client.zig");
+/// 管理 API 约定：固定 loopback 连接地址和安全边界常量。
 pub const management = @import("http/management.zig");
+/// HTTP 服务端：PXE 数据路由（kernel/initrd/ISO/rootfs 下载）和管理 API 路由。
 pub const http_server = @import("http/server.zig");
+/// HTTP 请求/响应契约：管理 API 的 JSON schema 和路由绑定。
 pub const http_contracts = @import("http/contracts.zig");
+/// HTTP 认证：bootstrap proof 和 capability token 验证中间件。
 pub const http_auth = @import("http/auth.zig");
+/// TFTP 包解析/序列化：RFC 1350 RRQ/WRQ/DATA/ACK/OERROR 包处理。
 pub const tftp_packet = @import("tftp/packet.zig");
+/// TFTP 服务端：虚拟 GRUB 配置拦截、文件传输和会话管理。
 pub const tftp_server = @import("tftp/server.zig");
+/// DHCPv4 包解析/序列化：RFC 2131/2132 option 编解码。
 pub const dhcp_packet = @import("dhcp/packet.zig");
+/// DHCP 探测器：启动前检测网络中是否有冲突的 DHCP 服务器。
 pub const dhcp_probe = @import("dhcp/probe.zig");
+/// DHCPv4 服务端：DISCOVER/OFFER/REQUEST/ACK 全流程和 lease 管理。
 pub const dhcp_server = @import("dhcp/server.zig");
+/// 启动解析器：根据节点 profile 和 catalog 解析 TFTP/HTTP 引导链。
 pub const boot_resolver = @import("boot/resolver.zig");
+/// TFTP 资产完整性校验：SHA-256 计算、路径安全验证和文件类型检查。
 pub const asset_validate = @import("assets/validate.zig");
+/// GRUB 虚拟配置渲染器：根据 session 和 resolver 结果动态生成 grub.cfg。
 pub const grub = @import("boot/grub.zig");
+/// 内核命令行渲染器：根据发行版和 profile 生成 install/diskless 启动参数。
+pub const boot_target = @import("boot/target.zig");
+/// 错误渲染器：将 Zig error set 映射为人类可读的审计消息。
 pub const observe_error = @import("observe/error.zig");
+/// 日志前端：结构化日志的公共 API。
 pub const observe_log = @import("observe/log.zig");
+/// 日志后端实现：文件滚动、stdout/stderr 分发和级别过滤。
 pub const log_backend = @import("observe/log_backend.zig");
+/// CLI 表格渲染：固定列宽的人类可读表格输出。
 pub const cli_table = @import("cli/table.zig");
+/// CLI 输出格式化：human/JSON 模式切换和颜色控制。
 pub const cli_output = @import("cli/output.zig");
+/// CLI 视图模板：status/check/asset/node/lease 等命令的展示视图。
 pub const cli_views = @import("cli/views.zig");
+/// CLI 事件工具：本地事件 JSONL 读取、过滤和字段提取。
 pub const cli_events = @import("cli/events.zig");
 
 test {
@@ -74,6 +132,7 @@ test {
     _ = boot_resolver;
     _ = asset_validate;
     _ = grub;
+    _ = boot_target;
     _ = observe_error;
     _ = observe_log;
     _ = log_backend;
@@ -82,7 +141,8 @@ test {
     _ = cli_views;
     _ = cli_events;
 }
-const std = @import("std");
 const log_backend_impl = @import("observe/log_backend.zig");
 
+/// 全局标准库选项：日志级别设为 debug，日志输出委托自定义后端。
+/// 后端根据配置将日志写入文件和/或 stdout/stderr。
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = log_backend_impl.logFn };

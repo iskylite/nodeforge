@@ -167,9 +167,9 @@ pub const DhcpState = struct {
     }
 };
 
-/// JSON-safe durable projection. Mutexes and TFTP counters never enter this file.
-/// Durable M3 runtime projection. M1/M2 files used schema 1 and contain only
-/// leases; the loader accepts them with an empty node-status set.
+/// JSON 安全的持久化投影。Mutex 和 TFTP 计数器不会进入此文件。
+/// M3 持久化运行时状态文件。M1/M2 文件使用 schema 1 且只包含 lease；
+/// 加载器接受它们并用空的节点状态集合补全。
 pub const RuntimeFile = struct {
     schema_version: u32 = 2,
     saved_at: i64,

@@ -18,8 +18,15 @@ pub const Error = error{
     NotRegularFile,
 };
 
-/// Rejects paths which could escape an asset root or address a platform-specific
-/// alternate separator.  Asset paths are always slash-separated relative paths.
+/// 校验资产相对路径的安全性。拒绝可能逃逸资产 root 的路径或使用平台特定
+/// 分隔符的路径。资产路径始终是斜杠分隔的相对路径。
+///
+/// 拒绝的路径模式：
+/// - 空路径
+/// - 以 `/` 或 `\` 开头的绝对路径
+/// - 包含 `..` 或 `.` 的路径段
+/// - 包含 Windows 分隔符 `\` 的路径段
+/// 这防止 `../etc/passwd` 类路径穿越攻击。
 pub fn validateRelativePath(path: []const u8) Error!void {
     if (path.len == 0) return error.EmptyPath;
     if (path[0] == '/' or path[0] == '\\') return error.UnsafePath;
@@ -60,17 +67,18 @@ pub fn sha256File(io: std.Io, root_path: []const u8, relative_path: []const u8, 
     out.* = std.fmt.bytesToHex(digest, .lower);
 }
 
-/// Checks the resolver boundary without reading the file into memory.  HTTP
-/// static serving calls this before delegating the transfer to facil.io.
+/// 在不读取文件内容的情况下校验解析器边界。HTTP 静态文件服务在将传输
+/// 委托给 I/O 后端之前调用此函数，确认文件存在且是常规文件。
+/// 返回文件大小（字节），供 HTTP Content-Length header 使用。
 pub fn verifyRegularFile(io: std.Io, root_path: []const u8, relative_path: []const u8) !u64 {
     var file = try openRegularFile(io, root_path, relative_path);
     defer file.close(io);
     return (try file.stat(io)).size;
 }
 
-/// Opens one regular file below an allowlisted root without following symlinks.
-/// The caller owns the returned descriptor.  HTTP uses this form when it must
-/// pass a verified descriptor directly to the kernel sendfile path.
+/// 在受管 root 下打开一个不跟随符号链接的常规文件。
+/// 调用方拥有返回的描述符的所有权。HTTP 在需要将已验证的描述符直接传递
+/// 给内核 sendfile 路径时使用此形式，避免二次打开和 TOCTOU 竞态。
 pub fn openRegularFile(io: std.Io, root_path: []const u8, relative_path: []const u8) !std.Io.File {
     try validateRelativePath(relative_path);
     var root = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .access_sub_paths = true });
@@ -84,9 +92,9 @@ pub fn openRegularFile(io: std.Io, root_path: []const u8, relative_path: []const
     return file;
 }
 
-/// Confirms that a confined path is a real directory rather than a symlink or
-/// other special file.  ISO import uses this before treating `dists` or
-/// `pool` as publishable repository roots.
+/// 确认受管路径是一个真实目录而非符号链接或其他特殊文件。
+/// ISO 导入在将 `dists` 或 `pool` 视为可发布的 repository root 之前
+/// 调用此函数，防止将符号链接目录误发布为 repository。
 pub fn verifyDirectory(io: std.Io, root_path: []const u8, relative_path: []const u8) !void {
     try validateRelativePath(relative_path);
     var root = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .access_sub_paths = true });

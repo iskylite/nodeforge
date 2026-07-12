@@ -92,8 +92,8 @@ pub const CatalogRuntime = struct {
     }
 };
 
-/// Copies every string that can originate from an HTTP request before catalog
-/// publication.  Request buffers are released immediately after route handling.
+/// 在 catalog 发布前拷贝所有可能来自 HTTP 请求的字符串。
+/// 请求缓冲区在路由处理完成后立即释放，因此 catalog 必须拥有自己的字符串副本。
 fn copyAsset(allocator: std.mem.Allocator, source: model.AssetConfig) !model.AssetConfig {
     return .{
         .name = try allocator.dupe(u8, source.name),

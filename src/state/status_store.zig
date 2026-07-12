@@ -23,9 +23,8 @@ pub const StatusFile = struct {
 /// DHCP lease persistence.
 io_mutex: std.atomic.Mutex = .unlocked,
 
-/// Atomically saves the node-status snapshot to `node-status.json`.
-/// The caller must have already obtained a consistent snapshot under the
-/// node_status.Store mutex (via `snapshot`).
+/// 原子保存节点状态快照到 `node-status.json`。
+/// 调用方必须已在 node_status.Store mutex 下获取一致快照（通过 `snapshot`）。
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, statuses: *const [node_status.max_statuses]node_status.Status, now: i64) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -34,9 +33,9 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, statuses
     try dhcp_store.atomicWrite(io, path, output.written());
 }
 
-/// Loads `node-status.json` and restores the projection as inactive.
-/// A daemon restart never revives a capability or makes an old boot session
-/// active; the historical projection is retained for `node status` queries.
+/// 加载 `node-status.json` 并以非活动状态恢复投影。
+/// daemon 重启永远不会恢复 capability 或使旧 boot session 变为活动；
+/// 历史投影仅为 `node status` 查询而保留。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *node_status.Store) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
@@ -48,8 +47,8 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     store.restoreInactive(&snapshot);
 }
 
-/// Migrates node statuses from a legacy `runtime.json` file.  Only the status
-/// portion is extracted; the lease portion is handled by `dhcp_store.zig`.
+/// 从旧版 `runtime.json` 文件迁移节点状态。只提取 status 部分；
+/// lease 部分由 `dhcp_store.zig` 处理。
 pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *node_status.Store) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);

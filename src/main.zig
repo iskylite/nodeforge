@@ -210,8 +210,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const install_source = try zli.Command.init(init_options, .{
         .name = "install-source",
         .description = "Import validated Linux installation media",
-        .usage = "nodeforge install-source import <iso-filename> [options]",
-        .help = "The ISO filename is relative to /opt/nodeforge/work/import and is imported by the local daemon through a read-only loop mount.",
+        .usage = "nodeforge install-source import <iso-path> [options]",
+        .help = "The ISO may be at any local path. The CLI stages a managed copy before the local daemon performs its read-only loop mount.",
     }, showCurrentHelp);
     try install_source.addCommands(&.{try installSourceImportCommand(init_options)});
 
@@ -263,17 +263,17 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
     const command = try zli.Command.init(init_options, .{
         .name = "import",
-        .description = "Import one staged Rocky ISO and publish its repository",
-        .help = "Requests the local daemon to mount and validate one ISO from /opt/nodeforge/work/import. The source file is never moved or deleted.",
+        .description = "Import one Rocky or Ubuntu ISO and publish its install source",
+        .help = "Accepts an ISO at any local path. The CLI stages a temporary managed copy, then asks the local daemon to mount, validate and publish it. The original file is never moved or deleted; distro/version/arch are detected unless supplied as checks.",
     }, installSourceImportHandler);
     try addConfigPathFlag(command);
     try addOutputFlag(command);
     try addDebugFlag(command);
-    try command.addPositionalArg(.{ .name = "filename", .description = "ISO filename relative to /opt/nodeforge/work/import", .required = true });
+    try command.addPositionalArg(.{ .name = "iso-path", .description = "Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso", .required = true });
     try command.addFlags(&.{
-        .{ .name = "distro", .description = "Distribution name; currently rocky", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "version", .description = "Distribution version; e.g. 9.7", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "ISO architecture; e.g. aarch64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "distro", .description = "Optional detected-distro check; e.g. ubuntu", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "version", .description = "Optional detected-version check; e.g. 22.04", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Optional detected-architecture check; e.g. aarch64", .type = .String, .default_value = .{ .String = "" } },
     });
     return command;
 }
@@ -465,9 +465,14 @@ fn catalogExportHandler(ctx: zli.CommandContext) !void {
     try ctx.writer.writeAll(bytes);
 }
 
-/// Imports an existing root-confined file, computes its digest, validates the
-/// candidate catalog and atomically publishes the new manifest.  This offline
-/// path is also useful during initial provisioning before nodeforged exists.
+/// 导入一个已存在的 root 受管文件，计算其 SHA-256 摘要，校验候选 catalog
+/// 后原子发布新 manifest。
+///
+/// 这是一个离线路径：不通过 daemon 的管理 API，而是直接操作 catalog 文件。
+/// 适用于 daemon 尚未启动时的初始部署场景。导入过程：
+/// 1. 解析 --type/--name/--path/--distro/--version/--arch/--kernel-release 参数
+/// 2. 通过管理 API 请求 daemon 执行实际导入（计算摘要、校验、发布）
+/// 3. daemon 拒绝时返回退出码 1，CLI 参数错误返回退出码 2
 fn assetImportHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const debug = ctx.flag("debug", bool);
@@ -524,6 +529,18 @@ fn assetImportHandler(ctx: zli.CommandContext) !void {
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"name\":\"{s}\"}}\n", .{name}) else try views.success(ctx.writer, "asset imported", &.{.{ .label = "Name", .value = name }});
 }
 
+/// M3.6 `install-source import` 命令处理器。
+///
+/// 完整流程：
+/// 1. 加载启动配置获取 daemon HTTP 端口
+/// 2. 校验 --arch 参数（如果提供了的话）
+/// 3. 调用 `stageInstallIso` 将 ISO 原子复制到 daemon 受管的暂存目录
+/// 4. 通过管理 API 请求 daemon 执行 loop mount、介质检测和 catalog 发布
+/// 5. daemon 返回后，defer 清理暂存文件
+///
+/// 安全设计：CLI 永远不将任意宿主路径发送给 daemon，只发送暂存目录中的
+/// 不透明 basename。daemon 只在受管目录内操作，杜绝路径穿越攻击。
+/// 原始 ISO 文件永远不会被移动或删除。
 fn installSourceImportHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const debug = ctx.flag("debug", bool);
@@ -532,21 +549,33 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed_config.deinit();
-    const filename = ctx.getArg("filename") orelse unreachable;
+    const iso_path = ctx.getArg("iso-path") orelse unreachable;
     const distro = ctx.flag("distro", []const u8);
     const version = ctx.flag("version", []const u8);
     const arch = ctx.flag("arch", []const u8);
-    if (distro.len == 0 or version.len == 0 or arch.len == 0) {
-        try ctx.writer.writeAll("error: install-source: --distro, --version and --arch are required\n");
-        setExitCode(ctx, 2);
-        return;
-    }
-    if (std.meta.stringToEnum(nodeforge.model.Arch, arch) == null) {
+    if (arch.len != 0 and std.meta.stringToEnum(nodeforge.model.Arch, arch) == null) {
         try ctx.writer.writeAll("error: install-source: unsupported --arch\n");
         setExitCode(ctx, 2);
         return;
     }
-    const imported = nodeforge.management_client.importInstallSource(ctx.io, parsed_config.value.server.http_port, .{ .filename = filename, .distro = distro, .version = version, .arch = arch }) catch |err| {
+    const staged = stageInstallIso(ctx.io, ctx.allocator, iso_path) catch |err| {
+        try ctx.writer.writeAll("error: install-source: cannot stage ISO\n");
+        if (debug) try ctx.writer.print("debug: install-source: stage cause={t}\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer {
+        std.Io.Dir.cwd().deleteFile(ctx.io, staged.path) catch {};
+        ctx.allocator.free(staged.filename);
+        ctx.allocator.free(staged.path);
+    }
+    if (!output_json) try ctx.writer.print("Staged ISO ({d} bytes) from {s}; validating and importing\n", .{ staged.size, iso_path });
+    const imported = nodeforge.management_client.importInstallSource(ctx.io, parsed_config.value.server.http_port, .{
+        .filename = staged.filename,
+        .distro = if (distro.len == 0) null else distro,
+        .version = if (version.len == 0) null else version,
+        .arch = if (arch.len == 0) null else arch,
+    }) catch |err| {
         try ctx.writer.writeAll("error: install-source: import request failed\n");
         if (debug) try ctx.writer.print("debug: install-source: cause={t}\n", .{err});
         setExitCode(ctx, 1);
@@ -557,7 +586,42 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
         setExitCode(ctx, 1);
         return;
     }
-    if (output_json) try ctx.writer.print("{{\"ok\":true,\"filename\":{f}}}\n", .{std.json.fmt(filename, .{})}) else try views.success(ctx.writer, "install source imported", &.{.{ .label = "ISO", .value = filename }});
+    if (output_json) try ctx.writer.print("{{\"ok\":true,\"path\":{f}}}\n", .{std.json.fmt(iso_path, .{})}) else try views.success(ctx.writer, "install source imported", &.{.{ .label = "ISO", .value = iso_path }});
+}
+
+/// 暂存 ISO 的结果：daemon 受管目录中的不透明文件名、完整路径和文件大小。
+const StagedInstallIso = struct {
+    filename: []u8,
+    path: []u8,
+    size: u64,
+};
+
+/// 将管理员指定的 ISO 原子复制到 daemon 受管的暂存目录。
+///
+/// 安全设计：
+/// - daemon 永远不会收到任意宿主路径，只收到暂存目录中的不透明 basename。
+/// - 管理员可以选择任何可读的普通 ISO 文件（拒绝符号链接）。
+/// - 文件名前缀 12 字节安全随机 hex，防止文件名碰撞和预测。
+/// - 复制使用 replace=false，如果目标已存在则失败（防止竞态覆盖）。
+/// - 调用方通过 defer 删除暂存文件，确保不会残留。
+fn stageInstallIso(io: std.Io, allocator: std.mem.Allocator, source: []const u8) !StagedInstallIso {
+    var input = try std.Io.Dir.cwd().openFile(io, source, .{ .follow_symlinks = false });
+    defer input.close(io);
+    const stat = try input.stat(io);
+    if (stat.kind != .file) return error.NotRegularFile;
+    const basename = std.fs.path.basename(source);
+    if (basename.len == 0 or !std.mem.endsWith(u8, basename, ".iso")) return error.InvalidIsoPath;
+
+    var random: [12]u8 = undefined;
+    try io.randomSecure(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    const filename = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ hex[0..], basename });
+    errdefer allocator.free(filename);
+    const destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ nodeforge.paths.import_dir, filename });
+    errdefer allocator.free(destination);
+    try std.Io.Dir.cwd().createDirPath(io, nodeforge.paths.import_dir);
+    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, io, .{ .permissions = .default_file, .replace = false });
+    return .{ .filename = filename, .path = destination, .size = stat.size };
 }
 
 fn assetListHandler(ctx: zli.CommandContext) !void {
@@ -791,9 +855,14 @@ fn eventsListHandler(ctx: zli.CommandContext) !void {
     try views.events(ctx.writer, display[0..result.count]);
 }
 
-/// A deliberately small follow implementation: it streams only newly appended
-/// records. On EOF it waits briefly, then reopens the path so rotations follow
-/// the new active inode without retaining an invalid descriptor.
+/// `events follow` 命令的精简实现：只流式输出新追加的事件记录。
+///
+/// 轮询策略：
+/// - 首次打开文件时记录当前大小作为起始 offset，跳过已有记录。
+/// - 每次 EOF 时休眠 200ms 后重新打开文件路径。
+/// - 重新打开而非持有旧 fd：当日志滚动时新记录写入新 inode，
+///   旧 fd 会指向被删除的旧文件。重新打开路径始终跟踪当前活跃文件。
+/// - 如果文件缩小（新 daemon 实例重新创建），重置 offset 到 0。
 fn eventsFollowHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const filters = eventFiltersFromContext(ctx, false) orelse return;

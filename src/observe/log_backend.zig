@@ -1,12 +1,10 @@
-//! Process-wide std.log backend with runtime severity threshold, bounded
-//! rendering, selectable terminal/file sinks, rotation and degradation.
+//! 进程级 std.log 后端，支持运行时严重级别阈值、有界渲染、可选终端/文件
+//! sink、滚动和降级。
 //!
-//! The backend renders each record into an 8 KiB stack buffer. When the
-//! formatted message exceeds the budget the line is truncated with
-//! `… [truncated]`. A sink mutex covers stderr and file writes so the two
-//! sinks always receive the same complete line. File rotation is based on
-//! `max_size_mb` and `keep`; on repeated file-write failures the backend
-//! degrades to stderr-only and emits a throttled diagnostic.
+//! 后端将每条记录渲染到 8 KiB 栈缓冲区。当格式化消息超过预算时，行以
+//! `… [truncated]` 截断。sink mutex 覆盖 stderr 和文件写入，确保两个
+//! sink 始终收到相同的完整行。文件滚动基于 `max_size_mb` 和 `keep`；
+//! 在反复文件写入失败时，后端降级为仅 stderr 并发出节流诊断。
 
 const std = @import("std");
 const events = @import("../state/events.zig");
@@ -40,8 +38,8 @@ pub fn enabled(comptime level: std.log.Level) bool {
     return @intFromEnum(level) <= threshold.load(.acquire);
 }
 
-/// Configures log destinations once at daemon startup, before workers spawn.
-/// A file mode without a usable file sink degrades each record to stderr.
+/// 在 daemon 启动时、worker 线程派生之前配置一次日志目标。
+/// 如果配置为文件模式但文件 sink 不可用，每条记录降级输出到 stderr。
 pub fn configure(io: std.Io, mode: OutputMode, file: ?FileSinkConfig) void {
     while (!sink_mutex.tryLock()) std.Thread.yield() catch {};
     defer sink_mutex.unlock();
@@ -119,8 +117,8 @@ fn rotateIfNeeded(io: std.Io, dir: std.Io.Dir, path: []const u8, max_size: u64, 
     try std.Io.Dir.rename(dir, path, dir, first, io);
 }
 
-/// Renders a log line into `buf` with timestamp, level and scope prefix.
-/// Truncates with `… [truncated]` if the formatted output exceeds `max_line_bytes`.
+/// 将日志行渲染到 `buf` 中，包含时间戳、级别和 scope 前缀。
+/// 如果格式化输出超过 `max_line_bytes`，以 `… [truncated]` 截断。
 fn renderLogLineBounded(
     buf: *[max_line_bytes]u8,
     comptime level: std.log.Level,
