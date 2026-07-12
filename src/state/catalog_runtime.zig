@@ -7,6 +7,7 @@ const std = @import("std");
 const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
 const validate = @import("../config/validate.zig");
+const iso_import = @import("../catalog/iso_import.zig");
 
 pub const CatalogRuntime = struct {
     allocator: std.mem.Allocator,
@@ -53,6 +54,38 @@ pub const CatalogRuntime = struct {
         next_assets[self.value.assets.len] = owned;
         var candidate = self.value;
         candidate.assets = next_assets;
+        try validate.validate(config, &candidate);
+        try catalog_store.save(io, self.allocator, self.path, &candidate);
+        self.value = candidate;
+    }
+
+    /// Publishes the related ISO, installer assets, optional repository and install
+    /// source in one catalog replacement. Files may already exist in distinct
+    /// managed roots, but nothing can resolve them until this method succeeds.
+    pub fn publishInstallSource(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, imported: iso_import.Result) !void {
+        self.lock();
+        defer self.unlock();
+        const assets_to_add = [_]model.AssetConfig{ imported.iso_asset, imported.kernel_asset, imported.initrd_asset };
+        for (assets_to_add) |asset| {
+            for (self.value.assets) |existing| if (std.mem.eql(u8, existing.name, asset.name)) return error.DuplicateObjectName;
+        }
+        if (imported.repository) |repository| for (self.value.repositories) |existing| if (std.mem.eql(u8, existing.name, repository.name)) return error.DuplicateObjectName;
+        for (self.value.install_sources) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
+
+        const next_assets = try self.allocator.alloc(model.AssetConfig, self.value.assets.len + assets_to_add.len);
+        @memcpy(next_assets[0..self.value.assets.len], self.value.assets);
+        @memcpy(next_assets[self.value.assets.len..], &assets_to_add);
+        const repository_count: usize = if (imported.repository == null) 0 else 1;
+        const next_repositories = try self.allocator.alloc(model.RepositoryConfig, self.value.repositories.len + repository_count);
+        @memcpy(next_repositories[0..self.value.repositories.len], self.value.repositories);
+        if (imported.repository) |repository| next_repositories[self.value.repositories.len] = repository;
+        const next_sources = try self.allocator.alloc(model.InstallSourceConfig, self.value.install_sources.len + 1);
+        @memcpy(next_sources[0..self.value.install_sources.len], self.value.install_sources);
+        next_sources[self.value.install_sources.len] = imported.install_source;
+        var candidate = self.value;
+        candidate.assets = next_assets;
+        candidate.repositories = next_repositories;
+        candidate.install_sources = next_sources;
         try validate.validate(config, &candidate);
         try catalog_store.save(io, self.allocator, self.path, &candidate);
         self.value = candidate;

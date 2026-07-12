@@ -8,6 +8,7 @@
 //! 提前发现明显的配置错误或端口占用，避免 `ExecStart` 进入不可恢复状态。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const model = @import("model.zig");
 
 /// M0 preflight failures that callers can present as actionable diagnostics.
@@ -16,6 +17,8 @@ pub const Error = error{
     TftpAdvertiseAddressUnavailable,
     TftpAddressUnavailable,
     DhcpAddressUnavailable,
+    InstallSourceMountUnavailable,
+    InstallSourceCapabilityUnavailable,
 };
 
 /// TFTP 标准监听端口；不暴露为配置或 CLI 参数。
@@ -42,6 +45,42 @@ pub fn checkPorts(io: std.Io, config: *const model.AppConfig) Error!void {
     checkUdpBind(io, config.server.server_ip, tftp_port) catch
         return error.TftpAddressUnavailable;
     checkUdpBind(io, config.server.server_ip, 67) catch return error.DhcpAddressUnavailable;
+}
+
+/// M3.4's importer uses a read-only loop mount.  Linux requires
+/// `CAP_SYS_ADMIN`; non-Linux development hosts intentionally skip this
+/// runtime-only check because they cannot run the Linux daemon service.
+pub fn checkInstallSourcePrerequisites(io: std.Io, allocator: std.mem.Allocator) Error!void {
+    if (builtin.os.tag != .linux) return;
+    if (!hasLinuxCapSysAdmin(io, allocator)) return error.InstallSourceCapabilityUnavailable;
+    commandSucceeds(io, allocator, &.{ "mount", "--version" }) catch return error.InstallSourceMountUnavailable;
+    commandSucceeds(io, allocator, &.{ "umount", "--version" }) catch return error.InstallSourceMountUnavailable;
+    std.Io.Dir.cwd().createDirPath(io, @import("paths.zig").work_dir ++ "/mount-check") catch return error.InstallSourceMountUnavailable;
+}
+
+fn hasLinuxCapSysAdmin(io: std.Io, allocator: std.mem.Allocator) bool {
+    // NodeForge's packaged systemd unit runs as root and narrows the bounding
+    // set explicitly. Root is therefore a valid fast path; non-root services
+    // must prove the effective capability below.
+    if (std.os.linux.geteuid() == 0) return true;
+    const status = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/status", allocator, .limited(64 * 1024)) catch return false;
+    defer allocator.free(status);
+    const marker = "CapEff:\t";
+    const start = std.mem.indexOf(u8, status, marker) orelse return false;
+    const tail = status[start + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, tail, '\n') orelse tail.len;
+    const effective = std.fmt.parseInt(u64, tail[0..end], 16) catch return false;
+    return effective & (@as(u64, 1) << 21) != 0;
+}
+
+fn commandSucceeds(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    const result = try std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(1024), .stderr_limit = .limited(1024) });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return else return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
 }
 
 fn checkTcpBind(io: std.Io, ip: []const u8, port: u16) !void {

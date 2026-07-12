@@ -2280,16 +2280,25 @@ repo tail、query、Authorization 或 capability。
 
 `nodeforge install-source import <filename>` 只接受管理员预先放入
 `/opt/nodeforge/work/import/` 的单个常规 ISO 文件名；CLI 传递相对此目录的名称，daemon 不接受任意绝对路径、
-symlink 或 URL。这样本机管理 API 即使被误暴露，也不会以服务用户权限读取任意宿主机文件。M3 将 `xorriso`
-作为明确的安装前置工具：缺失时 `nodeforged --check` 返回稳定的 `InstallSourceToolUnavailable` 并提示安装，
-不使用 loop mount，也不执行 ISO 内的任何文件。
+symlink 或 URL。这样本机管理 API 即使被误暴露，也不会以服务用户权限读取任意宿主机文件。M3 使用 Linux
+内核的只读 loop mount：ISO 不需要额外提取工具，但 daemon 必须具有 `CAP_SYS_ADMIN`，并且
+`nodeforged --check` 必须检查 `mount`/`umount`、私有挂载根和该 capability。导入只挂载 ISO9660/UDF，使用
+`ro,nosuid,nodev,noexec,loop`；不执行 ISO 内任何文件，也不把挂载树直接暴露给 HTTP/TFTP。
+随 M3.4 更新的 systemd unit 必须把 `CAP_SYS_ADMIN` 同时加入 `AmbientCapabilities` 与
+`CapabilityBoundingSet`；不具备该 capability 的容器或 sandbox 不是可导入 ISO 的 NodeForge 部署目标，
+而应在预检中返回稳定错误。
 
 导入在独立 import worker 中执行，HTTP worker 与 DHCP/TFTP 收包线程不得同步计算大 ISO 的 hash 或解包。CLI
 等待该本地请求完成并得到成功/失败摘要；M3 不引入可恢复的后台 job API。流程固定如下：
 
 1. 打开并 `fstat` staging ISO，校验普通文件、类型、SHA256、管理员声明的 distro/version/arch 及 ISO 元数据一致。
-2. 在 `/opt/nodeforge/work/iso-import-<random>/` 用 `xorriso` 解包，拒绝根目录外链接和不安全路径；提取 installer
-   kernel/initrd，并计算所有即将发布资产的 SHA256。
+2. 在 `/opt/nodeforge/work/iso-import-<random>/mnt` 创建权限收紧的随机私有挂载点，以
+   `mount -t iso9660 -o ro,nosuid,nodev,noexec,loop` 挂载该 ISO；只有 ISO9660 挂载失败且明确检测到
+   UDF 文件系统时才以同一组选项重试 `-t udf`。遍历挂载树时拒绝不安全路径、
+   不复制设备/FIFO/socket，且不得跟随根目录外的 symlink；将需要发布的仓库树复制至 sibling staging 目录，
+   提取 installer kernel/initrd，并计算所有即将发布资产的 SHA256。无论后续成功、失败、SIGTERM 或 worker
+   收到的 SIGINT，defer/finally 都必须先 `umount` 再删除挂载点；SIGKILL 或进程崩溃后的残留由下次启动的
+   受限 cleanup 扫描处理。卸载失败使导入失败并留下受限诊断目录，绝不发布 catalog。
 3. Rocky/RHEL 系必须校验 `.treeinfo` 和 `repodata/repomd.xml`；Ubuntu 必须校验 installer media，并单独检查
    `dists/`、`pool/` 与 apt 元数据是否完整。
 4. 构建 publication plan：ISO/installer kernel/initrd asset、一个 `InstallSourceConfig`，以及仅在元数据完整时
@@ -2344,10 +2353,11 @@ BootConfig 内嵌 answer file、repo 元数据或完整模板。`/api/v1/nodes/:
 `nodeforge_boot_session_id`、`nodeforge_access_token`、`nodeforge_event_url` 三个只读变量，供 M4 的
 hook/late-command 使用 header 上报。answer 内容、token 和渲染变量不得进入日志、Event 或错误响应。
 
-M3 的渲染器只允许显式声明的标量变量和固定模板 asset，不执行 shell、表达式、文件 include 或任意用户模板
-路径。M4 的 distro adapter 决定 Kickstart/Autoinstall 的字段与语义；M3 遇到尚未注册的 adapter 时返回
-`409 renderer_unavailable`，不伪造可安装 answer。每次成功签发 boot config 先更新 phase/status，再写
-`boot.config.fetched` Event；EventWriter 失败返回 5xx，但不回滚已经更新的状态。
+M3 内置一个纯文本 bootstrap answer fixture，只含上述三个只读变量，明确不是可安装的
+Kickstart/Autoinstall；它让 transport、peer proof 与 capability 交付可独立验收。M4 的 distro adapter
+才决定 Kickstart/Autoinstall 字段与语义，并替换该 fixture。M3 不执行 shell、表达式、文件 include 或任意
+用户模板路径。每次成功签发 boot config 先更新 phase/status，再写 `boot.config.fetched` Event；EventWriter
+失败返回 5xx，但不回滚已经更新的状态。
 
 ### 8.6 节点事件与日志摘要接收
 
@@ -2402,13 +2412,13 @@ nodeforge repository show rocky-9.7-aarch64-iso
 
 ### 8.8 并发与 HTTP 实现选择
 
-- HTTP 服务器基于 Zap/facil.io 固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力；M0 尚未注册静态资产或 Range 路由，M3 再将其接入。NodeForge 当前只维护业务路由、管理 API 和统一错误信封，不维护 HTTP 报文解析或连接循环。已评估的备选方案 `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，不作为依赖。
+- HTTP 服务器基于 Zap/facil.io 固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile；M3 在向 sendfile 交付已验证 descriptor 前自行解析单 Range/`If-Range`、设置 SHA256 ETag，并拒绝多段/无效 Range。这样不依赖 facil.io 的文件时间/长度 ETag 或其 `If-Range` 行为。M0 尚未注册静态资产或 Range 路由，M3 再将其接入。NodeForge 当前只维护业务路由、管理 API 和统一错误信封，不维护 HTTP 报文解析或连接循环。已评估的备选方案 `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，不作为依赖。
 - acceptor 与固定大小 worker pool 分离；大文件使用 `pread`/send loop 流式发送，不整体读入内存。
-- DHCP/TFTP 使用各自 UDP event loop；ISO hash、解包和 publication plan 提交到单独受限的 import worker，
+- DHCP/TFTP 使用各自 UDP event loop；ISO hash、只读挂载/复制和 publication plan 提交到单独受限的 import worker，
   不阻塞收包或 HTTP response worker。静态下载持有已打开 fd，不在整个传输期间占 catalog mutex。
 - 配置使用不可变 snapshot + 原子替换；catalog 仅在 candidate 通过完整校验和原子落盘后替换；runtime/state
-  由单 writer 串行落盘，事件通过 M2.5 的唯一
-  mutex 保护 writer 追加和轮转，不再引入独立队列或第二个文件后端。
+  由单 writer 串行落盘：DHCP lease/status 快照至多每秒一次原子 checkpoint，正常 shutdown 无条件补写最终快照；
+  Event v2 则通过 M2.5 的唯一 mutex 逐条追加和轮转，不再引入独立队列或第二个文件后端。
 - MVP 验收基线：并发 100 个 HTTP Range 下载、100 个 TFTP session 和每秒 200 个 DHCP 报文时无崩溃、无状态串扰；具体吞吐在目标 ARM VM 和 x86_64 机器记录，不先承诺生产数字。
 
 ### 8.9 测试
@@ -2427,8 +2437,9 @@ nodeforge repository show rocky-9.7-aarch64-iso
 - POST 日志摘要只保留有界失败摘要，不能把完整 installer/initrd log 写入 JSONL 或服务日志。
 - runtime summary 与事件同步；EventWriter 写入失败时状态不回滚、请求返回 5xx 且可幂等重试；daemon restart
   后保留的 status 不接受旧 session。
-- 使用 Rocky 与 Ubuntu ISO fixture 验证 `xorriso` 缺失、损坏 ISO、tuple/metadata 不匹配、repo 元数据完整/缺失、
-  candidate 发布失败和名字冲突均不改变 catalog；成功导入后 repo 与 installer assets 同时可解析。
+- 使用 Rocky 与 Ubuntu ISO fixture 验证无 `CAP_SYS_ADMIN`、`mount`/`umount` 缺失、挂载失败、卸载失败、损坏 ISO、
+  tuple/metadata 不匹配、repo 元数据完整/缺失、candidate 发布失败和名字冲突均不改变 catalog；成功导入后 repo
+  与 installer assets 同时可解析。另以独立 mount namespace 验证导入完成后没有残留 loop device 或挂载点。
 
 ### 8.10 阶段验收
 
@@ -2453,7 +2464,7 @@ M3 按以下批次实施，前一批的 contract test 必须通过后才能进�
    独立 Range spike，再接入唯一 HTTP listener。
 4. **M3.3 node API**：实现 boot config、config、answer、events、logs 和 runtime summary，所有 domain event 都走
    M2.5 Writer；此批只交付受控 answer fixture，不实现 M4/M5 adapter。
-5. **M3.4 ISO publication**：实现 staging/import worker、`xorriso` 检查、Rocky/Ubuntu 元数据分支和 catalog
+5. **M3.4 ISO publication**：实现 staging/import worker、受控只读 loop mount、Rocky/Ubuntu 元数据分支和 catalog
    多对象原子 publication，再开放 `install-source import`/`repository show`。
 6. **M3.5 integration**：合并 HTTP、ISO、DHCP/TFTP 并发测试；在 `r97n0` 用真实 ISO 与已认领 node 验证所有
    M3 验收项，并把实际命令、hash、并发结果与未覆盖的限制同步到验证记录。
@@ -3104,6 +3115,7 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
 | --- | --- |
 | Zig HTTP server 大文件 Range 实现细节 | M3 前做 1 个静态文件 Range demo |
 | M3 节点 session/capability 与安装器 URL 兼容 | M3 前用 active DHCP lease 模拟 bootstrap，验证 token 只走 header、旧 session 返回 409 |
+| ISO loop mount 权限与清理 | M3.4 前在 Rocky 9.7 aarch64 以 `CAP_SYS_ADMIN` 验证只读 `iso9660/udf` 挂载、异常路径卸载及无残留 mount/loop device |
 | TFTP option/GRUB 行为差异 | M1 使用标准 client 和 QEMU 拉取 GRUB 配置/kernel/initrd |
 | DHCP option 兼容性 | M2 前收集 UEFI x86_64/aarch64 DHCP fixtures |
 | Ubuntu autoinstall schema 差异 | M4 固定 Ubuntu Server 22.04 LTS 为 MVP 必测；后续 LTS 逐版本增加 fixture |

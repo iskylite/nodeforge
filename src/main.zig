@@ -207,6 +207,14 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     }, showCurrentHelp);
     try asset.addCommands(&.{ try assetImportCommand(init_options), try assetListCommand(init_options), try assetShowCommand(init_options), try assetValidateCommand(init_options) });
 
+    const install_source = try zli.Command.init(init_options, .{
+        .name = "install-source",
+        .description = "Import validated Linux installation media",
+        .usage = "nodeforge install-source import <iso-filename> [options]",
+        .help = "The ISO filename is relative to /opt/nodeforge/work/import and is imported by the local daemon through a read-only loop mount.",
+    }, showCurrentHelp);
+    try install_source.addCommands(&.{try installSourceImportCommand(init_options)});
+
     const events = try zli.Command.init(init_options, .{
         .name = "events",
         .description = "Query local Event v1/v2 audit history",
@@ -245,10 +253,29 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         runtime,
         node,
         asset,
+        install_source,
         events,
         trace,
     });
     return root;
+}
+
+fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{
+        .name = "import",
+        .description = "Import one staged Rocky ISO and publish its repository",
+        .help = "Requests the local daemon to mount and validate one ISO from /opt/nodeforge/work/import. The source file is never moved or deleted.",
+    }, installSourceImportHandler);
+    try addConfigPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
+    try command.addPositionalArg(.{ .name = "filename", .description = "ISO filename relative to /opt/nodeforge/work/import", .required = true });
+    try command.addFlags(&.{
+        .{ .name = "distro", .description = "Distribution name; currently rocky", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "version", .description = "Distribution version; e.g. 9.7", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "ISO architecture; e.g. aarch64", .type = .String, .default_value = .{ .String = "" } },
+    });
+    return command;
 }
 
 /// 构建带必填 `source` 位置参数的 `config import` 命令。
@@ -495,6 +522,42 @@ fn assetImportHandler(ctx: zli.CommandContext) !void {
         return;
     }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"name\":\"{s}\"}}\n", .{name}) else try views.success(ctx.writer, "asset imported", &.{.{ .label = "Name", .value = name }});
+}
+
+fn installSourceImportHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_config.deinit();
+    const filename = ctx.getArg("filename") orelse unreachable;
+    const distro = ctx.flag("distro", []const u8);
+    const version = ctx.flag("version", []const u8);
+    const arch = ctx.flag("arch", []const u8);
+    if (distro.len == 0 or version.len == 0 or arch.len == 0) {
+        try ctx.writer.writeAll("error: install-source: --distro, --version and --arch are required\n");
+        setExitCode(ctx, 2);
+        return;
+    }
+    if (std.meta.stringToEnum(nodeforge.model.Arch, arch) == null) {
+        try ctx.writer.writeAll("error: install-source: unsupported --arch\n");
+        setExitCode(ctx, 2);
+        return;
+    }
+    const imported = nodeforge.management_client.importInstallSource(ctx.io, parsed_config.value.server.http_port, .{ .filename = filename, .distro = distro, .version = version, .arch = arch }) catch |err| {
+        try ctx.writer.writeAll("error: install-source: import request failed\n");
+        if (debug) try ctx.writer.print("debug: install-source: cause={t}\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (!imported) {
+        try ctx.writer.writeAll("error: install-source: daemon rejected import\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    if (output_json) try ctx.writer.print("{{\"ok\":true,\"filename\":{f}}}\n", .{std.json.fmt(filename, .{})}) else try views.success(ctx.writer, "install source imported", &.{.{ .label = "ISO", .value = filename }});
 }
 
 fn assetListHandler(ctx: zli.CommandContext) !void {

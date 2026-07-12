@@ -266,3 +266,81 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
   `/opt/nodeforge/logs/nodeforged.log`，临时 unit 的 journal 不含重复的 `[nodeforge]` 服务日志。正式 unit
   已固定 `ExecStartPre=... --check --log-output file` 和 `ExecStart=... --log-output file`；验证后
   `nodeforged` 保持 inactive，未留下监听 socket。
+
+## M3 实施中
+
+### 2026-07-12：M3.0–M3.3 ARM 构建与受控 HTTP 路由 smoke
+
+- 本地 `zig build test` 通过。将当前工作树同步到 `root@r97n0:/root/NodeForge/` 后，
+  `zig build -Doptimize=ReleaseSafe` 通过；该机为 Rocky Linux 9.7 aarch64、Zig 0.16.0。
+- 使用现有隔离 PXE 夹具（`192.168.27.128:18080`、`enp26s0`）启动 daemon，确认 DHCP/67、
+  TFTP/69 与唯一 HTTP listener 均成功绑定，`GET /healthz` 返回 `200`。
+- 对没有活动 DHCP session 的 `GET /boot/config/no-such-node` 以及 capability-only
+  `POST /api/v1/nodes/no-such-node/events`，均返回稳定的 `409 session_inactive`；证明 M3 路由
+  没有因 URL 中携带 node id 而放行。
+- 本批新增 BootConfig v1/capability DTO、peer-IP bootstrap proof、Bearer + session header proof、
+  Event v2 受限 stage 映射、rootfs/image/repo catalog 路由以及 Range 委托给 facil.io 的静态传输。
+- 后续 M3.4/M3.5 的 ISO 导入、`node_status` 落盘和并发基线见本节后续记录；本子批次本身不等同于 M3 完成。
+- 待导入镜像已在开发机核验：
+  `/Users/iskylite/Downloads/Rocky-9.7-aarch64-minimal.iso`，SHA-256
+  `7a73b4dc3426053082d1a3fb28cc594f92133354b5ec16ccd5fd06875c35645f`（约 2.2 GiB）。
+
+### 2026-07-12：M3.4 Rocky 9.7 aarch64 ISO loop-mount 导入
+
+- 将上述 ISO 原样复制至 `r97n0:/opt/nodeforge/work/import/` 后再次计算 SHA-256，结果与开发机一致。
+  `mount -t iso9660 -o ro,nosuid,nodev,noexec,loop` 成功；`.treeinfo` 报告 `family = Rocky Linux Minimal`、
+  `version = 9.7`、`arch = aarch64`，并将 repository 定位为 `Minimal/repodata/repomd.xml`。
+- 以 `nodeforge install-source import Rocky-9.7-aarch64-minimal.iso --distro rocky --version 9.7 --arch aarch64`
+  请求 daemon 导入，返回成功。catalog 原子增加 ISO、installer kernel、installer initrd、DNF repository 与
+  `rocky-9.7-aarch64-iso` install source；repository URL 为 `/repos/rocky-9.7-aarch64-iso/Minimal`。
+- `Range: bytes=0-1023` 下载 `/images/rocky-9.7-aarch64-iso-image` 返回 1024 bytes、`206`、ETag 与
+  `Accept-Ranges: bytes`；`/repos/.../Minimal/repodata/repomd.xml` 可读。导出的 kernel/initrd SHA-256 分别为
+  `02feaa2a46d5c158b25813fe87cc3321a8a99d2268ab5a13bca20b3c49553bcf` 与
+  `566de96aaa1240ceb384d63aa57cda1af5648fced3ce34db59e54a9342dc1565`，同 `.treeinfo` 一致。
+- 重复导入被 daemon 拒绝，catalog SHA-256 未变；导入后确认不存在 `iso-import-*` work 目录或残留 loop mount。
+  在 daemon 停止后，`nodeforged --check` 通过了端口、`mount`/`umount` 与 Linux import 前置检查。
+- 后续将 mount/copy/hash 移入独立 import worker 后，以同一真实 ISO 重跑重复导入失败路径；worker 返回失败，
+  catalog SHA-256 仍为 `359ff5433028931ab4a736baeecdf862dc33af593146da126fdfe4a2e46f1798`，且没有残留
+  loop device、挂载点或 listener。
+- 对已发布 ISO 的 `bytes=1048576-2097151` 发起 100 个请求、并发度 20；全部返回完整的 1 MiB
+  响应，首尾文件 SHA-256 均为 `bd7cf734455c8e3117699e9f6268471cd287062413314406bf29f0221291ed68`。
+  验证后 daemon 有序停止，UDP/67、UDP/69 与 HTTP/18080 均已释放。
+- 对同一 ISO 复验受管强 ETag、单 Range、`If-Range` 与 416：匹配的 ETag 使
+  `bytes=1024-2047` 返回 `206`；不匹配的 ETag 忽略 Range 并返回完整 `200`（`Content-Length`
+  `2348744704`）；多段 `bytes=0-1,3-4` 返回 `416` 和
+  `Content-Range: bytes */2348744704`。响应只包含由 SHA-256 派生的一个 ETag，不再混入
+  facil.io 的文件时间/长度 ETag。
+
+### 2026-07-12：M3.5 已认领节点、状态重启边界与并发基线
+
+- 使用 `tests/fixtures/m3-r97n0-install.json` 中的已认领 aarch64 节点（MAC
+  `02:aa:bb:cc:dd:ef`、静态地址 `192.168.27.200`）执行真实 UDP
+  `DISCOVER -> OFFER -> REQUEST -> ACK`。OFFER 不写入 HTTP proof 所需的 lease-IP；只有 ACK 后从
+  `192.168.27.200` 直接请求 `/boot/config/m3-r97n0-fixture` 才获得 BootConfig v1。
+- BootConfig 确认 install source 为 `rocky-9.7-aarch64-iso`，包含一个本地 DNF repository URL 和 64 字符
+  bearer capability。错误 bearer 返回 `403`，正确 `Authorization` + `X-NodeForge-Session` 返回 `200`；
+  `/answer` fixture 中的 session/token 与 BootConfig 一致。
+- 以 capability POST `installer_started` 成功写入 `install.installer_started` Event v2，并把管理状态推进到
+  `installer_started`。重复获取 config 仍返回 `200`，但不会把该投影回退到 `boot_config_fetched`。
+  SIGTERM 后重启 daemon，旧 capability 返回 `409 session_inactive`；持久化的 status 仍为
+  `installer_started`，但 `session_active=false`。
+- 运行时 lease/status 快照改为最多每秒一次的原子 checkpoint（有序停止强制最终写入），避免每个 DHCP
+  报文 `fsync` 整份 JSON 而阻塞 UDP loop。定速发送 200 个 DHCPREQUEST（200 pps）后收到 200 个 DHCPACK；
+  用时 1000.8 ms，审计流恰有 400 条对应 request/ack Event。
+- 并发 20 发起 100 个标准 `tftp -m binary` 下载，全部取得 `efi/grubaa64.efi`，每个文件 SHA-256 均为
+  `109f17c8f7cd2fd92862945c9db59c6f2f83fd7674ac596225ce84903c98fd3f`。
+
+### 2026-07-12：M3.4 Ubuntu Server 22.04.5 aarch64 ISO
+
+- Ubuntu ISO `/Users/iskylite/Downloads/ubuntu-22.04.5-live-server-arm64.iso` 的 SHA-256 为
+  `eafec62cfe760c30cac43f446463e628fada468c2de2f14e0e2bc27295187505`；复制到 r97n0 staging 后再次计算结果一致。
+  只读 loop mount 识别 `.disk/info` 的 `Ubuntu-Server 22.04.5 LTS`、arm64 架构，安装器入口为
+  `casper/vmlinuz` 与 `casper/initrd`。
+- 同一介质包含 `dists/jammy/Release`、`pool/` 和 arm64 APT metadata；导入后原子发布
+  `ubuntu-22.04-aarch64-iso` install source、ISO、installer kernel/initrd 和 manager=`apt` repository。
+  repository base URL 为 `http://192.168.27.128:18080/repos/ubuntu-22.04-aarch64-iso`，
+  `dists/jammy/Release` 与 pool 中 `.deb` 均已确认在发布根内。
+- 以已认领节点（MAC `02:aa:bb:cc:dd:f0`、静态 IP `192.168.27.201`）完成真实 DHCP
+  `DISCOVER -> OFFER -> REQUEST -> ACK` 后，从该 peer 地址获取 BootConfig。其 profile 为
+  `ubuntu-install-aarch64`，installer 指向上述 Ubuntu assets，且 `repository_urls` 仅含发布的 APT 根 URL。
+  Ubuntu ISO 的 `Range: bytes=0-1023` 响应使用其 SHA-256 作为唯一 ETag；APT Release 可经 HTTP 读取。

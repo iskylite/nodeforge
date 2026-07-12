@@ -179,6 +179,12 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
                 nodeforge.observe_log.debug("preflight: cause={t}", .{err});
             return err;
         };
+        nodeforge.preflight.checkInstallSourcePrerequisites(ctx.io, ctx.allocator) catch |err| {
+            nodeforge.observe_log.err("preflight: install source import unavailable", .{});
+            if (debug or parsed.value.logging.level == .debug)
+                nodeforge.observe_log.debug("preflight: cause={t}", .{err});
+            return err;
+        };
         nodeforge.observe_log.info("preflight: config, HTTP, TFTP and DHCP ports available", .{});
         return;
     }

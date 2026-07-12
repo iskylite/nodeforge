@@ -21,6 +21,7 @@ const paths = @import("paths.zig");
 const dhcp_store = @import("state/dhcp_store.zig");
 const events = @import("state/events.zig");
 const boot_session = @import("state/boot_session.zig");
+const node_status = @import("state/node_status.zig");
 
 /// 启动 M1 TFTP 与唯一 HTTP listener。
 ///
@@ -40,9 +41,10 @@ pub fn run(
         .service = .running,
         .config_generation = 1,
     };
+    var statuses: node_status.Store = .{};
     var clock: std.posix.timespec = undefined;
     const current_time: i64 = if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) == .SUCCESS) @intCast(clock.sec) else 0;
-    dhcp_store.load(io, allocator, paths.runtime_path, &runtime.dhcp, current_time) catch |err| switch (err) {
+    dhcp_store.load(io, allocator, paths.runtime_path, &runtime.dhcp, &statuses, current_time) catch |err| switch (err) {
         error.FileNotFound => {},
         else => observe_log.err("dhcp: ignoring invalid runtime snapshot: {t}", .{err}),
     };
@@ -54,6 +56,8 @@ pub fn run(
     try boot_session.generateId(io, &daemon_instance_id);
     try event_writer.setDaemonInstanceId(daemon_instance_id);
     var sessions: boot_session.Store = .{};
+    var runtime_mutex: std.atomic.Mutex = .unlocked;
+    var last_runtime_checkpoint = std.atomic.Value(i64).init(0);
 
     event_writer.appendWithFields(io, allocator, paths.events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
         observe_log.err("events: unable to record configuration load: {t}", .{err});
@@ -63,6 +67,9 @@ pub fn run(
         .events_path = paths.events_path,
         .writer = &event_writer,
         .sessions = &sessions,
+        .statuses = &statuses,
+        .runtime_mutex = &runtime_mutex,
+        .last_runtime_checkpoint = &last_runtime_checkpoint,
     };
     var live_catalog = catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
     // DHCP needs a wildcard receive socket for client broadcasts.  The DHCP
@@ -92,6 +99,10 @@ pub fn run(
         &live_catalog,
         &runtime,
         &event_writer,
+        &sessions,
+        &statuses,
+        &daemon_instance_id,
+        &persistence,
     ) catch |err| {
         serve_error = err;
     };
@@ -109,13 +120,16 @@ pub fn run(
     dhcp_thread.join();
     tftp_thread.join();
 
-    dhcp_store.save(io, allocator, paths.runtime_path, &runtime.dhcp, now()) catch |err|
+    while (!runtime_mutex.tryLock()) std.Thread.yield() catch {};
+    dhcp_store.save(io, allocator, paths.runtime_path, &runtime.dhcp, &statuses, now()) catch |err|
         observe_log.err("dhcp: runtime persistence failed: {t}", .{err});
+    runtime_mutex.unlock();
 
     // worker 已退出后才终止活动 session，确保不会再有 DHCP/TFTP 事件引用它们；
     // 每个 session 仍单独写审计终态，随后才写全局 service.stopped。
     var terminated: [boot_session.max_sessions]boot_session.Session = undefined;
     const terminated_count = sessions.terminateAll(boot_session.monotonicNow(), now(), &terminated);
+    statuses.deactivateAll();
     for (terminated[0..terminated_count]) |session| dhcp_server.emitSessionTermination(io, &persistence, session);
 
     event_writer.appendWithFields(io, allocator, paths.events_path, "service.stopped", "orderly shutdown complete", &.{}) catch |err|

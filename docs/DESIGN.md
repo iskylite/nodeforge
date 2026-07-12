@@ -574,7 +574,11 @@ safe/ephemeral profile 至少需要满足：`safety.safe_for_unknown = true`、`
 
 ISO 导入规则保持简单且不做错误假设：
 
-- ISO 解包到 NodeForge 管理的版本目录，提取 installer kernel/initrd，并通过 HTTP 只读发布。
+- ISO 导入只接受受管 staging 目录中的常规文件。daemon 在私有随机挂载点以
+  `-o ro,nosuid,nodev,noexec,loop` 挂载 ISO9660/UDF；不执行介质内容、不接受任意宿主机路径，导入完成、
+  失败或收到终止信号时均必须卸载并清理挂载点。
+- 挂载树先复制到 NodeForge 管理的 staging/version 目录，再提取 installer kernel/initrd 并通过 HTTP
+  只读发布；不得让 HTTP/TFTP 直接指向仍挂载的介质。
 - Rocky/RHEL 系 DVD ISO 只有在 `.treeinfo` 和 `repodata/repomd.xml` 有效时才自动建立 yum/dnf repository。
 - Ubuntu Server ISO 始终可作为 installer media；只有 `dists/`、`pool/` 和 apt 元数据完整时才自动建立 apt repository，否则必须配置外部 mirror。
 - NodeForge 不重建发行版仓库元数据；只发布已经有效的仓库内容或管理员明确提供的额外源。
@@ -770,7 +774,7 @@ kernel cmdline、日志、事件或持久 runtime；daemon 重启后旧 session 
 
 MVP 不再拆分 management listener 和 PXE listener。管理路由与 M3 PXE 数据路由逻辑分区，但共享同一个 HTTP listener。M0 当前只注册 `/healthz` 和管理路由；M3 才在同一 socket 提供裸机可通过 `server.server_ip` 访问的数据路由。本 listener 固定绑定 `0.0.0.0:<http.port>`；`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址，不作为 M0 HTTP bind 地址。服务端不按 peer 地址过滤管理请求，所有能到达该 listener 的 IPv4 客户端都可直接调用管理路由；`nodeforge` CLI 则固定连接 `127.0.0.1:<http.port>`，不提供远程 endpoint，只支持管理同机 `nodeforged`。这样可以减少 socket 生命周期、端口自检、路由注册和 CLI 连接配置的复杂度，前期把精力集中在 provisioning 主链路。
 
-HTTP 服务器基于 Zap/facil.io 的固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力；M0 尚未注册静态资产或 Range 路由，M3 再将这些能力接入 NodeForge 路由。NodeForge 当前只维护业务路由、管理 API 和统一错误信封。已评估的纯 Zig `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
+HTTP 服务器基于 Zap/facil.io 的固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile；M3 在把已验证 descriptor 交给 sendfile 前解析单 Range/`If-Range`，并只使用受管 SHA256 ETag，不依赖 facil.io 的文件时间/长度 ETag。M0 尚未注册静态资产或 Range 路由，M3 再将这些能力接入 NodeForge 路由。NodeForge 当前只维护业务路由、管理 API 和统一错误信封。已评估的纯 Zig `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 
 ## 8. 核心能力 A：PXE 无人值守自动安装
 
@@ -1632,11 +1636,13 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 
 - 只支持 IPv4；不定义 IPv6 配置字段，不监听 DHCPv6，不在 initrd 中加入 IPv6 分支。
 - 一个 HTTP 实现只启动一个 listener，绑定 `0.0.0.0:http.port`；管理路由接受该 listener 上所有可达连接；CLI 管理客户端固定连接 `127.0.0.1:http.port`，只支持同机 `nodeforged`；不设置独立 `management_port`；`server.server_ip` 用于对外 URL、DHCP next-server、TFTP/HTTP 广告地址。
-- HTTP 服务器基于 Zap/facil.io 的固定提交实现；Zap 负责 HTTP 报文解析、连接生命周期和并发调度，并提供静态文件/Range 所需的库能力。M0 尚未注册静态资产或 Range 路由，M3 再接入；NodeForge 当前只维护业务路由、管理 API 和统一错误信封。纯 Zig `http.zig` 的 Zig 0.16 分支尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
+- HTTP 服务器基于 Zap/facil.io 的固定提交实现；Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile。M3 在交给 sendfile 前自行解析单 Range/`If-Range`，并只发出受管 SHA256 ETag，避免采用 facil.io 的文件时间/长度 ETag。M0 尚未注册静态资产或 Range 路由，M3 再接入；NodeForge 当前只维护业务路由、管理 API 和统一错误信封。纯 Zig `http.zig` 的 Zig 0.16 分支尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 - M0 的 `nodeforged --check` 在启动前检查配置/catalog 和唯一 HTTP 端口；正常启动不以预检替代实际 bind，仍由 Zap `listen()` 处理竞态和端口冲突。UDP 67/69、权限、资产目录、TFTP、DHCP resolver、repository 和 state 检查随对应阶段补齐。
 - M3 把每个节点请求归一化为 server-side `AuthenticatedNodeSession`，再决定 node、profile、mode、状态更新与 Event fields；URL、body、`X-Forwarded-For` 和客户端 event type 绝不直接成为事实。`node_status` 是持久 runtime 投影，Event v2 是审计；daemon 重启保留最后投影但使旧 session 失效，由 trace 显示重启边界。
+- DHCP 的 runtime lease/status 快照采用至多一秒一次的原子 checkpoint；每个协议事件仍经唯一 EventWriter 立即追加，有序停机再强制写入最终快照。不得在每个 DHCP 报文上同步 `fsync` 整份 runtime 文件，以免阻塞 UDP 收包。
 - 随软件包提供 `packaging/systemd/nodeforged.service`；CLI 不重复封装 `systemctl`；M0 需要通过 Rocky 9.7 aarch64 systemd 验证。
-- ISO 导入自动发布本地 HTTP yum/dnf/apt 基础源并绑定 repository；repo GPG 检查默认关闭，只有显式启用才校验 key。
+- M3 的 `nodeforged --check` 同时验证 `mount`/`umount` 可用、私有挂载根可创建，且服务具有
+  `CAP_SYS_ADMIN`；ISO 导入自动发布本地 HTTP yum/dnf/apt 基础源并绑定 repository。repo GPG 检查默认关闭，只有显式启用才校验 key。
 - rootfs HTTP 下载支持 Range/If-Range 断点续传和最终 SHA256 校验。
 - DHCP/TFTP 使用独立 UDP event loop，HTTP 使用固定 worker pool，配置使用不可变快照，状态使用单 writer。
 - 开发时先用标准 `tftp` 客户端验证 TFTP 协议闭环，再接 DHCP/PXE；里程碑仍按 DHCP 地址入口、TFTP 启动闭环编号。

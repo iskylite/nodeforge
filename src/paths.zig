@@ -34,6 +34,9 @@ pub const provisioned_dir = install_root ++ "/provisioned";
 pub const run_dir = install_root ++ "/run";
 /// 构建、导入、解包等可清理工作目录。
 pub const work_dir = install_root ++ "/work";
+/// Administrator-staged ISO input directory. M3 import accepts only a single
+/// relative regular filename below this root.
+pub const import_dir = work_dir ++ "/import";
 
 pub const config_path = config_dir ++ "/config.json";
 pub const catalog_path = catalog_dir ++ "/catalog.json";

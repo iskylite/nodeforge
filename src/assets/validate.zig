@@ -60,6 +60,41 @@ pub fn sha256File(io: std.Io, root_path: []const u8, relative_path: []const u8, 
     out.* = std.fmt.bytesToHex(digest, .lower);
 }
 
+/// Checks the resolver boundary without reading the file into memory.  HTTP
+/// static serving calls this before delegating the transfer to facil.io.
+pub fn verifyRegularFile(io: std.Io, root_path: []const u8, relative_path: []const u8) !u64 {
+    var file = try openRegularFile(io, root_path, relative_path);
+    defer file.close(io);
+    return (try file.stat(io)).size;
+}
+
+/// Opens one regular file below an allowlisted root without following symlinks.
+/// The caller owns the returned descriptor.  HTTP uses this form when it must
+/// pass a verified descriptor directly to the kernel sendfile path.
+pub fn openRegularFile(io: std.Io, root_path: []const u8, relative_path: []const u8) !std.Io.File {
+    try validateRelativePath(relative_path);
+    var root = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .access_sub_paths = true });
+    defer root.close(io);
+    var file = try root.openFile(io, relative_path, .{ .follow_symlinks = false, .resolve_beneath = true });
+    const stat = try file.stat(io);
+    if (stat.kind != .file) {
+        file.close(io);
+        return error.NotRegularFile;
+    }
+    return file;
+}
+
+/// Confirms that a confined path is a real directory rather than a symlink or
+/// other special file.  ISO import uses this before treating `dists` or
+/// `pool` as publishable repository roots.
+pub fn verifyDirectory(io: std.Io, root_path: []const u8, relative_path: []const u8) !void {
+    try validateRelativePath(relative_path);
+    var root = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .access_sub_paths = true });
+    defer root.close(io);
+    var directory = try root.openDir(io, relative_path, .{ .follow_symlinks = false });
+    directory.close(io);
+}
+
 test "relative asset paths cannot escape a root" {
     try validateRelativePath("efi/grubaa64.efi");
     try std.testing.expectError(error.UnsafePath, validateRelativePath("../etc/passwd"));

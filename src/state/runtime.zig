@@ -1,6 +1,7 @@
 //! Short-lived operational state.  DHCP state is deliberately separate from
 //! configuration and has a small, serialisable projection for restart recovery.
 const std = @import("std");
+const node_status = @import("node_status.zig");
 
 pub const RuntimeState = struct {
     schema_version: u32 = 2,
@@ -135,7 +136,14 @@ pub const DhcpState = struct {
 };
 
 /// JSON-safe durable projection. Mutexes and TFTP counters never enter this file.
-pub const DhcpRuntimeFile = struct { schema_version: u32 = 1, saved_at: i64, leases: []const DhcpLease };
+/// Durable M3 runtime projection. M1/M2 files used schema 1 and contain only
+/// leases; the loader accepts them with an empty node-status set.
+pub const RuntimeFile = struct {
+    schema_version: u32 = 2,
+    saved_at: i64,
+    leases: []const DhcpLease,
+    statuses: []const node_status.Status = &.{},
+};
 
 pub const TftpState = struct {
     started: std.atomic.Value(u64) = .init(0),

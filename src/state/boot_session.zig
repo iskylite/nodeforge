@@ -15,6 +15,10 @@ pub const max_sessions = 256;
 pub const retransmit_window_seconds: i64 = 30;
 /// 未继续推进的 bootstrap session 的存活时间。
 pub const bootstrap_ttl_seconds: i64 = 15 * 60;
+/// A successfully authenticated delivery may continue for two hours.  The
+/// capability itself remains process-local and expires with the session.
+pub const delivery_ttl_seconds: i64 = 2 * 60 * 60;
+pub const capability_len = 64;
 
 /// `phase` 是观察性投影而非持久化状态机；后续 M3/M4 仅能在已验证的
 /// node/session 关联上推进它。
@@ -65,6 +69,8 @@ pub const Session = struct {
     last_seen_mono: i64 = 0,
     phase: Phase = .dhcp_discover,
     terminal_reason: ?TerminalReason = null,
+    capability: [capability_len]u8 = [_]u8{0} ** capability_len,
+    capability_issued: bool = false,
 
     pub fn active(self: *const Session) bool {
         return self.id[0] != 0 and self.terminal_reason == null;
@@ -73,6 +79,18 @@ pub const Session = struct {
     pub fn idSlice(self: *const Session) []const u8 {
         return self.id[0..];
     }
+};
+
+/// The sole node-side authorization result consumed by M3 handlers.  It is a
+/// value copy so no request keeps the session mutex while rendering or I/O.
+pub const Authenticated = struct {
+    node_id: []const u8,
+    boot_session_id: [id_len]u8,
+    profile: []const u8,
+    mode: model.ProfileMode,
+    lease_ip: u32,
+    capability: [capability_len]u8,
+    capability_issued: bool,
 };
 
 /// 协议事件到 session 的关联结果。
@@ -209,6 +227,87 @@ pub const Store = struct {
         self.updateDhcp(link, phase, 0, mono_now, utc_now);
     }
 
+    /// Verifies the bootstrap proof using only the direct TCP peer and the
+    /// active DHCP lease.  The caller's node id is never trusted by itself.
+    pub fn authenticateBootstrap(self: *Store, node_id: []const u8, peer_ip: u32, mono_now: i64) !Authenticated {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or sessionExpired(session, mono_now)) continue;
+            if (session.node_id == null or session.profile == null or session.mode == null) continue;
+            if (!std.mem.eql(u8, session.node_id.?, node_id)) continue;
+            if (session.lease_ip != peer_ip) return error.ProofMismatch;
+            return authenticated(session);
+        }
+        return error.SessionInactive;
+    }
+
+    /// Verifies the bearer capability and explicit correlation header.  A
+    /// session id alone is intentionally never a proof.
+    pub fn authenticateCapability(self: *Store, node_id: []const u8, session_id: []const u8, token: []const u8, mono_now: i64) !Authenticated {
+        if (!validId(session_id) or token.len != capability_len) return error.ProofMismatch;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
+            if (sessionExpired(session, mono_now)) return error.SessionInactive;
+            if (session.node_id == null or session.profile == null or session.mode == null) return error.ProofMismatch;
+            if (!std.mem.eql(u8, session.node_id.?, node_id) or !session.capability_issued or !std.mem.eql(u8, &session.capability, token)) return error.ProofMismatch;
+            return authenticated(session);
+        }
+        return error.SessionInactive;
+    }
+
+    /// Capability-only proof for a catalog-scoped URL such as `/rootfs/:name`.
+    /// The route has no node id segment, so the resolved session supplies the
+    /// identity and the caller must perform the profile/asset binding.
+    pub fn authenticateCapabilityAny(self: *Store, session_id: []const u8, token: []const u8, mono_now: i64) !Authenticated {
+        if (!validId(session_id) or token.len != capability_len) return error.ProofMismatch;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
+            if (sessionExpired(session, mono_now)) return error.SessionInactive;
+            if (session.node_id == null or session.profile == null or session.mode == null or !session.capability_issued or !std.mem.eql(u8, &session.capability, token)) return error.ProofMismatch;
+            return authenticated(session);
+        }
+        return error.SessionInactive;
+    }
+
+    /// Generates a 256-bit bearer token only after bootstrap authentication.
+    /// It is kept exclusively in the in-memory Session and is never persisted.
+    pub fn issueCapability(self: *Store, io: std.Io, session_id: []const u8, mono_now: i64, utc_now: i64) !Authenticated {
+        if (!validId(session_id)) return error.SessionInactive;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id) or sessionExpired(session, mono_now)) continue;
+            if (!session.capability_issued) {
+                try generateCapability(io, &session.capability);
+                session.capability_issued = true;
+            }
+            session.phase = .boot_config_fetched;
+            session.last_seen_mono = mono_now;
+            session.last_seen_at = utc_now;
+            return authenticated(session);
+        }
+        return error.SessionInactive;
+    }
+
+    /// A valid delivery extends the session's delivery TTL, without altering its
+    /// identity or minting a new token.
+    pub fn touchDelivery(self: *Store, session_id: []const u8, mono_now: i64, utc_now: i64) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (session.active() and std.mem.eql(u8, session.idSlice(), session_id)) {
+                session.last_seen_mono = mono_now;
+                session.last_seen_at = utc_now;
+                return;
+            }
+        }
+    }
+
     /// Expires inactive bootstrap attempts and copies their terminal records for
     /// the caller to append through the sole EventWriter.
     pub fn expire(self: *Store, mono_now: i64, utc_now: i64, destination: *[max_sessions]Session) usize {
@@ -216,7 +315,7 @@ pub const Store = struct {
         defer self.mutex.unlock();
         var count: usize = 0;
         for (&self.sessions) |*session| {
-            if (!session.active() or mono_now - session.last_seen_mono < bootstrap_ttl_seconds) continue;
+            if (!session.active() or !sessionExpired(session, mono_now)) continue;
             destination[count] = terminateLocked(session, .expired, mono_now, utc_now);
             count += 1;
             session.* = .{};
@@ -248,6 +347,15 @@ pub fn monotonicNow() i64 {
 /// 从安全随机源生成不可预测的 128-bit session/daemon id。
 pub fn generateId(io: std.Io, destination: *[id_len]u8) !void {
     var random: [16]u8 = undefined;
+    try io.randomSecure(&random);
+    for (random, 0..) |byte, index| {
+        destination[index * 2] = hex(byte >> 4);
+        destination[index * 2 + 1] = hex(byte & 0x0f);
+    }
+}
+
+pub fn generateCapability(io: std.Io, destination: *[capability_len]u8) !void {
+    var random: [32]u8 = undefined;
     try io.randomSecure(&random);
     for (random, 0..) |byte, index| {
         destination[index * 2] = hex(byte >> 4);
@@ -297,6 +405,23 @@ fn terminateLocked(session: *Session, reason: TerminalReason, mono_now: i64, utc
     session.last_seen_at = utc_now;
     if (reason == .expired) session.phase = .expired;
     return session.*;
+}
+
+fn authenticated(session: *const Session) Authenticated {
+    return .{
+        .node_id = session.node_id.?,
+        .boot_session_id = session.id,
+        .profile = session.profile.?,
+        .mode = session.mode.?,
+        .lease_ip = session.lease_ip,
+        .capability = session.capability,
+        .capability_issued = session.capability_issued,
+    };
+}
+
+fn sessionExpired(session: *const Session, mono_now: i64) bool {
+    const ttl = if (session.capability_issued) delivery_ttl_seconds else bootstrap_ttl_seconds;
+    return mono_now - session.last_seen_mono >= ttl;
 }
 
 fn isDhcpEarly(phase: Phase) bool {
@@ -366,4 +491,41 @@ test "generated identifiers are lowercase fixed-width hex" {
     var id: [id_len]u8 = undefined;
     try generateId(std.testing.io, &id);
     try std.testing.expect(validId(&id));
+}
+
+test "M3 bootstrap and capability proofs remain bound to one active lease" {
+    var store: Store = .{};
+    const session_id: [id_len]u8 = "0123456789abcdef0123456789abcdef".*;
+    const token: [capability_len]u8 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".*;
+    store.sessions[0] = .{
+        .id = session_id,
+        .node_id = "node-01",
+        .lease_ip = 0xc0a81b0a,
+        .profile = "rocky-install",
+        .mode = .install,
+        .last_seen_mono = 100,
+        .capability = token,
+        .capability_issued = true,
+    };
+    const bootstrap = try store.authenticateBootstrap("node-01", 0xc0a81b0a, 101);
+    try std.testing.expectEqualStrings("node-01", bootstrap.node_id);
+    try std.testing.expectError(error.ProofMismatch, store.authenticateBootstrap("node-01", 0xc0a81b0b, 101));
+    _ = try store.authenticateCapability("node-01", &session_id, &token, 101);
+    try std.testing.expectError(error.ProofMismatch, store.authenticateCapability("node-02", &session_id, &token, 101));
+    try std.testing.expectError(error.SessionInactive, store.authenticateCapability("node-01", &session_id, &token, 100 + delivery_ttl_seconds));
+}
+
+test "DHCP offer phase alone is never an HTTP bootstrap proof" {
+    var store: Store = .{};
+    const acquired = try store.acquireDhcp(std.testing.io, .{
+        .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xef },
+        .xid = 0x12345678,
+        .node_id = "m3-node",
+        .profile = "rocky-install",
+        .mode = .install,
+    }, 10, 10);
+    store.updateDhcp(acquired.link, .dhcp_offer, 0, 11, 11);
+    try std.testing.expectError(error.ProofMismatch, store.authenticateBootstrap("m3-node", 0xc0a81bc8, 12));
+    store.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 13, 13);
+    _ = try store.authenticateBootstrap("m3-node", 0xc0a81bc8, 14);
 }

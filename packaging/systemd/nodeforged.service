@@ -11,8 +11,8 @@ ExecStart=/opt/nodeforge/bin/nodeforged --log-output file
 Restart=on-failure
 RestartSec=2s
 # TFTP/DHCP use privileged UDP ports; DHCP also sends raw ICMP Echo before OFFER.
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN
 NoNewPrivileges=true
 
 [Install]

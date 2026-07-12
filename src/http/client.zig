@@ -34,6 +34,15 @@ pub const AssetImport = struct {
     kernel_release: ?[]const u8 = null,
 };
 
+/// M3.4 import request. The ISO filename is relative to the fixed daemon
+/// staging root and never describes a host path.
+pub const InstallSourceImport = struct {
+    filename: []const u8,
+    distro: []const u8,
+    version: []const u8,
+    arch: []const u8,
+};
+
 /// 探测管理接口 `/healthz`。
 /// 使用 `Connection: close` 保证能够以 EOF 作为响应结束，不实现通用 HTTP 客户端。
 pub fn health(io: std.Io, port: u16) Status {
@@ -157,6 +166,22 @@ pub fn importAsset(io: std.Io, port: u16, asset: AssetImport) !bool {
     if (asset.arch) |value| try writer.interface.print("&arch={s}", .{value});
     if (asset.kernel_release) |value| try writer.interface.print("&kernel_release={s}", .{value});
     try writer.interface.writeAll(" HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+    var recv_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    const status = reader.interface.takeDelimiterInclusive('\n') catch return false;
+    return std.mem.findPosLinear(u8, status, 0, " 200 ") != null;
+}
+
+pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) !bool {
+    inline for ([_][]const u8{ request.filename, request.distro, request.version, request.arch }) |value|
+        if (!querySafe(value)) return error.InvalidInstallSourceField;
+    const address = try std.Io.net.IpAddress.parseIp4(management.client_ip, port);
+    var stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer stream.close(io);
+    var send_buffer: [2048]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    try writer.interface.print("POST /api/v1/management/install-sources/import?filename={s}&distro={s}&version={s}&arch={s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{ request.filename, request.distro, request.version, request.arch });
     try writer.interface.flush();
     var recv_buffer: [1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
