@@ -42,6 +42,43 @@ M1+ 尚未实现、因此尚未在目标机执行的系统级验证。功能实�
 - `/usr/bin/nodeforge -> /opt/nodeforge/bin/nodeforge`
 - `/usr/bin/nodeforged -> /opt/nodeforge/bin/nodeforged`
 
+### 测试前清理
+
+在目标机执行 `zig build test` 或手动集成测试之前，必须清理上一次运行残留的日志、事件和
+状态文件，否则会导致断言误判：
+
+```sh
+# 停止正在运行的 daemon，释放端口
+systemctl stop nodeforged 2>/dev/null || true
+
+# 清理服务日志和事件审计文件
+rm -f /opt/nodeforge/logs/nodeforged.log
+rm -f /opt/nodeforge/logs/events.jsonl
+rm -f /opt/nodeforge/logs/events.jsonl.*
+
+# 清理运行态持久化文件（leases / node-status / legacy runtime.json）
+rm -f /opt/nodeforge/state/leases.json
+rm -f /opt/nodeforge/state/node-status.json
+rm -f /opt/nodeforge/state/runtime.json
+rm -f /opt/nodeforge/state/*.tmp
+
+# 清理导入工作目录和 catalog 缓存（如果需要干净 catalog 回归）
+rm -rf /opt/nodeforge/work/iso-import-*
+rm -f /opt/nodeforge/catalog/catalog.json
+```
+
+以下问题已由测试前清理或测试脚本修正规避：
+
+- **事件污染**：`tests/cli.sh` 中的 `events list` 空列表断言会因 `/opt/nodeforge/logs/events.jsonl`
+  残留历史事件而失败。脚本已改为使用 `--events-path "$tmp/nonexistent.jsonl"` 隔离；但手动
+  验证时仍需清理该文件。
+- **日志匹配**：`tests/http.sh` 中 `grep` 匹配 daemon 日志时，旧日志会与本次日志混合。
+  测试脚本使用独立临时目录（`$tmp`），不受影响；但手动验证应确保只读当前进程的日志。
+- **端口冲突**：`zig build test` 的 `http_tests` 与 `cli_tests` 如并行启动两个 daemon 实例，
+  会因 HTTP 端口冲突而失败。`build.zig` 已强制两者串行执行（`http_tests.step.dependOn(&cli_tests.step)`）。
+- **网口适配**：`tests/http.sh` 默认使用 `config.example.json` 中的 `enp1s0` 网口，`r97n0`
+  上不存在该接口。脚本已将 `bind_interface` 动态替换为 `lo` 以适配本机回环测试。
+
 M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CLI 固定通过
 `127.0.0.1:8080` 访问且不支持远程 endpoint，因此只能管理同机 `nodeforged`。服务端 listener
 绑定 `0.0.0.0:8080`，管理路由接受所有可达连接且不做 peer 来源检查；从宿主机访问应返回
@@ -344,3 +381,40 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
   `DISCOVER -> OFFER -> REQUEST -> ACK` 后，从该 peer 地址获取 BootConfig。其 profile 为
   `ubuntu-install-aarch64`，installer 指向上述 Ubuntu assets，且 `repository_urls` 仅含发布的 APT 根 URL。
   Ubuntu ISO 的 `Range: bytes=0-1023` 响应使用其 SHA-256 作为唯一 ETag；APT Release 可经 HTTP 读取。
+
+### 2026-07-12：M3.1 运行态持久化拆分与全量集成测试回归
+
+- 将 `runtime.json` 拆分为 `leases.json`（DHCP 租约，checkpoint worker 异步保存）和
+  `node-status.json`（HTTP 节点状态，同步原子保存），两个文件各自持独立 I/O 锁、独立 schema
+  校验和独立崩溃恢复路径。
+- Legacy 迁移验证：以旧版 `runtime.json`（含活动租约和 `installer_started` 节点状态）启动新版
+  daemon，确认活动租约正确迁移到 `leases.json`，过期租约被丢弃；节点状态迁移到
+  `node-status.json` 且 `session_active` 重置为 `false`、`status` 保留为 `inactive`。
+- 在 `r97n0` 上执行 `zig build test` 全量回归。修复以下兼容性问题后，59 个单元测试 +
+  2 个集成测试（`cli_tests` + `http_tests`）全部通过：
+  - **网口名**：`tests/http.sh` 中 `config.example.json` 的 `bind_interface: "enp1s0"` 在
+    r97n0 上不存在（实际为 `enp26s0`），测试脚本已动态替换为 `lo` 以适配本机回环。
+  - **日志匹配**：`tests/http.sh` 中 `grep` 匹配 daemon 调试日志时，原先按精确行匹配会因
+    时间戳和 scope 前缀失败；改为 `grep -Fq 'http: request received GET /healthz'` 部分匹配。
+  - **测试竞争**：`build.zig` 中 `http_tests` 和 `cli_tests` 并行启动两个 daemon 实例导致
+    HTTP 端口冲突；已强制串行化（`http_tests.step.dependOn(&cli_tests.step)`）。
+  - **事件污染**：`tests/cli.sh` 中 `events list` 空列表断言会因全局
+    `/opt/nodeforge/logs/events.jsonl` 残留历史事件而失败；脚本已改用
+    `--events-path "$tmp/nonexistent.jsonl"` 隔离。
+- macOS 本地开发机同样通过 59 单元测试 + 2 集成测试（macOS 跳过需要 root/UDP 67 的
+  `http_tests` DHCP 部分）。
+
+### M3 系统级验收
+
+- [x] 已认领节点能从活动 session 获取 BootConfig/answer；session、token、URL node 或 peer IP
+  任一不匹配均不能读写。
+- [x] 合法节点事件能按 Event v2 写入 `events.jsonl` 并更新持久 `node_status`，非法 body 或旧
+  session 不会污染审计文件。
+- [x] rootfs/ISO/repo 大文件下载支持 `Content-Length`、ETag、单 Range 和 `If-Range`，全程受
+  catalog 路径沙箱限制。
+- [x] ISO 导入后无需手工建基础 repo 即可通过 HTTP 安装；导入失败不会发布半个 catalog 或可访问
+  的半成品。
+- [x] 在 `r97n0` 完成真实 Rocky 9.7 aarch64 ISO 导入、Range/续传、节点 config/answer 和
+  capability 上报验证，并记录 100 HTTP Range、100 TFTP、200 DHCP 报文/秒并发基线。
+- [x] `runtime.json` 拆分为 `leases.json` + `node-status.json`，独立 I/O 锁、legacy 迁移和
+  崩溃恢复通过验证；`zig build test` 全量回归通过。

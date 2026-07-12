@@ -167,7 +167,7 @@ M0 参数规则是命令局部而非 persistent/global：`nodeforge` 根命令�
 | 无盘启动 | `profile.diskless`、`boot_bundle` | `node_status`、`event` | `diskless status`、`diskless overlay update` | 小 initrd 下载 rootfs 并切换到目标 rootfs |
 | boot bundle 校验 | `asset`、`rootfs`、`profile` | `event` | `rootfs validate`、`initrd validate` | kernel/initrd/rootfs 的版本、架构、kernel ABI 一致 |
 | 补充包和后处理 | `provisioning_bundle` | `node_status`、`event` | `provision bundle show/plan`、`provision status` | Kickstart、autoinstall、rootfs build、diskless 共用强类型步骤和清晰输出 |
-| 配置与目录持久化 | `config.json`、`catalog.json` | `runtime.json`、`events.jsonl` | `config validate/export/apply`、`asset/install-source/rootfs/initrd/boot-bundle import/build/publish` | 启动配置可重启加载；导入/构建/发布请求由 `nodeforged` 原子写入 catalog 并更新内存视图 |
+| 配置与目录持久化 | `config.json`、`catalog.json` | M3.1 起为 `leases.json`、`node-status.json`、`events.jsonl`；`runtime.json` 仅兼容迁移 | `config validate/export/apply`、`asset/install-source/rootfs/initrd/boot-bundle import/build/publish` | 启动配置可重启加载；导入/构建/发布请求由 `nodeforged` 原子写入 catalog 并更新内存视图 |
 | 观测输出 | `logging`、`events` | `node_status`、`event` | `node status`、`events list/follow/types` | 输出分组、表格化，错误有摘要和下一步建议 |
 
 ## 5. 总体架构与数据流
@@ -463,7 +463,8 @@ const ProfileSafetyConfig = struct {
 | `tftp_session` | 当前 TFTP 传输会话、block、重试、结果 |
 | `event` | DHCP/TFTP/HTTP/install/diskless/config 事件流 |
 
-运行态不是管理员长期配置，不应混进 profile JSON。`RuntimeState` 可落盘为 `runtime.json`，用于重启后恢复租约、未知客户端观察记录和 `node_facts`；事件使用 `events.jsonl` 追加写。
+运行态不是管理员长期配置，不应混进 profile JSON。M3.1 前的 `RuntimeState` 可落盘为 `runtime.json`；M3.1 的补充方案
+改为独立 `leases.json` 和 `node-status.json`，旧文件仅用于兼容迁移。事件始终使用 `events.jsonl` 追加写。
 
 ### 5.3 Node 字段语义
 
@@ -1186,7 +1187,7 @@ sequenceDiagram
 
 `config.json` 是启动配置和人工声明策略的事实源，M0 当前实际读取 server、http、logging、distros、profiles、nodes 和 policy 字段；DHCP/TFTP 与 provisioning 字段属于 M1+ schema 扩展。`catalog.json` 是 NodeForge 管理目录的事实源，M0 只读取、导出和校验；M1+ 才记录 asset、repository、install source、rootfs、initrd、boot bundle 等导入、构建、扫描、发布结果。二者都使用 JSON、都必须整体校验并原子写回；catalog 写入始终只允许由 `nodeforged` 执行。
 
-MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。`runtime.json` 属于运行态，`events.jsonl` 属于事件历史；M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。交互式启动默认写 stderr，systemd 显式选择受限权限的轮转文件 `/opt/nodeforge/logs/nodeforged.log`；`--log-output both` 才同时写入 stderr/journal。
+MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。M3.1 前的 `runtime.json` 属于运行态，M3.1 起其内容按恢复语义拆分为 `leases.json` 与 `node-status.json`，并保留旧文件作兼容迁移输入；`events.jsonl` 属于事件历史。M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。交互式启动默认写 stderr，systemd 显式选择受限权限的轮转文件 `/opt/nodeforge/logs/nodeforged.log`；`--log-output both` 才同时写入 stderr/journal。
 
 默认安装根为 `/opt/nodeforge`，代码中只在统一路径定义处声明一次，其他默认路径全部派生。完整的目录布局、系统集成点和仓库目录结构见第 14 章。
 
@@ -1639,7 +1640,10 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 - HTTP 服务器基于 Zap/facil.io 的固定提交实现；Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile。M3 在交给 sendfile 前自行解析单 Range/`If-Range`，并只发出受管 SHA256 ETag，避免采用 facil.io 的文件时间/长度 ETag。M0 尚未注册静态资产或 Range 路由，M3 再接入；NodeForge 当前只维护业务路由、管理 API 和统一错误信封。纯 Zig `http.zig` 的 Zig 0.16 分支尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 - M0 的 `nodeforged --check` 在启动前检查配置/catalog 和唯一 HTTP 端口；正常启动不以预检替代实际 bind，仍由 Zap `listen()` 处理竞态和端口冲突。UDP 67/69、权限、资产目录、TFTP、DHCP resolver、repository 和 state 检查随对应阶段补齐。
 - M3 把每个节点请求归一化为 server-side `AuthenticatedNodeSession`，再决定 node、profile、mode、状态更新与 Event fields；URL、body、`X-Forwarded-For` 和客户端 event type 绝不直接成为事实。`node_status` 是持久 runtime 投影，Event v2 是审计；daemon 重启保留最后投影但使旧 session 失效，由 trace 显示重启边界。
-- DHCP 的 runtime lease/status 快照采用至多一秒一次的原子 checkpoint；每个协议事件仍经唯一 EventWriter 立即追加，有序停机再强制写入最终快照。不得在每个 DHCP 报文上同步 `fsync` 整份 runtime 文件，以免阻塞 UDP 收包。
+- M3.1 作为 M3 runtime 持久化的补充方案：DHCP lease 由专属 worker 至多每秒 checkpoint 至 `leases.json`，HTTP
+  `node_status` 独立同步保存至 `node-status.json`；两者不共享 I/O 锁，旧 `runtime.json` 只作迁移输入。每个协议
+  事件仍经唯一 EventWriter 立即追加；有序停机要求 checkpoint worker flush-and-stop 后再写服务终态。不得在每个
+  DHCP 报文上同步 `fsync` 整份 runtime 文件，以免阻塞 UDP 收包。
 - 随软件包提供 `packaging/systemd/nodeforged.service`；CLI 不重复封装 `systemctl`；M0 需要通过 Rocky 9.7 aarch64 systemd 验证。
 - M3 的 `nodeforged --check` 同时验证 `mount`/`umount` 可用、私有挂载根可创建，且服务具有
   `CAP_SYS_ADMIN`；ISO 导入自动发布本地 HTTP yum/dnf/apt 基础源并绑定 repository。repo GPG 检查默认关闭，只有显式启用才校验 key。
@@ -1706,7 +1710,9 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
   catalog/
     catalog.json
   state/
-    runtime.json
+    leases.json             # M3.1 DHCP lease snapshot
+    node-status.json        # M3.1 node-status snapshot
+    runtime.json            # legacy migration input
   logs/
     events.jsonl
     events.jsonl.1          # M2.5+ 轮转文件，最多保留 events.keep 个
@@ -1845,7 +1851,7 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 | 是否支持未知节点 | 是，默认分配临时租约并等待认领；可显式配置安全 discovery 或 safe/ephemeral 无盘；不允许未知安装 |
 | 是否需要完整租约池 | 是，PXE authoritative 模式需要基础地址管理 |
 | 发行版支持范围 | 只适配 Ubuntu Server 22.04+ 和 RHEL/CentOS 系；RHEL/CentOS 系优先 Rocky Linux |
-| 配置是否上数据库 | 否，MVP 使用内存结构体 + `config.json` + `catalog.json`；runtime.json 和 events.jsonl 独立 |
+| 配置是否上数据库 | 否，MVP 使用内存结构体 + `config.json` + `catalog.json`；M3.1 的 leases/node-status snapshots 与 events.jsonl 独立 |
 | 配置文件格式 | MVP 的 config、catalog、runtime 事实源均为 JSON；YAML 后续最多作为导入/导出格式，不作为内部事实源 |
 | 管理接口 | 复用唯一 HTTP listener，接受所有可达连接；CLI 固定访问 `127.0.0.1:<http.port>`，只支持管理同机 `nodeforged` |
 | DHCP/TFTP 端口是否可配 | 否，`UDP 67` 和 `UDP 69` 固定，除非改源码 |

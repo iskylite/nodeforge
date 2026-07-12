@@ -280,7 +280,7 @@ MVP 不把所有对象都塞进单一手写配置文件，而是分为三类事�
 | --- | --- | --- | --- |
 | 启动/策略配置 | `/opt/nodeforge/config/config.json` | M0 为 server/http/logging、发行版矩阵、profile/node/policy 的基础配置；M1+ 扩展 dhcp/tftp、hooks、网络 override、provisioning bundle | M0 手工编辑 + `config validate` 或离线 `config import`，重启生效；M1+ 增加 `config apply` 和 DHCP discovery 在线切换 |
 | 管理 catalog | `/opt/nodeforge/catalog/catalog.json` | asset、repository、install source、rootfs、initrd、boot bundle | M0 只读校验/导出；M1+ CLI/API 请求 `nodeforged` import/build/package/publish 并写入 |
-| 运行态 | `/opt/nodeforge/state/runtime.json`、`/opt/nodeforge/logs/events.jsonl` | lease、unknown client、session、node status、事件 | 服务运行时更新 |
+| 运行态 | M2/M3.0 使用或兼容读取 `/opt/nodeforge/state/runtime.json`；M3.1 起为 `/opt/nodeforge/state/leases.json`、`/opt/nodeforge/state/node-status.json` 与 `/opt/nodeforge/logs/events.jsonl` | lease、node status、事件；活动 session/TFTP 传输仅在内存 | 服务运行时更新 |
 
 MVP 不读取 YAML 配置文件；如果后续需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。catalog 是 `nodeforged` 的内部持久化文件，CLI 不直接写。配置和 catalog 明显变大后再评估拆分或引入数据库。
 
@@ -675,8 +675,9 @@ const NodeStatus = struct {
 
 运行态写入规则：
 
-- 运行态由 `state` 模块统一修改。
-- `runtime.json` 可周期性保存或关键事件后保存。
+- 运行态由 `state` 模块统一修改；M3.1 前的 `runtime.json` 是兼容快照，M3.1 仅在迁移读取它。
+- M3.1 将 DHCP lease 与 `node_status` 拆为独立文件、锁和保存生命周期；二者不承诺跨文件事务。
+- `leases.json` 由 DHCP checkpoint worker 周期性保存；`node-status.json` 由 HTTP 的关键状态转移同步保存。
 - `events.jsonl` 只追加，不作为当前状态事实源。
 - discovery/initrd 上报的 `NodeFacts` 默认只是观察数据；只包含 SN、BMC 地址/掩码/网关、IPMI 用户名和密码。管理员确认后可回填到 `node.serial_number` 或 `node.oob.ipmi`。
 
@@ -1210,9 +1211,9 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 - **ACK 归属约束**：动态地址（未知节点和没有静态保留地址的已登记节点）必须先存在同一 MAC 的未过期
   OFFER，才会转换为 ACK；任意 REQUEST 不能取得池内地址。唯一例外是已登记节点声明的静态保留地址，
   它可在服务重启后没有内存 OFFER 的情况下确认其配置 IP。
-- **M2 生命周期边界**：DHCP/TFTP worker 当前为 detached 长循环；进程退出会关闭 socket 终止 worker，
-  尚无配置热重载或独立 graceful shutdown 协调器。引入运行期重载或独立停服能力前必须添加取消信号、
-  worker join 与 listener drain，这属于后续生命周期管理工作。
+- **M2 生命周期边界（M2 阶段记录，M2.5 已解决；M3.1 补充持久化协调）**：M2 的 DHCP/TFTP worker 为 detached
+  长循环，进程退出会关闭 socket 终止 worker，尚无 graceful shutdown 协调器。M2.5 已引入 `stop_workers`
+  原子标志和 worker join；M3.1 将增加 DHCP checkpoint worker 的 final flush 和 join。有序停机顺序见 §8.1.3。
 - **`giaddr` 处理（RFC 2131 标准行为）**：当收到的 DHCP 报文 `giaddr` 非零时，表示报文经由外部 relay agent（路由器 IP Helper 或 `dhcrelay`）转发。服务器基于 `giaddr` 或 option 82 中的 RFC 3527 Link Selection 子选项定位目标 subnet，而非使用接收接口的 subnet。回复报文按 RFC 2131 Section 4.1 发送到 `giaddr:67`（relay agent 的 UDP 67 端口），而非广播或直接发给客户端。这是任何 RFC 2131 合规 DHCP 服务器的基本行为，不是独立功能特性。NodeForge 自身不实现 relay agent。参考 ISC DHCP `locate_network()`（`server/dhcp.c`）和 `bootp()`（`server/bootp.c`）的实现。
 - **服务器端地址冲突检测（Ping Probe）**：在发送 DHCPOFFER 前，对候选 IP 发送 ICMP Echo Request。在配置的超时内（默认 500ms）未收到与该请求匹配的 Echo Reply 才发送 OFFER；Linux raw socket 收到自身发出的 Echo Request 或其他无关 ICMP 报文时，必须继续等待同一个绝对 deadline，不能提前判定地址空闲。收到匹配回复则调用 `abandon_lease()` 标记该 IP 为 abandoned 状态（保持 `abandon_lease_time`，默认 1 小时），并尝试下一个候选 IP。raw socket 打开、发送或接收失败时必须取消该 pending OFFER 并不回复，绝不能把 `unavailable` 当成 `clear`。Linux 服务单元需要 `CAP_NET_RAW` 和 `CAP_NET_BIND_SERVICE`。参考 ISC DHCP `do_ping_check()`/`lease_pinged()`/`abandon_lease()` 实现。
 - 未识别 option 必须安全跳过并保留报文边界；编码顺序稳定，必须正确写 end option 255。
@@ -2213,14 +2214,65 @@ M3 新增每节点一个受 mutex 保护、单 writer 持久化的 `NodeStatus`�
   last_error, last_reason, session_active }
 ```
 
-它在校验 `AuthenticatedNodeSession` 和 phase transition 后更新，并与 DHCP runtime 一起原子写入
-`runtime.json`。EventWriter 失败不回滚该投影，HTTP 返回 5xx 以允许 at-least-once 重试。daemon 重启时，
-历史投影保留供 `node status` 查看，但所有 `session_active` 置为 false；旧 session 不会被重新打开，trace
-继续用 `daemon_restart_gap` 表达该断点。
+它在校验 `AuthenticatedNodeSession` 和 phase transition 后更新，并按 M3.1 的独立持久化契约写入
+`state/node-status.json`。status 持久化或 EventWriter 失败均不回滚已保存的投影，HTTP 返回 5xx 以允许
+at-least-once 重试。daemon 重启时，历史投影保留供 `node status` 查看，但所有 `session_active` 置为 false；
+旧 session 不会被重新打开，trace 继续用 `daemon_restart_gap` 表达该断点。
 
 `boot.config.fetched` 是 M3 新增的 server-origin EventType。有效 bootstrap 不因缺少 TFTP 诊断事件而被
 拒绝：它从当前 DHCP/TFTP phase 转入 `boot_config_fetched`，而 `trace` 负责将缺失的 TFTP phase 显式显示为
 gap，而不是把可用性错误伪装成认证错误。
+
+#### 8.1.3 M3.1 持久化边界与 checkpoint
+
+M3.1 是对 M2/M2.5/M3.0 单一 `runtime.json` 持久化模型的**补充方案**，不是对这些阶段已交付行为的
+追溯性完成声明。本节仅替换 M3.1 及后续版本的 runtime 持久化边界；此前章节中关于 `runtime.json` 的
+描述仍适用于 legacy 文件的读取与迁移。DHCP、HTTP 与 TFTP 仍共享进程内的
+`BootSession` 关联和唯一的 Event v2 writer，但不共享 runtime 快照文件或其 I/O 锁：
+
+| 域 | 持久化事实源 | 写入策略 | 重启语义 |
+| --- | --- | --- | --- |
+| DHCP lease | `state/leases.json` | 专属 checkpoint worker；有未保存变更时至多每秒一次 | 丢弃已过期 lease 后恢复 |
+| HTTP `node_status` | `state/node-status.json` | HTTP 状态转移后同步、原子保存 | 保留历史投影，并将 `session_active` 置为 false |
+| TFTP transfer | 无 snapshot；`events.jsonl` 为审计 | 不保存 TID、block、打开文件或传输计数 | 不恢复中断传输 |
+| `BootSession` | 无 snapshot；`events.jsonl` 为审计 | 仅进程内 mutex 保护 | 不恢复 session 或 capability |
+
+TFTP 必须继续通过已 ACK lease-IP 与 `BootSession` 关联，但该关联在 daemon 重启后失效；不得为了持久化
+计数或传输列表而恢复旧 TFTP session，也不得把 TFTP 纳入 DHCP 或 HTTP 的 checkpoint 锁。
+
+DHCP 热路径完成任何实际 lease 变更（包括分配、ACK、RELEASE、DECLINE、取消 OFFER、过期回收及恢复）后只递增
+单调 `lease_generation`，不得等待 JSON 序列化、文件写入、`fsync`、rename 或目录同步。checkpoint worker 是
+`leases.json` 的唯一写者：它比较已保存 generation，在
+`DhcpState` 的 mutex 内复制一致快照，并在锁外完成序列化和原子落盘。保存成功才推进已保存 generation；
+保存期间产生的新变更必须保留为待保存状态，保存失败不得清除它。checkpoint 的节流使用单调时钟；文件的
+`saved_at` 使用 UTC，仅作显示和排序。不得把 `receiveTimeout` 的空闲窗口作为唯一触发条件，因为持续
+200 pps 流量可永远不出现 200ms 空闲窗口。
+
+checkpoint worker 必须拥有 lease 文件写入的完整生命周期。停机时 coordinator 在 DHCP worker 停止后向它发送
+“flush-and-stop”命令；该 worker 自己完成 final flush 并退出，coordinator 随后 join。任何其它线程在 worker
+存活期间不得写 `leases.json`，不得以通用 stop 标志使其直接退出而跳过 final flush。若最终保存失败，只能记录
+err 并保留未保存 generation，不得伪造成功或无限阻塞有序停机。
+
+HTTP handler 在成功校验并更新 `node_status` 后，必须先同步保存 `node-status.json`，再追加 domain Event。
+该文件使用仅属于 status 的写入锁，不得争用 DHCP checkpoint 锁。`status.persist_failed` 是 M3.1 新增的稳定
+HTTP 错误码，status 保存失败时 handler 返回 503 且不追加该次 domain Event；内存中的投影可由客户端重试再次保存。
+EventWriter
+失败时沿用 at-least-once 语义：已保存的 status 不回滚，响应返回 5xx。重复请求必须保持 status transition
+幂等，并可重试尚未写出的 Event。
+
+两个 snapshot 文件均采用相同的单文件耐久协议：写入唯一临时文件、`fsync` 临时文件、同目录 rename、再
+`fsync` 父目录。崩溃或断电后遗留临时文件是允许且预期的，启动时只能在受限 state 目录中识别和清理它们；
+不得承诺 SIGKILL/断电后绝无 `.tmp` 残留。每个文件独立校验 schema、容量和内容边界，坏文件仅拒绝本域
+恢复并记录 err，不得污染另一个域。
+
+启动时优先加载新文件。某个新文件不存在时，才从旧 `runtime.json` 独立迁移该域的数据；例如
+`leases.json` 已存在但 `node-status.json` 缺失时，仍必须迁移 legacy status。迁移后保留旧文件作只读备份，
+不以删除旧文件作为启动成功条件。
+
+有序停机必须先停止并 drain HTTP，再停止 DHCP/TFTP；随后要求 DHCP checkpoint worker 完成 final flush 并
+退出。协议 worker 已退出后终止活动 `BootSession`、将所有 status 标记 inactive、最终保存
+`node-status.json`，最后才追加 `service.stopped`。这不扩展到 SIGKILL 或进程崩溃；后者由下次启动的
+`daemon_restart_gap` 表达。
 
 ### 8.2 代码任务
 
@@ -2235,7 +2287,9 @@ gap，而不是把可用性错误伪装成认证错误。
 | `http/api.zig` | JSON API handler |
 | `profile/render.zig` | 模板渲染入口 |
 | `http/node_events.zig` | 节点事件/日志摘要 DTO 校验、认证结果绑定和 EventType 映射；不直接操作文件 |
-| `state/node_status.zig` | `node_status` 状态机、原子投影与 runtime 序列化 |
+| `state/node_status.zig` | `node_status` 状态机与内存投影 |
+| `state/dhcp_store.zig` | `leases.json` 的 schema、原子保存/加载、legacy `runtime.json` lease 迁移 |
+| `state/status_store.zig` | `node-status.json` 的 schema、原子保存/加载、legacy `runtime.json` status 迁移 |
 | `state/boot_session.zig` | 活动 node/session 查询、capability 生命周期和 phase 推进；不持久化 token |
 | `state/catalog_runtime.zig` | 多对象 candidate 校验、catalog 原子发布和已发布资源查询 |
 | `catalog/iso_import.zig` | ISO staging、元数据检查、解包与 publication plan；不直接暴露 HTTP 路由 |
@@ -2390,10 +2444,12 @@ server-origin 类型。`reason` 是至多 128 bytes 的稳定 machine code，`me
 field 或认证失败返回明确 4xx/409，且不会写 domain Event。
 
 写入顺序固定为：验证 capability、URL node 与活动 session -> 校验 mode/stage transition -> 原子更新
-`node_status`/BootSession -> 追加 domain Event -> 返回响应。EventWriter 失败时状态更新不回滚，响应返回 5xx
-并记录服务 err，调用方可以重试；M3 的上报语义是 at-least-once，重复 domain event 可出现，但
-`node_status` transition 必须幂等。跨请求事件去重需要持久化 event id，超出 M3，不得以猜测 message 相同来
-去重。同一次 POST 无论成功或失败都各自产生一条服务侧 `http.request`，但它不替代 domain Event。
+`node_status`/BootSession -> 同步保存 `node-status.json` -> 追加 domain Event -> 返回响应。status 保存失败时返回
+`503 status.persist_failed`，不追加该次 domain Event；内存投影不回滚，调用方重试会再次尝试保存。EventWriter
+失败时状态更新和已保存投影不回滚，响应返回 5xx 并记录服务 err，调用方可以重试；M3 的上报语义是
+at-least-once，重复 domain event 可出现，但 `node_status` transition 必须幂等。跨请求事件去重需要持久化
+event id，超出 M3，不得以猜测 message 相同来去重。同一次 POST 无论成功或失败都各自产生一条服务侧
+`http.request`，但它不替代 domain Event。
 
 ### 8.7 CLI 命令
 
@@ -2416,9 +2472,10 @@ nodeforge repository show rocky-9.7-aarch64-iso
 - acceptor 与固定大小 worker pool 分离；大文件使用 `pread`/send loop 流式发送，不整体读入内存。
 - DHCP/TFTP 使用各自 UDP event loop；ISO hash、只读挂载/复制和 publication plan 提交到单独受限的 import worker，
   不阻塞收包或 HTTP response worker。静态下载持有已打开 fd，不在整个传输期间占 catalog mutex。
-- 配置使用不可变 snapshot + 原子替换；catalog 仅在 candidate 通过完整校验和原子落盘后替换；runtime/state
-  由单 writer 串行落盘：DHCP lease/status 快照至多每秒一次原子 checkpoint，正常 shutdown 无条件补写最终快照；
-  Event v2 则通过 M2.5 的唯一 mutex 逐条追加和轮转，不再引入独立队列或第二个文件后端。
+- 配置使用不可变 snapshot + 原子替换；catalog 仅在 candidate 通过完整校验和原子落盘后替换。M3.1 的
+  `leases.json` 与 `node-status.json` 按恢复域分别保存：DHCP checkpoint worker 最多每秒一次且不阻塞收包，
+  HTTP status 转移同步保存且不争 DHCP I/O 锁；有序 shutdown 分别补写最终快照。Event v2 则通过 M2.5 的唯一
+  mutex 逐条追加和轮转，不再引入独立队列或第二个文件后端。
 - MVP 验收基线：并发 100 个 HTTP Range 下载、100 个 TFTP session 和每秒 200 个 DHCP 报文时无崩溃、无状态串扰；具体吞吐在目标 ARM VM 和 x86_64 机器记录，不先承诺生产数字。
 
 ### 8.9 测试
@@ -2437,9 +2494,30 @@ nodeforge repository show rocky-9.7-aarch64-iso
 - POST 日志摘要只保留有界失败摘要，不能把完整 installer/initrd log 写入 JSONL 或服务日志。
 - runtime summary 与事件同步；EventWriter 写入失败时状态不回滚、请求返回 5xx 且可幂等重试；daemon restart
   后保留的 status 不接受旧 session。
+- 持续 200 DHCP pps、期间不出现 200ms 空闲窗口时，正常完成的 lease checkpoint 最多每秒一次；注入慢或失败的
+  `fsync` 不得阻塞 DHCP 收包，也不得错误推进已保存 generation。单次 `fsync` 长于 checkpoint 间隔时不承诺
+  实际每秒完成一次保存，但必须保持单写者、顺序保存和可重试性。
+- HTTP status 保存与 DHCP checkpoint 互不等待；status 保存失败返回 `503 status.persist_failed` 且不追加
+  domain Event。覆盖两个新文件的独立恢复、legacy `runtime.json` 的部分迁移、父目录同步和有序停机最终状态。
 - 使用 Rocky 与 Ubuntu ISO fixture 验证无 `CAP_SYS_ADMIN`、`mount`/`umount` 缺失、挂载失败、卸载失败、损坏 ISO、
   tuple/metadata 不匹配、repo 元数据完整/缺失、candidate 发布失败和名字冲突均不改变 catalog；成功导入后 repo
   与 installer assets 同时可解析。另以独立 mount namespace 验证导入完成后没有残留 loop device 或挂载点。
+
+#### 测试前清理约定
+
+在目标机执行 `zig build test` 或手动集成测试之前，必须清理上一次运行残留的日志、事件和
+状态文件，否则会导致断言误判：
+
+- 停止正在运行的 daemon（`systemctl stop nodeforged`），释放 UDP/67、UDP/69 和 HTTP 端口。
+- 删除 `/opt/nodeforge/logs/` 下的 `nodeforged.log`、`events.jsonl` 及轮转文件——残留事件
+  会导致 `events list` 空列表断言失败，残留日志会导致 `grep` 匹配到非本次运行的行。
+- 删除 `/opt/nodeforge/state/` 下的 `leases.json`、`node-status.json`、`runtime.json`（legacy）
+  和 `*.tmp`——残留状态会影响 legacy 迁移和崩溃恢复测试的起始条件。
+- 如需干净 catalog 回归，额外删除 `/opt/nodeforge/catalog/catalog.json` 和
+  `/opt/nodeforge/work/iso-import-*` 工作目录。
+- `tests/http.sh` 和 `tests/cli.sh` 已各自使用独立临时目录（`$tmp`）和 `--events-path` 隔离，
+  但手动验证仍需遵守上述清理步骤。`build.zig` 已强制 `http_tests` 和 `cli_tests` 串行执行
+  以避免端口冲突。
 
 ### 8.10 阶段验收
 
@@ -2449,6 +2527,8 @@ nodeforge repository show rocky-9.7-aarch64-iso
 - ISO 导入后无需手工建基础 repo 即可通过 HTTP 安装；导入失败不会发布半个 catalog 或可访问的半成品。
 - 在 `r97n0` 完成真实 Rocky 9.7 aarch64 ISO 导入、Range/续传、节点 config/answer 和 capability 上报验证，并记录
   100 HTTP Range、100 TFTP、200 DHCP 报文/秒并发基线。
+- `runtime.json` 拆分为 `leases.json` + `node-status.json`，独立 I/O 锁、legacy 迁移和崩溃恢复通过验证；
+  `zig build test` 全量回归通过。
 
 ### 8.11 实施顺序与文档同步
 
@@ -2458,8 +2538,11 @@ M3 按以下批次实施，前一批的 contract test 必须通过后才能进�
 1. **M3.0 contract fixture**：固定 BootConfig v1、`AuthenticatedNodeSession`、capability header、NodeEvent/
    LogSummary DTO、错误码、`boot.config.fetched` registry 与 `node_status` phase table；先为合法/非法 JSON 和
    session 组合建立 fixture。
-2. **M3.1 state/auth**：扩展 `BootSession`、实现 capability 生命周期与持久 `node_status`，将 HTTP context 接入
-   session/status store；验证 lease/node/peer、token、过期、supersede 和 daemon restart。
+2. **M3.1 state/auth（补充方案）**：扩展 `BootSession`、实现 capability 生命周期及独立持久化边界：DHCP generation
+   checkpoint 到 `leases.json`、checkpoint worker 的 flush-and-stop/join、HTTP 同步保存 `node-status.json`、
+   `503 status.persist_failed` contract fixture、legacy `runtime.json` 的独立迁移和有序 shutdown final flush；将
+   HTTP context 接入 session/status store，验证 lease/node/peer、token、过期、supersede、daemon restart、持续
+   200 pps 与慢/失败持久化。
 3. **M3.2 static/Range**：完成 catalog resolver、路径沙箱、fd 流式读取、ETag/Range/If-Range；先完成风险表中的
    独立 Range spike，再接入唯一 HTTP listener。
 4. **M3.3 node API**：实现 boot config、config、answer、events、logs 和 runtime summary，所有 domain event 都走
@@ -3082,7 +3165,9 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
 
 运行态：
 
-- `/opt/nodeforge/state/runtime.json`
+- `/opt/nodeforge/state/leases.json`（M3 DHCP lease snapshot）
+- `/opt/nodeforge/state/node-status.json`（M3 node-status snapshot）
+- `/opt/nodeforge/state/runtime.json`（M2/早期 M3 兼容迁移输入，不再写入）
 - `/opt/nodeforge/logs/events.jsonl`
 
 资产目录：
