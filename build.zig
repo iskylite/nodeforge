@@ -72,9 +72,12 @@ pub fn build(b: *std.Build) void {
 
     // HTTP integration tests exercise the Zap-backed listener, management
     // routes, and the M0 single-listener/port-preflight invariant.
+    // Both shell tests start daemon processes that bind privileged UDP ports
+    // (DHCP 67, TFTP 69); run them serially to avoid port conflicts.
     const http_tests = b.addSystemCommand(&.{"sh"});
     http_tests.addFileArg(b.path("tests/http.sh"));
     http_tests.addArtifactArg(cli);
     http_tests.addArtifactArg(daemon);
+    http_tests.step.dependOn(&cli_tests.step);
     test_step.dependOn(&http_tests.step);
 }

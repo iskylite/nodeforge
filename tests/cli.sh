@@ -249,11 +249,13 @@ grep -Fq '"name":"service.started"' "$tmp/events-types-json"
 grep -Fq '"name":"dhcp.ack"' "$tmp/events-types-json"
 
 # events list returns an empty table when no events file exists.
-"$cli" events list >"$tmp/events-list-empty"
+# Use an explicit non-existent path so the test is not affected by a
+# real events.jsonl left behind by prior daemon runs on this host.
+"$cli" events list --events-path "$tmp/nonexistent.jsonl" >"$tmp/events-list-empty"
 grep -Fqx 'No events recorded.' "$tmp/events-list-empty"
 
 # events list JSON returns an empty array when no events file exists.
-"$cli" events list -o json >"$tmp/events-list-empty-json"
+"$cli" events list --events-path "$tmp/nonexistent.jsonl" -o json >"$tmp/events-list-empty-json"
 grep -Fqx '[]' "$tmp/events-list-empty-json"
 
 # events list with an unknown --type is a usage error (exit 2).
@@ -310,7 +312,7 @@ else
 fi
 
 # events follow on a missing file is an error (non-zero exit).
-if "$cli" events follow >"$tmp/events-follow-missing" 2>&1; then
+if "$cli" events follow --events-path "$tmp/nonexistent.jsonl" >"$tmp/events-follow-missing" 2>&1; then
     echo "events follow on missing file unexpectedly succeeded" >&2
     exit 1
 else

@@ -10,10 +10,10 @@
   "tftp": { "asset_root": "/opt/nodeforge/tftp" },
   "distros": [
     { "name": "rocky", "family": "rhel", "versions": [
-      { "version": "9.7", "archs": ["aarch64"], "install_adapter": "kickstart", "package_manager": "dnf" }
+      { "version": "9.7", "archs": ["aarch64", "x86_64"], "install_adapter": "kickstart", "package_manager": "dnf" }
     ] },
     { "name": "ubuntu", "family": "ubuntu", "versions": [
-      { "version": "22.04", "archs": ["aarch64"], "install_adapter": "autoinstall", "package_manager": "apt" }
+      { "version": "22.04", "archs": ["aarch64", "x86_64"], "install_adapter": "autoinstall", "package_manager": "apt" }
     ] }
   ],
   "dhcp": {

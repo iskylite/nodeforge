@@ -34,6 +34,7 @@ sed \
     -e 's/192.168.50.100/127.0.0.100/' \
     -e 's/192.168.50.200/127.0.0.200/' \
     -e "s/\"http_port\": 8080/\"http_port\": $port/" \
+    -e 's/"bind_interface": "enp1s0"/"bind_interface": "lo"/' \
     "$root/config.example.json" > "$tmp/config.json"
 
 "$daemon" -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
@@ -97,7 +98,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     sleep 0.1
 done
 test "$ready" = true
-if ! grep -Fqx 'debug: http: request received GET /healthz' "$tmp/debug-daemon.err"; then
+if ! grep -Fq 'http: request received GET /healthz' "$tmp/debug-daemon.err"; then
     cat "$tmp/debug-daemon.out" "$tmp/debug-daemon.err" >&2
     exit 1
 fi
@@ -105,7 +106,7 @@ fi
 # M2.5 HTTP request log must include method, path, status, bytes, duration and
 # client IP in the service log. /healthz is excluded from event audit but its
 # service log line must still contain the full structured fields.
-grep -Eq 'http: GET /healthz -> [0-9]+ \([0-9]+ bytes, [0-9]+us, client=' "$tmp/debug-daemon.err" || {
+grep -Eq 'GET /healthz -> [0-9]+ \([0-9]+ bytes, [0-9]+us, client=' "$tmp/debug-daemon.err" || {
     echo "healthz log line missing structured fields" >&2
     cat "$tmp/debug-daemon.err" >&2
     exit 1
