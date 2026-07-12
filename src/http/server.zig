@@ -311,7 +311,17 @@ fn repositoryAsset(request: zap.Request, context: *const RouteContext, name: []c
     if (repository == null) return notFound(request, meta);
     const root = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ context.config.http.repository_root, name });
     defer context.allocator.free(root);
-    return staticFile(request, context, root, tail, null, meta);
+    // M4: URL-decode the tail before file lookup. HTTP clients (e.g., Anaconda)
+    // percent-encode special characters in file names such as `libstdc++` →
+    // `libstdc%2b%2b`. Without decoding, the server looks for the literal
+    // encoded name and returns 404. The decoded path is re-validated inside
+    // `staticFile` → `openRegularFile` → `validateRelativePath` to prevent
+    // path traversal attacks (e.g., `%2e%2e%2f` decodes to `../`).
+    const decode_buf = try context.allocator.alloc(u8, tail.len);
+    defer context.allocator.free(decode_buf);
+    @memcpy(decode_buf, tail);
+    const decoded_tail = std.Uri.percentDecodeInPlace(decode_buf);
+    return staticFile(request, context, root, decoded_tail, null, meta);
 }
 
 /// M3.6 下载可观测性：NodeForge 解析唯一支持的 Range 形式后，将验证过的
@@ -477,8 +487,10 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
     return json(request, .ok, output.written(), meta);
 }
 
-/// M3 有意返回一个传输夹具而非安装器方言。M4 将替换为 Kickstart/Autoinstall
-/// 渲染器，但 capability 投递和 answer URL 契约已在此处验证。
+/// M4 installer answer renderer: serves Kickstart (RHEL) or Autoinstall
+/// user-data/meta-data (Ubuntu) to authenticated install-mode nodes.
+/// Bootstrap proof (peer IP match) is accepted on the first fetch and
+/// upgraded to a capability token; subsequent requests use capability proof.
 const AnswerFormat = enum { kickstart, user_data, meta_data };
 fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []const u8, format: AnswerFormat, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
@@ -514,6 +526,28 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     // borrowed route segment before that hand-off rather than retaining a
     // request-owned slice for diagnostics afterwards.
     log.info("GET installer answer -> 200 (node={s}, client={s})", .{ node_id, meta.client_ip });
+    // M4: Record the HTTP request event for observability. `answerFixture`
+    // does not use the `json()` helper (which handles event logging), so the
+    // event must be appended explicitly. Without this, successful kickstart/
+    // autoinstall fetches are invisible in events.jsonl.
+    {
+        const duration_us = meta.started.durationTo(std.Io.Clock.awake.now(meta.io)).toMicroseconds();
+        var status_text: [4]u8 = undefined;
+        var bytes_text: [20]u8 = undefined;
+        var duration_text: [20]u8 = undefined;
+        const req_path = request.path orelse "<missing>";
+        const req_method = request.method orelse "OTHER";
+        const fields = [_]events.Field{
+            .{ .key = "method", .value = req_method },
+            .{ .key = "path", .value = req_path },
+            .{ .key = "status", .value = std.fmt.bufPrint(&status_text, "200", .{}) catch "0" },
+            .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{body.len}) catch "0" },
+            .{ .key = "client_ip", .value = meta.client_ip },
+            .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
+        };
+        context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "http.request", "HTTP request completed", &fields) catch |err|
+            observe_log.err("http: event append failed: {t}", .{err});
+    }
     try request.sendBody(body);
 }
 

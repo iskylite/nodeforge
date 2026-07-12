@@ -221,7 +221,17 @@ pub const Store = struct {
         defer self.mutex.unlock();
         for (&self.sessions) |*session| {
             if (!session.active() or !std.mem.eql(u8, session.idSlice(), id)) continue;
-            session.phase = phase;
+            // M4: Don't downgrade the phase from a post-TFTP state back to a
+            // DHCP early state. When the installer initrd performs its own DHCP
+            // after GRUB has loaded kernel/initrd, the DHCP server calls
+            // updateDhcp with .dhcp_ack, which would reset the phase from
+            // tftp_complete to dhcp_ack (early). This causes the next DHCP
+            // renewal to terminate the session (superseded) instead of
+            // preserving it, invalidating the bootstrap proof before
+            // inst.ks / NoCloud is fetched.
+            if (!isDhcpEarly(phase) or isDhcpEarly(session.phase)) {
+                session.phase = phase;
+            }
             if (lease_ip != 0) session.lease_ip = lease_ip;
             session.last_seen_mono = mono_now;
             session.last_seen_at = utc_now;
@@ -661,6 +671,34 @@ test "installer DHCP renewal preserves bootstrap proof after TFTP" {
     try std.testing.expectEqualStrings(first.link.id().?, renewal.link.id().?);
     store.updateDhcp(renewal.link, .dhcp_ack, 0xc0a81bd2, 21, 21);
     const auth = try store.authenticateBootstrap("node-01", 0xc0a81bd2, 22);
+    try std.testing.expectEqualStrings(first.link.id().?, auth.boot_session_id[0..]);
+}
+
+test "repeated installer DHCP renewals preserve bootstrap proof" {
+    // M4 regression: after the first installer DHCP renewal, updateDhcp was
+    // called with .dhcp_ack, downgrading the phase from tftp_complete to
+    // dhcp_ack (early). The next DHCP renewal would then terminate the
+    // session (superseded) instead of preserving it, invalidating the
+    // bootstrap proof before inst.ks was fetched.
+    var store: Store = .{};
+    const mac = &.{ 0x00, 0x0c, 0x29, 0x38, 0xb9, 0x1f };
+    const first = try store.acquireDhcp(std.testing.io, .{ .mac = mac, .xid = 1, .node_id = "node-01", .profile = "rocky", .mode = .install }, 10, 10);
+    store.updateDhcp(first.link, .dhcp_ack, 0xc0a81bd2, 11, 11);
+    store.updateTftp(first.link, .tftp_complete, 12, 12);
+
+    // First installer DHCP renewal (XID 2)
+    const second = try store.acquireDhcp(std.testing.io, .{ .mac = mac, .xid = 2, .node_id = "node-01", .profile = "rocky", .mode = .install }, 20, 20);
+    try std.testing.expectEqualStrings(first.link.id().?, second.link.id().?);
+    store.updateDhcp(second.link, .dhcp_ack, 0xc0a81bd2, 21, 21);
+
+    // Second installer DHCP renewal (XID 3) — previously failed because
+    // updateDhcp had reset the phase to dhcp_ack (early)
+    const third = try store.acquireDhcp(std.testing.io, .{ .mac = mac, .xid = 3, .node_id = "node-01", .profile = "rocky", .mode = .install }, 30, 30);
+    try std.testing.expectEqualStrings(first.link.id().?, third.link.id().?);
+    store.updateDhcp(third.link, .dhcp_ack, 0xc0a81bd2, 31, 31);
+
+    // Bootstrap proof must still be valid after multiple renewals
+    const auth = try store.authenticateBootstrap("node-01", 0xc0a81bd2, 32);
     try std.testing.expectEqualStrings(first.link.id().?, auth.boot_session_id[0..]);
 }
 

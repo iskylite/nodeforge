@@ -24,7 +24,7 @@ pub fn renderUserData(allocator: std.mem.Allocator, node: *const model.NodeConfi
         for (script) |c| if (c == '\'') try w.writeAll("'\\''") else if (c == '\n') try w.writeAll("; ") else try w.writeByte(c);
         try w.writeAll("'\n");
     }
-    try w.print("    - curtin in-target --target=/target -- sh -c \"curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"post\\\"}}' {s} || true\"\n", .{ token, session, session, event_url });
+    try w.print("    - curtin in-target --target=/target -- sh -c \"curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"post\\\"}}' {s} || true\"\n", .{ token, session, session, event_url });
     return out.toOwnedSlice();
 }
 

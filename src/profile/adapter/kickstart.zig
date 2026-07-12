@@ -35,7 +35,7 @@ pub fn renderAnswer(allocator: std.mem.Allocator, node: *const model.NodeConfig,
         defer allocator.free(script);
         try w.writeAll(script);
     }
-    try w.print("curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\n", .{ token, session, session, event_url });
+    try w.print("curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\n", .{ token, session, session, event_url });
     try w.writeAll("%end\nreboot\n");
     return out.toOwnedSlice();
 }

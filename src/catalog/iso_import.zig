@@ -226,13 +226,16 @@ fn detectRockyMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []con
 /// 从 Ubuntu live-server ISO 的 `.disk/info` 检测媒体信息。
 ///
 /// M3.6 介质完整性：除 `.disk/info`、`casper/vmlinuz` 与 `casper/initrd` 外，
-/// 导入还必须存在 `casper/filesystem.squashfs`。这避免发布一个能下载 kernel
-/// 却无法进入 live installer 的 ISO（缺少 squashfs，casper 无法挂载 live 文件系统）。
+/// 导入还必须存在至少一个 `casper/*.squashfs` 文件。这避免发布一个能下载
+/// kernel 却无法进入 live installer 的 ISO（缺少 squashfs，casper 无法挂载
+/// live 文件系统）。Ubuntu Server 22.04+ 不再使用固定文件名
+/// `filesystem.squashfs`，而是使用 `ubuntu-server-minimal.squashfs` 等多个
+/// squashfs 文件，因此检查目录中是否存在任意 `.squashfs` 后缀文件。
 ///
 /// `.disk/info` 是人可读字符串，例如：
 /// `Ubuntu-Server 22.04.5 LTS "Jammy Jellyfish" - Release arm64 (20230810)`
 /// 解析步骤：
-/// 1. 验证必需文件存在（含 filesystem.squashfs）
+/// 1. 验证必需文件存在（含 casper squashfs）
 /// 2. 读取 `.disk/info` 并解析 distro/version/arch
 /// 3. 版本截取到 major.minor（如 `22.04`），去除 patch 组件
 /// 4. 检查是否存在完整 APT repository（dists/pool/Release）
@@ -241,8 +244,10 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
     _ = try assets.verifyRegularFile(io, mount_point, "casper/vmlinuz");
     _ = try assets.verifyRegularFile(io, mount_point, "casper/initrd");
     // M3.6 介质完整性：没有 casper filesystem 的 live-server kernel/initrd
-    // 无法在 ISO 被下载并挂载后进入 Subiquity 安装器。
-    _ = try assets.verifyRegularFile(io, mount_point, "casper/filesystem.squashfs");
+    // 无法在 ISO 被下载并挂载后进入 Subiquity 安装器。Ubuntu Server 22.04+
+    // 使用 ubuntu-server-minimal.squashfs 等非固定文件名，因此扫描目录
+    // 确认至少存在一个 .squashfs 文件。
+    if (!try casperHasSquashfs(io, mount_point)) return error.FileNotFound;
     const info_path = try std.fmt.allocPrint(allocator, "{s}/.disk/info", .{mount_point});
     defer allocator.free(info_path);
     const info = try std.Io.Dir.cwd().readFileAlloc(io, info_path, allocator, .limited(64 * 1024));
@@ -255,6 +260,23 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
         .arch = tuple.arch,
         .layout = .{ .kernel_path = "casper/vmlinuz", .initrd_path = "casper/initrd", .repository_base = if (has_repository) "" else null },
     };
+}
+
+/// 检查 `casper/` 目录中是否存在至少一个 `.squashfs` 文件。
+///
+/// Ubuntu Server 22.04+ 不再使用固定文件名 `filesystem.squashfs`，
+/// 而是使用 `ubuntu-server-minimal.squashfs` 等多个命名 squashfs 文件。
+/// 此函数扫描 `casper/` 目录确认存在任意 `.squashfs` 后缀的常规文件。
+fn casperHasSquashfs(io: std.Io, mount_point: []const u8) !bool {
+    var root = try std.Io.Dir.openDirAbsolute(io, mount_point, .{ .access_sub_paths = true });
+    defer root.close(io);
+    var casper = root.openDir(io, "casper", .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    defer casper.close(io);
+    var iterator = casper.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".squashfs")) return true;
+    }
+    return false;
 }
 
 fn ubuntuRepositoryComplete(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, version: []const u8, arch: model.Arch) !bool {
