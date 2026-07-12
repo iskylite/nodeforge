@@ -180,6 +180,18 @@ pub const Store = struct {
                 session.last_seen_at = utc_now;
                 return .{ .link = .{ .linked = session.id } };
             }
+            // The installer initrd commonly starts a fresh DHCP transaction
+            // after GRUB has downloaded kernel/initrd.  It is still the same
+            // physical client (same MAC) and boot attempt, so replacing this
+            // already ACKed/TFTP-bound session would invalidate the bootstrap
+            // proof just before `inst.ks`/NoCloud is fetched.  Preserve the
+            // session identity and record the latest DHCP XID instead.
+            if (!isDhcpEarly(session.phase) and session.lease_ip != 0 and mono_now - session.last_seen_mono <= bootstrap_ttl_seconds) {
+                session.dhcp_xid = identity.xid;
+                session.last_seen_mono = mono_now;
+                session.last_seen_at = utc_now;
+                return .{ .link = .{ .linked = session.id } };
+            }
             same_mac_index = index;
             break;
         }
@@ -309,13 +321,20 @@ pub const Store = struct {
     pub fn authenticateBootstrap(self: *Store, node_id: []const u8, peer_ip: u32, mono_now: i64) !Authenticated {
         lock(&self.mutex);
         defer self.mutex.unlock();
+        var node_match = false;
+        var lease_match = false;
         for (&self.sessions) |*session| {
             if (!session.active() or sessionExpired(session, mono_now)) continue;
             if (session.node_id == null or session.profile == null or session.mode == null) continue;
             if (!std.mem.eql(u8, session.node_id.?, node_id)) continue;
+            node_match = true;
+            if (session.lease_ip == peer_ip) lease_match = true;
             if (session.lease_ip != peer_ip) return error.ProofMismatch;
             return authenticated(session);
         }
+        // Deliberately return stable diagnostic classes so the HTTP layer can
+        // log a safe reason without exposing session identifiers or tokens.
+        if (node_match and !lease_match) return error.ProofMismatch;
         return error.SessionInactive;
     }
 
@@ -630,6 +649,19 @@ test "resolveTftpBoot returns null for session without node_id" {
     }, 10, 10);
     store.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc9, 11, 11);
     try std.testing.expect(store.resolveTftpBoot(0xc0a81bc9, 12) == null);
+}
+
+test "installer DHCP renewal preserves bootstrap proof after TFTP" {
+    var store: Store = .{};
+    const mac = &.{ 0x00, 0x0c, 0x29, 0x38, 0xb9, 0x1f };
+    const first = try store.acquireDhcp(std.testing.io, .{ .mac = mac, .xid = 1, .node_id = "node-01", .profile = "rocky", .mode = .install }, 10, 10);
+    store.updateDhcp(first.link, .dhcp_ack, 0xc0a81bd2, 11, 11);
+    store.updateTftp(first.link, .tftp_complete, 12, 12);
+    const renewal = try store.acquireDhcp(std.testing.io, .{ .mac = mac, .xid = 2, .node_id = "node-01", .profile = "rocky", .mode = .install }, 20, 20);
+    try std.testing.expectEqualStrings(first.link.id().?, renewal.link.id().?);
+    store.updateDhcp(renewal.link, .dhcp_ack, 0xc0a81bd2, 21, 21);
+    const auth = try store.authenticateBootstrap("node-01", 0xc0a81bd2, 22);
+    try std.testing.expectEqualStrings(first.link.id().?, auth.boot_session_id[0..]);
 }
 
 test "capacity exhaustion remains explicit and bootstrap sessions expire" {

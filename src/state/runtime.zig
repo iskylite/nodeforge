@@ -63,6 +63,19 @@ pub const DhcpState = struct {
         return 0;
     }
 
+    /// Returns true only when `ip` is already an active lease for this same
+    /// client.  Such a lease is a renewal, not a new allocation, and must not
+    /// be ICMP-probed: the client is expected to answer its own address.
+    pub fn ownsActiveLease(self: *DhcpState, mac: []const u8, ip: u32, now: i64) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        self.reapLocked(now);
+        for (&self.leases) |*lease| {
+            if (lease.matches(mac) and lease.ip == ip and lease.phase == .active) return true;
+        }
+        return false;
+    }
+
     /// Drop only a pending OFFER that was never put on the wire. This is used
     /// when Ping Probe cannot run: an active lease must never be removed just
     /// because a later DISCOVER could not be conflict-checked.
@@ -243,6 +256,16 @@ test "refreshing an existing offer advances the checkpoint generation" {
     const before = state.generation();
     try std.testing.expectEqual(ip, state.offer(&mac, ip, true, 110, 60));
     try std.testing.expectEqual(before + 1, state.generation());
+}
+
+test "active lease renewal is distinguishable from a new offer" {
+    var state: DhcpState = .{};
+    const mac = [_]u8{ 0, 1, 2, 3, 4, 13 };
+    const ip: u32 = 0xc0a81b0a;
+    try std.testing.expectEqual(ip, state.offer(&mac, ip, false, 100, 30));
+    try std.testing.expect(state.acknowledge(&mac, ip, false, false, 101, 60));
+    try std.testing.expect(state.ownsActiveLease(&mac, ip, 102));
+    try std.testing.expect(!state.ownsActiveLease(&[_]u8{ 0, 1, 2, 3, 4, 14 }, ip, 102));
 }
 
 test "an abandoned candidate does not block ACK or release of the replacement" {

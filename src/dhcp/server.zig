@@ -123,6 +123,14 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
     while (attempts < runtime_state.DhcpState.max_leases) : (attempts += 1) {
         const reply = process(config, runtime, request) orelse return null;
         if (reply.kind != .offer) return reply;
+        // A registered node's explicit reservation is exclusive to its MAC.
+        // Do not make a booting reserved node fail just because an old guest
+        // network stack still answers ICMP while firmware is reacquiring DHCP.
+        if (resolver.resolve(config, request.mac(), request.architecture).reserved_ip != null) return reply;
+        // A client renewing its own active lease will (correctly) answer an
+        // ICMP probe for that address.  Treating that reply as a conflict
+        // abandons the installer's live lease just as Anaconda comes online.
+        if (runtime.dhcp.ownsActiveLease(request.mac(), reply.yiaddr, now())) return reply;
         switch (probe.ping(io, reply.yiaddr, config.dhcp.ping_timeout_ms)) {
             .clear => return reply,
             .occupied => {

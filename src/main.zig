@@ -199,6 +199,20 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addDebugFlag(node_list);
     try node.addCommands(&.{node_list});
 
+    const install = try zli.Command.init(init_options, .{
+        .name = "install",
+        .description = "Preview M4 unattended installer answers",
+        .usage = "nodeforge install render <node_id> [options]",
+        .help = "Render the selected node's Kickstart or Ubuntu NoCloud answer locally. Preview output redacts runtime session credentials.",
+    }, showCurrentHelp);
+    const install_render = try zli.Command.init(init_options, .{ .name = "render", .description = "Render the unattended install answer for one registered node" }, installRenderHandler);
+    try install_render.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try addConfigPathFlag(install_render);
+    try addCatalogPathFlag(install_render);
+    try addOutputFlag(install_render);
+    try addDebugFlag(install_render);
+    try install.addCommands(&.{install_render});
+
     const asset = try zli.Command.init(init_options, .{
         .name = "asset",
         .description = "Inspect and register TFTP boot assets",
@@ -252,6 +266,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         dhcp,
         runtime,
         node,
+        install,
         asset,
         install_source,
         events,
@@ -816,6 +831,39 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     if (config.value.nodes.len > rows.len) return error.TooManyNodes;
     for (config.value.nodes, 0..) |item, i| rows[i] = .{ .id = item.id, .mac = item.mac, .ip = item.ip orelse "-", .profile = item.profile };
     try views.nodes(ctx.writer, rows[0..config.value.nodes.len]);
+}
+
+/// Offline answer preview intentionally uses obvious non-secret placeholders.
+/// Real credentials are only delivered by the authenticated `/answer` route.
+fn installRenderHandler(ctx: zli.CommandContext) !void {
+    _ = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer config.deinit();
+    var catalog = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    defer catalog.deinit();
+    const node_id = ctx.getArg("node_id") orelse return;
+    const node = nodeforge.catalog.findNode(&config.value, node_id) orelse { try ctx.writer.print("error: install: unknown node {s}\n", .{node_id}); setExitCode(ctx, 1); return; };
+    const profile = nodeforge.catalog.findProfile(&config.value, node.profile) orelse { try ctx.writer.writeAll("error: install: node profile unavailable\n"); setExitCode(ctx, 1); return; };
+    if (profile.mode != .install) { try ctx.writer.writeAll("error: install: node does not use an install profile\n"); setExitCode(ctx, 1); return; }
+    const source = nodeforge.catalog.findInstallSource(catalog.value(), profile.install_source orelse "") orelse { try ctx.writer.writeAll("error: install: install source unavailable\n"); setExitCode(ctx, 1); return; };
+    const install = profile.install orelse nodeforge.model.InstallConfig{};
+    const event_url = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/api/v1/nodes/{s}/events", .{ config.value.server.server_ip, config.value.server.http_port, node.id });
+    defer ctx.allocator.free(event_url);
+    const bundle = if (install.bundle) |name| findBundle(&config.value, name) else null;
+    const answer = if (std.mem.eql(u8, source.distro, "ubuntu"))
+        try nodeforge.ubuntu_autoinstall.renderUserData(ctx.allocator, node, install, bundle, event_url, "<boot-session>", "<capability>")
+    else blk: {
+        const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/repos/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
+        defer ctx.allocator.free(install_root);
+        break :blk try nodeforge.kickstart.renderAnswer(ctx.allocator, node, install, install_root, bundle, event_url, "<boot-session>", "<capability>");
+    };
+    defer ctx.allocator.free(answer);
+    try ctx.writer.writeAll(answer);
+}
+
+fn findBundle(config: *const nodeforge.model.AppConfig, name: []const u8) ?*const nodeforge.model.ProvisioningBundle {
+    for (config.provisioning_bundles) |*bundle| if (std.mem.eql(u8, bundle.name, name)) return bundle;
+    return null;
 }
 
 const EventFilters = cli_events.Filters;

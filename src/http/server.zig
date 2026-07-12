@@ -102,6 +102,12 @@ pub fn serve(
         .interface = "0.0.0.0",
         .port = port,
         .on_request = route,
+        // Installer stage2 images are routinely larger than 1 GiB.  Zap's
+        // listener default (5 seconds) terminates a healthy PXE HTTP transfer
+        // on a moderately fast link before Anaconda can finish it.  Keep the
+        // transfer window bounded, but long enough for low-bandwidth lab and
+        // production networks; request/body limits remain enforced per route.
+        .timeout = 120,
         .log = false,
     });
     try listener.listen();
@@ -109,10 +115,13 @@ pub fn serve(
     event_writer.appendWithFields(io, allocator, paths.events_path, "service.started", "all protocol listeners ready", &.{}) catch |err|
         log.err("unable to record service start: {t}", .{err});
 
-    // One management import handler waits for its bounded worker by API
-    // contract. Keep another HTTP worker available for downloads, health and
-    // node callbacks; shared publication is separately serialized.
-    zap.start(.{ .threads = 1, .workers = 2 });
+    // `workers > 1` enables facil.io cluster mode and forks the listener.
+    // Boot sessions are intentionally process-local capability state shared
+    // with the DHCP/TFTP threads, so a forked HTTP worker would authenticate
+    // against a stale copy and reject the installer's `/answer` request.
+    // One worker keeps all protocol state in this process; the event loop
+    // remains non-blocking for sendfile downloads and HTTP callbacks.
+    zap.start(.{ .threads = 1, .workers = 1 });
 }
 
 /// 从底层 facil.io socket 提取客户端 IP。只使用 direct peer 地址；
@@ -163,7 +172,9 @@ fn route(request: zap.Request) !void {
         if (repoRoute(path)) |repo| return repositoryAsset(request, context, repo.name, repo.tail, meta);
         if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/config")) return bootConfig(request, context, node_route.node_id, meta);
-            if (std.mem.eql(u8, node_route.suffix, "/answer")) return answerFixture(request, context, node_route.node_id, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/answer")) return answerFixture(request, context, node_route.node_id, .kickstart, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/answer/user-data")) return answerFixture(request, context, node_route.node_id, .user_data, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/answer/meta-data")) return answerFixture(request, context, node_route.node_id, .meta_data, meta);
         };
     }
     if (std.mem.eql(u8, method, "POST")) {
@@ -468,7 +479,8 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
 
 /// M3 有意返回一个传输夹具而非安装器方言。M4 将替换为 Kickstart/Autoinstall
 /// 渲染器，但 capability 投递和 answer URL 契约已在此处验证。
-fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+const AnswerFormat = enum { kickstart, user_data, meta_data };
+fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []const u8, format: AnswerFormat, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
     const session = if (checked.proof == .bootstrap)
@@ -478,16 +490,36 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     context.sessions.touchDelivery(session.boot_session_id[0..], boot_session.monotonicNow(), unixNow());
     const event_url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/events", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
     defer context.allocator.free(event_url);
-    var output: [1024]u8 = undefined;
-    const body = try std.fmt.bufPrint(&output, "# NodeForge M3 bootstrap answer fixture; M4 replaces this with a distro adapter.\nnodeforge_boot_session_id={s}\nnodeforge_access_token={s}\nnodeforge_event_url={s}\n", .{ session.boot_session_id[0..], session.capability[0..], event_url });
+    const node = lookup.findNode(context.config, node_id) orelse return notFound(request, meta);
+    const profile = lookup.findProfile(context.config, session.profile) orelse return notFound(request, meta);
+    const install = profile.install orelse model.InstallConfig{};
+    const bundle = if (install.bundle) |name| findProvisioningBundle(context.config, name) else null;
+    const body = switch (format) {
+        .meta_data => try @import("../profile/adapter/ubuntu.zig").renderMetaData(context.allocator, node),
+        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserData(context.allocator, node, install, bundle, event_url, session.boot_session_id[0..], session.capability[0..]),
+        .kickstart => blk: {
+            context.catalog.lock();
+            defer context.catalog.unlock();
+            const source = lookup.findInstallSource(&context.catalog.value, profile.install_source orelse return notFound(request, meta)) orelse return notFound(request, meta);
+            const install_root = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/repos/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
+            defer context.allocator.free(install_root);
+            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswer(context.allocator, node, install, install_root, bundle, event_url, session.boot_session_id[0..], session.capability[0..]);
+        },
+    };
+    defer context.allocator.free(body);
     request.setStatus(.ok);
     try request.setHeader("content-type", "text/plain; charset=utf-8");
     try request.setHeader("cache-control", "no-store");
     // `sendBody` may hand the response back to facil.io immediately; log the
     // borrowed route segment before that hand-off rather than retaining a
     // request-owned slice for diagnostics afterwards.
-    log.info("GET answer fixture -> 200 (node={s}, client={s})", .{ node_id, meta.client_ip });
+    log.info("GET installer answer -> 200 (node={s}, client={s})", .{ node_id, meta.client_ip });
     try request.sendBody(body);
+}
+
+fn findProvisioningBundle(config: *const model.AppConfig, name: []const u8) ?*const model.ProvisioningBundle {
+    for (config.provisioning_bundles) |*bundle| if (std.mem.eql(u8, bundle.name, name)) return bundle;
+    return null;
 }
 
 fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
@@ -622,7 +654,7 @@ const StageMapping = struct { event_type: []const u8, phase: node_status.Phase }
 fn mapStage(mode: model.ProfileMode, stage: []const u8) ?StageMapping {
     if (mode == .install) {
         const values = [_]struct { []const u8, []const u8, node_status.Phase }{
-            .{ "installer_started", "install.installer_started", .installer_started }, .{ "config_fetched", "install.config_fetched", .installer_started }, .{ "started", "install.started", .installing }, .{ "partitioning", "install.partitioning", .installing }, .{ "packages", "install.packages", .installing }, .{ "bootloader", "install.bootloader", .installing }, .{ "post", "install.post", .installing }, .{ "rebooting", "install.rebooting", .installing }, .{ "completed", "install.completed", .completed }, .{ "failed", "install.failed", .failed },
+            .{ "installer_started", "install.installer_started", .installer_started }, .{ "config_fetched", "install.config_fetched", .install_config_fetched }, .{ "started", "install.started", .install_started }, .{ "partitioning", "install.partitioning", .install_partitioning }, .{ "packages", "install.packages", .install_packages }, .{ "bootloader", "install.bootloader", .install_bootloader }, .{ "post", "install.post", .install_post }, .{ "rebooting", "install.rebooting", .install_rebooting }, .{ "completed", "install.completed", .completed }, .{ "failed", "install.failed", .failed },
         };
         for (values) |value| if (std.mem.eql(u8, stage, value[0])) return .{ .event_type = value[1], .phase = value[2] };
     } else if (mode == .diskless) {
@@ -641,6 +673,11 @@ fn bodyWithin(request: zap.Request, maximum: usize) bool {
 }
 
 fn nodeAuthError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
+    // This deliberately records only the stable error tag and direct peer;
+    // credentials, headers and request body are never logged.
+    // A rejected installer bootstrap must be visible at the normal operating
+    // log level while still excluding credentials, headers and request bodies.
+    observe_log.warn("node auth rejected client={s} reason={t}", .{ meta.client_ip, err });
     return switch (err) {
         error.MissingProof => json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"node.missing_proof\",\"message\":\"node proof required\"}}\n", meta),
         error.SessionInactive => json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"session_inactive\",\"message\":\"boot session inactive\"}}\n", meta),

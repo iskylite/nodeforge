@@ -55,6 +55,12 @@ pub fn findProfile(config: *const model.AppConfig, name: []const u8) ?*const mod
     return null;
 }
 
+/// 按节点 ID 查找已显式认领的节点。安装 answer 只能为这类节点渲染。
+pub fn findNode(config: *const model.AppConfig, id: []const u8) ?*const model.NodeConfig {
+    for (config.nodes) |*item| if (equal(item.id, id)) return item;
+    return null;
+}
+
 fn equal(a: []const u8, b: []const u8) bool {
     return @import("std").mem.eql(u8, a, b);
 }

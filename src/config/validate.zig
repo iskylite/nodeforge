@@ -56,6 +56,10 @@ pub const ValidationError = error{
     DuplicateNodeMac,
     InvalidUnknownNodePolicy,
     KernelReleaseMismatch,
+    InvalidInstallStorage,
+    UnsupportedFirmwareBootOrder,
+    MissingProvisioningBundle,
+    InvalidProvisioningStep,
 };
 
 /// 完整校验启动配置和 catalog 的引用关系。
@@ -261,6 +265,7 @@ fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalo
                 if (profile.boot_bundle != null or !sameTuple(profile.distro, profile.version, profile.arch, source.distro, source.version, source.arch))
                     return error.InvalidProfileSource;
                 if (!profile.safety.destructive or !profile.safety.persistent_writes) return error.InvalidProfileSafety;
+                if (profile.install) |install| try validateInstallConfig(config, install);
             },
             .diskless => {
                 const name = profile.boot_bundle orelse return error.MissingBootBundle;
@@ -270,6 +275,37 @@ fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalo
                 if (profile.safety.destructive) return error.InvalidProfileSafety;
             },
         }
+    }
+}
+
+fn validateInstallConfig(config: *const model.AppConfig, install: model.InstallConfig) ValidationError!void {
+    const storage = install.storage;
+    if (storage.boot_disk.len == 0 or storage.install_disks.len == 0) return error.InvalidInstallStorage;
+    var disk_found = false;
+    for (storage.install_disks) |disk| {
+        if (disk.len == 0 or !std.mem.startsWith(u8, disk, "/dev/")) return error.InvalidInstallStorage;
+        if (std.mem.eql(u8, disk, storage.boot_disk)) disk_found = true;
+    }
+    if (!disk_found) return error.InvalidInstallStorage;
+    if (install.bootloader.install and !std.mem.eql(u8, install.bootloader.target, "storage.boot_disk")) return error.InvalidInstallStorage;
+    if (install.bootloader.set_firmware_boot_order) return error.UnsupportedFirmwareBootOrder;
+    var esp = false;
+    var biosboot = false;
+    for (storage.partitions) |part| {
+        if (part.size_mib == 0) return error.InvalidInstallStorage;
+        if (part.kind == .esp and part.mount != null and std.mem.eql(u8, part.mount.?, "/boot/efi")) esp = true;
+        if (part.kind == .biosboot) biosboot = true;
+    }
+    // Empty partitions request adapter defaults; explicit layouts must include
+    // the firmware-required partition.
+    if (storage.partitions.len != 0 and storage.boot_mode == .uefi and !esp) return error.InvalidInstallStorage;
+    if (storage.partitions.len != 0 and storage.boot_mode == .bios and storage.partition_table == .gpt and !biosboot) return error.InvalidInstallStorage;
+    if (install.bundle) |name| {
+        var found = false;
+        for (config.provisioning_bundles) |bundle| {
+            if (std.mem.eql(u8, bundle.name, name)) found = true;
+        }
+        if (!found) return error.MissingProvisioningBundle;
     }
 }
 

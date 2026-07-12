@@ -69,7 +69,7 @@ pub fn resolve(
     http_port: u16,
     cmdline_buf: []u8,
 ) ?BootTarget {
-    if (identity.mode == .install) return resolveInstall(identity, config, catalog, cmdline_buf);
+    if (identity.mode == .install) return resolveInstall(identity, config, catalog, server_ip, http_port, cmdline_buf);
     if (identity.mode == .diskless) return resolveDiskless(identity, config, catalog, server_ip, http_port, cmdline_buf);
     return null;
 }
@@ -92,11 +92,12 @@ fn resolveInstall(
     identity: TftpBootIdentity,
     config: *const model.AppConfig,
     catalog: *const model.Catalog,
+    server_ip: []const u8,
+    http_port: u16,
     cmdline_buf: []u8,
 ) ?BootTarget {
     // install 模式不直接使用 boot_session_id/mac/lease_ip 构造 cmdline，
     // 它们已由 DHCP/TFTP 链路验证，这里只用于查找 profile。
-    _ = identity.boot_session_id;
     _ = identity.mac;
     _ = identity.lease_ip;
     // 按 profile 名称查找启动配置中的 profile 定义。
@@ -136,8 +137,8 @@ fn resolveInstall(
         if (source_asset.kind != .iso) return null;
         break :blk std.fmt.bufPrint(
             cmdline_buf,
-            "root=/dev/ram0 ramdisk_size=1500000 cloud-config-url=/dev/null ip=dhcp url=http://{s}:{d}/images/{s}",
-            .{ config.server.server_ip, config.server.http_port, source.source_asset },
+            "root=/dev/ram0 ramdisk_size=1500000 cloud-config-url=/dev/null ip=dhcp url=http://{s}:{d}/images/{s} autoinstall ds=nocloud-net;s=http://{s}:{d}/api/v1/nodes/{s}/answer/",
+            .{ config.server.server_ip, config.server.http_port, source.source_asset, server_ip, http_port, identity.node_id },
         ) catch return null;
     } else blk: {
         // RHEL 系（Rocky/CentOS）安装 cmdline。
@@ -145,9 +146,13 @@ fn resolveInstall(
         // - rd.neednet=1：强制 dracut 在 initramfs 阶段初始化网络
         // - inst.repo=<url>：Anaconda 从此 DNF repository URL 下载安装树
         // M4 会追加 `inst.ks=<answer_url>` 以实现无人值守 Kickstart 安装。
-        if (source.repositories.len == 0) return null;
-        const repo = lookup.findRepository(catalog, source.repositories[0]) orelse return null;
-        break :blk std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s}", .{repo.base_url}) catch return null;
+        // `repository.base_url` is the DNF package root (for example
+        // `/repos/<source>/Minimal`).  Anaconda's `inst.repo` instead needs
+        // the media tree root so it can read `.treeinfo`, `images/install.img`
+        // and follow the treeinfo repository pointer itself.
+        var install_root_buf: [256]u8 = undefined;
+        const install_root = std.fmt.bufPrint(&install_root_buf, "http://{s}:{d}/repos/{s}", .{ server_ip, http_port, source.name }) catch return null;
+        break :blk std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s} inst.ks=http://{s}:{d}/api/v1/nodes/{s}/answer", .{ install_root, server_ip, http_port, identity.node_id }) catch return null;
     };
 
     return .{
@@ -273,8 +278,8 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
     try std.testing.expectEqualStrings("install/rocky/initrd.img", target.initrd_path);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "ip=dhcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.repo=http://192.168.27.128:18080/repos/rocky-9.7-iso") != null);
-    // M3 阶段不追加 inst.ks=，该参数由 M4 Kickstart renderer 提供。
-    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.ks=") == null); // M4
+    // M4 appends the authenticated node-specific Kickstart endpoint.
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.ks=http://") != null);
 }
 
 test "resolve diskless target returns config url cmdline" {

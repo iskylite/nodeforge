@@ -25,6 +25,9 @@ pub const AppConfig = struct {
     profiles: []const ProfileConfig = &.{},
     /// 已录入节点；未知节点行为由 policy 单独控制。
     nodes: []const NodeConfig = &.{},
+    /// 可复用的基础后处理步骤；M4 只执行 install_post 的 repository、
+    /// standard_packages 和 managed_file 三种动作。
+    provisioning_bundles: []const ProvisioningBundle = &.{},
     /// 未知节点的全局默认行为。
     policy: PolicyConfig = .{},
 };
@@ -282,6 +285,63 @@ pub const ProfileConfig = struct {
     boot_bundle: ?[]const u8 = null,
     /// 安全元数据，供未知节点策略做静态判断。
     safety: ProfileSafetyConfig = .{},
+    /// install mode 的安装器输入。保留 optional 以兼容 M3 catalog/boot
+    /// fixture；M4 renderer 对缺省值采用安全的最小安装配置。
+    install: ?InstallConfig = null,
+};
+
+pub const InstallConfig = struct {
+    storage: StorageConfig = .{},
+    bootloader: BootloaderInstallConfig = .{},
+    packages: []const []const u8 = &.{},
+    users: []const UserConfig = &.{},
+    ssh_authorized_keys: []const []const u8 = &.{},
+    bundle: ?[]const u8 = null,
+};
+
+pub const StorageConfig = struct {
+    wipe: bool = true,
+    boot_disk: []const u8 = "/dev/sda",
+    install_disks: []const []const u8 = &.{"/dev/sda"},
+    boot_mode: BootMode = .uefi,
+    partition_table: PartitionTable = .gpt,
+    partitions: []const PartitionConfig = &.{},
+};
+pub const BootMode = enum { uefi, bios };
+pub const PartitionTable = enum { gpt, mbr };
+pub const PartitionKind = enum { esp, biosboot, swap, root, boot, plain };
+pub const PartitionConfig = struct {
+    mount: ?[]const u8 = null,
+    size_mib: u32 = 0,
+    filesystem: ?[]const u8 = null,
+    kind: PartitionKind = .plain,
+};
+pub const BootloaderInstallConfig = struct {
+    install: bool = true,
+    target: []const u8 = "storage.boot_disk",
+    set_firmware_boot_order: bool = false,
+};
+pub const UserConfig = struct {
+    name: []const u8,
+    password: ?[]const u8 = null,
+    sudo: bool = true,
+};
+
+pub const ProvisionPhase = enum { install_post };
+pub const ProvisionAction = enum { repository, standard_packages, managed_file };
+pub const ProvisionStep = struct {
+    name: []const u8,
+    phase: ProvisionPhase = .install_post,
+    action: ProvisionAction,
+    repository: ?[]const u8 = null,
+    packages: []const []const u8 = &.{},
+    content: ?[]const u8 = null,
+    destination: ?[]const u8 = null,
+};
+pub const ProvisioningBundle = struct {
+    name: []const u8,
+    version: []const u8 = "1",
+    steps: []const ProvisionStep = &.{},
 };
 
 /// M0 节点最小身份模型；后续网络覆盖和 IPMI 信息在保持此身份不变的前提下扩展。

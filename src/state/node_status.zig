@@ -10,7 +10,13 @@ pub const max_statuses = 256;
 pub const Phase = enum {
     boot_config_fetched,
     installer_started,
-    installing,
+    install_config_fetched,
+    install_started,
+    install_partitioning,
+    install_packages,
+    install_bootloader,
+    install_post,
+    install_rebooting,
     completed,
     initrd_started,
     rootfs_downloading,
@@ -126,12 +132,16 @@ fn phaseAdvances(current: Phase, next: Phase) bool {
 fn phaseRank(phase: Phase) u8 {
     return switch (phase) {
         .boot_config_fetched => 1,
-        .installer_started, .initrd_started => 2,
-        .installing, .rootfs_downloading => 3,
+        .installer_started, .install_config_fetched, .initrd_started => 2,
+        .install_started, .install_partitioning, .rootfs_downloading => 3,
+        .install_packages => 4,
+        .install_bootloader => 5,
+        .install_post => 6,
+        .install_rebooting => 7,
         .rootfs_verified => 4,
         .rootfs_mounted => 5,
         .switching_root => 6,
-        .completed, .running => 7,
+        .completed, .running => 8,
         .failed => 8,
     };
 }
@@ -171,4 +181,14 @@ test "a retried boot config cannot regress an active install projection" {
     const status = store.get("n1").?;
     try std.testing.expectEqual(Phase.installer_started, status.phase);
     try std.testing.expectEqual(@as(i64, 2), status.last_event_at);
+}
+
+test "install projection retains the most specific verified stage" {
+    var store: Store = .{};
+    const id = "0123456789abcdef0123456789abcdef";
+    try store.update("n1", id, id, .install_partitioning, null, 1, true);
+    try store.update("n1", id, id, .install_packages, null, 2, true);
+    try store.update("n1", id, id, .install_bootloader, null, 3, true);
+    const status = store.get("n1").?;
+    try std.testing.expectEqual(Phase.install_bootloader, status.phase);
 }

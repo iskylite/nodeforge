@@ -84,6 +84,12 @@ pub const asset_validate = @import("assets/validate.zig");
 pub const grub = @import("boot/grub.zig");
 /// 内核命令行渲染器：根据发行版和 profile 生成 install/diskless 启动参数。
 pub const boot_target = @import("boot/target.zig");
+/// M4 installer adapters and shared answer rendering helpers.
+pub const profile_render = @import("profile/render.zig");
+pub const kickstart = @import("profile/adapter/kickstart.zig");
+pub const ubuntu_autoinstall = @import("profile/adapter/ubuntu.zig");
+/// M4 constrained install_post provisioning renderer.
+pub const provision_runner = @import("provision/runner.zig");
 /// 错误渲染器：将 Zig error set 映射为人类可读的审计消息。
 pub const observe_error = @import("observe/error.zig");
 /// 日志前端：结构化日志的公共 API。
@@ -133,6 +139,10 @@ test {
     _ = asset_validate;
     _ = grub;
     _ = boot_target;
+    _ = profile_render;
+    _ = kickstart;
+    _ = ubuntu_autoinstall;
+    _ = provision_runner;
     _ = observe_error;
     _ = observe_log;
     _ = log_backend;
