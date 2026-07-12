@@ -3,10 +3,15 @@
 //! 依赖 `model.zig`（配置类型）、`http/server.zig`（HTTP 实现）和
 //! `state/runtime.zig`（运行态骨架）；不直接操作文件系统或网络配置。
 //!
+//! M3.1 持久化边界：DHCP lease 由专属 checkpoint worker 至多每秒一次
+//! checkpoint 至 `leases.json`；HTTP `node_status` 独立同步保存至
+//! `node-status.json`；两者不共享 I/O 锁。旧 `runtime.json` 只作迁移输入。
+//!
 //! M2.5/M2.5.1 shutdown coordinator: 当 HTTP 事件循环退出（SIGINT/SIGTERM 或错误），
 //! 设置共享 stop 标志，DHCP/TFTP worker 通过 200ms 超时轮询检测到后自行退出
-//! 并 close 各自的 socket，主线程 join worker 线程、持久化运行态、写入
-//! 每个活动 boot session 的 `boot.session.terminated` 和 `service.stopped` 事件。
+//! 并 close 各自的 socket，主线程 join worker 线程、flush DHCP checkpoint、
+//! 持久化最终 status 快照、写入每个活动 boot session 的
+//! `boot.session.terminated` 和 `service.stopped` 事件。
 //! 初始化失败或 SIGKILL 等不可控终止不写入这些有序终态事件。
 
 const std = @import("std");
@@ -19,6 +24,7 @@ const catalog_runtime = @import("state/catalog_runtime.zig");
 const observe_log = @import("observe/log.zig");
 const paths = @import("paths.zig");
 const dhcp_store = @import("state/dhcp_store.zig");
+const status_store = @import("state/status_store.zig");
 const events = @import("state/events.zig");
 const boot_session = @import("state/boot_session.zig");
 const node_status = @import("state/node_status.zig");
@@ -44,10 +50,12 @@ pub fn run(
     var statuses: node_status.Store = .{};
     var clock: std.posix.timespec = undefined;
     const current_time: i64 = if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) == .SUCCESS) @intCast(clock.sec) else 0;
-    dhcp_store.load(io, allocator, paths.runtime_path, &runtime.dhcp, &statuses, current_time) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => observe_log.err("dhcp: ignoring invalid runtime snapshot: {t}", .{err}),
-    };
+
+    // M3.1: load from new files first; fall back to legacy runtime.json
+    // migration for each domain independently.
+    loadLeases(io, allocator, &runtime.dhcp, current_time);
+    loadStatuses(io, allocator, &statuses);
+
     var event_writer: events.Writer = .{};
     event_writer.configure(config.events.max_size_mb, config.events.keep);
     // 进程 id 与 boot session id 使用同一不可预测编码，但生命周期不同：前者
@@ -56,20 +64,20 @@ pub fn run(
     try boot_session.generateId(io, &daemon_instance_id);
     try event_writer.setDaemonInstanceId(daemon_instance_id);
     var sessions: boot_session.Store = .{};
-    var runtime_mutex: std.atomic.Mutex = .unlocked;
-    var last_runtime_checkpoint = std.atomic.Value(i64).init(0);
+
+    // M3.1: separate I/O locks for leases.json and node-status.json.
+    // The DHCP checkpoint worker owns leases.json; HTTP handlers own
+    // node-status.json.  Neither contends with the other.
+    var status_io_mutex: std.atomic.Mutex = .unlocked;
+    var checkpoint_flush_stop = std.atomic.Value(bool).init(false);
 
     event_writer.appendWithFields(io, allocator, paths.events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
         observe_log.err("events: unable to record configuration load: {t}", .{err});
     const persistence: dhcp_server.Persistence = .{
         .allocator = allocator,
-        .runtime_path = paths.runtime_path,
         .events_path = paths.events_path,
         .writer = &event_writer,
         .sessions = &sessions,
-        .statuses = &statuses,
-        .runtime_mutex = &runtime_mutex,
-        .last_runtime_checkpoint = &last_runtime_checkpoint,
     };
     var live_catalog = catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
     // DHCP needs a wildcard receive socket for client broadcasts.  The DHCP
@@ -82,6 +90,12 @@ pub fn run(
     const tftp_socket = try tftp_server.bind(io, config.server.server_ip);
     var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, allocator, tftp_socket, config, &live_catalog, &runtime, &event_writer, &sessions, &stop_workers });
     observe_log.info("tftp: listening on udp://{s}:{d}", .{ config.server.server_ip, tftp_server.port });
+
+    // M3.1: start the DHCP lease checkpoint worker.  It is the sole writer of
+    // leases.json and runs until it receives a flush-and-stop command during
+    // orderly shutdown.
+    var checkpoint_thread = try std.Thread.spawn(.{}, runCheckpoint, .{ io, allocator, &runtime.dhcp, paths.leases_path, &checkpoint_flush_stop });
+    observe_log.info("dhcp: lease checkpoint worker started", .{});
 
     // HTTP 明确绑定所有 IPv4 地址。`server.server_ip` 是给裸机节点使用的
     // 对外广告地址，不参与 bind；后续 DHCP/TFTP 接入时也要保持这个区分。
@@ -102,34 +116,50 @@ pub fn run(
         &sessions,
         &statuses,
         &daemon_instance_id,
-        &persistence,
+        &status_io_mutex,
+        paths.node_status_path,
     ) catch |err| {
         serve_error = err;
     };
 
-    // ── Shutdown sequence ──────────────────────────────────────────────
+    // ── Shutdown sequence (M3.1) ───────────────────────────────────────
     // 1. Mark service as stopping so management API can report the state.
-    // 2. Set stop flag; workers poll with 200ms timeout and self-exit,
+    // 2. Set stop flag; DHCP/TFTP workers poll with 200ms timeout and self-exit,
     //    closing their own sockets via defer.
-    // 3. Join worker threads (wait for orderly exit).
-    // 4. Persist runtime state.
-    // 5. Write service.stopped event.
+    // 3. Join DHCP and TFTP worker threads.
+    // 4. Send flush-and-stop to the DHCP checkpoint worker and join it.
+    // 5. Terminate active boot sessions and deactivate all statuses.
+    // 6. Final save of node-status.json (under status_io_mutex).
+    // 7. Write service.stopped event.
     runtime.service = .stopping;
     observe_log.info("shutdown: stopping protocol workers", .{});
     stop_workers.store(true, .release);
     dhcp_thread.join();
     tftp_thread.join();
 
-    while (!runtime_mutex.tryLock()) std.Thread.yield() catch {};
-    dhcp_store.save(io, allocator, paths.runtime_path, &runtime.dhcp, &statuses, now()) catch |err|
-        observe_log.err("dhcp: runtime persistence failed: {t}", .{err});
-    runtime_mutex.unlock();
+    // M3.1: The checkpoint worker must complete its final flush after the DHCP
+    // worker has stopped.  It is the sole writer of leases.json; no other
+    // thread may write that file while the worker is alive.
+    observe_log.info("shutdown: flushing lease checkpoint worker", .{});
+    checkpoint_flush_stop.store(true, .release);
+    checkpoint_thread.join();
 
     // worker 已退出后才终止活动 session，确保不会再有 DHCP/TFTP 事件引用它们；
     // 每个 session 仍单独写审计终态，随后才写全局 service.stopped。
     var terminated: [boot_session.max_sessions]boot_session.Session = undefined;
     const terminated_count = sessions.terminateAll(boot_session.monotonicNow(), now(), &terminated);
     statuses.deactivateAll();
+
+    // M3.1: final save of node-status.json with all sessions marked inactive.
+    {
+        var status_snapshot: [node_status.max_statuses]node_status.Status = undefined;
+        statuses.snapshot(&status_snapshot);
+        while (!status_io_mutex.tryLock()) std.Thread.yield() catch {};
+        defer status_io_mutex.unlock();
+        status_store.save(io, allocator, paths.node_status_path, &status_snapshot, now()) catch |err|
+            observe_log.err("status: final persistence failed: {t}", .{err});
+    }
+
     for (terminated[0..terminated_count]) |session| dhcp_server.emitSessionTermination(io, &persistence, session);
 
     event_writer.appendWithFields(io, allocator, paths.events_path, "service.stopped", "orderly shutdown complete", &.{}) catch |err|
@@ -140,9 +170,89 @@ pub fn run(
     if (serve_error) |err| return err;
 }
 
+/// M3.1: Load DHCP leases from `leases.json`.  If the new file does not exist,
+/// attempt to migrate from the legacy `runtime.json`.
+fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.DhcpState, now_val: i64) void {
+    dhcp_store.load(io, allocator, paths.leases_path, dhcp, now_val) catch |err| switch (err) {
+        error.FileNotFound => {
+            // New file missing: try legacy runtime.json migration for leases.
+            dhcp_store.migrateLegacy(io, allocator, paths.runtime_path, dhcp, now_val) catch |legacy_err| switch (legacy_err) {
+                error.FileNotFound => {},
+                else => observe_log.err("dhcp: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),
+            };
+        },
+        else => observe_log.err("dhcp: ignoring invalid leases snapshot: {t}", .{err}),
+    };
+}
+
+/// M3.1: Load node statuses from `node-status.json`.  If the new file does not
+/// exist, attempt to migrate from the legacy `runtime.json`.
+fn loadStatuses(io: std.Io, allocator: std.mem.Allocator, store: *node_status.Store) void {
+    status_store.load(io, allocator, paths.node_status_path, store) catch |err| switch (err) {
+        error.FileNotFound => {
+            // New file missing: try legacy runtime.json migration for statuses.
+            status_store.migrateLegacy(io, allocator, paths.runtime_path, store) catch |legacy_err| switch (legacy_err) {
+                error.FileNotFound => {},
+                else => observe_log.err("status: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),
+            };
+        },
+        else => observe_log.err("status: ignoring invalid node-status snapshot: {t}", .{err}),
+    };
+}
+
 fn now() i64 {
     var ts: std.posix.timespec = undefined;
     return if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) == .SUCCESS) @intCast(ts.sec) else 0;
+}
+
+/// M3.1 DHCP lease checkpoint worker.
+///
+/// It is the sole writer of `leases.json`.  The DHCP hot path only bumps
+/// `lease_generation` after any real lease mutation; this worker compares the
+/// saved generation, takes a consistent snapshot under the DhcpState mutex,
+/// and serializes/saves outside the lock.  It throttles at most once per second
+/// using a monotonic clock.  On flush-and-stop it performs one final save
+/// before exiting.
+fn runCheckpoint(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    dhcp: *runtime_state.DhcpState,
+    leases_path: []const u8,
+    flush_stop: *const std.atomic.Value(bool),
+) void {
+    var saved_generation: u64 = 0;
+    var leases: [runtime_state.DhcpState.max_leases]runtime_state.DhcpLease = undefined;
+
+    while (true) {
+        // Throttle: at most one save attempt per second.
+        std.Io.sleep(io, .fromSeconds(1), .awake) catch {};
+
+        if (flush_stop.load(.acquire)) {
+            // Final flush: the DHCP worker has already stopped, so no new
+            // mutations can occur.  Save unconditionally if there are unsaved
+            // changes.  If the final save fails, log the error and exit without
+            // faking success or blocking the orderly shutdown indefinitely.
+            const gen = dhcp.snapshotWithGeneration(&leases);
+            if (gen > saved_generation) {
+                dhcp_store.save(io, allocator, leases_path, &leases, now()) catch |err| {
+                    observe_log.err("dhcp: checkpoint final flush failed: {t}", .{err});
+                };
+            }
+            return;
+        }
+
+        // Normal checkpoint: save only if the generation advanced.
+        const gen = dhcp.snapshotWithGeneration(&leases);
+        if (gen > saved_generation) {
+            dhcp_store.save(io, allocator, leases_path, &leases, now()) catch |err| {
+                observe_log.err("dhcp: checkpoint save failed: {t}", .{err});
+                // Do not update saved_generation on failure; the unsaved
+                // changes remain pending for the next iteration.
+                continue;
+            };
+            saved_generation = gen;
+        }
+    }
 }
 
 fn runDhcp(io: std.Io, socket: std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: *const dhcp_server.Persistence, stop: *const std.atomic.Value(bool)) void {

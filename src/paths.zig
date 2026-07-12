@@ -41,6 +41,10 @@ pub const import_dir = work_dir ++ "/import";
 pub const config_path = config_dir ++ "/config.json";
 pub const catalog_path = catalog_dir ++ "/catalog.json";
 pub const runtime_path = state_dir ++ "/runtime.json";
+/// M3.1 DHCP lease snapshot; replaces the lease portion of `runtime.json`.
+pub const leases_path = state_dir ++ "/leases.json";
+/// M3.1 node-status snapshot; replaces the status portion of `runtime.json`.
+pub const node_status_path = state_dir ++ "/node-status.json";
 pub const events_path = logs_dir ++ "/events.jsonl";
 pub const service_log_path = logs_dir ++ "/nodeforged.log";
 pub const service_path = systemd_dir ++ "/nodeforged.service";

@@ -37,6 +37,7 @@ fn run(init: std.process.Init, out: *std.Io.Writer, in: *std.Io.Reader) !u8 {
     var args_iter = init.minimal.args.iterate();
     root.execute(&args_iter, .{}) catch |err| {
         if (isUsageError(err)) return 2;
+        nodeforge.observe_log.err("daemon: fatal: {t}", .{err});
         return err;
     };
     return 0;

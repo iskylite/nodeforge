@@ -32,6 +32,10 @@ pub const DhcpState = struct {
     pub const max_leases = 256;
     leases: [max_leases]DhcpLease = [_]DhcpLease{.{}} ** max_leases,
     mutex: std.atomic.Mutex = .unlocked,
+    /// M3.1 monotonic generation.  The DHCP hot path only bumps this after any
+    /// real lease mutation; the checkpoint worker compares it against the saved
+    /// generation to decide whether a new `leases.json` snapshot is needed.
+    lease_generation: u64 = 0,
 
     /// Offer an address without turning it into a committed lease.  Expired
     /// offers and abandoned entries are reclaimed before every allocation.
@@ -45,6 +49,7 @@ pub const DhcpState = struct {
             if (lease.phase == .abandoned) continue;
             lease.known = known;
             lease.expires_at = now + @as(i64, seconds);
+            self.lease_generation += 1;
             if (lease.ip == candidate or lease.phase == .active) return lease.ip;
             return 0;
         };
@@ -52,6 +57,7 @@ pub const DhcpState = struct {
         for (&self.leases) |*lease| if (!lease.used()) {
             lease.* = .{ .phase = .offered, .known = known, .ip = candidate, .expires_at = now + @as(i64, seconds) };
             @memcpy(&lease.mac, mac[0..6]);
+            self.lease_generation += 1;
             return candidate;
         };
         return 0;
@@ -65,6 +71,7 @@ pub const DhcpState = struct {
         defer self.mutex.unlock();
         for (&self.leases) |*lease| if (lease.matches(mac) and lease.ip == candidate and lease.phase == .offered) {
             lease.* = .{};
+            self.lease_generation += 1;
             return true;
         };
         return false;
@@ -83,6 +90,7 @@ pub const DhcpState = struct {
             lease.phase = .active;
             lease.known = known;
             lease.expires_at = now + @as(i64, seconds);
+            self.lease_generation += 1;
             return true;
         };
         if (!static_reservation) return false;
@@ -90,6 +98,7 @@ pub const DhcpState = struct {
         for (&self.leases) |*lease| if (!lease.used()) {
             lease.* = .{ .phase = .active, .known = true, .ip = candidate, .expires_at = now + @as(i64, seconds) };
             @memcpy(&lease.mac, mac[0..6]);
+            self.lease_generation += 1;
             return true;
         };
         return false;
@@ -102,6 +111,7 @@ pub const DhcpState = struct {
             lease.* = .{};
             released = true;
         };
+        if (released) self.lease_generation += 1;
         return released;
     }
     pub fn decline(self: *DhcpState, mac: []const u8, now: i64, quarantine_seconds: u32) bool {
@@ -110,6 +120,7 @@ pub const DhcpState = struct {
         for (&self.leases) |*lease| if (lease.matches(mac) and lease.phase != .abandoned) {
             lease.phase = .abandoned;
             lease.expires_at = now + @as(i64, quarantine_seconds);
+            self.lease_generation += 1;
             return true;
         };
         return false;
@@ -118,6 +129,22 @@ pub const DhcpState = struct {
         lock(&self.mutex);
         defer self.mutex.unlock();
         destination.* = self.leases;
+    }
+
+    /// Captures the current lease array and its generation under the same lock.
+    /// The checkpoint worker uses this to avoid races with the DHCP hot path.
+    pub fn snapshotWithGeneration(self: *DhcpState, destination: *[max_leases]DhcpLease) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        destination.* = self.leases;
+        return self.lease_generation;
+    }
+
+    /// Returns the current lease generation without taking a snapshot.
+    pub fn generation(self: *DhcpState) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.lease_generation;
     }
     /// Replace leases restored from the durable snapshot under the same lock
     /// used by all DHCP mutations. Startup is currently single-threaded, but
@@ -129,9 +156,14 @@ pub const DhcpState = struct {
         self.leases = source.*;
     }
     fn reapLocked(self: *DhcpState, now: i64) void {
+        var reaped = false;
         for (&self.leases) |*lease| {
-            if (lease.used() and lease.expires_at <= now) lease.* = .{};
+            if (lease.used() and lease.expires_at <= now) {
+                lease.* = .{};
+                reaped = true;
+            }
         }
+        if (reaped) self.lease_generation += 1;
     }
 };
 
@@ -201,6 +233,16 @@ test "DHCP offer becomes ACK and declined address is quarantined" {
     try std.testing.expect(state.acknowledge(&mac, 0xc0a81b0a, false, false, 101, 60));
     try std.testing.expect(state.decline(&mac, 102, 3600));
     try std.testing.expectEqual(@as(u32, 0), state.offer(&mac, 0xc0a81b0a, false, 103, 30));
+}
+
+test "refreshing an existing offer advances the checkpoint generation" {
+    var state: DhcpState = .{};
+    const mac = [_]u8{ 0, 1, 2, 3, 4, 12 };
+    const ip: u32 = 0xc0a81b0a;
+    try std.testing.expectEqual(ip, state.offer(&mac, ip, false, 100, 30));
+    const before = state.generation();
+    try std.testing.expectEqual(ip, state.offer(&mac, ip, true, 110, 60));
+    try std.testing.expectEqual(before + 1, state.generation());
 }
 
 test "an abandoned candidate does not block ACK or release of the replacement" {

@@ -19,6 +19,7 @@ pub const catalog_runtime = @import("state/catalog_runtime.zig");
 pub const events = @import("state/events.zig");
 pub const event_types = @import("state/event_types.zig");
 pub const dhcp_store = @import("state/dhcp_store.zig");
+pub const status_store = @import("state/status_store.zig");
 pub const management_client = @import("http/client.zig");
 pub const management = @import("http/management.zig");
 pub const http_server = @import("http/server.zig");
@@ -59,6 +60,7 @@ test {
     _ = events;
     _ = event_types;
     _ = dhcp_store;
+    _ = status_store;
     _ = management_client;
     _ = management;
     _ = http_server;

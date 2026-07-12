@@ -23,7 +23,7 @@ const lookup = @import("../catalog.zig");
 const asset_validate = @import("../assets/validate.zig");
 const iso_import = @import("../catalog/iso_import.zig");
 const dhcp_server = @import("../dhcp/server.zig");
-const dhcp_store = @import("../state/dhcp_store.zig");
+const status_store = @import("../state/status_store.zig");
 const log = std.log.scoped(.http);
 
 const RouteContext = struct {
@@ -36,7 +36,10 @@ const RouteContext = struct {
     sessions: *boot_session.Store,
     statuses: *node_status.Store,
     daemon_instance_id: *const [boot_session.id_len]u8,
-    persistence: *const dhcp_server.Persistence,
+    /// M3.1 separate I/O lock for `node-status.json`; never contends with the
+    /// DHCP checkpoint worker's lease file lock.
+    status_io_mutex: *std.atomic.Mutex,
+    node_status_path: []const u8,
 };
 
 /// Per-request metadata captured at route entry and threaded through to `json`
@@ -70,7 +73,8 @@ pub fn serve(
     sessions: *boot_session.Store,
     statuses: *node_status.Store,
     daemon_instance_id: *const [boot_session.id_len]u8,
-    persistence: *const dhcp_server.Persistence,
+    status_io_mutex: *std.atomic.Mutex,
+    node_status_path: []const u8,
 ) !void {
     if (!std.mem.eql(u8, ip, "0.0.0.0")) return error.InvalidHttpBindAddress;
 
@@ -84,7 +88,8 @@ pub fn serve(
         .sessions = sessions,
         .statuses = statuses,
         .daemon_instance_id = daemon_instance_id,
-        .persistence = persistence,
+        .status_io_mutex = status_io_mutex,
+        .node_status_path = node_status_path,
     };
     if (active_context != null) return error.HttpAlreadyRunning;
     active_context = &context;
@@ -379,7 +384,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
 
     context.statuses.update(node_id, session.boot_session_id[0..], context.daemon_instance_id, .boot_config_fetched, null, unixNow(), true) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
-    persistRuntime(context);
+    if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     const fields = [_]events.Field{
         .{ .key = "node_id", .value = node_id },
         .{ .key = "boot_session_id", .value = session.boot_session_id[0..] },
@@ -468,7 +473,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
     const mapped = mapStage(checked.session.mode, event.value.stage) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"stage_invalid\",\"message\":\"stage not allowed for profile mode\"}}\n", meta);
     context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, mapped.phase, event.value.reason, unixNow(), true) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
-    persistRuntime(context);
+    if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [4]events.Field = .{
         .{ .key = "node_id", .value = node_id },
         .{ .key = "boot_session_id", .value = checked.session.boot_session_id[0..] },
@@ -499,7 +504,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
     };
     context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, .failed, summary.value.reason, unixNow(), true) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
-    persistRuntime(context);
+    if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     const fields = [_]events.Field{ .{ .key = "node_id", .value = node_id }, .{ .key = "boot_session_id", .value = checked.session.boot_session_id[0..] }, .{ .key = "reason", .value = summary.value.reason } };
     context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, event_type, summary.value.summary, &fields) catch |err| {
         observe_log.err("node log append failed: {t}", .{err});
@@ -621,11 +626,16 @@ fn unixNow() i64 {
     return if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) == .SUCCESS) @intCast(ts.sec) else 0;
 }
 
-fn persistRuntime(context: *const RouteContext) void {
-    while (!context.persistence.runtime_mutex.tryLock()) std.Thread.yield() catch {};
-    defer context.persistence.runtime_mutex.unlock();
-    dhcp_store.save(context.io, context.allocator, context.persistence.runtime_path, @constCast(&context.runtime.dhcp), context.statuses, unixNow()) catch |err|
-        observe_log.err("runtime persistence failed: {t}", .{err});
+fn persistStatus(context: *const RouteContext) bool {
+    var snapshot: [node_status.max_statuses]node_status.Status = undefined;
+    context.statuses.snapshot(&snapshot);
+    while (!context.status_io_mutex.tryLock()) std.Thread.yield() catch {};
+    defer context.status_io_mutex.unlock();
+    status_store.save(context.io, context.allocator, context.node_status_path, &snapshot, unixNow()) catch |err| {
+        observe_log.err("status: persistence failed: {t}", .{err});
+        return false;
+    };
+    return true;
 }
 
 /// Constructs a placeholder meta for early exits where timing is not meaningful.

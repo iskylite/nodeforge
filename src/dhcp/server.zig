@@ -7,9 +7,7 @@ const packet = @import("packet.zig");
 const probe = @import("probe.zig");
 const resolver = @import("../boot/resolver.zig");
 const runtime_state = @import("../state/runtime.zig");
-const dhcp_store = @import("../state/dhcp_store.zig");
 const boot_session = @import("../state/boot_session.zig");
-const node_status = @import("../state/node_status.zig");
 const events = @import("../state/events.zig");
 const observe_log = @import("../observe/log.zig");
 const log = std.log.scoped(.dhcp);
@@ -40,16 +38,9 @@ pub fn bind(io: std.Io, server_ip: []const u8, bind_interface: ?[]const u8) !std
 }
 pub const Persistence = struct {
     allocator: std.mem.Allocator,
-    runtime_path: []const u8,
     events_path: []const u8,
     writer: *events.Writer,
     sessions: *boot_session.Store,
-    statuses: *node_status.Store,
-    runtime_mutex: *std.atomic.Mutex,
-    /// DHCP is a hot UDP path.  This timestamp coalesces durable lease
-    /// snapshots; every packet is still audited, while an orderly shutdown
-    /// always performs an unconditional final checkpoint.
-    last_runtime_checkpoint: *std.atomic.Value(i64),
 };
 
 /// 在同一 UDP worker 中处理 DHCP 和 session 生命周期。
@@ -86,7 +77,6 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const mode
             if (persistence) |p| p.sessions.clearLease(request.mac(), request.xid, boot_session.monotonicNow(), now());
         }
         const reply = offerAfterProbe(io, config, runtime, &request, persistence, if (session_link) |*link| link else null) orelse {
-            persist(io, persistence, runtime);
             continue;
         };
         var output: [1500]u8 = undefined;
@@ -121,7 +111,6 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const mode
             .nak => "dhcp.nak",
             else => "dhcp.request",
         }, request_kind, reply.kind, request.mac(), reply.yiaddr, request.xid, request.architecture, if (session_link) |*link| link else null);
-        persist(io, persistence, runtime);
         logReply(config, &request, reply, session_link);
     }
 }
@@ -209,24 +198,6 @@ fn chooseLease(config: *const model.AppConfig, runtime: *runtime_state.RuntimeSt
 fn now() i64 {
     var ts: std.posix.timespec = undefined;
     return if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) == .SUCCESS) @intCast(ts.sec) else 0;
-}
-fn persist(io: std.Io, persistence: ?*const Persistence, runtime: *runtime_state.RuntimeState) void {
-    const p = persistence orelse return;
-    const timestamp = now();
-    // Serialising and fsyncing the complete 256-entry runtime file for every
-    // DHCP retransmission caps the UDP worker far below the M3 200 pps
-    // baseline.  Lease/state recovery is therefore checkpointed at most once
-    // per second; `app.run` flushes the latest projection during graceful
-    // shutdown.  The DHCP loop is the only writer of this timestamp.
-    if (timestamp - p.last_runtime_checkpoint.load(.monotonic) < 1) return;
-    while (!p.runtime_mutex.tryLock()) std.Thread.yield() catch {};
-    defer p.runtime_mutex.unlock();
-    if (timestamp - p.last_runtime_checkpoint.load(.monotonic) < 1) return;
-    dhcp_store.save(io, p.allocator, p.runtime_path, &runtime.dhcp, p.statuses, timestamp) catch |err| {
-        observe_log.err("dhcp: runtime persistence failed: {t}", .{err});
-        return;
-    };
-    p.last_runtime_checkpoint.store(timestamp, .monotonic);
 }
 /// 追加 DHCP 审计事件。
 ///
