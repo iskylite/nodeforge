@@ -481,6 +481,47 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 安装结果自动推定为通过。后续验证继续记录 profile、node、ISO/repository、answer hash、目标地址、抓包
 和安装后命令输出；失败也追加日期、症状和根因。
 
+### 2026-07-13/14：`r97n1` Rocky 9.7 与 Ubuntu 22.04 自动部署复验
+
+- **环境与配置**：PXE 服务为 `r97n0`（管理地址 `192.168.26.128`，PXE 地址
+  `192.168.27.128`，接口 `enp26s0`）；目标 VMware ARM64 UEFI VM、节点 ID 与 hostname 均为
+  `r97n1`，MAC `00:50:56:2A:23:DB`，`vmnet2` 静态地址 `192.168.27.210/24`。服务配置只保留该
+  真实目标节点，DNS 为 `192.168.27.128`。现有 Rocky 9.7、Ubuntu 22.04.5 和 Rocky 8.10
+  ISO/catalog 原样沿用并通过校验，没有重新导入或改写。
+- **重新编译与部署**：本地 `zig fmt --check`、`make test` 和 `make arm64` 全部通过；最新 ARM64
+  ReleaseSafe 二进制部署到 `r97n0` 后，SHA-256 为
+  `nodeforge=8fa8a0daec30bc29bd0dd8a09ee01d26f5e71a90b0f2004c59d0d677b79c1d3b`、
+  `nodeforged=aa569189a37f40456f908d004b3be9c18b9bb8c38865e175d3171d6a5b873f44`。备份位于
+  `/opt/nodeforge/backups/20260714-001448`。重启后 systemd active/enabled，`NRestarts=0`，DHCP/67、
+  TFTP/69、HTTP/18080 正常监听，`nodeforge check` 与 `nodeforge status` 均通过。
+- **Rocky 9.7 成功结果**：generation 2、session
+  `5809032f2d3c5c2e35cb92b13f92dc28` 完整产生
+  `installer_started → started → post → completed`。目标盘启动后为 Rocky Linux 9.7、hostname
+  `r97n1`、静态 `.210/24`、XFS root + EFI；sshd active/enabled、firewalld inactive/masked、
+  SELinux disabled、curl 已安装。root 和 `nodeforge` 均可用 `asdf1234` 密码 SSH，bootstrap key
+  登录也成功。
+- **Ubuntu root 锁定修复**：generation 3 首次安装成功，但 Subiquity/curtin 最终仍把 root shadow
+  字段写成 `*`，即使 user-data 已有 `disable_root: false`、`lock_passwd: false` 与 `$6$` hash。
+  Ubuntu adapter 因此新增 late-command，在 `/target` 内显式执行 `usermod --password '$6$…' root`。
+  修复后的第一次真实 `user-data` 请求还暴露 `sha512Crypt` 中 `16 + digest[0]` 按 `u8` 相加的整数
+  溢出；core backtrace定位到该表达式，现已先扩展为 `usize` 并增加 255 边界回归测试。
+- **Ubuntu 最终成功结果**：generation 4、session
+  `ad18164a4f87f17f45b7d5f0c81d2772` 的 meta-data、user-data、vendor-data 均返回 200，daemon
+  全程 `NRestarts=0`，随后完整产生 `installer_started → started → post → completed`。从目标盘启动后
+  确认为 Ubuntu 22.04.5 LTS、hostname `r97n1`、`enp2s0=192.168.27.210/24`、ext4 root + EFI；
+  cloud-init done，sshd active/enabled，UFW inactive/disabled，curl 与受管 hosts 文件均存在。
+  `passwd -S` 显示 root 与 `nodeforge` 均为 `P`；两者均使用 `asdf1234` 完成禁用公钥后的纯密码 SSH，
+  root bootstrap key 登录也成功，`nodeforge` 属于 sudo 组。
+- **Ubuntu 重试复验**：generation 5、session `6d4d92a614b6b8c40d997aec30585264` 再次完成
+  `installer_started → started → post → completed`，NoCloud 三个 answer 均返回 200，daemon
+  `NRestarts=0`。切回 HDD 后再次确认 Ubuntu 22.04.5、hostname、静态 `.210/24`、EFI/ext4、
+  cloud-init、SSH/UFW/curl 正常，root 与 `nodeforge` 的 `asdf1234` 纯密码登录均成功。
+- **VMware 陷阱**：原 VM 的快照带有 poweroff 自动回滚行为，曾在安装完成后删除新写入磁盘；删除唯一
+  快照并合并磁盘后持久化正常。PXE-first 固件在 install generation 未 armed 时不会自动回落 HDD，
+  验证目标盘前需停 VM 并把 `bios.bootOrder` 从 `ethernet0` 改为 `HDD`；下一轮安装前再改回网络。
+  本轮还观察到 `vmrun ... nogui` 在 TFTP 中异常退出，改用 GUI 启动路径后稳定完成，不属于 NodeForge
+  服务故障。
+
 ### M4 安装主链路
 
 - [x] Rocky Linux 9.7 aarch64 从 Kickstart 完成磁盘、ESP、bootloader、`install_post` 并从本地盘启动。
@@ -509,12 +550,12 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 - [x] Ubuntu early/late 与 Rocky 对应 hook 均在 installer 上下文上报合法
   `installer_started → started → post → completed`，目标系统 bundle 使用 in-target，服务端不返回 stage 409。
 - [ ] Ubuntu error 与 Rocky `%onerror` 在真实失败路径上报合法 failed stage。
-- [ ] Ubuntu UFW inactive/disabled；Rocky firewalld disabled/masked，`sestatus` 显示 disabled。
+- [x] Ubuntu UFW inactive/disabled；Rocky firewalld disabled/masked，`sestatus` 显示 disabled。
 - [ ] `local-only` answer 不含公共 mirror、GeoIP、NTP、installer refresh、update/upgrade、mirrorlist、
   metalink 或 CDN；PXE VLAN 抓包无公网请求。
 - [ ] 额外包只能从安装介质或 NodeForge 本地 HTTP repository 获取；缺少 required package 时安装失败，
   不回退公网。
-- [ ] DHCP 目标网络安装后保持 DHCP；静态目标网络要求 `address == node.ip`，安装过程中本地 HTTP/session
+- [x] 静态目标网络要求 `address == node.ip`，安装过程中本地 HTTP/session
   不断链，重启后 Ubuntu Netplan 或 Rocky NetworkManager 仍使用该静态地址。
 - [ ] config import/export 对用户、root、IPMI 及所有其他 password 字段均保留原始明文；schema 不要求
   SecretRef 或预哈希值。日志、事件、BootConfig 和 status/plan 默认输出不泄露明文密码。

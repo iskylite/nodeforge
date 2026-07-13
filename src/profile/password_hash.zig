@@ -40,7 +40,7 @@ pub fn sha512Crypt(allocator: std.mem.Allocator, password: []const u8, salt: []c
     var s_digest: [64]u8 = undefined;
     var s_input = std.ArrayList(u8).empty;
     defer s_input.deinit(allocator);
-    const repeats: usize = 16 + digest[0];
+    const repeats = saltRepeatCount(digest[0]);
     for (0..repeats) |_| try s_input.appendSlice(allocator, salt);
     sha(&s_digest, &.{s_input.items});
     const s_bytes = try repeatDigest(allocator, &s_digest, salt.len);
@@ -99,6 +99,10 @@ fn repeatDigest(allocator: std.mem.Allocator, digest: *const [64]u8, length: usi
     return value;
 }
 
+fn saltRepeatCount(digest_byte: u8) usize {
+    return 16 + @as(usize, digest_byte);
+}
+
 fn appendRepeatedDigest(out: *std.ArrayList(u8), allocator: std.mem.Allocator, digest: *const [64]u8, length: usize) !void {
     var remaining = length;
     while (remaining > digest.len) : (remaining -= digest.len) try out.appendSlice(allocator, digest);
@@ -124,4 +128,8 @@ test "preview salts use secure randomness and the crypt alphabet" {
     const second = try randomSalt(std.testing.io);
     try std.testing.expect(!std.mem.eql(u8, &first, &second));
     for (first ++ second) |byte| try std.testing.expect(std.mem.indexOfScalar(u8, crypt_b64, byte) != null);
+}
+
+test "salt repeat count widens before addition" {
+    try std.testing.expectEqual(@as(usize, 271), saltRepeatCount(255));
 }

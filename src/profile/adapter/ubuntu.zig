@@ -144,6 +144,16 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
         try render.yamlQuote(w, sshd);
         try w.writeByte('\n');
     }
+    if (system.ssh.root_password) |plain| {
+        const salt = password_hash.sessionSalt(password_scope, "root");
+        const hash = try password_hash.sha512Crypt(allocator, plain, &salt);
+        defer allocator.free(hash);
+        const root_password = try std.fmt.allocPrint(allocator, "curtin in-target --target=/target -- usermod --password '{s}' root", .{hash});
+        defer allocator.free(root_password);
+        try w.writeAll("    - ");
+        try render.yamlQuote(w, root_password);
+        try w.writeByte('\n');
+    }
     if (system.security.firewall == .disabled) try w.writeAll("    - 'curtin in-target --target=/target -- systemctl disable --now ufw || true'\n");
     if (!system.connectivity.time_sync) {
         try w.writeAll("    - 'curtin in-target --target=/target -- systemctl disable --now systemd-timesyncd || true'\n");
@@ -503,6 +513,7 @@ test "M4.1 autoinstall renders target defaults and static network" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "locale: 'zh_CN.UTF-8'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "timezone: 'Asia/Shanghai'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "$6$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "usermod --password ''$6$") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "addresses: ['192.168.50.27/24']") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "set-name: 'ens160'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "search: ['nodeforge.local']") != null);
