@@ -40,7 +40,7 @@
 | M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
 | M6 | 支持矩阵增强 | M4.1、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
 | M7 | 补充包和后处理增强 | M4.1、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
-| M8 | 部署链路健壮性、密钥可维护性与传输性能加固 | M4.1 | post-install 异常容忍、安装阶段错误全覆盖传回、节点级不部署开关、ISO 导入主流 OS+覆盖语义、TFTP windowsize/并发/配置项、免密公钥配置化+CLI 导入、CLI 命令体系重构 |
+| M8 | 部署链路健壮性、密钥可维护性与传输性能加固 | M4.1 | 部署错误传回 nodeforged、节点级不部署开关、ISO 导入主流 OS+覆盖语义、TFTP windowsize/并发/配置项、免密公钥配置化+CLI 导入、CLI 命令体系校准 |
 
 ### 1.3 完成标准
 
@@ -4440,65 +4440,62 @@ M7 承接 §9.10.12 中“desired 已变化但目标系统尚未同步”的节�
 
 ### 13.1 目标
 
-M4/M4.1 交付了 kickstart/autoinstall 渲染、受控 post-install provisioning 和安装生命周期事件上报，实机
-验证中暴露七组缺陷。本里程碑在不改变 M4.1 TargetSystemConfig 归一模型的前提下，修复部署链路健壮性、
-可维护性、传输性能和 CLI 结构。详细设计见
+M4/M4.1 交付了 kickstart/autoinstall 渲染、受控 post-install provisioning 和安装生命周期事件上报。
+本里程碑在不改变 M4.1 TargetSystemConfig 归一模型的前提下，修复部署链路的可维护性和传输性能。
+post-install 命令的异常容忍语义保持现状不动，不在本里程碑范围内。详细设计见
 `docs/superpowers/specs/2026-07-14-m8-provisioning-robustness-design.md`。
 
 缺陷清单：
 
 | # | 缺陷 | 根因 |
 |---|------|------|
-| F1 | post-install 命令异常容忍语义不一致 | Kickstart `%post --erroronfail` + 裸命令无 `set -e` + 尾部 curl `\|\| true` 静默吞错；Ubuntu `late-commands` 用 `&&` 串成单条一点失败即中止 |
-| F2 | 部署错误信息未传回 nodeforged | `/logs` 端点已实现但无模板调用；失败仅发空 `{stage:"failed"}` |
-| F3 | 无法对已匹配节点禁用 PXE 部署 | `NodeConfig` 无 deploy 标志 |
-| F4 | ISO 导入仅认 Rocky+Ubuntu | family 前缀硬编码 `Rocky`；不支持 RHEL 系变体与国产化 OS；`--distro` 是断言非覆盖 |
-| F5 | TFTP 性能差 | 未实现 RFC 7440 windowsize；单线程串行；无性能配置项 |
-| F6 | 免密公钥不可更新 | 公钥仅启动时解析一次、不覆盖已生成对 |
-| F7 | CLI 命令体系结构不合理 | 13 个扁平顶层命令无领域分组 |
+| F1 | 部署错误信息未传回 nodeforged | `/logs` 端点已实现但无模板调用；`reason`/`message` 从未被填充；失败仅发空 `{stage:"failed"}` |
+| F2 | 无法对已匹配节点禁用 PXE 部署 | `NodeConfig` 无 deploy 标志；generation 机制仅覆盖 install 模式且无法阻止首次部署 |
+| F3 | ISO 导入仅认 Rocky+Ubuntu | family 前缀硬编码 `Rocky`；不支持 RHEL 系变体与国产化 OS；`--distro` 是断言非覆盖 |
+| F4 | TFTP 性能差 | 未实现 RFC 7440 windowsize；单线程串行；无性能配置项 |
+| F5 | 免密公钥不可更新 | 公钥仅启动时解析一次、不覆盖已生成对 |
+| F6 | CLI 命令体系结构不合理 | 13 个扁平顶层命令与文档定义的 resource-action 模型存在偏差 |
 
-### 13.2 F1：post-install 两段式执行模型
+### 13.2 F2：节点级"不部署"开关
 
-把 post-install 分为**生命周期段**（curl 回调，始终 `\|\| true`，保持不变）和 **provisioning 段**
-（`provision/runner.zig` 生成的步骤，每条失败时捕获退出码与 stderr 摘要上报 `/logs` 后继续）。
+现有 generation 机制（`deployment_control.zig`）在默认 `reinstall_policy=.explicit` 下，首次部署成功后
+确实不会再次进入部署（armed=null -> `install_not_armed` -> 无 bootfile）。已有 CLI `install retry` 覆盖
+re-enable 方向。但 **disable 方向缺失**：无法标记"此节点永不部署但保留 MAC/IP 预留用于诊断"。
+generation gate 仅作用于 install 模式，无法阻止首次部署（`ensureInitial` 无条件 arm gen 1），
+无法覆盖 diskless/discovery 模式，且无 per-node policy override。
 
-`ProvisionStep` 新增 `on_failure: enum { continue_, abort }`，默认 `continue_`（失败不中止）。
-Kickstart `%post` 去掉 `--erroronfail`（provisioning 失败不回滚已完成的 OS 安装）；Ubuntu bundle 不再用
-`&&` 串成单条，改为每条独立 `late-commands` list item。复用已实现但未被调用的
-`POST /api/v1/nodes/:id/logs`（`server.zig:708`），新增 reason `install.post_step_failed`。
-
-### 13.3 F2：安装阶段错误全覆盖传回
-
-Ubuntu Autoinstall 原生支持 HTTP webhook（`autoinstall.reporting` 的 `http` callback）；Kickstart/Anaconda
-没有同等的 HTTP webhook，需要用 `%pre`、`%onerror`、`%post` 主动调用 HTTP API。
-
-- **Ubuntu**：`renderUserDataM41` 新增 `reporting:` 块声明 `http` callback 指向新路由
-  `POST /api/v1/nodes/:id/subiquity-report`；`subiquityReport` handler 将 Subiquity JSON 事件映射到
-  `install.*` 阶段（复用 `mapStage`）。手写 `early/late/error-commands` curl 保留为降级路径。
-  error-commands 增强：捕获 curtin env vars 填入 `/logs` summary，reason `install.subiquity_error`。
-- **Kickstart**：`%onerror` 增强为捕获 Anaconda traceback 后 curl `/logs`，reason `install.anaconda_error`。
-  `%post` provisioning 段每步失败 curl `/logs`，reason `install.post_step_failed`。
-
-不新增端点（除 `/subiquity-report`）；`/logs` 和 `/events` 已存在，仅接通调用方。
-
-### 13.4 F3：节点级"不部署"开关
-
-`NodeConfig` 新增 `deploy: bool = true`。`resolve()` MAC 命中后加守卫：`deploy=false` 时返回
-`bootfile=null, known=true`，仍发诊断 DHCP lease 但不下发 PXE。适用于 install/diskless/discovery 全模式。
+`NodeConfig` 新增 `deploy: bool = true`。`resolve()` MAC 命中后、mode 判定前加守卫：`deploy=false` 时返回
+`bootfile=null, known=true, mode=null`，仍发诊断 DHCP lease 但不下发 PXE。`mode=null` 使 generation gate
+被完全绕过。适用于 install/diskless/discovery 全模式。`deploy` 是硬外层开关，与 generation gate 互补不冗余。
 新增事件 `boot.deploy_disabled`。
 
-### 13.5 F4：ISO 导入支持主流 OS + 覆盖语义
+### 13.3 F1：安装阶段错误全覆盖传回
+
+> Ubuntu Autoinstall 原生支持 HTTP webhook（`autoinstall.reporting` 的 `http` callback）；
+> Kickstart/Anaconda 没有同等的 HTTP webhook，需要用 `%pre`、`%onerror`、`%post` 主动调用 HTTP API。
+
+`/logs` 和 `/events` 端点已完整实现但 `/logs` 从未被模板调用，`reason`/`message` 从未被填充。
+`answerFixture` 新增 `log_url` 构造（与 `event_url` 并行注入模板）。
+
+- **Kickstart**：`%onerror` 增强为捕获 Anaconda traceback（`/tmp/anaconda-tb-*/anaconda-tb`）后 curl `/logs`，
+  reason `install.anaconda_error`。`%pre`/`%post` 的 stage curl 保持不变。
+- **Ubuntu**：`renderUserDataM41` 新增 `reporting:` 块声明 Subiquity 原生 `type: http` callback，指向新路由
+  `POST /api/v1/nodes/:id/subiquity-report`（bearer token 通过 `headers` 注入）。`subiquityReport` handler 将
+  Subiquity JSON 事件映射到 `install.*` 阶段（复用 `mapStage`）。`early/late/error-commands` 手写 curl 保留为
+  降级路径。`error-commands` 增强：捕获 curtin env vars 填入 `/logs`，reason `install.subiquity_error`。
+
+### 13.4 F3：ISO 导入支持主流 OS + 覆盖语义
 
 RHEL 系 `.treeinfo` `family` 前缀白名单扩展为
 `Rocky|CentOS|CentOS Stream|RedHatEnterpriseServer|RedHatEnterpriseLinux|AlmaLinux|Fedora|OracleLinux|ScientificLinux|CloudLinux|EuroLinux`，
-加国产化 `openEuler|Kylin|TencentOS|AnolisOS|UnionTech OS Server|UOS Server|npserver|TurboLinux`，
+加国产化 `openEuler|Kylin|Kylin Linux Advanced Server|TencentOS|TencentOS-Server|AnolisOS|UnionTech OS Server|UOS Server|npserver|TurboLinux|Sugon OS|BigCloud-Enterprise-Linux`，
 全部归一到 distro `rocky`（复用 kickstart adapter），catalog 新增 `source_label` 记原始 family。
 Ubuntu 沿用 `.disk/info`；Debian 新增检测，归一 `ubuntu`。
 
 `--distro`/`--version`/`--arch` 语义从断言改为覆盖：指定时跳过自动检测直接采用（仍校验文件存在性和
 支持矩阵）。未识别 ISO 且未指定 `--distro` 时返回友好错误提示 supported families 与 hint。
 
-### 13.6 F5：TFTP 性能优化
+### 13.5 F4：TFTP 性能优化
 
 - **windowsize (RFC 7440)**：`negotiate` 识别 `windowsize` option 回 OACK；DATA 循环改为发 `windowsize` 块
   后才等一个 ACK。处理 block number 回绕。
@@ -4508,59 +4505,74 @@ Ubuntu 沿用 `.disk/info`；Debian 新增检测，归一 `ubuntu`。
   （默认 3）、`max_concurrent_transfers`（默认 8）。客户端不协商时 OACK 主动建议 1468。
 - HTTP 不改（已 sendfile + Range + 120s 超时）；`HttpConfig` 仅新增 `max_connections: u16 = 0`（M6 压测后固化）。
 
-### 13.7 F6：免密公钥配置化 + CLI 导入
+### 13.6 F5：免密公钥配置化
 
 `ServerConfig` 新增 `ssh_authorized_public_keys: []const []const u8 = &.{}`（多公钥数组，全部注入去重）。
 解析优先级：① config 数组 -> ② config 单值（向后兼容）-> ③ `state/bootstrap-ssh/*.pub` 目录扫描 ->
 ④ `/root/.ssh/*.pub` -> ⑤ 已生成 key -> ⑥ 生成新 pair。`state/bootstrap-ssh/` 现可存放多个 `*.pub` 文件；
 配置中只接受相对 `state/bootstrap-ssh/` 的文件名。
 
-CLI：`admin-key import <path> [--rename NAME]` 复制外部公钥到 `state/bootstrap-ssh/`（支持目录批量）；
-`admin-key reload` 重新解析刷新 `ServerContext` 缓存（不重启 daemon，后续 `/answer` 立即用新 key）；
-`admin-key show` 显示生效公钥来源+fingerprint（诊断"注入公钥 ≠ ssh 私钥"）；`admin-key list` 列出
-`state/bootstrap-ssh/*.pub`。已装节点 authorized_keys 需重装或手动更新，CLI 明确提示。
+CLI 接口见 §13.7 F6（`media key` 子命令，与 CLI 校准统一设计）。已装节点 authorized_keys 需重装或手动更新，
+CLI 明确提示。
 
-### 13.8 F7：CLI 命令体系重构
+### 13.7 F6：CLI 命令体系校准
 
-当前 13 个扁平顶层命令无领域分组。重构为 7 个领域分组：
+当前 13 个扁平顶层命令与文档定义的 CLI canonical form（`nodeforge <resource> [subresource] <action>`，
+`DESIGN.md:1612-1628`）存在偏差：`runtime` 独立于 `dhcp`、`trace` 独立于 `node`/`events`、
+`install-source` 与 `asset` 分离、`install` group 混杂 preview 和 mutation。
+
+校准原则：**resource 即顶层，action 紧随其后，不引入 subresource 中间层**（保持最多 2 个命令词），
+例外仅限逻辑上确实是子资源的（如 `media key`）。校准后命令树：
 
 ```
-nodeforge <command>
-  ① status / check                          (daemon health)
-  ② config   <validate|export|import>       (config files)
-  ② catalog  <validate|export>              (catalog files)
-  ③ media    <import|source <list|show>|asset <import|list|show|validate>>  (boot media)
-  ④ node     <list|show|render|retry|trace>  (nodes & lifecycle)
-  ⑤ dhcp     <show|leases list|unknown list>  (absorbs runtime)
-  ⑤ tftp     <show|sessions list>
-  ⑥ events   <list|follow|types>
-  ⑦ admin-key <import|reload|show|list>      (NEW)
+nodeforge [-v] <command> [options]
+
+① status / check                                    (daemon health)
+② config   <validate|export|import>                  (config files)
+② catalog  <validate|export>                         (catalog files)
+③ media import <iso-path> [--distro] [--version] [--arch]  (ISO import, online)
+   media list / show <name> / validate               (install source + assets, offline)
+   media key import <path> [--rename NAME]           (bootstrap public key, offline)
+   media key reload / show / list                     (key management, mixed/online)
+④ node list / show <id> / render <id> / retry <id> / trace <id>  (nodes & lifecycle)
+⑤ dhcp show / leases / unknown                       (absorbs runtime)
+   tftp show / sessions                              (sessions not session list)
+⑥ events <list|follow|types>                         (audit)
 ```
 
-迁移映射：`install-source import` -> `media import`；`asset *` -> `media asset *`；`install render/retry` ->
-`node render/retry`；`trace` -> `node trace`；`runtime leases/unknown list` -> `dhcp leases/unknown list`。
-新增 `node show`、`media source list/show`。旧路径保留 deprecated alias（zli `deprecated`+`replaced_by`）
-一个版本周期，执行时输出 warning。`buildCli` 拆分为按领域的 `register*Commands` 函数。
+`media key` 而非独立 `admin-key` 顶层：bootstrap key 与 install media 紧密相关（同 state 目录树、
+用于登录已部署节点），避免新增第 14 个顶层命令。`media key <action>` 是 resource-subresource-action
+三词结构（`media`=resource, `key`=subresource 限定, `import`/`reload`/`show`/`list`=action），
+符合 canonical form 的 `[subresource]` 槽位。
 
-### 13.9 验收标准
+`dhcp leases`/`dhcp unknown`/`tftp sessions` 省略 `list` 动词：单资源运行态查询只有一个 action，
+加 `list` 会变 3 词。`events list` 保留 `list` 因 `events` 有多个 action 需区分。
 
-1. Kickstart provisioning 段任一步骤失败 -> 安装仍 `completed`，`/logs` 收到 `install.post_step_failed`。
+迁移映射：`install-source import` -> `media import`；`asset *` -> `media *`（import 统一为 `media import --type`）；
+`install render/retry` -> `node render/retry`；`trace` -> `node trace`；`runtime leases/unknown list` -> `dhcp leases/unknown`；
+`tftp session list` -> `tftp sessions`。新增 `node show`、`media key *`。旧路径保留 deprecated alias（zli
+`deprecated`+`replaced_by`）一个版本周期，执行时输出 warning。`buildCli` 拆分为按领域的 `register*Commands` 函数。
+
+### 13.8 验收标准
+
+1. Kickstart `%onerror` 触发时 -> `/logs` 收到 `install.anaconda_error` + summary（含 Anaconda traceback 截断）。
 2. Ubuntu `reporting` 块 -> Subiquity 进度事件到达，`install.partitioning`/`packages` 等阶段可见。
-3. `deploy=false` 节点 -> DHCP lease 存在但无 PXE bootfile，事件 `boot.deploy_disabled`。
-4. openEuler/Kylin/CentOS/RHEL ISO -> 导入成功，catalog distro=rocky，source_label 记原始 family。
+3. `deploy=false` 节点 -> DHCP lease 存在但无 PXE bootfile，事件 `boot.deploy_disabled`；generation gate 被绕过。
+4. openEuler/Kylin/CentOS/RHEL/Sugon OS ISO -> 导入成功，catalog distro=rocky，source_label 记原始 family。
 5. `--distro rocky --version 9.7 --arch aarch64` -> 跳过自动检测。
 6. TFTP windowsize=16 -> QEMU PXE 吞吐显著优于 windowsize=1。
-7. `admin-key import` + `reload` -> `install render` 含新公钥。
-8. `nodeforge node render/retry/trace` 可用；旧 `install render` 输出 warning 且仍执行；
-   `nodeforge admin-key show` 显示来源与 fingerprint。
-9. 新 reason 值在 `event_types.zig` 注册、在 §11.5 错误分类表有 retryability 条目。
+7. `media key import` + `media key reload` -> `node render` 含新公钥；`media key show` 显示来源与 fingerprint。
+8. `nodeforge node list/show/render/retry/trace` 可用；旧 `install render` 输出 warning 且仍执行。
+9. `nodeforge dhcp leases` / `dhcp unknown` / `tftp sessions` 可用（旧 `runtime leases list` 输出 warning）。
+10. 新 reason 值在 `event_types.zig` 注册、在 §11.5 错误分类表有 retryability 条目。
+11. CLI 命令树符合 resource-action 模型：最多 2 个命令词（`media key import` 是唯一 3 词例外）。
 
-### 13.10 M4.1 基线继承
+### 13.9 M4.1 基线继承
 
 M8 不获得绕过 M4.1 TargetSystemConfig 的权限。`profile.system` 仍是 SSH/root/users/password/locale/
 防火墙/SELinux 的权威事实源。bootstrap admin key 合并去重规则（§9.10.6.2）不变，只是来源从单值扩展为
 多值数组 + state 目录扫描。kickstart/autoinstall 渲染仍消费 normalized plan，adapter 不读 `/root/.ssh`
-或 state 文件。
+或 state 文件。post-install 命令的异常容忍语义保持现状，不在 M8 范围内。
 
 ## 14. 测试矩阵
 
@@ -4650,7 +4662,7 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
       完成 M4.1。
 11. 实现 dracut module、boot bundle/rootfs/initrd capability 校验、TargetSystem BootConfig 和断点续传。
 12. 跑通 diskless squashfs overlay、目标系统 overlay 与 `rootfs_build`/`diskless_boot`，完成 M5，再实施 M6/M7 增强。
-13. 修复 post-install 异常容忍（F1）、安装阶段错误全覆盖传回（F2）、节点级不部署开关（F3）、ISO 导入主流 OS+覆盖语义（F4）、TFTP windowsize/并发/配置项（F5）、免密公钥配置化+CLI 导入（F6）、CLI 命令体系重构（F7），完成 M8。详见 §13。
+13. 修复部署错误传回 nodeforged（F1）、节点级不部署开关（F2）、ISO 导入主流 OS+覆盖语义（F3）、TFTP windowsize/并发/配置项（F4）、免密公钥配置化（F5）、CLI 命令体系校准（F6），完成 M8。详见 §13。post-install 异常容忍语义保持现状不动。
 
 ## 17. MVP 最终交付清单
 
@@ -4750,12 +4762,12 @@ M4.1 install generation/retry/drift 或横切门槛变化还必须同步检查�
 M5 diskless retry、M6 retryability/config apply 和 M7 reconciliation/自动预算。不得把 observed node_status
 倒退当作 retry，也不得通过 node override 或 generic script 绕过 generation/protected-domain。
 
-M8 的 post-install 异常容忍、错误上报、节点 deploy 开关、ISO 导入覆盖语义、TFTP 性能配置、bootstrap key 多值化
-或 CLI 重构任一变化，还必须同步检查：§13 M8 验收标准、§9.10.6.2 bootstrap admin key 合并去重规则、§11.5 错误
-分类表 retryability、`event_types.zig` 注册表、`config.example.json` TFTP 新配置项、`tests/cli.sh` 新命令树
-与 deprecated alias 断言、`buildCli` 拆分后的 `register*Commands` 函数。bootstrap key 来源从单值扩展为
-多值数组 + state 目录扫描，但合并去重规则（§9.10.6.2）不变；CLI 重构后旧路径必须保留 deprecated alias
-一个版本周期。
+M8 的错误上报（`/logs` 接通、`/subiquity-report`）、节点 deploy 开关、ISO 导入覆盖语义、TFTP 性能配置、
+bootstrap key 多值化或 CLI 校准任一变化，还必须同步检查：§13 M8 验收标准、§9.10.6.2 bootstrap admin key
+合并去重规则、§11.5 错误分类表 retryability、`event_types.zig` 注册表、`config.example.json` TFTP 新配置项、
+`tests/cli.sh` 新命令树与 deprecated alias 断言、`buildCli` 拆分后的 `register*Commands` 函数。bootstrap key
+来源从单值扩展为多值数组 + state 目录扫描，但合并去重规则（§9.10.6.2）不变；CLI 校准后旧路径必须保留
+deprecated alias 一个版本周期。post-install 命令异常容忍语义不在 M8 范围内，保持现状。
 
 不允许出现：
 
