@@ -28,6 +28,7 @@ const status_store = @import("state/status_store.zig");
 const events = @import("state/events.zig");
 const boot_session = @import("state/boot_session.zig");
 const node_status = @import("state/node_status.zig");
+const deployment_control = @import("state/deployment_control.zig");
 
 /// 启动 M1 TFTP 与唯一 HTTP listener。
 ///
@@ -64,6 +65,21 @@ pub fn run(
     try boot_session.generateId(io, &daemon_instance_id);
     try event_writer.setDaemonInstanceId(daemon_instance_id);
     var sessions: boot_session.Store = .{};
+    var deployments: deployment_control.Store = .{};
+    const config_revision = try deployment_control.revisionForConfig(allocator, config);
+    deployment_control.load(io, allocator, paths.deployment_control_path, &deployments) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            observe_log.err("deployment-control: refusing startup with invalid state: {t}", .{err});
+            return err;
+        },
+    };
+    for (config.nodes) |node| if (forProfile(config, node.profile)) |profile| if (profile.mode == .install) {
+        deployments.ensureInitial(node.id, config_revision, current_time) catch |err| return err;
+    };
+    try deployment_control.save(io, allocator, paths.deployment_control_path, &deployments);
+    const bootstrap_key = try @import("server/admin_key.zig").resolve(io, allocator, config.server);
+    defer allocator.free(bootstrap_key);
 
     // M3.1: separate I/O locks for leases.json and node-status.json.
     // The DHCP checkpoint worker owns leases.json; HTTP handlers own
@@ -73,11 +89,26 @@ pub fn run(
 
     event_writer.appendWithFields(io, allocator, paths.events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
         observe_log.err("events: unable to record configuration load: {t}", .{err});
+    for (config.nodes) |node| if (deployments.view(node.id)) |deployment| {
+        if (deployment.applied_revision != 0 and deployment.applied_revision != config_revision) {
+            var applied_text: [24]u8 = undefined;
+            var desired_text: [24]u8 = undefined;
+            const fields = [_]events.Field{
+                .{ .key = "node_id", .value = node.id },
+                .{ .key = "applied_revision", .value = std.fmt.bufPrint(&applied_text, "{d}", .{deployment.applied_revision}) catch "0" },
+                .{ .key = "desired_revision", .value = std.fmt.bufPrint(&desired_text, "{d}", .{config_revision}) catch "0" },
+            };
+            event_writer.appendWithFields(io, allocator, paths.events_path, "install.configuration_drifted", "installed node configuration differs from current desired state", &fields) catch |err|
+                observe_log.err("events: unable to record install drift: {t}", .{err});
+        }
+    };
     const persistence: dhcp_server.Persistence = .{
         .allocator = allocator,
         .events_path = paths.events_path,
         .writer = &event_writer,
         .sessions = &sessions,
+        .deployments = &deployments,
+        .config_revision = config_revision,
     };
     var live_catalog = catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
     // DHCP needs a wildcard receive socket for client broadcasts.  The DHCP
@@ -115,6 +146,9 @@ pub fn run(
         &event_writer,
         &sessions,
         &statuses,
+        &deployments,
+        config_revision,
+        bootstrap_key,
         &daemon_instance_id,
         &status_io_mutex,
         paths.node_status_path,
@@ -170,6 +204,11 @@ pub fn run(
     if (serve_error) |err| return err;
 }
 
+fn forProfile(config: *const model.AppConfig, name: []const u8) ?*const model.ProfileConfig {
+    for (config.profiles) |*profile| if (std.mem.eql(u8, profile.name, name)) return profile;
+    return null;
+}
+
 /// M3.1: Load DHCP leases from `leases.json`.  If the new file does not exist,
 /// attempt to migrate from the legacy `runtime.json`.
 fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.DhcpState, now_val: i64) void {
@@ -205,14 +244,12 @@ fn now() i64 {
     return if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) == .SUCCESS) @intCast(ts.sec) else 0;
 }
 
-/// M3.1 DHCP lease checkpoint worker.
+/// M3.1 DHCP lease checkpoint worker（检查点工作线程）。
 ///
-/// It is the sole writer of `leases.json`.  The DHCP hot path only bumps
-/// `lease_generation` after any real lease mutation; this worker compares the
-/// saved generation, takes a consistent snapshot under the DhcpState mutex,
-/// and serializes/saves outside the lock.  It throttles at most once per second
-/// using a monotonic clock.  On flush-and-stop it performs one final save
-/// before exiting.
+/// 它是 `leases.json` 的唯一写入者。DHCP 热路径在每次真实 lease 变更后
+/// 只递增 `lease_generation`；此 worker 对比已保存的生成号，在 DhcpState
+/// mutex 下获取一致性快照，然后在锁外序列化和保存。使用单调时钟限制
+/// 最多每秒保存一次。在 flush-and-stop 时执行最后一次保存后退出。
 fn runCheckpoint(
     io: std.Io,
     allocator: std.mem.Allocator,

@@ -56,6 +56,7 @@ pub const event_types = @import("state/event_types.zig");
 pub const dhcp_store = @import("state/dhcp_store.zig");
 /// 节点状态持久化存储：磁盘上的节点状态和终态记录。
 pub const status_store = @import("state/status_store.zig");
+pub const deployment_control = @import("state/deployment_control.zig");
 /// CLI 管理客户端：通过本机 HTTP 管理 API 与 daemon 通信。
 pub const management_client = @import("http/client.zig");
 /// 管理 API 约定：固定 loopback 连接地址和安全边界常量。
@@ -86,6 +87,9 @@ pub const grub = @import("boot/grub.zig");
 pub const boot_target = @import("boot/target.zig");
 /// M4 installer adapters and shared answer rendering helpers.
 pub const profile_render = @import("profile/render.zig");
+pub const password_hash = @import("profile/password_hash.zig");
+pub const profile_install = @import("profile/install.zig");
+pub const admin_key = @import("server/admin_key.zig");
 pub const kickstart = @import("profile/adapter/kickstart.zig");
 pub const ubuntu_autoinstall = @import("profile/adapter/ubuntu.zig");
 /// M4 constrained install_post provisioning renderer.

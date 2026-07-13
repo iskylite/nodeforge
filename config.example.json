@@ -41,6 +41,12 @@
           "archs": ["aarch64", "x86_64"],
           "install_adapter": "kickstart",
           "package_manager": "dnf"
+        },
+        {
+          "version": "8.10",
+          "archs": ["aarch64", "x86_64"],
+          "install_adapter": "kickstart",
+          "package_manager": "dnf"
         }
       ]
     },

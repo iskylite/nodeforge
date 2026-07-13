@@ -59,6 +59,8 @@ pub const ServerConfig = struct {
     server_ip: []const u8,
     /// 唯一 HTTP 监听端口；同时承载 PXE 数据路由和管理路由。CLI 固定使用 loopback 访问。
     http_port: u16 = 8080,
+    /// NodeForge 管理端在目标机上使用的 bootstrap SSH 公钥；私钥绝不进入配置。
+    ssh_authorized_public_key: ?[]const u8 = null,
 };
 
 /// HTTP 大文件和发行版仓库目录配置。
@@ -86,13 +88,12 @@ pub const DhcpConfig = struct {
     router: ?[]const u8 = null,
     dns: []const []const u8 = &.{},
     lease_seconds: u32 = 1800,
-    /// An OFFER is short lived until the client confirms it with REQUEST.
+    /// OFFER 的有效期（秒）；客户端在此时限内需用 REQUEST 确认。
     offer_seconds: u32 = 60,
-    /// A declined address is quarantined before it may re-enter the pool.
+    /// 被拒绝地址的隔离时间（秒）；隔离期满前该地址不可重新分配。
     abandon_seconds: u32 = 3600,
-    /// ICMP Echo Reply wait before an address is offered. Zero is invalid.
-    /// The daemon requires CAP_NET_RAW; when probing is unavailable it withholds
-    /// the OFFER instead of treating the candidate as clear.
+    /// 在 OFFER 前等待 ICMP Echo Reply 的超时时间（毫秒）。0 为非法值。
+    /// daemon 需要 CAP_NET_RAW 能力；探测不可用时扣留 OFFER 而非将候选地址视为可用。
     ping_timeout_ms: u16 = 500,
 };
 
@@ -265,7 +266,11 @@ pub const ProfileSafetyConfig = struct {
     destructive: bool = false,
     /// 是否写入持久状态；safe/ephemeral profile 必须为 false。
     persistent_writes: bool = false,
+    /// 安装 profile 默认只允许显式 rearm 后执行一次，避免 PXE-first 固件重复擦盘。
+    reinstall_policy: ReinstallPolicy = .explicit,
 };
+
+pub const ReinstallPolicy = enum { explicit, always };
 
 /// 节点启动策略。install source 与 boot bundle 按 mode 二选一。
 pub const ProfileConfig = struct {
@@ -285,62 +290,224 @@ pub const ProfileConfig = struct {
     boot_bundle: ?[]const u8 = null,
     /// 安全元数据，供未知节点策略做静态判断。
     safety: ProfileSafetyConfig = .{},
+    /// M4.1 的跨发行版目标系统事实。安装和后续无盘链路都消费此字段。
+    system: TargetSystemConfig = .{},
     /// install mode 的安装器输入。保留 optional 以兼容 M3 catalog/boot
     /// fixture；M4 renderer 对缺省值采用安全的最小安装配置。
     install: ?InstallConfig = null,
 };
 
-pub const InstallConfig = struct {
-    storage: StorageConfig = .{},
-    bootloader: BootloaderInstallConfig = .{},
-    packages: []const []const u8 = &.{},
-    users: []const UserConfig = &.{},
+pub const LocalizationConfig = struct {
+    locale: []const u8 = "en_US.UTF-8",
+    timezone: []const u8 = "UTC",
+    keyboard: []const u8 = "us",
+};
+
+pub const ConnectivityMode = enum { @"local-only" };
+pub const ConnectivityPolicy = struct {
+    mode: ConnectivityMode = .@"local-only",
+    time_sync: bool = false,
+    ntp_servers: []const []const u8 = &.{},
+};
+
+pub const RootLoginPolicy = enum { no, @"prohibit-password", yes };
+pub const SshConfig = struct {
+    enabled: bool = true,
+    password_authentication: bool = true,
+    root_login: RootLoginPolicy = .yes,
+    /// Config password fields are deliberately plaintext facts; adapters derive `$6$` only in memory.
+    root_password: ?[]const u8 = "asdf1234",
+    root_authorized_keys: []const []const u8 = &.{},
+};
+
+pub const FirewallPolicy = enum { disabled, enabled };
+pub const SelinuxMode = enum { disabled, permissive, enforcing };
+pub const TargetSecurityConfig = struct {
+    firewall: FirewallPolicy = .disabled,
+    selinux: SelinuxMode = .disabled,
+};
+
+pub const TargetUserConfig = struct {
+    name: []const u8,
+    password: ?[]const u8 = null,
+    sudo: bool = false,
     ssh_authorized_keys: []const []const u8 = &.{},
+};
+
+/// Common target system facts, intentionally independent of installer syntax.
+pub const TargetSystemConfig = struct {
+    localization: LocalizationConfig = .{},
+    connectivity: ConnectivityPolicy = .{},
+    ssh: SshConfig = .{},
+    security: TargetSecurityConfig = .{},
+    users: []const TargetUserConfig = &.{},
+    packages: []const []const u8 = &.{},
+};
+
+pub const NetworkMode = enum { dhcp, static };
+pub const TargetNetworkConfig = struct {
+    mode: NetworkMode = .dhcp,
+    interface: ?[]const u8 = null,
+    match_mac: ?[]const u8 = null,
+    address: ?[]const u8 = null,
+    prefix_len: ?u8 = null,
+    gateway: ?[]const u8 = null,
+    dns: []const []const u8 = &.{},
+    search_domains: []const []const u8 = &.{},
+};
+
+pub const NodeOverrideConfig = struct { network: ?TargetNetworkConfig = null };
+
+/// 安装器输入配置，由 profile 引用以渲染 Kickstart/Autoinstall answer 文件。
+/// 所有字段在配置校验阶段已验证安全性；渲染器直接使用这些值生成安装脚本。
+pub const InstallConfig = struct {
+    /// 存储布局配置；M4 渲染器根据 boot_mode 和 partition_table 生成分区指令。
+    storage: StorageConfig = .{},
+    /// 引导加载器安装配置；控制是否在目标磁盘上安装 GRUB。
+    bootloader: BootloaderInstallConfig = .{},
+    /// Ubuntu APT 安装策略。默认允许使用 live ISO/squashfs 离线安装；
+    /// 严格验收本地 HTTP mirror 时应显式设为 `abort`。
+    apt: AptInstallConfig = .{},
+    /// 额外安装的包名列表；渲染器将其写入 `%packages`（Kickstart）或 `packages`（Autoinstall）段。
+    packages: []const []const u8 = &.{},
+    /// 创建的用户列表；Kickstart 渲染为 `user` 指令，Autoinstall 渲染为 `identity` 段。
+    users: []const UserConfig = &.{},
+    /// SSH 公钥列表；渲染器将其写入安装后配置的 authorized_keys。
+    ssh_authorized_keys: []const []const u8 = &.{},
+    /// 可选的后处理 bundle 名称；引用 `AppConfig.provisioning_bundles` 中的条目。
+    /// 渲染器将 bundle 中的步骤展开为安装后 shell 命令（`%post` 或 `late-commands`）。
     bundle: ?[]const u8 = null,
 };
 
-pub const StorageConfig = struct {
-    wipe: bool = true,
-    boot_disk: []const u8 = "/dev/sda",
-    install_disks: []const []const u8 = &.{"/dev/sda"},
-    boot_mode: BootMode = .uefi,
-    partition_table: PartitionTable = .gpt,
-    partitions: []const PartitionConfig = &.{},
-};
-pub const BootMode = enum { uefi, bios };
-pub const PartitionTable = enum { gpt, mbr };
-pub const PartitionKind = enum { esp, biosboot, swap, root, boot, plain };
-pub const PartitionConfig = struct {
-    mount: ?[]const u8 = null,
-    size_mib: u32 = 0,
-    filesystem: ?[]const u8 = null,
-    kind: PartitionKind = .plain,
-};
-pub const BootloaderInstallConfig = struct {
-    install: bool = true,
-    target: []const u8 = "storage.boot_disk",
-    set_firmware_boot_order: bool = false,
-};
-pub const UserConfig = struct {
-    name: []const u8,
-    password: ?[]const u8 = null,
-    sudo: bool = true,
+/// Subiquity 在所有候选 APT mirror 均不可用时的处理策略。
+///
+/// 枚举标签刻意与 autoinstall schema 和 JSON 配置中的连字符值完全一致，
+/// 因此 `config import/export` 不需要额外字符串映射。
+pub const AptFallback = enum {
+    /// 立即终止安装；用于要求 HTTP APT mirror 必须可用的严格验收。
+    abort,
+    /// 回退到 live ISO 的 squashfs/离线介质。现有 profile 的兼容默认值。
+    @"offline-install",
+    /// mirror 不可用仍继续；Subiquity 官方不推荐，通常会在后续包阶段失败。
+    @"continue-anyway",
 };
 
+/// Ubuntu autoinstall 的 APT 策略子配置。
+/// 独立命名空间便于后续加入 mirror probe、suite 或更新策略，避免继续向
+/// 通用 `InstallConfig` 平铺 Ubuntu 专属字段。
+pub const AptInstallConfig = struct {
+    fallback: AptFallback = .@"offline-install",
+};
+
+/// 磁盘存储布局配置。M4 渲染器根据此配置生成 Kickstart `part` 指令或
+/// Autoinstall `storage` 段。当 `partitions` 为空时使用安全默认值。
+pub const StorageConfig = struct {
+    /// 是否在分区前擦除磁盘所有分区表。MVP 默认为 true，确保安装环境干净。
+    wipe: bool = true,
+    /// 主启动磁盘设备路径；Kickstart 的 `clearpart --drives` 和 `bootloader --boot-drive` 使用此值。
+    /// 值格式为 Linux 设备路径（如 `/dev/sda`），渲染时去掉 `/dev/` 前缀。
+    boot_disk: []const u8 = "/dev/sda",
+    /// 参与安装的磁盘列表；MVP 只使用 `boot_disk`，此字段为未来多磁盘安装预留。
+    install_disks: []const []const u8 = &.{"/dev/sda"},
+    /// 固件启动模式；决定是否创建 ESP 分区（UEFI）或 biosboot 分区（BIOS）。
+    boot_mode: BootMode = .uefi,
+    /// 分区表类型；GPT 是 UEFI 的默认要求，MBR 用于旧式 BIOS。
+    partition_table: PartitionTable = .gpt,
+    /// 显式分区列表；为空时渲染器使用安全默认布局（ESP + swap + root）。
+    partitions: []const PartitionConfig = &.{},
+};
+
+/// 固件启动模式。UEFI 是现代服务器的默认模式；BIOS 用于旧式硬件。
+/// 此值影响分区类型选择和引导加载器安装方式。
+pub const BootMode = enum { uefi, bios };
+
+/// 分区表类型。GPT 是 UEFI 的标准要求；MBR 用于旧式 BIOS 系统。
+pub const PartitionTable = enum { gpt, mbr };
+
+/// 分区用途类型。渲染器根据此值选择默认的文件系统和挂载点。
+pub const PartitionKind = enum {
+    /// EFI System Partition，UEFI 启动必需，FAT32 格式。
+    esp,
+    /// BIOS Boot Partition，GPT + BIOS 启动时 GRUB 需要的嵌入分区。
+    biosboot,
+    /// 交换分区。
+    swap,
+    /// 根分区。
+    root,
+    /// /boot 分区，部分发行版需要独立分区。
+    boot,
+    /// 通用分区，由调用方指定挂载点和文件系统。
+    plain,
+};
+
+/// 单个分区的配置。`mount` 和 `filesystem` 为 null 时由渲染器按 `kind` 推导默认值。
+pub const PartitionConfig = struct {
+    /// 挂载点路径；null 时按 kind 推导（swap→"swap"，esp→"/boot/efi"等）。
+    mount: ?[]const u8 = null,
+    /// 分区大小（MiB）；0 表示使用剩余空间（仅 root 分区适用）。
+    size_mib: u32 = 0,
+    /// 文件系统类型；null 时按 kind 推导（esp→"efi"，swap→"swap"，其他→"xfs"）。
+    /// Kickstart 使用此值作为 `--fstype` 参数。
+    filesystem: ?[]const u8 = null,
+    /// 分区用途；决定渲染器的默认行为。
+    kind: PartitionKind = .plain,
+};
+
+/// 引导加载器安装配置。控制是否在目标磁盘上安装 GRUB 及其配置方式。
+pub const BootloaderInstallConfig = struct {
+    /// 是否安装引导加载器；false 时跳过 `bootloader` 指令，适用于已有引导管理的环境。
+    install: bool = true,
+    /// 安装目标；默认引用 `storage.boot_disk`，渲染器将其解析为实际设备路径。
+    target: []const u8 = "storage.boot_disk",
+    /// 是否在安装后设置固件启动顺序；MVP 默认 false，由操作员手动确认。
+    set_firmware_boot_order: bool = false,
+};
+
+/// M4 compatibility spelling; M4.1 normalizes it into `profile.system.users`.
+pub const UserConfig = TargetUserConfig;
+
+/// 后处理执行阶段。M4 只实现 `install_post`（安装后）；
+/// 后续阶段（如 `first_boot`、`runtime`）在 M7 补充。
 pub const ProvisionPhase = enum { install_post };
-pub const ProvisionAction = enum { repository, standard_packages, managed_file };
+
+/// 后处理动作类型。M4 只实现这三种受约束动作；
+/// 任意脚本执行在 M7 作为 `script` 动作补充。
+pub const ProvisionAction = enum {
+    /// 添加软件仓库（dnf config-manager 或 apt sources.list）。
+    repository,
+    /// 安装标准软件包（dnf install 或 apt-get install）。
+    standard_packages,
+    /// 写入受管文件（使用 heredoc 创建指定路径的文件）。
+    managed_file,
+};
+
+/// 单个后处理步骤。渲染器按 `action` 类型生成对应的 shell 命令。
+/// 每种 action 只使用与之相关的字段，其余字段应保持 null/空。
 pub const ProvisionStep = struct {
+    /// 步骤名称；用于日志和审计，不进入生成的 shell 脚本。
     name: []const u8,
+    /// 执行阶段；M4 只支持 `install_post`。
     phase: ProvisionPhase = .install_post,
+    /// 动作类型；决定使用哪些字段以及生成何种 shell 命令。
     action: ProvisionAction,
+    /// `repository` 动作使用的仓库 URL 或 repo 文件内容；dnf 和 apt 的处理方式不同。
     repository: ?[]const u8 = null,
+    /// `standard_packages` 动作要安装的包名列表；为空时渲染器返回错误。
     packages: []const []const u8 = &.{},
+    /// `managed_file` 动作的文件内容；使用 heredoc 写入目标路径。
     content: ?[]const u8 = null,
+    /// `managed_file` 动作的目标路径；必须是绝对路径且不含 `..`，防止路径逃逸。
     destination: ?[]const u8 = null,
 };
+
+/// 可复用的后处理步骤集合。通过 profile.install.bundle 引用。
+/// 同一 bundle 可被多个 profile 共享，减少配置重复。
 pub const ProvisioningBundle = struct {
+    /// bundle 名称；profile.install.bundle 引用此值。
     name: []const u8,
+    /// bundle 版本；用于未来兼容性检查，M4 不强制校验。
     version: []const u8 = "1",
+    /// 有序步骤列表；渲染器按声明顺序生成 shell 命令。
     steps: []const ProvisionStep = &.{},
 };
 
@@ -358,6 +525,8 @@ pub const NodeConfig = struct {
     ip: ?[]const u8 = null,
     /// 节点主机名；用于渲染安装配置中的 hostname。
     hostname: ?[]const u8 = null,
+    /// Node-specific target configuration.  Bootstrap PXE always remains DHCP.
+    overrides: NodeOverrideConfig = .{},
 };
 
 /// 未录入节点的默认策略。

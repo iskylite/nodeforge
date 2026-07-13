@@ -1,19 +1,21 @@
-//! Durable projection of DHCP leases (M3.1).
+//! DHCP lease 的持久化投影（M3.1）。
 //!
-//! `leases.json` is the sole durable fact source for DHCP lease state.  The
-//! checkpoint worker is the only writer; the DHCP hot path only bumps
-//! `lease_generation`.  A corrupt snapshot is rejected by the loader rather
-//! than silently reused.  Legacy `runtime.json` files (which combined leases
-//! and node statuses) are accepted as migration input only.
+//! `leases.json` 是 DHCP lease 状态的唯一持久化事实源。checkpoint worker
+//! 是唯一写入者；DHCP 热路径只递增 `lease_generation`。损坏的快照被加载器
+//! 拒绝而非静默复用。旧版 `runtime.json` 文件（合并了 lease 和节点状态）
+//! 仅作为迁移输入接受。
 
 const std = @import("std");
 const runtime = @import("runtime.zig");
 const node_status = @import("node_status.zig");
 
-/// M3.1 `leases.json` schema.  Contains only DHCP leases and a display timestamp.
+/// M3.1 `leases.json` schema。只包含 DHCP lease 和显示时间戳。
 pub const LeasesFile = struct {
+    /// schema 版本；M3.1 使用版本 3。
     schema_version: u32 = 3,
+    /// 保存时的 Unix 时间戳。
     saved_at: i64,
+    /// DHCP lease 列表。
     leases: []const runtime.DhcpLease,
 };
 

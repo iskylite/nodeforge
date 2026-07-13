@@ -212,6 +212,12 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(install_render);
     try addDebugFlag(install_render);
     try install.addCommands(&.{install_render});
+    const install_retry = try zli.Command.init(init_options, .{ .name = "retry", .description = "Explicitly rearm the next PXE install generation" }, installRetryHandler);
+    try install_retry.addPositionalArg(.{ .name = "node_id", .description = "Registered install node", .required = true });
+    try addConfigPathFlag(install_retry);
+    try addOutputFlag(install_retry);
+    try addDebugFlag(install_retry);
+    try install.addCommands(&.{install_retry});
 
     const asset = try zli.Command.init(init_options, .{
         .name = "asset",
@@ -837,28 +843,85 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
 /// Real credentials are only delivered by the authenticated `/answer` route.
 fn installRenderHandler(ctx: zli.CommandContext) !void {
     _ = outputJsonFromContext(ctx) orelse return;
-    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer config.deinit();
-    var catalog = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse { setExitCode(ctx, 1); return; };
+    var catalog = loadCatalogOrEmpty(ctx.io, ctx.allocator, ctx.flag("catalog", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
     defer catalog.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
-    const node = nodeforge.catalog.findNode(&config.value, node_id) orelse { try ctx.writer.print("error: install: unknown node {s}\n", .{node_id}); setExitCode(ctx, 1); return; };
-    const profile = nodeforge.catalog.findProfile(&config.value, node.profile) orelse { try ctx.writer.writeAll("error: install: node profile unavailable\n"); setExitCode(ctx, 1); return; };
-    if (profile.mode != .install) { try ctx.writer.writeAll("error: install: node does not use an install profile\n"); setExitCode(ctx, 1); return; }
-    const source = nodeforge.catalog.findInstallSource(catalog.value(), profile.install_source orelse "") orelse { try ctx.writer.writeAll("error: install: install source unavailable\n"); setExitCode(ctx, 1); return; };
-    const install = profile.install orelse nodeforge.model.InstallConfig{};
+    const node = nodeforge.catalog.findNode(&config.value, node_id) orelse {
+        try ctx.writer.print("error: install: unknown node {s}\n", .{node_id});
+        setExitCode(ctx, 1);
+        return;
+    };
+    const profile = nodeforge.catalog.findProfile(&config.value, node.profile) orelse {
+        try ctx.writer.writeAll("error: install: node profile unavailable\n");
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (profile.mode != .install) {
+        try ctx.writer.writeAll("error: install: node does not use an install profile\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    const source = nodeforge.catalog.findInstallSource(catalog.value(), profile.install_source orelse "") orelse {
+        try ctx.writer.writeAll("error: install: install source unavailable\n");
+        setExitCode(ctx, 1);
+        return;
+    };
+    const install = profile.install orelse {
+        try ctx.writer.writeAll("error: install: profile has no install plan\n");
+        setExitCode(ctx, 1);
+        return;
+    };
+    const system = nodeforge.profile_install.effectiveSystem(profile) catch {
+        try ctx.writer.writeAll("error: install: legacy and system fields conflict\n");
+        setExitCode(ctx, 1);
+        return;
+    };
+    const config_revision = try nodeforge.deployment_control.revisionForConfig(ctx.allocator, &config.value);
+    const plan_digest = try nodeforge.profile_install.planDigest(ctx.allocator, node, profile, source);
+    const preview_scope = try nodeforge.password_hash.randomSalt(ctx.io);
+    std.debug.print("password_hash_scope=preview config_revision={d} plan_digest={d} package_availability=installer-media\n", .{ config_revision, plan_digest });
+    // APT 源 URL 解析：与 HTTP answerFixture 保持一致的 fallback 逻辑。
+    // Ubuntu ISO 导入时始终创建 repository，但手动配置场景可能缺失。
+    const apt_primary_url = if (std.mem.eql(u8, source.distro, "ubuntu")) blk: {
+        const repository = nodeforge.catalog.findRepository(catalog.value(), source.name);
+        if (repository) |repo| if (repo.manager == .apt) break :blk repo.base_url;
+        break :blk try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/repos/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
+    } else null;
     const event_url = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/api/v1/nodes/{s}/events", .{ config.value.server.server_ip, config.value.server.http_port, node.id });
     defer ctx.allocator.free(event_url);
+    const bootstrap_key = try nodeforge.admin_key.resolve(ctx.io, ctx.allocator, config.value.server);
+    defer ctx.allocator.free(bootstrap_key);
     const bundle = if (install.bundle) |name| findBundle(&config.value, name) else null;
     const answer = if (std.mem.eql(u8, source.distro, "ubuntu"))
-        try nodeforge.ubuntu_autoinstall.renderUserData(ctx.allocator, node, install, bundle, event_url, "<boot-session>", "<capability>")
+        try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, event_url, "<boot-session>", "<capability>", &preview_scope)
     else blk: {
         const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/repos/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
         defer ctx.allocator.free(install_root);
-        break :blk try nodeforge.kickstart.renderAnswer(ctx.allocator, node, install, install_root, bundle, event_url, "<boot-session>", "<capability>");
+        break :blk try nodeforge.kickstart.renderAnswerM41(ctx.allocator, node, install, system, bootstrap_key, install_root, bundle, event_url, "<boot-session>", "<capability>", &preview_scope);
     };
     defer ctx.allocator.free(answer);
     try ctx.writer.writeAll(answer);
+}
+
+fn installRetryHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const node_id = ctx.getArg("node_id") orelse return;
+    const status = nodeforge.management_client.installRetry(ctx.io, config.value.server.http_port, node_id);
+    if (output_json) try ctx.writer.print("{{\"ok\":{s},\"node_id\":{f}}}\n", .{ if (status.healthy) "true" else "false", std.json.fmt(node_id, .{}) }) else if (status.healthy) try ctx.writer.print("install generation rearmed for {s}; waiting for next PXE\n", .{node_id}) else try ctx.writer.print("error: install retry failed for {s}\n", .{node_id});
+    if (!status.healthy) setExitCode(ctx, 1);
 }
 
 fn findBundle(config: *const nodeforge.model.AppConfig, name: []const u8) ?*const nodeforge.model.ProvisioningBundle {

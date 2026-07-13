@@ -82,7 +82,12 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     defer allocator.free(staged_repo);
     try std.Io.Dir.cwd().createDirPath(io, mount_point);
     try std.Io.Dir.cwd().createDirPath(io, staged_repo);
-    defer std.Io.Dir.cwd().deleteTree(io, work) catch {};
+    // DVD trees preserve read-only directory modes when staged with `cp -a`.
+    // Prefer the native delete, but fall back to the same constrained `rm`
+    // invocation used elsewhere so a successful import never retains a
+    // multi-gigabyte work tree merely because its copied directories are
+    // read-only.
+    defer removeTreeBestEffort(io, allocator, work);
 
     // ISO9660 是首选文件系统。某些介质是 UDF-only（部分新版 Ubuntu），
     // 因此失败后重试一次 UDF。两次尝试都是私有的、只读的，
@@ -110,14 +115,30 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     const repo_destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.repository_root, source_name });
     defer allocator.free(repo_destination);
 
+    // Publication is a separate, atomic catalog operation performed by the
+    // caller.  Do not leave files in the public asset roots if any copy or
+    // checksum step below fails before a Result can be handed to that caller.
+    // (A catalog-publication failure is cleaned by cleanupPublishedOutputs.)
+    var retain_outputs = false;
+    // Cleanup must be ownership-aware. A rejected duplicate import can find a
+    // valid, already-published kernel/repository with the deterministic source
+    // name. Never delete that pre-existing generation while rolling back this
+    // candidate; only remove paths this invocation created (or started to
+    // create) after its no-clobber check succeeded.
+    var iso_created = false;
+    var kernel_created = false;
+    var initrd_created = false;
+    var repository_created = false;
+    defer if (!retain_outputs) removeCreatedOutputPaths(io, allocator, iso_destination, kernel_destination, initrd_destination, repo_destination, iso_created, kernel_created, initrd_created, repository_created);
+
     const mounted_kernel = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staged_repo, media.kernel_path });
     defer allocator.free(mounted_kernel);
     const mounted_initrd = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staged_repo, media.initrd_path });
     defer allocator.free(mounted_initrd);
-    try copyFileNoClobber(io, allocator, input, iso_destination);
-    try copyFileNoClobber(io, allocator, mounted_kernel, kernel_destination);
-    try copyFileNoClobber(io, allocator, mounted_initrd, initrd_destination);
-    if (media.repository_base != null) try copyTreeNoClobber(io, allocator, staged_repo, repo_destination);
+    try copyFileNoClobber(io, allocator, input, iso_destination, &iso_created);
+    try copyFileNoClobber(io, allocator, mounted_kernel, kernel_destination, &kernel_created);
+    try copyFileNoClobber(io, allocator, mounted_initrd, initrd_destination, &initrd_created);
+    if (media.repository_base != null) try copyTreeNoClobber(io, allocator, staged_repo, repo_destination, &repository_created);
 
     var iso_hash: [64]u8 = undefined;
     var kernel_hash: [64]u8 = undefined;
@@ -133,7 +154,7 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     } else &.{};
     const distro_name = try allocator.dupe(u8, detected.distro);
     const distro_version = try allocator.dupe(u8, detected.version);
-    return .{
+    const result: Result = .{
         .source_name = source_name,
         .iso_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .kind = .iso, .path = iso_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &iso_hash) },
         .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
@@ -141,6 +162,42 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
         .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = if (std.mem.eql(u8, detected.distro, "rocky")) .dnf else .apt, .base_url = if (base.len == 0) try std.fmt.allocPrint(allocator, "http://{s}:{d}/repos/{s}", .{ config.server.server_ip, config.server.http_port, source_name }) else try std.fmt.allocPrint(allocator, "http://{s}:{d}/repos/{s}/{s}", .{ config.server.server_ip, config.server.http_port, source_name, base }) } else null,
         .install_source = .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .repositories = repository_names },
     };
+    retain_outputs = true;
+    return result;
+}
+
+/// Remove unpublished output after catalog candidate validation or atomic
+/// publication fails.  These paths are derived from a Result created by this
+/// module, never from an HTTP request; cleanup is best-effort so it cannot
+/// hide the original import failure.
+pub fn cleanupPublishedOutputs(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, result: *const Result) void {
+    const iso = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.asset_root, result.iso_asset.path }) catch return;
+    defer allocator.free(iso);
+    const kernel = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tftp.asset_root, result.kernel_asset.path }) catch return;
+    defer allocator.free(kernel);
+    const initrd = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tftp.asset_root, result.initrd_asset.path }) catch return;
+    defer allocator.free(initrd);
+    const repository = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.repository_root, result.source_name }) catch return;
+    defer allocator.free(repository);
+    removeOutputPaths(io, allocator, iso, kernel, initrd, repository, result.repository != null);
+}
+
+fn removeOutputPaths(io: std.Io, allocator: std.mem.Allocator, iso: []const u8, kernel: []const u8, initrd: []const u8, repository: []const u8, has_repository: bool) void {
+    std.Io.Dir.cwd().deleteFile(io, iso) catch {};
+    std.Io.Dir.cwd().deleteFile(io, kernel) catch {};
+    std.Io.Dir.cwd().deleteFile(io, initrd) catch {};
+    if (has_repository) removeTreeBestEffort(io, allocator, repository);
+}
+
+fn removeCreatedOutputPaths(io: std.Io, allocator: std.mem.Allocator, iso: []const u8, kernel: []const u8, initrd: []const u8, repository: []const u8, iso_created: bool, kernel_created: bool, initrd_created: bool, repository_created: bool) void {
+    if (iso_created) std.Io.Dir.cwd().deleteFile(io, iso) catch {};
+    if (kernel_created) std.Io.Dir.cwd().deleteFile(io, kernel) catch {};
+    if (initrd_created) std.Io.Dir.cwd().deleteFile(io, initrd) catch {};
+    if (repository_created) removeTreeBestEffort(io, allocator, repository);
+}
+
+fn removeTreeBestEffort(io: std.Io, allocator: std.mem.Allocator, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch run(io, allocator, &.{ "rm", "-rf", "--", path }) catch {};
 }
 
 /// 媒体布局描述。描述 installer kernel/initrd 在挂载的 ISO 中的相对路径，
@@ -238,7 +295,16 @@ fn detectRockyMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []con
 /// 1. 验证必需文件存在（含 casper squashfs）
 /// 2. 读取 `.disk/info` 并解析 distro/version/arch
 /// 3. 版本截取到 major.minor（如 `22.04`），去除 patch 组件
-/// 4. 检查是否存在完整 APT repository（dists/pool/Release）
+/// 4. 始终发布 ISO 内容作为 APT repository（即使不完整）
+///
+/// Ubuntu live-server ISO 通常包含 dists/ 和 pool/ 目录，但某些定制或
+/// minimal ISO 可能缺少完整的 APT metadata。即使如此，也必须发布 ISO
+/// 内容并创建 repository 条目：
+/// - autoinstall user-data 中的 apt.primary 需要一个 URL 来阻止
+///   Subiquity 回退到 archive.ubuntu.com（隔离网段会长时间超时）
+/// - 如果 ISO 确实有 apt metadata，apt 能正常工作
+/// - 如果没有，apt 请求会快速返回 404（而非 DNS 超时），安装器可
+///   在合理时间内继续或报告明确错误
 fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8) !DetectedMedia {
     _ = try assets.verifyRegularFile(io, mount_point, ".disk/info");
     _ = try assets.verifyRegularFile(io, mount_point, "casper/vmlinuz");
@@ -253,12 +319,18 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
     const info = try std.Io.Dir.cwd().readFileAlloc(io, info_path, allocator, .limited(64 * 1024));
     defer allocator.free(info);
     const tuple = parseUbuntuDiskInfo(info) orelse return error.MediaTupleMismatch;
+    // ubuntuRepositoryComplete 检测 ISO 是否有完整 APT metadata（dists/pool/Release）。
+    // 检测结果保留用于诊断，但不再决定是否创建 repository——Ubuntu ISO 始终创建。
     const has_repository = try ubuntuRepositoryComplete(io, allocator, mount_point, tuple.version, tuple.arch);
+    _ = has_repository;
     return .{
         .distro = "ubuntu",
         .version = try allocator.dupe(u8, tuple.version),
         .arch = tuple.arch,
-        .layout = .{ .kernel_path = "casper/vmlinuz", .initrd_path = "casper/initrd", .repository_base = if (has_repository) "" else null },
+        // Ubuntu ISO 始终以根目录作为 repository_base（空字符串表示根）。
+        // 即使 ISO 没有 dists/pool，发布 ISO 内容仍能让 apt 快速失败
+        // 而非挂起在 DNS 超时上。
+        .layout = .{ .kernel_path = "casper/vmlinuz", .initrd_path = "casper/initrd", .repository_base = "" },
     };
 }
 
@@ -386,12 +458,13 @@ fn unmountIso(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8)
 fn copyTree(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8) !void {
     try runAt(io, allocator, &.{ "cp", "-a", "--no-dereference", ".", destination }, .{ .path = source });
 }
-fn copyTreeNoClobber(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8) !void {
+fn copyTreeNoClobber(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8, created: *bool) !void {
     const status = try std.Io.Dir.cwd().createDirPathStatus(io, destination, .default_dir);
     if (status == .existed) return error.ImportDestinationExists;
+    created.* = true;
     try runAt(io, allocator, &.{ "cp", "-a", "--no-dereference", "--no-clobber", ".", destination }, .{ .path = source });
 }
-fn copyFileNoClobber(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8) !void {
+fn copyFileNoClobber(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8, created: *bool) !void {
     const parent = std.fs.path.dirname(destination) orelse return error.InvalidImportDestination;
     try std.Io.Dir.cwd().createDirPath(io, parent);
     // 避免使用 `cp --no-clobber`：已存在的目标会看起来像成功，
@@ -401,6 +474,7 @@ fn copyFileNoClobber(io: std.Io, allocator: std.mem.Allocator, source: []const u
         opened.close(io);
         return error.ImportDestinationExists;
     } else |err| if (err != error.FileNotFound) return err;
+    created.* = true;
     try run(io, allocator, &.{ "cp", "--no-dereference", "--no-clobber", source, destination });
 }
 

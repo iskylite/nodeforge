@@ -1,10 +1,15 @@
-//! Stable Event v2 registry shared by daemon producers and CLI discovery.
+//! Event v2 稳定事件类型注册表，由 daemon 生产者和 CLI 发现共用。
+//! 所有事件类型名称和描述在此集中定义，确保 daemon 和 CLI 使用一致的事件词汇表。
 
 const model = @import("../model.zig");
 
+/// 单个事件类型的元数据定义。
 pub const EventDefinition = struct {
+    /// 稳定事件名称（如 `dhcp.ack`），写入 events.jsonl 的 `type` 字段。
     name: []const u8,
+    /// 事件描述，供 CLI 展示和文档引用。
     description: []const u8,
+    /// 默认日志等级；错误类事件默认为 err。
     default_level: model.LogLevel = .info,
 };
 
@@ -37,6 +42,9 @@ pub const EventType = enum {
     install_rebooting,
     install_completed,
     install_failed,
+    install_retry_requested,
+    install_configuration_drifted,
+    boot_install_not_armed,
     diskless_initrd_started,
     diskless_rootfs_download_started,
     diskless_rootfs_verified,
@@ -83,6 +91,9 @@ pub const definitions = [_]EventDefinition{
     .{ .name = "install.rebooting", .description = "installer rebooting" },
     .{ .name = "install.completed", .description = "installation completed" },
     .{ .name = "install.failed", .description = "installation failed", .default_level = .err },
+    .{ .name = "install.retry.requested", .description = "install generation rearmed" },
+    .{ .name = "install.configuration_drifted", .description = "desired install configuration differs from the applied revision", .default_level = .warn },
+    .{ .name = "boot.install_not_armed", .description = "install PXE denied because no generation is armed" },
     .{ .name = "diskless.initrd_started", .description = "diskless initrd started" },
     .{ .name = "diskless.rootfs_download_started", .description = "rootfs download started" },
     .{ .name = "diskless.rootfs_verified", .description = "rootfs verified" },

@@ -46,10 +46,9 @@ pub const BootTarget = struct {
 /// cmdline 按发行版 installer family 生成：
 /// - RHEL 系（Rocky/CentOS）使用 `inst.repo=<repository_url>`，由 Anaconda
 ///   从 DNF repository 下载安装树。M4 会追加 `inst.ks=<answer_url>`。
-/// - Ubuntu live-server/casper 使用 `url=<iso_url>`，由 casper initrd 下载
-///   ISO 并 loop mount 为 live 文件系统。Canonical 当前 UEFI netboot 文档
-///   （涵盖 20.04+）以 `url=` 作为 live ISO 定位参数，不使用旧式
-///   `boot=casper netboot=url`。M4 会追加 `autoinstall ds=nocloud-net;...`。
+/// - Ubuntu live-server/casper 使用 `boot=casper url=<iso_url>`，由 casper
+///   initrd 下载 ISO 并 loop mount 为 live 文件系统。M4 会追加
+///   `autoinstall ds=nocloud-net;...`。
 ///
 /// diskless mode：从 boot bundle 取 kernel/initrd asset 路径，
 /// cmdline 包含 `ip=dhcp nodeforge.config=<config_url>`，节点 initrd 通过
@@ -82,10 +81,11 @@ pub fn resolve(
 ///
 /// cmdline 生成按发行版分支：
 /// - Ubuntu：使用 casper 的 `url=` 参数指向已发布的 ISO HTTP URL，
-///   附加 `root=/dev/ram0 ramdisk_size=1500000 cloud-config-url=/dev/null ip=dhcp`。
+///   附加 `root=/dev/ram0 ramdisk_size=1500000 ip=dhcp`。M4 追加
+///   `autoinstall ds=nocloud-net;s=<answer_url>/` 传入 autoinstall 数据。
 ///   `ramdisk_size=1500000`（约 1.5 GB）确保 ramdisk 足够容纳 casper 提取的
-///   squashfs；`cloud-config-url=/dev/null` 阻止 cloud-init 在安装阶段尝试
-///   拉取 cloud config（M4 才通过 NoCloud-Net 传入 autoinstall 数据）。
+///   squashfs。不再使用 `cloud-config-url=/dev/null`——该 M3 临时参数会与
+///   NoCloud-Net 冲突（详见下方内联注释）。
 /// - RHEL 系（Rocky 等）：使用 `ip=dhcp rd.neednet=1 inst.repo=<repo_url>`，
 ///   Anaconda 从 DNF repository 下载安装树。M4 追加 `inst.ks=`。
 fn resolveInstall(
@@ -128,16 +128,23 @@ fn resolveInstall(
         // Ubuntu 的 live-server 安装器基于 casper。`inst.repo` 是 Anaconda 专用
         // 参数，在此被忽略；casper 需要已发布的 ISO URL 来下载并 loop mount ISO。
         // 额外的 live-server 参数匹配 Canonical 的 netboot 指引：
+        // - boot=casper：显式选择 casper live 启动路径，避免没有本地 CD-ROM
+        //   时 initramfs 回退到 `/dev/sr0` 探测
         // - root=/dev/ram0：使用 ramdisk 作为初始根文件系统
         // - ramdisk_size=1500000：分配约 1.5 GB ramdisk 空间给 casper squashfs
-        // - cloud-config-url=/dev/null：阻止 cloud-init 在安装阶段拉取配置
         // - ip=dhcp：通过 DHCP 获取网络配置
-        // M4 会在此基础之上追加 `autoinstall ds=nocloud-net;s=<answer_url>/`。
+        //
+        // M4 通过 NoCloud-Net 数据源（`ds=nocloud-net;s=<answer_url>/`）传入
+        // autoinstall user-data/meta-data。live-server 22.04 的 casper 启动
+        // 路径还必须显式禁用其默认 cloud-config URL；否则 cloud-init 可能
+        // 退回 DataSourceNone，完全不探测指定的 NoCloud-Net URL（实机可见
+        // 语言选择交互界面）。这不是第二个 answer source：/dev/null 仅阻止
+        // 默认 URL，NoCloud-Net 仍是唯一的 M4 answer source。
         const source_asset = lookup.findAsset(catalog, source.source_asset) orelse return null;
         if (source_asset.kind != .iso) return null;
         break :blk std.fmt.bufPrint(
             cmdline_buf,
-            "root=/dev/ram0 ramdisk_size=1500000 cloud-config-url=/dev/null ip=dhcp url=http://{s}:{d}/images/{s} autoinstall ds=nocloud-net;s=http://{s}:{d}/api/v1/nodes/{s}/answer/",
+            "boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=dhcp url=http://{s}:{d}/images/{s}.iso cloud-config-url=/dev/null autoinstall ds=nocloud-net\\;s=http://{s}:{d}/api/v1/nodes/{s}/answer/",
             .{ config.server.server_ip, config.server.http_port, source.source_asset, server_ip, http_port, identity.node_id },
         ) catch return null;
     } else blk: {
@@ -345,7 +352,12 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
     var cmdline_buf: [512]u8 = undefined;
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     // 必须包含 url= 参数指向已发布的 ISO HTTP URL。
-    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "url=http://192.168.27.128:18080/images/ubuntu-iso") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "url=http://192.168.27.128:18080/images/ubuntu-iso.iso") != null);
+    // Ubuntu live initramfs must explicitly select casper; otherwise it can
+    // fall back to scanning a missing local CD-ROM device.
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "boot=casper") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "ds=nocloud-net\\;s=http://192.168.27.128:18080/api/v1/nodes/node-ubuntu/answer/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "cloud-config-url=/dev/null") != null);
     // 绝不能包含 inst.repo=，那是 Anaconda/RHEL 专用参数。
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.repo=") == null);
 }

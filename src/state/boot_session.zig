@@ -157,6 +157,13 @@ pub const Store = struct {
     sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions,
     mutex: std.atomic.Mutex = .unlocked,
 
+    pub fn hasActiveNode(self: *Store, node_id: []const u8, mono_now: i64) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| if (session.active() and !sessionExpired(session, mono_now) and session.node_id != null and std.mem.eql(u8, session.node_id.?, node_id)) return true;
+        return false;
+    }
+
     /// 为新的 MAC/XID 对创建 session，或仅在有界 DHCP 重传窗口内刷新同一 session。
     /// 不同 XID 会取代旧的活动 session（标记为 superseded）。
     ///
@@ -437,6 +444,35 @@ pub const Store = struct {
         }
     }
 
+    /// Advances an authenticated installer/diskless session beyond DHCP/TFTP.
+    /// This is deliberately separate from node-status: it keeps a fresh DHCP
+    /// transaction from superseding a capability-bearing installer callback.
+    pub fn advanceDelivery(self: *Store, session_id: []const u8, phase: Phase, mono_now: i64, utc_now: i64) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
+            session.phase = phase;
+            session.last_seen_mono = mono_now;
+            session.last_seen_at = utc_now;
+            return;
+        }
+    }
+
+    /// Terminal installer events must release the in-memory capability
+    /// immediately: otherwise a failed attempt blocks `install retry` for the
+    /// two-hour delivery TTL. Terminal history remains in the durable event
+    /// and node-status stores.
+    pub fn finishDelivery(self: *Store, session_id: []const u8, reason: TerminalReason, mono_now: i64, utc_now: i64) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
+            _ = terminateLocked(session, reason, mono_now, utc_now);
+            return;
+        }
+    }
+
     /// 过期清理不活跃的 bootstrap session，并拷贝终态记录供调用方通过唯一
     /// EventWriter 追加审计事件。
     ///
@@ -700,6 +736,15 @@ test "repeated installer DHCP renewals preserve bootstrap proof" {
     // Bootstrap proof must still be valid after multiple renewals
     const auth = try store.authenticateBootstrap("node-01", 0xc0a81bd2, 32);
     try std.testing.expectEqualStrings(first.link.id().?, auth.boot_session_id[0..]);
+}
+
+test "terminal install event releases retry gate" {
+    var store: Store = .{};
+    const id = "0123456789abcdef0123456789abcdef";
+    store.sessions[0] = .{ .id = id.*, .node_id = "node-01", .profile = "install", .mode = .install, .last_seen_mono = 1 };
+    try std.testing.expect(store.hasActiveNode("node-01", 2));
+    store.finishDelivery(id, .failed, 3, 3);
+    try std.testing.expect(!store.hasActiveNode("node-01", 4));
 }
 
 test "capacity exhaustion remains explicit and bootstrap sessions expire" {

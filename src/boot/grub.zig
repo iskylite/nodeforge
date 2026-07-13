@@ -19,11 +19,17 @@ const model = @import("../model.zig");
 ///
 /// 所有字段都是已验证的安全值：
 /// - `node_id`：用于菜单项标题，不含特殊字符
+/// - `hostname`：节点配置的可读主机名（当前未用于标题，保留供未来扩展）
+/// - `lease_ip`：DHCP 分配的 IPv4 地址（大端 u32），用于在 PXE 控制台显示节点网络身份
+/// - `profile`：已解析的 profile 名称，便于在 PXE 控制台确认部署意图
 /// - `kernel_path`/`initrd_path`：已通过 toGrubPath 安全校验的 GRUB 路径
 /// - `cmdline`：由 resolveInstall/resolveDiskless 拼接的 kernel 命令行
 /// - `arch`：用于选择 GRUB 指令（当前两种架构统一使用 linux/initrd）
 pub const Entry = struct {
     node_id: []const u8,
+    hostname: []const u8,
+    lease_ip: u32,
+    profile: []const u8,
     kernel_path: []const u8,
     initrd_path: []const u8,
     cmdline: []const u8,
@@ -34,7 +40,8 @@ pub const Entry = struct {
 ///
 /// 输出格式是一个最小化的 `grub.cfg`，包含：
 /// - `set timeout=5`：5 秒菜单超时，允许操作员在启动时看到菜单
-/// - `menuentry`：以节点 ID 为标题的菜单项
+/// - `menuentry`：格式为 `NodeForge - <node_id>:<lease_ip> - <profile>`，
+///   显示节点 ID、DHCP 分配的 IP 地址和 profile 名称
 /// - `linux` 指令：指定 kernel 路径和命令行参数
 /// - `initrd` 指令：指定 initrd 路径
 ///
@@ -48,20 +55,22 @@ pub const Entry = struct {
 ///
 /// `buffer` 由调用方提供，渲染结果写入其中并返回有效切片。
 pub fn render(buffer: []u8, entry: Entry) ![]const u8 {
-    return std.fmt.bufPrint(buffer,
+    return std.fmt.bufPrint(
+        buffer,
         "set timeout=5\n" ++
-            "menuentry 'NodeForge {s}' {{\n" ++
+            "menuentry 'NodeForge - {s}:{d}.{d}.{d}.{d} - {s}' {{\n" ++
             "  linux {s} {s}\n" ++
             "  initrd {s}\n" ++
             "}}\n",
-        .{ entry.node_id, entry.kernel_path, entry.cmdline, entry.initrd_path },
+        .{ entry.node_id, (entry.lease_ip >> 24) & 0xFF, (entry.lease_ip >> 16) & 0xFF, (entry.lease_ip >> 8) & 0xFF, entry.lease_ip & 0xFF, entry.profile, entry.kernel_path, entry.cmdline, entry.initrd_path },
     );
 }
 
 // 测试：ARM64 GRUB 条目使用标准 linux/initrd 指令，不含 linuxefi/initrdefi。
 test "renders an ARM64 GRUB entry with linux/initrd" {
     var buffer: [512]u8 = undefined;
-    const value = try render(&buffer, .{ .node_id = "node-a", .kernel_path = "/install/rocky/vmlinuz", .initrd_path = "/install/rocky/initrd.img", .cmdline = "ip=dhcp", .arch = .aarch64 });
+    const value = try render(&buffer, .{ .node_id = "node-a", .hostname = "rocky-a", .lease_ip = 0xC0A81BC8, .profile = "rocky-install", .kernel_path = "/install/rocky/vmlinuz", .initrd_path = "/install/rocky/initrd.img", .cmdline = "ip=dhcp", .arch = .aarch64 });
+    try std.testing.expect(std.mem.indexOf(u8, value, "NodeForge - node-a:192.168.27.200 - rocky-install") != null);
     try std.testing.expect(std.mem.indexOf(u8, value, "linux /install/rocky/vmlinuz ip=dhcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, value, "initrd /install/rocky/initrd.img") != null);
     // 确保不使用 linuxefi/initrdefi，因为 ARM64 GRUB 不含这些模块。
@@ -74,7 +83,7 @@ test "renders an ARM64 GRUB entry with linux/initrd" {
 // 更安全，因为标准 GRUB UEFI 模块默认包含这两个指令。
 test "renders an x86_64 GRUB entry with linux/initrd" {
     var buffer: [512]u8 = undefined;
-    const value = try render(&buffer, .{ .node_id = "node-x", .kernel_path = "/install/rocky/vmlinuz", .initrd_path = "/install/rocky/initrd.img", .cmdline = "ip=dhcp", .arch = .x86_64 });
+    const value = try render(&buffer, .{ .node_id = "node-x", .hostname = "rocky-x", .lease_ip = 0xC0A81BC8, .profile = "rocky-install", .kernel_path = "/install/rocky/vmlinuz", .initrd_path = "/install/rocky/initrd.img", .cmdline = "ip=dhcp", .arch = .x86_64 });
     try std.testing.expect(std.mem.indexOf(u8, value, "linux /install/rocky/vmlinuz ip=dhcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, value, "initrd /install/rocky/initrd.img") != null);
     try std.testing.expect(std.mem.indexOf(u8, value, "linuxefi") == null);
@@ -84,6 +93,6 @@ test "renders an x86_64 GRUB entry with linux/initrd" {
 // 测试：菜单超时为 5 秒，确保操作员在 PXE 启动时能看到菜单。
 test "timeout is 5 seconds for boot menu visibility" {
     var buffer: [512]u8 = undefined;
-    const value = try render(&buffer, .{ .node_id = "node-a", .kernel_path = "/vmlinuz", .initrd_path = "/initrd.img", .cmdline = "ip=dhcp", .arch = .aarch64 });
+    const value = try render(&buffer, .{ .node_id = "node-a", .hostname = "node-a", .lease_ip = 0xC0A81BC8, .profile = "install", .kernel_path = "/vmlinuz", .initrd_path = "/initrd.img", .cmdline = "ip=dhcp", .arch = .aarch64 });
     try std.testing.expect(std.mem.indexOf(u8, value, "set timeout=5") != null);
 }

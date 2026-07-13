@@ -50,15 +50,14 @@ pub const Writer = struct {
         self.keep = keep;
     }
 
-    /// Configures the process identity injected into every daemon-written
-    /// Event v2 record. Callers cannot provide or override this field.
+    /// 配置注入到每条 daemon 事件的进程身份标识。调用方不能提供或覆盖此字段。
     pub fn setDaemonInstanceId(self: *Writer, value: [32]u8) !void {
         if (!validCorrelationId(&value)) return error.InvalidDaemonInstanceId;
         self.daemon_instance_id = value;
     }
 
-    /// Compatibility entrypoint for v1 fixture producers. New daemon code must
-    /// call `appendWithFields` and therefore always produce Event v2.
+    /// v1 fixture 生产者的兼容入口。新 daemon 代码必须调用 `appendWithFields`，
+    /// 因此总是生成 Event v2。
     pub fn append(self: *Writer, io: std.Io, allocator: std.mem.Allocator, path: []const u8, event: Event) !void {
         try self.appendWithFields(io, allocator, path, event.type, event.message, event.fields);
     }

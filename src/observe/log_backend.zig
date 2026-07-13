@@ -7,7 +7,9 @@
 //! 在反复文件写入失败时，后端降级为仅 stderr 并发出节流诊断。
 
 const std = @import("std");
-const events = @import("../state/events.zig");
+const c = @cImport({
+    @cInclude("time.h");
+});
 
 pub const max_line_bytes = 8 * 1024;
 const truncation_suffix = "… [truncated]";
@@ -61,12 +63,12 @@ const FileSink = struct {
     fn writeOrReportDegraded(self: *FileSink, io: std.Io, line: []const u8) bool {
         self.writeLine(io, line) catch {
             self.degraded_count += 1;
-            // Throttle: only report every 32 failures to avoid recursive noise.
+            // 节流：仅每 32 次失败报告一次，避免递归噪声。
             if (self.degraded_count % 32 == 1) {
                 const msg = "log_backend: file sink degraded, falling back to stderr\n";
                 _ = std.posix.system.write(2, msg.ptr, msg.len);
             }
-            // After enough failures, disable the file sink entirely.
+            // 失败次数足够多后，完全禁用文件 sink。
             if (self.degraded_count > 1000) {
                 file_backend = null;
             }
@@ -126,20 +128,20 @@ fn renderLogLineBounded(
     comptime format: []const u8,
     args: anytype,
 ) []const u8 {
-    var timestamp: [20]u8 = undefined;
-    const stamp = events.rfc3339Now(&timestamp) catch return buf[0..0];
+    var timestamp: [25]u8 = undefined;
+    const stamp = localRfc3339Now(&timestamp) catch return buf[0..0];
 
-    // Build the prefix: "<timestamp> <level> [<scope>] "
+    // 构建前缀："<timestamp> <level> [<scope>] "
     const prefix = std.fmt.bufPrint(buf, "{s} {s} [{s}] ", .{ stamp, @tagName(level), @tagName(scope) }) catch return buf[0..0];
     const prefix_len = prefix.len;
 
-    // Reserve space for truncation suffix at the boundary.
+    // 在边界处为截断后缀预留空间。
     const reserve = if (max_line_bytes > prefix_len + truncation_suffix.len + 1)
         max_line_bytes - truncation_suffix.len - 1
     else
         max_line_bytes;
 
-    // Format the message into the remaining sub-buffer.
+    // 将消息格式化到剩余的子缓冲区。
     var sub: std.Io.Writer = .fixed(buf[prefix_len..reserve]);
     sub.print(format, args) catch {
         const written = prefix_len + sub.buffered().len;
@@ -149,7 +151,7 @@ fn renderLogLineBounded(
             @memcpy(buf[written .. written + tail.len], tail);
             return buf[0 .. written + tail.len];
         }
-        // Extreme edge: not enough space even for the suffix.
+        // 极端边界：连截断后缀都放不下。
         buf[written] = '\n';
         return buf[0 .. written + 1];
     };
@@ -157,6 +159,30 @@ fn renderLogLineBounded(
     const total = prefix_len + sub.buffered().len;
     buf[total] = '\n';
     return buf[0 .. total + 1];
+}
+
+/// Human-facing service logs follow the daemon host's local timezone. Include
+/// the numeric offset (`+08:00`, for example) so copied log lines remain
+/// unambiguous. Structured Event v2 timestamps deliberately remain UTC `Z` in
+/// `state/events.zig`; changing that audit contract would break time filters
+/// and consumers for no operational benefit.
+fn localRfc3339Now(buffer: *[25]u8) ![]const u8 {
+    var clock: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) != .SUCCESS) return error.ClockUnavailable;
+
+    var seconds: c.time_t = @intCast(clock.sec);
+    var local: c.struct_tm = undefined;
+    if (c.localtime_r(&seconds, &local) == null) return error.ClockUnavailable;
+
+    // `%z` is emitted as ±HHMM. Insert the RFC 3339 colon without relying on
+    // non-portable `struct tm` offset fields shared differently by libc ABIs.
+    var raw: [32]u8 = undefined;
+    const length = c.strftime(&raw, raw.len, "%Y-%m-%dT%H:%M:%S%z", &local);
+    if (length != 24 or (raw[19] != '+' and raw[19] != '-')) return error.InvalidTimezone;
+    @memcpy(buffer[0..22], raw[0..22]);
+    buffer[22] = ':';
+    @memcpy(buffer[23..25], raw[22..24]);
+    return buffer;
 }
 
 pub fn logFn(
@@ -170,8 +196,7 @@ pub fn logFn(
     var buf: [max_line_bytes]u8 = undefined;
     const line = renderLogLineBounded(&buf, level, scope, format, args);
 
-    // The sink mutex covers stderr and file writes atomically so the two
-    // sinks always receive the same complete line.
+    // sink mutex 原子地覆盖 stderr 和文件写入，确保两个 sink 始终收到相同的完整行。
     while (!sink_mutex.tryLock()) std.Thread.yield() catch {};
     defer sink_mutex.unlock();
 

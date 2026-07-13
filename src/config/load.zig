@@ -62,3 +62,19 @@ test "parsed strings do not borrow the input buffer" {
     @memset(source, 'x');
     try std.testing.expectEqualStrings("192.168.50.1", parsed.value.server.server_ip);
 }
+
+test "APT fallback accepts schema-compatible hyphenated values" {
+    const parsed = try std.json.parseFromSlice(
+        model.InstallConfig,
+        std.testing.allocator,
+        \\{"apt":{"fallback":"abort"}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(model.AptFallback.abort, parsed.value.apt.fallback);
+
+    const default_parsed = try std.json.parseFromSlice(model.InstallConfig, std.testing.allocator, "{}", .{});
+    defer default_parsed.deinit();
+    try std.testing.expectEqual(model.AptFallback.@"offline-install", default_parsed.value.apt.fallback);
+}

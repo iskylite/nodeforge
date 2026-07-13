@@ -94,19 +94,20 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 - **启动加载与在线更新分层**：M0 中，`nodeforged` 启动时读取并校验 `config.json`，形成内存配置快照；站点结构性配置修改后重启生效，`config import` 只是离线原子写入。M1+ 才引入 DHCP discovery 策略和 catalog 变更的在线 API，由 `nodeforged` 原子更新内存快照并持久化。
 - **端口固定**：DHCP 固定监听 `UDP 67`，TFTP 固定监听 `UDP 69`。这两个端口是源码常量，不提供配置项、CLI 参数或运行时覆盖参数。
 - **发现安全**：未知节点身份可以从租约池获得临时 IP，并按 `dhcp.discovery.default_action` 进入等待、discovery 或显式允许的临时无盘；未知节点不能执行自动安装。MVP 以 MAC 为主要身份，保留 DHCP client id 和 SN 作为辅助信息。
-- **HTTP 单监听简化**：MVP 只启动一个 HTTP listener，固定绑定 `0.0.0.0:<http.port>`。M0 先提供健康检查和管理 API，M3 的 PXE 数据 API 将复用同一 HTTP 实现、连接循环和路由入口。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。DHCPv4 Linux 部署必须设置 `server.bind_interface`，用于以 `SO_BINDTODEVICE` 约束 DHCP 广播；CLI 管理客户端写死访问 `127.0.0.1:<http.port>`，不做远程管理发现和多管理端点配置。
+- **HTTP 单监听简化**：MVP 只启动一个 HTTP listener，固定绑定 `0.0.0.0:<http.port>`。健康检查、管理 API 和 M3+ PXE 数据 API 复用同一 HTTP 实现、连接循环和路由入口。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 HTTP bind 地址。DHCPv4 Linux 部署必须设置 `server.bind_interface`，用于以 `SO_BINDTODEVICE` 约束 DHCP 广播；CLI 管理客户端写死访问 `127.0.0.1:<http.port>`，不做远程管理发现和多管理端点配置。
 - **管理端口约定**：MVP 不引入独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`；listener 绑定所有 IPv4 接口，但 `/api/v1/management/` 仅接受 direct peer `127.0.0.1`，远端请求稳定返回 403。`nodeforge` CLI 固定连接 `127.0.0.1:<http.port>` 且不提供远程 endpoint，只支持管理同机 `nodeforged`。端口冲突时修改 `config.json` 后重启服务。
 - **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 只做 status/check、config/catalog 校验与导出、离线 config import。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
 - **CLI 使用成熟库**：命令解析、帮助信息、参数类型、默认值和错误提示使用固定版本的开源 CLI 库。MVP 固定使用支持 Zig 0.16.0 的 `zli v5.1.2`；命令、子命令、flag、位置参数和说明只在命令树中声明一次，解析与分级帮助从同一份声明生成。zli 只承载 CLI 语法和展示，不承载复杂业务配置模型。
 - **CLI 帮助可达**：顶层、每个资源命令和每个子命令都必须支持 `-h/--help`，显示用途、参数和默认值；长示例保留在 README 和运维文档，不塞进帮助页。
 - **日志与排障**：M0–M2 的 stderr/journal 行为在 M2.5 统一迁移为带时间、等级、scope 的标准库日志后端；`nodeforged --log-output auto|terminal|file|both` 控制本次输出目标，systemd 默认写入 `/opt/nodeforge/logs/nodeforged.log`，配置支持 `debug/info/warn/err` 和文件轮转，`nodeforged -d/--debug` 仅覆盖本次启动。M2.5 的 Event v2 是本地可查询审计契约，所有后续协议、installer、initrd 与 runner 复用同一注册表和 writer。服务日志、业务事件和 CLI 错误分别输出，且任何等级都不得记录密码、token、完整请求体或节点上传的大日志。
+- **密码配置统一为明文事实**：NodeForge config 中所有声明为 password 的字段都接受普通明文字符串，并在 JSON 存储、`config import` 和 `config export` 中原样保留；不限于用户、root 和 IPMI，未来 repository/proxy/basic-auth 等密码字段也遵循同一规则。需要 crypt/hash 的 adapter 只在渲染或受控下发阶段转换，不得回写配置。token、session capability、SSH private key 和派生 password hash 不属于 password 配置字段。
 - **输出可读优先**：面向人的默认输出必须分组、对齐、标注状态和时间；机器消费使用显式 `--output json`。
 
-## 2.5 M0 实现状态
+## 3. M0 实现状态
 
 M0 项目骨架阶段已完成，并在 Rocky 9.7 aarch64 环境完成实机验证。
 
-### 核心模块
+### 3.1 核心模块
 - **配置管理**: `config/load.zig`、`config/validate.zig`、`config/store.zig` 支持配置的加载、校验和原子保存
 - **目录管理**: `catalog/store.zig` 实现资产目录的管理和追踪，`catalog.zig` 提供配置与 catalog 的只读查询函数
 - **HTTP 服务**: `http/server.zig` 通过 Zap/facil.io 提供单监听器 HTTP 服务和路由管理
@@ -116,18 +117,18 @@ M0 项目骨架阶段已完成，并在 Rocky 9.7 aarch64 环境完成实机验�
 - **服务日志**: `observe/log.zig` 提供 info/debug 等级的服务日志门面
 - **预检机制**: `preflight.zig` 实现唯一 HTTP 端口的可用性检查
 
-### 代码质量
+### 3.2 代码质量
 - 核心领域模型、对外入口和错误/日志协议均有文档注释；具体模块职责和公开接口见详细设计第 3 节
 - 遵循统一的错误处理模式
 - 实现了完整的配置和目录校验逻辑
 - HTTP 请求处理确保内存安全
 
-### 关键实现
+### 3.3 关键实现
 - Zap/facil.io 接管 HTTP 报文解析、连接生命周期和 worker 调度；NodeForge 只维护业务路由
 - preflight 先识别活跃 listener、再允许 `SO_REUSEADDR` 快速重启，避免重复监听与重启窗口冲突
 - catalog 已填写的 SHA-256 字段会执行格式校验
 
-### 已验证能力
+### 3.4 已验证能力
 - `nodeforged --check-config` 配置校验通过
 - `nodeforge status` 状态查询功能正常
 - `nodeforge config validate` 配置验证功能正常
@@ -136,7 +137,7 @@ M0 项目骨架阶段已完成，并在 Rocky 9.7 aarch64 环境完成实机验�
 - systemd 服务启动、停止、重启功能正常
 - HTTP 管理接口和 API 路由响应正常
 
-### M0 CLI 边界
+### 3.5 M0 CLI 边界
 
 M0 只交付以下可执行命令：`status`、`check`、`config validate/export/import`、
 `catalog validate/export`。其中 `status` 和 `check` 固定调用本机管理 API；config/catalog
@@ -152,22 +153,26 @@ M0 参数规则是命令局部而非 persistent/global：`nodeforge` 根命令�
 
 ## 4. 功能对齐矩阵（M1+ 路线图）
 
-下表描述完整 provisioning 产品闭环，不是 M0 已实现能力。M0 当前代码边界以 2.5 节为准；
-各行能力在第 15 节的阶段路线图中按 M1-M7 交付。
+下表描述完整 provisioning 产品闭环，不等同于当前已实现能力。第 2.5 节保留 M0 的历史交付边界；
+当前实施状态为 M0-M3 已有验证记录，M4/M4.1 的 Rocky 9.7 与 Ubuntu 22.04 正向安装、登录和生命周期
+已完成实机验证；M4.1 异常恢复与边界项继续按审计清单回归，Rocky 8.10 aarch64 因当前 VMware/
+Apple-Silicon 环境不支持介质内核的 64 KiB page granule 而单独暂缓，M5-M7 待实现。各行能力按
+第 15 节路线图交付，只有代码、测试和系统级验收均完成后才能标记为支持。
 
 | 能力 | 配置对象 | 运行态对象 | 主要命令 | MVP 验收点 |
 | --- | --- | --- | --- | --- |
-| TFTP 启动资产 | `tftp`、`asset` | `tftp_session` | `tftp show`、`tftp session list` | 节点能拉取 bootloader、虚拟 `grub.cfg`、kernel、initrd（M3.5 代码已实现，待实机验证） |
+| TFTP 启动资产 | `tftp`、`asset` | `tftp_session` | `tftp show`、`tftp session list` | 节点能拉取 bootloader、虚拟 `grub.cfg`、kernel、initrd（M3.5 已在 r97n0 完成实机验证） |
 | DHCP 地址分配 | `dhcp`、`node`、`policy` | `lease`、`unknown_client` | `dhcp network update`、`dhcp pool update`、`runtime leases list` | 未知节点可获临时 lease，已登记节点拿正确 IP |
 | PXE 启动入口 | `node`、`profile`、`asset` | `node_status`、`event` | `node status`、`asset list` | DHCP 返回正确 `next-server` 和 `bootfile` |
 | HTTP 配置和资产 | `http`、`asset`、`profile` | `event` | `asset import`、`events list/follow` | initrd/installer 能获取配置并上报事件 |
 | 基础数据关系 | `distro`、`repository`、`install_source`、`asset`、`rootfs`、`boot_bundle` | `event` | `distro show`、`repository validate`、`install-source validate`、`boot-bundle show` | 能展开 OS 版本、repo、kernel、initrd、rootfs 的引用关系 |
 | 自动安装 | `profile.install` | `node_status`、`event` | `install render`、`install status` | Ubuntu Server autoinstall 跑通，Rocky Linux 9.x kickstart 模板可渲染 |
+| 目标系统基础配置（M4.1） | `profile.system`、`node.overrides.network` | `node_status`、deployment control、`event` | `install render/retry`、`profile show` | 公共系统配置跨安装/无盘复用；一次性 install generation 防止重复 PXE 擦盘，显式 retry/drift 可审计 |
 | 本地启动盘配置 | `profile.install.storage`、`profile.install.bootloader` | `node_status`、`event` | `install render`、`install status` | 可选择安装目标盘，创建 EFI/BIOS 引导分区并安装 bootloader |
 | 无盘启动 | `profile.diskless`、`boot_bundle` | `node_status`、`event` | `diskless status`、`diskless overlay update` | 小 initrd 下载 rootfs 并切换到目标 rootfs |
 | boot bundle 校验 | `asset`、`rootfs`、`profile` | `event` | `rootfs validate`、`initrd validate` | kernel/initrd/rootfs 的版本、架构、kernel ABI 一致 |
 | 补充包和后处理 | `provisioning_bundle` | `node_status`、`event` | `provision bundle show/plan`、`provision status` | Kickstart、autoinstall、rootfs build、diskless 共用强类型步骤和清晰输出 |
-| 配置与目录持久化 | `config.json`、`catalog.json` | M3.1 起为 `leases.json`、`node-status.json`、`events.jsonl`；`runtime.json` 仅兼容迁移 | `config validate/export/apply`、`asset/install-source/rootfs/initrd/boot-bundle import/build/publish` | 启动配置可重启加载；导入/构建/发布请求由 `nodeforged` 原子写入 catalog 并更新内存视图 |
+| 配置与目录持久化 | `config.json`、`catalog.json` | M3.1 起为 `leases.json`、`node-status.json`、`events.jsonl`，M4.1 增加 `deployment-control.json`；`runtime.json` 仅兼容迁移 | `config validate/export/apply`、`asset/install-source/rootfs/initrd/boot-bundle import/build/publish` | 启动配置可重启加载；install generation 和导入/发布状态可审计恢复 |
 | 观测输出 | `logging`、`events` | `node_status`、`event` | `node status`、`events list/follow/types` | 输出分组、表格化，错误有摘要和下一步建议 |
 
 ## 5. 总体架构与数据流
@@ -268,9 +273,9 @@ nodeforge.mode=diskless nodeforge.node_id={{node_id}} nodeforge.config_url={{con
 
 NodeForge 的对象模型保持简单：配置对象描述“应该怎样”，运行态对象描述“现在怎样”。
 
-本章描述 M1-M7 的目标模型。M0 当前代码只实现其中的最小子集；准确的 M0 字段、直接
-`install_source`/`boot_bundle` 引用方式和校验范围以详细设计第 5 节为准，不能把本章的 DHCP、
-TFTP、hooks、network override 或 provisioning 字段当作 M0 已支持的配置。
+本章描述 M1-M7（含 M4.1）的目标模型，不等同于当前代码 schema。历史 M0 边界以详细设计第 5 节为准；
+当前代码已实现 M4.1 的 `profile.system` 和节点目标网络字段，但仍须以 fixture 与系统验收为准，不能因为
+字段出现在目标模型中就宣称已完成系统级支持。
 
 ### 6.1 配置对象
 
@@ -345,6 +350,7 @@ const NodeOverrideConfig = struct {
 const NodeNetworkOverride = struct {
     mode: NetworkMode,
     interface: ?[]const u8,
+    match_mac: ?MacAddress,
     address: ?Ipv4Address,
     prefix_len: ?u8,
     netmask: ?Ipv4Address,
@@ -354,7 +360,6 @@ const NodeNetworkOverride = struct {
 };
 
 const NetworkMode = enum {
-    inherit,
     dhcp,
     static,
 };
@@ -432,6 +437,7 @@ const ProfileConfig = struct {
     boot_source: BootSourceRef,
     cmdline_template: []const u8,
     safety: ProfileSafetyConfig,
+    system: TargetSystemConfig,
     install: ?InstallConfig,
     diskless: ?DisklessConfig,
 };
@@ -445,6 +451,8 @@ const ProfileSafetyConfig = struct {
     safe_for_unknown: bool,
     destructive: bool,
     persistent_writes: bool,
+    // install profile 默认只执行一次；再次 PXE 需显式 rearm。
+    reinstall_policy: enum { explicit, always } = .explicit,
 };
 ```
 
@@ -452,7 +460,7 @@ const ProfileSafetyConfig = struct {
 
 `profile.mode` 决定运行路径，`install` 和 `diskless` 是 mode-specific 子配置。不要把 `install_profile`、`diskless_profile`、`initrd_profile` 拆成互相独立的一堆顶层表。
 
-### 5.2 运行态对象
+### 6.2 运行态对象
 
 | 对象 | 作用 |
 | --- | --- |
@@ -466,7 +474,7 @@ const ProfileSafetyConfig = struct {
 运行态不是管理员长期配置，不应混进 profile JSON。M3.1 前的 `RuntimeState` 可落盘为 `runtime.json`；M3.1 的补充方案
 改为独立 `leases.json` 和 `node-status.json`，旧文件仅用于兼容迁移。事件始终使用 `events.jsonl` 追加写。
 
-### 5.3 Node 字段语义
+### 6.3 Node 字段语义
 
 Node 描述“这一台机器是谁，以及它相对 profile 有哪些安全差异”。常见字段语义如下：
 
@@ -481,7 +489,7 @@ Node 描述“这一台机器是谁，以及它相对 profile 有哪些安全差
 | `tags` | 多值标签 | `rack:r1`、`env:lab`、`gpu`，用于分组、查询、批量操作和策略筛选 |
 | `vars` | 节点模板变量 | 渲染 answer/rootfs firstboot 配置，例如 `rack_id`、`cluster_id` |
 | `overrides` | 受控覆盖项 | 只允许覆盖 profile 声明可覆盖的系统内网络、安装变量、diskless overlay 等 |
-| `oob` | 可选带外管理配置 | IPMI BMC 地址、掩码、网关、用户名、临时密码或凭据引用 |
+| `oob` | 可选带外管理配置 | IPMI BMC 地址、掩码、网关、用户名和明文密码 |
 
 `client_id` 不是 NodeForge 自己发明的业务 ID，而是 DHCP 协议中的客户端标识。它可以和 MAC 一起作为节点认领和匹配依据。MVP 主要使用 MAC，`serial_number` 作为资产辅助信息，不引入复杂的多身份匹配规则。
 
@@ -493,15 +501,15 @@ Node 描述“这一台机器是谁，以及它相对 profile 有哪些安全差
 - `overrides` 是 NodeForge 认识并校验的覆盖项，例如静态网络、安装模板变量、diskless overlay size。
 - 破坏性行为不能通过 `vars` 或 `overrides` 临时打开；擦盘、分区、bootloader 安装仍必须来自 install profile。
 
-`overrides.network` 表达的是安装后系统内或无盘系统内的网络配置覆盖，不等同于 `node.ip`。`node.ip` 是 DHCP 侧给 PXE 阶段使用的保留地址；`overrides.network` 用来渲染 autoinstall/kickstart 或无盘 firstboot 网络配置。`dns`、`gateway`、`search_domains` 都是可选字段。`mode = static` 时必须提供 `address`，并提供 `prefix_len` 或 `netmask` 之一；`mode = dhcp` 时不需要 address/prefix/gateway/dns；`mode = inherit` 表示继承 profile 或 DHCP 结果。
+`overrides.network` 表达的是安装后系统内或无盘系统内的网络配置覆盖，不等同于 PXE bootstrap 配置。`node.ip` 是 DHCP 侧给 PXE 阶段使用的保留地址；`overrides.network` 用来渲染 autoinstall/kickstart 或无盘 overlay。M4.1 的 mode 只有 `dhcp`、`static`：静态模式必须同时提供 `address` 与 `prefix_len`，且 `address` 必须等于同一 MAC 的 `node.ip`；`gateway`、`dns`、`search_domains` 可选。M4.1 不接受 `netmask` 或 `inherit`，以免 adapter 对继承来源作出不同解释。
 
-结构体中的 `dns: []Ipv4Address` 和 `search_domains: [][]const u8` 使用空列表表示未配置，不代表必填。渲染安装配置时，空列表应继承 profile、DHCP 或发行版默认行为。
+结构体中的 `dns: []Ipv4Address` 和 `search_domains: [][]const u8` 使用空列表表示未配置，不代表必填。DHCP 模式可接受 DHCP 下发结果；静态模式的空列表表示不配置对应项。任何模式都不得为了补默认值写入发行版公共 DNS、公共 NTP 或其他公网端点。
 
 `oob` 是可选能力，不是 PXE MVP 的硬依赖。当前只预留 IPMI，不引入 Redfish。BMC 地址、掩码、网关、IPMI 用户名和密码均直接配置和保存；密码使用普通明文字符串，不引入 SecretRef、加密存储、temporary 标记或轮换流程。
 
 discovery 环境或小 initrd 可以回传少量 `node_facts`：机器 SN、BMC 地址、BMC 掩码、BMC 网关、IPMI 用户名和 IPMI 密码。NodeForge 可以把这些信息展示为“建议回填”，由管理员确认后写入 `node.serial_number` 或 `node.oob.ipmi`。不要扩展成完整硬件资产采集系统。
 
-### 5.4 Profile 职责
+### 6.4 Profile 职责
 
 Profile 描述“一类节点如何启动和部署”，node 描述“这一台机器是谁”。
 
@@ -514,9 +522,15 @@ Profile 描述“一类节点如何启动和部署”，node 描述“这一台�
 - `cmdline_template`：kernel cmdline 模板。
 - `safety`：是否允许未知节点使用、是否破坏性、是否写持久状态。
 
+`system` 公共配置描述 locale/timezone/keyboard、离线连接策略、SSH/root、普通用户/password/sudo/key、
+目标系统额外包和安全默认值；这些字段跨自动安装/无盘链路复用。节点专属持久网络放在
+`node.overrides.network`。
+
 `install` 子配置描述：
 
-- answer 模板、分区、软件包、网络、用户、文件覆盖、脚本 hook。安装源由 `profile.boot_source.install_source` 引用。
+- APT fallback、answer/schema、分区、bootloader、安装器文件覆盖和 installer hook/event。安装源由
+  `profile.boot_source.install_source` 引用；不得另建与 `profile.system` 冲突的用户、包、目标网络、SSH、
+  localization 或安全默认值。
 
 `diskless` 子配置描述：
 
@@ -524,7 +538,7 @@ Profile 描述“一类节点如何启动和部署”，node 描述“这一台�
 
 节点可以覆盖 profile 的少量变量，例如 hostname、静态 IP、DNS/gateway、标签、角色、模板变量，以及 profile 明确允许的运行参数覆盖。破坏性行为仍由 install profile 明确声明，不能由节点变量、IP 租约或未知节点策略临时拼出来。
 
-### 5.5 节点参数覆盖与未知节点默认行为
+### 6.5 节点参数覆盖与未知节点默认行为
 
 NodeForge 支持“每个节点单独配置部署参数”，但边界应按职责拆开：
 
@@ -559,7 +573,7 @@ NodeForge 支持“每个节点单独配置部署参数”，但边界应按职�
 
 safe/ephemeral profile 至少需要满足：`safety.safe_for_unknown = true`、`safety.destructive = false`、`safety.persistent_writes = false`，并且 hooks 不包含擦盘、格式化、固件修改或持久化凭据写入等危险动作。
 
-### 5.6 基础数据关系、命名规则与 boot bundle
+### 6.6 基础数据关系、命名规则与 boot bundle
 
 基础数据分两层：
 
@@ -581,7 +595,11 @@ ISO 导入规则保持简单且不做错误假设：
 - 挂载树先复制到 NodeForge 管理的 staging/version 目录，再提取 installer kernel/initrd 并通过 HTTP
   只读发布；不得让 HTTP/TFTP 直接指向仍挂载的介质。
 - Rocky/RHEL 系 DVD ISO 只有在 `.treeinfo` 和 `repodata/repomd.xml` 有效时才自动建立 yum/dnf repository。
-- Ubuntu Server ISO 始终可作为 installer media；只有 `dists/`、`pool/` 和 apt 元数据完整时才自动建立 apt repository，否则必须配置外部 mirror。
+- Ubuntu Server ISO 始终可作为 installer media；ISO 导入时始终发布 repo 内容并创建 `RepositoryConfig`
+  条目。当 `dists/`、`pool/` 和 apt 元数据完整时 apt 能正常工作；不完整时 apt 请求快速 404 而非
+  DNS 超时。`user-data` 中始终只向 `apt.mirror-selection.primary` 写入 NodeForge 本地 URL，设置
+  `apt.geoip: false`，并按 `install.apt.fallback` 决定严格失败或 ISO 离线回退；不得生成
+  `archive.ubuntu.com` / `ports.ubuntu.com` / `security.ubuntu.com` 候选。
 - NodeForge 不重建发行版仓库元数据；只发布已经有效的仓库内容或管理员明确提供的额外源。
 
 查看配置时，NodeForge 不应只返回 kernel/initrd 路径，而应能展开关系：
@@ -690,7 +708,7 @@ PXE 路径中 TFTP 只发送：
 
 TFTP 不发送 rootfs、ISO、repo 或大镜像。这些必须走 HTTP。
 
-### 6.2 DHCP：PXE 特化但具备基础地址管理
+### 7.2 DHCP：PXE 特化但具备基础地址管理
 
 NodeForge DHCP 不是“只返回 bootfile”的半成品。MVP 使用 authoritative 模式：在绑定的 PXE 管理网段内，提供标准 DHCP 地址分配、基础网络配置、租约生命周期和 PXE 启动入口。
 
@@ -702,7 +720,8 @@ NodeForge DHCP 不是“只返回 bootfile”的半成品。MVP 使用 authorita
 - 按 RFC 2131 标准处理 `giaddr`：当报文经由外部 relay agent（路由器 IP Helper 或 `dhcrelay`）转发到达时，`giaddr` 非零，服务器基于 `giaddr` 或 option 82 中的 RFC 3527 Link Selection 子选项定位目标 subnet；回复报文发送到 `giaddr:67` 而非广播。这是标准 DHCP 服务器行为，不作为独立功能特性。NodeForge 自身不实现 relay agent。
 - 支持服务器端地址冲突检测（Ping Probe）：在发送 DHCPOFFER 前对候选 IP 发送 ICMP Echo Request，超时内未收到回复才正式分配；收到回复则标记该 IP 为 abandoned 并尝试下一个候选。参考 ISC DHCP `do_ping_check`/`lease_pinged`/`abandon_lease` 实现。
 - 支持未知节点身份：从地址池分配临时租约，记录为 `unknown_client`，并按 `dhcp.discovery.default_action` 决定等待、discovery、显式安全无盘或拒绝。discovery 策略支持运行期在线切换。
-- 返回基础网络选项：subnet mask、router、DNS、lease time。
+- 返回基础网络选项：subnet mask、router、DNS、lease time，以及由同一 lease 推导的 T1 renewal（option 58）
+  和 T2 rebinding（option 59，默认分别为 1/2 与 7/8）。
 - 返回 PXE 启动选项：`next-server`、`bootfile`，必要时处理 option 60/93/97。
 - 把租约变化、未知客户端观察记录和 PXE 事件写入运行态和 JSONL 事件。
 
@@ -734,7 +753,7 @@ NodeForge DHCP 不是“只返回 bootfile”的半成品。MVP 使用 authorita
          install: 配置非法，启动前校验拒绝
 ```
 
-### 6.3 HTTP：主要数据通道
+### 7.3 HTTP：主要数据通道
 
 HTTP 是 NodeForge 的主要数据通道，负责 TFTP 之后的所有大内容和状态交互。
 
@@ -773,13 +792,13 @@ M3 的节点侧 HTTP 认证结果必须绑定已认领 node、活动 `boot_sessi
 kernel cmdline、日志、事件或持久 runtime；daemon 重启后旧 session 必须失效。`/images` 与 `/repos` 可以只读
 公开，但只能发布 catalog allowlist 的资源；`/rootfs` 和所有节点 API 必须经过 session 认证。
 
-MVP 不再拆分 management listener 和 PXE listener。管理路由与 M3 PXE 数据路由逻辑分区，但共享同一个 HTTP listener。M0 当前只注册 `/healthz` 和管理路由；M3 才在同一 socket 提供裸机可通过 `server.server_ip` 访问的数据路由。本 listener 固定绑定 `0.0.0.0:<http.port>`；`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址，不作为 M0 HTTP bind 地址。`/api/v1/management/` 在 route 入口按 direct peer 严格限制为 `127.0.0.1`，不能由 `X-Forwarded-For` 绕过；`nodeforge` CLI 固定连接该地址，不提供远程 endpoint。这样保留唯一 socket，同时不把 catalog 写入和 loop-mount 权限暴露到 PXE 网段。
+MVP 不拆分 management listener 和 PXE listener。管理路由与 M3+ PXE 数据路由逻辑分区，但共享同一个 HTTP listener；当前同一 socket 已提供 `/healthz`、管理路由和裸机可通过 `server.server_ip` 访问的数据路由。本 listener 固定绑定 `0.0.0.0:<http.port>`；`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址，不作为 HTTP bind 地址。`/api/v1/management/` 在 route 入口按 direct peer 严格限制为 `127.0.0.1`，不能由 `X-Forwarded-For` 绕过；`nodeforge` CLI 固定连接该地址，不提供远程 endpoint。这样保留唯一 socket，同时不把 catalog 写入和 loop-mount 权限暴露到 PXE 网段。
 
-HTTP 服务器基于 Zap/facil.io 的固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile；M3 在把已验证 descriptor 交给 sendfile 前解析单 Range/`If-Range`，并只使用受管 SHA256 ETag，不依赖 facil.io 的文件时间/长度 ETag。M0 尚未注册静态资产或 Range 路由，M3 再将这些能力接入 NodeForge 路由。NodeForge 当前只维护业务路由、管理 API 和统一错误信封。已评估的纯 Zig `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
+HTTP 服务器基于 Zap/facil.io 的固定提交实现。Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile；M3 已接入受管静态资产和 Range 路由，在把已验证 descriptor 交给发送路径前解析单 Range/`If-Range`，并只使用受管 SHA256 ETag，不依赖 facil.io 的文件时间/长度 ETag。NodeForge 维护业务路由、管理 API 和统一错误信封。已评估的纯 Zig `http.zig`（karlseguin）在 Zig 0.16 上尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 
 ## 8. 核心能力 A：PXE 无人值守自动安装
 
-### 7.1 安装流程
+### 8.1 安装流程
 
 ```text
 PXE 启动
@@ -793,7 +812,7 @@ PXE 启动
   -> 重启进入本地磁盘系统
 ```
 
-### 7.2 install profile 需要表达什么
+### 8.2 install profile 需要表达什么
 
 | 类别 | 需要表达的内容 |
 | --- | --- |
@@ -808,11 +827,14 @@ PXE 启动
 | 脚本 hook | pre-install、post-install、firstboot、failure hook；支持内联脚本或引用 HTTP asset |
 | 安全输入 | token、临时凭据；MVP 不引入 secret store，密码直接明文配置 |
 
-系统用户密码直接以明文配置和存储，例如 `111111` 或 `asdf1234`。发行版 adapter 在渲染 answer file 时按安装器要求临时生成 hash；MVP 不设计额外密码状态或 secret 管理。
+NodeForge 配置中所有语义为 password 的字段均直接以明文配置和存储，例如 `111111` 或 `asdf1234`。
+当前包括系统用户、root 与 IPMI；未来若增加 repository、proxy、HTTP basic-auth 或其他 password 字段，
+也必须默认接受明文并由 config import/export 原样往返。发行版 adapter 在渲染 answer file 时按安装器要求
+临时生成 hash；MVP 不设计额外密码状态、SecretRef、加密封装或轮换流程。
 
 未显式认领的节点默认不能使用会擦盘的 install profile。必须先由管理员把发现到的节点身份认领为 node，并绑定 IP/profile。这个身份 MVP 以 MAC 为主，可用 DHCP client id 和 SN 辅助确认。这样做的原因是 PXE 管理网段里可能临时接入未知服务器、虚拟机或误插设备，默认自动擦盘安装风险太高。
 
-### 7.3 启动盘与引导配置
+### 8.3 启动盘与引导配置
 
 PXE 自动安装必须具备本地启动盘配置能力。这里的“配置启动盘”指的是：在目标机器本地磁盘上创建可启动系统，而不是保证修改服务器固件的全局 boot order。
 
@@ -833,7 +855,7 @@ NodeForge 可以通过 autoinstall/kickstart 渲染本地磁盘、分区和 boot
 - 可选增强：post-install 中使用 `efibootmgr` 调整 UEFI BootNext/BootOrder。已在 Rocky 9.7 aarch64 VMware EFI 虚拟机上验证：`efibootmgr -o` 修改 BootOrder 后重启持久化正常；`efibootmgr --bootnext` 设置一次性启动项有效；`efibootmgr -c`/`-B` 可创建/删除启动项（需有效 EFI 文件路径）。不同厂商固件对 BootOrder 修改的兼容性可能存在差异，MVP 默认 `set_firmware_boot_order = false` 避免阻塞自动安装。
 - 可选增强：通过 IPMI 设置下一次启动设备，但这属于带外管理能力，不进入 MVP。
 
-### 7.4 发行版 adapter
+### 8.4 发行版 adapter
 
 | 系统族 | 支持发行版 | 机制 | NodeForge 输出 |
 | --- | --- | --- | --- |
@@ -844,13 +866,65 @@ NodeForge 可以通过 autoinstall/kickstart 渲染本地磁盘、分区和 boot
 
 | 通用字段 | Ubuntu Server autoinstall | RHEL 系 kickstart |
 | --- | --- | --- |
+| locale / timezone / keyboard | `locale` / `timezone` / keyboard config | `lang` / `timezone` / `keyboard` |
 | 分区 | `storage.config` | `clearpart` / `part` / `logvol` |
 | 软件包 | `packages` | `%packages` |
 | 用户/SSH | `identity` / `ssh` | `user` / `sshkey` |
+| 目标系统网络 | Netplan v2 `network` | `network --bootproto=...` / NetworkManager |
 | post-install | `late-commands` | `%post` |
 | 安装源 | nocloud/repo URL | `inst.repo` / `url` |
+| APT mirror 失败策略 | `install.apt.fallback` | 不适用 |
 
-install profile 中的 `packages` 只表示安装器原生基础包选择；额外 repository 包、tar.bz2、文件更新和脚本统一进入 provisioning bundle，避免同一个包在安装模板和后处理里重复声明。
+`profile.system.packages` 表示最终目标系统必须具备的额外包：自动安装在安装器原生 package 阶段安装，
+无盘在 rootfs build 阶段安装。更复杂的 package group、tar.bz2、文件更新和脚本统一进入 provisioning bundle，
+且不得与 `system.packages` 重复声明。
+
+M4.1 将目标系统公共配置收敛为 `profile.system`，包括 localization、connectivity、SSH/root、普通用户/
+password/sudo/逐账号 key、目标系统额外包和 security；节点专属静态网络放在
+`node.overrides.network`。兼容默认值为 `locale=en_US.UTF-8`、`timezone=UTC`、`keyboard=us`、
+`connectivity.mode=local-only`、OpenSSH/password authentication enabled、root login `yes`、root password
+`asdf1234`、firewall disabled、Rocky SELinux disabled 和目标系统 DHCP。root password 允许在 profile 中
+明文修改；配置文件和 config import/export 都保留明文，adapter 仅在安装器要求时临时转换为目标 hash。
+locale/timezone 可自定义；Ubuntu 的 GeoIP 始终关闭，不能通过修改 timezone 间接恢复公网探测。
+
+M4.1 将 M0-M4 审计发现的 answer 正确性缺口一并作为补丁交付：Ubuntu/Rocky 普通用户和 root 的明文
+password 在 session 内统一派生标准 SHA-512 crypt `$6$`，Ubuntu 不再使用裸 SHA-256 hex，Kickstart 使用
+`--iscrypted`；password 字段不接受“以 `$6$` 开头即预哈希透传”的双重语义。Ubuntu 不输出残缺 identity，
+空用户只在绑定的 Subiquity 版本实测支持时通过 `autoinstall.user-data` 实现 root-only，否则部署前拒绝；
+空 packages 保持 list。显式 storage/bootloader、
+Rocky 必需 `rootpw`、sudo/groups、逐账号 SSH key、installer-context 事件和 answer schema 校验也属于 M4.1，
+不能继续推迟到 M5。
+
+NodeForge 管理端 bootstrap SSH 公钥按“显式 `server.ssh_authorized_public_key` →
+`/root/.ssh/id_rsa.pub` → `/root/.ssh/id_ed25519.pub` → 加载/生成 state 中持久 Ed25519”的顺序确定。
+最终 root keys 为 server public key + profile root keys，每个普通用户为 server public key + 该用户 profile keys，
+按 key blob 去重且不串账号。generated private key 只保存在 NodeForge state 的受限目录，绝不进入
+config/catalog/answer/BootConfig/rootfs/log/event；它是管理客户端 key，不是目标 sshd host key。
+
+“关闭 `sestatus`”按“关闭 SELinux”解释，因为 `sestatus` 本身只是查询命令。Rocky 安装后执行 `sestatus`
+应显示 disabled；Ubuntu 不使用 SELinux，因此不借此关闭 AppArmor。firewall disabled 在 Rocky 对应
+firewalld disabled/masked，在 Ubuntu 对应 UFW inactive/disabled。
+
+PXE bootstrap 与目标系统网络是两层配置：GRUB/kernel/initrd/ISO/answer/rootfs 获取仍先使用 DHCP；目标系统
+可以持久 DHCP 或静态 IPv4。M4.1 静态模式要求目标地址等于同一 MAC 的 `node.ip` DHCP reservation，避免
+安装器中途换地址导致本地 HTTP 链路断开。Ubuntu 按 MAC 生成 Netplan，Rocky 按 MAC/device 生成 Kickstart/
+NetworkManager 配置，不依赖不稳定的 `ens*`/`enp*` 名称。
+
+自动安装采用持久化的一次性 install generation。install profile 首次绑定会 arm 一次，进入
+`install.started` 后 consumption 生效；成功、失败或已消费节点再次 PXE 默认进入 wait/local-disk handoff，
+不会仅因 profile 仍绑定就再次擦盘。`nodeforge install retry <node>` 只 rearm 下一代并等待节点自行重启/PXE，
+不倒退历史 node status、不调用 BMC。只有 profile 明确配置高风险 `reinstall_policy=always` 时才允许每次 PXE
+重装；不提供持久的 node force-reinstall override。
+
+安装完成时记录 applied config/target-system/install-plan digest。之后修改 network、用户、密码、包或安全策略
+只形成 desired/applied drift，不自动重装；storage/bootloader/source 变化必须显式新 generation，目标系统在线
+reconciliation 留给 M7。离线 `config validate` 不读取 runtime，只有 diff/apply/show 能结合 applied revision
+提示影响。
+
+`local-only` 保证 NodeForge 生成的 answer 不包含未声明公网源：Ubuntu 禁止 installer refresh、APT GeoIP、
+update/upgrade 和默认 NTP，Rocky 不生成 mirrorlist/metalink/vendor NTP，两者只使用 NodeForge 本地 repo 和
+server IP。它不是网络防火墙；绝对禁止互联网仍由部署 VLAN/出口 ACL 保证。OpenSSH 所需包和用户额外包必须
+能从安装介质或本地 repository 获得，缺包不得回退公网。
 
 MVP 首先在当前 Rocky Linux 9.7 aarch64 环境跑通 kickstart，再跑通 Ubuntu Server 22.04 LTS autoinstall；随后以 x86_64 完成首个生产验收。RHEL、Alma、Fedora 复用 Rocky 优先的 kickstart adapter。
 
@@ -860,6 +934,11 @@ Ubuntu Server 自动安装策略：
 - NodeForge 通过 HTTP 提供 cloud-init NoCloud-Net 数据源：`user-data` 和 `meta-data`。
 - PXE 侧加载 Ubuntu live-server ISO 中的 kernel/initrd，cmdline 追加 `autoinstall ds=nocloud-net;s={{answer_base_url}}/`。
 - `user-data` 中写入 `autoinstall: { version: 1, ... }`，由 NodeForge adapter 渲染 storage、identity、ssh、packages、late-commands 等字段。
+- Ubuntu profile 通过 `install.apt.fallback` 选择 mirror 失败策略：默认 `offline-install`；
+  要求本地 HTTP APT 必须成功的验收 profile 使用 `abort`；`continue-anyway` 仅作为 Subiquity
+  schema 的完整透传值，不推荐生产使用。
+- MVP 通过离线事实源工作流配置该字段：修改 JSON 后执行 `nodeforge config import <path>`、
+  `nodeforge config validate` 并重启 daemon。当前不提供在线 `profile update` 命令。
 - NodeForge 只支持 Ubuntu Server 22.04 LTS 及之后版本；不为 20.04 或更早版本做兼容。
 
 NodeForge Ubuntu 版本支持分层：
@@ -886,7 +965,7 @@ RHEL / CentOS 系支持优先级：
 | 当前开发验证 | aarch64 / ARM64 | macOS 宿主机上的 Rocky Linux 9.7 ARM VM 优先验证构建和启动流程 |
 | 生产初期优先 | x86_64 | 补齐 QEMU/真机 PXE、性能和发行版资产矩阵后优先验收 |
 
-### 7.5 安装阶段状态
+### 8.5 安装阶段状态
 
 ```text
 pxe_seen
@@ -906,7 +985,7 @@ pxe_seen
 
 ## 9. 核心能力 B：内存无盘系统
 
-### 8.1 无盘启动流程
+### 9.1 无盘启动流程
 
 ```text
 PXE
@@ -921,7 +1000,7 @@ PXE
   -> rootfs 中的 /sbin/init 接管系统
 ```
 
-### 8.2 小 initrd、rootfs、diskless profile 的关系
+### 9.2 小 initrd、rootfs、diskless profile 的关系
 
 | 概念 | 作用 | 生命周期 |
 | --- | --- | --- |
@@ -931,7 +1010,7 @@ PXE
 
 rootfs 不包含小 initrd，小 initrd 也不应该包含完整 rootfs。把完整 rootfs 塞进 initrd 会变成“大 initrd”，会带来内存占用高、更新粗、调试困难等问题。
 
-### 8.3 rootfs 运行方式
+### 9.3 rootfs 运行方式
 
 | 维度 | `ram_rootfs` | `squashfs_overlay` |
 | --- | --- | --- |
@@ -944,7 +1023,7 @@ rootfs 不包含小 initrd，小 initrd 也不应该包含完整 rootfs。把完
 
 MVP 优先实现 `squashfs_overlay`，保留 `ram_rootfs` 作为轻量模式。
 
-### 8.4 squashfs + tmpfs overlay
+### 9.4 squashfs + tmpfs overlay
 
 `squashfs_overlay` 的最终根文件系统由两层合成：
 
@@ -990,7 +1069,7 @@ overlay tmpfs 大小限制必须是配置项：
 
 `tmpfs_size` 支持百分比和明确容量，例如 `50%`、`8g`、`4096m`。配置校验必须拒绝空值、负值、无法解析的单位和明显危险的超大配置。小 initrd 从 HTTP boot config 读取该值，并转换成 `mount -t tmpfs -o size=...` 需要的参数。
 
-### 8.5 rootfs 制作与定制
+### 9.5 rootfs 制作与定制
 
 rootfs 是完整 Linux 根文件系统目录树，不是 initrd，也不是 ISO。
 
@@ -1012,7 +1091,7 @@ rootfs 定制能力：
 
 rootfs 可以通过 Ubuntu Server 的 `debootstrap/mmdebstrap`、cloud image 展开，或 RHEL 系的 `dnf --installroot`、安装树/镜像展开生成。NodeForge CLI 后续可以封装常见流程，但底层仍应尊重发行版工具。
 
-### 8.6 小 initrd 制作要求
+### 9.6 小 initrd 制作要求
 
 小 initrd 统一使用目标发行版的 `dracut` 定制构建。构建环境必须与 rootfs 同发行版、同版本、同架构、同 kernel release；NodeForge 提供 `95nodeforge` dracut module 和稳定的 build/validate 命令。initrd 必备能力：
 
@@ -1030,16 +1109,19 @@ rootfs 可以通过 Ubuntu Server 的 `debootstrap/mmdebstrap`、cloud image 展
 - kernel cmdline 中的 `nodeforge.mode`、`nodeforge.node_id`、`nodeforge.config_url`、`nodeforge.event_url`。
 - HTTP boot config 中的 `rootfs_url`、`rootfs_sha256`、`rootfs_mode`、`overlay.tmpfs_size`、网络补充参数和调试开关。
 
-不建议让 initrd 直接理解发行版名称、包组、用户、分区、安装模板、角色脚本等高级概念。initrd 的职责是把节点带到最终 rootfs；更多变量由 profile 渲染、rootfs firstboot 或 nodeforge-agent 处理。
+不建议让 initrd 直接理解发行版名称、包组、用户创建/生命周期、分区、安装模板、角色脚本等高级概念。
+M5 只允许它执行服务端已归一化的有限 target-system overlay 计划，例如为 rootfs 中已存在的账号写 shadow hash
+和 `authorized_keys`；不得运行通用 useradd/usermod 或依据包名安装软件。initrd 的职责是把节点带到最终
+rootfs；更多变量由 profile 渲染、rootfs build/firstboot 或 nodeforge-agent 处理。
 
-### 8.7 驱动放置规则
+### 9.7 驱动放置规则
 
 - 下载 rootfs 前必须使用的网卡驱动、firmware、证书、网络工具，必须放进 kernel 或小 initrd。
 - 切根后才需要的 GPU、RDMA、存储扩展、监控 agent 依赖模块，可以放在 rootfs。
 - 如果同一驱动既影响早期联网又影响目标系统运行，应同时放入 initrd 和 rootfs，或编进 kernel。
 - rootfs 中的 `/lib/modules/<kernel-release>/` 必须匹配实际启动 kernel。
 
-### 8.8 无盘节点差异化
+### 9.8 无盘节点差异化
 
 多台无盘节点通常共享同一个 rootfs asset。节点差异不应通过复制多份 rootfs 解决，而应在启动时注入：
 
@@ -1049,7 +1131,22 @@ rootfs 可以通过 Ubuntu Server 的 `debootstrap/mmdebstrap`、cloud image 展
 - 节点独有小配置通过 HTTP config、模板变量或 firstboot 脚本下发。
 - rootfs 中只保留通用系统和通用配置模板。
 
-### 8.9 发布前校验
+M5 复用 M4.1 的 `profile.system` 与 `node.overrides.network`，但严格区分构建期和启动期：locale 数据、
+tzdata、keyboard 数据、OpenSSH、`system.packages` 和 `system.users` 账号骨架在 `rootfs_build` 阶段从
+NodeForge 本地 repository/构建计划落地；hostname、locale/timezone/keyboard 选择、目标 DHCP/静态网络、
+root/普通用户 password hash、sudo/key、firewall/SELinux 和 SSH 策略在下载 rootfs 后写入 overlay upper。
+无盘启动阶段不得运行 apt/dnf/useradd/usermod，也不得为缺能力访问公网。
+
+无盘 initrd 为获取 BootConfig/rootfs 始终先 DHCP；目标静态地址必须与该 MAC 的 DHCP reservation 相同。
+initrd 不主动切换成另一个 IP，只生成 Netplan 或 NetworkManager 持久配置，由 `switch_root` 后的目标网络服务
+接管相同地址。共享 rootfs 必须清除 SSH host private keys；MVP 在每个临时 overlay 生成实例 key，因此没有
+持久 overlay 时重启后 fingerprint 会变化，不能用所有节点共享同一 host key 掩盖该限制。
+
+M5 rootfs 下载器使用有界 connect/no-progress/attempt timeout、最多 5 次暂态网络退避和严格 4xx 分类；完整
+SHA256 失败只允许从 0 重下一次，重复失败进入 quarantine。`diskless retry` 只解除失败隔离并等待下一次 PXE，
+不远程重启、不改写历史状态。ISO 属于 M3/installer 链路，不复用 initrd rootfs retry 实现。
+
+### 9.9 发布前校验
 
 发布前至少校验：
 
@@ -1063,8 +1160,18 @@ rootfs 可以通过 Ubuntu Server 的 `debootstrap/mmdebstrap`、cloud image 展
 - initrd 能解析 `nodeforge.*` kernel cmdline。
 - initrd 包含下载 rootfs 前必需驱动、firmware、HTTP 工具和校验工具。
 - initrd 支持目标 `rootfs_mode` 所需的文件系统能力。
+- rootfs manifest 声明已生成 locale、可用 timezone/keyboard、已安装 `system.packages`、已创建
+  `system.users` 账号骨架/sudo membership 和 OpenSSH/Netplan/NetworkManager capability；
+  profile 请求的系统能力缺失时拒绝发布 boot bundle。
+- BootConfig 只下发 root/普通用户 password hash 和 public key，不含明文密码/private key；initrd manifest 必须声明
+  `target-system-v1` 等 required feature，旧 initrd 不得静默忽略目标系统配置。
+- M5 复用 M4.1 的 `$6$` PasswordHasher 和 ServerAdminKeyProvider；BootConfig 的 authorized keys 已完成
+  server/profile 合并，只携带 public key，并声明 `sha512-crypt-v1`、`bootstrap-admin-key-v1` 能力。
+- `local-only` rootfs 不保留发行版公网 mirror/metalink/vendor NTP 默认值，运行时不自动 update/upgrade。
+- RHEL 系默认禁用 firewalld，并由 diskless kernel cmdline `selinux=0` + overlay 配置共同保证本次启动和目标
+  配置均为 SELinux disabled；Ubuntu 默认禁用 UFW，不改变 AppArmor。
 
-### 8.10 无盘阶段状态
+### 9.10 无盘阶段状态
 
 ```text
 pxe_seen
@@ -1082,7 +1189,7 @@ pxe_seen
 
 ## 10. 配置、持久化与校验
 
-### 9.1 配置入口
+### 10.1 配置入口
 
 | 入口 | 用途 |
 | --- | --- |
@@ -1096,7 +1203,7 @@ pxe_seen
 
 管理接口复用唯一 HTTP listener，但 `/api/v1/management/` 仅接受 direct peer `127.0.0.1`；`nodeforge` CLI 的管理客户端也固定请求该地址，不读取配置中的管理地址，也不支持远程管理地址参数。远程管理需要未来明确的 TLS、认证和授权设计，不能借用 PXE listener 绕过。MVP 不再并列设计 Unix socket、独立 RPC、第二个 HTTP listener 或独立 `management_port`，减少协议、端口和客户端实现分叉。
 
-### 9.2 配置与 CLI 分工
+### 10.2 配置与 CLI 分工
 
 按对象来源、生命周期和运行期需求切分：
 
@@ -1118,7 +1225,7 @@ CLI 不应为每个配置字段都设计一个长参数。对于复杂对象，�
 
 这类命令以文件、清单或 patch 为输入，由核心校验器负责语义检查。
 
-### 9.3 修改流程
+### 10.3 修改流程
 
 ```mermaid
 sequenceDiagram
@@ -1150,14 +1257,17 @@ sequenceDiagram
 - 已绑定 socket 的参数，例如绑定网卡、server IP、HTTP/管理共用端口，MVP 可以提示需要重启 `nodeforged`。
 - DHCP/TFTP 生产端口不能配置，不能通过 CLI 或启动参数修改。
 
-### 9.4 配置校验
+### 10.4 配置校验
 
 提交前至少校验：
 
 - node id、MAC、client id、SN、IP、profile 名称格式。
 - node `tags` 必须是稳定短字符串，推荐 `key:value` 或简单标签。
-- node `vars` 必须是 JSON object；密码只能放入明确的 password 字段，不能藏在自由变量中。
-- node `overrides.network.mode = static` 时必须有 `address`，且 `prefix_len` 与 `netmask` 至少有一个；DNS 和 gateway 可选。
+- node `vars` 必须是 JSON object；密码只能放入 schema 明确定义的 password 字段，不能藏在自由变量中。所有
+  password 字段接受并保存明文，不得要求调用方预先提供 hash；需要 hash 的目标输出使用独立派生字段。
+- `server.ssh_authorized_public_key` 只能是受支持的单行 OpenSSH public key；private-key header、换行、非法
+  base64 或不支持算法拒绝。省略时 generated bootstrap key state 必须可创建/加载且权限正确。
+- node `overrides.network.mode = static` 时必须有 `address` 和 `prefix_len`，且 `address == node.ip`；不接受 `netmask` 或 `inherit`。DNS、search domain 和 gateway 可选，但不得隐式补公网默认值。
 - node `oob.ipmi.address/netmask/gateway` 必须是 IPv4 地址；`oob.ipmi.username/password` 是可选明文字段。
 - 节点静态 IP 属于 PXE subnet，且不冲突。
 - DHCP range 不与 server IP、router IP、静态 IP 冲突。
@@ -1183,21 +1293,21 @@ sequenceDiagram
 - diskless profile 的 `overlay.tmpfs_size` 必须存在、可解析，并落在允许范围内。
 - TFTP/HTTP 路径必须经过 normalize，禁止目录穿越。
 
-### 9.5 配置持久化与格式
+### 10.5 配置持久化与格式
 
-`config.json` 是启动配置和人工声明策略的事实源，M0 当前实际读取 server、http、logging、distros、profiles、nodes 和 policy 字段；DHCP/TFTP 与 provisioning 字段属于 M1+ schema 扩展。`catalog.json` 是 NodeForge 管理目录的事实源，M0 只读取、导出和校验；M1+ 才记录 asset、repository、install source、rootfs、initrd、boot bundle 等导入、构建、扫描、发布结果。二者都使用 JSON、都必须整体校验并原子写回；catalog 写入始终只允许由 `nodeforged` 执行。
+`config.json` 是启动配置和人工声明策略的事实源，schema 随阶段从 M0 的 server/http/logging、基础 distro/profile/node/policy 扩展到 DHCP/TFTP、安装和 provisioning；准确的当前可加载字段以代码与 `config.example.json` 为准，M4.1 目标字段在实现前不得提前当作可用配置。`catalog.json` 是 NodeForge 管理目录的事实源，M1+ 记录 asset、repository、install source、rootfs、initrd、boot bundle 等导入、构建、扫描、发布结果。二者都使用 JSON、都必须整体校验并原子写回；catalog 写入始终只允许由 `nodeforged` 执行。
 
 MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。M3.1 前的 `runtime.json` 属于运行态，M3.1 起其内容按恢复语义拆分为 `leases.json` 与 `node-status.json`，并保留旧文件作兼容迁移输入；`events.jsonl` 属于事件历史。M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。交互式启动默认写 stderr，systemd 显式选择受限权限的轮转文件 `/opt/nodeforge/logs/nodeforged.log`；`--log-output both` 才同时写入 stderr/journal。
 
 默认安装根为 `/opt/nodeforge`，代码中只在统一路径定义处声明一次，其他默认路径全部派生。完整的目录布局、系统集成点和仓库目录结构见第 14 章。
 
-### 9.6 日志分层
+### 10.6 日志分层
 
 NodeForge 区分三类输出，避免把服务日志、业务事件和深度调试混成一锅粥：
 
 | 类型 | 默认位置 | 内容 | 日常级别 |
 | --- | --- | --- | --- |
-| 服务日志 | 交互式 stderr；systemd 默认 `/opt/nodeforge/logs/nodeforged.log`；`both` 时也进入 journal | 启动、配置校验、监听、协议与 HTTP 请求摘要、错误摘要 | `debug/info/warn/err` |
+| 服务日志 | 交互式 stderr；systemd 默认 `/opt/nodeforge/logs/nodeforged.log`；`both` 时也进入 journal | 启动、配置校验、监听、协议与 HTTP 请求摘要、错误摘要；时间使用主机本地时区并携带 RFC 3339 数字偏移 | `debug/info/warn/err` |
 | 业务事件（M2.5+） | `/opt/nodeforge/logs/events.jsonl` 及轮转文件 | DHCP/TFTP/HTTP/install/diskless/provisioning 事件，便于 CLI 和采集工具处理 | Event v2 结构化字段 |
 | CLI 错误 | 调用终端 stderr | 一行简短错误；`-d` 时附内部原因 | 不进入服务日志或事件 |
 
@@ -1205,6 +1315,10 @@ M0 服务端必须输出 HTTP access log 摘要，至少包含 method、path 和
 client IP、响应字节数、单调耗时和 `http.request` event。日常运行不记录完整请求体、不打印密钥/密码、
 不信任 `X-Forwarded-For`，也不把节点上传的大日志直接写入服务日志；M3 的节点日志摘要经长度、类型和
 身份校验后映射到受限 Event v2。
+
+静态资产与 repository 的 GET、Range GET、HEAD 和 416 响应都必须写终态 access log 并产生
+`http.request` event。HEAD 的 `bytes_sent` 为 0，同时记录 `object_bytes`；sendfile GET 在 handler
+交给 facil.io 后记录 `response_state=queued`，不得把异步排队误报为客户端已经 ACK 全部字节。
 
 M0 使用两个互补的 debug 开关：`config.json` 的 `logging.level` 控制常驻 daemon 日志等级；
 `nodeforged -d/--debug` 只覆盖本次启动，适合 systemd 外的临时诊断，并沿用 `--log-output` 选择的目标。`nodeforge` 叶子命令的
@@ -1215,7 +1329,7 @@ M2.5 后，`nodeforge events list/follow/types` 只读本机 events 文件和轮
 formatter，`list --output json` 输出 JSON array，`follow --output json` 输出 JSONL。服务日志不提供新的
 远程采集或 NodeForge `logs tail` API：日常读取使用 journalctl 或已配置的本地文件。
 
-### 9.7 最小配置示例
+### 10.7 最小配置示例
 
 ```json
 {
@@ -1326,15 +1440,37 @@ Install profile 示例：
   "boot_source": {
     "install_source": "ubuntu-22.04-x86_64-live-server"
   },
-  "cmdline_template": "nodeforge.mode=install nodeforge.node_id={{node_id}} nodeforge.config_url={{config_url}} nodeforge.event_url={{event_url}} autoinstall ds=nocloud-net;s={{answer_base_url}}/ cloud-config-url=/dev/null",
+  "cmdline_template": "nodeforge.mode=install nodeforge.node_id={{node_id}} nodeforge.config_url={{config_url}} nodeforge.event_url={{event_url}} autoinstall ds=nocloud-net;s={{answer_base_url}}/",
   "safety": {
     "safe_for_unknown": false,
     "destructive": true,
     "persistent_writes": true
   },
+  "system": {
+    "localization": {
+      "locale": "en_US.UTF-8",
+      "timezone": "Asia/Shanghai",
+      "keyboard": "us"
+    },
+    "connectivity": { "mode": "local-only", "time_sync": false, "ntp_servers": [] },
+    "ssh": {
+      "enabled": true,
+      "password_authentication": true,
+      "root_login": "yes",
+      "root_password": "asdf1234",
+      "root_authorized_keys": []
+    },
+    "security": {
+      "firewall": "disabled",
+      "selinux": "disabled"
+    }
+  },
   "install": {
     "installer": "autoinstall",
     "answer_template": "ubuntu/22.04/user-data.tmpl",
+    "apt": {
+      "fallback": "abort"
+    },
     "storage": {
       "wipe": true,
       "boot_disk": "/dev/sda",
@@ -1406,6 +1542,21 @@ Diskless profile 示例：
     "destructive": false,
     "persistent_writes": false
   },
+  "system": {
+    "localization": { "locale": "en_US.UTF-8", "timezone": "UTC", "keyboard": "us" },
+    "connectivity": { "mode": "local-only", "time_sync": false, "ntp_servers": [] },
+    "ssh": {
+      "enabled": true,
+      "password_authentication": true,
+      "root_login": "yes",
+      "root_password": "asdf1234",
+      "root_authorized_keys": ["ssh-ed25519 AAAA... admin@example"]
+    },
+    "security": {
+      "firewall": "disabled",
+      "selinux": "disabled"
+    }
+  },
   "diskless": {
     "rootfs_mode": "squashfs_overlay",
     "overlay": {
@@ -1417,11 +1568,11 @@ Diskless profile 示例：
 }
 ```
 
-## 10. CLI 与运维观测
+## 11. CLI 与运维观测
 
 CLI 是 NodeForge MVP 的主要运维界面。M0 仅提供状态、健康检查及本地 config/catalog 工具；M1+ 才逐步加入节点、资产、导入、构建、发布、预览、批量操作和运行期高频变更。无论阶段，CLI 都不应把 `config.json` 的每个字段拆成命令行参数，也不应要求管理员手写由扫描、导入、构建才能可靠得到的 catalog 对象。
 
-### 10.1 CLI 实现原则
+### 11.1 CLI 实现原则
 
 - 使用 vendored `zli v5.1.2`，不长期维护手写参数 parser、字符串命令分发或重复帮助文本。命令树是 CLI 语法的唯一事实源；新增 flag 时同时声明名称、类型、默认值和说明，自动进入解析和对应层级的帮助。
 - 顶层、资源级和动作级都必须支持 `-h/--help`，例如 `nodeforge --help`、`nodeforge config --help`、`nodeforge config validate --help`。
@@ -1434,7 +1585,7 @@ CLI 是 NodeForge MVP 的主要运维界面。M0 仅提供状态、健康检查�
 - zli spinner 仅作为未来耗时交互命令的可选能力；当前命令不启动 spinner。后续启用时必须同时满足 TTY、human 输出和确有可感知等待时间，JSON、重定向、管道和 systemd 场景必须禁用。
 - `nodeforge` CLI 调用管理 API 时固定连接 `127.0.0.1:<http.port>`；不提供管理地址配置项，只支持管理同机 `nodeforged`。服务端路由虽可从其他可达地址调用，但正式远程管理仍需另行设计鉴权、TLS 和审计。
 
-### 10.2 CLI 与配置文件切分
+### 11.2 CLI 与配置文件切分
 
 | 放在配置文件 | 放在 CLI/API |
 | --- | --- |
@@ -1458,7 +1609,7 @@ CLI 是 NodeForge MVP 的主要运维界面。M0 仅提供状态、健康检查�
 - 默认输出面向人；机器消费必须显式使用 `--output json`。其他输出格式等有真实需求后再加。
 - 命令局部参数只放在所属动作之后，例如 `nodeforge check --output json`、`nodeforge config validate --config ./config.json --catalog ./catalog.json`；根命令只接受 `-v/--version`。
 
-### 10.3 命令格式规范
+### 11.3 命令格式规范
 
 常规命令仍保持资源化风格：
 
@@ -1476,7 +1627,7 @@ nodeforge apply <file>   # M1+，尚未实现
 
 这些融合入口只是常用命令的快捷聚合，必须在帮助信息中说明等价关系或覆盖范围。
 
-### 10.4 命令分组与阶段边界
+### 11.4 命令分组与阶段边界
 
 M0 的实际命令面以 2.5 “M0 CLI 边界”为准。下表仅前两行是 M0 已实现命令；其余资源化
 命令均为 M1+ 设计目标，不应作为 M0 可执行命令清单。
@@ -1505,7 +1656,7 @@ M0 的实际命令面以 2.5 “M0 CLI 边界”为准。下表仅前两行是 M
 
 `profile` 和 `provisioning bundle` 的完整定义不强行拆成大量 `add/update --field` 参数；创建和大范围修改优先通过配置文件或配置片段完成。`repository`、`install-source`、`rootfs`、`initrd`、`boot-bundle` 则优先通过 CLI 的 import/build/package/publish 命令请求 `nodeforged` 生成和更新 catalog，并提供 `show/validate/plan/render` 等可视化和校验入口。
 
-### 10.5 示例命令
+### 11.5 示例命令
 
 ```bash
 nodeforge status
@@ -1542,7 +1693,7 @@ nodeforge runtime leases list
 nodeforge config validate
 ```
 
-### 10.6 输出格式
+### 11.6 输出格式
 
 默认输出要像运维工具，而不是像调试日志：
 
@@ -1552,7 +1703,7 @@ nodeforge config validate
 - 彩色输出只在 TTY 默认开启；`--no-color` 必须关闭颜色。
 - 所有命令支持 `--output json`，字段名与内部 API 保持稳定。
 
-#### 10.6.1 统一 formatter
+#### 11.6.1 统一 formatter
 
 CLI 使用独立展示层统一渲染 human 输出：handler 先构造 typed view，`cli/output.zig` 决定
 分组、成功/错误样式和颜色策略，`cli/table.zig` 根据显式 column 定义计算宽度、对齐和截断。
@@ -1602,7 +1753,7 @@ node-01  52:54:00:12:34:01  192.168.50.101  install   install_packages  ubuntu-2
 node-02  52:54:00:12:34:02  192.168.50.102  diskless  rootfs_mounted    ubuntu-22.04-diskless
 ```
 
-### 10.7 events.jsonl
+### 11.7 events.jsonl
 
 `events.jsonl` 是追加型 JSON Lines 审计流；M2.5 起由 daemon 内唯一 writer 写入 Event v2。每行具有
 `v`、RFC 3339 UTC `ts`、`type`、人类摘要 `message` 和字符串 key/value `fields`，例如：
@@ -1616,7 +1767,7 @@ node-02  52:54:00:12:34:02  192.168.50.102  diskless  rootfs_mounted    ubuntu-2
 follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、写入顺序和节点上报 DTO 由详细设计 §7.5
 统一规定；M3–M7 不得直接 append 原始客户端 JSON 或建立新的事件格式。
 
-## 11. 安全设计
+## 12. 安全设计
 
 - M0 的 HTTP listener 固定绑定 `0.0.0.0:<http.port>`；M3.6 起管理路由仅接受 `127.0.0.1` direct peer；CLI 固定连接该地址，只支持管理同机 `nodeforged`。
 - 不建议在办公网或已有生产 DHCP 网络上直接开启 authoritative 模式。
@@ -1629,7 +1780,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 - 安装事件 token 属于短期会话数据，不与明文系统/IPMI 密码混为一类。
 - IPMI 用户名和密码直接明文配置和保存；MVP 只保存、展示和回填，不实现凭据管理。
 
-## 12. Zig 实现策略
+## 13. Zig 实现策略
 
 模块边界遵循“少模块、清边界、按需拆文件”。MVP 初始结构不提前铺开所有未来子目录。
 
@@ -1637,7 +1788,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 
 - 只支持 IPv4；不定义 IPv6 配置字段，不监听 DHCPv6，不在 initrd 中加入 IPv6 分支。
 - 一个 HTTP 实现只启动一个 listener，绑定 `0.0.0.0:http.port`；管理路由只接受 `127.0.0.1` direct peer，CLI 管理客户端固定连接同一地址；不设置独立 `management_port`；`server.server_ip` 用于对外 URL、DHCP next-server、TFTP/HTTP 广告地址。
-- HTTP 服务器基于 Zap/facil.io 的固定提交实现；Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile。M3 在交给 sendfile 前自行解析单 Range/`If-Range`，并只发出受管 SHA256 ETag，避免采用 facil.io 的文件时间/长度 ETag。M0 尚未注册静态资产或 Range 路由，M3 再接入；NodeForge 当前只维护业务路由、管理 API 和统一错误信封。纯 Zig `http.zig` 的 Zig 0.16 分支尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
+- HTTP 服务器基于 Zap/facil.io 的固定提交实现；Zap 负责 HTTP 报文解析、连接生命周期、并发调度和 fd-backed sendfile。M3 已接入受管静态资产和 Range 路由，在交给发送路径前自行解析单 Range/`If-Range`，并只发出受管 SHA256 ETag，避免采用 facil.io 的文件时间/长度 ETag。NodeForge 维护业务路由、管理 API 和统一错误信封。纯 Zig `http.zig` 的 Zig 0.16 分支尚未充分测试且不承诺完整 HTTP/1.1 合规，因此不作为本 MVP 的直接依赖。
 - M0 的 `nodeforged --check` 在启动前检查配置/catalog 和唯一 HTTP 端口；正常启动不以预检替代实际 bind，仍由 Zap `listen()` 处理竞态和端口冲突。UDP 67/69、权限、资产目录、TFTP、DHCP resolver、repository 和 state 检查随对应阶段补齐。
 - M3 把每个节点请求归一化为 server-side `AuthenticatedNodeSession`，再决定 node、profile、mode、状态更新与 Event fields；URL、body、`X-Forwarded-For` 和客户端 event type 绝不直接成为事实。`node_status` 是持久 runtime 投影，Event v2 是审计；daemon 重启保留最后投影但使旧 session 失效，由 trace 显示重启边界。
 - M3.1 作为 M3 runtime 持久化的补充方案：DHCP lease 由专属 worker 至多每秒 checkpoint 至 `leases.json`，HTTP
@@ -1655,7 +1806,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 
 代码结构、模块依赖方向、核心调用路径、复杂度预算和注释/代码文档要求详见 `DETAILED_DESIGN.md` 第 2 章。
 
-## 13. 测试策略
+## 14. 测试策略
 
 ### 13.1 单元测试
 
@@ -1690,7 +1841,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 - TFTP 文件不存在、block 重传、option 协商。
 - 安装阶段事件和无盘阶段事件。
 
-## 14. 目录布局
+## 15. 目录布局
 
 默认安装根为 `/opt/nodeforge`。除 systemd unit 和 `/usr/bin` 软链接外，配置、运行态、日志、资产、部署产物和工作目录都放在该目录下。`/etc/systemd/system/nodeforged.service` 也是软链接，指向 `/opt/nodeforge/systemd/nodeforged.service`，避免卸载 `/opt/nodeforge` 后留下可用但失配的旧 service 文件。
 
@@ -1712,6 +1863,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
   state/
     leases.json             # M3.1 DHCP lease snapshot
     node-status.json        # M3.1 node-status snapshot
+    deployment-control.json # M4.1 install generation / applied revision
     runtime.json            # legacy migration input
   logs/
     events.jsonl
@@ -1767,9 +1919,10 @@ NodeForge/
     systemd/
 ```
 
-## 15. 分阶段路线图
+## 16. 分阶段路线图
 
-主依赖链为 `M0 -> M1(TFTP) -> M2(DHCP/PXE) -> M3 -> M4/M5`；M6、M7 都建立在 M4/M5 已跑通的基础上。TFTP 先用标准客户端形成独立闭环，再接入 DHCP 的 bootfile 决策。
+主依赖链为 `M0 -> M1(TFTP) -> M2(DHCP/PXE) -> M3 -> M4 -> M4.1 -> M5`；M6、M7 都建立在
+M4.1/M5 已跑通的基础上。TFTP 先用标准客户端形成独立闭环，再接入 DHCP 的 bootfile 决策。
 
 | 阶段 | 名称 | 前置 | 核心结果 |
 | --- | --- | --- | --- |
@@ -1778,13 +1931,14 @@ NodeForge/
 | M2 | DHCP + PXE 闭环 | M0、M1 | 节点获得 lease 和正确 bootfile，并进入 bootloader |
 | M3 | HTTP 资产、ISO 仓库和事件接口 | M0、资产模型 | 节点可获取配置/answer/rootfs/ISO repo，并上报事件 |
 | M4 | PXE 无人值守安装与基础后处理 | M1-M3 | Rocky Linux 9.7 aarch64、Ubuntu Server 22.04 LTS 安装和 `install_post` 跑通 |
-| M5 | 内存无盘启动与基础后处理 | M1-M3、基础 runner | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
-| M6 | 支持矩阵增强 | M4、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
-| M7 | 补充包和后处理增强 | M4、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
+| M4.1 | 公共目标系统配置、安装生命周期与 M4 answer 纠错 | M4 | 公共系统配置、一次性 generation/retry/drift、`$6$`/bootstrap key、storage/schema/event 及 M1-M3 横切回归在 Ubuntu/Rocky 生效并供 M5+ 继承 |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner | 小 initrd 进入 `squashfs_overlay`，复用目标系统配置并跑通 `rootfs_build`/`diskless_boot` |
+| M6 | 支持矩阵增强 | M4.1、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
+| M7 | 补充包和后处理增强 | M4.1、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
 
-每个阶段的代码任务、CLI 命令、测试和验收标准详见 `DETAILED_DESIGN.md` 第 4-11 章。
+每个阶段的代码任务、CLI 命令、测试和验收标准详见 `DETAILED_DESIGN.md` 第 3-12 章。
 
-## 16. MVP 验收标准
+## 17. MVP 验收标准
 
 MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 
@@ -1802,10 +1956,21 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 - bootloader 能通过 TFTP 获取配置、kernel 和 initrd。
 - initrd 或 installer hook 能通过 HTTP 获取配置并上报状态事件。
 - 至少跑通 Rocky Linux 9.7 aarch64 kickstart 和 Ubuntu Server 22.04 LTS autoinstall，并能自定义 ext4/xfs 分区、补充包、网络、用户和后处理。
+- M4.1 自动安装能自定义 locale/timezone/keyboard，默认启用 OpenSSH 和 root 密码登录，默认密码
+  `asdf1234` 且允许明文修改；默认关闭发行版主机防火墙和 Rocky SELinux，并在
+  `local-only` 下不生成公网 repo、GeoIP、installer refresh、update/upgrade 或 vendor NTP 请求。
+- 自动安装目标系统支持 DHCP 和节点静态 IPv4；静态地址必须与同一 MAC 的 DHCP reservation 相同，重启后
+  Ubuntu Netplan 或 Rocky NetworkManager 配置生效。
+- install profile 默认只消费一次 generation；安装完成后固件继续 PXE 也不得自动再次擦盘，只有显式
+  `install retry` rearm 后才允许下一次重装。retry 不重启节点，desired/applied drift 不自动触发重装。
 - 自动安装能配置本地启动盘，至少支持 UEFI GPT + ESP + bootloader 安装。
 - 至少提供 Rocky Linux 9.x kickstart profile 模板和渲染框架。
 - `nodeforge install render <node>` 能预览渲染后的 answer file。
 - 至少跑通一条内存无盘启动链路：NodeForge 小 initrd 通过 HTTP 下载 rootfs，校验后进入 `squashfs_overlay`。
+- M4.1 的普通用户/password/sudo/逐账号 key 与 `system.packages` 在自动安装目标系统生效；同一配置由 M5
+  无盘链路继承，不再定义 diskless 私有 users/packages 字段。
+- 无盘 rootfs 在构建期包含 locale/timezone/keyboard/OpenSSH、账号骨架和额外包能力，启动期只向 overlay
+  注入节点差异、password hash/key 和服务策略，不运行 useradd/apt/dnf，不访问未声明公网端点。
 - 无盘 `squashfs_overlay` 的 overlay tmpfs 大小限制能通过 profile 配置控制，并在 initrd 挂载时生效。
 - 至少能导入或打包一个 boot bundle，记录 kernel/initrd/rootfs 的 SHA256、版本和 profile 引用关系。
 - 至少能校验一个 initrd/rootfs 组合，包括 rootfs init 入口、kernel modules 匹配和 initrd 早期网络/overlay 能力。
@@ -1816,7 +1981,7 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 - `nodeforge check` 能验证唯一 HTTP listener、管理路由、TFTP、DHCP 配置、repository 和状态存储。
 - `nodeforge provision bundle plan` 与 `provision status` 能按阶段展示后处理计划和结果。
 
-## 17. 技术不确定点与详细设计待确认
+## 18. 技术不确定点与详细设计待确认
 
 这些不是当前概要设计的阻塞项，但进入实现前需要详细设计或 spike 验证：
 
@@ -1831,14 +1996,20 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 | 安装阶段事件 | stock installer initrd 不一定能直接运行 nodeforge-init | 通过 answer file hook、late command、firstboot 上报 |
 | 固件启动顺序 | 安装器能安装本地 bootloader，但不能保证所有机器自动修改 BIOS/UEFI boot order | MVP 配置本地启动盘和 bootloader；IPMI/efibootmgr 作为增强 |
 | 小 initrd 工具链 | dracut module 的依赖和发行版差异 | 统一使用同发行版/版本/架构/kernel release 环境中的 dracut |
-| 早期网络复杂配置 | 静态 IP、VLAN、bonding 会增加 initrd 复杂度 | MVP 优先 DHCP；明确不支持 IPv6 |
+| 早期网络复杂配置 | initrd 静态 IP、VLAN、bonding 会增加 bootstrap 复杂度 | PXE/initrd bootstrap 保持 DHCP；M4.1 只交付目标系统持久静态 IPv4，多 NIC/VLAN/bonding 留 M6；明确不支持 IPv6 |
+| M4.1 目标静态网络切换 | installer 下载期间切换地址可能中断本地 HTTP/session | 强制静态地址等于同一 MAC 的 `node.ip` reservation，并验证 Ubuntu Netplan、Rocky NetworkManager 重启后配置 |
+| Ubuntu root SSH 默认值 | Subiquity/cloud-init 的 identity、root lock 与 sshd 配置可能相互覆盖 | 双 adapter fixture + 安装后 root 密码 SSH 实测；adapter 只临时生成 hash，事实源保留明文 |
+| SHA-512 crypt 正确性与并发 | 自实现排列错误、非线程安全 `crypt(3)` 或每次 GET 新 salt 会产生无效/漂移 answer | `crypt_r`/经验证实现、已知向量与 OpenSSL/libxcrypt 交叉验证；同 session/config revision 缓存派生结果 |
+| bootstrap admin key 生命周期 | `/root/.ssh` 不可读、generated key 损坏或误把 client key 当 host key | 固定降级顺序、原子 state 持久化、严格权限/指纹日志；private key 不下发，host key 独立生成 |
+| local-only 外联回归 | 新 adapter、包或脚本可能重新引入公共 mirror/GeoIP/NTP | answer 静态检查、隔离 VLAN/出口 ACL 和抓包验收；M5-M7 finalizer 与 protected-domain 校验继承该策略 |
+| Rocky 安全默认值 | Kickstart、目标文件和首次启动可能导致 firewalld/SELinux 状态不一致 | 同时检查 kickstart、目标文件、kernel cmdline 和安装后 `systemctl`/`sestatus` 结果 |
 | Secure Boot | 自定义 kernel/initrd/bootloader 签名链需要额外设计 | 暂不进入 MVP |
 | overlay 高写入路径 | `/var/log`、`/tmp`、容器运行目录如何单独挂载 | MVP 提供配置位，详细设计定义挂载策略 |
 | 持久化 overlay | 无盘节点是否需要持久化写层 | MVP 默认不持久化，后续扩展 |
-| secret 管理 | 安装 token、SSH key、repo 凭据的长期保存方式 | MVP 使用临时 token；系统和 IPMI 密码明文存储，不引入 secret store |
+| secret 管理 | 安装 token、SSH key、repo 凭据的长期保存方式 | MVP 使用临时 token；所有 password 配置字段均明文存储，不引入 secret store；token/private key 不因该规则转为普通 password 字段 |
 | 配置并发修改 | 多 CLI 同时修改时的锁、回滚、冲突提示 | 详细设计定义文件锁和 API 错误模型 |
 
-## 18. 关键决策
+## 19. 关键决策
 
 | 问题 | 决策 |
 | --- | --- |
@@ -1860,15 +2031,25 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 | overlay tmpfs 大小是否可控 | 是，作为 diskless profile 配置项，并由 initrd 挂载时执行 |
 | 小 initrd 是否承载发行版差异 | 否，只保留早期启动通用能力和少量稳定输入 |
 | 小 initrd 如何构建 | 在同发行版/版本/架构/kernel release 环境中使用定制 dracut module |
-| ISO 与仓库关系 | ISO 内容通过 HTTP 发布；仅在对应 yum/dnf/apt 元数据完整时自动建立 repository |
+| ISO 与仓库关系 | ISO 内容通过 HTTP 发布；Rocky 仅在有效 `.treeinfo`/repodata 时建立 DNF repository，Ubuntu 导入始终发布 `/repos/<source>/` 并建立 APT `RepositoryConfig`，元数据不完整时由 `install.apt.fallback` 决定 abort 或默认 offline-install |
 | repo GPG | 默认关闭，只有 repository 显式启用时才配置并校验 |
-| 密码如何存储 | 系统和 IPMI 密码直接明文配置、明文存储 |
+| 密码如何存储 | NodeForge config 中所有 password 字段均接受明文并明文存储、导入、导出；adapter 仅在目标格式需要时派生 hash，未来新增 password 字段默认继承该规则 |
+| password 如何进入 answer | M4.1 起统一在 session 内派生 SHA-512 crypt `$6$`；不接受 password 前缀预哈希透传，Kickstart 也使用 `--iscrypted`，派生结果不回写事实源 |
+| 默认管理公钥 | NodeForge bootstrap admin public key 始终与 root/各用户自己的 profile keys 合并；显式公钥优先，否则读 root key，最后生成并持久化 Ed25519；private key 只留服务端 state |
+| 目标系统默认账号 | M4.1+ 默认安装并启用 OpenSSH、启用密码认证和 root 登录，root 默认明文密码 `asdf1234`；`system.users=[]` 不隐式创建普通用户，profile 可显式覆盖 |
+| 目标系统安全默认值 | Ubuntu UFW、Rocky firewalld 默认关闭；Rocky SELinux 默认 disabled，Ubuntu AppArmor 不因该选项关闭 |
+| 目标系统网络归属 | PXE/bootstrap 始终先走 DHCP；安装后/无盘系统由 `node.overrides.network` 配置 DHCP 或静态 IPv4，静态地址必须等于 `node.ip` reservation |
+| 已安装节点再次 PXE | install generation 默认一次性且 `reinstall_policy=explicit`；已消费节点进入 wait/local-disk handoff，只有显式 `install retry` rearm 或高风险 `always` 才重装 |
+| retry 是否重启节点 | 否；retry 只持久化下一代部署意图且幂等，不倒退 node_status、不调用 BMC，活动 install session 时拒绝 |
+| lease 与 session | DHCP option 58/59 促进续租；bootstrap proof 要求有效 lease，已签发 capability 在 BootSession delivery TTL 内独立工作；daemon 重启后 token 失效 |
+| 已部署配置变更 | 记录 desired/applied digest；配置变化不自动擦盘，storage/source 必须重装，目标系统 users/packages/network 等由 M7 按能力 reconcile |
+| 后续阶段默认继承 | M5-M7 和新增 adapter/version 必须继承 M4.1 的 locale/timezone/keyboard、local-only、SSH/root、普通用户/password/sudo/key、`system.packages`、防火墙、SELinux 和网络语义；bundle/script 不得静默覆盖保护域 |
 | CLI 命令形态 | 按变更频率和运行期需求与配置文件分工；复杂对象不拆成海量参数；使用成熟 CLI 解析库并支持分级 `-h/--help` |
 | CLI 默认输出 | 面向人类阅读，分组和表格化；机器消费显式使用 `--output json` |
 | 如何补充软件和配置 | RPM/DEB 走额外标准仓库；其他只支持 tar.bz2；使用强类型步骤和 provisioning bundle 编排 |
 | 后处理如何可视化 | 通过 CLI 的分阶段表格、执行计划和状态输出实现；不为此引入 Web UI、JSON Schema 或 DAG |
 
-## 19. 最小可行结论
+## 20. 最小可行结论
 
 NodeForge 的核心不是"写一个 DHCP/TFTP/HTTP 服务器"，而是把裸机从上电带到可运行系统：
 

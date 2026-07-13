@@ -53,6 +53,7 @@ pub const leases_path = state_dir ++ "/leases.json";
 /// 该文件由 HTTP 管理路由在节点状态变更时写入，使用独立的 I/O 锁避免
 /// 与 DHCP checkpoint worker 的 lease 文件锁竞争。
 pub const node_status_path = state_dir ++ "/node-status.json";
+pub const deployment_control_path = state_dir ++ "/deployment-control.json";
 pub const events_path = logs_dir ++ "/events.jsonl";
 pub const service_log_path = logs_dir ++ "/nodeforged.log";
 pub const service_path = systemd_dir ++ "/nodeforged.service";

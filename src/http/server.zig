@@ -24,6 +24,7 @@ const asset_validate = @import("../assets/validate.zig");
 const iso_import = @import("../catalog/iso_import.zig");
 const dhcp_server = @import("../dhcp/server.zig");
 const status_store = @import("../state/status_store.zig");
+const deployment_control = @import("../state/deployment_control.zig");
 const log = std.log.scoped(.http);
 
 const RouteContext = struct {
@@ -35,6 +36,9 @@ const RouteContext = struct {
     event_writer: *events.Writer,
     sessions: *boot_session.Store,
     statuses: *node_status.Store,
+    deployments: *deployment_control.Store,
+    config_revision: u64,
+    bootstrap_key: []const u8,
     daemon_instance_id: *const [boot_session.id_len]u8,
     /// M3.1 独立的 I/O 锁，用于 `node-status.json`；永远不与 DHCP checkpoint
     /// worker 的 lease 文件锁竞争。
@@ -75,6 +79,9 @@ pub fn serve(
     event_writer: *events.Writer,
     sessions: *boot_session.Store,
     statuses: *node_status.Store,
+    deployments: *deployment_control.Store,
+    config_revision: u64,
+    bootstrap_key: []const u8,
     daemon_instance_id: *const [boot_session.id_len]u8,
     status_io_mutex: *std.atomic.Mutex,
     node_status_path: []const u8,
@@ -90,6 +97,9 @@ pub fn serve(
         .event_writer = event_writer,
         .sessions = sessions,
         .statuses = statuses,
+        .deployments = deployments,
+        .config_revision = config_revision,
+        .bootstrap_key = bootstrap_key,
         .daemon_instance_id = daemon_instance_id,
         .status_io_mutex = status_io_mutex,
         .node_status_path = node_status_path,
@@ -165,16 +175,17 @@ fn route(request: zap.Request) !void {
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/healthz"))
         return json(request, .ok, "{\"ok\":true,\"service\":\"nodeforge\"}\n", meta);
-    if (std.mem.eql(u8, method, "GET")) {
+    if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD")) {
         if (nodePath(path, "/boot/config/")) |node_id| return bootConfig(request, context, node_id, meta);
         if (assetRoute(path, "/images/")) |name| return imageAsset(request, context, name, meta);
         if (assetRoute(path, "/rootfs/")) |name| return rootfsAsset(request, context, name, meta);
         if (repoRoute(path)) |repo| return repositoryAsset(request, context, repo.name, repo.tail, meta);
-        if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
+        if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/config")) return bootConfig(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/answer")) return answerFixture(request, context, node_route.node_id, .kickstart, meta);
             if (std.mem.eql(u8, node_route.suffix, "/answer/user-data")) return answerFixture(request, context, node_route.node_id, .user_data, meta);
             if (std.mem.eql(u8, node_route.suffix, "/answer/meta-data")) return answerFixture(request, context, node_route.node_id, .meta_data, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/answer/vendor-data")) return answerFixture(request, context, node_route.node_id, .vendor_data, meta);
         };
     }
     if (std.mem.eql(u8, method, "POST")) {
@@ -191,6 +202,7 @@ fn route(request: zap.Request) !void {
         config_validate.validate(context.config, &context.catalog.value) catch |err| return validationError(request, err, meta);
         return json(request, .ok, "{\"ok\":true,\"result\":{}}\n", meta);
     }
+    if (std.mem.eql(u8, method, "POST")) if (installRetryPath(path)) |node_id| return installRetry(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/server/status")) {
         const body = switch (context.runtime.service) {
             .starting => "{\"ok\":true,\"result\":{\"service\":\"starting\"}}\n",
@@ -275,7 +287,13 @@ fn repoRoute(path: []const u8) ?RepoRoute {
 
 fn imageAsset(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
     context.catalog.lock();
-    const asset = lookup.findAsset(&context.catalog.value, name);
+    // Casper accepts a network ISO only when the kernel `url=` value ends in
+    // `.iso`. Catalog asset IDs are logical names and need not have that
+    // suffix, so `/images/<asset>.iso` is a read-only alias for ISO assets.
+    const asset = lookup.findAsset(&context.catalog.value, name) orelse if (std.mem.endsWith(u8, name, ".iso") and name.len > ".iso".len)
+        lookup.findAsset(&context.catalog.value, name[0 .. name.len - ".iso".len])
+    else
+        null;
     if (asset == null or asset.?.kind != .iso) {
         context.catalog.unlock();
         return notFound(request, meta);
@@ -336,17 +354,37 @@ fn staticFile(request: zap.Request, context: *const RouteContext, root: []const 
     var file = asset_validate.openRegularFile(context.io, root, relative) catch return notFound(request, meta);
     errdefer file.close(context.io);
     const size = (try file.stat(context.io)).size;
+    // Subiquity probes APT candidates with HEAD before it runs apt-get.  A
+    // GET-only repository therefore appears unavailable even though package
+    // files can be downloaded.  Preserve the same path confinement and
+    // metadata as GET, but return no body as required by HTTP HEAD.
+    if (std.mem.eql(u8, request.method orelse "", "HEAD")) {
+        // Zap may invalidate request-owned method/path slices as soon as
+        // sendBody hands the response back to facil.io. Preserve the path so
+        // the terminal log and event never observe released request memory.
+        const request_path = try context.allocator.dupe(u8, request.path orelse "<missing>");
+        defer context.allocator.free(request_path);
+        request.setStatus(.ok);
+        try request.setHeader("accept-ranges", "bytes");
+        request.setContentTypeFromFilename(relative) catch try request.setHeader("content-type", "application/octet-stream");
+        var length: [20]u8 = undefined;
+        try request.setHeader("content-length", try std.fmt.bufPrint(&length, "{d}", .{size}));
+        try request.sendBody("");
+        file.close(context.io);
+        recordStaticCompletion("HEAD", request_path, context, relative, 200, 0, size, meta);
+        return;
+    }
     if (checksum) |hash| {
         var etag: [68]u8 = undefined;
         const value = try std.fmt.bufPrint(&etag, "\"{s}\"", .{hash});
         try request.setHeader("etag", value);
         if (request.getHeader("range")) |range_value| if (request.getHeader("if-range")) |if_range| {
-            if (!std.mem.eql(u8, if_range, value)) return sendWholeFile(request, &file, size, relative, meta);
+            if (!std.mem.eql(u8, if_range, value)) return sendWholeFile(request, context, &file, size, relative, meta);
             return sendRangedFile(request, context, &file, size, relative, range_value, meta);
         } else return sendRangedFile(request, context, &file, size, relative, range_value, meta);
     }
     if (request.getHeader("range")) |range_value| return sendRangedFile(request, context, &file, size, relative, range_value, meta);
-    return sendWholeFile(request, &file, size, relative, meta);
+    return sendWholeFile(request, context, &file, size, relative, meta);
 }
 
 const ByteRange = struct { offset: u64, length: u64 };
@@ -354,41 +392,81 @@ const ByteRange = struct { offset: u64, length: u64 };
 fn sendRangedFile(request: zap.Request, context: *const RouteContext, file: *std.Io.File, size: u64, relative: []const u8, range_value: []const u8, meta: RequestMeta) !void {
     const range = parseSingleRange(range_value, size) catch {
         file.close(context.io);
-        return rangeNotSatisfiable(request, size, meta);
+        return rangeNotSatisfiable(request, context, size, relative, meta);
     };
     request.setStatusNumeric(206);
     var content_range: [96]u8 = undefined;
     const value = try std.fmt.bufPrint(&content_range, "bytes {d}-{d}/{d}", .{ range.offset, range.offset + range.length - 1, size });
     try request.setHeader("content-range", value);
-    try sendManagedFile(request, file, range, size, relative, meta);
+    try sendManagedFile(request, context, file, range, size, relative, 206, meta);
 }
 
-fn sendWholeFile(request: zap.Request, file: *std.Io.File, size: u64, relative: []const u8, meta: RequestMeta) !void {
-    try sendManagedFile(request, file, .{ .offset = 0, .length = size }, size, relative, meta);
+fn sendWholeFile(request: zap.Request, context: *const RouteContext, file: *std.Io.File, size: u64, relative: []const u8, meta: RequestMeta) !void {
+    try sendManagedFile(request, context, file, .{ .offset = 0, .length = size }, size, relative, 200, meta);
 }
 
-fn sendManagedFile(request: zap.Request, file: *std.Io.File, range: ByteRange, total_size: u64, relative: []const u8, meta: RequestMeta) !void {
+fn sendManagedFile(request: zap.Request, context: *const RouteContext, file: *std.Io.File, range: ByteRange, total_size: u64, relative: []const u8, status: u16, meta: RequestMeta) !void {
+    // `http_sendfile` can release request-owned method/path storage before it
+    // returns. Preserve the path for the synchronous audit event below, just
+    // as the sendBody-backed HEAD and 416 branches do.
+    const request_path = try context.allocator.dupe(u8, request.path orelse "<missing>");
+    defer context.allocator.free(request_path);
     try request.setHeader("accept-ranges", "bytes");
     request.setContentTypeFromFilename(relative) catch try request.setHeader("content-type", "application/octet-stream");
     // M3.6 下载日志：info 记录每个 HTTP 下载请求的对象、范围、字节数和客户端 IP。
     log.info("HTTP download request GET {s} (range={d}+{d}/{d}, client={s})", .{ relative, range.offset, range.length, total_size, meta.client_ip });
     const result = zap.fio.http_sendfile(request.h, file.handle, @intCast(range.length), @intCast(range.offset));
     if (result != 0) return error.SendFile;
-    request.markAsFinished(true);
     // M3.6 下载日志：facil.io 拥有异步 sendfile 完成回调。我们有意将其标记为
     // queued progress 而非声称是 peer ACK progress；每个 HTTP Range 请求
     // 仍被记录为一个精确的 chunk。
     log.debug("HTTP download queued {s}: {d}/{d} bytes (range {d}+{d})", .{ relative, range.offset + range.length, total_size, range.offset, range.length });
-    log.info("GET static -> {d} (asset={s}, bytes={d}, client={s})", .{ request.h.*.status, relative, range.length, meta.client_ip });
+    // `request.h.*.status` is not authoritative here: facil.io can retain its
+    // default value until the asynchronous sendfile response is committed.
+    // The caller owns the HTTP decision (200 whole file or 206 range), so pass
+    // that value explicitly to keep terminal logs and events accurate.
+    recordStaticCompletion("GET", request_path, context, relative, status, range.length, total_size, meta);
+    request.markAsFinished(true);
 }
 
-fn rangeNotSatisfiable(request: zap.Request, size: u64, meta: RequestMeta) !void {
+fn rangeNotSatisfiable(request: zap.Request, context: *const RouteContext, size: u64, relative: []const u8, meta: RequestMeta) !void {
+    const request_path = try context.allocator.dupe(u8, request.path orelse "<missing>");
+    defer context.allocator.free(request_path);
     request.setStatusNumeric(416);
     var content_range: [64]u8 = undefined;
     try request.setHeader("content-range", try std.fmt.bufPrint(&content_range, "bytes */{d}", .{size}));
     try request.setHeader("accept-ranges", "bytes");
     try request.sendBody("");
-    log.info("GET static -> 416 (client={s})", .{meta.client_ip});
+    recordStaticCompletion("GET", request_path, context, relative, 416, 0, size, meta);
+}
+
+/// Record the terminal state of every static HTTP response, including HEAD
+/// probes. For sendfile-backed GET responses this means the response was
+/// successfully queued to facil.io; it is not a claim that the peer ACKed all
+/// bytes. The explicit `response_state` field preserves that distinction.
+fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const RouteContext, relative: []const u8, status: u16, bytes_sent: u64, object_size: u64, meta: RequestMeta) void {
+    const duration_us = meta.started.durationTo(std.Io.Clock.awake.now(meta.io)).toMicroseconds();
+    const response_state = if (std.mem.eql(u8, method, "GET") and status >= 200 and status < 300) "queued" else "completed";
+    log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, asset={s}, object_bytes={d}, response_state={s})", .{
+        method, path, status, bytes_sent, duration_us, meta.client_ip, relative, object_size, response_state,
+    });
+
+    var status_text: [4]u8 = undefined;
+    var bytes_text: [20]u8 = undefined;
+    var object_bytes_text: [20]u8 = undefined;
+    var duration_text: [20]u8 = undefined;
+    const fields = [_]events.Field{
+        .{ .key = "method", .value = method },
+        .{ .key = "path", .value = path },
+        .{ .key = "status", .value = std.fmt.bufPrint(&status_text, "{d}", .{status}) catch "0" },
+        .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{bytes_sent}) catch "0" },
+        .{ .key = "object_bytes", .value = std.fmt.bufPrint(&object_bytes_text, "{d}", .{object_size}) catch "0" },
+        .{ .key = "client_ip", .value = meta.client_ip },
+        .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
+        .{ .key = "response_state", .value = response_state },
+    };
+    context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "http.request", "HTTP request completed", &fields) catch |err|
+        observe_log.err("http: event append failed: {t}", .{err});
 }
 
 fn parseSingleRange(value: []const u8, size: u64) !ByteRange {
@@ -491,7 +569,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
 /// user-data/meta-data (Ubuntu) to authenticated install-mode nodes.
 /// Bootstrap proof (peer IP match) is accepted on the first fetch and
 /// upgraded to a capability token; subsequent requests use capability proof.
-const AnswerFormat = enum { kickstart, user_data, meta_data };
+const AnswerFormat = enum { kickstart, user_data, meta_data, vendor_data };
 fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []const u8, format: AnswerFormat, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
@@ -504,18 +582,38 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     defer context.allocator.free(event_url);
     const node = lookup.findNode(context.config, node_id) orelse return notFound(request, meta);
     const profile = lookup.findProfile(context.config, session.profile) orelse return notFound(request, meta);
-    const install = profile.install orelse model.InstallConfig{};
+    const install = profile.install orelse return error.MissingInstallConfig;
+    const system = try @import("../profile/install.zig").effectiveSystem(profile);
     const bundle = if (install.bundle) |name| findProvisioningBundle(context.config, name) else null;
+    var password_scope_buffer: [128]u8 = undefined;
+    const password_scope = try std.fmt.bufPrint(&password_scope_buffer, "{s}:{s}:{d}", .{ context.daemon_instance_id.*[0..], session.boot_session_id[0..], context.config_revision });
+    // APT 源 URL 解析：Ubuntu ISO 导入时始终创建 repository 条目
+    //（即使 ISO 不含完整 APT metadata），因此 findRepository 应总能找到。
+    // 保留 fallback 逻辑以兼容手动配置场景：当 repository 不存在时，
+    // 构造 /repos/<source_name>/ URL，使 apt 请求快速 404 而非 DNS 超时。
+    const apt_primary_url = if (format == .user_data) blk: {
+        context.catalog.lock();
+        defer context.catalog.unlock();
+        const source = lookup.findInstallSource(&context.catalog.value, profile.install_source orelse break :blk null) orelse break :blk null;
+        if (std.mem.eql(u8, source.distro, "ubuntu")) {
+            // Ubuntu: 优先使用 repository.base_url；若不存在则构造 fallback URL
+            const repository = lookup.findRepository(&context.catalog.value, source.name);
+            if (repository) |repo| if (repo.manager == .apt) break :blk repo.base_url;
+            break :blk try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/repos/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
+        }
+        break :blk null;
+    } else null;
     const body = switch (format) {
         .meta_data => try @import("../profile/adapter/ubuntu.zig").renderMetaData(context.allocator, node),
-        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserData(context.allocator, node, install, bundle, event_url, session.boot_session_id[0..], session.capability[0..]),
+        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserDataM41(context.allocator, node, install, system, context.bootstrap_key, bundle, apt_primary_url, event_url, session.boot_session_id[0..], session.capability[0..], password_scope),
+        .vendor_data => try context.allocator.dupe(u8, ""),
         .kickstart => blk: {
             context.catalog.lock();
             defer context.catalog.unlock();
             const source = lookup.findInstallSource(&context.catalog.value, profile.install_source orelse return notFound(request, meta)) orelse return notFound(request, meta);
             const install_root = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/repos/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
             defer context.allocator.free(install_root);
-            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswer(context.allocator, node, install, install_root, bundle, event_url, session.boot_session_id[0..], session.capability[0..]);
+            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, event_url, session.boot_session_id[0..], session.capability[0..], password_scope);
         },
     };
     defer context.allocator.free(body);
@@ -565,7 +663,26 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
     @import("contracts.zig").validateNodeEvent(event.value) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_event\",\"message\":\"invalid node event\"}}\n", meta);
     if (!std.mem.eql(u8, event.value.boot_session_id, checked.session.boot_session_id[0..])) return nodeAuthError(request, error.ProofMismatch, meta);
     const mapped = mapStage(checked.session.mode, event.value.stage) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"stage_invalid\",\"message\":\"stage not allowed for profile mode\"}}\n", meta);
-    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, mapped.phase, event.value.reason, unixNow(), true) catch |err|
+    const terminal = std.mem.eql(u8, event.value.stage, "completed") or std.mem.eql(u8, event.value.stage, "failed");
+    // A generation is consumed only when the installer itself reports it has
+    // started, never when DHCP, TFTP, or answer delivery merely succeeds.
+    if (checked.session.mode == .install and std.mem.eql(u8, event.value.stage, "started")) {
+        const consumed = context.deployments.consume(node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot consume install generation\"}}\n", meta);
+        deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
+            if (consumed) |result| context.deployments.rollbackConsume(node_id, result);
+            observe_log.err("deployment-control save failed: {t}", .{err});
+            return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist install generation\"}}\n", meta);
+        };
+    }
+    if (checked.session.mode == .install and terminal) {
+        const terminal_result = context.deployments.markTerminal(node_id, std.mem.eql(u8, event.value.stage, "completed"));
+        deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
+            if (terminal_result) |result| context.deployments.rollbackTerminal(node_id, result);
+            observe_log.err("deployment-control applied revision save failed: {t}", .{err});
+            return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
+        };
+    }
+    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, mapped.phase, event.value.reason, unixNow(), !terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [4]events.Field = .{
@@ -579,7 +696,12 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
         observe_log.err("node event append failed: {t}", .{err});
         return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"events.unavailable\",\"message\":\"event writer unavailable\"}}\n", meta);
     };
-    context.sessions.touchDelivery(checked.session.boot_session_id[0..], boot_session.monotonicNow(), unixNow());
+    if (terminal) {
+        context.sessions.finishDelivery(checked.session.boot_session_id[0..], if (std.mem.eql(u8, event.value.stage, "completed")) .completed else .failed, boot_session.monotonicNow(), unixNow());
+    } else {
+        const phase: boot_session.Phase = if (std.mem.eql(u8, event.value.stage, "installer_started")) .installer_started else .installing;
+        context.sessions.advanceDelivery(checked.session.boot_session_id[0..], phase, boot_session.monotonicNow(), unixNow());
+    }
     return json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
@@ -596,7 +718,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
         .diskless => "diskless.failed",
         .discovery => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"stage_invalid\",\"message\":\"logs unavailable for discovery\"}}\n", meta),
     };
-    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, .failed, summary.value.reason, unixNow(), true) catch |err|
+    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, .failed, summary.value.reason, unixNow(), false) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     const fields = [_]events.Field{ .{ .key = "node_id", .value = node_id }, .{ .key = "boot_session_id", .value = checked.session.boot_session_id[0..] }, .{ .key = "reason", .value = summary.value.reason } };
@@ -604,6 +726,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
         observe_log.err("node log append failed: {t}", .{err});
         return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"events.unavailable\",\"message\":\"event writer unavailable\"}}\n", meta);
     };
+    context.sessions.finishDelivery(checked.session.boot_session_id[0..], .failed, boot_session.monotonicNow(), unixNow());
     return json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
@@ -804,6 +927,11 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
         return assetInputError(request, @errorName(err), meta);
     };
     context.catalog.publishInstallSource(context.io, context.config, imported) catch |err| {
+        // importMedia has already copied immutable files into managed roots.
+        // A rejected candidate must not accumulate inaccessible public-root
+        // orphans (for example, when the media tuple is not declared in the
+        // operator's configured distro matrix).
+        iso_import.cleanupPublishedOutputs(context.io, context.allocator, context.config, &imported);
         observe_log.err("ISO catalog publication failed: {t}", .{err});
         return assetInputError(request, @errorName(err), meta);
     };
@@ -842,6 +970,43 @@ fn managementNodePath(path: []const u8) ?[]const u8 {
     return if (auth.nodeIdSafe(node_id)) node_id else null;
 }
 
+fn installRetryPath(path: []const u8) ?[]const u8 {
+    const prefix = "/api/v1/management/nodes/";
+    const suffix = "/install/retry";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const node_id = path[prefix.len .. path.len - suffix.len];
+    return if (auth.nodeIdSafe(node_id)) node_id else null;
+}
+
+fn installRetry(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const node = lookup.findNode(context.config, node_id) orelse return notFound(request, meta);
+    const profile = lookup.findProfile(context.config, node.profile) orelse return notFound(request, meta);
+    if (profile.mode != .install) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.not_profile\",\"message\":\"node does not have an install profile\"}}\n", meta);
+    if (context.sessions.hasActiveNode(node_id, boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.session_active\",\"message\":\"active install session cannot be rearmed\"}}\n", meta);
+    const requested_at = unixNow();
+    const rearm = context.deployments.rearm(node_id, context.config_revision, requested_at, .operator) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot rearm install generation\"}}\n", meta);
+    if (rearm.changed) {
+        deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch {
+            context.deployments.rollbackRearm(node_id, rearm);
+            return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist install generation\"}}\n", meta);
+        };
+        var generation_text: [24]u8 = undefined;
+        var revision_text: [24]u8 = undefined;
+        var requested_at_text: [24]u8 = undefined;
+        const fields = [_]events.Field{
+            .{ .key = "node_id", .value = node_id },
+            .{ .key = "generation", .value = std.fmt.bufPrint(&generation_text, "{d}", .{rearm.generation}) catch "0" },
+            .{ .key = "config_revision", .value = std.fmt.bufPrint(&revision_text, "{d}", .{context.config_revision}) catch "0" },
+            .{ .key = "requested_at", .value = std.fmt.bufPrint(&requested_at_text, "{d}", .{requested_at}) catch "0" },
+            .{ .key = "requested_by", .value = "operator" },
+            .{ .key = "replaced_stale_revision", .value = if (rearm.replaced) "true" else "false" },
+        };
+        context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "install.retry.requested", "install generation rearmed", &fields) catch |err| observe_log.err("retry event append failed: {t}", .{err});
+    }
+    var body: [160]u8 = undefined;
+    return json(request, .ok, try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"generation\":{d},\"message\":\"rearmed; waiting for next PXE\"}}}}\n", .{ std.json.fmt(node_id, .{}), rearm.generation }), meta);
+}
+
 /// 暴露有界的 M3 状态投影，不读取事件流。
 fn runtimeSummary(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     var statuses: [node_status.max_statuses]node_status.Status = undefined;
@@ -865,12 +1030,27 @@ fn runtimeSummary(request: zap.Request, context: *const RouteContext, meta: Requ
 
 fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const status = context.statuses.get(node_id) orelse return notFound(request, meta);
-    var output: [512]u8 = undefined;
-    const body = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"id\":{f},\"boot_session_id\":{f},\"phase\":{f},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}}}}}\n", .{
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"id\":{f},\"boot_session_id\":{f},\"phase\":{f},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}", .{
         std.json.fmt(status.node(), .{}),           std.json.fmt(status.boot_session_id[0..], .{}), std.json.fmt(@tagName(status.phase), .{}),      status.last_event_at,
         if (status.last_error) "true" else "false", std.json.fmt(status.reasonSlice(), .{}),        if (status.session_active) "true" else "false",
     });
-    try json(request, .ok, body, meta);
+    if (context.deployments.view(node_id)) |deployment| {
+        try output.writer.print(",\"deployment\":{{\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"drifted\":{s},\"requested_at\":{d},\"requested_by\":{f}}}", .{
+            std.json.fmt(deployment.armed_generation, .{}),
+            std.json.fmt(deployment.consumed_generation, .{}),
+            std.json.fmt(deployment.terminal_generation, .{}),
+            deployment.requested_revision,
+            deployment.applied_revision,
+            context.config_revision,
+            if (deployment.applied_revision != 0 and deployment.applied_revision != context.config_revision) "true" else "false",
+            deployment.requested_at,
+            std.json.fmt(@tagName(deployment.requested_by), .{}),
+        });
+    }
+    try output.writer.writeAll("}}\n");
+    try json(request, .ok, output.written(), meta);
 }
 
 /// 渲染 M1 TFTP 会话计数；读取使用原子 load，不阻塞 UDP transfer worker。

@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const model = @import("../model.zig");
+const lookup = @import("../catalog.zig");
 const catalog_runtime = @import("../state/catalog_runtime.zig");
 const packet = @import("packet.zig");
 const runtime_state = @import("../state/runtime.zig");
@@ -239,12 +240,16 @@ fn transferVirtualConfig(
         // 渲染结果写入栈缓冲区，在 TFTP I/O 开始前就已完成自包含，
         // 因此慢速客户端不会长时间持有 catalog mutex。
         const target = boot_target.resolve(identity, config, &catalog.value, config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
+        const node = lookup.findNode(config, identity.node_id) orelse return error.BootTargetUnavailable;
         // 为路径补充前导 `/` 以符合 GRUB 语法（GRUB 路径以 `/` 开头）。
         // 此操作在 catalog 锁内完成，确保路径切片引用的 catalog 数据有效。
         const kernel_path = std.fmt.bufPrint(&kernel_grub, "/{s}", .{target.kernel_path}) catch return error.BootTargetUnavailable;
         const initrd_path = std.fmt.bufPrint(&initrd_grub, "/{s}", .{target.initrd_path}) catch return error.BootTargetUnavailable;
         break :blk grub.render(&config_buf, .{
             .node_id = identity.node_id,
+            .hostname = node.hostname orelse node.id,
+            .lease_ip = identity.lease_ip,
+            .profile = identity.profile,
             .kernel_path = kernel_path,
             .initrd_path = initrd_path,
             .cmdline = target.cmdline,

@@ -7,6 +7,7 @@ const std = @import("std");
 const model = @import("../model.zig");
 const lookup = @import("../catalog.zig");
 const asset_validate = @import("../assets/validate.zig");
+const profile_install = @import("../profile/install.zig");
 
 /// 配置校验错误码。
 /// 所有错误均为编译期已知集合，不包含动态字符串——
@@ -60,6 +61,19 @@ pub const ValidationError = error{
     UnsupportedFirmwareBootOrder,
     MissingProvisioningBundle,
     InvalidProvisioningStep,
+    InvalidLocale,
+    InvalidTimezone,
+    InvalidKeyboard,
+    InvalidRootLoginPolicy,
+    InstallAccessUnavailable,
+    InvalidTargetNetwork,
+    StaticAddressMismatch,
+    DuplicateStaticAddress,
+    InstallServerUnreachable,
+    InstallPackageUnavailable,
+    InstallIdentityUnavailable,
+    ExternalEndpointForbidden,
+    InvalidReinstallPolicy,
 };
 
 /// 完整校验启动配置和 catalog 的引用关系。
@@ -89,6 +103,7 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     }
     _ = std.Io.net.IpAddress.parseIp4(config.server.server_ip, 0) catch
         return error.InvalidServerIpv4;
+    if (config.server.ssh_authorized_public_key) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
     if (config.server.http_port == 0) return error.InvalidHttpPort;
     if (config.http.asset_root.len == 0 or config.http.repository_root.len == 0)
         return error.EmptyAssetRoot;
@@ -196,6 +211,7 @@ fn validateRepositories(config: *const model.AppConfig, catalog: *const model.Ca
         if (repository.manager != version.package_manager)
             return error.RepositoryManagerMismatch;
         if (repository.base_url.len == 0) return error.MissingRepository;
+        if (!managedRepositoryUrl(config, repository.base_url)) return error.ExternalEndpointForbidden;
         if (repository.gpg_check) {
             const key_name = repository.gpg_key orelse return error.MissingGpgKey;
             const key = lookup.findAsset(catalog, key_name) orelse return error.MissingGpgKey;
@@ -265,7 +281,12 @@ fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalo
                 if (profile.boot_bundle != null or !sameTuple(profile.distro, profile.version, profile.arch, source.distro, source.version, source.arch))
                     return error.InvalidProfileSource;
                 if (!profile.safety.destructive or !profile.safety.persistent_writes) return error.InvalidProfileSafety;
-                if (profile.install) |install| try validateInstallConfig(config, install);
+                const system = profile_install.effectiveSystem(&profile) catch return error.InstallIdentityUnavailable;
+                if (profile.install) |install| try validateInstallConfig(config, system, install) else return error.InvalidProfileSource;
+                try validateTargetSystem(system);
+                // `always` remains deliberately high-risk but is valid only
+                // for the already-required destructive persistent profile.
+                if (profile.safety.reinstall_policy == .always and (!profile.safety.destructive or !profile.safety.persistent_writes)) return error.InvalidReinstallPolicy;
             },
             .diskless => {
                 const name = profile.boot_bundle orelse return error.MissingBootBundle;
@@ -278,12 +299,27 @@ fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalo
     }
 }
 
-fn validateInstallConfig(config: *const model.AppConfig, install: model.InstallConfig) ValidationError!void {
+fn validateTargetSystem(system: model.TargetSystemConfig) ValidationError!void {
+    if (!validLocale(system.localization.locale)) return error.InvalidLocale;
+    if (!validTimezone(system.localization.timezone)) return error.InvalidTimezone;
+    if (!validIdentifier(system.localization.keyboard)) return error.InvalidKeyboard;
+    if (system.connectivity.time_sync and system.connectivity.ntp_servers.len == 0) return error.InvalidTargetNetwork;
+    for (system.connectivity.ntp_servers) |server| if (!validNetworkName(server)) return error.InvalidTargetNetwork;
+    if (system.ssh.root_login == .yes and system.ssh.root_password == null and system.ssh.root_authorized_keys.len == 0 and system.users.len == 0) return error.InstallAccessUnavailable;
+    for (system.users, 0..) |user, i| {
+        if (!validUser(user.name) or std.mem.eql(u8, user.name, "root")) return error.InstallAccessUnavailable;
+        for (system.users[i + 1 ..]) |other| if (std.mem.eql(u8, user.name, other.name)) return error.InstallAccessUnavailable;
+        for (user.ssh_authorized_keys) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
+    }
+    for (system.ssh.root_authorized_keys) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
+}
+
+fn validateInstallConfig(config: *const model.AppConfig, system: model.TargetSystemConfig, install: model.InstallConfig) ValidationError!void {
     const storage = install.storage;
     if (storage.boot_disk.len == 0 or storage.install_disks.len == 0) return error.InvalidInstallStorage;
     var disk_found = false;
     for (storage.install_disks) |disk| {
-        if (disk.len == 0 or !std.mem.startsWith(u8, disk, "/dev/")) return error.InvalidInstallStorage;
+        if (!validDevicePath(disk)) return error.InvalidInstallStorage;
         if (std.mem.eql(u8, disk, storage.boot_disk)) disk_found = true;
     }
     if (!disk_found) return error.InvalidInstallStorage;
@@ -291,21 +327,28 @@ fn validateInstallConfig(config: *const model.AppConfig, install: model.InstallC
     if (install.bootloader.set_firmware_boot_order) return error.UnsupportedFirmwareBootOrder;
     var esp = false;
     var biosboot = false;
+    var root_count: usize = 0;
     for (storage.partitions) |part| {
         if (part.size_mib == 0) return error.InvalidInstallStorage;
+        if (part.filesystem) |fs| if (!validIdentifier(fs)) return error.InvalidInstallStorage;
+        if (part.mount) |mount| if (!validMountPath(mount)) return error.InvalidInstallStorage;
         if (part.kind == .esp and part.mount != null and std.mem.eql(u8, part.mount.?, "/boot/efi")) esp = true;
         if (part.kind == .biosboot) biosboot = true;
+        if (part.kind == .root) root_count += 1;
     }
     // Empty partitions request adapter defaults; explicit layouts must include
     // the firmware-required partition.
     if (storage.partitions.len != 0 and storage.boot_mode == .uefi and !esp) return error.InvalidInstallStorage;
     if (storage.partitions.len != 0 and storage.boot_mode == .bios and storage.partition_table == .gpt and !biosboot) return error.InvalidInstallStorage;
+    if (storage.partitions.len != 0 and root_count != 1) return error.InvalidInstallStorage;
+    try validatePackages(system.packages);
     if (install.bundle) |name| {
         var found = false;
         for (config.provisioning_bundles) |bundle| {
             if (std.mem.eql(u8, bundle.name, name)) found = true;
         }
         if (!found) return error.MissingProvisioningBundle;
+        for (config.provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) for (bundle.steps) |step| if (step.action == .standard_packages) for (step.packages) |package| for (system.packages) |requested| if (std.mem.eql(u8, package, requested)) return error.InstallPackageUnavailable;
     }
 }
 
@@ -325,11 +368,101 @@ fn validateNodes(config: *const model.AppConfig) ValidationError!void {
             const parsed_ip = std.Io.net.IpAddress.parseIp4(ip, 0) catch return error.InvalidNodeIpv4;
             if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed_ip))) return error.NodeOutsideDhcpSubnet;
         }
+        if (node.overrides.network) |network| try validateTargetNetwork(config, node, network);
         for (config.nodes[i + 1 ..]) |other| {
             if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
             if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
+            if (node.overrides.network) |network| if (network.address) |address| if (other.overrides.network) |other_network| if (other_network.address) |other_address| if (std.mem.eql(u8, address, other_address)) return error.DuplicateStaticAddress;
         }
     }
+}
+
+fn validateTargetNetwork(config: *const model.AppConfig, node: model.NodeConfig, network: model.TargetNetworkConfig) ValidationError!void {
+    if (network.interface) |name| if (!validIdentifier(name)) return error.InvalidTargetNetwork;
+    for (network.search_domains) |domain| if (!validNetworkName(domain)) return error.InvalidTargetNetwork;
+    if (network.mode == .dhcp) return;
+    const address = network.address orelse return error.InvalidTargetNetwork;
+    const prefix = network.prefix_len orelse return error.InvalidTargetNetwork;
+    if (prefix == 0 or prefix > 32) return error.InvalidTargetNetwork;
+    const node_ip = node.ip orelse return error.StaticAddressMismatch;
+    if (!std.mem.eql(u8, node_ip, address)) return error.StaticAddressMismatch;
+    if (network.match_mac) |mac| if (!std.ascii.eqlIgnoreCase(mac, node.mac)) return error.InvalidTargetNetwork;
+    const parsed = std.Io.net.IpAddress.parseIp4(address, 0) catch return error.InvalidTargetNetwork;
+    if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed))) return error.NodeOutsideDhcpSubnet;
+    if (network.gateway) |gateway| _ = std.Io.net.IpAddress.parseIp4(gateway, 0) catch return error.InvalidTargetNetwork;
+    for (network.dns) |dns| _ = std.Io.net.IpAddress.parseIp4(dns, 0) catch return error.InvalidTargetNetwork;
+}
+
+fn managedRepositoryUrl(config: *const model.AppConfig, value: []const u8) bool {
+    var prefix_buffer: [160]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&prefix_buffer, "http://{s}:{d}/repos/", .{ config.server.server_ip, config.server.http_port }) catch return false;
+    if (!std.mem.startsWith(u8, value, prefix) or value.len == prefix.len) return false;
+    const path = value[prefix.len..];
+    if (std.mem.indexOfAny(u8, path, "?#%\\\r\n") != null) return false;
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+        for (segment) |byte| if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~')) return false;
+    }
+    return true;
+}
+
+fn validNetworkName(value: []const u8) bool {
+    if (value.len == 0 or value.len > 253 or value[0] == '.' or value[value.len - 1] == '.') return false;
+    for (value) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '.')) return false;
+    return true;
+}
+
+fn validIdentifier(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return false;
+    return true;
+}
+fn validPackage(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.' or c == '+' or c == ':')) return false;
+    return true;
+}
+fn validatePackages(packages: []const []const u8) ValidationError!void {
+    for (packages, 0..) |package, i| {
+        if (!validPackage(package)) return error.InstallPackageUnavailable;
+        for (packages[i + 1 ..]) |other| if (std.mem.eql(u8, package, other)) return error.InstallPackageUnavailable;
+    }
+}
+fn validDevicePath(value: []const u8) bool {
+    return std.mem.startsWith(u8, value, "/dev/") and value.len > 5 and validIdentifier(value[5..]);
+}
+fn validMountPath(value: []const u8) bool {
+    if (value.len == 0 or value[0] != '/' or std.mem.indexOf(u8, value, "..") != null) return false;
+    for (value) |c| if (!(std.ascii.isAlphanumeric(c) or c == '/' or c == '_' or c == '-' or c == '.')) return false;
+    return true;
+}
+fn validLocale(value: []const u8) bool {
+    return std.mem.eql(u8, value, "C") or std.mem.eql(u8, value, "C.UTF-8") or validIdentifier(value) or (value.len != 0 and std.mem.indexOfScalar(u8, value, '@') != null);
+}
+fn validTimezone(value: []const u8) bool {
+    if (std.mem.eql(u8, value, "UTC")) return true;
+    if (value.len == 0 or value[0] == '/') return false;
+    var parts = std.mem.splitScalar(u8, value, '/');
+    while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or !validIdentifier(part)) return false;
+    return true;
+}
+fn validUser(value: []const u8) bool {
+    if (value.len == 0 or value.len > 32 or !std.ascii.isLower(value[0])) return false;
+    for (value) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-' or c == '_')) return false;
+    return true;
+}
+fn validSshKey(value: []const u8) bool {
+    if (value.len <= 32 or value.len >= 16384 or std.mem.indexOfScalar(u8, value, '\n') != null) return false;
+    const first_space = std.mem.indexOfScalar(u8, value, ' ') orelse return false;
+    const kind = value[0..first_space];
+    if (!(std.mem.eql(u8, kind, "ssh-ed25519") or std.mem.eql(u8, kind, "ssh-rsa") or std.mem.startsWith(u8, kind, "ecdsa-sha2-"))) return false;
+    const tail = value[first_space + 1 ..];
+    const body_end = std.mem.indexOfScalar(u8, tail, ' ') orelse tail.len;
+    const body = tail[0..body_end];
+    if (body.len == 0) return false;
+    const decoded_len = std.base64.standard_no_pad.Decoder.calcSizeForSlice(body) catch return false;
+    return decoded_len >= 16;
 }
 
 fn inDhcpSubnet(cidr: []const u8, ip: u32) bool {
@@ -406,6 +539,49 @@ test "最小配置和空 catalog 有效" {
     const config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
     const cat: model.Catalog = .{};
     try validate(&config, &cat);
+}
+
+test "M4.1 default UTC timezone is accepted" {
+    try std.testing.expect(validTimezone("UTC"));
+    try std.testing.expect(validTimezone("Asia/Shanghai"));
+    try std.testing.expect(!validTimezone("/UTC"));
+}
+
+test "M4.1 repositories must use the managed local HTTP namespace" {
+    const config: model.AppConfig = .{ .server = .{
+        .bind_interface = "pxe0",
+        .server_ip = "192.168.50.1",
+        .http_port = 8080,
+    } };
+    try std.testing.expect(managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/ubuntu-22.04"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "https://archive.ubuntu.com/ubuntu"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/local?mirror=external"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/../images/private"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/%2e%2e/images/private"));
+
+    const catalog: model.Catalog = .{
+        .repositories = &.{.{
+            .name = "external",
+            .distro = "ubuntu",
+            .version = "22.04",
+            .arch = .aarch64,
+            .manager = .apt,
+            .base_url = "https://archive.ubuntu.com/ubuntu",
+        }},
+    };
+    var full_config = config;
+    full_config.distros = &.{.{
+        .name = "ubuntu",
+        .family = .ubuntu,
+        .versions = &.{.{
+            .version = "22.04",
+            .archs = &.{.aarch64},
+            .install_adapter = .autoinstall,
+            .package_manager = .apt,
+        }},
+    }};
+    try std.testing.expectError(error.ExternalEndpointForbidden, validateCatalog(&full_config, &catalog));
 }
 
 test "DHCP requires an explicit PXE interface" {

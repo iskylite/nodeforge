@@ -44,14 +44,15 @@ pub fn validateLogSummary(value: LogSummary) !void {
     if (!safeToken(value.reason, max_reason_bytes) or !safeSingleLine(value.summary, max_log_summary_bytes)) return error.InvalidLogSummary;
 }
 
-/// A stable machine reason contains no spaces or control characters.  It is
-/// intentionally stricter than a display label so it can safely enter Event v2.
+/// 稳定的机器可读原因字符串，不含空格和控制字符。
+/// 比显示标签更严格，使其能安全进入 Event v2。
 pub fn safeToken(value: []const u8, maximum: usize) bool {
     if (value.len == 0 or value.len > maximum) return false;
     for (value) |byte| if (!((byte >= 'a' and byte <= 'z') or (byte >= '0' and byte <= '9') or byte == '.' or byte == '_' or byte == '-')) return false;
     return true;
 }
 
+/// 单行安全字符串，不含控制字符。允许空格但拒绝换行符等控制字符。
 pub fn safeSingleLine(value: []const u8, maximum: usize) bool {
     if (value.len == 0 or value.len > maximum) return false;
     for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;

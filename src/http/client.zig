@@ -84,6 +84,14 @@ pub fn validateActiveConfig(io: std.Io, port: u16) Status {
     );
 }
 
+/// Explicitly rearms one install generation through the localhost-only API.
+pub fn installRetry(io: std.Io, port: u16, node_id: []const u8) Status {
+    if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
+    var path: [256]u8 = undefined;
+    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/install/retry", .{node_id}) catch return .{ .reachable = false, .healthy = false };
+    return probeAt(io, management.client_ip, port, value, "POST");
+}
+
 /// 探测 M1 TFTP 运行态路由。仅由本机 daemon 提供，不接受远程地址。
 pub fn tftpStatus(io: std.Io, port: u16) Status {
     return probeAt(io, management.client_ip, port, "/api/v1/management/tftp/status", "GET");

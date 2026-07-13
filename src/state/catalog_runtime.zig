@@ -13,23 +13,22 @@ pub const CatalogRuntime = struct {
     allocator: std.mem.Allocator,
     path: []const u8,
     value: model.Catalog,
-    // This protects catalog publication while the UDP and HTTP workers read it.
-    // `atomic.Mutex` is synchronous and therefore does not couple catalog reads to
-    // the daemon's particular `std.Io` backend.
+    // 此锁保护 catalog 发布，同时 UDP 和 HTTP worker 读取它。
+    // `atomic.Mutex` 是同步的，因此不会将 catalog 读取耦合到
+    // daemon 的特定 `std.Io` 后端。
     mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8, initial: *const model.Catalog) CatalogRuntime {
         return .{ .allocator = allocator, .path = path, .value = initial.* };
     }
 
-    /// Acquires the short catalog publication lock.  Catalog operations only copy
-    /// metadata and atomically replace a small JSON file, so a yield-based spin
-    /// lock keeps the synchronous HTTP/UDP interfaces independent of an Io loop.
+    /// 获取短期 catalog 发布锁。catalog 操作只复制元数据并原子替换小型 JSON 文件，
+    /// 因此基于 yield 的自旋锁使同步 HTTP/UDP 接口独立于 Io 循环。
     pub fn lock(self: *CatalogRuntime) void {
         while (!self.mutex.tryLock()) std.Thread.yield() catch {};
     }
 
-    /// Releases the catalog publication lock acquired by `lock`.
+    /// 释放由 `lock` 获取的 catalog 发布锁。
     pub fn unlock(self: *CatalogRuntime) void {
         self.mutex.unlock();
     }
@@ -59,9 +58,8 @@ pub const CatalogRuntime = struct {
         self.value = candidate;
     }
 
-    /// Publishes the related ISO, installer assets, optional repository and install
-    /// source in one catalog replacement. Files may already exist in distinct
-    /// managed roots, but nothing can resolve them until this method succeeds.
+    /// 在一次 catalog 替换中发布关联的 ISO、安装器资产、可选仓库和安装入口。
+    /// 文件可能已存在于不同的受管根中，但在本方法成功之前没有任何东西能解析它们。
     pub fn publishInstallSource(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, imported: iso_import.Result) !void {
         self.lock();
         defer self.unlock();

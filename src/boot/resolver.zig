@@ -11,6 +11,7 @@
 
 const model = @import("../model.zig");
 const packet = @import("../dhcp/packet.zig");
+const deployment_control = @import("../state/deployment_control.zig");
 
 /// DHCP 唯一的 PXE 决策结果。
 ///
@@ -30,6 +31,9 @@ pub const Decision = struct {
     profile: ?[]const u8 = null,
     /// profile 的启动模式（install/diskless/discovery），用于 boot session 创建。
     mode: ?model.ProfileMode = null,
+    /// An install profile was intentionally held at the PXE gate because it
+    /// has no pending generation (or its request was made for an older plan).
+    install_not_armed: bool = false,
 };
 
 /// 按已注册 MAC 或 unknown-client policy 解析启动行为和可审计的配置身份。
@@ -63,6 +67,36 @@ pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Arc
         .discovery => .{ .bootfile = bootfile(arch), .known = false, .node_id = null, .profile = profile, .mode = if (profile) |name| profileMode(config, name) else .discovery },
         .diskless => if (config.policy.allow_unknown_diskless) .{ .bootfile = bootfile(arch), .known = false, .node_id = null, .profile = profile, .mode = if (profile) |name| profileMode(config, name) else .diskless } else .{ .bootfile = null, .known = false, .node_id = null, .profile = profile, .mode = if (profile) |name| profileMode(config, name) else null },
     };
+}
+
+/// M4.1 destructive-install gate. DHCP may still provide a diagnostic lease,
+/// but an install profile without an armed generation receives no PXE bootfile.
+pub fn resolveWithDeployment(config: *const model.AppConfig, deployments: ?*deployment_control.Store, revision: u64, mac: []const u8, arch: packet.Architecture) Decision {
+    var decision = resolve(config, mac, arch);
+    if (decision.mode == .install and decision.node_id != null and deployments != null and !deployments.?.isArmedForRevision(decision.node_id.?, revision)) {
+        decision.bootfile = null;
+        decision.install_not_armed = true;
+    }
+    return decision;
+}
+
+test "consumed install generation suppresses PXE bootfile" {
+    var deployments: deployment_control.Store = .{};
+    try deployments.ensureInitial("node-01", 1, 1);
+    _ = try deployments.consume("node-01");
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }} };
+    const decision = resolveWithDeployment(&config, &deployments, 1, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
+    try @import("std").testing.expect(decision.bootfile == null);
+}
+
+test "always reinstall policy still requires an armed generation" {
+    var deployments: deployment_control.Store = .{};
+    try deployments.ensureInitial("node-01", 1, 1);
+    _ = try deployments.consume("node-01");
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .safety = .{ .destructive = true, .persistent_writes = true, .reinstall_policy = .always } }} };
+    const decision = resolveWithDeployment(&config, &deployments, 1, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
+    try @import("std").testing.expect(decision.bootfile == null);
+    try @import("std").testing.expect(decision.install_not_armed);
 }
 
 /// 检查节点配置的架构与 PXE 客户端申报的架构是否一致。

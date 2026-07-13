@@ -1,9 +1,12 @@
-# Rocky Linux 9.7 后续阶段验证清单
+# Rocky Linux 9.7 分阶段验证记录与待办
 
 M0 已在 Rocky Linux 9.7 aarch64 实机完成 systemd、HTTP、CLI、端口独占和 debug 验证；结果以
-[`DETAILED_DESIGN.md` 第 5 节](DETAILED_DESIGN.md#5-m0-验收标准与验证结果)为准。本文只跟踪
-M1+ 尚未实现、因此尚未在目标机执行的系统级验证。功能实现和纯逻辑测试仍在本地完成；下列项目
-不能在实际验证前标记为通过。
+[`DETAILED_DESIGN.md` 第 5 节](DETAILED_DESIGN.md#5-m0-验收标准与验证结果)为准。本文是追加式验证
+日志：已勾选项表示对应日期和环境下曾实际通过，不代表后续阶段自动通过；未勾选项是当前待办。
+M4/M4.1 的 Rocky 9.7 与 Ubuntu 22.04 正向安装、登录和生命周期链路均已完成实机验证；尚未执行的
+异常/负向条目继续保持未勾选。Rocky 8.10 aarch64 因 VMware/Apple-Silicon 的 64 KiB page-granule
+不兼容单独暂缓，详见 `ROCKY_8_10_VALIDATION.md`；M5+ 尚未实现。任何新能力仍必须在实际目标机验证后
+才可勾选，不能把设计、renderer fixture 或较早阶段成功当成系统级通过。
 
 ## 环境
 
@@ -267,7 +270,7 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
   因而相关 RRQ 返回 `file not found`。这不影响本项对 DHCP bootfile、TFTP bootloader 下载和进入
   bootloader 的验收边界。
 
-### 2026-07-12：M3.5 TFTP 虚拟 GRUB 配置补全（代码已实现，待实机验证）
+### 2026-07-12：M3.5 TFTP 虚拟 GRUB 配置补全（当时待实机验证）
 
 - **问题发现**：M2 实机验证确认 GRUB 可下载 `grubaa64.efi` 并进入 bootloader 提示符，但 GRUB
   随后查找 `grub.cfg` 时返回 `file not found`。根因有三：
@@ -351,7 +354,7 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
   已固定 `ExecStartPre=... --check --log-output file` 和 `ExecStart=... --log-output file`；验证后
   `nodeforged` 保持 inactive，未留下监听 socket。
 
-## M3 实施中
+## M3 验证记录
 
 ### 2026-07-12：M3.0–M3.3 ARM 构建与受控 HTTP 路由 smoke
 
@@ -468,3 +471,59 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 - [x] M3.5 TFTP 虚拟 GRUB 配置：PXE 客户端从 TFTP 获取动态渲染的 `grub.cfg`，GRUB 按 `linux`/
   `initrd` 指令成功下载 kernel（13 MB）和 initrd（133 MB），内核启动后发起 HTTP 安装仓库请求。
   完整 DHCP→TFTP→kernel→initrd→installer 链路在 `192.168.27.0/24` 实机验证通过。
+
+## M4/M4.1 已验证项与剩余边界、M5 待验证
+
+2026-07-13，`r97n1` 已分别完成 Rocky 9.7 Kickstart 与 Ubuntu 22.04 autoinstall，均从目标盘启动，
+以 bootstrap key 和 `nodeforge` 密码完成 SSH 登录，并产生
+`installer_started → started → post → completed`；Ubuntu 还验证了重启后静态
+`192.168.27.210/24`。下列未勾选项是尚未单独取得证据的负向、显式覆盖或跨发行版组合，不应被正向
+安装结果自动推定为通过。后续验证继续记录 profile、node、ISO/repository、answer hash、目标地址、抓包
+和安装后命令输出；失败也追加日期、症状和根因。
+
+### M4 安装主链路
+
+- [x] Rocky Linux 9.7 aarch64 从 Kickstart 完成磁盘、ESP、bootloader、`install_post` 并从本地盘启动。
+- [x] Ubuntu Server 22.04 LTS 从 autoinstall 完成磁盘、ESP、bootloader、`install_post` 并从本地盘启动。
+- [ ] Ubuntu 默认 `apt.fallback=offline-install` 可在本地 mirror 不完整时使用 ISO squashfs 完成安装。
+- [ ] 严格 HTTP APT profile 使用 `apt.fallback=abort`；Release/Packages/DEB 任一不可用时明确失败，不得以
+  ISO 离线回退掩盖问题。HTTP 日志能看到 request received、响应完成状态、字节数和 client。
+
+### M4.1 目标系统公共配置
+
+- [ ] 默认 profile 在 Ubuntu/Rocky 均得到 `en_US.UTF-8`、`UTC`、`us`；显式 locale/timezone/keyboard
+  覆盖在安装后生效。
+- [x] 默认安装并启用 OpenSSH、启用 password authentication 和 root login；使用默认明文密码
+  `asdf1234` 可直接 SSH 登录。
+- [ ] 修改密码、root_login 或 password_authentication 后行为严格一致。
+- [ ] config 中普通用户/root password 保持明文；Ubuntu/Rocky answer 中均为有效 SHA-512 crypt `$6$`，
+  Kickstart 使用 `--iscrypted`。固定 salt 输出与 OpenSSL/libxcrypt 一致，同 session 重试 answer 不漂移。
+- [ ] 未配置显式 server key 时按 `/root/.ssh/id_rsa.pub`、`id_ed25519.pub`、state generated Ed25519 顺序
+  取得 bootstrap admin key；server key 与各账号自己的 profile keys 始终合并、按 blob 去重，daemon 重启后
+  generated fingerprint 不变，任何 answer/BootConfig/rootfs/log/event 都不含 private key。
+- [ ] Ubuntu `users=[]` 不产生残缺 identity；绑定的 22.04 installer 支持 user-data-only 时 root-only 可登录，
+  否则部署前明确拒绝。多用户 password/sudo/key 不丢失不串号；22.04 answer 不误用 26.04 新增的
+  `identity.groups`。空 packages 是 YAML list；完整 answer 通过随 install source 固定的 Subiquity schema。
+- [x] Ubuntu 显式目标盘/分区实际生效；Rocky answer 包含 `rootpw --iscrypted`，且
+  `bootloader.install=true` 时不出现 `bootloader --location=none`，安装后能从目标盘启动。
+- [x] Ubuntu early/late 与 Rocky 对应 hook 均在 installer 上下文上报合法
+  `installer_started → started → post → completed`，目标系统 bundle 使用 in-target，服务端不返回 stage 409。
+- [ ] Ubuntu error 与 Rocky `%onerror` 在真实失败路径上报合法 failed stage。
+- [ ] Ubuntu UFW inactive/disabled；Rocky firewalld disabled/masked，`sestatus` 显示 disabled。
+- [ ] `local-only` answer 不含公共 mirror、GeoIP、NTP、installer refresh、update/upgrade、mirrorlist、
+  metalink 或 CDN；PXE VLAN 抓包无公网请求。
+- [ ] 额外包只能从安装介质或 NodeForge 本地 HTTP repository 获取；缺少 required package 时安装失败，
+  不回退公网。
+- [ ] DHCP 目标网络安装后保持 DHCP；静态目标网络要求 `address == node.ip`，安装过程中本地 HTTP/session
+  不断链，重启后 Ubuntu Netplan 或 Rocky NetworkManager 仍使用该静态地址。
+- [ ] config import/export 对用户、root、IPMI 及所有其他 password 字段均保留原始明文；schema 不要求
+  SecretRef 或预哈希值。日志、事件、BootConfig 和 status/plan 默认输出不泄露明文密码。
+
+### M5 继承验收
+
+- [ ] diskless rootfs build 继承 M4.1 locale/timezone、OpenSSH/root/password、防火墙和 Rocky SELinux 默认值。
+- [ ] BootConfig 声明 `sha512-crypt-v1`、`bootstrap-admin-key-v1`，只含 `$6$` hash 和合并后的 public keys；
+  不含 config 明文 password 或 NodeForge bootstrap private key。
+- [ ] 额外包只在 rootfs build 阶段安装；initrd/diskless_boot 不运行 apt/dnf，不访问公网。
+- [ ] DHCP/静态节点 overlay 遵循 M4.1 网络约束，BootConfig 只携带目标 hash，不携带明文 root 密码。
+- [ ] RHEL 系 diskless kernel cmdline 含 `selinux=0`，切根后 firewalld disabled/masked、`sestatus` disabled。

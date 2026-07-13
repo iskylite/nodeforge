@@ -54,3 +54,21 @@ test "render produces parseable JSON" {
     try std.testing.expectEqualStrings("192.168.50.1", parsed.value.server.server_ip);
     try std.testing.expectEqual(@as(u8, '\n'), bytes[bytes.len - 1]);
 }
+
+test "render preserves hyphenated APT fallback" {
+    const allocator = std.testing.allocator;
+    const config: model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+        .profiles = &.{.{
+            .name = "strict-ubuntu",
+            .mode = .install,
+            .distro = "ubuntu",
+            .version = "22.04",
+            .arch = .aarch64,
+            .install = .{ .apt = .{ .fallback = .abort } },
+        }},
+    };
+    const bytes = try render(allocator, &config);
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"fallback\": \"abort\"") != null);
+}

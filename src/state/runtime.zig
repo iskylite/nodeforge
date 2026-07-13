@@ -1,44 +1,63 @@
-//! Short-lived operational state.  DHCP state is deliberately separate from
-//! configuration and has a small, serialisable projection for restart recovery.
+//! 短期运行态状态。DHCP 状态与配置故意分离，具有小型可序列化投影用于重启恢复。
+//!
+//! RuntimeState 不直接持久化；DHCP lease 由 dhcp_store 独立保存到 leases.json，
+//! TFTP 计数器是仅存在于内存的原子计数器，节点状态由 status_store 独立管理。
 const std = @import("std");
 const node_status = @import("node_status.zig");
 
+/// 进程内运行态根对象。TFTP 和 DHCP 各有独立子状态。
 pub const RuntimeState = struct {
+    /// 运行态文件 schema 版本。
     schema_version: u32 = 2,
+    /// 服务生命周期状态。
     service: ServiceState = .starting,
+    /// 配置生成号；每次配置重载递增。
     config_generation: u64 = 1,
+    /// TFTP 传输计数器和会话列表。
     tftp: TftpState = .{},
+    /// DHCP lease 池和互斥锁。
     dhcp: DhcpState = .{},
 };
 
+/// DHCP lease 生命周期阶段。
 pub const LeasePhase = enum { empty, offered, active, abandoned };
 
+/// 单个 DHCP lease 记录。采用固定大小数组而非哈希表，避免动态分配。
 pub const DhcpLease = struct {
+    /// lease 当前阶段。
     phase: LeasePhase = .empty,
+    /// 客户端是否为已注册节点。
     known: bool = false,
+    /// 分配的 IPv4 地址（大端序 32 位）。
     ip: u32 = 0,
+    /// 客户端 MAC 地址。
     mac: [6]u8 = [_]u8{0} ** 6,
-    /// Unix seconds.  `abandoned` uses this as its quarantine deadline.
+    /// Unix 时间戳（秒）。`abandoned` 阶段用作隔离截止时间。
     expires_at: i64 = 0,
+    /// lease 是否被使用（非 empty）。
     pub fn used(self: *const DhcpLease) bool {
         return self.phase != .empty;
     }
+    /// 检查 lease 是否匹配指定 MAC。
     pub fn matches(self: *const DhcpLease, value: []const u8) bool {
         return self.used() and value.len == 6 and std.mem.eql(u8, &self.mac, value);
     }
 };
 
+/// DHCP lease 池。使用固定大小数组和自旋锁保护并发访问。
+/// 所有 mutation 方法在锁内执行 `reapLocked` 清理过期条目。
 pub const DhcpState = struct {
+    /// lease 池最大容量。超过时新请求无法分配地址。
     pub const max_leases = 256;
     leases: [max_leases]DhcpLease = [_]DhcpLease{.{}} ** max_leases,
+    /// 自旋锁，保护 lease 数组的并发访问。
     mutex: std.atomic.Mutex = .unlocked,
-    /// M3.1 monotonic generation.  The DHCP hot path only bumps this after any
-    /// real lease mutation; the checkpoint worker compares it against the saved
-    /// generation to decide whether a new `leases.json` snapshot is needed.
+    /// M3.1 单调递增的 lease 生成号。DHCP 热路径在每次真实 lease 变更后递增它；
+    /// checkpoint worker 对比它与已保存的生成号，决定是否需要新的 leases.json 快照。
     lease_generation: u64 = 0,
 
-    /// Offer an address without turning it into a committed lease.  Expired
-    /// offers and abandoned entries are reclaimed before every allocation.
+    /// 提供（OFFER）一个地址但不提交为 lease。每次分配前先清理过期 offer 和隔离条目。
+    /// 返回 0 表示分配失败（地址被占用或池已满）。
     pub fn offer(self: *DhcpState, mac: []const u8, candidate: u32, known: bool, now: i64, seconds: u32) u32 {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -63,9 +82,8 @@ pub const DhcpState = struct {
         return 0;
     }
 
-    /// Returns true only when `ip` is already an active lease for this same
-    /// client.  Such a lease is a renewal, not a new allocation, and must not
-    /// be ICMP-probed: the client is expected to answer its own address.
+    /// 检查 `ip` 是否已是此 MAC 的活动 lease。续约场景下客户端会回答自身地址的
+    /// ICMP 探测，因此不应将此视为冲突。
     pub fn ownsActiveLease(self: *DhcpState, mac: []const u8, ip: u32, now: i64) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -76,9 +94,8 @@ pub const DhcpState = struct {
         return false;
     }
 
-    /// Drop only a pending OFFER that was never put on the wire. This is used
-    /// when Ping Probe cannot run: an active lease must never be removed just
-    /// because a later DISCOVER could not be conflict-checked.
+    /// 仅撤销从未上线的待定 OFFER。当 ICMP 探测不可用时使用：
+    /// 活动 lease 绝不能因为后续 DISCOVER 无法做冲突检查而被移除。
     pub fn cancelOffer(self: *DhcpState, mac: []const u8, candidate: u32) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -90,10 +107,9 @@ pub const DhcpState = struct {
         return false;
     }
 
-    /// Commit only an address previously offered to this MAC. A configured
-    /// static reservation is the sole exception: it may ACK its declared
-    /// address after a restart without retaining an in-memory OFFER. Merely
-    /// being a known node never authorizes an arbitrary DHCP REQUEST.
+    /// 确认（ACK）之前已 OFFER 给此 MAC 的地址。配置的静态保留是唯一例外：
+    /// 它可以在重启后没有内存 OFFER 的情况下 ACK 其声明地址。
+    /// 仅仅作为已注册节点永远不授权任意 DHCP REQUEST。
     pub fn acknowledge(self: *DhcpState, mac: []const u8, candidate: u32, known: bool, static_reservation: bool, now: i64, seconds: u32) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -116,6 +132,7 @@ pub const DhcpState = struct {
         };
         return false;
     }
+    /// 释放（RELEASE）此 MAC 的所有非隔离 lease。
     pub fn release(self: *DhcpState, mac: []const u8) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -127,6 +144,7 @@ pub const DhcpState = struct {
         if (released) self.lease_generation += 1;
         return released;
     }
+    /// 拒绝（DECLINE）此 MAC 的地址，将其隔离指定时间后再允许重新分配。
     pub fn decline(self: *DhcpState, mac: []const u8, now: i64, quarantine_seconds: u32) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -138,14 +156,15 @@ pub const DhcpState = struct {
         };
         return false;
     }
+    /// 在锁内快照当前 lease 数组。
     pub fn snapshot(self: *DhcpState, destination: *[max_leases]DhcpLease) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         destination.* = self.leases;
     }
 
-    /// Captures the current lease array and its generation under the same lock.
-    /// The checkpoint worker uses this to avoid races with the DHCP hot path.
+    /// 在同一锁内捕获当前 lease 数组及其生成号。checkpoint worker 使用此方法
+    /// 避免与 DHCP 热路径的竞态。
     pub fn snapshotWithGeneration(self: *DhcpState, destination: *[max_leases]DhcpLease) u64 {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -153,21 +172,20 @@ pub const DhcpState = struct {
         return self.lease_generation;
     }
 
-    /// Returns the current lease generation without taking a snapshot.
+    /// 返回当前 lease 生成号（不快照数组）。
     pub fn generation(self: *DhcpState) u64 {
         lock(&self.mutex);
         defer self.mutex.unlock();
         return self.lease_generation;
     }
-    /// Replace leases restored from the durable snapshot under the same lock
-    /// used by all DHCP mutations. Startup is currently single-threaded, but
-    /// keeping this boundary prevents future lifecycle changes from bypassing
-    /// state synchronization.
+    /// 在与所有 DHCP mutation 相同的锁下恢复持久化快照中的 lease。
+    /// 启动当前是单线程的，但保持此边界防止未来生命周期变更绕过状态同步。
     pub fn restore(self: *DhcpState, source: *const [max_leases]DhcpLease) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         self.leases = source.*;
     }
+    /// 在锁内清理所有过期 lease。过期包括 offer 超时和隔离超时。
     fn reapLocked(self: *DhcpState, now: i64) void {
         var reaped = false;
         for (&self.leases) |*lease| {
@@ -184,19 +202,32 @@ pub const DhcpState = struct {
 /// M3 持久化运行时状态文件。M1/M2 文件使用 schema 1 且只包含 lease；
 /// 加载器接受它们并用空的节点状态集合补全。
 pub const RuntimeFile = struct {
+    /// schema 版本。
     schema_version: u32 = 2,
+    /// 保存时间戳。
     saved_at: i64,
+    /// DHCP lease 列表。
     leases: []const DhcpLease,
+    /// 节点状态列表（M3 新增；M1/M2 文件为空）。
     statuses: []const node_status.Status = &.{},
 };
 
+/// TFTP 传输计数器和活动会话列表。计数器使用原子操作，
+/// 会话列表使用自旋锁保护。
 pub const TftpState = struct {
+    /// 已启动的 TFTP 传输总数。
     started: std.atomic.Value(u64) = .init(0),
+    /// 已完成的 TFTP 传输总数。
     completed: std.atomic.Value(u64) = .init(0),
+    /// 失败的 TFTP 传输总数。
     failed: std.atomic.Value(u64) = .init(0),
+    /// 活动会话数组（环形缓冲）。
     sessions: [max_sessions]TftpSession = [_]TftpSession{.{}} ** max_sessions,
+    /// 下一个会话 ID（单调递增）。
     next_session_id: u64 = 1,
+    /// 保护会话数组的自旋锁。
     mutex: std.atomic.Mutex = .unlocked,
+    /// 活动会话最大数量。
     pub const max_sessions = 32;
     pub fn begin(self: *TftpState, filename: []const u8) usize {
         lock(&self.mutex);
@@ -221,14 +252,20 @@ pub const TftpState = struct {
     }
 };
 pub const TftpSession = struct {
+    /// 会话 ID（0 表示空槽）。
     id: u64 = 0,
+    /// 会话阶段。
     phase: TftpSessionPhase = .empty,
+    /// 请求的文件名（NUL 结尾的固定缓冲区）。
     filename: [128]u8 = [_]u8{0} ** 128,
+    /// 返回文件名的有效切片（到第一个 NUL 为止）。
     pub fn filenameSlice(self: *const TftpSession) []const u8 {
         return self.filename[0 .. std.mem.indexOfScalar(u8, &self.filename, 0) orelse self.filename.len];
     }
 };
+/// TFTP 会话阶段。
 pub const TftpSessionPhase = enum { empty, running, completed, failed };
+/// 服务生命周期状态。
 pub const ServiceState = enum { starting, running, stopping };
 fn copyLabel(destination: *[128]u8, source: []const u8) void {
     destination.* = [_]u8{0} ** destination.len;
