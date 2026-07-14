@@ -81,8 +81,8 @@ fn spaces(writer: *std.Io.Writer, count: usize) !void {
 /// 返回 display width；无效 UTF-8 以单字节可见占位计算，确保 renderer 永不崩溃。
 pub fn displayWidth(value: []const u8) usize {
     var view = std.unicode.Utf8View.init(value) catch {
-        // Invalid UTF-8: fall back to byte-by-byte width calculation so that
-        // displayWidth matches the \xNN escaping performed by writeCell/writeEscaped.
+        // 无效 UTF-8：回退到逐字节宽度计算，使 displayWidth 与
+        // writeCell/writeEscaped 执行的 \xNN 转义一致。
         var width: usize = 0;
         var i: usize = 0;
         while (i < value.len) {
@@ -126,7 +126,7 @@ pub fn displayWidth(value: []const u8) usize {
 fn codepointWidth(codepoint: u21) usize {
     if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint < 0xa0)) return 4; // rendered as \xNN (4 visible chars)
     if ((codepoint >= 0x300 and codepoint <= 0x36f) or (codepoint >= 0x1ab0 and codepoint <= 0x1aff)) return 0;
-    // East Asian wide/fullwidth ranges used by NodeForge's Chinese operator-facing output.
+    // NodeForge 中文操作界面使用的东亚宽/全角字符范围。
     if ((codepoint >= 0x1100 and codepoint <= 0x115f) or (codepoint >= 0x2e80 and codepoint <= 0xa4cf) or
         (codepoint >= 0xac00 and codepoint <= 0xd7a3) or (codepoint >= 0xf900 and codepoint <= 0xfaff) or
         (codepoint >= 0xff01 and codepoint <= 0xff60) or (codepoint >= 0x20000 and codepoint <= 0x3fffd)) return 2;

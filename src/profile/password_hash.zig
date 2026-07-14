@@ -1,15 +1,15 @@
-//! SHA-512 crypt (`$6$`) for installer-only password delivery.
+//! SHA-512 crypt（`$6$`）用于仅安装器密码下发。
 //!
-//! Config remains plaintext by design.  This module derives a standard SHA-crypt
-//! value in memory and never writes it to config, events, or runtime state.
+//! 配置按设计保持明文。本模块在内存中派生标准 SHA-crypt 值，
+//! 永远不会将其写入配置、事件或运行时状态。
 
 const std = @import("std");
 
 const crypt_b64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/// Derive a SHA-512 crypt string using an explicit salt.  The salt must contain
-/// 1..16 characters from the crypt alphabet; explicit salts make fixture vectors
-/// deterministic while production callers use `randomSalt`.
+/// 使用显式 salt 派生 SHA-512 crypt 字符串。salt 必须包含
+/// 1..16 个 crypt 字母表字符；显式 salt 使测试向量确定性，
+/// 生产调用方使用 `randomSalt`。
 pub fn sha512Crypt(allocator: std.mem.Allocator, password: []const u8, salt: []const u8) ![]u8 {
     if (salt.len == 0 or salt.len > 16) return error.InvalidSalt;
     for (salt) |c| if (std.mem.indexOfScalar(u8, crypt_b64, c) == null) return error.InvalidSalt;
@@ -63,7 +63,7 @@ pub fn sha512Crypt(allocator: std.mem.Allocator, password: []const u8, salt: []c
     try out.append(allocator, '$');
     const groups = [_][3]usize{ .{ 0, 21, 42 }, .{ 22, 43, 1 }, .{ 44, 2, 23 }, .{ 3, 24, 45 }, .{ 25, 46, 4 }, .{ 47, 5, 26 }, .{ 6, 27, 48 }, .{ 28, 49, 7 }, .{ 50, 8, 29 }, .{ 9, 30, 51 }, .{ 31, 52, 10 }, .{ 53, 11, 32 }, .{ 12, 33, 54 }, .{ 34, 55, 13 }, .{ 56, 14, 35 }, .{ 15, 36, 57 }, .{ 37, 58, 16 }, .{ 59, 17, 38 }, .{ 18, 39, 60 }, .{ 40, 61, 19 }, .{ 62, 20, 41 } };
     for (groups) |g| try b64(&out, allocator, digest[g[0]], digest[g[1]], digest[g[2]], 4);
-    // The final SHA-512 byte is encoded as two low-to-high crypt-base64 chars.
+    // 最后一个 SHA-512 字节编码为两个低位到高位的 crypt-base64 字符。
     try out.append(allocator, crypt_b64[digest[63] & 0x3f]);
     try out.append(allocator, crypt_b64[digest[63] >> 6]);
     return out.toOwnedSlice(allocator);
@@ -77,8 +77,8 @@ pub fn randomSalt(io: std.Io) ![16]u8 {
     return salt;
 }
 
-/// Deterministic per boot-session salt: answer retries stay byte-stable while
-/// different capability sessions produce different hashes.
+/// 确定性的 per boot-session salt：answer 重试保持字节稳定，
+/// 不同 capability session 产生不同哈希。
 pub fn sessionSalt(session: []const u8, account: []const u8) [16]u8 {
     var digest: [64]u8 = undefined;
     sha(&digest, &.{ session, ":", account });

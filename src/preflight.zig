@@ -11,7 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const model = @import("model.zig");
 
-/// M0 preflight failures that callers can present as actionable diagnostics.
+/// M0 preflight 失败类型，调用方可将其呈现为可操作的诊断信息。
 pub const Error = error{
     HttpAddressUnavailable,
     TftpAdvertiseAddressUnavailable,
@@ -37,9 +37,8 @@ pub const tftp_port: u16 = 69;
 pub fn checkPorts(io: std.Io, config: *const model.AppConfig) Error!void {
     checkTcpBind(io, "0.0.0.0", config.server.http_port) catch
         return error.HttpAddressUnavailable;
-    // The advertised PXE address must be locally bindable.  This catches a
-    // misspelled/nonexistent service address before a daemon can advertise a
-    // TFTP endpoint it cannot actually serve.
+    // 广告的 PXE 地址必须可本地 bind。这在 daemon 广告一个实际无法服务的
+    // TFTP 端点之前，捕获拼写错误或不存在的服务地址。
     checkUdpBind(io, config.server.server_ip, 0) catch
         return error.TftpAdvertiseAddressUnavailable;
     checkUdpBind(io, config.server.server_ip, tftp_port) catch
@@ -47,9 +46,8 @@ pub fn checkPorts(io: std.Io, config: *const model.AppConfig) Error!void {
     checkUdpBind(io, config.server.server_ip, 67) catch return error.DhcpAddressUnavailable;
 }
 
-/// M3.4's importer uses a read-only loop mount.  Linux requires
-/// `CAP_SYS_ADMIN`; non-Linux development hosts intentionally skip this
-/// runtime-only check because they cannot run the Linux daemon service.
+/// M3.4 的导入器使用只读 loop mount。Linux 需要 `CAP_SYS_ADMIN`；
+/// 非 Linux 开发主机有意跳过此仅运行时检查，因为它们无法运行 Linux daemon 服务。
 pub fn checkInstallSourcePrerequisites(io: std.Io, allocator: std.mem.Allocator) Error!void {
     if (builtin.os.tag != .linux) return;
     if (!hasLinuxCapSysAdmin(io, allocator)) return error.InstallSourceCapabilityUnavailable;
@@ -59,9 +57,8 @@ pub fn checkInstallSourcePrerequisites(io: std.Io, allocator: std.mem.Allocator)
 }
 
 fn hasLinuxCapSysAdmin(io: std.Io, allocator: std.mem.Allocator) bool {
-    // NodeForge's packaged systemd unit runs as root and narrows the bounding
-    // set explicitly. Root is therefore a valid fast path; non-root services
-    // must prove the effective capability below.
+    // NodeForge 打包的 systemd unit 以 root 运行并显式收窄 bounding set。
+    // 因此 root 是有效的快速路径；非 root 服务必须在下方证明其有效 capability。
     if (std.os.linux.geteuid() == 0) return true;
     const status = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/status", allocator, .limited(64 * 1024)) catch return false;
     defer allocator.free(status);

@@ -84,7 +84,7 @@ pub fn validateActiveConfig(io: std.Io, port: u16) Status {
     );
 }
 
-/// Explicitly rearms one install generation through the localhost-only API.
+/// 通过仅限本机的 API 显式武装一个 install generation。
 pub fn installRetry(io: std.Io, port: u16, node_id: []const u8) Status {
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;

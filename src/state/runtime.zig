@@ -69,8 +69,8 @@ pub const DhcpState = struct {
         defer self.mutex.unlock();
         self.reapLocked(now);
         for (&self.leases) |*lease| if (lease.matches(mac)) {
-            // An abandoned address remains quarantined, but its client may be
-            // offered a different free address from the same pool.
+            // 被废弃的地址仍保持隔离状态，但其客户端可以从
+            // 同一地址池中获得其他空闲地址。
             if (lease.phase == .abandoned) continue;
             lease.known = known;
             lease.expires_at = now + @as(i64, seconds);
@@ -204,7 +204,7 @@ pub const DhcpState = struct {
     }
 };
 
-/// Per-node boot-gate event suppressor (M4.2 F9).
+/// Per-node boot-gate 事件抑制器（M4.2 F9）。
 ///
 /// ## 问题背景
 ///
@@ -461,31 +461,31 @@ test "only a static reservation may acknowledge without an offer" {
 test "boot-gate suppressor emits only on state transition" {
     var suppressor: BootGateSuppressor = .{};
 
-    // First DHCP packet: normal → not_armed → should emit
+    // 首个 DHCP 包：normal → not_armed → 应发出
     try std.testing.expect(suppressor.shouldEmit("r97n1", true, false));
-    // Second DHCP packet (retransmit): not_armed → not_armed → suppress
+    // 第二个 DHCP 包（重传）：not_armed → not_armed → 抑制
     try std.testing.expect(!suppressor.shouldEmit("r97n1", true, false));
-    // Third DHCP packet (OS boot): still not_armed → suppress
+    // 第三个 DHCP 包（OS 启动）：仍为 not_armed → 抑制
     try std.testing.expect(!suppressor.shouldEmit("r97n1", true, false));
 
-    // Node gets armed: not_armed → normal → suppress (no event for recovery)
+    // 节点被武装：not_armed → normal → 抑制（恢复时不发事件）
     try std.testing.expect(!suppressor.shouldEmit("r97n1", false, false));
-    // Node becomes not_armed again: normal → not_armed → should emit
+    // 节点再次变为 not_armed：normal → not_armed → 应发出
     try std.testing.expect(suppressor.shouldEmit("r97n1", true, false));
 }
 
 test "boot-gate suppressor tracks deploy_disabled independently" {
     var suppressor: BootGateSuppressor = .{};
 
-    // not_armed → deploy_disabled is a transition → emit
+    // not_armed → deploy_disabled 是状态转换 → 发出
     try std.testing.expect(suppressor.shouldEmit("r97n2", true, false));
     try std.testing.expect(!suppressor.shouldEmit("r97n2", true, false));
-    // not_armed → deploy_disabled → emit (different state)
+    // not_armed → deploy_disabled → 发出（不同状态）
     try std.testing.expect(suppressor.shouldEmit("r97n2", false, true));
     try std.testing.expect(!suppressor.shouldEmit("r97n2", false, true));
-    // deploy_disabled → normal → suppress
+    // deploy_disabled → normal → 抑制
     try std.testing.expect(!suppressor.shouldEmit("r97n2", false, false));
-    // normal → deploy_disabled → emit
+    // normal → deploy_disabled → 发出
     try std.testing.expect(suppressor.shouldEmit("r97n2", false, true));
 }
 

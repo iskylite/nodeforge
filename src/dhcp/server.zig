@@ -57,8 +57,8 @@ pub const Persistence = struct {
     /// boot session 存储，用于创建和更新 PXE 启动关联。
     sessions: *boot_session.Store,
     deployments: ?*deployment_control.Store = null,
-    /// Stable digest of the daemon's validated config snapshot. Pending
-    /// destructive generations are only bootable against this exact revision.
+    /// daemon 已校验配置快照的稳定摘要。待执行的破坏性 generation
+    /// 只能在此精确 revision 上启动。
     config_revision: u64 = 0,
 };
 
@@ -223,15 +223,14 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
     return null;
 }
 
-/// Emit a `boot.install_not_armed` event for a node whose install profile is
-/// held because no matching armed generation exists.
+/// 为因无匹配已武装 generation 而被暂停的节点发出 `boot.install_not_armed` 事件。
 ///
-/// This is a server-side diagnostic event: no boot session exists for a held
-/// node, so it carries no credential or answer data. The event is intentionally
-/// visible in the audit trail so operators can see why PXE was denied.
+/// 这是服务端诊断事件：被暂停的节点不存在 boot session，
+/// 因此不携带任何凭据或 answer 数据。该事件有意在审计记录中可见，
+/// 以便操作员了解 PXE 被拒绝的原因。
 ///
-/// M4.2 F9: calls are gated by `BootGateSuppressor.shouldEmit` in
-/// `offerAfterProbe` to prevent event flooding from repeated DHCP packets.
+/// M4.2 F9：调用由 `offerAfterProbe` 中的 `BootGateSuppressor.shouldEmit`
+/// 控制，防止重复 DHCP 包导致事件泛滥。
 fn emitInstallNotArmed(io: std.Io, persistence: ?*const Persistence, node_id: []const u8) void {
     const p = persistence orelse return;
     const fields = [_]events.Field{.{ .key = "node_id", .value = node_id }};
@@ -239,14 +238,13 @@ fn emitInstallNotArmed(io: std.Io, persistence: ?*const Persistence, node_id: []
         observe_log.err("dhcp: install-not-armed event append failed: {t}", .{err});
 }
 
-/// M4.2 F2: emit a `boot.deploy_disabled` event when a known node with
-/// `deploy=false` receives a DHCP offer. The lease is still served for
-/// diagnostics, but no PXE bootfile is sent.
+/// M4.2 F2：当已知节点配置为 `deploy=false` 且收到 DHCP offer 时发出
+/// `boot.deploy_disabled` 事件。lease 仍会发放用于诊断，但不发送 PXE bootfile。
 ///
-/// M4.2 F9: calls are gated by `BootGateSuppressor.shouldEmit` in
-/// `offerAfterProbe` to prevent event flooding from repeated DHCP packets.
-/// Without the suppressor, a `deploy=false` node would generate 8-10+ events
-/// per boot cycle (one per DHCP packet).
+/// M4.2 F9：调用由 `offerAfterProbe` 中的 `BootGateSuppressor.shouldEmit`
+/// 控制，防止重复 DHCP 包导致事件泛滥。
+/// 若无抑制器，`deploy=false` 节点在每个启动周期会产生 8-10+ 条事件
+///（每个 DHCP 包一条）。
 fn emitDeployDisabled(io: std.Io, persistence: ?*const Persistence, node_id: []const u8) void {
     const p = persistence orelse return;
     const fields = [_]events.Field{.{ .key = "node_id", .value = node_id }};
@@ -383,10 +381,9 @@ fn audit(io: std.Io, persistence: ?*const Persistence, config: *const model.AppC
 /// 关联缺口，而非错误地把本次请求接到另一条活动记录上。
 fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const model.AppConfig, request: *const packet.Packet) ?boot_session.Link {
     const p = persistence orelse return .capacity_exhausted;
-    // A held destructive profile must still receive its diagnostic DHCP
-    // lease, but it must not acquire a capability-bearing boot session.  Such
-    // a session would make the safe `install retry` operation return 409 even
-    // though no installer was ever served.
+    // 被暂停的破坏性 profile 仍需获得诊断 DHCP lease，
+    // 但不能获取携带 capability 的 boot session。这样的 session
+    // 会使安全的 `install retry` 操作返回 409，即使从未服务过安装器。
     const decision = resolver.resolveWithDeployment(config, p.deployments, p.config_revision, request.mac(), request.architecture);
     if (decision.install_not_armed) return null;
     const result = p.sessions.acquireDhcp(io, .{

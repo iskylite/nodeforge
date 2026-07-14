@@ -1,6 +1,5 @@
-//! Durable-facing M3 node-status projection.  The store is deliberately
-//! distinct from the JSONL audit writer: status answers "where is the node
-//! now", while events retain the history that led there.
+//! 面向持久化的 M3 节点状态投影。该 store 有意与 JSONL 审计写入器分离：
+//! status 回答“节点现在处于哪个阶段”，而 events 保留到达该状态的历史记录。
 
 const std = @import("std");
 const boot_session = @import("boot_session.zig");
@@ -61,11 +60,10 @@ pub const Store = struct {
         var target: ?*Status = null;
         for (&self.entries) |*entry| {
             if (entry.used() and std.mem.eql(u8, entry.node(), node_id)) {
-                // A retransmitted or retried HTTP request belongs to the
-                // same boot session.  It may produce another audit Event,
-                // but it must never move the durable "where is this node"
-                // projection backwards (for example, a second config fetch
-                // after the installer has already started).
+                // 重传或重试的 HTTP 请求属于同一个 boot session。
+                // 它可能产生另一条审计 Event，但绝不能让持久的
+                // “该节点处于哪个阶段”状态回退（例如安装器已启动后的
+                // 第二次配置获取）。
                 if (std.mem.eql(u8, &entry.boot_session_id, session_id) and
                     !phaseAdvances(entry.phase, phase)) return;
                 target = entry;
@@ -107,8 +105,8 @@ pub const Store = struct {
         destination.* = self.entries;
     }
 
-    /// Restored projections are historical observations only.  A daemon
-    /// restart never revives a capability or makes an old boot session active.
+    /// 恢复的投影仅为历史观测。daemon 重启永远不会恢复 capability
+    /// 或使旧 boot session 变为活跃。
     pub fn restoreInactive(self: *Store, source: *const [max_statuses]Status) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -119,9 +117,9 @@ pub const Store = struct {
     }
 };
 
-/// M3 has two independent progress paths (installer and diskless), plus the
-/// common initial config fetch.  A failure is terminal for the current
-/// session; a new boot session is handled by `update` as a fresh projection.
+/// M3 有两条独立进度路径（安装器和无盘），加上公共的初始配置获取。
+/// 失败对当前 session 是终止性的；新的 boot session 由 `update` 作为
+/// 全新投影处理。
 fn phaseAdvances(current: Phase, next: Phase) bool {
     if (current == next) return true;
     if (current == .failed or current == .completed or current == .running) return next == .failed;

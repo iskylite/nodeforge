@@ -1,26 +1,24 @@
-//! Durable projection of node status (M3.1).
+//! 节点状态的持久化投影（M3.1）。
 //!
-//! `node-status.json` is the sole durable fact source for the HTTP node-status
-//! projection.  It uses its own I/O lock, independent from the DHCP checkpoint
-//! lock, so HTTP status transitions never contend with DHCP lease persistence.
-//! A corrupt snapshot is rejected by the loader.  Legacy `runtime.json` files
-//! are accepted as migration input only for the status portion.
+//! `node-status.json` 是 HTTP node-status 投影的唯一持久化事实源。
+//! 它使用独立的 I/O 锁，与 DHCP checkpoint 锁分离，使 HTTP 状态转换
+//! 永远不会与 DHCP lease 持久化争用。损坏的快照会被加载器拒绝。
+//! 旧版 `runtime.json` 文件仅作为状态部分的迁移输入被接受。
 
 const std = @import("std");
 const node_status = @import("node_status.zig");
 const runtime = @import("runtime.zig");
 const dhcp_store = @import("dhcp_store.zig");
 
-/// M3.1 `node-status.json` schema.
+/// M3.1 `node-status.json` schema。
 pub const StatusFile = struct {
     schema_version: u32 = 3,
     saved_at: i64,
     statuses: []const node_status.Status,
 };
 
-/// I/O mutex for `node-status.json`.  This is deliberately separate from the
-/// DHCP checkpoint lock so HTTP status saves never block or be blocked by
-/// DHCP lease persistence.
+/// `node-status.json` 的 I/O mutex。有意与 DHCP checkpoint 锁分离，
+/// 使 HTTP 状态保存永远不会阻塞或被 DHCP lease 持久化阻塞。
 io_mutex: std.atomic.Mutex = .unlocked,
 
 /// 原子保存节点状态快照到 `node-status.json`。

@@ -52,6 +52,13 @@ if grep -Fq 'relative to /opt/nodeforge/work/import' "$tmp/assets-import-help"; 
     exit 1
 fi
 
+"$cli" assets --help >"$tmp/assets-help"
+for command in key-import key-reload key-show key-list; do
+    grep -Fq "$command" "$tmp/assets-help"
+    "$cli" assets "$command" --help >"$tmp/assets-$command-help"
+done
+grep -Fq 'Local OpenSSH public key path' "$tmp/assets-key-import-help"
+
 for command in \
     "status" \
     "check" \

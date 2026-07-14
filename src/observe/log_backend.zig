@@ -161,11 +161,10 @@ fn renderLogLineBounded(
     return buf[0 .. total + 1];
 }
 
-/// Human-facing service logs follow the daemon host's local timezone. Include
-/// the numeric offset (`+08:00`, for example) so copied log lines remain
-/// unambiguous. Structured Event v2 timestamps deliberately remain UTC `Z` in
-/// `state/events.zig`; changing that audit contract would break time filters
-/// and consumers for no operational benefit.
+/// 面向人类的服务日志使用 daemon 宿主机的本地时区。包含数字偏移
+///（如 `+08:00`），使复制的日志行保持无歧义。结构化 Event v2 时间戳
+/// 有意保持在 `state/events.zig` 中的 UTC `Z` 格式；更改该审计契约
+/// 会破坏时间过滤器和消费者，且无运维收益。
 fn localRfc3339Now(buffer: *[25]u8) ![]const u8 {
     var clock: std.posix.timespec = undefined;
     if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) != .SUCCESS) return error.ClockUnavailable;
@@ -174,8 +173,8 @@ fn localRfc3339Now(buffer: *[25]u8) ![]const u8 {
     var local: c.struct_tm = undefined;
     if (c.localtime_r(&seconds, &local) == null) return error.ClockUnavailable;
 
-    // `%z` is emitted as ±HHMM. Insert the RFC 3339 colon without relying on
-    // non-portable `struct tm` offset fields shared differently by libc ABIs.
+    // `%z` 输出为 ±HHMM 格式。插入 RFC 3339 要求的冒号，
+    // 不依赖各 libc ABI 不同地暴露的 `struct tm` 偏移字段。
     var raw: [32]u8 = undefined;
     const length = c.strftime(&raw, raw.len, "%Y-%m-%dT%H:%M:%S%z", &local);
     if (length != 24 or (raw[19] != '+' and raw[19] != '-')) return error.InvalidTimezone;

@@ -244,6 +244,10 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         try assetShowCommand(init_options),
         try assetValidateCommand(init_options),
         try assetImportCommand(init_options),
+        try assetKeyImportCommand(init_options),
+        try assetKeyReloadCommand(init_options),
+        try assetKeyShowCommand(init_options),
+        try assetKeyListCommand(init_options),
     });
 
     // ── runtime 资源（DHCP/TFTP 运行态查看）──────────────────────────────
@@ -279,7 +283,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         rt_tftp_counters,
         rt_tftp_sessions,
         try runtimeStatusCommand(init_options),
-        // M4.2 F6: deprecated subcommands for backward compat
+        // M4.2 F6：为向后兼容保留的废弃子命令
         try deprecatedRuntimeLeasesCommand(init_options),
         try deprecatedRuntimeUnknownCommand(init_options),
     });
@@ -307,8 +311,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         assets,
         runtime,
         events,
-        // M4.2 F6: Deprecated aliases for backward compatibility.
-        // Each prints a deprecation warning before delegating to the new command path.
+        // M4.2 F6：为向后兼容保留的废弃别名。
+        // 每个别名在委托到新命令路径前会先输出废弃警告。
         try deprecatedAliasCommand(init_options, "import-iso", "assets import"),
         try deprecatedAliasCommand(init_options, "install-render", "node render"),
         try deprecatedAliasCommand(init_options, "install-retry", "node retry"),
@@ -377,6 +381,35 @@ fn assetListCommand(init_options: zli.InitOptions) !*zli.Command {
     try addCatalogPathFlag(command);
     try addOutputFlag(command);
     try addDebugFlag(command);
+    return command;
+}
+
+fn assetKeyImportCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{ .name = "key-import", .description = "Import a bootstrap SSH public key" }, assetKeyImportHandler);
+    try command.addPositionalArg(.{ .name = "path", .description = "Local OpenSSH public key path", .required = true });
+    try addOutputFlag(command);
+    return command;
+}
+
+fn assetKeyReloadCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{ .name = "key-reload", .description = "Reload bootstrap SSH public keys" }, assetKeyReloadHandler);
+    try addConfigPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
+    return command;
+}
+
+fn assetKeyShowCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{ .name = "key-show", .description = "Show effective SSH key fingerprints" }, assetKeyShowHandler);
+    try addConfigPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
+    return command;
+}
+
+fn assetKeyListCommand(init_options: zli.InitOptions) !*zli.Command {
+    const command = try zli.Command.init(init_options, .{ .name = "key-list", .description = "List imported SSH public key files" }, assetKeyListHandler);
+    try addOutputFlag(command);
     return command;
 }
 
@@ -752,6 +785,140 @@ fn assetValidateHandler(ctx: zli.CommandContext) !void {
     }
 }
 
+fn assetKeyImportHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const source = ctx.getArg("path") orelse unreachable;
+    const basename = std.fs.path.basename(source);
+    if (basename.len == 0 or !std.mem.endsWith(u8, basename, ".pub")) {
+        try ctx.writer.writeAll("error: assets key-import requires a .pub file\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    // assets/keys/id_ed25519{,.pub} 是 NodeForge 自动生成 key pair 的保留名。
+    // 操作员导入常见的 ~/.ssh/id_ed25519.pub 时安全改名，不能覆盖或拆散该 pair。
+    const destination_name = if (std.mem.eql(u8, basename, "id_ed25519.pub")) "imported-id_ed25519.pub" else basename;
+    const key = nodeforge.admin_key.loadPublicKey(ctx.io, ctx.allocator, source) catch |err| {
+        try ctx.writer.print("error: assets key-import invalid public key: {t}\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer ctx.allocator.free(key);
+
+    const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ nodeforge.paths.keys_dir, destination_name });
+    defer ctx.allocator.free(destination);
+    try std.Io.Dir.cwd().createDirPath(ctx.io, nodeforge.paths.keys_dir);
+    var atomic_file = std.Io.Dir.cwd().createFileAtomic(ctx.io, destination, .{ .permissions = .default_file, .make_path = true, .replace = false }) catch |err| {
+        try ctx.writer.print("error: assets key-import cannot create destination: {t}\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer atomic_file.deinit(ctx.io);
+    var buffer: [4096]u8 = undefined;
+    var writer = atomic_file.file.writer(ctx.io, &buffer);
+    writer.interface.writeAll(key) catch return writer.err.?;
+    writer.interface.writeByte('\n') catch return writer.err.?;
+    writer.interface.flush() catch return writer.err.?;
+    try atomic_file.file.sync(ctx.io);
+    atomic_file.link(ctx.io) catch |err| {
+        try ctx.writer.print("error: assets key-import destination already exists or cannot be published: {t}\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+
+    const fingerprint = try nodeforge.admin_key.fingerprint(ctx.allocator, key);
+    defer ctx.allocator.free(fingerprint);
+    if (output_json) {
+        try ctx.writer.print("{{\"ok\":true,\"file\":{f},\"fingerprint\":{f}}}\n", .{ std.json.fmt(destination_name, .{}), std.json.fmt(fingerprint, .{}) });
+    } else try views.success(ctx.writer, "SSH public key imported", &.{ .{ .label = "File", .value = destination_name }, .{ .label = "Fingerprint", .value = fingerprint } });
+}
+
+fn assetKeyReloadHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const status = nodeforge.management_client.configReload(ctx.io, config.value.server.http_port);
+    if (!status.healthy) {
+        try ctx.writer.writeAll("error: assets key-reload could not reach the local daemon\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    if (output_json) try ctx.writer.writeAll("{\"ok\":true,\"reload\":\"requested\"}\n") else try views.success(ctx.writer, "SSH public key reload requested", &.{});
+}
+
+fn assetKeyShowHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const primary = nodeforge.admin_key.resolve(ctx.io, ctx.allocator, config.value.server) catch |err| {
+        try ctx.writer.print("error: assets key-show cannot resolve keys: {t}\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer ctx.allocator.free(primary);
+    const additional = try nodeforge.admin_key.resolveAdditional(ctx.io, ctx.allocator, config.value.server);
+    defer {
+        for (additional) |key| ctx.allocator.free(key);
+        ctx.allocator.free(additional);
+    }
+    if (output_json) try ctx.writer.writeAll("{\"keys\":[");
+    var index: usize = 0;
+    while (index <= additional.len) : (index += 1) {
+        const key = if (index == 0) primary else additional[index - 1];
+        const fingerprint = try nodeforge.admin_key.fingerprint(ctx.allocator, key);
+        defer ctx.allocator.free(fingerprint);
+        const source = try nodeforge.admin_key.sourceLabel(ctx.io, ctx.allocator, config.value.server, key);
+        defer ctx.allocator.free(source);
+        if (output_json) {
+            if (index != 0) try ctx.writer.writeByte(',');
+            try ctx.writer.print("{{\"source\":{f},\"fingerprint\":{f}}}", .{ std.json.fmt(source, .{}), std.json.fmt(fingerprint, .{}) });
+        } else {
+            var label: [24]u8 = undefined;
+            try views.success(ctx.writer, if (index == 0) "effective primary SSH key" else "effective additional SSH key", &.{ .{ .label = "Index", .value = try std.fmt.bufPrint(&label, "{d}", .{index}) }, .{ .label = "Source", .value = source }, .{ .label = "Fingerprint", .value = fingerprint } });
+        }
+    }
+    if (output_json) try ctx.writer.writeAll("]}\n");
+}
+
+fn assetKeyListHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |name| ctx.allocator.free(name);
+        names.deinit(ctx.allocator);
+    }
+    var directory = std.Io.Dir.cwd().openDir(ctx.io, nodeforge.paths.keys_dir, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (output_json) try ctx.writer.writeAll("{\"keys\":[]}\n") else try ctx.writer.writeAll("No SSH public keys imported.\n");
+            return;
+        },
+        else => return err,
+    };
+    defer directory.close(ctx.io);
+    var iterator = directory.iterate();
+    while (try iterator.next(ctx.io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".pub")) try names.append(ctx.allocator, try ctx.allocator.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    if (output_json) try ctx.writer.writeAll("{\"keys\":[");
+    for (names.items, 0..) |name, index| {
+        if (output_json) {
+            if (index != 0) try ctx.writer.writeByte(',');
+            try ctx.writer.print("{f}", .{std.json.fmt(name, .{})});
+        } else try ctx.writer.print("{s}\n", .{name});
+    }
+    if (output_json) try ctx.writer.writeAll("]}\n");
+}
+
 fn assetRoot(config: *const nodeforge.model.AppConfig, kind: nodeforge.model.AssetKind) []const u8 {
     return switch (kind) {
         .iso => config.http.asset_root,
@@ -901,8 +1068,8 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     try views.nodes(ctx.writer, rows[0..config.value.nodes.len]);
 }
 
-/// Offline answer preview intentionally uses obvious non-secret placeholders.
-/// Real credentials are only delivered by the authenticated `/answer` route.
+/// 离线 answer 预览有意使用明显的非密钥占位符。
+/// 真实凭据仅通过已认证的 `/answer` 路由下发。
 fn installRenderHandler(ctx: zli.CommandContext) !void {
     _ = outputJsonFromContext(ctx) orelse return;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
@@ -962,7 +1129,7 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     const bootstrap_key = try nodeforge.admin_key.resolve(ctx.io, ctx.allocator, config.value.server);
     defer ctx.allocator.free(bootstrap_key);
     const bundle = if (install.bundle) |name| findBundle(&config.value, name) else null;
-    // M4.2: webhook reporting 对所有 Ubuntu 版本可用（curtin handler 相同）
+    // M4.2：webhook 上报对所有 Ubuntu 版本可用（curtin handler 相同）
     const preview_report_url: []const u8 = if (std.mem.eql(u8, source.distro, "ubuntu")) "<report-url>" else "";
     const answer = if (std.mem.eql(u8, source.distro, "ubuntu"))
         try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, event_url, "<log-url>", preview_report_url, "<boot-session>", "<capability>", &preview_scope)
@@ -1014,13 +1181,13 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
     };
     const ip_val: ?[]const u8 = if (ip.len > 0) ip else null;
     const hostname_val: ?[]const u8 = if (hostname.len > 0) hostname else null;
-    // M4.2 F8: strict boolean parsing for --deploy
+    // M4.2 F8：--deploy 严格布尔解析
     const deploy_val: bool = if (deploy_str.len == 0) true else if (std.mem.eql(u8, deploy_str, "true") or std.mem.eql(u8, deploy_str, "1")) true else if (std.mem.eql(u8, deploy_str, "false") or std.mem.eql(u8, deploy_str, "0")) false else {
         try ctx.writer.print("error: --deploy must be true or false\n", .{});
         setExitCode(ctx, 1);
         return;
     };
-    // M4.2 F4: strict boolean parsing for --http-accel (default false)
+    // M4.2 F4：--http-accel 严格布尔解析（默认 false）
     const http_accel_val: bool = if (http_accel_str.len == 0) false else if (std.mem.eql(u8, http_accel_str, "true") or std.mem.eql(u8, http_accel_str, "1")) true else if (std.mem.eql(u8, http_accel_str, "false") or std.mem.eql(u8, http_accel_str, "0")) false else {
         try ctx.writer.print("error: --http-accel must be true or false\n", .{});
         setExitCode(ctx, 1);
@@ -1047,7 +1214,7 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    _ = nodeforge.management_client.configReload(ctx.io, config.value.server.http_port);
+    if (!try requestNodeConfigReload(ctx, config.value.server.http_port, node_id)) return;
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node added", &.{ .{ .label = "Node", .value = node_id }, .{ .label = "MAC", .value = mac }, .{ .label = "Profile", .value = profile } });
 }
 
@@ -1080,7 +1247,7 @@ fn nodeSetHandler(ctx: zli.CommandContext) !void {
         params.hostname = hostname;
     }
     if (deploy_str.len > 0) {
-        // M4.2 F8: strict boolean parsing — reject ambiguous values
+        // M4.2 F8：严格布尔解析 — 拒绝歧义值
         if (std.mem.eql(u8, deploy_str, "true") or std.mem.eql(u8, deploy_str, "1")) {
             params.deploy = true;
         } else if (std.mem.eql(u8, deploy_str, "false") or std.mem.eql(u8, deploy_str, "0")) {
@@ -1114,7 +1281,7 @@ fn nodeSetHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    _ = nodeforge.management_client.configReload(ctx.io, config.value.server.http_port);
+    if (!try requestNodeConfigReload(ctx, config.value.server.http_port, node_id)) return;
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node updated", &.{.{ .label = "Node", .value = node_id }});
 }
 
@@ -1133,7 +1300,7 @@ fn nodeRemoveHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    _ = nodeforge.management_client.configReload(ctx.io, config.value.server.http_port);
+    if (!try requestNodeConfigReload(ctx, config.value.server.http_port, node_id)) return;
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node removed", &.{.{ .label = "Node", .value = node_id }});
 }
 
@@ -1179,7 +1346,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
         } else {
             try ctx.writer.print("null", .{});
         }
-        try ctx.writer.print(",\"deploy\":{s}}}\n", .{if (node.deploy) "true" else "false"});
+        try ctx.writer.print(",\"deploy\":{s},\"http_accel\":{s}}}\n", .{ if (node.deploy) "true" else "false", if (node.http_accel) "true" else "false" });
     } else {
         try views.nodeDetail(ctx.writer, node);
     }
@@ -1196,6 +1363,17 @@ fn printMutationError(ctx: zli.CommandContext, err: anyerror, action: []const u8
         else => @errorName(err),
     };
     try ctx.writer.print("error: node {s} failed for {s}: {s}\n", .{ action, node_id, msg });
+}
+
+/// 节点配置已经原子写盘后，请求 daemon 有序退出并由 systemd 重启加载。
+/// reload 失败不能回滚已持久化配置，因此错误信息必须明确区分“写盘成功”与
+/// “运行态尚未切换”，避免 CLI 错报整次 mutation 成功。
+fn requestNodeConfigReload(ctx: zli.CommandContext, port: u16, node_id: []const u8) !bool {
+    const status = nodeforge.management_client.configReload(ctx.io, port);
+    if (status.healthy) return true;
+    try ctx.writer.print("error: node config saved for {s}, but daemon reload was not requested; restart nodeforged manually\n", .{node_id});
+    setExitCode(ctx, 1);
+    return false;
 }
 
 fn findBundle(config: *const nodeforge.model.AppConfig, name: []const u8) ?*const nodeforge.model.ProvisioningBundle {
@@ -1764,7 +1942,7 @@ fn printVersion(out: *std.Io.Writer) !void {
     try out.print("nodeforge {s}\n", .{nodeforge.version.version});
 }
 
-// ── M4.2 F6: runtime status + deprecated aliases ─────────────────────
+// ── M4.2 F6：runtime status + 废弃别名 ─────────────────────
 
 /// `runtime status` 子命令：展示服务运行态概要（DHCP/TFTP/管理 API）。
 fn runtimeStatusCommand(init_options: zli.InitOptions) !*zli.Command {
@@ -1816,7 +1994,7 @@ fn deprecatedAliasCommand(init_options: zli.InitOptions, old_name: []const u8, n
     }, showCurrentHelp);
 }
 
-// ── Deprecated `dhcp` top-level command ──────────────────────────────
+// ── 废弃的 `dhcp` 顶层命令 ──────────────────────────────
 
 fn deprecatedDhcpCommand(init_options: zli.InitOptions) !*zli.Command {
     const dhcp = try zli.Command.init(init_options, .{
@@ -1839,7 +2017,7 @@ fn deprecatedDhcpShowHandler(ctx: zli.CommandContext) !void {
     try dhcpShowHandler(ctx);
 }
 
-// ── Deprecated `tftp` top-level command ──────────────────────────────
+// ── 废弃的 `tftp` 顶层命令 ──────────────────────────────
 
 fn deprecatedTftpCommand(init_options: zli.InitOptions) !*zli.Command {
     const tftp = try zli.Command.init(init_options, .{
@@ -1879,7 +2057,7 @@ fn deprecatedTftpSessionListHandler(ctx: zli.CommandContext) !void {
     try tftpSessionListHandler(ctx);
 }
 
-// ── Deprecated `runtime leases` / `runtime unknown` subcommands ──────
+// ── 废弃的 `runtime leases` / `runtime unknown` 子命令 ──────
 
 fn deprecatedRuntimeLeasesCommand(init_options: zli.InitOptions) !*zli.Command {
     const leases = try zli.Command.init(init_options, .{

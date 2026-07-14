@@ -12,7 +12,7 @@ pub const max_reason_bytes = 128;
 pub const max_message_bytes = 1024;
 pub const max_log_summary_bytes = 2048;
 
-/// M4.2 F1: stable reason values for install failure log summaries.
+/// M4.2 F1：安装失败日志摘要的稳定 reason 值。
 pub const reason_anaconda_error = "install.anaconda_error";
 pub const reason_subiquity_error = "install.subiquity_error";
 

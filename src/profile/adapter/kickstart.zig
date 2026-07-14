@@ -23,7 +23,7 @@ const render = @import("../render.zig");
 const runner = @import("../../provision/runner.zig");
 const password_hash = @import("../password_hash.zig");
 
-/// M4.1 Kickstart rendering from the shared TargetSystemConfig.
+/// M4.1 Kickstart 渲染器，从共享的 TargetSystemConfig 生成。
 pub fn renderAnswerM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, repo_url: []const u8, bundle: ?*const model.ProvisioningBundle, event_url: []const u8, log_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -32,16 +32,15 @@ pub fn renderAnswerM41(allocator: std.mem.Allocator, node: *const model.NodeConf
     if (system.connectivity.time_sync) for (system.connectivity.ntp_servers) |server| try w.print("timesource --ntp-server={s}\n", .{server});
     const network = node.overrides.network orelse model.TargetNetworkConfig{};
     if (network.mode == .dhcp) {
-        // `--activate` configures the installer environment only.  Persist the
-        // connection as an on-boot profile as well, otherwise a successfully
-        // installed system can reach the login prompt without any route for
-        // bootstrap SSH.
+        // `--activate` 仅配置安装器环境。同时将连接持久化为开机
+        // 启动的 profile，否则安装成功的系统可能在到达登录提示时
+        // 没有任何路由可供 bootstrap SSH 使用。
         try w.print("network --bootproto=dhcp --device=link --hostname={s} --activate --onboot=on\n", .{render.hostname(node)});
     } else {
         const device = network.interface orelse network.match_mac orelse node.mac;
-        // Anaconda/Kickstart accepts dotted IPv4 `--netmask`; unlike Netplan,
-        // it does not accept a CIDR `--prefix` argument (verified by the
-        // Rocky 8 and Rocky 9 ksvalidator fixtures).
+        // Anaconda/Kickstart 接受点分 IPv4 `--netmask`；与 Netplan 不同，
+        // 它不接受 CIDR `--prefix` 参数（已通过 Rocky 8 和 Rocky 9
+        // ksvalidator fixture 验证）。
         var netmask_buf: [15]u8 = undefined;
         const netmask = ipv4Netmask(&netmask_buf, network.prefix_len.?);
         try w.print("network --bootproto=static --device={s} --ip={s} --netmask={s} --hostname={s} --activate --onboot=on", .{ device, network.address.?, netmask, render.hostname(node) });
@@ -161,13 +160,13 @@ pub fn renderAnswerM41(allocator: std.mem.Allocator, node: *const model.NodeConf
         defer allocator.free(script);
         try w.writeAll(script);
     }
-    try w.print("curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"completed\"}}' {s} || true\n%end\n%onerror\nERRLOG=$(ls /tmp/anaconda-tb-*/anaconda-tb 2>/dev/null | head -1)\nSUMMARY=\"anaconda error\"\nif [ -n \"$ERRLOG\" ]; then\n  SUMMARY=\"anaconda error: $(head -c 2048 \"$ERRLOG\" 2>/dev/null | tr '\\n' ' ')\"\nfi\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/x-www-form-urlencoded' -d \"v=1&boot_session_id={s}&reason=install.anaconda_error&summary=$SUMMARY\" {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"failed\"}}' {s} || true\n%end\nreboot\n", .{ token, session, session, event_url, token, session, session, event_url, token, session, session, log_url, token, session, session, event_url });
+    try w.print("curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"completed\"}}' {s} || true\n%end\n%onerror\nERRLOG=$(ls /tmp/anaconda-tb-*/anaconda-tb 2>/dev/null | head -1)\nSUMMARY=\"anaconda error\"\nif [ -n \"$ERRLOG\" ]; then\n  SUMMARY=\"anaconda error: $(head -c 1800 \"$ERRLOG\" 2>/dev/null | tr '\\n' ' ')\"\nfi\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' --data-urlencode 'v=1' --data-urlencode 'boot_session_id={s}' --data-urlencode 'reason=install.anaconda_error' --data-urlencode \"summary=$SUMMARY\" {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"failed\"}}' {s} || true\n%end\nreboot\n", .{ token, session, session, event_url, token, session, session, event_url, token, session, session, log_url, token, session, session, event_url });
     return out.toOwnedSlice();
 }
 
-/// `sshkey` has exactly one positional argument.  An SSH public key includes
-/// its type, base64 payload, and usually a comment, so emit it as one quoted
-/// Kickstart token rather than letting the parser split it into three tokens.
+/// `sshkey` 只有一个位置参数。SSH 公钥包含类型、base64 负载和通常还有
+/// 注释，因此将其作为一个带引号的 Kickstart token 输出，而不是让解析器
+/// 拆分为三个 token。
 fn kickstartQuote(w: *std.Io.Writer, value: []const u8) !void {
     try w.writeByte('"');
     for (value) |byte| switch (byte) {
@@ -283,6 +282,15 @@ test "M4.1 kickstart renders root crypt and security defaults" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "bootloader --location=none") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "%pre") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "%onerror") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "--data-urlencode \"summary=$SUMMARY\"") != null);
+}
+
+test "M4.2 kickstart renders default nodeforge account" {
+    const node: model.NodeConfig = .{ .id = "node-default", .mac = "00:11:22:33:44:67", .arch = .x86_64, .profile = "rocky" };
+    const bytes = try renderAnswerM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "user --name=nodeforge --password=$6$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "--groups=wheel") != null);
 }
 
 test "M4.1 kickstart static target network uses Anaconda netmask syntax" {

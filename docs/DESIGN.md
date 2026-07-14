@@ -292,11 +292,21 @@ initrd 建立 TCP 连接时仍可能触发 EFI 内存碎片化，导致后续 ke
 M6 的 BIOS PXELINUX 链路使用 `pxelinux.0`（只支持 TFTP，不支持 HTTP），
 `http_accel` 对 PXELINUX 节点无效，kernel/initrd 始终通过 TFTP 传输。
 
-**TFTP 微调（§7.4）**：对 `http_accel=false` 或 BIOS PXELINUX 等仍走 TFTP 的场景，
-服务端在 `negotiate()` 中实现 OACK 主动建议 `blksize=1468`：客户端发送了至少一个
-已识别 option（如 `tsize=0`）但未发送 `blksize` 时，在 OACK 中建议 Ethernet MTU 最优
-值 1468（1500 − 20 IP − 8 UDP − 4 TFTP），将默认 512 字节/块升级到 1468，吞吐提升
-约 3 倍。不覆盖客户端显式发送的 `blksize`，不对零 option 客户端发送 OACK。
+**TFTP 微调（§7.4 blksize 升级）**：对 `http_accel=false` 或 BIOS PXELINUX 等仍走 TFTP 的场景，
+服务端在 `negotiate()` 中实现两种 blksize 升级机制：
+
+1. **主动建议**：客户端发送了至少一个已识别 option（如 `tsize=0`）但未发送 `blksize` 时，
+   在 OACK 中建议 Ethernet MTU 最优值 `max_blksize`（默认 1468：1500 − 20 IP − 8 UDP − 4 TFTP），
+   将默认 512 字节/块升级到 1468，吞吐提升约 3 倍。不对零 option 客户端发送 OACK。
+
+2. **升级客户端请求值**：客户端发送的 `blksize` 小于 `max_blksize` 时（如 GRUB 发送 `blksize=1024`），
+   服务端在 OACK 中返回 `max_blksize`（1468）而非客户端请求的值。RFC 2347 §1 规定客户端
+   "SHOULD" 接受服务端在 OACK 中返回的值；实测 GRUB 2.06 兼容此行为，将吞吐从
+   2.5 MB/s（blksize=1024）提升到 3.7 MB/s（blksize=1468），提升约 48%。
+   客户端请求更大块时 clamp 到 `max_blksize` 避免 UDP 分片。
+
+`max_blksize` 可通过配置文件 `tftp.max_blksize` 调整（默认 1468），适用于 jumbo frames
+环境（如 `max_blksize=8192`）。
 
 ### 5.3 initrd 类型边界
 
@@ -1422,8 +1432,8 @@ formatter，`list --output json` 输出 JSON array，`follow --output json` 输�
   "tftp": {
     "asset_root": "<paths.boot_dir>",
     "max_blksize": 1468,
-    "timeout_seconds": 3,
-    "max_retries": 5
+    "windowsize": 4,
+    "max_concurrent_transfers": 4
   },
   "http": {
     "asset_root": "<paths.iso_dir>",

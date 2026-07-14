@@ -1,8 +1,7 @@
-//! Resolves NodeForge's persistent bootstrap SSH client key.
+//! 解析 NodeForge 持久化的 bootstrap SSH 客户端密钥。
 //!
-//! The private key never enters config or answer data. `ssh-keygen` is used for
-//! generated keys so the on-disk private-key encoding and file permissions are
-//! directly compatible with the OpenSSH client used by operators.
+//! 私钥永远不进入配置或 answer 数据。生成的密钥使用 `ssh-keygen`，
+//! 因此磁盘上的私钥编码和文件权限与操作员使用的 OpenSSH 客户端直接兼容。
 
 const std = @import("std");
 const model = @import("../model.zig");
@@ -17,8 +16,19 @@ const generated_private_temp = generated_private ++ ".tmp";
 const generated_public_temp = generated_private_temp ++ ".pub";
 
 pub fn resolve(io: std.Io, allocator: std.mem.Allocator, server: model.ServerConfig) ![]u8 {
+    // 显式多公钥数组是最高优先级事实源。第一个 key 作为兼容旧渲染接口的
+    // bootstrap_key，其余 key 由 resolveAdditional 返回；不得混入磁盘来源。
+    if (server.ssh_authorized_public_keys.len > 0) return checkedDupe(allocator, server.ssh_authorized_public_keys[0]);
     if (server.ssh_authorized_public_key) |key| return checkedDupe(allocator, key);
-    inline for ([_][]const u8{ "/root/.ssh/id_rsa.pub", "/root/.ssh/id_ed25519.pub" }) |path| {
+    const imported = try readImportedKeys(io, allocator);
+    if (imported.len > 0) {
+        const primary = imported[0];
+        for (imported[1..]) |key| allocator.free(key);
+        allocator.free(imported);
+        return @constCast(primary);
+    }
+    allocator.free(imported);
+    for ([_][]const u8{ "/root/.ssh/id_rsa.pub", "/root/.ssh/id_ed25519.pub" }) |path| {
         if (readKey(io, allocator, path)) |key| return key else |_| {}
     }
     if (readKey(io, allocator, generated_public)) |key| {
@@ -54,35 +64,34 @@ pub fn resolve(io: std.Io, allocator: std.mem.Allocator, server: model.ServerCon
     return readKey(io, allocator, generated_public) catch error.ServerAdminKeyUnavailable;
 }
 
-/// M4.2 F5: Resolve additional SSH public keys from config and assets directory.
-/// Scans `ssh_authorized_public_keys` from ServerConfig and the
-/// `assets/keys/` directory for `.pub` files.
-/// Returns an allocated slice of allocated key strings; caller must free each
-/// element and the slice itself.
+/// M4.2 F5：解析主 key 之外需要一并注入的 SSH 公钥。
+/// 显式多公钥数组非空时只采用该数组；旧单值非空时不混入其他来源；两者
+/// 都为空时才扫描 assets/keys，并把排序后的第一个 key 留给 resolve()。
 pub fn resolveAdditional(io: std.Io, allocator: std.mem.Allocator, server: model.ServerConfig) ![][]const u8 {
     var keys: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (keys.items) |key| allocator.free(key);
         keys.deinit(allocator);
     }
-    // Config-specified additional keys.
-    for (server.ssh_authorized_public_keys) |key| {
-        if (!valid(key)) return error.InvalidPublicKey;
-        try keys.append(allocator, try allocator.dupe(u8, key));
-    }
-    // State directory scan for .pub files.
-    var dir = std.Io.Dir.cwd().openDir(io, generated_dir, .{ .iterate = true, .follow_symlinks = false }) catch {
+    if (server.ssh_authorized_public_keys.len > 0) {
+        for (server.ssh_authorized_public_keys[1..]) |key| {
+            if (!valid(key)) return error.InvalidPublicKey;
+            var duplicate = sameKey(server.ssh_authorized_public_keys[0], key);
+            for (keys.items) |existing| if (sameKey(existing, key)) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) try keys.append(allocator, try allocator.dupe(u8, key));
+        }
         return keys.toOwnedSlice(allocator);
-    };
-    defer dir.close(io);
-    var iterator = dir.iterate();
-    while (iterator.next(io) catch null) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".pub")) continue;
-        if (std.mem.eql(u8, entry.name, "id_ed25519.pub")) continue;
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ generated_dir, entry.name });
-        defer allocator.free(path);
-        const key = readKey(io, allocator, path) catch continue;
-        // Deduplicate against already-collected keys.
+    }
+    if (server.ssh_authorized_public_key != null) return keys.toOwnedSlice(allocator);
+
+    const imported = try readImportedKeys(io, allocator);
+    defer allocator.free(imported);
+    if (imported.len == 0) return keys.toOwnedSlice(allocator);
+    defer allocator.free(imported[0]);
+    for (imported[1..]) |key| {
         var duplicate = false;
         for (keys.items) |existing| if (sameKey(existing, key)) {
             duplicate = true;
@@ -90,11 +99,55 @@ pub fn resolveAdditional(io: std.Io, allocator: std.mem.Allocator, server: model
         };
         if (duplicate) {
             allocator.free(key);
-            continue;
+        } else {
+            try keys.append(allocator, key);
         }
-        try keys.append(allocator, key);
     }
     return keys.toOwnedSlice(allocator);
+}
+
+/// 读取并按文件名排序导入公钥，确保 daemon 重启后主 key 选择稳定。
+/// 自动生成的 id_ed25519.pub 属于更低优先级的兜底来源，不参与此扫描。
+fn readImportedKeys(io: std.Io, allocator: std.mem.Allocator) ![][]const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    var dir = std.Io.Dir.cwd().openDir(io, generated_dir, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return allocator.alloc([]const u8, 0),
+        else => return err,
+    };
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".pub")) continue;
+        if (std.mem.eql(u8, entry.name, "id_ed25519.pub")) continue;
+        try names.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+
+    var imported: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (imported.items) |key| allocator.free(key);
+        imported.deinit(allocator);
+    }
+    for (names.items) |name| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ generated_dir, name });
+        defer allocator.free(path);
+        const key = readKey(io, allocator, path) catch continue;
+        var duplicate = false;
+        for (imported.items) |existing| if (sameKey(existing, key)) {
+            duplicate = true;
+            break;
+        };
+        if (duplicate) allocator.free(key) else try imported.append(allocator, key);
+    }
+    return imported.toOwnedSlice(allocator);
 }
 
 fn pathExists(io: std.Io, path: []const u8) !bool {
@@ -160,8 +213,8 @@ fn syncDirectory(io: std.Io, path: []const u8) !void {
 }
 
 fn readKey(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    // Never follow a symlink from a privileged key search path. The public
-    // component is still treated as untrusted input and parsed below.
+    // 永远不从特权密钥搜索路径跟随符号链接。公钥部分仍被视为不可信输入，
+    // 在下方解析校验。
     var file = try std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false, .follow_symlinks = false });
     defer file.close(io);
     const stat = try file.stat(io);
@@ -195,6 +248,63 @@ pub fn valid(key: []const u8) bool {
     return size >= 16;
 }
 
+/// 生成与 OpenSSH `ssh-keygen -lf` 一致的 SHA256 指纹，不包含 key 注释。
+/// 返回内存归调用者所有，格式固定为 `SHA256:<base64-no-padding>`。
+pub fn fingerprint(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+    const parts = keyParts(key) orelse return error.InvalidPublicKey;
+    const decoded_len = std.base64.standard_no_pad.Decoder.calcSizeForSlice(parts.blob) catch return error.InvalidPublicKey;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    std.base64.standard_no_pad.Decoder.decode(decoded, parts.blob) catch return error.InvalidPublicKey;
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(decoded, &digest, .{});
+    const encoded_len = std.base64.standard_no_pad.Encoder.calcSize(digest.len);
+    const output = try allocator.alloc(u8, "SHA256:".len + encoded_len);
+    @memcpy(output[0.."SHA256:".len], "SHA256:");
+    _ = std.base64.standard_no_pad.Encoder.encode(output["SHA256:".len..], &digest);
+    return output;
+}
+
+/// 从任意本地路径读取并校验单行 OpenSSH 公钥，供 CLI 导入复用。
+pub fn loadPublicKey(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return readKey(io, allocator, path);
+}
+
+/// 根据已解析 key 反查运维可读来源。返回值归调用者所有；配置来源使用稳定
+/// 字段路径，文件来源返回绝对路径，便于排查“私钥与注入公钥不匹配”。
+pub fn sourceLabel(io: std.Io, allocator: std.mem.Allocator, server: model.ServerConfig, key: []const u8) ![]u8 {
+    for (server.ssh_authorized_public_keys, 0..) |configured, index| {
+        if (sameKey(configured, key)) return std.fmt.allocPrint(allocator, "config:server.ssh_authorized_public_keys[{d}]", .{index});
+    }
+    if (server.ssh_authorized_public_key) |configured| {
+        if (sameKey(configured, key)) return allocator.dupe(u8, "config:server.ssh_authorized_public_key");
+    }
+
+    var directory = std.Io.Dir.cwd().openDir(io, generated_dir, .{ .iterate = true, .follow_symlinks = false }) catch null;
+    if (directory) |*dir| {
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (iterator.next(io) catch null) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".pub")) continue;
+            const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ generated_dir, entry.name });
+            const candidate = readKey(io, allocator, path) catch {
+                allocator.free(path);
+                continue;
+            };
+            defer allocator.free(candidate);
+            if (sameKey(candidate, key)) return path;
+            allocator.free(path);
+        }
+    }
+    for ([_][]const u8{ "/root/.ssh/id_rsa.pub", "/root/.ssh/id_ed25519.pub" }) |path| {
+        const candidate = readKey(io, allocator, path) catch continue;
+        defer allocator.free(candidate);
+        if (sameKey(candidate, key)) return allocator.dupe(u8, path);
+    }
+    return allocator.dupe(u8, "generated-or-unknown");
+}
+
 test "explicit bootstrap key is accepted without filesystem access" {
     const key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test";
     const result = try checkedDupe(std.testing.allocator, key);
@@ -207,4 +317,41 @@ test "bootstrap key identity ignores comments but not algorithm or blob" {
     try std.testing.expect(sameKey("ssh-ed25519 " ++ blob ++ " first", "ssh-ed25519 " ++ blob ++ " second"));
     try std.testing.expect(!sameKey("ssh-rsa " ++ blob, "ssh-ed25519 " ++ blob));
     try std.testing.expect(!sameKey("ssh-ed25519 " ++ blob, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeDifferentBlobValue1234567890"));
+}
+
+test "M4.2 explicit key array is authoritative and deduplicated" {
+    const blob = "AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+";
+    const first = "ssh-ed25519 " ++ blob ++ " operator";
+    const duplicate = "ssh-ed25519 " ++ blob ++ " duplicate-comment";
+    const second = "ssh-rsa " ++ blob ++ " auditor";
+    const server: model.ServerConfig = .{
+        .server_ip = "192.168.50.1",
+        .ssh_authorized_public_key = "ssh-ed25519 ignored-legacy-value",
+        .ssh_authorized_public_keys = &.{ first, duplicate, second },
+    };
+
+    const primary = try resolve(std.testing.io, std.testing.allocator, server);
+    defer std.testing.allocator.free(primary);
+    try std.testing.expectEqualStrings(first, primary);
+
+    const additional = try resolveAdditional(std.testing.io, std.testing.allocator, server);
+    defer {
+        for (additional) |key| std.testing.allocator.free(key);
+        std.testing.allocator.free(additional);
+    }
+    try std.testing.expectEqual(@as(usize, 1), additional.len);
+    try std.testing.expectEqualStrings(second, additional[0]);
+    const source = try sourceLabel(std.testing.io, std.testing.allocator, server, additional[0]);
+    defer std.testing.allocator.free(source);
+    try std.testing.expectEqualStrings("config:server.ssh_authorized_public_keys[2]", source);
+}
+
+test "M4.2 SSH fingerprint ignores comments" {
+    const blob = "AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+";
+    const first = try fingerprint(std.testing.allocator, "ssh-ed25519 " ++ blob ++ " first");
+    defer std.testing.allocator.free(first);
+    const second = try fingerprint(std.testing.allocator, "ssh-ed25519 " ++ blob ++ " second");
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.startsWith(u8, first, "SHA256:"));
 }

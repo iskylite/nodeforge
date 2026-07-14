@@ -84,11 +84,9 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     defer allocator.free(staged_repo);
     try std.Io.Dir.cwd().createDirPath(io, mount_point);
     try std.Io.Dir.cwd().createDirPath(io, staged_repo);
-    // DVD trees preserve read-only directory modes when staged with `cp -a`.
-    // Prefer the native delete, but fall back to the same constrained `rm`
-    // invocation used elsewhere so a successful import never retains a
-    // multi-gigabyte work tree merely because its copied directories are
-    // read-only.
+    // DVD 目录树以 `cp -a` 暂存时保留只读目录权限。
+    // 优先使用原生删除，但回退到与其他位置相同的受限 `rm` 命令，
+    // 确保成功的导入不会仅因复制的目录为只读而保留数 GB 的工作树。
     defer removeTreeBestEffort(io, allocator, work);
 
     // ISO9660 是首选文件系统。某些介质是 UDF-only（部分新版 Ubuntu），
@@ -117,16 +115,15 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     const repo_destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.repository_root, source_name });
     defer allocator.free(repo_destination);
 
-    // Publication is a separate, atomic catalog operation performed by the
-    // caller.  Do not leave files in the public asset roots if any copy or
-    // checksum step below fails before a Result can be handed to that caller.
-    // (A catalog-publication failure is cleaned by cleanupPublishedOutputs.)
+    // 发布是由调用方执行的独立原子 catalog 操作。
+    // 如果下方的任何拷贝或校验和步骤在 Result 交给调用方之前失败，
+    // 不要在公共 asset root 中遗留文件。
+    //（catalog 发布失败由 cleanupPublishedOutputs 清理。）
     var retain_outputs = false;
-    // Cleanup must be ownership-aware. A rejected duplicate import can find a
-    // valid, already-published kernel/repository with the deterministic source
-    // name. Never delete that pre-existing generation while rolling back this
-    // candidate; only remove paths this invocation created (or started to
-    // create) after its no-clobber check succeeded.
+    // 清理必须感知所有权。被拒绝的重复导入可能发现已存在有效且已发布的
+    // kernel/repository（具有确定性 source name）。回滚此候选时绝不能
+    // 删除先前存在的 generation，只删除本次调用在 no-clobber 检查通过后
+    // 创建（或开始创建）的路径。
     var iso_created = false;
     var kernel_created = false;
     var initrd_created = false;
@@ -169,10 +166,9 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     return result;
 }
 
-/// Remove unpublished output after catalog candidate validation or atomic
-/// publication fails.  These paths are derived from a Result created by this
-/// module, never from an HTTP request; cleanup is best-effort so it cannot
-/// hide the original import failure.
+/// 在 catalog 候选校验或原子发布失败后移除未发布的输出。这些路径由
+/// 本模块创建的 Result 派生，绝非来自 HTTP 请求；清理是尽力而为的，
+/// 不能掩盖原始导入失败。
 pub fn cleanupPublishedOutputs(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, result: *const Result) void {
     const iso = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.asset_root, result.iso_asset.path }) catch return;
     defer allocator.free(iso);
@@ -243,11 +239,11 @@ fn detectMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8
     return detected;
 }
 
-/// M4.2 F3: Apply operator-provided tuple as override on top of detected media.
-/// When the operator provides a distro/version/arch, it overrides the detected
-/// value. This enables importing media that has ambiguous or incomplete metadata
-/// (e.g., custom RHEL rebuilds with non-standard .treeinfo family strings).
-/// Null fields keep the detected value unchanged.
+/// M4.2 F3：将操作员提供的三元组作为覆盖应用到检测到的媒体信息上。
+/// 当操作员提供 distro/version/arch 时，覆盖检测值。这使得可以导入
+/// 元数据模糊或不完整的介质（例如自定义 RHEL 重建版使用非标准
+/// .treeinfo family 字符串）。
+/// 空字段保持检测值不变。
 fn applyRequestedTuple(requested: Request, detected: *DetectedMedia) void {
     if (requested.distro) |value| detected.distro = value;
     if (requested.version) |value| detected.version = value;
@@ -271,8 +267,8 @@ fn detectRockyMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []con
     defer allocator.free(treeinfo_path);
     const treeinfo = try std.Io.Dir.cwd().readFileAlloc(io, treeinfo_path, allocator, .limited(256 * 1024));
     defer allocator.free(treeinfo);
-    // Kylin V10 and some other supported RHEL-family media publish repodata
-    // at the ISO root and omit the optional repository key.
+    // Kylin V10 和其他一些受支持的 RHEL 系媒体将 repodata 发布在
+    // ISO 根目录，并省略可选的 repository 键。
     const repository_path = valueFor(treeinfo, "repository") orelse "";
     if (repository_path.len != 0) try assets.validateRelativePath(repository_path);
     const repomd_path = if (repository_path.len == 0)
@@ -424,11 +420,10 @@ fn containsPrefixValue(text: []const u8, key: []const u8, expected_prefix: []con
     return std.mem.startsWith(u8, value, expected_prefix);
 }
 
-/// M4.2 F3: RHEL family whitelist for .treeinfo `family` field.
-/// Accepts Rocky, CentOS, AlmaLinux, and Red Hat Enterprise Linux rebuilds.
-/// This replaces the hardcoded `Rocky` prefix check, allowing import of
-/// CentOS/Alma/RHEL media that share the same .treeinfo structure and
-/// Anaconda installer layout.
+/// M4.2 F3：.treeinfo `family` 字段的 RHEL 系白名单。
+/// 接受 Rocky、CentOS、AlmaLinux 和 Red Hat Enterprise Linux 重建版。
+/// 这取代了硬编码的 `Rocky` 前缀检查，允许导入共享相同 .treeinfo
+/// 结构和 Anaconda 安装器布局的 CentOS/Alma/RHEL 介质。
 fn rhelFamily(treeinfo: []const u8) ?[]const u8 {
     const family = valueFor(treeinfo, "family") orelse return null;
     const whitelisted = [_][]const u8{

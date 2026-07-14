@@ -22,7 +22,7 @@ pub const AddParams = struct {
     ip: ?[]const u8 = null,
     hostname: ?[]const u8 = null,
     deploy: bool = true,
-    /// M4.2 F4: HTTP 加速下载 kernel/initrd（默认开启）。
+    /// M4.2 F4: HTTP 加速下载 initrd（实验性，默认关闭）。
     /// 参见 `model.NodeConfig.http_accel` 字段说明。
     http_accel: bool = false,
 };

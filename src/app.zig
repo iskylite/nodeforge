@@ -52,8 +52,7 @@ pub fn run(
     var clock: std.posix.timespec = undefined;
     const current_time: i64 = if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) == .SUCCESS) @intCast(clock.sec) else 0;
 
-    // M3.1: load from new files first; fall back to legacy runtime.json
-    // migration for each domain independently.
+    // M3.1：优先从新文件加载；每个域独立回退到旧版 runtime.json 迁移。
     loadLeases(io, allocator, &runtime.dhcp, current_time);
     loadStatuses(io, allocator, &statuses);
 
@@ -86,14 +85,14 @@ pub fn run(
         allocator.free(additional_keys);
     }
 
-    // M3.1: separate I/O locks for leases.json and node-status.json.
-    // The DHCP checkpoint worker owns leases.json; HTTP handlers own
-    // node-status.json.  Neither contends with the other.
+    // M3.1：leases.json 和 node-status.json 使用独立的 I/O 锁。
+    // DHCP checkpoint worker 持有 leases.json；HTTP handler 持有
+    // node-status.json。两者互不争用。
     var status_io_mutex: std.atomic.Mutex = .unlocked;
     var checkpoint_flush_stop = std.atomic.Value(bool).init(false);
-    // M4.2: config reload flag. HTTP handler sets this after node add/set/remove
-    // writes config.json. serve() returns after the next event loop tick;
-    // app.zig then exits cleanly and systemd restarts with the new config.
+    // M4.2：config reload 标志。HTTP handler 在 node add/set/remove 写入
+    // config.json 后设置此标志。serve() 在下一个事件循环 tick 后返回；
+    // app.zig 随后干净退出，systemd 用新配置重启。
     var reload_requested = std.atomic.Value(bool).init(false);
 
     event_writer.appendWithFields(io, allocator, paths.events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
@@ -120,9 +119,8 @@ pub fn run(
         .config_revision = config_revision,
     };
     var live_catalog = catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
-    // DHCP needs a wildcard receive socket for client broadcasts.  The DHCP
-    // server applies the configured PXE NIC as a Linux socket-level boundary;
-    // TFTP remains bound to the advertised unicast address below.
+    // DHCP 需要 wildcard 接收 socket 以处理客户端广播。DHCP 服务器将配置的
+    // PXE NIC 作为 Linux socket 级别的边界；TFTP 保持绑定在广告的 unicast 地址。
     const dhcp_socket = try dhcp_server.bind(io, config.server.server_ip, config.server.bind_interface);
     var stop_workers = std.atomic.Value(bool).init(false);
     var dhcp_thread = try std.Thread.spawn(.{}, runDhcp, .{ io, dhcp_socket, config, &runtime, &persistence, &stop_workers });
@@ -131,18 +129,16 @@ pub fn run(
     var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, allocator, tftp_socket, config, &live_catalog, &runtime, &event_writer, &sessions, &stop_workers });
     observe_log.info("tftp: listening on udp://{s}:{d}", .{ config.server.server_ip, tftp_server.port });
 
-    // M3.1: start the DHCP lease checkpoint worker.  It is the sole writer of
-    // leases.json and runs until it receives a flush-and-stop command during
-    // orderly shutdown.
+    // M3.1：启动 DHCP lease checkpoint worker。它是 leases.json 的唯一写入者，
+    // 运行直到有序关闭时收到 flush-and-stop 命令。
     var checkpoint_thread = try std.Thread.spawn(.{}, runCheckpoint, .{ io, allocator, &runtime.dhcp, paths.leases_path, &checkpoint_flush_stop });
     observe_log.info("dhcp: lease checkpoint worker started", .{});
 
     // HTTP 明确绑定所有 IPv4 地址。`server.server_ip` 是给裸机节点使用的
     // 对外广告地址，不参与 bind；后续 DHCP/TFTP 接入时也要保持这个区分。
     //
-    // Zap/facil.io installs its own SIGINT/SIGTERM handler. When either signal
-    // arrives, the event loop stops and `zap.start()` returns, causing
-    // `serve()` to return normally.
+    // Zap/facil.io 安装自己的 SIGINT/SIGTERM handler。当任一信号到达时，
+    // 事件循环停止，`zap.start()` 返回，`serve()` 正常返回。
     var serve_error: ?anyerror = null;
     http_server.serve(
         io,
@@ -168,24 +164,23 @@ pub fn run(
         serve_error = err;
     };
 
-    // M4.2: if config reload was requested (node add/set/remove), exit cleanly
-    // so systemd restarts the daemon with the new config.json. This is simpler
-    // and safer than in-place config replacement (which would require
-    // re-initializing DHCP/TFTP/HTTP state machines).
+    // M4.2：如果请求了 config reload（node add/set/remove），干净退出
+    // 以便 systemd 用新 config.json 重启 daemon。这比原地配置替换更简单
+    // 且更安全（后者需要重新初始化 DHCP/TFTP/HTTP 状态机）。
     if (reload_requested.load(.acquire)) {
         observe_log.info("config: reload requested, exiting for systemd restart", .{});
-        // Fall through to normal shutdown, then systemd auto-restarts.
+        // 进入正常关闭流程，然后 systemd 自动重启。
     }
 
-    // ── Shutdown sequence (M3.1) ───────────────────────────────────────
-    // 1. Mark service as stopping so management API can report the state.
-    // 2. Set stop flag; DHCP/TFTP workers poll with 200ms timeout and self-exit,
-    //    closing their own sockets via defer.
-    // 3. Join DHCP and TFTP worker threads.
-    // 4. Send flush-and-stop to the DHCP checkpoint worker and join it.
-    // 5. Terminate active boot sessions and deactivate all statuses.
-    // 6. Final save of node-status.json (under status_io_mutex).
-    // 7. Write service.stopped event.
+    // ── 关闭序列（M3.1）───────────────────────────────────────────────────
+    // 1. 标记服务为 stopping，使管理 API 能报告该状态。
+    // 2. 设置 stop 标志；DHCP/TFTP worker 以 200ms 超时轮询并自行退出，
+    //    通过 defer 关闭各自的 socket。
+    // 3. join DHCP 和 TFTP worker 线程。
+    // 4. 向 DHCP checkpoint worker 发送 flush-and-stop 并 join。
+    // 5. 终止活跃 boot session 并停用所有 status。
+    // 6. 最终保存 node-status.json（在 status_io_mutex 下）。
+    // 7. 写入 service.stopped 事件。
     runtime.service = .stopping;
     observe_log.info("shutdown: stopping protocol workers", .{});
     stop_workers.store(true, .release);
@@ -230,12 +225,12 @@ fn forProfile(config: *const model.AppConfig, name: []const u8) ?*const model.Pr
     return null;
 }
 
-/// M3.1: Load DHCP leases from `leases.json`.  If the new file does not exist,
-/// attempt to migrate from the legacy `runtime.json`.
+/// M3.1：从 `leases.json` 加载 DHCP lease。如果新文件不存在，
+/// 尝试从旧版 `runtime.json` 迁移。
 fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.DhcpState, now_val: i64) void {
     dhcp_store.load(io, allocator, paths.leases_path, dhcp, now_val) catch |err| switch (err) {
         error.FileNotFound => {
-            // New file missing: try legacy runtime.json migration for leases.
+            // 新文件缺失：尝试从旧版 runtime.json 迁移 lease。
             dhcp_store.migrateLegacy(io, allocator, paths.runtime_path, dhcp, now_val) catch |legacy_err| switch (legacy_err) {
                 error.FileNotFound => {},
                 else => observe_log.err("dhcp: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),

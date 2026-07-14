@@ -75,6 +75,7 @@ pub const ValidationError = error{
     ExternalEndpointForbidden,
     InvalidReinstallPolicy,
     InvalidTftpConcurrency,
+    InvalidTftpBlksize,
 };
 
 /// 完整校验启动配置和 catalog 的引用关系。
@@ -110,8 +111,9 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     if (config.http.asset_root.len == 0 or config.http.repository_root.len == 0)
         return error.EmptyAssetRoot;
     if (config.tftp.asset_root.len == 0) return error.EmptyTftpAssetRoot;
-    // M4.2 F4: validate TFTP performance config
+    // M4.2 F4：校验 TFTP 性能配置
     if (config.tftp.max_concurrent_transfers > 64) return error.InvalidTftpConcurrency;
+    if (config.tftp.max_blksize < 8) return error.InvalidTftpBlksize;
     try validateObservability(config);
     try validateDhcp(&config.dhcp);
     try uniqueNamed(model.DistroConfig, config.distros);
@@ -288,8 +290,8 @@ fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalo
                 const system = profile_install.effectiveSystem(&profile) catch return error.InstallIdentityUnavailable;
                 if (profile.install) |install| try validateInstallConfig(config, system, install) else return error.InvalidProfileSource;
                 try validateTargetSystem(system);
-                // `always` remains deliberately high-risk but is valid only
-                // for the already-required destructive persistent profile.
+                // `always` 保留为刻意高风险选项，但仅对已要求 destructive
+                // persistent 的 profile 有效。
                 if (profile.safety.reinstall_policy == .always and (!profile.safety.destructive or !profile.safety.persistent_writes)) return error.InvalidReinstallPolicy;
             },
             .diskless => {
@@ -340,8 +342,7 @@ fn validateInstallConfig(config: *const model.AppConfig, system: model.TargetSys
         if (part.kind == .biosboot) biosboot = true;
         if (part.kind == .root) root_count += 1;
     }
-    // Empty partitions request adapter defaults; explicit layouts must include
-    // the firmware-required partition.
+    // 空分区列表请求适配器默认布局；显式布局必须包含固件要求的分区。
     if (storage.partitions.len != 0 and storage.boot_mode == .uefi and !esp) return error.InvalidInstallStorage;
     if (storage.partitions.len != 0 and storage.boot_mode == .bios and storage.partition_table == .gpt and !biosboot) return error.InvalidInstallStorage;
     if (storage.partitions.len != 0 and root_count != 1) return error.InvalidInstallStorage;

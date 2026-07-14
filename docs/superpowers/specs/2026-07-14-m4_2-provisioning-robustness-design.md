@@ -82,7 +82,7 @@ M5/M6/M7 继承 M4.2 的以下变更，不得假设旧行为：
 | F4 `node.http_accel` | M5 diskless 模式的 kernel/initrd 同样适用 HTTP 加速；仅对 GRUB UEFI 生效，M6 BIOS PXELINUX 固定使用 `pxelinux.0`（TFTP only），`http_accel` 无效 | M5 (§10.4)、M6 (§11.4) |
 | F5 多公钥 | M5 BootConfig `root_authorized_keys` 可含多个 bootstrap key；M7 finalizer 须断言多 key 归属 | M5 (§10.6)、M7 (§12.3) |
 | F6 CLI 8 资源模型 | M5/M6/M7 新增命令须遵循 resource-action 模型；M5 构建产物归入 `assets`，M6 profile 独立顶层，M7 provision 独立顶层 | M5 (§10.7)、M6 (§11.4)、M7 (§12.8) |
-| F6 node CRUD 管理 API | M6 config diff/apply 须分类 node add/set/remove 为 runtime-applicable；M6 profile/distro/repo CRUD 复用同一原子写回模式 | M6 (§11.6) |
+| F6 node 原子变更 + reload | M6 config diff/apply 须识别 node add/set/remove 的有序重启语义；M6 profile/distro/repo CRUD 复用同一原子写回模式 | M6 (§11.6) |
 | F6 安装目录资源化 | M5 构建产物路径（rootfs/initrd/boot-bundle）须使用新布局 `assets/rootfs/`/`assets/initrd/`/`assets/bundles/`；M7 provisioned 归 `state/provisioned/` | M5 (§10.2)、M7 (§12.2) |
 | F1 `log_url` 注入 | BootConfig 共同字段增加 `log_url`；M5 initrd 如需失败摘要可复用 `/logs` | M5 (§10.4) |
 | F9 boot-gate 去重 | M5 diskless boot-gate 事件（如 `boot.diskless_not_armed`）须复用同一 `BootGateSuppressor` 模式 | M5 (§10.5) |
@@ -151,8 +151,9 @@ deploy: bool = true,
 ```
 
 通过 `node set <id> --deploy false` 管理（CLI 接口见 §9 F6），与 `--ip`/`--mac`/`--profile` 同级。
-新增管理 API `PUT /api/v1/management/nodes/{id}`（`node set`）通过 daemon 原子写回 `config.json`，
-即时生效，不重启 daemon（见 §9.3 节点资源管理 API）。
+CLI 通过 `config_store.save` 原子写回 `config.json`，随后调用本机
+`POST /api/v1/management/config/reload`。daemon 校验新配置后有序退出，由 systemd 重启加载；
+CLI 只有在 reload 请求成功后才报告 mutation 成功（见 §9.6）。
 
 ### 4.5 resolver 变更
 
@@ -283,8 +284,15 @@ curl `/logs`，reason `install.subiquity_error`。
 ##### Ubuntu hostname 始终渲染（M4.2 修复）
 
 原代码中 `identity.hostname` 仅在 `system.users` 非空时渲染。无 users 时 `identity:` 块被跳过，
-hostname 从未设置，导致安装后主机名为 `localhost`。修复：在顶层 cloud-config（`ntp:` 之后）添加
-`hostname:` 字段，始终渲染，独立于 `identity:` 块。
+hostname 从未设置，导致安装后主机名为 `localhost`。修复：始终在 `autoinstall.user-data` 中渲染
+`hostname:` 与 `preserve_hostname: false`，并保留文档顶层 hostname 供安装环境使用。目标 hostname
+不再依赖 identity 是否存在。
+
+##### 默认普通管理用户（M4.2）
+
+省略 `system.users` 时默认创建 `nodeforge`，密码 `asdf1234`，并授予 sudo/wheel 权限；Ubuntu 与
+Kickstart adapter 必须从共享 `TargetSystemConfig` 生成相同账号事实。显式配置 `system.users: []`
+仍表示 root-only。旧版 `install.users` 非空时可覆盖隐式默认值；若新旧字段都显式非空且不一致，继续拒绝歧义配置。
 
 ### 5.4 新增端点汇总
 
@@ -381,7 +389,7 @@ dispatcher（`server.zig:59-121`）收到 RRQ 后 spawn 独立线程处理该 tr
 pub const TftpConfig = struct {
     asset_root: []const u8,
     windowsize: u16 = 4,             // 1-65535，默认 4
-    max_concurrent_transfers: u8 = 4, // 1-64
+    max_concurrent_transfers: u8 = 4, // 0/1=串行，2-64=有界并发
 };
 ```
 
@@ -443,13 +451,13 @@ EFI 连续内存页，导致剩余连续内存不足以分配 13 MB 内核缓冲
 `pxelinux.0`（只支持 TFTP），`http_accel` 对 BIOS 节点无效，kernel/initrd
 始终通过 TFTP 传输。详见 DESIGN.md §5.2.1。
 
-### 7.4 客户端不协商时的优化
+### 7.4 客户端省略 blksize 时的主动建议
 
-客户端发送了至少一个已识别 option（如 `tsize=0`）但未发送 `blksize` 时，在 OACK 中主动建议
-`blksize=1468`（Ethernet MTU 最优：1500 − 20 IP − 8 UDP − 4 TFTP header）。这将默认 512
-字节/块升级到 1468，吞吐提升约 3 倍。仅当已有 OACK 时执行，避免对完全不发 option 的老客户端
-发送 OACK 导致兼容性问题。客户端显式发送的 `blksize` 不被覆盖。不发送 `windowsize` 时，
-按 RFC 7440 默认 `windowsize=1`（保持兼容）。
+客户端发送了至少一个已识别 option（证明支持 RFC 2347 option extension）但省略 `blksize` 时，服务端
+在 OACK 中主动建议 `blksize=1468`（Ethernet MTU 最优值，将 RFC 1350 默认 512 字节/块升级，吞吐约 3 倍）。
+不覆盖客户端显式发送的 `blksize`，不返回大于客户端请求值的 `blksize`（RFC 2348），不对零 option 客户端
+发送 OACK。`windowsize` 不主动建议：未请求时保持 stop-and-wait，避免破坏不支持 RFC 7440 的客户端。
+大文件优化优先使用节点级 HTTP 加速，或使用确实支持 RFC 7440 的 TFTP 客户端。
 
 ### 7.5 校验
 
@@ -692,7 +700,7 @@ nodeforge <resource> <action> [object] [options]
 ```
 ═══ node（节点资源）═══
   list                  列出所有已注册节点                        [M4.2 迁移]
-  show <id>             查看节点详情（属性+状态+部署generation）   [M4.2 新增]
+  show <id>             查看节点声明属性                           [M4.2 新增]
   add <id>              添加节点（--mac --arch --profile --ip...） [M4.2 新增]
   set <id>              修改节点属性（--deploy --ip --mac...）     [M4.2 新增]
   remove <id>           移除节点                                   [M4.2 新增]
@@ -711,7 +719,7 @@ nodeforge <resource> <action> [object] [options]
   validate              校验资产文件和 SHA-256                     [M1 迁移]
   # SSH key 管理（F5）:
   key-import <path>     导入 bootstrap 公钥                         [M4.2 新增]
-  key-reload            重载 bootstrap 公钥（不重启 daemon）        [M4.2 新增]
+  key-reload            校验并有序重启加载 bootstrap 公钥           [M4.2 新增]
   key-show              显示生效公钥来源+fingerprint               [M4.2 新增]
   key-list              列出 assets/keys/*.pub                     [M4.2 新增]
   # M5 新增:
@@ -778,20 +786,15 @@ nodeforge <resource> <action> [object] [options]
 旧路径保留 deprecated alias 一个版本周期（zli `deprecated=true` + `replaced_by`），执行时输出 warning。
 `buildCli` 拆分为按资源的 `register*Commands` 函数。
 
-### 9.6 节点资源管理 API
+### 9.6 节点资源变更与 reload
 
-当前管理 API 仅有 `POST /management/nodes/{id}/install/retry`（rearm）。节点配置（add/set/remove）的唯一
-路径是离线 `config import`（全量替换+重启），不满足 runtime 需求。M4.2 新增节点 CRUD 管理 API：
+`node add/set/remove` 是本机管理员命令：CLI 执行 load-modify-validate-save，复用 `config_store.save` 的
+tmp+fsync+rename 原子写回，再调用 localhost-only 的 `POST /api/v1/management/config/reload`。daemon 在接受
+reload 前重新解析并校验磁盘配置，响应成功后执行完整有序 shutdown，由 systemd `Restart=always` 拉起新实例。
 
-| 方法 | 路由 | CLI 命令 | 用途 |
-|------|------|---------|------|
-| POST | `/api/v1/management/nodes` | `node add` | 添加节点（写回 config.json） |
-| PUT | `/api/v1/management/nodes/{id}` | `node set` | 修改节点属性（含 deploy flag） |
-| DELETE | `/api/v1/management/nodes/{id}` | `node remove` | 移除节点 |
-| GET | `/api/v1/management/nodes/{id}/status` | `node show` | 查看节点详情+状态（已有端点，新增 CLI） |
-
-这些端点通过 daemon 原子写回 `config.json`（复用 `config_store.save` 的 tmp+fsync+rename 原子写），
-不重启 daemon 即时生效。`deploy` 通过 `node set <id> --deploy false` 管理，与 `--ip`/`--mac`/`--profile` 同级。
+该方案有约 2 秒的可配置重启窗口，但避免在运行中替换被 DHCP/TFTP/HTTP 多线程借用的 config slice。
+若写盘成功而 reload 请求失败，CLI 返回非零并明确提示配置已保存、需手工重启，不能谎报“即时生效”。
+`deploy` 仍通过 `node set <id> --deploy false` 管理，与 `--ip`/`--mac`/`--profile` 同级。
 
 `profile`/`distro`/`repository` 等 config 资源的 CRUD 管理 API 不在 M4.2 范围（留 M6）。
 
@@ -866,7 +869,7 @@ resource-action canonical form：
 - `Range: bytes=<size>-` -> 206 + 0 字节（GRUB 完整性验证兼容）；`bytes=<size+1>-` -> 416。
 - 106 MB initrd via HTTP < 5s vs via TFTP ~52s。
 - `assets key-import` -> `assets key-reload` -> `node render` -> 验证 answer 含新公钥。
-- `node add` -> `node set --deploy false` -> `node show` -> `node remove` -> 验证 config.json 原子写回+即时生效。
+- `node add` -> `node set --deploy false` -> `node show` -> `node remove` -> 验证 config.json 原子写回、reload 请求和重启后生效。
 
 ## 11. 文件变更清单
 
@@ -880,7 +883,7 @@ resource-action canonical form：
 | `src/server/admin_key.zig` | 多来源解析、state 目录扫描 |
 | `src/profile/adapter/kickstart.zig` | `%onerror` 增强（traceback 捕获 + curl /logs） |
 | `src/profile/adapter/ubuntu.zig` | `reporting:` 块、`error-commands` 增强（curtin env 捕获 + curl /logs） |
-| `src/http/server.zig` | 新增 `/subiquity-report` 路由；新增 `/boot/<path>` HTTP 加速路由（`bootFileRoute`+`bootFile`）；`answerFixture` 新增 `log_url`；新增 node CRUD 管理路由（POST/PUT/DELETE /management/nodes） |
+| `src/http/server.zig` | 新增 `/subiquity-report` 路由；新增 `/boot/<path>` HTTP 加速路由（`bootFileRoute`+`bootFile`）；`answerFixture` 新增 `log_url`；新增受限 config reload 路由 |
 | `src/http/client.zig` | 新增 node add/set/remove + node status 客户端函数 |
 | `src/http/contracts.zig` | 新增 reason 常量 + node mutation DTO |
 | `src/config/store.zig` | 新增增量写回函数（node add/set/remove 原子修改 config.json） |
@@ -910,8 +913,8 @@ resource-action canonical form：
 7. `assets key-import /root/.ssh/id_ed25519.pub` -> `assets/keys/` 存在；`assets key-reload` ->
    `node render` 输出含新公钥；`assets key-show` 显示来源与 fingerprint。
 8. `node add node-01 --mac 02:aa:bb:cc:dd:ef --arch aarch64 --profile rocky-install` -> config.json 原子写回，
-   `node list` 立即可见；`node set node-01 --ip 192.168.50.101 --deploy false` -> 即时生效；
-   `node show node-01` 显示属性+状态；`node remove node-01` -> 移除。
+   reload 完成后 `node list` 可见；`node set node-01 --ip 192.168.50.101 --deploy false` -> 重启后生效；
+   `node show node-01` 显示声明属性；`node remove node-01` -> 移除。
 9. `nodeforge node list/show/render/retry/trace` 可用；旧 `install render` 输出 deprecation warning 且仍执行。
 10. `nodeforge runtime dhcp-leases` / `dhcp-unknown` / `tftp-counters` / `tftp-sessions` 可用
     （旧 `runtime leases list`/`tftp session list` 输出 warning）。

@@ -8,6 +8,7 @@
   },
   "http": { "max_connections": 0 },
   "tftp": {
+    "max_blksize": 1468,
     "windowsize": 4,
     "max_concurrent_transfers": 4
   },

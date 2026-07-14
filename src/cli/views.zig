@@ -20,7 +20,10 @@ pub fn assets(writer: *std.Io.Writer, rows: []const AssetRow) !void {
     var cells: [64][3][]const u8 = undefined;
     var table_rows: [64]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
-    for (rows, 0..) |row, i| { cells[i] = .{ row.name, row.kind, row.path }; table_rows[i] = .{ .cells = &cells[i] }; }
+    for (rows, 0..) |row, i| {
+        cells[i] = .{ row.name, row.kind, row.path };
+        table_rows[i] = .{ .cells = &cells[i] };
+    }
     try table.render(writer, &columns, table_rows[0..rows.len], "No assets registered.", .{});
 }
 
@@ -56,7 +59,10 @@ pub fn dhcpLeases(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_on
     var cells: [256][4][]const u8 = undefined;
     var table_rows: [256]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
-    for (rows, 0..) |row, i| { cells[i] = .{ row.ip, row.mac, row.phase, row.expires_at }; table_rows[i] = .{ .cells = &cells[i] }; }
+    for (rows, 0..) |row, i| {
+        cells[i] = .{ row.ip, row.mac, row.phase, row.expires_at };
+        table_rows[i] = .{ .cells = &cells[i] };
+    }
     try table.render(writer, &columns, table_rows[0..rows.len], if (unknown_only) "No unknown clients." else "No DHCP leases.", .{});
 }
 
@@ -65,7 +71,10 @@ pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
     var cells: [256][4][]const u8 = undefined;
     var table_rows: [256]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
-    for (rows, 0..) |row, i| { cells[i] = .{ row.id, row.mac, row.ip, row.profile }; table_rows[i] = .{ .cells = &cells[i] }; }
+    for (rows, 0..) |row, i| {
+        cells[i] = .{ row.id, row.mac, row.ip, row.profile };
+        table_rows[i] = .{ .cells = &cells[i] };
+    }
     try table.render(writer, &columns, table_rows[0..rows.len], "No nodes registered.", .{});
 }
 
@@ -74,7 +83,10 @@ pub fn events(writer: *std.Io.Writer, rows: []const EventRow) !void {
     var cells: [1000][5][]const u8 = undefined;
     var table_rows: [1000]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
-    for (rows, 0..) |row, index| { cells[index] = .{ row.ts, row.event_type, row.node, row.message, row.fields }; table_rows[index] = .{ .cells = &cells[index] }; }
+    for (rows, 0..) |row, index| {
+        cells[index] = .{ row.ts, row.event_type, row.node, row.message, row.fields };
+        table_rows[index] = .{ .cells = &cells[index] };
+    }
     try table.render(writer, &columns, table_rows[0..rows.len], "No events recorded.", .{});
 }
 
@@ -89,7 +101,10 @@ pub fn eventTypes(writer: *std.Io.Writer, rows: []const EventTypeRow) !void {
     var cells: [64][3][]const u8 = undefined;
     var table_rows: [64]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
-    for (rows, 0..) |row, index| { cells[index] = .{ row.name, row.level, row.description }; table_rows[index] = .{ .cells = &cells[index] }; }
+    for (rows, 0..) |row, index| {
+        cells[index] = .{ row.name, row.level, row.description };
+        table_rows[index] = .{ .cells = &cells[index] };
+    }
     try table.render(writer, &columns, table_rows[0..rows.len], "No event types registered.", .{});
 }
 
@@ -111,6 +126,7 @@ pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
     try detailField(writer, "IP", node.ip orelse "-");
     try detailField(writer, "Hostname", node.hostname orelse "-");
     try detailField(writer, "Deploy", if (node.deploy) "true" else "false");
+    try detailField(writer, "HTTP accel", if (node.http_accel) "true" else "false");
 }
 
 /// check 失败时仍使用人类可读的状态块；它与 `status` 共享字段对齐而不改变退出码。
@@ -128,7 +144,10 @@ pub fn tftpSessions(writer: *std.Io.Writer, rows: []const TftpSessionRow) !void 
     var cells: [32][3][]const u8 = undefined;
     var table_rows: [32]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
-    for (rows, 0..) |row, i| { cells[i] = .{ row.id, row.phase, row.filename }; table_rows[i] = .{ .cells = &cells[i] }; }
+    for (rows, 0..) |row, i| {
+        cells[i] = .{ row.id, row.phase, row.filename };
+        table_rows[i] = .{ .cells = &cells[i] };
+    }
     try table.render(writer, &columns, table_rows[0..rows.len], "No TFTP sessions recorded.", .{});
 }
 

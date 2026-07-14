@@ -187,12 +187,11 @@ pub const Store = struct {
                 session.last_seen_at = utc_now;
                 return .{ .link = .{ .linked = session.id } };
             }
-            // The installer initrd commonly starts a fresh DHCP transaction
-            // after GRUB has downloaded kernel/initrd.  It is still the same
-            // physical client (same MAC) and boot attempt, so replacing this
-            // already ACKed/TFTP-bound session would invalidate the bootstrap
-            // proof just before `inst.ks`/NoCloud is fetched.  Preserve the
-            // session identity and record the latest DHCP XID instead.
+            // 安装器 initrd 通常在 GRUB 下载 kernel/initrd 后发起全新的
+            // DHCP 事务。这仍是同一物理客户端（相同 MAC）和同一次启动尝试，
+            // 因此替换这个已 ACK/TFTP 绑定的 session 会使 bootstrap proof
+            // 在 `inst.ks`/NoCloud 获取前失效。保留 session 身份并记录
+            // 最新的 DHCP XID。
             if (!isDhcpEarly(session.phase) and session.lease_ip != 0 and mono_now - session.last_seen_mono <= bootstrap_ttl_seconds) {
                 session.dhcp_xid = identity.xid;
                 session.last_seen_mono = mono_now;
@@ -228,14 +227,12 @@ pub const Store = struct {
         defer self.mutex.unlock();
         for (&self.sessions) |*session| {
             if (!session.active() or !std.mem.eql(u8, session.idSlice(), id)) continue;
-            // M4: Don't downgrade the phase from a post-TFTP state back to a
-            // DHCP early state. When the installer initrd performs its own DHCP
-            // after GRUB has loaded kernel/initrd, the DHCP server calls
-            // updateDhcp with .dhcp_ack, which would reset the phase from
-            // tftp_complete to dhcp_ack (early). This causes the next DHCP
-            // renewal to terminate the session (superseded) instead of
-            // preserving it, invalidating the bootstrap proof before
-            // inst.ks / NoCloud is fetched.
+            // M4：不要将 phase 从 post-TFTP 状态降级回 DHCP 早期状态。
+            // 当安装器 initrd 在 GRUB 加载 kernel/initrd 后执行自己的 DHCP
+            // 时，DHCP 服务器会以 .dhcp_ack 调用 updateDhcp，这会将 phase
+            // 从 tftp_complete 重置为 dhcp_ack（早期）。这会导致下一次 DHCP
+            // 续约终止 session（superseded）而非保留它，在 inst.ks / NoCloud
+            // 获取前使 bootstrap proof 失效。
             if (!isDhcpEarly(phase) or isDhcpEarly(session.phase)) {
                 session.phase = phase;
             }
@@ -349,8 +346,8 @@ pub const Store = struct {
             if (session.lease_ip != peer_ip) return error.ProofMismatch;
             return authenticated(session);
         }
-        // Deliberately return stable diagnostic classes so the HTTP layer can
-        // log a safe reason without exposing session identifiers or tokens.
+        // 有意返回稳定的诊断分类，使 HTTP 层可以记录安全原因
+        // 而不暴露 session 标识符或令牌。
         if (node_match and !lease_match) return error.ProofMismatch;
         return error.SessionInactive;
     }
@@ -444,9 +441,9 @@ pub const Store = struct {
         }
     }
 
-    /// Advances an authenticated installer/diskless session beyond DHCP/TFTP.
-    /// This is deliberately separate from node-status: it keeps a fresh DHCP
-    /// transaction from superseding a capability-bearing installer callback.
+    /// 推进已认证的安装器/无盘 session 超越 DHCP/TFTP 阶段。
+    /// 此操作有意与 node-status 分离：它防止新的 DHCP 事务
+    // 覆盖已携带 capability 的安装器回调。
     pub fn advanceDelivery(self: *Store, session_id: []const u8, phase: Phase, mono_now: i64, utc_now: i64) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -711,29 +708,28 @@ test "installer DHCP renewal preserves bootstrap proof after TFTP" {
 }
 
 test "repeated installer DHCP renewals preserve bootstrap proof" {
-    // M4 regression: after the first installer DHCP renewal, updateDhcp was
-    // called with .dhcp_ack, downgrading the phase from tftp_complete to
-    // dhcp_ack (early). The next DHCP renewal would then terminate the
-    // session (superseded) instead of preserving it, invalidating the
-    // bootstrap proof before inst.ks was fetched.
+    // M4 回归测试：首次安装器 DHCP 续约后，updateDhcp 被调用时传入
+    // .dhcp_ack，将 phase 从 tftp_complete 降级为 dhcp_ack（早期阶段）。
+    // 随后的 DHCP 续约会终止 session（被 superseded）而非保留它，
+    // 导致 inst.ks 获取前 bootstrap proof 失效。
     var store: Store = .{};
     const mac = &.{ 0x00, 0x0c, 0x29, 0x38, 0xb9, 0x1f };
     const first = try store.acquireDhcp(std.testing.io, .{ .mac = mac, .xid = 1, .node_id = "node-01", .profile = "rocky", .mode = .install }, 10, 10);
     store.updateDhcp(first.link, .dhcp_ack, 0xc0a81bd2, 11, 11);
     store.updateTftp(first.link, .tftp_complete, 12, 12);
 
-    // First installer DHCP renewal (XID 2)
+    // 首次安装器 DHCP 续约（XID 2）
     const second = try store.acquireDhcp(std.testing.io, .{ .mac = mac, .xid = 2, .node_id = "node-01", .profile = "rocky", .mode = .install }, 20, 20);
     try std.testing.expectEqualStrings(first.link.id().?, second.link.id().?);
     store.updateDhcp(second.link, .dhcp_ack, 0xc0a81bd2, 21, 21);
 
-    // Second installer DHCP renewal (XID 3) — previously failed because
-    // updateDhcp had reset the phase to dhcp_ack (early)
+    // 第二次安装器 DHCP 续约（XID 3）—— 此前因 updateDhcp 将 phase
+    // 重置为 dhcp_ack（早期阶段）而失败
     const third = try store.acquireDhcp(std.testing.io, .{ .mac = mac, .xid = 3, .node_id = "node-01", .profile = "rocky", .mode = .install }, 30, 30);
     try std.testing.expectEqualStrings(first.link.id().?, third.link.id().?);
     store.updateDhcp(third.link, .dhcp_ack, 0xc0a81bd2, 31, 31);
 
-    // Bootstrap proof must still be valid after multiple renewals
+    // 多次续约后 bootstrap proof 必须仍然有效
     const auth = try store.authenticateBootstrap("node-01", 0xc0a81bd2, 32);
     try std.testing.expectEqualStrings(first.link.id().?, auth.boot_session_id[0..]);
 }

@@ -78,3 +78,16 @@ test "APT fallback accepts schema-compatible hyphenated values" {
     defer default_parsed.deinit();
     try std.testing.expectEqual(model.AptFallback.@"offline-install", default_parsed.value.apt.fallback);
 }
+
+test "M4.2 target users default unless explicitly empty" {
+    const omitted = try std.json.parseFromSlice(model.TargetSystemConfig, std.testing.allocator, "{}", .{});
+    defer omitted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), omitted.value.users.len);
+    try std.testing.expectEqualStrings("nodeforge", omitted.value.users[0].name);
+    try std.testing.expectEqualStrings("asdf1234", omitted.value.users[0].password.?);
+    try std.testing.expect(omitted.value.users[0].sudo);
+
+    const empty = try std.json.parseFromSlice(model.TargetSystemConfig, std.testing.allocator, "{\"users\":[]}", .{});
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.value.users.len);
+}

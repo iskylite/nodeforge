@@ -1,8 +1,8 @@
-//! Read-only Event v1/v2 history access shared by local CLI commands.
+//! 只读 Event v1/v2 历史访问，由本地 CLI 命令共享。
 //!
-//! The daemon remains the sole JSONL writer. This module only scans retained
-//! rotations, clones parsed records into the command allocator, and exposes
-//! stable field filters for list, follow, and trace views.
+//! daemon 仍是唯一的 JSONL 写入者。本模块只扫描保留的轮转文件，
+//! 将解析的记录克隆到命令分配器中，并为 list、follow 和 trace
+//! 视图暴露稳定的字段过滤器。
 
 const std = @import("std");
 const events = @import("../state/events.zig");

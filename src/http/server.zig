@@ -40,7 +40,7 @@ const RouteContext = struct {
     deployments: *deployment_control.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
-    /// M4.2 F5: Additional SSH public keys from config and state dir.
+    /// M4.2 F5：来自配置和状态目录的额外 SSH 公钥。
     additional_keys: []const []const u8,
     daemon_instance_id: *const [boot_session.id_len]u8,
     /// M3.1 独立的 I/O 锁，用于 `node-status.json`；永远不与 DHCP checkpoint
@@ -126,11 +126,10 @@ pub fn serve(
         .interface = "0.0.0.0",
         .port = port,
         .on_request = route,
-        // Installer stage2 images are routinely larger than 1 GiB.  Zap's
-        // listener default (5 seconds) terminates a healthy PXE HTTP transfer
-        // on a moderately fast link before Anaconda can finish it.  Keep the
-        // transfer window bounded, but long enough for low-bandwidth lab and
-        // production networks; request/body limits remain enforced per route.
+        // 安装器 stage2 镜像通常超过 1 GiB。Zap listener 默认超时（5 秒）
+        // 在中等速率链路上会在 Anaconda 完成传输前中断正常的 PXE HTTP 传输。
+        // 保持传输窗口有界但足够长以适应低带宽实验和生产网络；
+        // 请求体限制仍按路由独立执行。
         .timeout = 120,
         .log = false,
     });
@@ -139,12 +138,11 @@ pub fn serve(
     event_writer.appendWithFields(io, allocator, paths.events_path, "service.started", "all protocol listeners ready", &.{}) catch |err|
         log.err("unable to record service start: {t}", .{err});
 
-    // `workers > 1` enables facil.io cluster mode and forks the listener.
-    // Boot sessions are intentionally process-local capability state shared
-    // with the DHCP/TFTP threads, so a forked HTTP worker would authenticate
-    // against a stale copy and reject the installer's `/answer` request.
-    // One worker keeps all protocol state in this process; the event loop
-    // remains non-blocking for sendfile downloads and HTTP callbacks.
+    // `workers > 1` 启用 facil.io cluster 模式并 fork listener。
+    // Boot session 是刻意设计为进程本地的能力状态，与 DHCP/TFTP 线程共享，
+    // 因此 fork 出的 HTTP worker 会用过期副本认证，拒绝安装器的 `/answer` 请求。
+    // 单 worker 保持所有协议状态在此进程内；事件循环对 sendfile 下载和
+    // HTTP 回调保持非阻塞。
     zap.start(.{ .threads = 1, .workers = 1 });
 }
 
@@ -281,8 +279,8 @@ fn route(request: zap.Request) !void {
 /// HTTP listener 仅支持 IPv4。精确匹配 127.0.0.1 并 fail closed，
 /// 而非信任 X-Forwarded-For 或接受任意私有子网。
 fn isLoopbackPeer(client_ip: []const u8) bool {
-    // The HTTP listener is IPv4-only. Keep this exact and fail closed rather
-    // than trusting X-Forwarded-For or accepting an arbitrary private subnet.
+    // HTTP listener 仅支持 IPv4。精确匹配并 fail closed，
+    // 而非信任 X-Forwarded-For 或接受任意私有子网。
     return std.mem.eql(u8, client_ip, "127.0.0.1");
 }
 
@@ -326,9 +324,9 @@ fn repoRoute(path: []const u8) ?RepoRoute {
 
 fn imageAsset(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
     context.catalog.lock();
-    // Casper accepts a network ISO only when the kernel `url=` value ends in
-    // `.iso`. Catalog asset IDs are logical names and need not have that
-    // suffix, so `/images/<asset>.iso` is a read-only alias for ISO assets.
+    // Casper 仅在 kernel `url=` 值以 `.iso` 结尾时接受网络 ISO。Catalog 资产
+    // ID 是逻辑名，不一定有该后缀，因此 `/images/<asset>.iso` 是 ISO 资产的
+    // 只读别名。
     const asset = lookup.findAsset(&context.catalog.value, name) orelse if (std.mem.endsWith(u8, name, ".iso") and name.len > ".iso".len)
         lookup.findAsset(&context.catalog.value, name[0 .. name.len - ".iso".len])
     else
@@ -354,15 +352,15 @@ fn rootfsAsset(request: zap.Request, context: *const RouteContext, name: []const
         if (!std.mem.eql(u8, bundle.rootfs, name)) return nodeAuthError(request, error.ProofMismatch, meta);
         const asset = lookup.findAsset(&context.catalog.value, name) orelse return notFound(request, meta);
         if (asset.kind != .rootfs) return notFound(request, meta);
-        // Catalog allocations are append-only for the daemon lifetime, therefore
-        // these slices remain valid after unlock and are safe for the transfer.
+        // Catalog 分配在 daemon 生命周期内是只追加的，因此这些 slice 在
+        // unlock 后仍然有效，可安全用于传输。
         break :blk .{ .path = asset.path, .checksum = asset.sha256 };
     };
     return staticFile(request, context, context.config.http.asset_root, asset_info.path, asset_info.checksum, meta);
 }
 
-/// M4.2 F4: Route for `/boot/<path>` — serves kernel/initrd files from
-/// `tftp.asset_root` via HTTP, enabling GRUB HTTP acceleration.
+/// M4.2 F4：`/boot/<path>` 路由——通过 HTTP 从 `tftp.asset_root` 提供
+/// kernel/initrd 文件，启用 GRUB HTTP 加速。
 ///
 /// GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，大文件（100+ MB initrd）
 /// 在 TFTP 模式下受 RTT 限制仅约 2 MB/s。HTTP 使用 TCP 窗口控制达到接近线速。
@@ -384,7 +382,7 @@ fn bootFileRoute(path: []const u8) ?[]const u8 {
     return relative;
 }
 
-/// M4.2 F4: Serve a boot file (kernel/initrd) from `tftp.asset_root`.
+/// M4.2 F4：从 `tftp.asset_root` 提供启动文件（kernel/initrd）。
 /// Catalog 白名单 + ETag checksum 支持条件请求和断点续传。
 fn bootFile(request: zap.Request, context: *const RouteContext, relative: []const u8, meta: RequestMeta) !void {
     const asset_info = blk: {
@@ -403,12 +401,11 @@ fn repositoryAsset(request: zap.Request, context: *const RouteContext, name: []c
     if (repository == null) return notFound(request, meta);
     const root = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ context.config.http.repository_root, name });
     defer context.allocator.free(root);
-    // M4: URL-decode the tail before file lookup. HTTP clients (e.g., Anaconda)
-    // percent-encode special characters in file names such as `libstdc++` →
-    // `libstdc%2b%2b`. Without decoding, the server looks for the literal
-    // encoded name and returns 404. The decoded path is re-validated inside
-    // `staticFile` → `openRegularFile` → `validateRelativePath` to prevent
-    // path traversal attacks (e.g., `%2e%2e%2f` decodes to `../`).
+    // M4：在文件查找前对 tail 做 URL 解码。HTTP 客户端（如 Anaconda）
+    // 会对文件名中的特殊字符做百分号编码，例如 `libstdc++` →
+    // `libstdc%2b%2b`。不解码则服务器查找字面编码名并返回 404。
+    // 解码后的路径在 `staticFile` → `openRegularFile` → `validateRelativePath`
+    // 中重新校验，防止路径穿越攻击（例如 `%2e%2e%2f` 解码为 `../`）。
     const decode_buf = try context.allocator.alloc(u8, tail.len);
     defer context.allocator.free(decode_buf);
     @memcpy(decode_buf, tail);
@@ -428,14 +425,13 @@ fn staticFile(request: zap.Request, context: *const RouteContext, root: []const 
     var file = asset_validate.openRegularFile(context.io, root, relative) catch return notFound(request, meta);
     errdefer file.close(context.io);
     const size = (try file.stat(context.io)).size;
-    // Subiquity probes APT candidates with HEAD before it runs apt-get.  A
-    // GET-only repository therefore appears unavailable even though package
-    // files can be downloaded.  Preserve the same path confinement and
-    // metadata as GET, but return no body as required by HTTP HEAD.
+    // Subiquity 在运行 apt-get 前用 HEAD 探测 APT 候选镜像。因此仅支持
+    // GET 的仓库会表现为不可用，尽管包文件可以被下载。保留与 GET 相同的
+    // 路径约束和元数据，但按 HTTP HEAD 要求不返回响应体。
     if (std.mem.eql(u8, request.method orelse "", "HEAD")) {
-        // Zap may invalidate request-owned method/path slices as soon as
-        // sendBody hands the response back to facil.io. Preserve the path so
-        // the terminal log and event never observe released request memory.
+        // Zap 可能在 sendBody 将响应交回 facil.io 后立即失效 request 拥有的
+        // method/path slice。保留 path 以确保终端日志和事件不会观察已释放的
+        // request 内存。
         const request_path = try context.allocator.dupe(u8, request.path orelse "<missing>");
         defer context.allocator.free(request_path);
         request.setStatus(.ok);
@@ -508,9 +504,8 @@ fn sendWholeFile(request: zap.Request, context: *const RouteContext, file: *std.
 }
 
 fn sendManagedFile(request: zap.Request, context: *const RouteContext, file: *std.Io.File, range: ByteRange, total_size: u64, relative: []const u8, status: u16, meta: RequestMeta) !void {
-    // `http_sendfile` can release request-owned method/path storage before it
-    // returns. Preserve the path for the synchronous audit event below, just
-    // as the sendBody-backed HEAD and 416 branches do.
+    // `http_sendfile` 可能在返回前释放 request 拥有的 method/path 存储。
+    // 为下方同步审计事件保留 path，与 sendBody 支持的 HEAD 和 416 分支一致。
     const request_path = try context.allocator.dupe(u8, request.path orelse "<missing>");
     defer context.allocator.free(request_path);
     try request.setHeader("accept-ranges", "bytes");
@@ -523,10 +518,9 @@ fn sendManagedFile(request: zap.Request, context: *const RouteContext, file: *st
     // queued progress 而非声称是 peer ACK progress；每个 HTTP Range 请求
     // 仍被记录为一个精确的 chunk。
     log.debug("HTTP download queued {s}: {d}/{d} bytes (range {d}+{d})", .{ relative, range.offset + range.length, total_size, range.offset, range.length });
-    // `request.h.*.status` is not authoritative here: facil.io can retain its
-    // default value until the asynchronous sendfile response is committed.
-    // The caller owns the HTTP decision (200 whole file or 206 range), so pass
-    // that value explicitly to keep terminal logs and events accurate.
+    // `request.h.*.status` 在此处不可靠：facil.io 可能保留其默认值直到异步
+    // sendfile 响应提交。调用方拥有 HTTP 决策（200 整文件或 206 范围），
+    // 因此显式传递该值以保持终端日志和事件准确。
     recordStaticCompletion("GET", request_path, context, relative, status, range.length, total_size, meta);
     request.markAsFinished(true);
 }
@@ -542,10 +536,9 @@ fn rangeNotSatisfiable(request: zap.Request, context: *const RouteContext, size:
     recordStaticCompletion("GET", request_path, context, relative, 416, 0, size, meta);
 }
 
-/// Record the terminal state of every static HTTP response, including HEAD
-/// probes. For sendfile-backed GET responses this means the response was
-/// successfully queued to facil.io; it is not a claim that the peer ACKed all
-/// bytes. The explicit `response_state` field preserves that distinction.
+/// 记录每个静态 HTTP 响应的终态，包括 HEAD 探测。对于 sendfile 支持的 GET
+/// 响应，这意味着响应已成功排队到 facil.io；不代表对端已 ACK 所有字节。
+/// 显式的 `response_state` 字段保留了这一区分。
 fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const RouteContext, relative: []const u8, status: u16, bytes_sent: u64, object_size: u64, meta: RequestMeta) void {
     const duration_us = meta.started.durationTo(std.Io.Clock.awake.now(meta.io)).toMicroseconds();
     const response_state = if (std.mem.eql(u8, method, "GET") and status >= 200 and status < 300) "queued" else "completed";
@@ -579,7 +572,7 @@ fn parseSingleRange(value: []const u8, size: u64) !ByteRange {
     if (std.mem.indexOfScalar(u8, spec[dash + 1 ..], '-') != null) return error.InvalidRange;
     const first = spec[0..dash];
     const last = spec[dash + 1 ..];
-    // Suffix form: bytes=-N → last N bytes
+    // 后缀形式：bytes=-N → 最后 N 字节
     if (first.len == 0) {
         const suffix = std.fmt.parseInt(u64, last, 10) catch return error.InvalidRange;
         if (suffix == 0) return error.InvalidRange;
@@ -597,9 +590,9 @@ fn parseSingleRange(value: []const u8, size: u64) !ByteRange {
     // (416)，符合 RFC 7233 §4.4。
     if (offset > size) return error.InvalidRange;
     if (offset == size) return .{ .offset = offset, .length = 0 };
-    // Open-ended form: bytes=N- → from N to end
+    // 开放形式：bytes=N- → 从 N 到末尾
     if (last.len == 0) return .{ .offset = offset, .length = size - offset };
-    // Bounded form: bytes=N-M → from N to M (inclusive), clipped to size-1
+    // 有界形式：bytes=N-M → 从 N 到 M（含），截断到 size-1
     const requested_last = std.fmt.parseInt(u64, last, 10) catch return error.InvalidRange;
     if (requested_last < offset) return error.InvalidRange;
     const actual_last = @min(requested_last, size - 1);
@@ -650,8 +643,8 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
         std.json.fmt(node_id, .{}),    std.json.fmt(session.boot_session_id[0..], .{}), std.json.fmt(session.profile, .{}), std.json.fmt(@tagName(session.mode), .{}),
         std.json.fmt(config_url, .{}), std.json.fmt(event_url, .{}),
     });
-    // The temporary URL strings above are intentionally copied into the writer
-    // before its lifetime ends; free the writer as one response allocation.
+    // 上方临时 URL 字符串在其生命周期结束前被有意复制到 writer 中；
+    // 将 writer 作为一次响应分配释放。
     switch (session.mode) {
         .install => {
             const answer_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/answer", .{ base, node_id });
@@ -680,10 +673,9 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
     return json(request, .ok, output.written(), meta);
 }
 
-/// M4 installer answer renderer: serves Kickstart (RHEL) or Autoinstall
-/// user-data/meta-data (Ubuntu) to authenticated install-mode nodes.
-/// Bootstrap proof (peer IP match) is accepted on the first fetch and
-/// upgraded to a capability token; subsequent requests use capability proof.
+/// M4 安装器 answer 渲染器：向已认证的 install 模式节点提供 Kickstart（RHEL）
+/// 或 Autoinstall user-data/meta-data（Ubuntu）。首次获取时接受 bootstrap
+/// proof（peer IP 匹配）并升级为 capability token；后续请求使用 capability proof。
 const AnswerFormat = enum { kickstart, user_data, meta_data, vendor_data };
 fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []const u8, format: AnswerFormat, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
@@ -707,7 +699,7 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     } else "";
     defer if (report_url.len > 0) context.allocator.free(report_url);
     const install_orig = profile.install orelse return error.MissingInstallConfig;
-    // M4.2 F5: Merge server-level additional SSH keys into the install config.
+    // M4.2 F5：将服务端级别的额外 SSH 公钥合并到安装配置中。
     const merged_keys: []const []const u8 = if (context.additional_keys.len > 0) blk: {
         const combined = try context.allocator.alloc([]const u8, install_orig.ssh_authorized_keys.len + context.additional_keys.len);
         @memcpy(combined[0..install_orig.ssh_authorized_keys.len], install_orig.ssh_authorized_keys);
@@ -761,14 +753,12 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     request.setStatus(.ok);
     try request.setHeader("content-type", "text/plain; charset=utf-8");
     try request.setHeader("cache-control", "no-store");
-    // `sendBody` may hand the response back to facil.io immediately; log the
-    // borrowed route segment before that hand-off rather than retaining a
-    // request-owned slice for diagnostics afterwards.
+    // `sendBody` 可能立即将响应交回 facil.io；在交接前记录借用的路由段，
+    // 而非之后保留 request 拥有的 slice 用于诊断。
     log.info("GET installer answer -> 200 (node={s}, client={s})", .{ node_id, meta.client_ip });
-    // M4: Record the HTTP request event for observability. `answerFixture`
-    // does not use the `json()` helper (which handles event logging), so the
-    // event must be appended explicitly. Without this, successful kickstart/
-    // autoinstall fetches are invisible in events.jsonl.
+    // M4：记录 HTTP 请求事件用于可观测性。`answerFixture` 不使用 `json()`
+    // 助手（后者处理事件日志），因此必须显式追加事件。否则成功的
+    // kickstart/autoinstall 获取在 events.jsonl 中不可见。
     {
         const duration_us = meta.started.durationTo(std.Io.Clock.awake.now(meta.io)).toMicroseconds();
         var status_text: [4]u8 = undefined;
@@ -805,8 +795,8 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
     if (!std.mem.eql(u8, event.value.boot_session_id, checked.session.boot_session_id[0..])) return nodeAuthError(request, error.ProofMismatch, meta);
     const mapped = mapStage(checked.session.mode, event.value.stage) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"stage_invalid\",\"message\":\"stage not allowed for profile mode\"}}\n", meta);
     const terminal = std.mem.eql(u8, event.value.stage, "completed") or std.mem.eql(u8, event.value.stage, "failed");
-    // A generation is consumed only when the installer itself reports it has
-    // started, never when DHCP, TFTP, or answer delivery merely succeeds.
+    // generation 仅在安装器自身报告已启动时被消费，
+    // 而非 DHCP、TFTP 或 answer 下发成功时消费。
     if (checked.session.mode == .install and std.mem.eql(u8, event.value.stage, "started")) {
         const consumed = context.deployments.consume(node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot consume install generation\"}}\n", meta);
         deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
@@ -871,16 +861,16 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
     return json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
-/// M4.2 F1: Subiquity native HTTP reporting callback.
-/// Subiquity sends JSON events with `event`/`level`/`message` fields.
-/// This handler maps them to NodeForge install stages and records events.
+/// M4.2 F1：Subiquity/curtin 原生 webhook reporting 回调。
+/// curtin 的 `ReportingEvent.as_dict` 使用 `name`、`description`、
+/// `event_type` 和可选 `result` 字段，不是 NodeForge `/events` DTO 的
+/// `event`/`message` 字段。这里先把 curtin 层级事件归一为 NodeForge 阶段。
 ///
-/// Subiquity's curtin webhook reporter does not support custom headers
-/// (see ubuntu adapter: "webhook reporter 不支持 `headers` 字段").
-/// Therefore this endpoint accepts both bootstrap (source-IP) and capability
-/// (bearer token) authentication.  Bootstrap auth verifies that the request
-/// originates from the IP of an active boot session's DHCP lease, which is
-/// sufficient for the isolated PXE provisioning network.
+/// Subiquity 的 curtin webhook reporter 不支持自定义 headers
+///（参见 ubuntu adapter："webhook reporter 不支持 `headers` 字段"）。
+/// 因此此端点同时接受 bootstrap（源 IP）和 capability（bearer token）认证。
+/// Bootstrap 认证验证请求来源于活跃 boot session 的 DHCP lease IP，
+/// 这对隔离的 PXE 部署网络已足够。
 fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
@@ -889,26 +879,31 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
     var params = try request.parametersToOwnedList(context.allocator);
     defer params.deinit();
     var event_name: ?[]const u8 = null;
+    var event_type: ?[]const u8 = null;
+    var webhook_result: ?[]const u8 = null;
     var message: []const u8 = "";
     for (params.items) |param| {
-        if (std.mem.eql(u8, param.key, "event")) event_name = stringParam(param.value) else if (std.mem.eql(u8, param.key, "message")) message = stringParam(param.value) orelse "";
+        if (std.mem.eql(u8, param.key, "name")) {
+            event_name = stringParam(param.value);
+        } else if (std.mem.eql(u8, param.key, "description")) {
+            message = stringParam(param.value) orelse "";
+        } else if (std.mem.eql(u8, param.key, "event_type")) {
+            event_type = stringParam(param.value);
+        } else if (std.mem.eql(u8, param.key, "result")) {
+            webhook_result = stringParam(param.value);
+        }
     }
-    const event = event_name orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"subiquity.invalid\",\"message\":\"missing event field\"}}\n", meta);
-    // Map Subiquity events to NodeForge install stages.
-    const resolved_stage: ?[]const u8 = blk: {
-        if (std.ascii.eqlIgnoreCase(event, "STARTED")) break :blk "started";
-        if (std.ascii.eqlIgnoreCase(event, "PARTITIONING")) break :blk "partitioning";
-        if (std.ascii.eqlIgnoreCase(event, "PACKAGES")) break :blk "packages";
-        if (std.ascii.eqlIgnoreCase(event, "BOOTLOADER")) break :blk "bootloader";
-        if (std.ascii.eqlIgnoreCase(event, "DONE")) break :blk "completed";
-        if (std.ascii.eqlIgnoreCase(event, "ERROR")) break :blk "failed";
-        break :blk null;
-    };
+    const event = event_name orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"subiquity.invalid\",\"message\":\"missing name field\"}}\n", meta);
+    const resolved_stage = mapSubiquityStage(event, event_type orelse "", webhook_result orelse "");
     const stage = resolved_stage orelse {
-        // Unknown Subiquity events are acknowledged but not recorded.
+        // 未知的 Subiquity 事件被确认但不记录。
         return json(request, .ok, "{\"ok\":true}\n", meta);
     };
-    const terminal = std.mem.eql(u8, stage, "completed") or std.mem.eql(u8, stage, "failed");
+    const deployment_terminal = std.mem.eql(u8, stage, "completed") or std.mem.eql(u8, stage, "failed");
+    // curtin 的 FAIL webhook 通常先于 error-commands。失败时先更新 deployment
+    // 和状态，但保留 capability，让随后携带 traceback 的 /logs 仍可认证；
+    // 成功没有后续失败摘要，可以立即关闭 delivery。
+    const delivery_terminal = std.mem.eql(u8, stage, "completed");
     const mapped = mapStage(.install, stage) orelse return json(request, .ok, "{\"ok\":true}\n", meta);
     if (std.mem.eql(u8, stage, "started")) {
         const consumed = context.deployments.consume(node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot consume install generation\"}}\n", meta);
@@ -918,7 +913,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist install generation\"}}\n", meta);
         };
     }
-    if (terminal) {
+    if (deployment_terminal) {
         const terminal_result = context.deployments.markTerminal(node_id, std.mem.eql(u8, stage, "completed"));
         deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
             if (terminal_result) |result| context.deployments.rollbackTerminal(node_id, result);
@@ -926,7 +921,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
         };
     }
-    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, mapped.phase, null, unixNow(), !terminal) catch |err|
+    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, mapped.phase, null, unixNow(), !delivery_terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [3]events.Field = .{
@@ -938,13 +933,45 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
         observe_log.err("subiquity report event append failed: {t}", .{err});
         return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"events.unavailable\",\"message\":\"event writer unavailable\"}}\n", meta);
     };
-    if (terminal) {
-        context.sessions.finishDelivery(checked.session.boot_session_id[0..], if (std.mem.eql(u8, stage, "completed")) .completed else .failed, boot_session.monotonicNow(), unixNow());
-    } else {
+    if (delivery_terminal) {
+        context.sessions.finishDelivery(checked.session.boot_session_id[0..], .completed, boot_session.monotonicNow(), unixNow());
+    } else if (!std.mem.eql(u8, stage, "failed")) {
         const phase: boot_session.Phase = if (std.mem.eql(u8, stage, "installer_started")) .installer_started else if (std.mem.eql(u8, stage, "started")) .installing else .installing;
         context.sessions.advanceDelivery(checked.session.boot_session_id[0..], phase, boot_session.monotonicNow(), unixNow());
     }
     return json(request, .ok, "{\"ok\":true}\n", meta);
+}
+
+/// 将 curtin 的层级事件名映射为稳定的 NodeForge 安装阶段。
+/// 子阶段通常形如 `curtin/command-install/stage-partitioning`；只有根级
+/// `command-install` 的成功终态才映射为 completed，避免某个子阶段完成时
+/// 提前关闭 boot session。失败 result 则无论发生在哪个子阶段都立即上报。
+fn mapSubiquityStage(name: []const u8, event_type: []const u8, result: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(result, "FAIL")) return "failed";
+    const install_root = endsWithIgnoreCase(name, "command-install");
+    if (install_root and std.ascii.eqlIgnoreCase(event_type, "start")) return "started";
+    if (install_root and (std.ascii.eqlIgnoreCase(event_type, "finish") or std.ascii.eqlIgnoreCase(event_type, "result")) and std.ascii.eqlIgnoreCase(result, "SUCCESS")) return "completed";
+
+    // curtin 会为每个子阶段同时发送 start 和 finish。NodeForge 的阶段事件
+    // 表示“进入该阶段”，因此只消费 start，避免成功结束时重复写同一阶段。
+    if (!std.ascii.eqlIgnoreCase(event_type, "start")) return null;
+    if (containsIgnoreCase(name, "partition")) return "partitioning";
+    if (containsIgnoreCase(name, "extract") or containsIgnoreCase(name, "package") or containsIgnoreCase(name, "apt-config")) return "packages";
+    if (containsIgnoreCase(name, "bootloader") or containsIgnoreCase(name, "grub") or containsIgnoreCase(name, "curthooks")) return "bootloader";
+    return null;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
+    return value.len >= suffix.len and std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
 }
 
 const ParsedNodeEvent = struct { value: @import("contracts.zig").NodeEvent, params: zap.Request.HttpParamKVList };
@@ -955,9 +982,8 @@ fn parseNodeEvent(request: zap.Request, allocator: std.mem.Allocator) !ParsedNod
     var params = try request.parametersToOwnedList(allocator);
     errdefer params.deinit();
     if (params.items.len < 3 or params.items.len > 5) return error.InvalidNodeEvent;
-    // `reason` and `message` are optional.  Start from their contract
-    // defaults rather than inspecting uninitialized optionals while checking
-    // duplicate keys in an otherwise valid client payload.
+    // `reason` 和 `message` 是可选字段。从 contract 默认值开始，
+    // 而非在检查有效客户端负载中的重复键时检查未初始化的 optional。
     var result: @import("contracts.zig").NodeEvent = .{ .v = 0, .boot_session_id = "", .stage = "" };
     var seen_v = false;
     var seen_session = false;
@@ -1047,10 +1073,10 @@ fn bodyWithin(request: zap.Request, maximum: usize) bool {
 }
 
 fn nodeAuthError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
-    // This deliberately records only the stable error tag and direct peer;
-    // credentials, headers and request body are never logged.
-    // A rejected installer bootstrap must be visible at the normal operating
-    // log level while still excluding credentials, headers and request bodies.
+    // 刻意仅记录稳定的错误标签和 direct peer；
+    // 凭据、headers 和请求体永远不会被记录。
+    // 被拒绝的安装器 bootstrap 必须在正常操作日志级别可见，
+    // 同时仍排除凭据、headers 和请求体。
     observe_log.warn("node auth rejected client={s} reason={t}", .{ meta.client_ip, err });
     return switch (err) {
         error.MissingProof => json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"node.missing_proof\",\"message\":\"node proof required\"}}\n", meta),
@@ -1144,10 +1170,9 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
         return assetInputError(request, @errorName(err), meta);
     };
     context.catalog.publishInstallSource(context.io, context.config, imported) catch |err| {
-        // importMedia has already copied immutable files into managed roots.
-        // A rejected candidate must not accumulate inaccessible public-root
-        // orphans (for example, when the media tuple is not declared in the
-        // operator's configured distro matrix).
+        // importMedia 已经将不可变文件复制到受管根目录。
+        // 被拒绝的候选不得积累不可访问的 public-root 孤儿文件
+        //（例如，当 media 三元组未在操作员配置的 distro 矩阵中声明时）。
         iso_import.cleanupPublishedOutputs(context.io, context.allocator, context.config, &imported);
         observe_log.err("ISO catalog publication failed: {t}", .{err});
         return assetInputError(request, @errorName(err), meta);
@@ -1383,8 +1408,8 @@ fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, met
                 observe_log.err("http: event append failed: {t}", .{err});
         }
     }
-    // Set the header directly instead of `sendJson`: Zap's helper emits its own
-    // debug line even when NodeForge is configured for info-level logging.
+    // 直接设置 header 而非使用 `sendJson`：Zap 的助手会发出自己的
+    // debug 行，即使 NodeForge 配置为 info 级别日志。
     try request.setHeader("content-type", "application/json");
     try request.sendBody(body);
 }
@@ -1395,20 +1420,31 @@ test "Zap-backed route module compiles" {
     try std.testing.expect(!isLoopbackPeer("192.168.50.9"));
 }
 
+test "M4.2 curtin webhook events map to stable install stages" {
+    try std.testing.expectEqualStrings("started", mapSubiquityStage("curtin/command-install", "start", "").?);
+    try std.testing.expectEqualStrings("partitioning", mapSubiquityStage("curtin/command-install/stage-partitioning", "start", "").?);
+    try std.testing.expectEqualStrings("packages", mapSubiquityStage("curtin/command-install/stage-extract", "start", "").?);
+    try std.testing.expectEqualStrings("bootloader", mapSubiquityStage("curtin/command-install/stage-curthooks", "start", "").?);
+    try std.testing.expectEqualStrings("completed", mapSubiquityStage("curtin/command-install", "finish", "SUCCESS").?);
+    try std.testing.expectEqualStrings("failed", mapSubiquityStage("curtin/command-install/stage-extract", "finish", "FAIL").?);
+    // 子阶段成功只表示该阶段结束，不能提前关闭整个 boot session。
+    try std.testing.expect(mapSubiquityStage("curtin/command-install/stage-extract", "finish", "SUCCESS") == null);
+}
+
 test "single byte ranges cover bounded, open-ended, suffix and EOF forms" {
-    // Bounded: bytes=4-7 → offset=4, length=4
+    // 有界形式：bytes=4-7 → offset=4, length=4
     const bounded = try parseSingleRange("bytes=4-7", 10);
     try std.testing.expectEqual(ByteRange{ .offset = 4, .length = 4 }, bounded);
-    // Clipped: bytes=8-99 → offset=8, length=2 (clipped to size-1)
+    // 截断形式：bytes=8-99 → offset=8, length=2（截断到 size-1）
     const clipped = try parseSingleRange("bytes=8-99", 10);
     try std.testing.expectEqual(ByteRange{ .offset = 8, .length = 2 }, clipped);
-    // Open-ended: bytes=7- → offset=7, length=3
+    // 开放形式：bytes=7- → offset=7, length=3
     const open_ended = try parseSingleRange("bytes=7-", 10);
     try std.testing.expectEqual(ByteRange{ .offset = 7, .length = 3 }, open_ended);
-    // Suffix: bytes=-4 → offset=6, length=4
+    // 后缀形式：bytes=-4 → offset=6, length=4
     const suffix = try parseSingleRange("bytes=-4", 10);
     try std.testing.expectEqual(ByteRange{ .offset = 6, .length = 4 }, suffix);
-    // Multi-range rejected
+    // 多段 Range 被拒绝
     try std.testing.expectError(error.InvalidRange, parseSingleRange("bytes=0-1,3-4", 10));
     // GRUB HTTP 兼容：bytes=<size>- 返回空范围(offset=size, length=0)而非 error
     const eof_range = try parseSingleRange("bytes=10-", 10);

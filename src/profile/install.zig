@@ -1,17 +1,34 @@
-//! Adapter-independent M4.1 install-plan normalization.
+//! 适配器无关的 M4.1 安装计划规范化。
 const std = @import("std");
 const model = @import("../model.zig");
 
-/// Resolve the one-period M4 compatibility fields without allowing ambiguous
-/// merges.  Renderers only receive the returned shared system model.
+/// 解析单周期 M4 兼容字段，不允许歧义合并。
+/// 渲染器只接收返回的共享 system 模型。
 pub fn effectiveSystem(profile: *const model.ProfileConfig) !model.TargetSystemConfig {
     var system = profile.system;
     const legacy = profile.install orelse return system;
-    if (system.users.len != 0 and legacy.users.len != 0) return error.LegacySystemUsersConflict;
+    const implicit_default_users = model.targetUsersAreImplicitDefault(system.users);
+    if (system.users.len != 0 and legacy.users.len != 0 and !implicit_default_users) return error.LegacySystemUsersConflict;
     if (system.packages.len != 0 and legacy.packages.len != 0) return error.LegacySystemPackagesConflict;
-    if (system.users.len == 0) system.users = legacy.users;
+    if ((system.users.len == 0 or implicit_default_users) and legacy.users.len != 0) system.users = legacy.users;
     if (system.packages.len == 0) system.packages = legacy.packages;
     return system;
+}
+
+test "M4.2 implicit users default and legacy compatibility" {
+    const base: model.ProfileConfig = .{ .name = "rocky", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .x86_64 };
+    const default_system = try effectiveSystem(&base);
+    try std.testing.expectEqual(@as(usize, 1), default_system.users.len);
+    try std.testing.expectEqualStrings("nodeforge", default_system.users[0].name);
+
+    var legacy = base;
+    legacy.install = .{ .users = &.{.{ .name = "legacy" }} };
+    const legacy_system = try effectiveSystem(&legacy);
+    try std.testing.expectEqualStrings("legacy", legacy_system.users[0].name);
+
+    var conflict = legacy;
+    conflict.system.users = &.{.{ .name = "new" }};
+    try std.testing.expectError(error.LegacySystemUsersConflict, effectiveSystem(&conflict));
 }
 
 pub fn planDigest(allocator: std.mem.Allocator, node: *const model.NodeConfig, profile: *const model.ProfileConfig, source: *const model.InstallSourceConfig) !u64 {

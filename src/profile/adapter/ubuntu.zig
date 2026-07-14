@@ -41,8 +41,8 @@ const render = @import("../render.zig");
 const runner = @import("../../provision/runner.zig");
 const password_hash = @import("../password_hash.zig");
 
-/// M4.1 renderer.  The original M4 entry point remains as a compatibility
-/// wrapper; all daemon answer delivery uses this common-system variant.
+/// M4.1 渲染器。原始 M4 入口点保留为兼容包装；
+/// 所有 daemon answer 下发均使用此 common-system 变体。
 pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -64,8 +64,8 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
         try render.yamlQuote(w, package);
         try w.writeByte('\n');
     }
-    // Jammy requires a complete identity stanza whenever a normal user is
-    // requested. Root and further accounts remain explicitly scoped below.
+    // Jammy 在请求普通用户时要求完整的 identity 段。Root 和其他账户
+    // 在下方显式配置。
     if (system.users.len != 0) {
         const identity = system.users[0];
         try w.writeAll("  identity:\n    hostname: ");
@@ -155,7 +155,11 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
             }
         }
     }
-    try w.writeAll("  user-data:\n    disable_root: false\n    ssh_pwauth: ");
+    // 目标系统的 cloud-init 只消费 autoinstall.user-data。文档根节点的
+    // hostname 仅影响安装环境，不能替代这里的目标 hostname。
+    try w.writeAll("  user-data:\n    hostname: ");
+    try render.yamlQuote(w, render.hostname(node));
+    try w.writeAll("\n    preserve_hostname: false\n    disable_root: false\n    ssh_pwauth: ");
     try w.writeAll(if (system.ssh.password_authentication) "true" else "false");
     try w.writeAll("\n    users:\n");
     try renderCloudUser(w, allocator, "root", system.ssh.root_password, false, bootstrap_key, system.ssh.root_authorized_keys, &.{}, password_scope);
@@ -211,12 +215,11 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
         try w.writeByte('\n');
     }
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"post\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
-    // This is deliberately the final successful installer-side action.  It
-    // closes the durable generation and records the applied revision before
-    // Subiquity performs the configured reboot.
+    // 这是刻意安排的最后一个安装器侧成功操作。它在 Subiquity 执行
+    // 配置的重启之前关闭持久化 generation 并记录已应用的修订版本。
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"completed\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.writeAll("  error-commands:\n");
-    try w.print("    - 'ERR_CMD=${{ERROR_CMD}} ERR_STATUS=${{ERROR_STATUS}} ERR_TB=${{ERROR_TRACEBACK}} && curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/x-www-form-urlencoded\" -d \"v=1&boot_session_id={s}&reason=install.subiquity_error&summary=subiquity error: $ERR_CMD $ERR_STATUS $ERR_TB\" {s} || true'\n", .{ token, session, session, log_url });
+    try w.print("    - 'ERR_CMD=${{ERROR_CMD}} ERR_STATUS=${{ERROR_STATUS}} ERR_TB=${{ERROR_TRACEBACK}} && SUMMARY=$(printf \"subiquity error: %s %s %s\" \"$ERR_CMD\" \"$ERR_STATUS\" \"$ERR_TB\" | head -c 1800) && curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" --data-urlencode \"v=1\" --data-urlencode \"boot_session_id={s}\" --data-urlencode \"reason=install.subiquity_error\" --data-urlencode \"summary=$SUMMARY\" {s} || true'\n", .{ token, session, session, log_url });
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"failed\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     if (system.connectivity.time_sync) {
         try w.writeAll("ntp:\n  enabled: true\n  servers:\n");
@@ -226,9 +229,7 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
             try w.writeByte('\n');
         }
     } else try w.writeAll("ntp:\n  enabled: false\n");
-    // cloud-init top-level hostname: always set, independent of identity stanza.
-    // When system.users is empty, identity is skipped, but hostname must still
-    // be set or the installed system defaults to "localhost".
+    // 同时设置安装环境 hostname；目标系统由上方 autoinstall.user-data 设置。
     try w.writeAll("hostname: ");
     try render.yamlQuote(w, render.hostname(node));
     try w.writeByte('\n');
@@ -236,9 +237,8 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
     return out.toOwnedSlice();
 }
 
-/// Render either a constrained direct layout pinned to `boot_disk`, or an
-/// explicit curtin action graph.  This prevents a profile's selected target
-/// disk/partitions from being silently discarded by Subiquity.
+/// 渲染绑定到 `boot_disk` 的受约束 direct 布局，或显式 curtin action graph。
+/// 防止 profile 选择的目标磁盘/分区被 Subiquity 静默丢弃。
 fn renderStorageM41(w: *std.Io.Writer, install: model.InstallConfig) !void {
     if (install.storage.partitions.len == 0) {
         try w.writeAll("  storage:\n    layout:\n      name: direct\n      match:\n        path: ");
@@ -557,6 +557,7 @@ test "M4.1 autoinstall renders target defaults and static network" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "servers:\n    - 'ntp.nodeforge.local'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "early-commands") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "error-commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "--data-urlencode \"summary=$SUMMARY\"") != null);
     // reporting 块不渲染（report_url 为空时跳过）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "reporting:") == null);
     // curl 回调中仍含 Authorization: Bearer header（降级路径）
@@ -581,13 +582,22 @@ test "M4.2 webhook reporting rendered when report_url is non-empty" {
 }
 
 test "M4.2 hostname always rendered even without users" {
-    // 无 users 时 identity 被跳过，但 hostname 仍在顶层 cloud-config 中设置
+    // 显式空 users 保留 root-only；目标 hostname 必须位于 autoinstall.user-data。
     const node: model.NodeConfig = .{ .id = "node-nh", .mac = "00:11:22:33:44:bb", .arch = .aarch64, .profile = "ubuntu", .hostname = "myhost" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope");
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{ .users = &.{} }, "ssh-key", null, "http://repo", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope");
     defer std.testing.allocator.free(bytes);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "hostname: 'myhost'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "  user-data:\n    hostname: 'myhost'\n    preserve_hostname: false\n    disable_root: false") != null);
     // identity 不应出现（无 users）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "identity:") == null);
+}
+
+test "M4.2 autoinstall renders default nodeforge identity" {
+    const node: model.NodeConfig = .{ .id = "node-default", .mac = "00:11:22:33:44:bc", .arch = .aarch64, .profile = "ubuntu", .hostname = "ubuntu-default" };
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "identity:\n    hostname: 'ubuntu-default'\n    username: 'nodeforge'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "name: 'nodeforge'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "groups: [sudo]") != null);
 }
 
 test "late command keeps managed files single-line and fail-fast" {

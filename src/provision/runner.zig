@@ -23,9 +23,9 @@ fn writeShellQuoted(writer: *std.Io.Writer, value: []const u8) !void {
     try writer.writeByte('\'');
 }
 
-/// Write arbitrary file bytes without embedding literal newlines in the
-/// generated shell program. POSIX `printf %b` accepts `\0ddd` octal escapes;
-/// encoding every byte also prevents shell expansion and delimiter injection.
+/// 写入任意文件字节，不在生成的 shell 程序中嵌入字面换行符。
+/// POSIX `printf %b` 接受 `\0ddd` 八进制转义；逐字节编码也防止了
+/// shell 展开和分隔符注入。
 fn writePrintfBytes(writer: *std.Io.Writer, content: []const u8) !void {
     try writer.writeAll("printf '%b' '");
     for (content) |byte| try writer.print("\\0{o:0>3}", .{byte});

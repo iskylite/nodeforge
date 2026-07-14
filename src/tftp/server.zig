@@ -33,15 +33,12 @@ const max_options = 8;
 /// 允许的最大 `blksize` 值（RFC 2348）；超过此值的请求被拒绝。
 /// 受限于 UDP datagram 最大安全负载（65535 - 20 IP - 8 UDP = 65507）。
 const max_block_size: usize = 65_464;
-/// DATA 重传次数上限；超过后放弃传输。RFC 1350 建议超时重传。
-/// 设为 5 与 tftpd-hpa 默认值一致，给 GRUB TFTP 客户端足够时间处理
-/// 大文件末尾块的 ACK（139 MB initrd 在 blksize=1024 下需 ~60s 传输）。
-const max_retries = 5;
-/// Ethernet MTU 最优 TFTP block size: 1500 - 20 (IP) - 8 (UDP) - 4 (TFTP header) = 1468。
-/// 用于 §7.4 OACK 主动建议：客户端未发送 blksize 但已发送其他 option 时，
-/// 在 OACK 中建议此值，将默认 512 字节/块升级到 1468，吞吐提升约 3 倍。
-const ethernet_blksize: usize = 1468;
-
+/// TFTP DATA/ACK 超时（秒），与 tftpd-hpa 默认一致。客户端未在 RRQ 发送
+/// `timeout` option 时采用此值；给 GRUB 足够时间处理大文件末尾块的 ACK。
+const default_timeout: u8 = 5;
+/// DATA 重传次数上限；超过后放弃传输（RFC 1350 建议超时重传）。与 tftpd-hpa
+/// 默认一致，配合 5s 超时应对大文件末尾块 ACK 偶发延迟。
+const max_retries: u8 = 5;
 /// 在固定 UDP 69 上运行 TFTP RRQ dispatcher。
 ///
 /// `config` 提供 TFTP asset root 路径；`catalog` 提供资产白名单快照；
@@ -60,11 +57,14 @@ pub fn bind(io: std.Io, server_ip: []const u8) !std.Io.net.Socket {
 
 /// 在已绑定 socket 上运行 RRQ dispatcher。调用方转移 socket 的关闭责任。
 ///
-/// 主循环：接收 UDP datagram -> 解析 TFTP 报文 -> 如果是 RRQ 则启动文件传输 ->
-/// 传输在当前线程串行完成（M1 单 worker 模型）。WRQ 返回 ERROR；其他类型返回 ERROR。
+/// 主循环只负责接收和分发。`max_concurrent_transfers <= 1` 保留串行模式；
+/// 大于 1 时为每个 RRQ 启动有界 worker，worker 使用复制后的 datagram，绝不
+/// 借用下一轮 receive 会覆盖的栈缓冲区。
 pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned_socket;
     defer socket.close(io);
+    var active_transfers = std.atomic.Value(u8).init(0);
+    defer while (active_transfers.load(.acquire) != 0) std.Thread.yield() catch {};
 
     while (true) {
         if (if (stop) |flag| flag.load(.acquire) else false) return;
@@ -80,82 +80,137 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
         };
         switch (message) {
             .rrq => |request| {
-                const session = runtime.tftp.begin(request.filename);
-                // TFTP 没有 MAC/XID；只接受活动 session 中唯一的已 ACK lease-IP。
-                // 零个或多个命中均保留 session_link_state，绝不能按文件名、TID
-                // 或最近 DHCP 日志猜测关联。
-                var session_link: ?boot_session.Link = null;
-                if (sessions) |store| session_link = store.associateTftp(clientIpv4(&incoming.from) orelse 0, boot_session.monotonicNow(), now());
-                if (session_link) |*link| {
-                    if (link.id()) |id| log.info("RRQ {s} session={s}", .{ request.filename, id }) else log.warn("RRQ {s} session_link_state={s}", .{ request.filename, link.state().? });
-                } else log.info("RRQ {s}", .{request.filename});
-                const started = std.Io.Clock.awake.now(io);
-                emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, if (session_link) |*link| link else null);
-
-                // M3.5/M3.6：在 catalog manifest 白名单检查之前拦截虚拟 GRUB 配置请求。
-                // 只有严格匹配的文件名才是虚拟配置候选；仍需要一个有效的已 ACK
-                // session 才能渲染和传输配置。虚拟名称是动态策略端点而非磁盘文件，
-                // 因此访问拒绝必须返回 TFTP ERROR code 2（access violation）
-                // 而非 code 1（file not found）。这区分了“策略拒绝”和“文件不存在”，
-                // 使 PXE 客户端和操作员能正确诊断启动失败原因。
-                const is_virtual = isVirtualGrubConfig(request.filename);
-                const bytes_sent = if (is_virtual)
-                    transferVirtualConfig(io, &incoming.from, request, config, catalog, sessions) catch |err| {
-                        runtime.tftp.finish(session, false);
-                        if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
-                        switch (err) {
-                            error.BootAccessDenied, error.BootTargetUnavailable, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected virtual config {s} from {f}: {t}", .{ request.filename, incoming.from, err }),
-                            else => observe_log.err("tftp: virtual config transfer failed for {s}: {t}", .{ request.filename, err }),
-                        }
-                        emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
-                        // M3.6 错误语义：虚拟 GRUB 配置请求的失败是授权/策略拒绝，
-                        // 不是文件缺失。返回 TFTP ERROR code 2（access violation）
-                        // 而非 code 1（file not found）。
-                        // - BootAccessDenied：无活动 DHCP lease 或 session 已过期
-                        // - BootTargetUnavailable：有 session 但 profile/catalog 引用无效
-                        // - UnsupportedMode/InvalidOption：TFTP mode 非 octet 或 option 非法
-                        const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
-                            error.BootAccessDenied => .{ .code = .access_violation, .message = "boot configuration requires an active DHCP lease" },
-                            error.BootTargetUnavailable => .{ .code = .access_violation, .message = "boot configuration unavailable for this node" },
-                            error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
-                            else => .{ .code = .undefined, .message = "transfer failed" },
-                        };
-                        try sendError(&socket, io, &incoming.from, response.code, response.message);
-                        continue;
-                    }
-                else
-                    transfer(io, &incoming.from, request, config.tftp.asset_root, catalog, config.tftp.windowsize) catch |err| {
-                        runtime.tftp.finish(session, false);
-                        if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
-                        switch (err) {
-                            error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, incoming.from, err }),
-                            else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
-                        }
-                        emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
-                        // 静态文件传输的错误语义遵循 RFC 1350 标准：
-                        // - FileNotAllowed/FileNotFound → code 1（file not found）
-                        // - UnsupportedMode/InvalidOption → code 4（illegal operation）
-                        // - AccessDenied/PermissionDenied/SymLinkLoop → code 2（access violation）
-                        const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
-                            error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
-                            error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
-                            error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => .{ .code = .access_violation, .message = "access denied" },
-                            else => .{ .code = .undefined, .message = "transfer failed" },
-                        };
-                        try sendError(&socket, io, &incoming.from, response.code, response.message);
-                        continue;
-                    };
-                runtime.tftp.finish(session, true);
-                if (session_link) |link| if (sessions) |store| store.updateTftp(link, .tftp_complete, boot_session.monotonicNow(), now());
-                if (session_link) |*link| {
-                    if (link.id()) |boot_id| observe_log.info("tftp: transfer completed {s} ({d} bytes) session={s}", .{ request.filename, bytes_sent, boot_id }) else observe_log.info("tftp: transfer completed {s} ({d} bytes) session_link_state={s}", .{ request.filename, bytes_sent, link.state().? });
-                } else observe_log.info("tftp: transfer completed {s} ({d} bytes)", .{ request.filename, bytes_sent });
-                emit(event_writer, io, allocator, &incoming.from, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+                const limit = config.tftp.max_concurrent_transfers;
+                if (limit <= 1) {
+                    try handleRrq(io, allocator, incoming.from, request, config, catalog, runtime, event_writer, sessions);
+                    continue;
+                }
+                if (!reserveTransferSlot(&active_transfers, limit)) {
+                    try sendError(&socket, io, &incoming.from, .undefined, "server busy, retry later");
+                    continue;
+                }
+                const datagram = allocator.dupe(u8, incoming.data) catch |err| {
+                    _ = active_transfers.fetchSub(1, .acq_rel);
+                    return err;
+                };
+                const context = allocator.create(TransferWorker) catch |err| {
+                    allocator.free(datagram);
+                    _ = active_transfers.fetchSub(1, .acq_rel);
+                    return err;
+                };
+                context.* = .{ .io = io, .allocator = allocator, .datagram = datagram, .remote = incoming.from, .config = config, .catalog = catalog, .runtime = runtime, .event_writer = event_writer, .sessions = sessions, .active = &active_transfers };
+                const thread = std.Thread.spawn(.{}, runTransferWorker, .{context}) catch |err| {
+                    _ = active_transfers.fetchSub(1, .acq_rel);
+                    allocator.free(datagram);
+                    allocator.destroy(context);
+                    observe_log.err("tftp: unable to start transfer worker: {t}", .{err});
+                    try sendError(&socket, io, &incoming.from, .undefined, "server busy, retry later");
+                    continue;
+                };
+                thread.detach();
             },
             .wrq => try sendError(&socket, io, &incoming.from, .access_violation, "write requests are disabled"),
             else => try sendError(&socket, io, &incoming.from, .illegal_operation, "expected RRQ"),
         }
     }
+}
+
+/// dispatcher 是唯一的 slot 生产者，worker 只负责递减，因此一次 load 后递增
+/// 不会与另一个生产者竞争；该约束比为单线程 dispatcher 引入 CAS 循环更清晰。
+fn reserveTransferSlot(active: *std.atomic.Value(u8), limit: u8) bool {
+    if (active.load(.acquire) >= limit) return false;
+    _ = active.fetchAdd(1, .acq_rel);
+    return true;
+}
+
+const TransferWorker = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    datagram: []u8,
+    remote: std.Io.net.IpAddress,
+    config: *const model.AppConfig,
+    catalog: *catalog_runtime.CatalogRuntime,
+    runtime: *runtime_state.RuntimeState,
+    event_writer: ?*events.Writer,
+    sessions: ?*boot_session.Store,
+    active: *std.atomic.Value(u8),
+};
+
+fn runTransferWorker(context: *TransferWorker) void {
+    // active 最后递减；dispatcher 看到 0 时，worker 已释放所有借用资源。
+    defer _ = context.active.fetchSub(1, .acq_rel);
+    defer context.allocator.destroy(context);
+    defer context.allocator.free(context.datagram);
+    var options: [max_options]packet.Option = undefined;
+    const message = packet.parse(context.datagram, &options) catch return;
+    const request = switch (message) {
+        .rrq => |value| value,
+        else => return,
+    };
+    handleRrq(context.io, context.allocator, context.remote, request, context.config, context.catalog, context.runtime, context.event_writer, context.sessions) catch |err|
+        observe_log.err("tftp: worker failed: {t}", .{err});
+}
+
+fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddress, request: packet.Request, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store) !void {
+    const session = runtime.tftp.begin(request.filename);
+    var session_link: ?boot_session.Link = null;
+    if (sessions) |store| session_link = store.associateTftp(clientIpv4(&remote) orelse 0, boot_session.monotonicNow(), now());
+    if (session_link) |*link| {
+        if (link.id()) |id| log.info("RRQ {s} session={s}", .{ request.filename, id }) else log.warn("RRQ {s} session_link_state={s}", .{ request.filename, link.state().? });
+    } else log.info("RRQ {s}", .{request.filename});
+    const started = std.Io.Clock.awake.now(io);
+    emit(event_writer, io, allocator, &remote, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, if (session_link) |*link| link else null);
+
+    const is_virtual = isVirtualGrubConfig(request.filename);
+    const bytes_sent = if (is_virtual)
+        transferVirtualConfig(io, &remote, request, config, catalog, sessions) catch |err| {
+            runtime.tftp.finish(session, false);
+            if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
+            switch (err) {
+                error.BootAccessDenied, error.BootTargetUnavailable, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected virtual config {s} from {f}: {t}", .{ request.filename, remote, err }),
+                else => observe_log.err("tftp: virtual config transfer failed for {s}: {t}", .{ request.filename, err }),
+            }
+            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+            const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
+                error.BootAccessDenied => .{ .code = .access_violation, .message = "boot configuration requires an active DHCP lease" },
+                error.BootTargetUnavailable => .{ .code = .access_violation, .message = "boot configuration unavailable for this node" },
+                error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
+                else => .{ .code = .undefined, .message = "transfer failed" },
+            };
+            try sendEphemeralError(io, &remote, response.code, response.message);
+            return;
+       }
+      else
+           transfer(io, &remote, request, config.tftp.asset_root, catalog, config.tftp.windowsize, config.tftp.max_blksize) catch |err| {
+           runtime.tftp.finish(session, false);
+            if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
+            switch (err) {
+                error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, remote, err }),
+                else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
+            }
+            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+            const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
+                error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
+                error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
+                error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => .{ .code = .access_violation, .message = "access denied" },
+                else => .{ .code = .undefined, .message = "transfer failed" },
+            };
+            try sendEphemeralError(io, &remote, response.code, response.message);
+            return;
+        };
+    runtime.tftp.finish(session, true);
+    if (session_link) |link| if (sessions) |store| store.updateTftp(link, .tftp_complete, boot_session.monotonicNow(), now());
+    if (session_link) |*link| {
+        if (link.id()) |boot_id| observe_log.info("tftp: transfer completed {s} ({d} bytes) session={s}", .{ request.filename, bytes_sent, boot_id }) else observe_log.info("tftp: transfer completed {s} ({d} bytes) session_link_state={s}", .{ request.filename, bytes_sent, link.state().? });
+    } else observe_log.info("tftp: transfer completed {s} ({d} bytes)", .{ request.filename, bytes_sent });
+    emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+}
+
+fn sendEphemeralError(io: std.Io, remote: *const std.Io.net.IpAddress, code: packet.ErrorCode, message: []const u8) !void {
+    const local = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 0);
+    var socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(io);
+    try sendError(&socket, io, remote, code, message);
 }
 
 /// M3.5/M3.6：识别严格匹配的虚拟 GRUB 配置请求。
@@ -174,8 +229,8 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
 /// 才能渲染和传输配置。允许 GRUB 常见的单个前导 `/`（如 `/efi/grub.cfg-...`）。
 fn isVirtualGrubConfig(filename: []const u8) bool {
     const normalized = trimLeadingSlash(filename);
-    // MAC form: efi/grub.cfg-01-<6 hex pairs separated by hyphens>
-    // Total length: "efi/grub.cfg-01-" (16) + "XX-XX-XX-XX-XX-XX" (17) = 33
+    // MAC 形式：efi/grub.cfg-01-<6 个用连字符分隔的 hex 对>
+    // 总长度："efi/grub.cfg-01-" (16) + "XX-XX-XX-XX-XX-XX" (17) = 33
     if (std.mem.startsWith(u8, normalized, "efi/grub.cfg-01-")) {
         const suffix = normalized["efi/grub.cfg-01-".len..];
         if (suffix.len != 17) return false;
@@ -187,7 +242,7 @@ fn isVirtualGrubConfig(filename: []const u8) bool {
         return true;
     }
     if (std.mem.startsWith(u8, normalized, "efi/grub.cfg-")) {
-        // Hex IP form: grub.cfg-<8 hex chars> (e.g. C0A81BC8)
+        // Hex IP 形式：grub.cfg-<8 个 hex 字符>（如 C0A81BC8）
         const suffix = normalized["efi/grub.cfg-".len..];
         if (suffix.len == 8) {
             for (suffix) |c| if (!(std.ascii.isDigit(c) or (c >= 'A' and c <= 'F'))) return false;
@@ -247,14 +302,14 @@ fn transferVirtualConfig(
         // 因此慢速客户端不会长时间持有 catalog mutex。
         const target = boot_target.resolve(identity, config, &catalog.value, config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
         const node = lookup.findNode(config, identity.node_id) orelse return error.BootTargetUnavailable;
-        // M4.2 F4: node.http_accel is an experimental feature (default false).
-        // When enabled, render the initrd path as a GRUB HTTP URL
-        // `(http,server:port)/boot/<path>` instead of TFTP `/<path>`.
-        // GRUB's TFTP client doesn't support RFC 7440 windowsize, so large
-        // files over TFTP are limited to ~2 MB/s.  HTTP uses TCP windowing
-        // for near-line-rate throughput.  The HTTP server serves /boot/<path>
-        // from tftp.asset_root (see http/server.zig bootFile route).
-        // Requires GRUB built with the `http` module.
+        // M4.2 F4：node.http_accel 是实验性功能（默认 false）。
+        // 启用时，initrd 路径渲染为 GRUB HTTP URL
+        // `(http,server:port)/boot/<path>` 而非 TFTP `/<path>`。
+        // GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，因此 TFTP 上的
+        // 大文件传输受限于 ~2 MB/s。HTTP 使用 TCP 窗口控制达到接近线速。
+        // HTTP 服务器从 tftp.asset_root 提供 /boot/<path>
+        //（参见 http/server.zig bootFile 路由）。
+        // 需要编译了 `http` 模块的 GRUB。
         //
         // **kernel 始终走 TFTP**：GRUB 的 ARM64 Linux loader 在
         // `grub_file_open()` 获取文件大小后立即调用
@@ -289,7 +344,7 @@ fn transferVirtualConfig(
         }) catch return error.BootTargetUnavailable;
     };
 
-    return transferFromMemory(io, remote, request, rendered);
+    return transferFromMemory(io, remote, request, rendered, config.tftp.max_blksize);
 }
 
 /// 使用与文件传输相同的 TFTP OACK/DATA/ACK 逻辑传输内存缓冲区。
@@ -302,9 +357,10 @@ fn transferFromMemory(
     remote: *const std.Io.net.IpAddress,
     request: packet.Request,
     content: []const u8,
+    max_blksize: u16,
 ) !u64 {
     const file_size: u64 = content.len;
-    const settings = try negotiate(request.options, file_size, 0);
+    const settings = try negotiate(request.options, file_size, 0, max_blksize);
 
     const local = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 0);
     var socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
@@ -364,12 +420,13 @@ fn transfer(
     remote: *const std.Io.net.IpAddress,
     request: packet.Request,
     asset_root: []const u8,
-    catalog: *catalog_runtime.CatalogRuntime,
-    max_windowsize: u16,
+   catalog: *catalog_runtime.CatalogRuntime,
+   max_windowsize: u16,
+    max_blksize: u16,
 ) !u64 {
     if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
-    // PXE clients (GRUB, PXELINUX) often send paths with a leading '/';
-    // strip it so the path is relative to the TFTP asset root.
+    // PXE 客户端（GRUB、PXELINUX）经常发送以 `/` 开头的路径；
+    // 去除后使路径相对于 TFTP asset root。
     const filename = trimLeadingSlash(request.filename);
     if (!isSafeRelativePath(filename) or !isManifestPath(catalog, filename))
         return error.FileNotAllowed;
@@ -382,15 +439,13 @@ fn transfer(
     });
     defer file.close(io);
     const file_size = (try file.stat(io)).size;
-    const settings = try negotiate(request.options, file_size, max_windowsize);
-    // M4.2 F4: log negotiated options to help diagnose performance issues.
-    // GRUB's TFTP client does not support RFC 7440 windowsize, so the server
-    // falls back to windowsize=1 (stop-and-wait). This is the expected
-    // behavior for most PXE clients and explains the ~2 MB/s throughput
-    // limit for large files over TFTP.
-    // §7.4: If the client sent at least one option but omitted blksize, the
-    // server proactively suggests blksize=1468 in the OACK (~3× improvement
-    // over the RFC 1350 default 512).
+    const settings = try negotiate(request.options, file_size, max_windowsize, max_blksize);
+    // M4.2 F4：记录协商后的 options 以帮助诊断性能问题。
+    // GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，因此服务端回退到
+    // windowsize=1（停止等待）。这是大多数 PXE 客户端的预期行为，
+    // 解释了 TFTP 大文件传输 ~2 MB/s 的吞吐限制。
+    // §7.4：客户端发送了至少一个 option 但省略 blksize 时，服务端在
+    // OACK 中主动建议 blksize=1468（比 RFC 1350 默认 512 提升约 3 倍）。
     log.debug("negotiated {s}: blksize={d} windowsize={d} timeout={d}s", .{ request.filename, settings.block_size, settings.windowsize, settings.timeout });
 
     const local = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 0);
@@ -437,8 +492,8 @@ fn transfer(
     // ──────────────────────────────────────────────────────────────
 
     while (true) {
-        // M4.2 F4: RFC 7440 sliding window - send up to 'window' blocks
-        // before waiting for an ACK on the last block of the window.
+        // M4.2 F4：RFC 7440 滑动窗口——在等待 window 最后一块的 ACK 前
+        // 最多发送 'window' 个块。
         const window_start_offset = offset;
         const window_start_block = block;
         var blocks_in_window: u16 = 0;
@@ -454,11 +509,11 @@ fn transfer(
             last_sent_block = block; // 记录刚刚发送的块号
             offset += read;
             blocks_in_window += 1;
-            // Last DATA with payload < block_size signals end of transfer.
+            // 最后一个负载 < block_size 的 DATA 标志传输结束。
             if (read < settings.block_size) break;
             block +%= 1; // 为 window 内下一个块准备；外层不再重复递增
         }
-        // Wait for ACK of the last block actually sent in this window.
+        // 等待本窗口中实际发送的最后一块的 ACK。
         // expected_ack 必须是 last_sent_block 而非 block（block 可能已递增）。
         const expected_ack = last_sent_block;
         var attempts: usize = 0;
@@ -467,9 +522,8 @@ fn transfer(
                 if (err == error.Timeout and attempts < max_retries) {
                     attempts += 1;
                     log.warn("retransmit {s} block {d} attempt {d}/{d}", .{ request.filename, expected_ack, attempts, max_retries });
-                    // A client cannot ACK the end of a window if an earlier
-                    // block was lost, so retransmit the whole outstanding
-                    // window in order rather than only its final block.
+                    // 客户端无法在 window 中较早的块丢失时 ACK window 末尾，
+                    // 因此按顺序重传整个未完成 window，而非仅重传最后一块。
                     var resend_offset = window_start_offset;
                     var resend_block = window_start_block;
                     var resent: u16 = 0;
@@ -504,7 +558,7 @@ fn transfer(
 /// 其他 option 被安全忽略，不返回给客户端。
 const Settings = struct {
     block_size: usize = packet.default_block_size,
-    timeout: u8 = 5,
+    timeout: u8 = default_timeout,
     windowsize: u16 = 1,
     use_blksize: bool = false,
     use_timeout: bool = false,
@@ -549,21 +603,28 @@ const Settings = struct {
 /// - `windowsize`：RFC 7440，clamp 到服务端 `max_windowsize`
 /// 未知 option 被安全忽略。
 ///
-/// §7.4 OACK 主动建议：客户端发送了至少一个已识别 option（因此已有 OACK）
-/// 但未发送 `blksize` 时，在 OACK 中主动建议 `blksize=1468`（Ethernet MTU 最优）。
-/// 这将默认 512 字节/块升级到 1468，吞吐提升约 3 倍。仅当已有 OACK 时执行，
-/// 避免对完全不发 option 的老客户端发送 OACK 导致兼容性问题。
-fn negotiate(options: []const packet.Option, file_size: u64, max_windowsize: u16) !Settings {
+/// **blksize 升级策略**：当客户端发送的 `blksize` 小于 `max_blksize`（默认 1468）时，
+/// 服务端在 OACK 中返回 `max_blksize` 作为实际块大小。RFC 2347 §1 规定客户端
+/// "SHOULD"接受服务端在 OACK 中返回的值；实测 GRUB 2.06 的 TFTP 客户端会接受
+/// 服务端回复的更大 blksize，从而将吞吐从 2.5 MB/s（blksize=1024）提升到
+/// 3.7 MB/s（blksize=1468），提升约 48%。若客户端拒绝服务端建议的值，TFTP 协议
+/// 不提供回退机制，传输将失败；但已知 GRUB 和大多数现代 TFTP 客户端均兼容此行为。
+///
+/// §7.4：客户端发送了至少一个已识别 option 但省略 `blksize` 时，服务端在 OACK 中
+/// 主动建议 `max_blksize`，将 RFC 1350 默认 512 字节/块升级。不对零 option 客户端
+/// 发送 OACK（避免向不期望 OACK 的客户端发送）。
+/// `windowsize` 不主动建议（RFC 7440 较新，未请求时下发可能破坏不支持的客户端）。
+fn negotiate(options: []const packet.Option, file_size: u64, max_windowsize: u16, max_blksize: u16) !Settings {
     var settings: Settings = .{};
     for (options) |option| {
         if (std.ascii.eqlIgnoreCase(option.name, "blksize")) {
-            const value = std.fmt.parseInt(u16, option.value, 10) catch return error.InvalidOption;
-            if (value < 8 or value > max_block_size) return error.InvalidOption;
-            // RFC 2348 allows the server to return a different blksize in the OACK.
-            // Upgrade sub-optimal values to the Ethernet MTU optimal (1468) for
-            // ~43% throughput improvement over 1024. The client SHOULD accept
-            // the server-proposed value (RFC 2347 §1).
-            settings.block_size = if (value < ethernet_blksize) ethernet_blksize else value;
+           const value = std.fmt.parseInt(u16, option.value, 10) catch return error.InvalidOption;
+           if (value < 8 or value > max_block_size) return error.InvalidOption;
+            // blksize 升级：当客户端请求的 blksize 小于 max_blksize（默认 1468）时，
+            // 服务端在 OACK 中返回 max_blksize。RFC 2347 §1 规定客户端 SHOULD 接受
+            // 服务端返回的值。GRUB 2.06 兼容此行为，吞吐提升 ~48%（1024→1468）。
+            // 客户端请求更大块时 clamp 到 max_blksize 避免 UDP 分片。
+            settings.block_size = if (value < max_blksize) max_blksize else @min(value, max_blksize);
             settings.use_blksize = true;
         } else if (std.ascii.eqlIgnoreCase(option.name, "timeout")) {
             const value = std.fmt.parseInt(u8, option.value, 10) catch return error.InvalidOption;
@@ -574,23 +635,21 @@ fn negotiate(options: []const packet.Option, file_size: u64, max_windowsize: u16
             _ = file_size;
             settings.use_tsize = true;
         } else if (std.ascii.eqlIgnoreCase(option.name, "windowsize")) {
-            // M4.2 F4: RFC 7440 windowsize negotiation.
-            // Accept the client's requested value, clamped to the server's max.
+            // M4.2 F4：RFC 7440 windowsize 协商。
+            // 接受客户端请求的值，限制到服务端最大值。
             const value = std.fmt.parseInt(u16, option.value, 10) catch return error.InvalidOption;
             if (value == 0) return error.InvalidOption;
             settings.windowsize = if (max_windowsize > 0) @min(value, max_windowsize) else value;
             settings.use_windowsize = max_windowsize > 0;
         }
     }
-    // §7.4: Proactive blksize suggestion. When the client sent at least one
-    // recognized option (so we're already sending an OACK) but omitted blksize,
-    // proactively suggest 1468 (Ethernet MTU optimal). This upgrades clients
-    // that send tsize/timeout but not blksize from the RFC 1350 default 512
-    // to 1468 bytes/block — ~3× throughput improvement.
-    // We do NOT proactively send an OACK when the client sends no options at
-    // all, to avoid breaking very old clients that don't expect OACK.
-    if (!settings.use_blksize and settings.hasOptions()) {
-        settings.block_size = ethernet_blksize;
+    // §7.4 主动建议：客户端发送了至少一个已识别 option（证明支持 RFC 2347 option
+    // extension）但未发送 blksize 时，在 OACK 中建议 Ethernet MTU 最优块大小，
+    // 将默认 512 字节/块升级到 1468，吞吐提升约 3 倍。不覆盖客户端显式发送的
+    // blksize（此时 use_blksize 已在循环中置位），也不对零 option 客户端触发
+    // （hasOptions() 为假，避免向不期望 OACK 的客户端发送）。
+   if (!settings.use_blksize and settings.hasOptions()) {
+        settings.block_size = max_blksize;
         settings.use_blksize = true;
     }
     return settings;
@@ -736,8 +795,8 @@ test "M4.2 F4 windowsize negotiation clamps to server max" {
         .{ .name = "windowsize", .value = "8" },
         .{ .name = "blksize", .value = "1468" },
     };
-    // Server max is 4; client requested 8 → clamped to 4.
-    const s = try negotiate(&opts, 1024, 4);
+    // 服务端最大值为 4；客户端请求 8 → 限制为 4。
+    const s = try negotiate(&opts, 1024, 4, 1468);
     try std.testing.expectEqual(@as(u16, 4), s.windowsize);
     try std.testing.expect(s.use_windowsize);
     try std.testing.expectEqual(@as(usize, 1468), s.block_size);
@@ -747,7 +806,7 @@ test "M4.2 F4 windowsize disabled when server max is 0" {
     const opts = [_]packet.Option{
         .{ .name = "windowsize", .value = "4" },
     };
-    const s = try negotiate(&opts, 1024, 0);
+    const s = try negotiate(&opts, 1024, 0, 1468);
     try std.testing.expect(!s.use_windowsize);
 }
 
@@ -765,16 +824,25 @@ test "M4.2 F4 windowsize OACK includes all negotiated options" {
     try std.testing.expect(has_windowsize);
 }
 
-test "§7.4 proactive blksize suggestion when client omits blksize" {
-    // Client sends tsize=0 but no blksize → should suggest 1468.
+test "M4.2 F4 concurrent transfer limit rejects excess RRQ" {
+    var active = std.atomic.Value(u8).init(0);
+    try std.testing.expect(reserveTransferSlot(&active, 2));
+    try std.testing.expect(reserveTransferSlot(&active, 2));
+    try std.testing.expect(!reserveTransferSlot(&active, 2));
+    _ = active.fetchSub(1, .acq_rel);
+    try std.testing.expect(reserveTransferSlot(&active, 2));
+}
+
+test "§7.4 proactively suggests blksize=1468 when client omits it" {
+    // 客户端发送了已识别 option（tsize=0）但省略 blksize。
+    // 服务端在 OACK 中主动建议 blksize=1468（吞吐提升约 3 倍）。
     const opts = [_]packet.Option{
         .{ .name = "tsize", .value = "0" },
     };
-    const s = try negotiate(&opts, 65536, 4);
+    const s = try negotiate(&opts, 65536, 4, 1468);
     try std.testing.expect(s.use_blksize);
     try std.testing.expectEqual(@as(usize, 1468), s.block_size);
     try std.testing.expect(s.use_tsize);
-    // OACK should contain both blksize and tsize.
     var values: [4][20]u8 = undefined;
     var options: [4]packet.Option = undefined;
     const oack = s.oackOptions(65536, &values, &options);
@@ -785,35 +853,81 @@ test "§7.4 proactive blksize suggestion when client omits blksize" {
 }
 
 test "§7.4 no proactive blksize when client sends no options" {
-    // Client sends no options at all → must NOT suggest blksize.
-    // This avoids sending an OACK to clients that don't expect one.
+    // 客户端未发送任何 option → 不得建议 blksize。
+    // 避免向不期望 OACK 的客户端发送 OACK。
     const opts = [_]packet.Option{};
-    const s = try negotiate(&opts, 1024, 4);
+    const s = try negotiate(&opts, 1024, 4, 1468);
     try std.testing.expect(!s.use_blksize);
     try std.testing.expectEqual(@as(usize, 512), s.block_size);
     try std.testing.expect(!s.hasOptions());
 }
 
-test "§7.4 proactive blksize respects client's explicit blksize" {
-    // Client sends blksize=1024 → server upgrades to 1468 (RFC 2348).
+test "§7.4 no proactive blksize when client sends only an unknown option" {
+    // 未知 option 被忽略；没有已识别 option 被接受 -> 不发送 OACK，
+    // 不主动建议 blksize（客户端可能不期望 OACK）。
+    const opts = [_]packet.Option{
+        .{ .name = "unknownopt", .value = "1" },
+    };
+    const s = try negotiate(&opts, 1024, 4, 1468);
+    try std.testing.expect(!s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 512), s.block_size);
+    try std.testing.expect(!s.hasOptions());
+}
+
+test "§7.4 server upgrades client's explicit blksize" {
+    // 客户端发送 blksize=1024 -> 服务端升级到 1468（max_blksize）。
     const opts = [_]packet.Option{
         .{ .name = "blksize", .value = "1024" },
         .{ .name = "tsize", .value = "0" },
     };
-    const s = try negotiate(&opts, 4096, 4);
+    const s = try negotiate(&opts, 4096, 4, 1468);
     try std.testing.expect(s.use_blksize);
     try std.testing.expectEqual(@as(usize, 1468), s.block_size);
 }
 
+test "blksize clamps down to server max_blksize" {
+    // 客户端请求 8192（> 服务端最大 1468）-> 限制为 1468。
+    // RFC 2348 允许返回更小的值；避免 IP 分片。
+    const opts = [_]packet.Option{
+        .{ .name = "blksize", .value = "8192" },
+    };
+    const s = try negotiate(&opts, 65536, 4, 1468);
+    try std.testing.expect(s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 1468), s.block_size);
+}
+
+test "blksize upgrades sub-optimal client value to max_blksize" {
+    // 客户端请求 1024（< 服务端最大 1468）-> 升级到 1468。
+    // RFC 2347 §1：客户端 SHOULD 接受 OACK 中服务端建议的值。
+    // GRUB 2.06 兼容；吞吐提升约 48%（2.5→3.7 MB/s）。
+    const opts = [_]packet.Option{
+        .{ .name = "blksize", .value = "1024" },
+    };
+    const s = try negotiate(&opts, 65536, 4, 1468);
+    try std.testing.expect(s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 1468), s.block_size);
+}
+
+test "§7.4 proactive suggestion uses configured max_blksize" {
+    // 当 max_blksize 被调优（如 jumbo frame 用 8192）时，
+    // 主动建议该值而非默认 1468。
+    const opts = [_]packet.Option{
+        .{ .name = "tsize", .value = "0" },
+    };
+    const s = try negotiate(&opts, 65536, 4, 8192);
+    try std.testing.expect(s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 8192), s.block_size);
+}
+
 test "identifies virtual GRUB config filenames" {
-    // MAC form
+    // MAC 形式
     try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-ef"));
-    // Hex IP form (uppercase)
+    // Hex IP 形式（大写）
     try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg-C0A81BC8"));
-    // Fallback
+    // 回退名称
     try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg"));
     try std.testing.expect(isVirtualGrubConfig("/efi/grub.cfg-C0A81BC8"));
-    // Non-matching
+    // 不匹配的路径
     try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-ef-extra"));
     try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-XYZ"));
     try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-c0a81bc8"));

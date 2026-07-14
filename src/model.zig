@@ -59,12 +59,12 @@ pub const ServerConfig = struct {
     server_ip: []const u8,
     /// 唯一 HTTP 监听端口；同时承载 PXE 数据路由和管理路由。CLI 固定使用 loopback 访问。
     http_port: u16 = 8080,
-/// NodeForge 管理端在目标机上使用的 bootstrap SSH 公钥；私钥绝不进入配置。
-ssh_authorized_public_key: ?[]const u8 = null,
-/// M4.2 F5: 额外的 SSH 公钥列表，注入到所有目标节点的 authorized_keys。
-/// 这些密钥不用于 nodeforged 自身的 SSH 访问（那由 ssh_authorized_public_key 负责），
-/// 而是用于操作员/审计员的额外访问。CLI key-* 命令管理 assets/keys 中的密钥文件。
-ssh_authorized_public_keys: []const []const u8 = &.{},
+    /// NodeForge 管理端在目标机上使用的 bootstrap SSH 公钥；私钥绝不进入配置。
+    ssh_authorized_public_key: ?[]const u8 = null,
+    /// M4.2 F5: 额外的 SSH 公钥列表，注入到所有目标节点的 authorized_keys。
+    /// 这些密钥不用于 nodeforged 自身的 SSH 访问（那由 ssh_authorized_public_key 负责），
+    /// 而是用于操作员/审计员的额外访问。CLI key-* 命令管理 assets/keys 中的密钥文件。
+    ssh_authorized_public_keys: []const []const u8 = &.{},
 };
 
 /// HTTP 大文件和发行版仓库目录配置。
@@ -73,8 +73,8 @@ pub const HttpConfig = struct {
     asset_root: []const u8 = paths.iso_dir,
     /// 通过 `/repos/` 只读发布的仓库根目录。
     repository_root: []const u8 = paths.repos_dir,
-    /// M4.2 F4: Maximum concurrent HTTP connections. 0 = unlimited.
-    /// M6 will set production defaults after load testing.
+    /// M4.2 F4: 最大并发 HTTP 连接数。0 = 不限制。
+    /// M6 将在压力测试后设置生产默认值。
     max_connections: u16 = 0,
 };
 
@@ -83,16 +83,24 @@ pub const HttpConfig = struct {
 /// 端口是 PXE 协议约定，固定在服务实现中；此处只允许声明只读根目录，
 /// 防止把每项传输参数扩散为难以维护的 CLI 参数。
 pub const TftpConfig = struct {
-/// bootloader、GRUB 配置、kernel 和 initrd 的只读根目录。
-asset_root: []const u8 = paths.boot_dir,
-/// M4.2 F4: Maximum TFTP windowsize (RFC 7440) advertised in OACK.
-/// 0 disables windowsize negotiation (RFC 1350 stop-and-wait).
-/// Values 1-65535 are accepted; the client may request a lower value.
-windowsize: u16 = 4,
-/// M4.2 F4: Maximum concurrent per-client TFTP transfers.
-/// Each RRQ spawns an independent thread with its own TID socket.
-/// 0 or 1 preserves the original serial behavior.
-max_concurrent_transfers: u8 = 4,
+    /// bootloader、GRUB 配置、kernel 和 initrd 的只读根目录。
+    asset_root: []const u8 = paths.boot_dir,
+    /// M4.2 F4: OACK 中通告的最大 TFTP windowsize（RFC 7440）。
+    /// 0 禁用 windowsize 协商（RFC 1350 停止等待模式）。
+    /// 接受 1-65535 的值；客户端可以请求更小的值。
+    windowsize: u16 = 4,
+    /// 服务端提供并作为上限的最大 TFTP 块大小（RFC 2348 blksize option）。
+    /// 默认 1468 是以太网 MTU 最优值：1500 − 20 (IP) − 8 (UDP) − 4 (TFTP)，
+    /// 使每个 DATA 包恰好填满一个以太网帧而不触发 IP 分片（约为 RFC 1350
+    /// 默认 512 字节的 3 倍）。两种用法：(1) §7.4 当客户端省略 blksize 时在
+    /// OACK 中主动建议此值；(2) 将客户端请求的 blksize 向下限制到此值
+    ///（RFC 2348 允许返回更小的值）。jumbo-frame 链路可调高，受限链路调低。
+    /// 必须 ≥ 8。
+    max_blksize: u16 = 1468,
+    /// M4.2 F4: 每个客户端的最大并发 TFTP 传输数。
+    /// 每个 RRQ 启动一个独立线程，拥有自己的 TID socket。
+    /// 0 或 1 保留原始串行行为。
+    max_concurrent_transfers: u8 = 4,
 };
 
 /// M2 authoritative DHCPv4 的最小站点级地址池。端口不会进入配置。
@@ -333,7 +341,7 @@ pub const SshConfig = struct {
     enabled: bool = true,
     password_authentication: bool = true,
     root_login: RootLoginPolicy = .yes,
-    /// Config password fields are deliberately plaintext facts; adapters derive `$6$` only in memory.
+    /// 配置中的密码字段刻意为明文事实；适配器仅在内存中推导 `$6$` 哈希。
     root_password: ?[]const u8 = "asdf1234",
     root_authorized_keys: []const []const u8 = &.{},
 };
@@ -352,13 +360,24 @@ pub const TargetUserConfig = struct {
     ssh_authorized_keys: []const []const u8 = &.{},
 };
 
-/// Common target system facts, intentionally independent of installer syntax.
+/// M4.2 默认目标账号。配置显式写入 `system.users: []` 时仍可选择 root-only。
+pub const default_target_users = [_]TargetUserConfig{.{
+    .name = "nodeforge",
+    .password = "asdf1234",
+    .sudo = true,
+}};
+
+pub fn targetUsersAreImplicitDefault(users: []const TargetUserConfig) bool {
+    return users.ptr == default_target_users[0..].ptr;
+}
+
+/// 目标系统通用事实，刻意独立于安装器语法。
 pub const TargetSystemConfig = struct {
     localization: LocalizationConfig = .{},
     connectivity: ConnectivityPolicy = .{},
     ssh: SshConfig = .{},
     security: TargetSecurityConfig = .{},
-    users: []const TargetUserConfig = &.{},
+    users: []const TargetUserConfig = &default_target_users,
     packages: []const []const u8 = &.{},
 };
 
@@ -481,7 +500,7 @@ pub const BootloaderInstallConfig = struct {
     set_firmware_boot_order: bool = false,
 };
 
-/// M4 compatibility spelling; M4.1 normalizes it into `profile.system.users`.
+/// M4 兼容拼写；M4.1 将其规范化为 `profile.system.users`。
 pub const UserConfig = TargetUserConfig;
 
 /// 后处理执行阶段。M4 只实现 `install_post`（安装后）；
@@ -543,7 +562,7 @@ pub const NodeConfig = struct {
     ip: ?[]const u8 = null,
     /// 节点主机名；用于渲染安装配置中的 hostname。
     hostname: ?[]const u8 = null,
-    /// Node-specific target configuration.  Bootstrap PXE always remains DHCP.
+    /// 节点特定的目标配置。PXE 引导阶段始终保持 DHCP。
     overrides: NodeOverrideConfig = .{},
     /// M4.2 F2: 节点是否参与 PXE 部署。`false` 时即使 MAC/IP/profile 匹配，
     /// resolve() 也不下发 PXE bootfile，仍发诊断 DHCP lease。适用于 install/diskless/discovery 全模式。

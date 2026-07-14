@@ -87,14 +87,14 @@ pub const asset_validate = @import("assets/validate.zig");
 pub const grub = @import("boot/grub.zig");
 /// 内核命令行渲染器：根据发行版和 profile 生成 install/diskless 启动参数。
 pub const boot_target = @import("boot/target.zig");
-/// M4 installer adapters and shared answer rendering helpers.
+/// M4 安装器适配器和共享 answer 渲染辅助工具。
 pub const profile_render = @import("profile/render.zig");
 pub const password_hash = @import("profile/password_hash.zig");
 pub const profile_install = @import("profile/install.zig");
 pub const admin_key = @import("server/admin_key.zig");
 pub const kickstart = @import("profile/adapter/kickstart.zig");
 pub const ubuntu_autoinstall = @import("profile/adapter/ubuntu.zig");
-/// M4 constrained install_post provisioning renderer.
+/// M4 受限 install_post provisioning 渲染器。
 pub const provision_runner = @import("provision/runner.zig");
 /// 错误渲染器：将 Zig error set 映射为人类可读的审计消息。
 pub const observe_error = @import("observe/error.zig");

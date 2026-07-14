@@ -1,7 +1,7 @@
-//! M4.1 durable install-generation control.
+//! M4.1 持久化 install-generation 控制。
 //!
-//! It deliberately tracks destructive install intent separately from observed
-//! node status.  A profile binding alone never authorizes a repeat PXE install.
+//! 有意将破坏性安装意图与观测到的节点状态分开跟踪。
+//! 仅凭 profile 绑定永远不能授权重复 PXE 安装。
 
 const std = @import("std");
 const dhcp_store = @import("dhcp_store.zig");
@@ -18,12 +18,12 @@ pub const Entry = struct {
     armed_generation: ?u64 = null,
     consumed_generation: ?u64 = null,
     terminal_generation: ?u64 = null,
-    /// Immutable config revision captured when the currently armed generation
-    /// was requested. A changed desired plan must be explicitly rearmed.
+    /// 当前已武装 generation 被请求时捕获的不可变 config revision。
+    /// 更改的期望计划必须显式重新武装。
     requested_revision: u64 = 0,
-    /// Revision that entered the destructive installer phase.
+    /// 进入破坏性安装器阶段的 revision。
     consumed_revision: u64 = 0,
-    /// Revision reported as successfully installed by installer completion.
+    /// 安装器完成时报告为成功安装的 revision。
     applied_revision: u64 = 0,
     requested_at: i64 = 0,
     requested_by: RequestSource = .initial,
@@ -36,10 +36,9 @@ pub const Entry = struct {
     }
 };
 
-/// On-disk state deliberately uses variable length node IDs.  `Entry` keeps a
-/// fixed buffer for allocation-free runtime access, but serialising that
-/// buffer leaked 96 NUL-padded bytes for every record (and formerly for every
-/// unused slot).
+/// 磁盘状态有意使用变长 node ID。`Entry` 保留固定缓冲区以实现无分配运行时访问，
+/// 但序列化该缓冲区会为每条记录泄漏 96 字节的 NUL 填充（此前甚至包括每个
+/// 空闲槽位）。
 pub const DiskEntry = struct {
     node_id: []const u8,
     node_id_len: u8 = 0,
@@ -94,8 +93,8 @@ pub const Store = struct {
     entries: [max_entries]Entry = [_]Entry{.{}} ** max_entries,
     mutex: std.atomic.Mutex = .unlocked,
 
-    /// First observation arms generation 1. Existing entries are never
-    /// automatically rearmed by a config reload.
+    /// 首次观测武装 generation 1。已有条目永远不会
+    /// 被 config 重载自动重新武装。
     pub fn ensureInitial(self: *Store, node_id: []const u8, revision: u64, requested_at: i64) !void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -116,9 +115,8 @@ pub const Store = struct {
         return false;
     }
 
-    /// A pending generation must still refer to the exact desired snapshot
-    /// accepted by the operator. This prevents a config reload from silently
-    /// changing the destructive plan between `install retry` and PXE.
+    /// 待执行 generation 必须仍指向操作员已确认的精确快照。这防止
+    /// 配置重载在 `install retry` 与 PXE 之间静默改变破坏性部署计划。
     pub fn isArmedForRevision(self: *Store, node_id: []const u8, revision: u64) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -127,7 +125,7 @@ pub const Store = struct {
         return false;
     }
 
-    /// `install.started` consumes exactly the currently armed generation.
+    /// `install.started` 精确消费当前已武装的 generation。
     pub fn consume(self: *Store, node_id: []const u8) !?ConsumeResult {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -144,8 +142,8 @@ pub const Store = struct {
         return result;
     }
 
-    /// Idempotently arm the next destructive generation. The caller checks
-    /// profile/session constraints before invoking this state mutation.
+    /// 幂等地武装下一个破坏性 generation。调用方在执行此状态变更前
+    /// 已检查 profile/session 约束。
     pub fn rearm(self: *Store, node_id: []const u8, revision: u64, requested_at: i64, requested_by: RequestSource) !RearmResult {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -190,9 +188,9 @@ pub const Store = struct {
         };
     }
 
-    /// Roll back an in-memory retry arm when the atomic state write fails.
-    /// The operation is intentionally narrow: an already-pending generation
-    /// was not created by this call and must never be removed.
+    /// 当原子状态写入失败时回滚内存中的 retry 武装操作。
+    /// 该操作有意保持窄范围：已待执行的 generation 不是本次调用创建的，
+    /// 绝不能被移除。
     pub fn rollbackRearm(self: *Store, node_id: []const u8, result: RearmResult) void {
         if (!result.changed) return;
         lock(&self.mutex);
@@ -215,8 +213,8 @@ pub const Store = struct {
         return false;
     }
 
-    /// Completion is the only point that advances the applied desired state.
-    /// Failed attempts retain their consumed history and are never auto-rearmed.
+    /// 完成是唯一推进已应用期望状态的节点。
+    /// 失败的尝试保留其消费历史，永远不会自动重新武装。
     pub fn markTerminal(self: *Store, node_id: []const u8, applied: bool) ?TerminalResult {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -301,10 +299,9 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     store.entries = [_]Entry{.{}} ** max_entries;
     var count: usize = 0;
     for (parsed.value.entries) |disk_entry| {
-        // Version-1 fixed-array files contain 256 records.  An empty record
-        // has a 96-byte NUL string, so its string length is not its node ID
-        // length; `node_id_len` is the authoritative discriminator for both
-        // the legacy and compact encodings.
+        // Version-1 固定数组文件包含 256 条记录。空记录的字符串为 96 字节
+        // NUL，因此其字符串长度并非 node ID 长度；`node_id_len` 是旧版和
+        // 紧凑编码共用的权威判别字段。
         const node_len: usize = disk_entry.node_id_len;
         if (node_len == 0) continue;
         if (node_len > 96 or node_len > disk_entry.node_id.len or count == max_entries or !validNodeId(disk_entry.node_id[0..node_len])) return error.InvalidDeploymentControl;
@@ -342,9 +339,9 @@ fn validNodeId(value: []const u8) bool {
     return true;
 }
 
-/// Computes a stable, non-secret revision for a validated config snapshot.
-/// It is stored only as an opaque u64; no password, key, or serialized config
-/// is emitted to logs/events/state by this helper.
+/// 为已校验的配置快照计算稳定的、非密钥的 revision 值。
+/// 仅以不透明 u64 存储；此辅助函数不会将密码、密钥或序列化配置
+/// 写入日志/事件/状态文件。
 pub fn revisionForConfig(allocator: std.mem.Allocator, config: *const model.AppConfig) !u64 {
     var json: std.Io.Writer.Allocating = .init(allocator);
     defer json.deinit();
@@ -360,9 +357,8 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     store.snapshot(&entries);
     var used: [max_entries]DiskEntry = undefined;
     var used_len: usize = 0;
-    // Take pointers: a by-value `for (entries) |entry|` loop would leave the
-    // serialized slice pointing at the loop temporary, which is overwritten
-    // by later iterations and corrupts node IDs on disk.
+    // 取指针：按值遍历 `for (entries) |entry|` 会导致序列化切片指向
+    // 循环临时变量，该变量会被后续迭代覆盖，导致磁盘上的 node ID 损坏。
     for (&entries) |*entry| {
         if (!entry.used()) continue;
         used[used_len] = .{
@@ -457,7 +453,7 @@ test "compact deployment state preserves node id bytes" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("node-01", parsed.value.entries[0].node_id);
     var store: Store = .{};
-    // Exercise exactly the fixed-buffer copy used by `load` without a file.
+    // 精确测试 `load` 使用的固定缓冲区拷贝，无需实际文件。
     const disk = parsed.value.entries[0];
     @memcpy(store.entries[0].node_id[0..disk.node_id_len], disk.node_id[0..disk.node_id_len]);
     store.entries[0].node_id_len = disk.node_id_len;

@@ -31,8 +31,8 @@ pub const Decision = struct {
     profile: ?[]const u8 = null,
     /// profile 的启动模式（install/diskless/discovery），用于 boot session 创建。
     mode: ?model.ProfileMode = null,
-    /// An install profile was intentionally held at the PXE gate because it
-    /// has no pending generation (or its request was made for an older plan).
+    /// 安装 profile 被有意暂停在 PXE gate，因为没有待执行的 generation
+    ///（或其请求针对的是旧计划）。
     install_not_armed: bool = false,
     /// M4.2 F2: node has deploy=false; PXE denied but diagnostic lease still served.
     deploy_disabled: bool = false,
@@ -86,8 +86,8 @@ pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Arc
     };
 }
 
-/// M4.1 destructive-install gate. DHCP may still provide a diagnostic lease,
-/// but an install profile without an armed generation receives no PXE bootfile.
+/// M4.1 破坏性安装 gate。DHCP 仍可提供诊断 lease，
+/// 但未武装 generation 的安装 profile 不会收到 PXE bootfile。
 pub fn resolveWithDeployment(config: *const model.AppConfig, deployments: ?*deployment_control.Store, revision: u64, mac: []const u8, arch: packet.Architecture) Decision {
     var decision = resolve(config, mac, arch);
     if (decision.mode == .install and decision.node_id != null and deployments != null and !deployments.?.isArmedForRevision(decision.node_id.?, revision)) {

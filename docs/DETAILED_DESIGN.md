@@ -1000,8 +1000,8 @@ M0 验收结果：
 协议边界补丁（纳入 M4.1 前置回归，但归属仍为 M1）：
 
 - `blksize`、`timeout`、`tsize`、`windowsize` 的格式或范围非法时返回 option negotiation/illegal operation 错误，不能
-  静默截断；RRQ 中 `tsize` 只接受 RFC 2349 允许的查询形式。§7.4：客户端发送了至少一个已识别
-  option 但未发送 `blksize` 时，OACK 主动建议 `blksize=1468`（Ethernet MTU 最优）。
+  静默截断；RRQ 中 `tsize` 只接受 RFC 2349 允许的查询形式。除 §7.4 的 `blksize` 主动建议外，
+  服务端不在 OACK 中添加客户端未请求的 option，也不返回大于客户端显式请求值的 `blksize`（RFC 2348）。
 - 未识别 option 按 RFC 2347 忽略，已识别且接受的 option 才进入 OACK；OACK 后必须先收到 ACK block 0。
 - 客户端从当前 transfer TID 发送 ERROR 时立即终止该传输并记为 failed；未知 TID 的 DATA/ACK/ERROR 不得
   影响其他传输。超时达到重传上限后释放 socket/fd 和运行态槽位。
@@ -2644,7 +2644,7 @@ catalog 记录原始 family 于 `source_label` 字段供溯源。Rocky `arch` �
 
 请求在 catalog snapshot 下解析并打开 fd 后立即释放 snapshot 锁；进行中的传输持有已打开 fd 和解析时的
 object revision/ETag，新 publication 只影响后续请求。已发布对象使用不可变版本路径且 import NoClobber，
-不允许在原路径覆盖。M4.2 §9.11.5 F4 已引入 TFTP `windowsize`/`max_blksize`/`timeout_seconds`/`max_concurrent_transfers`
+不允许在原路径覆盖。M4.2 §9.11.5 F4 已引入 TFTP `windowsize`/`max_concurrent_transfers`
 和 HTTP `max_connections`（默认 0=不限）配置项及默认值；M6 生产压测负责验证并固化这些参数的上限和 429/503 行为，
 不在 M3/M4.1 路径加入未经验证的强制值。
 
@@ -3345,7 +3345,7 @@ hash 的需求时，必须另设显式 `password_hash` 类型、迁移和 adapte
 | `ssh.password_authentication` | `true` | 保持已有普通安装用户的密码登录兼容性 |
 | `ssh.root_login` | `yes` | 默认允许 root 通过 SSH 登录 |
 | `ssh.root_password` | `asdf1234` | root 默认密码；允许 profile 显式修改或设为 `null` |
-| `system.users` | `[]` | 不隐式创建 `ubuntu-server` 等普通用户；默认管理入口为 root |
+| `system.users` | `nodeforge/asdf1234/sudo=true` | M4.2 默认创建普通管理用户；显式配置 `[]` 才选择 root-only |
 | `system.packages` | `[]` | 不增加用户声明的额外包；OpenSSH 等系统必需包仍由 resolved plan 标记 |
 | `server.ssh_authorized_public_key` | `null` | 单值公钥（向后兼容）；省略时按固定来源探测/生成 |
 | `server.ssh_authorized_public_keys` | `[]`（空数组） | M4.2: 多公钥数组，非空时优先于单值，全部注入并去重；空时回退到单值 |
@@ -3355,7 +3355,8 @@ hash 的需求时，必须另设显式 `password_hash` 类型、迁移和 adapte
 | `safety.reinstall_policy` | `explicit` | install generation 默认只消费一次；再次重装需要显式 retry/rearm |
 
 默认组合为 `enabled=true`、`password_authentication=true`、`root_login=yes`、
-`root_password=asdf1234`，所以部署完成后 root 密码 SSH 应直接可用。用户可以修改 root password，也可以将
+`root_password=asdf1234`，并创建 sudo 用户 `nodeforge`（密码同为 `asdf1234`），所以部署完成后 root 与
+nodeforge 密码 SSH 均应直接可用。用户可以显式设置 `system.users: []` 保留 root-only，也可以修改 root password，或将
 `root_login` 改为 `prohibit-password`/`no`，或将 `root_password` 设为 `null`。root 密码登录实际成立必须同时
 满足 password authentication、非空 root password 和 `root_login=yes`。`enabled=false` 时不得渲染 sshd
 配置或启动服务，也不得因为事件上报内部使用 curl 而重新启用 SSH。
@@ -3887,8 +3888,8 @@ mode 判定前加守卫：`deploy=false` 时返回 `bootfile=null, known=true, m
 PXE。`mode=null` 使 generation gate 被完全绕过。适用于 install/diskless/discovery 全模式。`deploy` 是硬外层
 开关，与 generation gate 互补不冗余。新增事件 `boot.deploy_disabled`。
 
-新增管理 API（§9.11.10）：`PUT /api/v1/management/nodes/{id}`（`node set`）通过 daemon 原子写回 `config.json`，
-即时生效（resolve() 下次请求即读新值），不重启 daemon。
+节点 mutation（§9.11.10）由本机 CLI 原子写回 `config.json`，再请求 daemon 校验并有序重启加载。
+reload 请求失败时 CLI 返回非零并提示配置已保存、运行态尚未切换。
 
 #### 9.11.3 F1：安装阶段错误全覆盖传回
 
@@ -3939,8 +3940,9 @@ webhook reporter POST 的 JSON 事件格式（`ReportingEvent.as_dict`）：
 原代码中 `identity.hostname` 仅在 `system.users` 非空时渲染。无 users 时 `identity:` 块被跳过，
 hostname 从未设置，导致安装后主机名为 `localhost`。
 
-修复：在顶层 cloud-config（`ntp:` 之后）添加 `hostname:` 字段，始终渲染，独立于 `identity:` 块。
-当 `identity:` 存在时两者一致；当 `identity:` 不存在时顶层 `hostname:` 仍生效。
+修复：始终在 `autoinstall.user-data`（目标系统 cloud-init 配置）中渲染 `hostname:` 与
+`preserve_hostname: false`；文档顶层 `hostname:` 同时保留给安装环境。默认 `nodeforge` 用户会生成完整
+`identity`，但 hostname 正确性不依赖用户是否存在；显式 `system.users: []` 时目标系统仍使用节点 hostname。
 
 #### 9.11.4 F3：ISO 导入支持主流 OS + 覆盖语义
 
@@ -3960,9 +3962,13 @@ Ubuntu 沿用 `.disk/info`；Debian 新增检测，归一 `ubuntu`。
 - **per-client 并发**：dispatcher 收到 RRQ 后 spawn 独立线程处理，主循环立即回接。上限
   `max_concurrent_transfers`，超限时返回错误让客户端退避。
 - **配置项**：`TftpConfig` 新增 `windowsize`（默认 4）、`max_concurrent_transfers`（默认 4）。
-  §7.4 OACK 主动建议：客户端发送了至少一个已识别 option 但未发送 `blksize` 时，在 OACK 中
-  主动建议 `blksize=1468`（Ethernet MTU 最优），将默认 512 升级到 1468 字节/块（~3× 吞吐）。
-  仅当已有 OACK 时执行，不覆盖客户端显式发送的 `blksize`，不对零 option 客户端发送 OACK。
+  除 §7.4 外服务端不在 OACK 中添加客户端未请求的 option；§7.4 blksize 升级策略：
+  (1) 客户端发送了至少一个已识别 option 但省略 `blksize` 时，主动建议 `max_blksize`（默认 1468，
+  将默认 512 升级，吞吐约 3 倍）；(2) 客户端发送的 `blksize` 小于 `max_blksize` 时（如 GRUB 发送 1024），
+  服务端在 OACK 中返回 `max_blksize`（1468）而非客户端请求值。RFC 2347 §1 规定客户端 SHOULD 接受
+  服务端返回的值；GRUB 2.06 兼容此行为，吞吐从 2.5→3.7 MB/s（+48%）。客户端请求更大块时 clamp 到
+  `max_blksize` 避免 UDP 分片。`max_blksize` 可通过 `tftp.max_blksize` 配置（默认 1468）。
+  `windowsize` 不主动建议，未请求时保持 stop-and-wait。
 - **HTTP 加速（`node.http_accel`，实验性，默认 `false`）**：GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，
   即使服务端配置 `windowsize=4` 也回退到 stop-and-wait（~2 MB/s）。节点级 `http_accel`
   属性使 GRUB 配置中的 initrd 路径渲染为
@@ -4055,7 +4061,7 @@ nodeforge <resource> <action> [object] [options]
 ```
 ═══ node（节点资源）═══
   list                  列出所有已注册节点                        [M4.2 迁移]
-  show <id>             查看节点详情（属性+状态+部署generation）   [M4.2 新增]
+  show <id>             查看节点声明属性                           [M4.2 新增]
   add <id>              添加节点（--mac --arch --profile --ip...） [M4.2 新增]
   set <id>              修改节点属性（--deploy --ip --mac...）     [M4.2 新增]
   remove <id>           移除节点                                   [M4.2 新增]
@@ -4074,7 +4080,7 @@ nodeforge <resource> <action> [object] [options]
   validate              校验资产文件和 SHA-256                     [M1 迁移]
   # SSH key 管理（F5）:
   key-import <path>     导入 bootstrap 公钥                         [M4.2 新增]
-  key-reload            重载 bootstrap 公钥（不重启 daemon）        [M4.2 新增]
+  key-reload            校验并有序重启加载 bootstrap 公钥           [M4.2 新增]
   key-show              显示生效公钥来源+fingerprint               [M4.2 新增]
   key-list              列出 assets/keys/*.pub                     [M4.2 新增]
   # M5 新增:
@@ -4200,7 +4206,7 @@ resource-action canonical form：
 6b. 106 MB initrd via HTTP < 5s（千兆网），via TFTP ~52s（stop-and-wait）。
 7. `assets key-import` + `assets key-reload` -> `node render` 含新公钥；`assets key-show` 显示来源与 fingerprint。
 8. `node add node-01 --mac 02:aa:bb:cc:dd:ef --arch aarch64 --profile rocky-install` -> config.json 原子写回，
-   `node list` 立即可见；`node set node-01 --ip 192.168.50.101` -> 即时生效；`node show node-01` 显示属性+状态；
+   reload 完成后 `node list` 可见；`node set node-01 --ip 192.168.50.101` -> 重启后生效；`node show node-01` 显示属性；
    `node remove node-01` -> 移除。
 9. `nodeforge node list/show/render/retry/trace` 可用；旧 `install render` 输出 warning 且仍执行。
 10. `nodeforge runtime dhcp-leases` / `dhcp-unknown` / `tftp-counters` / `tftp-sessions` 可用
@@ -4267,21 +4273,15 @@ M4.2 将安装目录校准为资源化布局，每个目录对应一个 CLI 顶�
 中 ISO 的 `iso/` 前缀改为相对 `assets/iso/` 的路径，并移除旧路径。M5 新增目录直接按新布局创建，所有新代码
 只能引用 `paths.zig` 的派生常量。
 
-#### 9.11.10 节点资源管理 API
+#### 9.11.10 节点资源变更与 config reload
 
-当前管理 API 仅有 `POST /management/nodes/{id}/install/retry`（rearm）。节点配置（add/set/remove）的唯一
-路径是离线 `config import`（全量替换+重启），不满足 runtime 需求。M4.2 新增节点 CRUD 管理 API：
+`node add/set/remove` 由本机 CLI 执行 load-modify-validate-save，复用 `config_store.save` 的
+tmp+fsync+rename 原子写回。写回后调用 localhost-only 的 `POST /api/v1/management/config/reload`；daemon
+重新解析和校验磁盘配置，响应成功后完成有序 shutdown，由 systemd `Restart=always` 拉起并加载新快照。
 
-| 方法 | 路由 | CLI 命令 | 用途 |
-|------|------|---------|------|
-| POST | `/api/v1/management/nodes` | `node add` | 添加节点（写回 config.json） |
-| PUT | `/api/v1/management/nodes/{id}` | `node set` | 修改节点属性（含 deploy flag） |
-| DELETE | `/api/v1/management/nodes/{id}` | `node remove` | 移除节点 |
-| GET | `/api/v1/management/nodes/{id}/status` | `node show` | 查看节点详情+状态+部署generation（已有端点，新增 CLI） |
-
-这些端点通过 daemon 原子写回 `config.json`（复用 `config_store.save` 的 tmp+fsync+rename 原子写），
-不重启 daemon 即时生效（与 catalog import 一致的在线模式）。`config diff`（M6）将 `node add/set/remove`
-归类为 runtime-applicable。
+选择有序重启而非进程内替换，是因为 config 中的字符串和 slice 同时被 DHCP/TFTP/HTTP worker 借用；
+热替换必须引入完整的快照所有权和回收协议，超出 M4.2 范围。默认 `RestartSec=2s`，因此 mutation 存在短暂
+服务窗口。若写盘成功而 reload 请求失败，CLI 返回非零并要求手工重启，磁盘配置不会回滚。
 
 `profile`/`distro`/`repository` 等 config 资源的 CRUD 管理 API 不在 M4.2 范围（留 M6）。
 
@@ -4640,7 +4640,7 @@ Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 �
   改变归一 distro。
 - M6 的"安装错误分类"（§11.5）已含 M4.2 F1 新增的 `install.anaconda_error`/`install.subiquity_error`；
   M6 压测固化 TFTP/HTTP 性能参数时使用 M4.2 §9.11.5 F4 已引入的 `TftpConfig` 字段（`windowsize`/
-  `max_concurrent_transfers`）和 `HttpConfig.max_connections`。节点级 `node.http_accel`（默认 `true`）
+  `max_concurrent_transfers`）和 `HttpConfig.max_connections`。节点级 `node.http_accel`（实验性，默认 `false`）
   仅对 GRUB UEFI 链路生效；BIOS PXELINUX 固定使用 `pxelinux.0`（只支持 TFTP），`http_accel` 无效，
   kernel/initrd 始终走 TFTP。详见 §5.2.1。
 - M6 新增的 CLI 命令（如 `boot render --format pxelinux`）须遵循 M4.2 §9.11.7 F6 的 resource-action
@@ -4753,9 +4753,9 @@ M6 不因某 reason 自动执行 install retry；M7 的自动策略仍受 §12.9
 
 - `config diff` 对两个完整快照做纯只读、secret-aware 的结构 diff，并按 restart-required、runtime-applicable、
   redeploy-required、M7-reconcile 四类展示影响；password 只显示 changed，不打印旧值/新值。M4.2 新增字段的
-  diff 分类：`NodeConfig.deploy` 属 runtime-applicable（`resolve()` 每次请求读取，无需重启）；
-  `ServerConfig.ssh_authorized_public_keys` 属 runtime-applicable（`media key reload` 后即时生效，但已装节点
-  需重装），diff 显示增删公钥的 fingerprint 而非完整 key blob；`TftpConfig` 各字段属 restart-required；
+  diff 分类：M4.2 当前实现中 `NodeConfig.deploy` 和 `ServerConfig.ssh_authorized_public_keys` 都通过有序重启
+  加载；M6 若交付带快照回收协议的 `config apply`，可再将其提升为 runtime-applicable。公钥 diff 只显示
+  fingerprint 而非完整 key blob；`TftpConfig` 各字段属 restart-required；
   `HttpConfig.max_connections` 属 restart-required；`InstallSourceConfig.source_label` 属 catalog 导入产物
   不经 `config apply`。
 - `config apply` 先构造 candidate、完整校验和引用检查，再原子写盘/替换内存 snapshot 并写
