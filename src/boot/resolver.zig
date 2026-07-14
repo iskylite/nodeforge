@@ -34,6 +34,8 @@ pub const Decision = struct {
     /// An install profile was intentionally held at the PXE gate because it
     /// has no pending generation (or its request was made for an older plan).
     install_not_armed: bool = false,
+    /// M4.2 F2: node has deploy=false; PXE denied but diagnostic lease still served.
+    deploy_disabled: bool = false,
 };
 
 /// 按已注册 MAC 或 unknown-client policy 解析启动行为和可审计的配置身份。
@@ -49,16 +51,31 @@ pub const Decision = struct {
 ///    - discovery：下发 bootfile，mode=discovery。
 ///    - diskless：仅在 allow_unknown_diskless=true 时下发 bootfile，mode=diskless。
 pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Architecture) Decision {
-    for (config.nodes) |node| if (sameMac(node.mac, mac)) return .{
+    for (config.nodes) |node| if (sameMac(node.mac, mac)) {
+        // M4.2 F2: deploy=false 是硬外层开关，在 mode 判定前即返回无 bootfile。
+        // 仍发诊断 DHCP lease（known=true + reserved_ip），但不下发 PXE。
+        // mode=null 使 resolveWithDeployment 的 generation gate 被完全绕过。
+        if (!node.deploy) return .{
+            .bootfile = null,
+            .known = true,
+            .node_id = node.id,
+            .reserved_ip = node.ip,
+            .profile = node.profile,
+            .mode = null,
+            .install_not_armed = false,
+            .deploy_disabled = true,
+        };
         // M3.6：不给 x86 GRUB 二进制文件到 ARM profile（反之亦然）。
         // lease 仍可发放以保证网络可达性可诊断，但 PXE 必须在
         // 不匹配的 kernel/initrd 被选中之前停止。
-        .bootfile = if (architectureMatches(node.arch, arch)) bootfile(arch) else null,
-        .known = true,
-        .node_id = node.id,
-        .reserved_ip = node.ip,
-        .profile = node.profile,
-        .mode = profileMode(config, node.profile),
+        return .{
+            .bootfile = if (architectureMatches(node.arch, arch)) bootfile(arch) else null,
+            .known = true,
+            .node_id = node.id,
+            .reserved_ip = node.ip,
+            .profile = node.profile,
+            .mode = profileMode(config, node.profile),
+        };
     };
     // 未注册节点按 policy.default_action 决策。
     const profile = config.policy.default_profile;
@@ -87,6 +104,31 @@ test "consumed install generation suppresses PXE bootfile" {
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }} };
     const decision = resolveWithDeployment(&config, &deployments, 1, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
     try @import("std").testing.expect(decision.bootfile == null);
+}
+
+test "deploy=false suppresses PXE bootfile but keeps diagnostic lease" {
+    const std = @import("std");
+    const config: model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+        .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install", .deploy = false }},
+        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+    };
+    const decision = resolve(&config, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
+    try std.testing.expect(decision.bootfile == null);
+    try std.testing.expect(decision.known);
+    try std.testing.expect(decision.mode == null); // generation gate bypassed
+}
+
+test "deploy=true (default) still gets bootfile" {
+    const std = @import("std");
+    const config: model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+        .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
+        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+    };
+    const decision = resolve(&config, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
+    try std.testing.expect(decision.bootfile != null);
+    try std.testing.expect(decision.known);
 }
 
 test "always reinstall policy still requires an armed generation" {

@@ -241,6 +241,63 @@ bootfile 选择：
 | UEFI aarch64 | `11` | `grubaa64.efi` | MVP |
 | BIOS x86 | `0` | `pxelinux.0` | 后续补齐 |
 
+#### 5.2.1 HTTP 加速（`node.http_accel`，实验性）
+
+> **实验性功能**：默认禁用（`false`）。在实测中，即使 kernel 走 TFTP，
+> GRUB 为 initrd 建立 TCP 连接时仍可能触发 EFI 内存碎片化，导致后续
+> kernel 加载失败（`out of memory`）。仅在确认目标 GRUB 构建和 EFI 固件
+> 内存充裕时才可尝试启用。
+
+**背景问题**：GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize。即使服务端配置了
+`tftp.windowsize=4`，GRUB 的 RRQ 包不含 windowsize option，服务端回退到
+`windowsize=1`（stop-and-wait）。每个 DATA 块（通常 1468 字节）需等一个 ACK
+往返，吞吐被 RTT 限制：`吞吐 = block_size / RTT ≈ 1468 / 0.7ms ≈ 2 MB/s`。
+100+ MB 的 initrd.img 下载需 50+ 秒。
+
+**解决方案**：节点级 `http_accel` 属性（**默认 `false`**，实验性）。启用时 GRUB 配置中的
+initrd 路径渲染为 `(http,server:port)/boot/<path>` 设备记法，GRUB 通过
+TCP HTTP 下载，利用 TCP 窗口控制达到接近线速的吞吐。HTTP 服务器在
+`/boot/<path>` 路由从 `tftp.asset_root` 提供文件（catalog 白名单校验）。
+kernel 始终走 TFTP（见下方 GRUB EFI 内存限制说明）。禁用时 kernel/initrd 均走 TFTP。
+
+**配置粒度**：节点级而非全局，因为不同节点的 GRUB 构建可能不同（某些嵌入式
+GRUB 可能不含 http 模块），需要逐节点控制。
+
+**CLI 管理**：
+- `node add <id> --http-accel true`：添加节点时显式启用（实验性）
+- `node set <id> --http-accel true`：修改已有节点启用
+- 默认 `false`，kernel/initrd 均走 TFTP
+
+**安全模型**：`/boot/` 路由无需认证——GRUB 的 HTTP 请求无法携带 bearer token，
+与 TFTP 一致。catalog 白名单确保只有注册的 asset path 可被提供。路径安全双重
+校验（`validateRelativePath` + `openRegularFile`）。
+
+**GRUB HTTP Range 兼容**：GRUB 下载完整文件后发送 `Range: bytes=<size>-` 做完整性
+验证。服务端在此边界情况返回 206 + 0 字节而非 416，避免 GRUB 将 416 视为致命错误
+而中止启动（详见 DETAILED_DESIGN §8.3.1）。
+
+**GRUB EFI 内存限制**：GRUB 的 ARM64 Linux loader 在 `grub_file_open()` 获取文件大小后
+立即调用 `grub_efi_allocate_pages()` 分配内核缓冲区。GRUB 的 TCP/HTTP 模块自身会占用大量
+EFI 连续内存页（发送/接收缓冲、TCP 控制块等），导致剩余连续内存不足以分配 13 MB 内核
+缓冲区，报出 `can not alloc kernel buffer` 或 `out of memory` 并关闭 TCP 连接。
+tcpdump 可见 GRUB 在仅收到 ~43 KB 后发送 FIN+RST。即使 kernel 走 TFTP，GRUB 为
+initrd 建立 TCP 连接时仍可能触发 EFI 内存碎片化，导致后续 kernel 加载失败（实测
+`out of memory`）。因此 **kernel 始终走 TFTP**，且 `http_accel` 默认禁用。
+仅作为实验性功能保留，在确认目标 GRUB 构建和 EFI 固件内存充裕时才可尝试启用。
+
+**前置条件**：GRUB 二进制必须编译含 `http` 模块。验证方法：
+`strings grubaa64.efi | grep net/http`。大多数发行版的 GRUB UEFI 构建默认包含。
+
+**适用范围**：`http_accel` 仅对 GRUB UEFI 链路（`grubx64.efi`/`grubaa64.efi`）生效。
+M6 的 BIOS PXELINUX 链路使用 `pxelinux.0`（只支持 TFTP，不支持 HTTP），
+`http_accel` 对 PXELINUX 节点无效，kernel/initrd 始终通过 TFTP 传输。
+
+**TFTP 微调（§7.4）**：对 `http_accel=false` 或 BIOS PXELINUX 等仍走 TFTP 的场景，
+服务端在 `negotiate()` 中实现 OACK 主动建议 `blksize=1468`：客户端发送了至少一个
+已识别 option（如 `tsize=0`）但未发送 `blksize` 时，在 OACK 中建议 Ethernet MTU 最优
+值 1468（1500 − 20 IP − 8 UDP − 4 TFTP），将默认 512 字节/块升级到 1468，吞吐提升
+约 3 倍。不覆盖客户端显式发送的 `blksize`，不对零 option 客户端发送 OACK。
+
 ### 5.3 initrd 类型边界
 
 文档中必须区分两类 initrd：
@@ -273,7 +330,7 @@ nodeforge.mode=diskless nodeforge.node_id={{node_id}} nodeforge.config_url={{con
 
 NodeForge 的对象模型保持简单：配置对象描述“应该怎样”，运行态对象描述“现在怎样”。
 
-本章描述 M1-M7（含 M4.1）的目标模型，不等同于当前代码 schema。历史 M0 边界以详细设计第 5 节为准；
+本章描述 M1-M7（含 M4.1 和 M4.2）的目标模型，不等同于当前代码 schema。历史 M0 边界以详细设计第 5 节为准；
 当前代码已实现 M4.1 的 `profile.system` 和节点目标网络字段，但仍须以 fixture 与系统验收为准，不能因为
 字段出现在目标模型中就宣称已完成系统级支持。
 
@@ -694,7 +751,8 @@ TFTP 协议层可以较完整实现，但产品策略默认只开放 PXE 启动�
 - 支持 `RRQ`、`DATA`、`ACK`、`ERROR`。
 - 明确拒绝 `WRQ`，不实现上传路径。
 - 只支持 PXE 所需的 `octet`，不实现 `netascii`。
-- 支持 option 协商：`blksize`、`timeout`、`tsize`。
+- 支持 option 协商：`blksize`、`timeout`、`tsize`、`windowsize`（RFC 7440）。
+  §7.4：客户端发送了至少一个已识别 option 但未发送 `blksize` 时，OACK 主动建议 `blksize=1468`。
 - 路径沙箱，禁止目录穿越，只允许读取 asset manifest 中允许的启动资产。
 
 PXE 路径中 TFTP 只发送：
@@ -1362,13 +1420,14 @@ formatter，`list --output json` 输出 JSON array，`follow --output json` 输�
     }
   },
   "tftp": {
-    "root": "/opt/nodeforge/tftp",
+    "asset_root": "<paths.boot_dir>",
     "max_blksize": 1468,
     "timeout_seconds": 3,
     "max_retries": 5
   },
   "http": {
-    "asset_root": "/opt/nodeforge/assets",
+    "asset_root": "<paths.iso_dir>",
+    "repository_root": "<paths.repos_dir>",
     "enable_range": true
   }
 }
@@ -1932,12 +1991,12 @@ M4.1/M5 已跑通的基础上。TFTP 先用标准客户端形成独立闭环，�
 | M3 | HTTP 资产、ISO 仓库和事件接口 | M0、资产模型 | 节点可获取配置/answer/rootfs/ISO repo，并上报事件 |
 | M4 | PXE 无人值守安装与基础后处理 | M1-M3 | Rocky Linux 9.7 aarch64、Ubuntu Server 22.04 LTS 安装和 `install_post` 跑通 |
 | M4.1 | 公共目标系统配置、安装生命周期与 M4 answer 纠错 | M4 | 公共系统配置、一次性 generation/retry/drift、`$6$`/bootstrap key、storage/schema/event 及 M1-M3 横切回归在 Ubuntu/Rocky 生效并供 M5+ 继承 |
-| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner | 小 initrd 进入 `squashfs_overlay`，复用目标系统配置并跑通 `rootfs_build`/`diskless_boot` |
-| M6 | 支持矩阵增强 | M4.1、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
-| M7 | 补充包和后处理增强 | M4.1、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
-| M8 | 部署链路健壮性、密钥可维护性与传输性能加固 | M4.1 | post-install 异常容忍、安装阶段错误全覆盖传回、节点级不部署开关、ISO 导入主流 OS+覆盖语义、TFTP windowsize/并发/配置项、免密公钥配置化+CLI 导入、CLI 命令体系重构 |
+| M4.2 | 部署链路健壮性、密钥可维护性与传输性能加固 | M4.1 | 部署错误传回 nodeforged、节点级不部署开关、ISO 导入主流 OS+覆盖语义、TFTP windowsize/并发/配置项、免密公钥配置化+CLI 导入、CLI 命令体系校准 |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2 | 小 initrd 进入 `squashfs_overlay`，复用目标系统配置并跑通 `rootfs_build`/`diskless_boot` |
+| M6 | 支持矩阵增强 | M4.1、M4.2、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
+| M7 | 补充包和后处理增强 | M4.1、M4.2、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
 
-每个阶段的代码任务、CLI 命令、测试和验收标准详见 `DETAILED_DESIGN.md` 第 3-13 章。
+每个阶段的代码任务、CLI 命令、测试和验收标准详见 `DETAILED_DESIGN.md` 第 3-12 章（M4.2 见 §9.11）。
 
 ## 17. MVP 验收标准
 
@@ -2044,7 +2103,7 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 | retry 是否重启节点 | 否；retry 只持久化下一代部署意图且幂等，不倒退 node_status、不调用 BMC，活动 install session 时拒绝 |
 | lease 与 session | DHCP option 58/59 促进续租；bootstrap proof 要求有效 lease，已签发 capability 在 BootSession delivery TTL 内独立工作；daemon 重启后 token 失效 |
 | 已部署配置变更 | 记录 desired/applied digest；配置变化不自动擦盘，storage/source 必须重装，目标系统 users/packages/network 等由 M7 按能力 reconcile |
-| 后续阶段默认继承 | M5-M7 和新增 adapter/version 必须继承 M4.1 的 locale/timezone/keyboard、local-only、SSH/root、普通用户/password/sudo/key、`system.packages`、防火墙、SELinux 和网络语义；bundle/script 不得静默覆盖保护域 |
+| 后续阶段默认继承 | M5-M7 和新增 adapter/version 必须继承 M4.1/M4.2 的 locale/timezone/keyboard、local-only、SSH/root、普通用户/password/sudo/key、`system.packages`、防火墙、SELinux 和网络语义；bundle/script 不得静默覆盖保护域 |
 | CLI 命令形态 | 按变更频率和运行期需求与配置文件分工；复杂对象不拆成海量参数；使用成熟 CLI 解析库并支持分级 `-h/--help` |
 | CLI 默认输出 | 面向人类阅读，分组和表格化；机器消费显式使用 `--output json` |
 | 如何补充软件和配置 | RPM/DEB 走额外标准仓库；其他只支持 tar.bz2；使用强类型步骤和 provisioning bundle 编排 |

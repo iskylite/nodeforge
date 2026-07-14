@@ -38,6 +38,8 @@ pub const config = @import("config/load.zig");
 pub const config_store = @import("config/store.zig");
 /// 配置和 catalog 校验器：纯函数校验所有不变量和跨文件引用关系。
 pub const config_validate = @import("config/validate.zig");
+/// M4.2 节点资源增删改：load-modify-validate-save 原子写回 config.json。
+pub const node_mutation = @import("config/node_mutation.zig");
 /// 启动前预检：检查端口可用性、目录权限和必需的系统 capability。
 pub const preflight = @import("preflight.zig");
 /// 进程内运行时状态：DHCP lease 表、TFTP 传输计数器和 catalog 运行时快照。
@@ -120,6 +122,7 @@ test {
     _ = config;
     _ = config_store;
     _ = config_validate;
+    _ = node_mutation;
     _ = preflight;
     _ = runtime_state;
     _ = boot_session;

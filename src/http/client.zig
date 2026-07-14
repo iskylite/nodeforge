@@ -92,6 +92,12 @@ pub fn installRetry(io: std.Io, port: u16, node_id: []const u8) Status {
     return probeAt(io, management.client_ip, port, value, "POST");
 }
 
+/// M4.2: 通知 daemon 重新加载 config.json（node add/set/remove 写回后调用）。
+/// daemon 验证新配置后退出，由 systemd 自动重启加载新配置。
+pub fn configReload(io: std.Io, port: u16) Status {
+    return probeAt(io, management.client_ip, port, "/api/v1/management/config/reload", "POST");
+}
+
 /// 探测 M1 TFTP 运行态路由。仅由本机 daemon 提供，不接受远程地址。
 pub fn tftpStatus(io: std.Io, port: u16) Status {
     return probeAt(io, management.client_ip, port, "/api/v1/management/tftp/status", "GET");

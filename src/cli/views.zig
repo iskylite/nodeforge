@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const table = @import("table.zig");
+const model = @import("../model.zig");
 
 pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const u8 };
 pub const TftpSessionRow = struct { id: []const u8, phase: []const u8, filename: []const u8 };
@@ -100,6 +101,17 @@ pub fn success(writer: *std.Io.Writer, summary: []const u8, fields: []const Fiel
 }
 
 pub const Field = struct { label: []const u8, value: []const u8 };
+
+/// M4.2: 渲染单个节点的详情块（分组键值）。
+pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
+    try writer.print("Node {s}\n", .{node.id});
+    try detailField(writer, "MAC", node.mac);
+    try detailField(writer, "Arch", @tagName(node.arch));
+    try detailField(writer, "Profile", node.profile);
+    try detailField(writer, "IP", node.ip orelse "-");
+    try detailField(writer, "Hostname", node.hostname orelse "-");
+    try detailField(writer, "Deploy", if (node.deploy) "true" else "false");
+}
 
 /// check 失败时仍使用人类可读的状态块；它与 `status` 共享字段对齐而不改变退出码。
 pub fn checkFailure(writer: *std.Io.Writer, process: bool, http: bool, management: bool, config: bool) !void {

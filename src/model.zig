@@ -3,7 +3,7 @@
 
 const paths = @import("paths.zig");
 
-/// NodeForge 启动配置事实源 `/opt/nodeforge/config/config.json` 的根对象。
+/// NodeForge 启动配置事实源 `paths.config_path` 的根对象。
 pub const AppConfig = struct {
     /// 配置格式版本；M0 仅接受版本 1。
     schema_version: u32 = 1,
@@ -32,7 +32,7 @@ pub const AppConfig = struct {
     policy: PolicyConfig = .{},
 };
 
-/// NodeForge 管理目录事实源 `/opt/nodeforge/catalog/catalog.json` 的根对象。
+/// NodeForge 管理目录事实源 `paths.catalog_path` 的根对象。
 /// 该文件只由 `nodeforged` 写入，CLI 不直接编辑。
 pub const Catalog = struct {
     /// 配置格式版本；M0 仅接受版本 1。
@@ -59,16 +59,23 @@ pub const ServerConfig = struct {
     server_ip: []const u8,
     /// 唯一 HTTP 监听端口；同时承载 PXE 数据路由和管理路由。CLI 固定使用 loopback 访问。
     http_port: u16 = 8080,
-    /// NodeForge 管理端在目标机上使用的 bootstrap SSH 公钥；私钥绝不进入配置。
-    ssh_authorized_public_key: ?[]const u8 = null,
+/// NodeForge 管理端在目标机上使用的 bootstrap SSH 公钥；私钥绝不进入配置。
+ssh_authorized_public_key: ?[]const u8 = null,
+/// M4.2 F5: 额外的 SSH 公钥列表，注入到所有目标节点的 authorized_keys。
+/// 这些密钥不用于 nodeforged 自身的 SSH 访问（那由 ssh_authorized_public_key 负责），
+/// 而是用于操作员/审计员的额外访问。CLI key-* 命令管理 assets/keys 中的密钥文件。
+ssh_authorized_public_keys: []const []const u8 = &.{},
 };
 
 /// HTTP 大文件和发行版仓库目录配置。
 pub const HttpConfig = struct {
     /// rootfs、ISO 和普通 HTTP 资产根目录。
-    asset_root: []const u8 = paths.assets_dir,
+    asset_root: []const u8 = paths.iso_dir,
     /// 通过 `/repos/` 只读发布的仓库根目录。
     repository_root: []const u8 = paths.repos_dir,
+    /// M4.2 F4: Maximum concurrent HTTP connections. 0 = unlimited.
+    /// M6 will set production defaults after load testing.
+    max_connections: u16 = 0,
 };
 
 /// TFTP 启动小文件配置。
@@ -76,8 +83,16 @@ pub const HttpConfig = struct {
 /// 端口是 PXE 协议约定，固定在服务实现中；此处只允许声明只读根目录，
 /// 防止把每项传输参数扩散为难以维护的 CLI 参数。
 pub const TftpConfig = struct {
-    /// bootloader、GRUB 配置、kernel 和 initrd 的只读根目录。
-    asset_root: []const u8 = paths.tftp_dir,
+/// bootloader、GRUB 配置、kernel 和 initrd 的只读根目录。
+asset_root: []const u8 = paths.boot_dir,
+/// M4.2 F4: Maximum TFTP windowsize (RFC 7440) advertised in OACK.
+/// 0 disables windowsize negotiation (RFC 1350 stop-and-wait).
+/// Values 1-65535 are accepted; the client may request a lower value.
+windowsize: u16 = 4,
+/// M4.2 F4: Maximum concurrent per-client TFTP transfers.
+/// Each RRQ spawns an independent thread with its own TID socket.
+/// 0 or 1 preserves the original serial behavior.
+max_concurrent_transfers: u8 = 4,
 };
 
 /// M2 authoritative DHCPv4 的最小站点级地址池。端口不会进入配置。
@@ -222,6 +237,9 @@ pub const AssetConfig = struct {
 pub const InstallSourceConfig = struct {
     /// 稳定短名称，用于 install profile 的 `boot_source` 引用。
     name: []const u8,
+    /// M4.2 F3: 可选的操作员友好标签，用于 CLI 显示和日志关联。
+    /// null 时回退到 name。
+    source_label: ?[]const u8 = null,
     /// 所属发行版名称。
     distro: []const u8,
     /// 所属发行版版本。
@@ -527,6 +545,30 @@ pub const NodeConfig = struct {
     hostname: ?[]const u8 = null,
     /// Node-specific target configuration.  Bootstrap PXE always remains DHCP.
     overrides: NodeOverrideConfig = .{},
+    /// M4.2 F2: 节点是否参与 PXE 部署。`false` 时即使 MAC/IP/profile 匹配，
+    /// resolve() 也不下发 PXE bootfile，仍发诊断 DHCP lease。适用于 install/diskless/discovery 全模式。
+    /// 通过 `node set <id> --deploy false` 管理。与 generation gate 互补不冗余。
+    deploy: bool = true,
+    /// M4.2 F4: 节点是否使用 HTTP 加速下载 initrd。
+    /// **默认 `false`**。`true` 时 GRUB 配置中的 initrd 路径渲染为
+    /// `(http,server:port)/boot/<path>`，通过 TCP HTTP 下载，利用 TCP 窗口
+    /// 达到接近线速的吞吐。kernel 始终走 TFTP（GRUB EFI 内存限制，见下方）。
+    /// `false` 时 kernel/initrd 均通过 TFTP 下载。
+    ///
+    /// **实验性功能**：`http_accel=true` 在实测中发现 GRUB 的 TCP/HTTP 模块
+    /// 会占用大量 EFI 连续内存页（发送/接收缓冲、TCP 控制块等），导致剩余
+    /// 连续内存不足以分配 kernel 缓冲区（`grub_efi_allocate_pages()` 失败），
+    /// 报出 `can not alloc kernel buffer` 或 `out of memory`。即使 kernel 走
+    /// TFTP，GRUB 为 initrd 建立 TCP 连接时仍可能触发 EFI 内存碎片化，
+    /// 导致后续 kernel 加载失败。因此默认禁用，仅在确认目标 GRUB 构建和
+    /// EFI 固件内存充裕时才可尝试启用。
+    ///
+    /// GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，大文件（100+ MB initrd）
+    /// 在 TFTP 模式下受 RTT 限制仅约 2 MB/s。
+    /// 仅对 GRUB UEFI 链路生效；M6 BIOS PXELINUX 固定使用 `pxelinux.0`
+    /// （只支持 TFTP），此字段对 BIOS 节点无效。
+    /// 通过 `node set <id> --http-accel true` 启用。
+    http_accel: bool = false,
 };
 
 /// 未录入节点的默认策略。

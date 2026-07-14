@@ -5,14 +5,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/nodeforge
+WorkingDirectory=@INSTALL_ROOT@
 # 启动前执行配置校验；--log-output file 使校验错误写入日志文件而非仅 stdout。
 # 校验失败时 systemd 不会启动主进程，避免以无效配置绑定特权端口。
-ExecStartPre=/opt/nodeforge/bin/nodeforged --check --log-output file
+ExecStartPre=@INSTALL_ROOT@/bin/nodeforged --check --log-output file
 # 主进程：启动 DHCP/TFTP/HTTP 三合一 PXE 服务。
 # --log-output file 将结构化日志写入配置指定的文件路径。
-ExecStart=/opt/nodeforge/bin/nodeforged --log-output file
-Restart=on-failure
+ExecStart=@INSTALL_ROOT@/bin/nodeforged --log-output file
+# Restart=always: config reload (node add/set/remove) causes clean exit;
+# systemd restarts the daemon to load the new config.json. systemctl stop
+# still prevents restart (intentional stop).
+Restart=always
 RestartSec=2s
 # TFTP（UDP 69）和 DHCP（UDP 67）使用特权端口；DHCP 在 OFFER 前发送
 # raw ICMP Echo（ping）检测 IP 冲突。CAP_SYS_ADMIN 用于 ISO 导入时的

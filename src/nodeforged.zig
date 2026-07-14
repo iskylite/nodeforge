@@ -51,10 +51,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .description = "NodeForge daemon",
         .version = semantic_version,
         .usage = "nodeforged [options]",
-        .help =
-        \\Normal deployments load config and catalog from /opt/nodeforge.
-        \\Use overrides for development, testing, migration, or temporary diagnostics.
-        ,
+        .help = "Normal deployments load config and catalog from " ++ nodeforge.paths.install_root ++ ".\n" ++
+            "Use overrides for development, testing, migration, or temporary diagnostics.",
     }, daemonHandler);
     try root.addFlags(&.{
         .{
@@ -107,7 +105,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         },
         .{
             .name = "log-file",
-            .description = "Override the file destination for --log-output file/both (e.g. /opt/nodeforge/logs/nodeforged.log)",
+            .description = "Override the file destination for --log-output file/both (default: " ++ nodeforge.paths.service_log_path ++ ")",
             .type = .String,
             .default_value = .{ .String = "" },
         },

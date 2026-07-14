@@ -41,7 +41,7 @@ not treated as delivered merely because it appears in `DETAILED_DESIGN.md`.
 - Added bootstrap admin-key resolution: an explicit server key wins, then root
   RSA/Ed25519 public keys, then a persistent OpenSSH-generated Ed25519 key.
   Its public half is merged (deduplicated) into root and every declared user;
-  its private half remains in `/opt/nodeforge/state/bootstrap-ssh` only.
+  its private half remains in `/opt/nodeforge/assets/keys` only.
 
 ## Remaining boundary acceptance
 

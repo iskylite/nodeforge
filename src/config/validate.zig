@@ -74,6 +74,7 @@ pub const ValidationError = error{
     InstallIdentityUnavailable,
     ExternalEndpointForbidden,
     InvalidReinstallPolicy,
+    InvalidTftpConcurrency,
 };
 
 /// 完整校验启动配置和 catalog 的引用关系。
@@ -104,10 +105,13 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     _ = std.Io.net.IpAddress.parseIp4(config.server.server_ip, 0) catch
         return error.InvalidServerIpv4;
     if (config.server.ssh_authorized_public_key) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
+    for (config.server.ssh_authorized_public_keys) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
     if (config.server.http_port == 0) return error.InvalidHttpPort;
     if (config.http.asset_root.len == 0 or config.http.repository_root.len == 0)
         return error.EmptyAssetRoot;
     if (config.tftp.asset_root.len == 0) return error.EmptyTftpAssetRoot;
+    // M4.2 F4: validate TFTP performance config
+    if (config.tftp.max_concurrent_transfers > 64) return error.InvalidTftpConcurrency;
     try validateObservability(config);
     try validateDhcp(&config.dhcp);
     try uniqueNamed(model.DistroConfig, config.distros);

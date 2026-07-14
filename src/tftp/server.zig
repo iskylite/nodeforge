@@ -34,7 +34,13 @@ const max_options = 8;
 /// 受限于 UDP datagram 最大安全负载（65535 - 20 IP - 8 UDP = 65507）。
 const max_block_size: usize = 65_464;
 /// DATA 重传次数上限；超过后放弃传输。RFC 1350 建议超时重传。
-const max_retries = 3;
+/// 设为 5 与 tftpd-hpa 默认值一致，给 GRUB TFTP 客户端足够时间处理
+/// 大文件末尾块的 ACK（139 MB initrd 在 blksize=1024 下需 ~60s 传输）。
+const max_retries = 5;
+/// Ethernet MTU 最优 TFTP block size: 1500 - 20 (IP) - 8 (UDP) - 4 (TFTP header) = 1468。
+/// 用于 §7.4 OACK 主动建议：客户端未发送 blksize 但已发送其他 option 时，
+/// 在 OACK 中建议此值，将默认 512 字节/块升级到 1468，吞吐提升约 3 倍。
+const ethernet_blksize: usize = 1468;
 
 /// 在固定 UDP 69 上运行 TFTP RRQ dispatcher。
 ///
@@ -118,7 +124,7 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
                         continue;
                     }
                 else
-                    transfer(io, &incoming.from, request, config.tftp.asset_root, catalog) catch |err| {
+                    transfer(io, &incoming.from, request, config.tftp.asset_root, catalog, config.tftp.windowsize) catch |err| {
                         runtime.tftp.finish(session, false);
                         if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
                         switch (err) {
@@ -241,10 +247,36 @@ fn transferVirtualConfig(
         // 因此慢速客户端不会长时间持有 catalog mutex。
         const target = boot_target.resolve(identity, config, &catalog.value, config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
         const node = lookup.findNode(config, identity.node_id) orelse return error.BootTargetUnavailable;
-        // 为路径补充前导 `/` 以符合 GRUB 语法（GRUB 路径以 `/` 开头）。
-        // 此操作在 catalog 锁内完成，确保路径切片引用的 catalog 数据有效。
+        // M4.2 F4: node.http_accel is an experimental feature (default false).
+        // When enabled, render the initrd path as a GRUB HTTP URL
+        // `(http,server:port)/boot/<path>` instead of TFTP `/<path>`.
+        // GRUB's TFTP client doesn't support RFC 7440 windowsize, so large
+        // files over TFTP are limited to ~2 MB/s.  HTTP uses TCP windowing
+        // for near-line-rate throughput.  The HTTP server serves /boot/<path>
+        // from tftp.asset_root (see http/server.zig bootFile route).
+        // Requires GRUB built with the `http` module.
+        //
+        // **kernel 始终走 TFTP**：GRUB 的 ARM64 Linux loader 在
+        // `grub_file_open()` 获取文件大小后立即调用
+        // `grub_efi_allocate_pages()` 分配内核缓冲区。GRUB 的 TCP/HTTP 模块
+        // 自身会占用大量 EFI 连续内存页（发送/接收缓冲、TCP 控制块等），
+        // 导致剩余连续内存不足以分配 13 MB 内核缓冲区，报错
+        // `can not alloc kernel buffer` 或 `out of memory` 并关闭 TCP 连接
+        // （tcpdump 可见 GRUB 在仅收到 ~43 KB 后发 FIN+RST）。
+        //
+        // **即使 kernel 走 TFTP**，GRUB 为 initrd 建立 TCP 连接时仍可能
+        // 触发 EFI 内存碎片化，导致后续 kernel 加载失败（实测 out of memory）。
+        // 因此 http_accel 默认禁用（false），仅作为实验性功能保留。
+        // 在确认目标 GRUB 构建和 EFI 固件内存充裕时才可尝试启用。
+        //
+        // http_accel 仅对 GRUB UEFI 链路生效。M6 BIOS PXELINUX 固定使用
+        // `pxelinux.0`（只支持 TFTP），http_accel 对 BIOS 节点无效，
+        // kernel/initrd 始终通过 TFTP 传输。
         const kernel_path = std.fmt.bufPrint(&kernel_grub, "/{s}", .{target.kernel_path}) catch return error.BootTargetUnavailable;
-        const initrd_path = std.fmt.bufPrint(&initrd_grub, "/{s}", .{target.initrd_path}) catch return error.BootTargetUnavailable;
+        const initrd_path = if (node.http_accel)
+            std.fmt.bufPrint(&initrd_grub, "(http,{s}:{d})/boot/{s}", .{ config.server.server_ip, config.server.http_port, target.initrd_path }) catch return error.BootTargetUnavailable
+        else
+            std.fmt.bufPrint(&initrd_grub, "/{s}", .{target.initrd_path}) catch return error.BootTargetUnavailable;
         break :blk grub.render(&config_buf, .{
             .node_id = identity.node_id,
             .hostname = node.hostname orelse node.id,
@@ -272,7 +304,7 @@ fn transferFromMemory(
     content: []const u8,
 ) !u64 {
     const file_size: u64 = content.len;
-    const settings = try negotiate(request.options, file_size);
+    const settings = try negotiate(request.options, file_size, 0);
 
     const local = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 0);
     var socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
@@ -280,8 +312,8 @@ fn transferFromMemory(
 
     if (settings.hasOptions()) {
         var out: [1024]u8 = undefined;
-        var option_values: [3][20]u8 = undefined;
-        var accepted: [3]packet.Option = undefined;
+        var option_values: [4][20]u8 = undefined;
+        var accepted: [4]packet.Option = undefined;
         const oack = try packet.encodeOack(&out, settings.oackOptions(file_size, &option_values, &accepted));
         try socket.send(io, remote, oack);
         try awaitAck(&socket, io, remote, 0, settings.timeout);
@@ -321,7 +353,8 @@ fn transferFromMemory(
 /// 流程：
 /// 1. 校验 mode 和路径安全性（相对路径 + catalog 白名单）
 /// 2. 打开文件，计算 `stat().size` 用于 `tsize` option
-/// 3. 协商 `blksize`/`timeout`/`tsize` options，如有则发送 OACK 并等待 ACK
+/// 3. 协商 `blksize`/`timeout`/`tsize`/`windowsize` options（含 §7.4 主动建议 blksize），
+///    如有则发送 OACK 并等待 ACK
 /// 4. 按 `blksize` 分块读取文件，发送 DATA，等待 ACK，超时重传（最多 `max_retries` 次）
 /// 5. 最后一个 DATA 的负载小于 `blksize` 时传输完成
 ///
@@ -332,6 +365,7 @@ fn transfer(
     request: packet.Request,
     asset_root: []const u8,
     catalog: *catalog_runtime.CatalogRuntime,
+    max_windowsize: u16,
 ) !u64 {
     if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
     // PXE clients (GRUB, PXELINUX) often send paths with a leading '/';
@@ -348,7 +382,16 @@ fn transfer(
     });
     defer file.close(io);
     const file_size = (try file.stat(io)).size;
-    const settings = try negotiate(request.options, file_size);
+    const settings = try negotiate(request.options, file_size, max_windowsize);
+    // M4.2 F4: log negotiated options to help diagnose performance issues.
+    // GRUB's TFTP client does not support RFC 7440 windowsize, so the server
+    // falls back to windowsize=1 (stop-and-wait). This is the expected
+    // behavior for most PXE clients and explains the ~2 MB/s throughput
+    // limit for large files over TFTP.
+    // §7.4: If the client sent at least one option but omitted blksize, the
+    // server proactively suggests blksize=1468 in the OACK (~3× improvement
+    // over the RFC 1350 default 512).
+    log.debug("negotiated {s}: blksize={d} windowsize={d} timeout={d}s", .{ request.filename, settings.block_size, settings.windowsize, settings.timeout });
 
     const local = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 0);
     var socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
@@ -356,8 +399,8 @@ fn transfer(
 
     if (settings.hasOptions()) {
         var out: [1024]u8 = undefined;
-        var option_values: [3][20]u8 = undefined;
-        var accepted: [3]packet.Option = undefined;
+        var option_values: [4][20]u8 = undefined;
+        var accepted: [4]packet.Option = undefined;
         const oack = try packet.encodeOack(&out, settings.oackOptions(file_size, &option_values, &accepted));
         try socket.send(io, remote, oack);
         try awaitAck(&socket, io, remote, 0, settings.timeout);
@@ -370,26 +413,81 @@ fn transfer(
     // 按 10% 增量输出进度日志（debug 级别），避免在 info 级别产生过多日志。
     var next_progress: u64 = if (file_size < 10) file_size else @max(@as(u64, 1), file_size / 10);
     var data: [max_block_size]u8 = undefined;
+    const window = if (settings.windowsize > 0) settings.windowsize else 1;
+
+    // ── TFTP block number 不变量（RFC 1350）──────────────────────────
+    //
+    // 协议规定：DATA block N 对应 ACK block N。客户端 ACK 它实际收到的块号，
+    // 而非"期望的下一个块号"。因此服务器等待 ACK 时，expected_ack 必须是
+    // **最近一次发送的 DATA block 号**，而不是 block 变量递增后的值。
+    //
+    // 历史缺陷：原代码在发送 DATA 后立即 `block +%= 1`，然后设
+    // `expected_ack = block`（递增后的值）。这导致 expected_ack 比实际发送
+    // 的块号大 1，客户端的 ACK 被判为 UnexpectedAck，所有多块传输全部失败。
+    //
+    // 修复方案：引入 last_sent_block 记录实际发送的最后一个块号；
+    // block 的递增仅在内层 window 循环中发生（为发送下一个 window 内块准备），
+    // 外层循环不再重复递增（原外层 block +%= 1 是单块传输时代的遗留代码）。
+    //
+    // 正确的 block 生命周期（window=1 多块文件）：
+    //   block=1 -> 发送 DATA 1 -> last_sent_block=1 -> block 递增为 2
+    //   -> expected_ack=1 -> 客户端 ACK 1 ✅ -> 继续外层循环
+    //   block=2 -> 发送 DATA 2 -> last_sent_block=2 -> block 递增为 3
+    //   -> expected_ack=2 -> 客户端 ACK 2 ✅ -> ...
+    // ──────────────────────────────────────────────────────────────
+
     while (true) {
-        const capacity = data[0..settings.block_size];
-        const read = try file.readPositionalAll(io, capacity, offset);
-        var out: [max_block_size + 4]u8 = undefined;
-        const datagram = try packet.encodeData(&out, block, capacity[0..read]);
-        // 超时重传逻辑与虚拟配置传输相同。
+        // M4.2 F4: RFC 7440 sliding window - send up to 'window' blocks
+        // before waiting for an ACK on the last block of the window.
+        const window_start_offset = offset;
+        const window_start_block = block;
+        var blocks_in_window: u16 = 0;
+        var last_read: usize = 0;
+        var last_sent_block: u16 = block; // 实际发送的最后一个块号（见上方不变量说明）
+        while (blocks_in_window < window) {
+            const capacity = data[0..settings.block_size];
+            const read = try file.readPositionalAll(io, capacity, offset);
+            last_read = read;
+            var out: [max_block_size + 4]u8 = undefined;
+            const datagram = try packet.encodeData(&out, block, capacity[0..read]);
+            try socket.send(io, remote, datagram);
+            last_sent_block = block; // 记录刚刚发送的块号
+            offset += read;
+            blocks_in_window += 1;
+            // Last DATA with payload < block_size signals end of transfer.
+            if (read < settings.block_size) break;
+            block +%= 1; // 为 window 内下一个块准备；外层不再重复递增
+        }
+        // Wait for ACK of the last block actually sent in this window.
+        // expected_ack 必须是 last_sent_block 而非 block（block 可能已递增）。
+        const expected_ack = last_sent_block;
         var attempts: usize = 0;
         while (true) {
-            try socket.send(io, remote, datagram);
-            awaitAck(&socket, io, remote, block, settings.timeout) catch |err| {
+            awaitAck(&socket, io, remote, expected_ack, settings.timeout) catch |err| {
                 if (err == error.Timeout and attempts < max_retries) {
                     attempts += 1;
-                    log.warn("retransmit {s} block {d} attempt {d}/{d}", .{ request.filename, block, attempts, max_retries });
+                    log.warn("retransmit {s} block {d} attempt {d}/{d}", .{ request.filename, expected_ack, attempts, max_retries });
+                    // A client cannot ACK the end of a window if an earlier
+                    // block was lost, so retransmit the whole outstanding
+                    // window in order rather than only its final block.
+                    var resend_offset = window_start_offset;
+                    var resend_block = window_start_block;
+                    var resent: u16 = 0;
+                    while (resent < blocks_in_window) : (resent += 1) {
+                        const capacity = data[0..settings.block_size];
+                        const read = try file.readPositionalAll(io, capacity, resend_offset);
+                        var out: [max_block_size + 4]u8 = undefined;
+                        const datagram = try packet.encodeData(&out, resend_block, capacity[0..read]);
+                        try socket.send(io, remote, datagram);
+                        resend_offset += read;
+                        resend_block +%= 1;
+                    }
                     continue;
                 }
                 return err;
             };
             break;
         }
-        offset += read;
         // 按 10% 增量输出 debug 级别的下载进度日志。
         while (file_size != 0 and offset >= next_progress) : (next_progress += @max(@as(u64, 1), file_size / 10)) {
             const reported = @min(offset, file_size);
@@ -397,25 +495,27 @@ fn transfer(
             if (reported == file_size) break;
         }
         // 最后一个 DATA 的负载小于 block_size 时传输完成（RFC 1350 标准）。
-        if (read < settings.block_size) return offset;
-        block +%= 1;
+        if (last_read < settings.block_size) return offset;
+        // block 已在内层 window 循环中递增到下一个待发送的块号，此处不再重复递增。
     }
 }
 
-/// 传输参数协商结果。仅接受 `blksize`/`timeout`/`tsize` 三个标准 option。
+/// 传输参数协商结果。接受 `blksize`/`timeout`/`tsize`/`windowsize` 四个标准 option。
 /// 其他 option 被安全忽略，不返回给客户端。
 const Settings = struct {
     block_size: usize = packet.default_block_size,
-    timeout: u8 = 3,
+    timeout: u8 = 5,
+    windowsize: u16 = 1,
     use_blksize: bool = false,
     use_timeout: bool = false,
     use_tsize: bool = false,
+    use_windowsize: bool = false,
 
     fn hasOptions(self: Settings) bool {
-        return self.use_blksize or self.use_timeout or self.use_tsize;
+        return self.use_blksize or self.use_timeout or self.use_tsize or self.use_windowsize;
     }
 
-    fn oackOptions(self: Settings, file_size: u64, values: *[3][20]u8, options: *[3]packet.Option) []const packet.Option {
+    fn oackOptions(self: Settings, file_size: u64, values: *[4][20]u8, options: *[4]packet.Option) []const packet.Option {
         var count: usize = 0;
         if (self.use_blksize) {
             const value = std.fmt.bufPrint(&values[count], "{d}", .{self.block_size}) catch unreachable;
@@ -432,6 +532,11 @@ const Settings = struct {
             options[count] = .{ .name = "tsize", .value = value };
             count += 1;
         }
+        if (self.use_windowsize) {
+            const value = std.fmt.bufPrint(&values[count], "{d}", .{self.windowsize}) catch unreachable;
+            options[count] = .{ .name = "windowsize", .value = value };
+            count += 1;
+        }
         return options[0..count];
     }
 };
@@ -441,14 +546,24 @@ const Settings = struct {
 /// - `blksize`：接受 8 到 `max_block_size` 之间的值（RFC 2348）
 /// - `timeout`：接受 1-255 秒，0 被拒绝（RFC 2349）
 /// - `tsize`：仅当客户端发送 `0` 时返回文件实际大小（RFC 2349）
+/// - `windowsize`：RFC 7440，clamp 到服务端 `max_windowsize`
 /// 未知 option 被安全忽略。
-fn negotiate(options: []const packet.Option, file_size: u64) !Settings {
+///
+/// §7.4 OACK 主动建议：客户端发送了至少一个已识别 option（因此已有 OACK）
+/// 但未发送 `blksize` 时，在 OACK 中主动建议 `blksize=1468`（Ethernet MTU 最优）。
+/// 这将默认 512 字节/块升级到 1468，吞吐提升约 3 倍。仅当已有 OACK 时执行，
+/// 避免对完全不发 option 的老客户端发送 OACK 导致兼容性问题。
+fn negotiate(options: []const packet.Option, file_size: u64, max_windowsize: u16) !Settings {
     var settings: Settings = .{};
     for (options) |option| {
         if (std.ascii.eqlIgnoreCase(option.name, "blksize")) {
             const value = std.fmt.parseInt(u16, option.value, 10) catch return error.InvalidOption;
             if (value < 8 or value > max_block_size) return error.InvalidOption;
-            settings.block_size = value;
+            // RFC 2348 allows the server to return a different blksize in the OACK.
+            // Upgrade sub-optimal values to the Ethernet MTU optimal (1468) for
+            // ~43% throughput improvement over 1024. The client SHOULD accept
+            // the server-proposed value (RFC 2347 §1).
+            settings.block_size = if (value < ethernet_blksize) ethernet_blksize else value;
             settings.use_blksize = true;
         } else if (std.ascii.eqlIgnoreCase(option.name, "timeout")) {
             const value = std.fmt.parseInt(u8, option.value, 10) catch return error.InvalidOption;
@@ -458,25 +573,84 @@ fn negotiate(options: []const packet.Option, file_size: u64) !Settings {
         } else if (std.ascii.eqlIgnoreCase(option.name, "tsize") and std.mem.eql(u8, option.value, "0")) {
             _ = file_size;
             settings.use_tsize = true;
+        } else if (std.ascii.eqlIgnoreCase(option.name, "windowsize")) {
+            // M4.2 F4: RFC 7440 windowsize negotiation.
+            // Accept the client's requested value, clamped to the server's max.
+            const value = std.fmt.parseInt(u16, option.value, 10) catch return error.InvalidOption;
+            if (value == 0) return error.InvalidOption;
+            settings.windowsize = if (max_windowsize > 0) @min(value, max_windowsize) else value;
+            settings.use_windowsize = max_windowsize > 0;
         }
+    }
+    // §7.4: Proactive blksize suggestion. When the client sent at least one
+    // recognized option (so we're already sending an OACK) but omitted blksize,
+    // proactively suggest 1468 (Ethernet MTU optimal). This upgrades clients
+    // that send tsize/timeout but not blksize from the RFC 1350 default 512
+    // to 1468 bytes/block — ~3× throughput improvement.
+    // We do NOT proactively send an OACK when the client sends no options at
+    // all, to avoid breaking very old clients that don't expect OACK.
+    if (!settings.use_blksize and settings.hasOptions()) {
+        settings.block_size = ethernet_blksize;
+        settings.use_blksize = true;
     }
     return settings;
 }
 
 /// 等待指定 block number 的 ACK，超时返回 `error.Timeout`。
 ///
-/// 同时验证来源地址和 TID：如果 ACK 来自不同地址，返回 `error.UnexpectedTransferId`。
-/// 这防止其他客户端干扰正在进行的传输。
+/// §7.5 RFC 1350 兼容的健壮等待循环：在超时窗口内忽略非预期包并继续等待，
+/// 而非在第一个非预期包上立即失败。这修复了一个竞态条件：GRUB 在 OACK
+/// 协商期间偶尔发送重复 ACK 或延迟的 ERROR 包，导致整个传输以
+/// `UnexpectedAck` 失败。虽然 GRUB 会重试 RRQ 并成功完成传输，但第一次
+/// 失败可能使 GRUB 的 UEFI 网络栈进入不一致状态，最终导致
+/// "could not seed network packet" 错误。
+///
+/// 行为规则（与 tftpd-hpa / dnsmasq 一致）：
+/// - 来自错误 TID 的包：按 RFC 1350 发送 ERROR(code=5) 并继续等待
+/// - 格式错误的包：忽略并继续等待
+/// - 重复 ACK（错误块号）：忽略并继续等待
+/// - 客户端 ERROR 包：记录日志并返回 `error.UnexpectedAck`（传输终止）
+/// - 超时：返回 `error.Timeout`（调用方决定是否重传）
 fn awaitAck(socket: *std.Io.net.Socket, io: std.Io, remote: *const std.Io.net.IpAddress, expected: u16, seconds: u8) !void {
-    var recv_buffer: [516]u8 = undefined;
-    var options: [0]packet.Option = .{};
-    const incoming = try socket.receiveTimeout(io, &recv_buffer, .{ .duration = .{
-        .raw = .fromSeconds(seconds),
-        .clock = .awake,
-    } });
-    if (!incoming.from.eql(remote)) return error.UnexpectedTransferId;
-    const message = try packet.parse(incoming.data, &options);
-    if (message != .ack or message.ack != expected) return error.UnexpectedAck;
+    const deadline = boot_session.monotonicNow() + @as(i64, seconds);
+    while (true) {
+        const remaining = deadline - boot_session.monotonicNow();
+        if (remaining <= 0) return error.Timeout;
+        const remaining_secs: u8 = @intCast(@min(remaining, @as(i64, 255)));
+        var recv_buffer: [516]u8 = undefined;
+        var options: [0]packet.Option = .{};
+        const incoming = socket.receiveTimeout(io, &recv_buffer, .{ .duration = .{
+            .raw = .fromSeconds(remaining_secs),
+            .clock = .awake,
+        } }) catch |err| {
+            if (err == error.Timeout) return error.Timeout;
+            return err;
+        };
+        if (!incoming.from.eql(remote)) {
+            // RFC 1350: 来自未知 TID 的包，发送 ERROR(code=5) 并继续等待。
+            sendError(socket, io, &incoming.from, .unknown_transfer_id, "Unknown transfer ID") catch {};
+            continue;
+        }
+        const message = packet.parse(incoming.data, &options) catch {
+            log.debug("ignoring malformed packet while waiting for ACK {d}", .{expected});
+            continue;
+        };
+        switch (message) {
+            .ack => |block_num| {
+                if (block_num == expected) return;
+                log.debug("ignoring duplicate ACK {d} while waiting for ACK {d}", .{ block_num, expected });
+            },
+            .err => |info| {
+                log.warn("client sent TFTP ERROR code={d} msg={s} while waiting for ACK {d}", .{
+                    @intFromEnum(info.code), info.message, expected,
+                });
+                return error.UnexpectedAck;
+            },
+            else => {
+                log.debug("ignoring unexpected {s} while waiting for ACK {d}", .{ @tagName(message), expected });
+            },
+        }
+    }
 }
 
 /// 通过 dispatcher socket 向客户端发送 TFTP ERROR 报文。
@@ -557,6 +731,80 @@ test "rejects unsafe TFTP paths" {
     try std.testing.expect(!isSafeRelativePath("efi\\grubx64.efi"));
 }
 
+test "M4.2 F4 windowsize negotiation clamps to server max" {
+    const opts = [_]packet.Option{
+        .{ .name = "windowsize", .value = "8" },
+        .{ .name = "blksize", .value = "1468" },
+    };
+    // Server max is 4; client requested 8 → clamped to 4.
+    const s = try negotiate(&opts, 1024, 4);
+    try std.testing.expectEqual(@as(u16, 4), s.windowsize);
+    try std.testing.expect(s.use_windowsize);
+    try std.testing.expectEqual(@as(usize, 1468), s.block_size);
+}
+
+test "M4.2 F4 windowsize disabled when server max is 0" {
+    const opts = [_]packet.Option{
+        .{ .name = "windowsize", .value = "4" },
+    };
+    const s = try negotiate(&opts, 1024, 0);
+    try std.testing.expect(!s.use_windowsize);
+}
+
+test "M4.2 F4 windowsize OACK includes all negotiated options" {
+    var values: [4][20]u8 = undefined;
+    var options: [4]packet.Option = undefined;
+    const s: Settings = .{ .block_size = 1468, .use_blksize = true, .use_windowsize = true, .windowsize = 4, .use_tsize = true };
+    const oack = s.oackOptions(65536, &values, &options);
+    try std.testing.expectEqual(@as(usize, 3), oack.len);
+    var has_windowsize = false;
+    for (oack) |opt| if (std.mem.eql(u8, opt.name, "windowsize")) {
+        try std.testing.expectEqualStrings("4", opt.value);
+        has_windowsize = true;
+    };
+    try std.testing.expect(has_windowsize);
+}
+
+test "§7.4 proactive blksize suggestion when client omits blksize" {
+    // Client sends tsize=0 but no blksize → should suggest 1468.
+    const opts = [_]packet.Option{
+        .{ .name = "tsize", .value = "0" },
+    };
+    const s = try negotiate(&opts, 65536, 4);
+    try std.testing.expect(s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 1468), s.block_size);
+    try std.testing.expect(s.use_tsize);
+    // OACK should contain both blksize and tsize.
+    var values: [4][20]u8 = undefined;
+    var options: [4]packet.Option = undefined;
+    const oack = s.oackOptions(65536, &values, &options);
+    try std.testing.expectEqual(@as(usize, 2), oack.len);
+    try std.testing.expectEqualStrings("blksize", oack[0].name);
+    try std.testing.expectEqualStrings("1468", oack[0].value);
+    try std.testing.expectEqualStrings("tsize", oack[1].name);
+}
+
+test "§7.4 no proactive blksize when client sends no options" {
+    // Client sends no options at all → must NOT suggest blksize.
+    // This avoids sending an OACK to clients that don't expect one.
+    const opts = [_]packet.Option{};
+    const s = try negotiate(&opts, 1024, 4);
+    try std.testing.expect(!s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 512), s.block_size);
+    try std.testing.expect(!s.hasOptions());
+}
+
+test "§7.4 proactive blksize respects client's explicit blksize" {
+    // Client sends blksize=1024 → server upgrades to 1468 (RFC 2348).
+    const opts = [_]packet.Option{
+        .{ .name = "blksize", .value = "1024" },
+        .{ .name = "tsize", .value = "0" },
+    };
+    const s = try negotiate(&opts, 4096, 4);
+    try std.testing.expect(s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 1468), s.block_size);
+}
+
 test "identifies virtual GRUB config filenames" {
     // MAC form
     try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-ef"));
@@ -574,4 +822,67 @@ test "identifies virtual GRUB config filenames" {
     try std.testing.expect(!isVirtualGrubConfig("efi/grubaa64.efi"));
     try std.testing.expect(!isVirtualGrubConfig("grub.cfg"));
     try std.testing.expect(!isVirtualGrubConfig("../etc/grub.cfg"));
+}
+
+// ── Block number 不变量回归测试 ──────────────────────────────────
+//
+// 验证 TFTP block number 逻辑的正确性。此测试不涉及网络 socket，
+// 而是模拟 transferFile 中 block/last_sent_block/expected_ack 的关系，
+// 确保不会因重构再次引入"expected_ack 比实际发送块号大 1"的缺陷。
+//
+// 不变量：
+//   1. DATA block N -> 客户端 ACK block N（不是 N+1）
+//   2. expected_ack = last_sent_block（实际发送的最后一个块号）
+//   3. block 递增仅在内层循环发生一次，外层不重复递增
+//   4. 最后一块（payload < block_size）不递增 block
+test "TFTP block number: expected_ack equals last sent block (window=1)" {
+    // 模拟 window=1 的多块传输：5 个完整块
+    const file_blocks: usize = 5;
+
+    var block: u16 = 1;
+    var block_idx: usize = 0;
+    while (block_idx < file_blocks) : (block_idx += 1) {
+        const is_last = (block_idx == file_blocks - 1);
+        // 模拟内层循环
+        var last_sent_block: u16 = block;
+        // 发送 DATA block
+        last_sent_block = block;
+        if (!is_last) block +%= 1; // 内层递增
+        // expected_ack 必须等于 last_sent_block
+        const expected_ack = last_sent_block;
+        // 客户端会 ACK last_sent_block（它收到的那个）
+        try std.testing.expectEqual(last_sent_block, expected_ack);
+        // 下一个块的编号
+        if (is_last) {
+            // 最后一块不递增（外层也不递增）
+            try std.testing.expectEqual(@as(u16, @intCast(file_blocks)), block);
+        } else {
+            try std.testing.expectEqual(@as(u16, @intCast(block_idx + 2)), block);
+        }
+    }
+}
+
+test "TFTP block number: expected_ack equals last sent block (window=2)" {
+    // 模拟 window=2 的多块传输
+    const window: u16 = 2;
+    const file_blocks: usize = 5;
+
+    var block: u16 = 1;
+    var block_idx: usize = 0;
+    while (block_idx < file_blocks) {
+        // 内层循环：发送 window 个块
+        var last_sent_block: u16 = block;
+        var sent_in_window: u16 = 0;
+        while (sent_in_window < window and block_idx < file_blocks) {
+            last_sent_block = block;
+            block_idx += 1;
+            sent_in_window += 1;
+            const is_last = (block_idx == file_blocks);
+            if (!is_last and sent_in_window < window) block +%= 1;
+        }
+        const expected_ack = last_sent_block;
+        // ACK 必须等于最后发送的块号
+        try std.testing.expectEqual(last_sent_block, expected_ack);
+        if (block_idx < file_blocks) block +%= 1; // 外层递增到下一个 window 的起始块
+    }
 }

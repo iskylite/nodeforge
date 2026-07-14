@@ -10,6 +10,7 @@ const std = @import("std");
 const zap = @import("zap");
 const model = @import("../model.zig");
 const config_validate = @import("../config/validate.zig");
+const config_load = @import("../config/load.zig");
 const runtime_state = @import("../state/runtime.zig");
 const catalog_runtime = @import("../state/catalog_runtime.zig");
 const observe_error = @import("../observe/error.zig");
@@ -39,11 +40,18 @@ const RouteContext = struct {
     deployments: *deployment_control.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
+    /// M4.2 F5: Additional SSH public keys from config and state dir.
+    additional_keys: []const []const u8,
     daemon_instance_id: *const [boot_session.id_len]u8,
     /// M3.1 独立的 I/O 锁，用于 `node-status.json`；永远不与 DHCP checkpoint
     /// worker 的 lease 文件锁竞争。
     status_io_mutex: *std.atomic.Mutex,
     node_status_path: []const u8,
+    /// M4.2: config.json 路径，供 config/reload 端点重新加载。
+    config_path: []const u8,
+    /// M4.2: config reload 请求标志。HTTP handler 设置后，serve() 返回后
+    /// app.zig 检查并重启 daemon。
+    reload_requested: *std.atomic.Value(bool),
 };
 
 /// 路由入口捕获的每请求元数据，传递给 `json` 用于结构化日志和事件追加。
@@ -82,9 +90,12 @@ pub fn serve(
     deployments: *deployment_control.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
+    additional_keys: []const []const u8,
     daemon_instance_id: *const [boot_session.id_len]u8,
     status_io_mutex: *std.atomic.Mutex,
     node_status_path: []const u8,
+    config_path: []const u8,
+    reload_requested: *std.atomic.Value(bool),
 ) !void {
     if (!std.mem.eql(u8, ip, "0.0.0.0")) return error.InvalidHttpBindAddress;
 
@@ -100,9 +111,12 @@ pub fn serve(
         .deployments = deployments,
         .config_revision = config_revision,
         .bootstrap_key = bootstrap_key,
+        .additional_keys = additional_keys,
         .daemon_instance_id = daemon_instance_id,
         .status_io_mutex = status_io_mutex,
         .node_status_path = node_status_path,
+        .config_path = config_path,
+        .reload_requested = reload_requested,
     };
     if (active_context != null) return error.HttpAlreadyRunning;
     active_context = &context;
@@ -179,6 +193,7 @@ fn route(request: zap.Request) !void {
         if (nodePath(path, "/boot/config/")) |node_id| return bootConfig(request, context, node_id, meta);
         if (assetRoute(path, "/images/")) |name| return imageAsset(request, context, name, meta);
         if (assetRoute(path, "/rootfs/")) |name| return rootfsAsset(request, context, name, meta);
+        if (bootFileRoute(path)) |relative| return bootFile(request, context, relative, meta);
         if (repoRoute(path)) |repo| return repositoryAsset(request, context, repo.name, repo.tail, meta);
         if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/config")) return bootConfig(request, context, node_route.node_id, meta);
@@ -192,6 +207,7 @@ fn route(request: zap.Request) !void {
         if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/events")) return nodeEvent(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/logs")) return nodeLog(request, context, node_route.node_id, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/subiquity-report")) return subiquityReport(request, context, node_route.node_id, meta);
         };
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/config/status"))
@@ -201,6 +217,29 @@ fn route(request: zap.Request) !void {
         defer context.catalog.unlock();
         config_validate.validate(context.config, &context.catalog.value) catch |err| return validationError(request, err, meta);
         return json(request, .ok, "{\"ok\":true,\"result\":{}}\n", meta);
+    }
+    // M4.2: config reload - 通知 daemon 重新加载 config.json（node add/set/remove 后调用）。
+    // 客户端（nodeforge CLI）通过 localhost POST 触发；daemon 先校验新配置，
+    // 再设置 reload 标志，响应后停止 facil.io 事件循环退出，由 systemd 自动重启。
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/reload")) {
+        // 先校验新配置文件可解析且合法
+        const parsed = config_load.load(context.io, context.allocator, context.config_path) catch {
+            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"config.reload_failed\",\"message\":\"failed to load config.json\"}}\n", meta);
+        };
+        var parsed_mut = parsed;
+        defer parsed_mut.deinit();
+        config_validate.validateConfig(&parsed_mut.value) catch {
+            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"config.reload_failed\",\"message\":\"config.json validation failed\"}}\n", meta);
+        };
+        // 设置 reload 标志，serve() 返回后 app.zig 将退出让 systemd 重启
+        context.reload_requested.store(true, .release);
+        // 响应客户端后停止 facil.io 事件循环，使 zap.start() 返回
+        // 从而触发正常 shutdown 序列，systemd 随后自动重启加载新配置。
+        // 必须在此 return，否则 fall-through 到 notFound 会在已关闭的
+        // 连接上 setHeader，触发 zap error.HttpSetHeader。
+        try json(request, .ok, "{\"ok\":true,\"result\":{\"reload\":\"requested\"}}\n", meta);
+        zap.stop();
+        return;
     }
     if (std.mem.eql(u8, method, "POST")) if (installRetryPath(path)) |node_id| return installRetry(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/server/status")) {
@@ -322,6 +361,41 @@ fn rootfsAsset(request: zap.Request, context: *const RouteContext, name: []const
     return staticFile(request, context, context.config.http.asset_root, asset_info.path, asset_info.checksum, meta);
 }
 
+/// M4.2 F4: Route for `/boot/<path>` — serves kernel/initrd files from
+/// `tftp.asset_root` via HTTP, enabling GRUB HTTP acceleration.
+///
+/// GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，大文件（100+ MB initrd）
+/// 在 TFTP 模式下受 RTT 限制仅约 2 MB/s。HTTP 使用 TCP 窗口控制达到接近线速。
+///
+/// 路由优先级：`/boot/config/<node_id>` 在路由表中先于此条匹配，
+/// 因此不会误将 boot config 端点当作静态文件处理。
+///
+/// 安全：路径经 `validateRelativePath` 拒绝 `..`/绝对路径/反斜杠，
+/// 随后 `findAssetByPath` 做 catalog 白名单校验——只有 catalog 中注册的
+/// asset path 才能被提供。`staticFile` → `openRegularFile` 会再次
+/// `validateRelativePath`，形成双重校验。无需认证——GRUB 的 HTTP
+/// 请求无法携带 bearer token，与 TFTP 一致。
+fn bootFileRoute(path: []const u8) ?[]const u8 {
+    const prefix = "/boot/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const relative = path[prefix.len..];
+    if (relative.len == 0) return null;
+    asset_validate.validateRelativePath(relative) catch return null;
+    return relative;
+}
+
+/// M4.2 F4: Serve a boot file (kernel/initrd) from `tftp.asset_root`.
+/// Catalog 白名单 + ETag checksum 支持条件请求和断点续传。
+fn bootFile(request: zap.Request, context: *const RouteContext, relative: []const u8, meta: RequestMeta) !void {
+    const asset_info = blk: {
+        context.catalog.lock();
+        defer context.catalog.unlock();
+        const asset = lookup.findAssetByPath(&context.catalog.value, relative) orelse return notFound(request, meta);
+        break :blk .{ .path = asset.path, .checksum = asset.sha256 };
+    };
+    return staticFile(request, context, context.config.tftp.asset_root, asset_info.path, asset_info.checksum, meta);
+}
+
 fn repositoryAsset(request: zap.Request, context: *const RouteContext, name: []const u8, tail: []const u8, meta: RequestMeta) !void {
     context.catalog.lock();
     const repository = lookup.findRepository(&context.catalog.value, name);
@@ -394,6 +468,34 @@ fn sendRangedFile(request: zap.Request, context: *const RouteContext, file: *std
         file.close(context.io);
         return rangeNotSatisfiable(request, context, size, relative, meta);
     };
+    // GRUB HTTP 兼容（RFC 7233 §4.2 边界情况）：
+    //
+    // GRUB 的 HTTP 客户端在下载完整文件后会发送 `Range: bytes=<size>-`
+    // 做完整性验证（offset 恰好等于文件大小）。严格按 RFC 7233，这应返回
+    // 416 Range Not Satisfiable。但 GRUB 将 416 视为致命错误，会中止启动
+    // 流程，不下载后续文件（如 initrd）。
+    //
+    // 修复方案：当 `range.length == 0`（即 offset == size 的空范围）时，
+    // 返回 206 Partial Content + `Content-Range: bytes */<size>` +
+    // `Content-Length: 0` + 空响应体。这不违反 RFC 7233（空范围在语义上
+    // 是“已读完”的合法状态），同时满足 GRUB 的验证预期。
+    //
+    // 仅对 `offset == size` 生效；`offset > size` 仍返回 416。
+    if (range.length == 0) {
+        file.close(context.io);
+        const request_path = try context.allocator.dupe(u8, request.path orelse "<missing>");
+        defer context.allocator.free(request_path);
+        request.setStatusNumeric(206);
+        var content_range: [96]u8 = undefined;
+        const value = try std.fmt.bufPrint(&content_range, "bytes */{d}", .{size});
+        try request.setHeader("content-range", value);
+        try request.setHeader("accept-ranges", "bytes");
+        var length: [20]u8 = undefined;
+        try request.setHeader("content-length", try std.fmt.bufPrint(&length, "0", .{}));
+        try request.sendBody("");
+        recordStaticCompletion("GET", request_path, context, relative, 206, 0, size, meta);
+        return;
+    }
     request.setStatusNumeric(206);
     var content_range: [96]u8 = undefined;
     const value = try std.fmt.bufPrint(&content_range, "bytes {d}-{d}/{d}", .{ range.offset, range.offset + range.length - 1, size });
@@ -470,12 +572,14 @@ fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const 
 }
 
 fn parseSingleRange(value: []const u8, size: u64) !ByteRange {
+    // RFC 7233 §2.1: 只支持单一 bytes= Range（含 suffix 形式），拒绝多段 Range。
     if (!std.mem.startsWith(u8, value, "bytes=") or std.mem.indexOfScalar(u8, value, ',') != null or size == 0) return error.InvalidRange;
     const spec = value["bytes=".len..];
     const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return error.InvalidRange;
     if (std.mem.indexOfScalar(u8, spec[dash + 1 ..], '-') != null) return error.InvalidRange;
     const first = spec[0..dash];
     const last = spec[dash + 1 ..];
+    // Suffix form: bytes=-N → last N bytes
     if (first.len == 0) {
         const suffix = std.fmt.parseInt(u64, last, 10) catch return error.InvalidRange;
         if (suffix == 0) return error.InvalidRange;
@@ -483,8 +587,19 @@ fn parseSingleRange(value: []const u8, size: u64) !ByteRange {
         return .{ .offset = size - length, .length = length };
     }
     const offset = std.fmt.parseInt(u64, first, 10) catch return error.InvalidRange;
-    if (offset >= size) return error.InvalidRange;
+    // GRUB HTTP 兼容（RFC 7233 §2.1 边界情况）：
+    //
+    // bytes=<size>-  表示 offset 恰好等于文件大小——客户端已完成下载后的
+    // 完整性验证探测。返回 length=0 的空范围，由 sendRangedFile 发送
+    // 206 + 0 字节。这避免 GRUB 将 416 视为致命错误而中止启动。
+    //
+    // bytes=<size+1>- 及更大的 offset 仍为非法范围，返回 error.InvalidRange
+    // (416)，符合 RFC 7233 §4.4。
+    if (offset > size) return error.InvalidRange;
+    if (offset == size) return .{ .offset = offset, .length = 0 };
+    // Open-ended form: bytes=N- → from N to end
     if (last.len == 0) return .{ .offset = offset, .length = size - offset };
+    // Bounded form: bytes=N-M → from N to M (inclusive), clipped to size-1
     const requested_last = std.fmt.parseInt(u64, last, 10) catch return error.InvalidRange;
     if (requested_last < offset) return error.InvalidRange;
     const actual_last = @min(requested_last, size - 1);
@@ -580,9 +695,35 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     context.sessions.touchDelivery(session.boot_session_id[0..], boot_session.monotonicNow(), unixNow());
     const event_url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/events", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
     defer context.allocator.free(event_url);
+    const log_url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/logs", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
+    defer context.allocator.free(log_url);
     const node = lookup.findNode(context.config, node_id) orelse return notFound(request, meta);
     const profile = lookup.findProfile(context.config, session.profile) orelse return notFound(request, meta);
-    const install = profile.install orelse return error.MissingInstallConfig;
+    // M4.2: Subiquity webhook reporting 在 22.04 和 24.04 均可用（curtin handler 相同）。
+    // 始终为 Ubuntu 传入 report_url；webhook reporter 无认证，端点通过源 IP 校验。
+    const report_url: []const u8 = if (std.mem.eql(u8, profile.distro, "ubuntu")) blk: {
+        const url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/subiquity-report", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
+        break :blk url;
+    } else "";
+    defer if (report_url.len > 0) context.allocator.free(report_url);
+    const install_orig = profile.install orelse return error.MissingInstallConfig;
+    // M4.2 F5: Merge server-level additional SSH keys into the install config.
+    const merged_keys: []const []const u8 = if (context.additional_keys.len > 0) blk: {
+        const combined = try context.allocator.alloc([]const u8, install_orig.ssh_authorized_keys.len + context.additional_keys.len);
+        @memcpy(combined[0..install_orig.ssh_authorized_keys.len], install_orig.ssh_authorized_keys);
+        @memcpy(combined[install_orig.ssh_authorized_keys.len..], context.additional_keys);
+        break :blk combined;
+    } else install_orig.ssh_authorized_keys;
+    defer if (context.additional_keys.len > 0) context.allocator.free(merged_keys);
+    const install: model.InstallConfig = if (context.additional_keys.len > 0) .{
+        .storage = install_orig.storage,
+        .bootloader = install_orig.bootloader,
+        .packages = install_orig.packages,
+        .users = install_orig.users,
+        .ssh_authorized_keys = merged_keys,
+        .bundle = install_orig.bundle,
+        .apt = install_orig.apt,
+    } else install_orig;
     const system = try @import("../profile/install.zig").effectiveSystem(profile);
     const bundle = if (install.bundle) |name| findProvisioningBundle(context.config, name) else null;
     var password_scope_buffer: [128]u8 = undefined;
@@ -605,7 +746,7 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     } else null;
     const body = switch (format) {
         .meta_data => try @import("../profile/adapter/ubuntu.zig").renderMetaData(context.allocator, node),
-        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserDataM41(context.allocator, node, install, system, context.bootstrap_key, bundle, apt_primary_url, event_url, session.boot_session_id[0..], session.capability[0..], password_scope),
+        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserDataM41(context.allocator, node, install, system, context.bootstrap_key, bundle, apt_primary_url, event_url, log_url, report_url, session.boot_session_id[0..], session.capability[0..], password_scope),
         .vendor_data => try context.allocator.dupe(u8, ""),
         .kickstart => blk: {
             context.catalog.lock();
@@ -613,7 +754,7 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
             const source = lookup.findInstallSource(&context.catalog.value, profile.install_source orelse return notFound(request, meta)) orelse return notFound(request, meta);
             const install_root = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/repos/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
             defer context.allocator.free(install_root);
-            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, event_url, session.boot_session_id[0..], session.capability[0..], password_scope);
+            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope);
         },
     };
     defer context.allocator.free(body);
@@ -727,6 +868,82 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
         return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"events.unavailable\",\"message\":\"event writer unavailable\"}}\n", meta);
     };
     context.sessions.finishDelivery(checked.session.boot_session_id[0..], .failed, boot_session.monotonicNow(), unixNow());
+    return json(request, .ok, "{\"ok\":true}\n", meta);
+}
+
+/// M4.2 F1: Subiquity native HTTP reporting callback.
+/// Subiquity sends JSON events with `event`/`level`/`message` fields.
+/// This handler maps them to NodeForge install stages and records events.
+///
+/// Subiquity's curtin webhook reporter does not support custom headers
+/// (see ubuntu adapter: "webhook reporter 不支持 `headers` 字段").
+/// Therefore this endpoint accepts both bootstrap (source-IP) and capability
+/// (bearer token) authentication.  Bootstrap auth verifies that the request
+/// originates from the IP of an active boot session's DHCP lease, which is
+/// sufficient for the isolated PXE provisioning network.
+fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
+    if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
+    if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"body_too_large\",\"message\":\"subiquity report body too large\"}}\n", meta);
+    try request.parseBody();
+    var params = try request.parametersToOwnedList(context.allocator);
+    defer params.deinit();
+    var event_name: ?[]const u8 = null;
+    var message: []const u8 = "";
+    for (params.items) |param| {
+        if (std.mem.eql(u8, param.key, "event")) event_name = stringParam(param.value) else if (std.mem.eql(u8, param.key, "message")) message = stringParam(param.value) orelse "";
+    }
+    const event = event_name orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"subiquity.invalid\",\"message\":\"missing event field\"}}\n", meta);
+    // Map Subiquity events to NodeForge install stages.
+    const resolved_stage: ?[]const u8 = blk: {
+        if (std.ascii.eqlIgnoreCase(event, "STARTED")) break :blk "started";
+        if (std.ascii.eqlIgnoreCase(event, "PARTITIONING")) break :blk "partitioning";
+        if (std.ascii.eqlIgnoreCase(event, "PACKAGES")) break :blk "packages";
+        if (std.ascii.eqlIgnoreCase(event, "BOOTLOADER")) break :blk "bootloader";
+        if (std.ascii.eqlIgnoreCase(event, "DONE")) break :blk "completed";
+        if (std.ascii.eqlIgnoreCase(event, "ERROR")) break :blk "failed";
+        break :blk null;
+    };
+    const stage = resolved_stage orelse {
+        // Unknown Subiquity events are acknowledged but not recorded.
+        return json(request, .ok, "{\"ok\":true}\n", meta);
+    };
+    const terminal = std.mem.eql(u8, stage, "completed") or std.mem.eql(u8, stage, "failed");
+    const mapped = mapStage(.install, stage) orelse return json(request, .ok, "{\"ok\":true}\n", meta);
+    if (std.mem.eql(u8, stage, "started")) {
+        const consumed = context.deployments.consume(node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot consume install generation\"}}\n", meta);
+        deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
+            if (consumed) |result| context.deployments.rollbackConsume(node_id, result);
+            observe_log.err("deployment-control save failed: {t}", .{err});
+            return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist install generation\"}}\n", meta);
+        };
+    }
+    if (terminal) {
+        const terminal_result = context.deployments.markTerminal(node_id, std.mem.eql(u8, stage, "completed"));
+        deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
+            if (terminal_result) |result| context.deployments.rollbackTerminal(node_id, result);
+            observe_log.err("deployment-control applied revision save failed: {t}", .{err});
+            return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
+        };
+    }
+    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, mapped.phase, null, unixNow(), !terminal) catch |err|
+        observe_log.err("node status update failed: {t}", .{err});
+    if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
+    var fields: [3]events.Field = .{
+        .{ .key = "node_id", .value = node_id },
+        .{ .key = "boot_session_id", .value = checked.session.boot_session_id[0..] },
+        .{ .key = "stage", .value = stage },
+    };
+    context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, mapped.event_type, if (message.len > 0) message else "subiquity report", &fields) catch |err| {
+        observe_log.err("subiquity report event append failed: {t}", .{err});
+        return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"events.unavailable\",\"message\":\"event writer unavailable\"}}\n", meta);
+    };
+    if (terminal) {
+        context.sessions.finishDelivery(checked.session.boot_session_id[0..], if (std.mem.eql(u8, stage, "completed")) .completed else .failed, boot_session.monotonicNow(), unixNow());
+    } else {
+        const phase: boot_session.Phase = if (std.mem.eql(u8, stage, "installer_started")) .installer_started else if (std.mem.eql(u8, stage, "started")) .installing else .installing;
+        context.sessions.advanceDelivery(checked.session.boot_session_id[0..], phase, boot_session.monotonicNow(), unixNow());
+    }
     return json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
@@ -1178,15 +1395,24 @@ test "Zap-backed route module compiles" {
     try std.testing.expect(!isLoopbackPeer("192.168.50.9"));
 }
 
-test "single byte ranges cover bounded, open-ended and suffix forms" {
+test "single byte ranges cover bounded, open-ended, suffix and EOF forms" {
+    // Bounded: bytes=4-7 → offset=4, length=4
     const bounded = try parseSingleRange("bytes=4-7", 10);
     try std.testing.expectEqual(ByteRange{ .offset = 4, .length = 4 }, bounded);
+    // Clipped: bytes=8-99 → offset=8, length=2 (clipped to size-1)
     const clipped = try parseSingleRange("bytes=8-99", 10);
     try std.testing.expectEqual(ByteRange{ .offset = 8, .length = 2 }, clipped);
+    // Open-ended: bytes=7- → offset=7, length=3
     const open_ended = try parseSingleRange("bytes=7-", 10);
     try std.testing.expectEqual(ByteRange{ .offset = 7, .length = 3 }, open_ended);
+    // Suffix: bytes=-4 → offset=6, length=4
     const suffix = try parseSingleRange("bytes=-4", 10);
     try std.testing.expectEqual(ByteRange{ .offset = 6, .length = 4 }, suffix);
+    // Multi-range rejected
     try std.testing.expectError(error.InvalidRange, parseSingleRange("bytes=0-1,3-4", 10));
-    try std.testing.expectError(error.InvalidRange, parseSingleRange("bytes=10-", 10));
+    // GRUB HTTP 兼容：bytes=<size>- 返回空范围(offset=size, length=0)而非 error
+    const eof_range = try parseSingleRange("bytes=10-", 10);
+    try std.testing.expectEqual(ByteRange{ .offset = 10, .length = 0 }, eof_range);
+    // offset > size 仍为非法范围
+    try std.testing.expectError(error.InvalidRange, parseSingleRange("bytes=11-", 10));
 }

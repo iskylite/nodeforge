@@ -69,6 +69,12 @@ make arm64-debug    # 交叉编译 aarch64 Debug 二进制
 `/opt/nodeforge/catalog/catalog.json`，无需传 `--config`/`--catalog`；这些参数主要用于
 开发、测试和临时排障覆盖路径。
 
+安装布局的唯一事实源是 `src/paths.zig` 中的 `install_root`。运行时默认路径全部由它派生：ISO、TFTP
+启动文件、仓库、密钥、rootfs、initrd 与 bundle 分别位于 `assets/iso`、`assets/boot`、`assets/repos`、
+`assets/keys`、`assets/rootfs`、`assets/initrd`、`assets/bundles`；运行态 provisioning 结果位于
+`state/provisioned`。升级旧安装前先停止服务并执行 `packaging/install-layout.sh`；它会迁移旧数据、更新
+config/catalog、移除旧路径，并从同一事实源渲染 systemd unit。
+
 `config.example.json` 中的 `server.bind_interface = "enp1s0"` 是 Linux PXE 网卡占位值；部署
 DHCP 前必须替换为承载 `server.server_ip` 的实际接口。当前 DHCPv4 服务会拒绝空值，避免 wildcard
 UDP/67 在多网卡主机上失去接口边界。

@@ -81,4 +81,9 @@ pub fn build(b: *std.Build) void {
     http_tests.addArtifactArg(daemon);
     http_tests.step.dependOn(&cli_tests.step);
     test_step.dependOn(&http_tests.step);
+
+    const layout_tests = b.addSystemCommand(&.{"sh"});
+    layout_tests.addFileArg(b.path("tests/install-layout.sh"));
+    layout_tests.step.dependOn(&http_tests.step);
+    test_step.dependOn(&layout_tests.step);
 }

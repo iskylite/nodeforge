@@ -8,6 +8,8 @@ const nodeforge = @import("nodeforge");
 const views = @import("nodeforge").cli_views;
 const cli_output = @import("nodeforge").cli_output;
 const cli_events = @import("nodeforge").cli_events;
+const model = @import("nodeforge").model;
+const node_mutation = @import("nodeforge").node_mutation;
 
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = nodeforge.log_backend.logFn };
 
@@ -148,92 +150,139 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         catalog_export,
     });
 
-    const tftp = try zli.Command.init(init_options, .{
-        .name = "tftp",
-        .description = "Inspect the local TFTP service",
-        .usage = "nodeforge tftp <command> [options]",
-        .help = "Read M1 TFTP runtime state from the local nodeforged management listener.",
+    // ── node 资源（节点 CRUD + 部署生命周期）──────────────────────────
+    const node = try zli.Command.init(init_options, .{
+        .name = "node",
+        .description = "Manage registered nodes and deployment lifecycle",
+        .usage = "nodeforge node <list|show|add|set|remove|render|retry|trace> [options]",
     }, showCurrentHelp);
-    const tftp_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show TFTP transfer counters" }, tftpShowHandler);
-    try addConfigPathFlag(tftp_show);
-    try addOutputFlag(tftp_show);
-    try addDebugFlag(tftp_show);
-    const tftp_session = try zli.Command.init(init_options, .{ .name = "session", .description = "Inspect TFTP transfer sessions" }, showCurrentHelp);
-    const tftp_session_list = try zli.Command.init(init_options, .{ .name = "list", .description = "Show recent TFTP transfer sessions" }, tftpSessionListHandler);
-    try addConfigPathFlag(tftp_session_list);
-    try addOutputFlag(tftp_session_list);
-    try addDebugFlag(tftp_session_list);
-    try tftp_session.addCommands(&.{tftp_session_list});
-    try tftp.addCommands(&.{ tftp_show, tftp_session });
 
-    const dhcp = try zli.Command.init(init_options, .{
-        .name = "dhcp",
-        .description = "Inspect the DHCPv4 service configuration",
-        .usage = "nodeforge dhcp show [options]",
-    }, showCurrentHelp);
-    const dhcp_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show DHCP subnet and pool configuration" }, dhcpShowHandler);
-    try addConfigPathFlag(dhcp_show);
-    try addOutputFlag(dhcp_show);
-    try addDebugFlag(dhcp_show);
-    try dhcp.addCommands(&.{dhcp_show});
-
-    const runtime = try zli.Command.init(init_options, .{ .name = "runtime", .description = "Inspect current DHCP runtime state" }, showCurrentHelp);
-    const leases = try zli.Command.init(init_options, .{ .name = "leases", .description = "Inspect DHCP leases" }, showCurrentHelp);
-    const leases_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List active DHCP leases" }, runtimeLeasesHandler);
-    try addConfigPathFlag(leases_list);
-    try addOutputFlag(leases_list);
-    try addDebugFlag(leases_list);
-    const unknown = try zli.Command.init(init_options, .{ .name = "unknown", .description = "Inspect unclaimed DHCP clients" }, showCurrentHelp);
-    const unknown_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List unclaimed DHCP clients" }, runtimeUnknownHandler);
-    try addConfigPathFlag(unknown_list);
-    try addOutputFlag(unknown_list);
-    try addDebugFlag(unknown_list);
-    try leases.addCommands(&.{leases_list});
-    try unknown.addCommands(&.{unknown_list});
-    try runtime.addCommands(&.{ leases, unknown });
-
-    const node = try zli.Command.init(init_options, .{ .name = "node", .description = "Inspect registered nodes" }, showCurrentHelp);
     const node_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List registered nodes" }, nodeListHandler);
     try addConfigPathFlag(node_list);
     try addOutputFlag(node_list);
     try addDebugFlag(node_list);
-    try node.addCommands(&.{node_list});
 
-    const install = try zli.Command.init(init_options, .{
-        .name = "install",
-        .description = "Preview M4 unattended installer answers",
-        .usage = "nodeforge install render <node_id> [options]",
-        .help = "Render the selected node's Kickstart or Ubuntu NoCloud answer locally. Preview output redacts runtime session credentials.",
-    }, showCurrentHelp);
-    const install_render = try zli.Command.init(init_options, .{ .name = "render", .description = "Render the unattended install answer for one registered node" }, installRenderHandler);
-    try install_render.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
-    try addConfigPathFlag(install_render);
-    try addCatalogPathFlag(install_render);
-    try addOutputFlag(install_render);
-    try addDebugFlag(install_render);
-    try install.addCommands(&.{install_render});
-    const install_retry = try zli.Command.init(init_options, .{ .name = "retry", .description = "Explicitly rearm the next PXE install generation" }, installRetryHandler);
-    try install_retry.addPositionalArg(.{ .name = "node_id", .description = "Registered install node", .required = true });
-    try addConfigPathFlag(install_retry);
-    try addOutputFlag(install_retry);
-    try addDebugFlag(install_retry);
-    try install.addCommands(&.{install_retry});
+    const node_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show node detail (attributes + deploy state)" }, nodeShowHandler);
+    try node_show.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try addConfigPathFlag(node_show);
+    try addOutputFlag(node_show);
+    try addDebugFlag(node_show);
 
-    const asset = try zli.Command.init(init_options, .{
-        .name = "asset",
-        .description = "Inspect and register TFTP boot assets",
-        .usage = "nodeforge asset <command> [options]",
-        .help = "M1 asset paths are relative to config.tftp.asset_root and are integrity checked before catalog registration.",
-    }, showCurrentHelp);
-    try asset.addCommands(&.{ try assetImportCommand(init_options), try assetListCommand(init_options), try assetShowCommand(init_options), try assetValidateCommand(init_options) });
+    const node_add = try zli.Command.init(init_options, .{ .name = "add", .description = "Add a registered node" }, nodeAddHandler);
+    try node_add.addPositionalArg(.{ .name = "node_id", .description = "Unique node identifier", .required = true });
+    try node_add.addFlags(&.{
+        .{ .name = "mac", .description = "MAC address (e.g. 02:aa:bb:cc:dd:ef)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "profile", .description = "Profile name to bind", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "ip", .description = "Static DHCP reservation IP", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "hostname", .description = "Node hostname", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "deploy", .description = "Deploy flag: true or false (default true)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "http-accel", .description = "HTTP acceleration for initrd (experimental, default false)", .type = .String, .default_value = .{ .String = "" } },
+    });
+    try addConfigPathFlag(node_add);
+    try addOutputFlag(node_add);
+    try addDebugFlag(node_add);
 
-    const install_source = try zli.Command.init(init_options, .{
-        .name = "install-source",
-        .description = "Import validated Linux installation media",
-        .usage = "nodeforge install-source import <iso-path> [options]",
-        .help = "The ISO may be at any local path. The CLI stages a managed copy before the local daemon performs its read-only loop mount.",
+    const node_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Modify node attributes" }, nodeSetHandler);
+    try node_set.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try node_set.addFlags(&.{
+        .{ .name = "mac", .description = "New MAC address", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "New architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "profile", .description = "New profile name", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "ip", .description = "New static IP", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "hostname", .description = "New hostname", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "deploy", .description = "Deploy flag: true or false", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "http-accel", .description = "HTTP acceleration: true or false (experimental, default false)", .type = .String, .default_value = .{ .String = "" } },
+    });
+    try addConfigPathFlag(node_set);
+    try addOutputFlag(node_set);
+    try addDebugFlag(node_set);
+
+    const node_remove = try zli.Command.init(init_options, .{ .name = "remove", .description = "Remove a registered node" }, nodeRemoveHandler);
+    try node_remove.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try addConfigPathFlag(node_remove);
+    try addOutputFlag(node_remove);
+    try addDebugFlag(node_remove);
+
+    const node_render = try zli.Command.init(init_options, .{ .name = "render", .description = "Render the unattended install answer for one node" }, installRenderHandler);
+    try node_render.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try addConfigPathFlag(node_render);
+    try addCatalogPathFlag(node_render);
+    try addOutputFlag(node_render);
+    try addDebugFlag(node_render);
+
+    const node_retry = try zli.Command.init(init_options, .{ .name = "retry", .description = "Rearm the next PXE install generation" }, installRetryHandler);
+    try node_retry.addPositionalArg(.{ .name = "node_id", .description = "Registered install node", .required = true });
+    try addConfigPathFlag(node_retry);
+    try addOutputFlag(node_retry);
+    try addDebugFlag(node_retry);
+
+    const node_trace = try zli.Command.init(init_options, .{
+        .name = "trace",
+        .description = "Reconstruct one node boot-session timeline from local events",
+        .usage = "nodeforge node trace <node_id> [--session <id>] [--latest] [options]",
+    }, traceHandler);
+    try node_trace.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try node_trace.addFlags(&.{
+        .{ .name = "session", .description = "Exact 32-character boot session identifier", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "latest", .description = "Select the latest retained session (default when --session is omitted)", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.events_path } },
+    });
+    try addOutputFlag(node_trace);
+
+    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_remove, node_render, node_retry, node_trace });
+
+    // ── assets 资源（ISO/资产导入管理）──────────────────────────────────
+    const assets = try zli.Command.init(init_options, .{
+        .name = "assets",
+        .description = "Import and inspect boot assets and installation media",
+        .usage = "nodeforge assets <import|list|show|validate> [options]",
     }, showCurrentHelp);
-    try install_source.addCommands(&.{try installSourceImportCommand(init_options)});
+    try assets.addCommands(&.{
+        try installSourceImportCommand(init_options),
+        try assetListCommand(init_options),
+        try assetShowCommand(init_options),
+        try assetValidateCommand(init_options),
+        try assetImportCommand(init_options),
+    });
+
+    // ── runtime 资源（DHCP/TFTP 运行态查看）──────────────────────────────
+    const runtime = try zli.Command.init(init_options, .{
+        .name = "runtime",
+        .description = "Inspect runtime state: DHCP leases, TFTP sessions",
+        .usage = "nodeforge runtime <dhcp-leases|dhcp-unknown|tftp-counters|tftp-sessions> [options]",
+    }, showCurrentHelp);
+
+    const rt_dhcp_leases = try zli.Command.init(init_options, .{ .name = "dhcp-leases", .description = "List active DHCP leases" }, runtimeLeasesHandler);
+    try addConfigPathFlag(rt_dhcp_leases);
+    try addOutputFlag(rt_dhcp_leases);
+    try addDebugFlag(rt_dhcp_leases);
+
+    const rt_dhcp_unknown = try zli.Command.init(init_options, .{ .name = "dhcp-unknown", .description = "List unclaimed DHCP clients" }, runtimeUnknownHandler);
+    try addConfigPathFlag(rt_dhcp_unknown);
+    try addOutputFlag(rt_dhcp_unknown);
+    try addDebugFlag(rt_dhcp_unknown);
+
+    const rt_tftp_counters = try zli.Command.init(init_options, .{ .name = "tftp-counters", .description = "Show TFTP transfer counters" }, tftpShowHandler);
+    try addConfigPathFlag(rt_tftp_counters);
+    try addOutputFlag(rt_tftp_counters);
+    try addDebugFlag(rt_tftp_counters);
+
+    const rt_tftp_sessions = try zli.Command.init(init_options, .{ .name = "tftp-sessions", .description = "Show recent TFTP transfer sessions" }, tftpSessionListHandler);
+    try addConfigPathFlag(rt_tftp_sessions);
+    try addOutputFlag(rt_tftp_sessions);
+    try addDebugFlag(rt_tftp_sessions);
+
+    try runtime.addCommands(&.{
+        rt_dhcp_leases,
+        rt_dhcp_unknown,
+        rt_tftp_counters,
+        rt_tftp_sessions,
+        try runtimeStatusCommand(init_options),
+        // M4.2 F6: deprecated subcommands for backward compat
+        try deprecatedRuntimeLeasesCommand(init_options),
+        try deprecatedRuntimeUnknownCommand(init_options),
+    });
 
     const events = try zli.Command.init(init_options, .{
         .name = "events",
@@ -248,35 +297,24 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const events_types = try zli.Command.init(init_options, .{ .name = "types", .description = "List registered event types" }, eventsTypesHandler);
     try addOutputFlag(events_types);
     try events.addCommands(&.{ events_list, events_follow, events_types });
-    // trace 是只读的因果重建视图：只消费 daemon 审计流，不连接管理 API，
-    // 更不会因查询而创建或推进 boot session。
-    const trace = try zli.Command.init(init_options, .{
-        .name = "trace",
-        .description = "Reconstruct one node boot-session timeline from local events",
-        .usage = "nodeforge trace <node_id> [--session <boot_session_id>] [--latest] [options]",
-    }, traceHandler);
-    try trace.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
-    try trace.addFlags(&.{
-        .{ .name = "session", .description = "Exact 32-character boot session identifier", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "latest", .description = "Select the latest retained session (default when --session is omitted)", .type = .Bool, .default_value = .{ .Bool = false } },
-        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.events_path } },
-    });
-    try addOutputFlag(trace);
 
     try root.addCommands(&.{
         status,
         check,
         config,
         catalog,
-        tftp,
-        dhcp,
-        runtime,
         node,
-        install,
-        asset,
-        install_source,
+        assets,
+        runtime,
         events,
-        trace,
+        // M4.2 F6: Deprecated aliases for backward compatibility.
+        // Each prints a deprecation warning before delegating to the new command path.
+        try deprecatedAliasCommand(init_options, "import-iso", "assets import"),
+        try deprecatedAliasCommand(init_options, "install-render", "node render"),
+        try deprecatedAliasCommand(init_options, "install-retry", "node retry"),
+        try deprecatedAliasCommand(init_options, "trace", "node trace"),
+        try deprecatedDhcpCommand(init_options),
+        try deprecatedTftpCommand(init_options),
     });
     return root;
 }
@@ -284,17 +322,17 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
     const command = try zli.Command.init(init_options, .{
         .name = "import",
-        .description = "Import one Rocky or Ubuntu ISO and publish its install source",
-        .help = "Accepts an ISO at any local path. The CLI stages a temporary managed copy, then asks the local daemon to mount, validate and publish it. The original file is never moved or deleted; distro/version/arch are detected unless supplied as checks.",
+        .description = "Import an ISO and publish its install source",
+        .help = "Accepts an ISO at any local path. The CLI stages a temporary managed copy, then asks the local daemon to mount, validate and publish it. The original file is never moved or deleted; distro/version/arch are auto-detected unless overridden.",
     }, installSourceImportHandler);
     try addConfigPathFlag(command);
     try addOutputFlag(command);
     try addDebugFlag(command);
     try command.addPositionalArg(.{ .name = "iso-path", .description = "Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso", .required = true });
     try command.addFlags(&.{
-        .{ .name = "distro", .description = "Optional detected-distro check; e.g. ubuntu", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "version", .description = "Optional detected-version check; e.g. 22.04", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "Optional detected-architecture check; e.g. aarch64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "distro", .description = "Override auto-detected distro; e.g. rocky, ubuntu, debian. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "version", .description = "Override auto-detected version; e.g. 9.7, 22.04. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Override auto-detected arch; e.g. aarch64, x86_64. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
     });
     return command;
 }
@@ -318,7 +356,7 @@ fn configImportCommand(init_options: zli.InitOptions) !*zli.Command {
 }
 
 fn assetImportCommand(init_options: zli.InitOptions) !*zli.Command {
-    const command = try zli.Command.init(init_options, .{ .name = "import", .description = "Register an existing TFTP asset and its SHA-256" }, assetImportHandler);
+    const command = try zli.Command.init(init_options, .{ .name = "register", .description = "Register an existing TFTP asset and its SHA-256" }, assetImportHandler);
     try addConfigPathFlag(command);
     try addOutputFlag(command);
     try addDebugFlag(command);
@@ -697,7 +735,7 @@ fn assetValidateHandler(ctx: zli.CommandContext) !void {
     defer loaded.deinit();
     for (loaded.value().assets) |item| {
         var digest: [64]u8 = undefined;
-        nodeforge.asset_validate.sha256File(ctx.io, parsed_config.value.tftp.asset_root, item.path, &digest) catch {
+        nodeforge.asset_validate.sha256File(ctx.io, assetRoot(&parsed_config.value, item.kind), item.path, &digest) catch {
             try ctx.writer.print("error: asset: unreadable: {s}\n", .{item.path});
             setExitCode(ctx, 1);
             return;
@@ -712,6 +750,30 @@ fn assetValidateHandler(ctx: zli.CommandContext) !void {
         var count: [20]u8 = undefined;
         try views.success(ctx.writer, "assets valid", &.{.{ .label = "Assets", .value = try std.fmt.bufPrint(&count, "{d}", .{loaded.value().assets.len}) }});
     }
+}
+
+fn assetRoot(config: *const nodeforge.model.AppConfig, kind: nodeforge.model.AssetKind) []const u8 {
+    return switch (kind) {
+        .iso => config.http.asset_root,
+        .bootloader, .kernel, .installer_initrd => config.tftp.asset_root,
+        .gpg_key => nodeforge.paths.keys_dir,
+        .nodeforge_initrd => nodeforge.paths.initrd_dir,
+        .rootfs => nodeforge.paths.rootfs_dir,
+    };
+}
+
+test "asset validation selects the storage root by asset kind" {
+    const config: nodeforge.model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+        .http = .{ .asset_root = "/http-assets" },
+        .tftp = .{ .asset_root = "/tftp-assets" },
+    };
+    try std.testing.expectEqualStrings("/http-assets", assetRoot(&config, .iso));
+    try std.testing.expectEqualStrings(nodeforge.paths.rootfs_dir, assetRoot(&config, .rootfs));
+    try std.testing.expectEqualStrings(nodeforge.paths.initrd_dir, assetRoot(&config, .nodeforge_initrd));
+    try std.testing.expectEqualStrings(nodeforge.paths.keys_dir, assetRoot(&config, .gpg_key));
+    try std.testing.expectEqualStrings("/tftp-assets", assetRoot(&config, .bootloader));
+    try std.testing.expectEqualStrings("/tftp-assets", assetRoot(&config, .installer_initrd));
 }
 
 fn tftpShowHandler(ctx: zli.CommandContext) !void {
@@ -900,12 +962,14 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     const bootstrap_key = try nodeforge.admin_key.resolve(ctx.io, ctx.allocator, config.value.server);
     defer ctx.allocator.free(bootstrap_key);
     const bundle = if (install.bundle) |name| findBundle(&config.value, name) else null;
+    // M4.2: webhook reporting 对所有 Ubuntu 版本可用（curtin handler 相同）
+    const preview_report_url: []const u8 = if (std.mem.eql(u8, source.distro, "ubuntu")) "<report-url>" else "";
     const answer = if (std.mem.eql(u8, source.distro, "ubuntu"))
-        try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, event_url, "<boot-session>", "<capability>", &preview_scope)
+        try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, event_url, "<log-url>", preview_report_url, "<boot-session>", "<capability>", &preview_scope)
     else blk: {
         const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/repos/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
         defer ctx.allocator.free(install_root);
-        break :blk try nodeforge.kickstart.renderAnswerM41(ctx.allocator, node, install, system, bootstrap_key, install_root, bundle, event_url, "<boot-session>", "<capability>", &preview_scope);
+        break :blk try nodeforge.kickstart.renderAnswerM41(ctx.allocator, node, install, system, bootstrap_key, install_root, bundle, event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope);
     };
     defer ctx.allocator.free(answer);
     try ctx.writer.writeAll(answer);
@@ -922,6 +986,216 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     const status = nodeforge.management_client.installRetry(ctx.io, config.value.server.http_port, node_id);
     if (output_json) try ctx.writer.print("{{\"ok\":{s},\"node_id\":{f}}}\n", .{ if (status.healthy) "true" else "false", std.json.fmt(node_id, .{}) }) else if (status.healthy) try ctx.writer.print("install generation rearmed for {s}; waiting for next PXE\n", .{node_id}) else try ctx.writer.print("error: install retry failed for {s}\n", .{node_id});
     if (!status.healthy) setExitCode(ctx, 1);
+}
+
+// ── M4.2 node CRUD handlers ───────────────────────────────────────
+
+fn nodeAddHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const config_path = ctx.flag("config", []const u8);
+    const node_id = ctx.getArg("node_id") orelse return;
+    const mac = ctx.flag("mac", []const u8);
+    const arch_str = ctx.flag("arch", []const u8);
+    const profile = ctx.flag("profile", []const u8);
+    const ip = ctx.flag("ip", []const u8);
+    const hostname = ctx.flag("hostname", []const u8);
+    const deploy_str = ctx.flag("deploy", []const u8);
+    const http_accel_str = ctx.flag("http-accel", []const u8);
+
+    if (mac.len == 0 or profile.len == 0 or arch_str.len == 0) {
+        try ctx.writer.print("error: --mac, --arch and --profile are required\n", .{});
+        setExitCode(ctx, 1);
+        return;
+    }
+    const arch: model.Arch = if (std.mem.eql(u8, arch_str, "aarch64")) .aarch64 else if (std.mem.eql(u8, arch_str, "x86_64")) .x86_64 else {
+        try ctx.writer.print("error: --arch must be aarch64 or x86_64\n", .{});
+        setExitCode(ctx, 1);
+        return;
+    };
+    const ip_val: ?[]const u8 = if (ip.len > 0) ip else null;
+    const hostname_val: ?[]const u8 = if (hostname.len > 0) hostname else null;
+    // M4.2 F8: strict boolean parsing for --deploy
+    const deploy_val: bool = if (deploy_str.len == 0) true else if (std.mem.eql(u8, deploy_str, "true") or std.mem.eql(u8, deploy_str, "1")) true else if (std.mem.eql(u8, deploy_str, "false") or std.mem.eql(u8, deploy_str, "0")) false else {
+        try ctx.writer.print("error: --deploy must be true or false\n", .{});
+        setExitCode(ctx, 1);
+        return;
+    };
+    // M4.2 F4: strict boolean parsing for --http-accel (default false)
+    const http_accel_val: bool = if (http_accel_str.len == 0) false else if (std.mem.eql(u8, http_accel_str, "true") or std.mem.eql(u8, http_accel_str, "1")) true else if (std.mem.eql(u8, http_accel_str, "false") or std.mem.eql(u8, http_accel_str, "0")) false else {
+        try ctx.writer.print("error: --http-accel must be true or false\n", .{});
+        setExitCode(ctx, 1);
+        return;
+    };
+
+    node_mutation.addNode(ctx.io, ctx.allocator, config_path, .{
+        .id = node_id,
+        .mac = mac,
+        .arch = arch,
+        .profile = profile,
+        .ip = ip_val,
+        .hostname = hostname_val,
+        .deploy = deploy_val,
+        .http_accel = http_accel_val,
+    }) catch |err| {
+        try printMutationError(ctx, err, "add", node_id);
+        setExitCode(ctx, 1);
+        return;
+    };
+    // 通知 daemon 重新加载 config.json
+    var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    _ = nodeforge.management_client.configReload(ctx.io, config.value.server.http_port);
+    if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node added", &.{ .{ .label = "Node", .value = node_id }, .{ .label = "MAC", .value = mac }, .{ .label = "Profile", .value = profile } });
+}
+
+fn nodeSetHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const config_path = ctx.flag("config", []const u8);
+    const node_id = ctx.getArg("node_id") orelse return;
+    const mac = ctx.flag("mac", []const u8);
+    const arch_str = ctx.flag("arch", []const u8);
+    const profile = ctx.flag("profile", []const u8);
+    const ip = ctx.flag("ip", []const u8);
+    const hostname = ctx.flag("hostname", []const u8);
+    const deploy_str = ctx.flag("deploy", []const u8);
+    const http_accel_str = ctx.flag("http-accel", []const u8);
+
+    var params: node_mutation.SetParams = .{};
+    if (mac.len > 0) params.mac = mac;
+    if (arch_str.len > 0) params.arch = if (std.mem.eql(u8, arch_str, "aarch64")) .aarch64 else if (std.mem.eql(u8, arch_str, "x86_64")) .x86_64 else {
+        try ctx.writer.print("error: --arch must be aarch64 or x86_64\n", .{});
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (profile.len > 0) params.profile = profile;
+    if (ip.len > 0) {
+        params.ip_set = true;
+        params.ip = ip;
+    }
+    if (hostname.len > 0) {
+        params.hostname_set = true;
+        params.hostname = hostname;
+    }
+    if (deploy_str.len > 0) {
+        // M4.2 F8: strict boolean parsing — reject ambiguous values
+        if (std.mem.eql(u8, deploy_str, "true") or std.mem.eql(u8, deploy_str, "1")) {
+            params.deploy = true;
+        } else if (std.mem.eql(u8, deploy_str, "false") or std.mem.eql(u8, deploy_str, "0")) {
+            params.deploy = false;
+        } else {
+            try ctx.writer.print("error: --deploy must be true or false\n", .{});
+            setExitCode(ctx, 1);
+            return;
+        }
+    }
+    if (http_accel_str.len > 0) {
+        if (std.mem.eql(u8, http_accel_str, "true") or std.mem.eql(u8, http_accel_str, "1")) {
+            params.http_accel = true;
+        } else if (std.mem.eql(u8, http_accel_str, "false") or std.mem.eql(u8, http_accel_str, "0")) {
+            params.http_accel = false;
+        } else {
+            try ctx.writer.print("error: --http-accel must be true or false\n", .{});
+            setExitCode(ctx, 1);
+            return;
+        }
+    }
+
+    node_mutation.setNode(ctx.io, ctx.allocator, config_path, node_id, params) catch |err| {
+        try printMutationError(ctx, err, "set", node_id);
+        setExitCode(ctx, 1);
+        return;
+    };
+    // 通知 daemon 重新加载 config.json
+    var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    _ = nodeforge.management_client.configReload(ctx.io, config.value.server.http_port);
+    if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node updated", &.{.{ .label = "Node", .value = node_id }});
+}
+
+fn nodeRemoveHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const config_path = ctx.flag("config", []const u8);
+    const node_id = ctx.getArg("node_id") orelse return;
+
+    node_mutation.removeNode(ctx.io, ctx.allocator, config_path, node_id) catch |err| {
+        try printMutationError(ctx, err, "remove", node_id);
+        setExitCode(ctx, 1);
+        return;
+    };
+    var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    _ = nodeforge.management_client.configReload(ctx.io, config.value.server.http_port);
+    if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node removed", &.{.{ .label = "Node", .value = node_id }});
+}
+
+fn nodeShowHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const node_id = ctx.getArg("node_id") orelse return;
+
+    // 查找节点
+    var found: ?model.NodeConfig = null;
+    for (config.value.nodes) |n| {
+        if (std.mem.eql(u8, n.id, node_id)) {
+            found = n;
+            break;
+        }
+    }
+    const node = found orelse {
+        try ctx.writer.print("error: node not found: {s}\n", .{node_id});
+        setExitCode(ctx, 1);
+        return;
+    };
+
+    if (output_json) {
+        try ctx.writer.print("{{\"id\":{f},\"mac\":{f},\"arch\":\"{s}\",\"profile\":{f},\"ip\":", .{
+            std.json.fmt(node.id, .{}),
+            std.json.fmt(node.mac, .{}),
+            @tagName(node.arch),
+            std.json.fmt(node.profile, .{}),
+        });
+        if (node.ip) |ip| {
+            try ctx.writer.print("{f}", .{std.json.fmt(ip, .{})});
+        } else {
+            try ctx.writer.print("null", .{});
+        }
+        try ctx.writer.print(",\"hostname\":", .{});
+        if (node.hostname) |h| {
+            try ctx.writer.print("{f}", .{std.json.fmt(h, .{})});
+        } else {
+            try ctx.writer.print("null", .{});
+        }
+        try ctx.writer.print(",\"deploy\":{s}}}\n", .{if (node.deploy) "true" else "false"});
+    } else {
+        try views.nodeDetail(ctx.writer, node);
+    }
+}
+
+fn printMutationError(ctx: zli.CommandContext, err: anyerror, action: []const u8, node_id: []const u8) !void {
+    const msg = switch (err) {
+        error.NodeAlreadyExists => "node already exists",
+        error.NodeNotFound => "node not found",
+        error.DuplicateMac => "duplicate MAC address",
+        error.InvalidArch => "invalid architecture",
+        error.ProfileNotFound => "profile not found in config",
+        error.SaveFailed => "failed to save config.json",
+        else => @errorName(err),
+    };
+    try ctx.writer.print("error: node {s} failed for {s}: {s}\n", .{ action, node_id, msg });
 }
 
 fn findBundle(config: *const nodeforge.model.AppConfig, name: []const u8) ?*const nodeforge.model.ProvisioningBundle {
@@ -1488,4 +1762,163 @@ fn jsonBool(value: bool) []const u8 {
 /// 输出稳定的 CLI 名称与项目版本。
 fn printVersion(out: *std.Io.Writer) !void {
     try out.print("nodeforge {s}\n", .{nodeforge.version.version});
+}
+
+// ── M4.2 F6: runtime status + deprecated aliases ─────────────────────
+
+/// `runtime status` 子命令：展示服务运行态概要（DHCP/TFTP/管理 API）。
+fn runtimeStatusCommand(init_options: zli.InitOptions) !*zli.Command {
+    const cmd = try zli.Command.init(init_options, .{
+        .name = "status",
+        .description = "Show runtime status overview (DHCP, TFTP, service)",
+        .help = "Contact the local daemon management API and summarize active runtime state.",
+    }, runtimeStatusHandler);
+    try addConfigPathFlag(cmd);
+    try addOutputFlag(cmd);
+    try addDebugFlag(cmd);
+    return cmd;
+}
+
+fn runtimeStatusHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const debug = ctx.flag("debug", bool);
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, debug) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const port = config.value.server.http_port;
+    const mgmt = nodeforge.management_client.managementStatus(ctx.io, port);
+    const health = nodeforge.management_client.health(ctx.io, port);
+    const tftp = nodeforge.management_client.tftpCounters(ctx.io, port);
+    if (output_json) {
+        try ctx.writer.print(
+            "{{\"management\":{s},\"http\":{s},\"tftp\":{{\"started\":{d},\"completed\":{d},\"failed\":{d}}}}}\n",
+            .{ jsonBool(mgmt.healthy), jsonBool(health.healthy), tftp.started, tftp.completed, tftp.failed },
+        );
+    } else {
+        try ctx.writer.print("Runtime Status\n", .{});
+        try ctx.writer.print("  Management API   {s}\n", .{if (mgmt.healthy) "available" else "unavailable"});
+        try ctx.writer.print("  HTTP             {s}\n", .{if (health.healthy) "healthy" else "unhealthy"});
+        try ctx.writer.print("  TFTP Transfers   started={d} completed={d} failed={d}\n", .{ tftp.started, tftp.completed, tftp.failed });
+    }
+    if (!mgmt.healthy) setExitCode(ctx, 1);
+}
+
+/// 创建一个废弃别名命令：zli 原生 deprecated + replaced_by 支持，
+/// 执行时自动输出 warning 并返回 CommandDeprecated 错误（退出码 2）。
+fn deprecatedAliasCommand(init_options: zli.InitOptions, old_name: []const u8, new_cmd: []const u8) !*zli.Command {
+    return try zli.Command.init(init_options, .{
+        .name = old_name,
+        .description = "Deprecated alias — see help for the current command tree",
+        .deprecated = true,
+        .replaced_by = new_cmd,
+    }, showCurrentHelp);
+}
+
+// ── Deprecated `dhcp` top-level command ──────────────────────────────
+
+fn deprecatedDhcpCommand(init_options: zli.InitOptions) !*zli.Command {
+    const dhcp = try zli.Command.init(init_options, .{
+        .name = "dhcp",
+        .description = "Deprecated: use 'config export' for static config or 'runtime dhcp-leases' for runtime state",
+    }, showCurrentHelp);
+    const show = try zli.Command.init(init_options, .{
+        .name = "show",
+        .description = "Deprecated: show DHCP static configuration",
+    }, deprecatedDhcpShowHandler);
+    try addConfigPathFlag(show);
+    try addOutputFlag(show);
+    try addDebugFlag(show);
+    try dhcp.addCommands(&.{show});
+    return dhcp;
+}
+
+fn deprecatedDhcpShowHandler(ctx: zli.CommandContext) !void {
+    try ctx.writer.writeAll("warning: 'dhcp show' is deprecated. Use 'config export' for static config or 'runtime dhcp-leases' for runtime state.\n");
+    try dhcpShowHandler(ctx);
+}
+
+// ── Deprecated `tftp` top-level command ──────────────────────────────
+
+fn deprecatedTftpCommand(init_options: zli.InitOptions) !*zli.Command {
+    const tftp = try zli.Command.init(init_options, .{
+        .name = "tftp",
+        .description = "Deprecated: use 'runtime tftp-counters' and 'runtime tftp-sessions'",
+    }, showCurrentHelp);
+    const show = try zli.Command.init(init_options, .{
+        .name = "show",
+        .description = "Deprecated: show TFTP transfer counters",
+    }, deprecatedTftpShowHandler);
+    try addConfigPathFlag(show);
+    try addOutputFlag(show);
+    try addDebugFlag(show);
+    const session = try zli.Command.init(init_options, .{
+        .name = "session",
+        .description = "Deprecated: TFTP session subcommands",
+    }, showCurrentHelp);
+    const list = try zli.Command.init(init_options, .{
+        .name = "list",
+        .description = "Deprecated: list TFTP transfer sessions",
+    }, deprecatedTftpSessionListHandler);
+    try addConfigPathFlag(list);
+    try addOutputFlag(list);
+    try addDebugFlag(list);
+    try session.addCommands(&.{list});
+    try tftp.addCommands(&.{ show, session });
+    return tftp;
+}
+
+fn deprecatedTftpShowHandler(ctx: zli.CommandContext) !void {
+    try ctx.writer.writeAll("warning: 'tftp show' is deprecated. Use 'runtime tftp-counters' instead.\n");
+    try tftpShowHandler(ctx);
+}
+
+fn deprecatedTftpSessionListHandler(ctx: zli.CommandContext) !void {
+    try ctx.writer.writeAll("warning: 'tftp session list' is deprecated. Use 'runtime tftp-sessions' instead.\n");
+    try tftpSessionListHandler(ctx);
+}
+
+// ── Deprecated `runtime leases` / `runtime unknown` subcommands ──────
+
+fn deprecatedRuntimeLeasesCommand(init_options: zli.InitOptions) !*zli.Command {
+    const leases = try zli.Command.init(init_options, .{
+        .name = "leases",
+        .description = "Deprecated: use 'runtime dhcp-leases'",
+    }, showCurrentHelp);
+    const list = try zli.Command.init(init_options, .{
+        .name = "list",
+        .description = "Deprecated: list active DHCP leases",
+    }, deprecatedRuntimeLeasesListHandler);
+    try addConfigPathFlag(list);
+    try addOutputFlag(list);
+    try addDebugFlag(list);
+    try leases.addCommands(&.{list});
+    return leases;
+}
+
+fn deprecatedRuntimeLeasesListHandler(ctx: zli.CommandContext) !void {
+    try ctx.writer.writeAll("warning: 'runtime leases list' is deprecated. Use 'runtime dhcp-leases' instead.\n");
+    try runtimeLeasesHandler(ctx);
+}
+
+fn deprecatedRuntimeUnknownCommand(init_options: zli.InitOptions) !*zli.Command {
+    const unknown = try zli.Command.init(init_options, .{
+        .name = "unknown",
+        .description = "Deprecated: use 'runtime dhcp-unknown'",
+    }, showCurrentHelp);
+    const list = try zli.Command.init(init_options, .{
+        .name = "list",
+        .description = "Deprecated: list unclaimed DHCP clients",
+    }, deprecatedRuntimeUnknownListHandler);
+    try addConfigPathFlag(list);
+    try addOutputFlag(list);
+    try addDebugFlag(list);
+    try unknown.addCommands(&.{list});
+    return unknown;
+}
+
+fn deprecatedRuntimeUnknownListHandler(ctx: zli.CommandContext) !void {
+    try ctx.writer.writeAll("warning: 'runtime unknown list' is deprecated. Use 'runtime dhcp-unknown' instead.\n");
+    try runtimeUnknownHandler(ctx);
 }

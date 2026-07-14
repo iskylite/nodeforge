@@ -39,16 +39,16 @@ if grep -Eq '^   .*--catalog' "$tmp/import-help"; then
     exit 1
 fi
 
-"$cli" asset import --help >"$tmp/asset-import-help"
-grep -Fq 'Distro name, used with --version and --arch; e.g. rocky' "$tmp/asset-import-help"
-grep -Fq 'Distro version, used with --distro and --arch; e.g. 9.7' "$tmp/asset-import-help"
-grep -Fq 'Architecture, used with --distro and --version; e.g. aarch64' "$tmp/asset-import-help"
+"$cli" assets register --help >"$tmp/asset-register-help"
+grep -Fq 'Distro name, used with --version and --arch; e.g. rocky' "$tmp/asset-register-help"
+grep -Fq 'Distro version, used with --distro and --arch; e.g. 9.7' "$tmp/asset-register-help"
+grep -Fq 'Architecture, used with --distro and --version; e.g. aarch64' "$tmp/asset-register-help"
 
-"$cli" install-source import --help >"$tmp/install-source-import-help"
-grep -Fq 'Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso' "$tmp/install-source-import-help"
-grep -Fq 'Optional detected-distro check; e.g. ubuntu' "$tmp/install-source-import-help"
-if grep -Fq 'relative to /opt/nodeforge/work/import' "$tmp/install-source-import-help"; then
-    echo "install-source import must accept an arbitrary ISO path" >&2
+"$cli" assets import --help >"$tmp/assets-import-help"
+grep -Fq 'Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso' "$tmp/assets-import-help"
+grep -Fq 'Override auto-detected distro; e.g. rocky, ubuntu, debian' "$tmp/assets-import-help"
+if grep -Fq 'relative to /opt/nodeforge/work/import' "$tmp/assets-import-help"; then
+    echo "assets import must accept an arbitrary ISO path" >&2
     exit 1
 fi
 
@@ -111,16 +111,16 @@ grep -q "$root/config.example.json" "$tmp/validate"
 # M1.5 human output is an aligned, headered table rather than tabs. The
 # contract runs with stdout redirected, so it also proves no ANSI bytes leak
 # into scripts and snapshots; JSON retains its machine-readable shape.
-"$cli" asset list -C "$root/catalog.example.json" >"$tmp/asset-list"
+"$cli" assets list -C "$root/catalog.example.json" >"$tmp/asset-list"
 grep -Eq '^NAME[[:space:]]+KIND[[:space:]]+PATH[[:space:]]*$' "$tmp/asset-list"
 grep -F 'rocky-9.7-aarch64-installer-kernel' "$tmp/asset-list" | grep -Fq 'kernel'
 if LC_ALL=C grep -q "$(printf '\033')" "$tmp/asset-list"; then
     echo "human asset list must not emit ANSI outside a TTY" >&2
     exit 1
 fi
-"$cli" asset list -C "$root/catalog.example.json" --no-color >"$tmp/asset-list-no-color"
+"$cli" assets list -C "$root/catalog.example.json" --no-color >"$tmp/asset-list-no-color"
 cmp "$tmp/asset-list" "$tmp/asset-list-no-color"
-"$cli" asset list -C "$root/catalog.example.json" -o json >"$tmp/asset-list-json"
+"$cli" assets list -C "$root/catalog.example.json" -o json >"$tmp/asset-list-json"
 grep -Fq '"assets":[' "$tmp/asset-list-json"
 
 if "$cli" --config "$root/config.example.json" config validate >"$tmp/root-config" 2>&1; then
@@ -304,13 +304,13 @@ EOF
 "$cli" events list --events-path "$events_dir/events.jsonl" --session "$session_id" -o json >"$tmp/events-session-json"
 python3 -m json.tool "$tmp/events-session-json" >/dev/null
 grep -Fq '"type":"tftp.transfer.complete"' "$tmp/events-session-json"
-"$cli" trace node-01 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-session-json"
+"$cli" node trace node-01 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-session-json"
 python3 -m json.tool "$tmp/trace-session-json" >/dev/null
 grep -Fq '"boot_session_id":"'"$session_id"'"' "$tmp/trace-session-json"
 grep -Fq '"kind":"daemon_restart_gap"' "$tmp/trace-session-json"
-"$cli" trace node-01 --events-path "$events_dir/events.jsonl" >"$tmp/trace-session-human"
+"$cli" node trace node-01 --events-path "$events_dir/events.jsonl" >"$tmp/trace-session-human"
 grep -Fq 'daemon_restart_gap' "$tmp/trace-session-human"
-"$cli" trace node-02 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-capacity-json"
+"$cli" node trace node-02 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-capacity-json"
 grep -Fq '"kind":"capacity_exhausted"' "$tmp/trace-capacity-json"
 if "$cli" events list --session invalid --events-path "$events_dir/events.jsonl" >"$tmp/events-invalid-session" 2>&1; then
     echo "invalid session filter unexpectedly succeeded" >&2

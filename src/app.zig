@@ -80,12 +80,21 @@ pub fn run(
     try deployment_control.save(io, allocator, paths.deployment_control_path, &deployments);
     const bootstrap_key = try @import("server/admin_key.zig").resolve(io, allocator, config.server);
     defer allocator.free(bootstrap_key);
+    const additional_keys = try @import("server/admin_key.zig").resolveAdditional(io, allocator, config.server);
+    defer {
+        for (additional_keys) |key| allocator.free(key);
+        allocator.free(additional_keys);
+    }
 
     // M3.1: separate I/O locks for leases.json and node-status.json.
     // The DHCP checkpoint worker owns leases.json; HTTP handlers own
     // node-status.json.  Neither contends with the other.
     var status_io_mutex: std.atomic.Mutex = .unlocked;
     var checkpoint_flush_stop = std.atomic.Value(bool).init(false);
+    // M4.2: config reload flag. HTTP handler sets this after node add/set/remove
+    // writes config.json. serve() returns after the next event loop tick;
+    // app.zig then exits cleanly and systemd restarts with the new config.
+    var reload_requested = std.atomic.Value(bool).init(false);
 
     event_writer.appendWithFields(io, allocator, paths.events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
         observe_log.err("events: unable to record configuration load: {t}", .{err});
@@ -149,12 +158,24 @@ pub fn run(
         &deployments,
         config_revision,
         bootstrap_key,
+        additional_keys,
         &daemon_instance_id,
         &status_io_mutex,
         paths.node_status_path,
+        paths.config_path,
+        &reload_requested,
     ) catch |err| {
         serve_error = err;
     };
+
+    // M4.2: if config reload was requested (node add/set/remove), exit cleanly
+    // so systemd restarts the daemon with the new config.json. This is simpler
+    // and safer than in-place config replacement (which would require
+    // re-initializing DHCP/TFTP/HTTP state machines).
+    if (reload_requested.load(.acquire)) {
+        observe_log.info("config: reload requested, exiting for systemd restart", .{});
+        // Fall through to normal shutdown, then systemd auto-restarts.
+    }
 
     // ── Shutdown sequence (M3.1) ───────────────────────────────────────
     // 1. Mark service as stopping so management API can report the state.

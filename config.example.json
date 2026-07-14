@@ -6,12 +6,10 @@
     "server_ip": "192.168.50.1",
     "http_port": 8080
   },
-  "http": {
-    "asset_root": "/opt/nodeforge/assets",
-    "repository_root": "/opt/nodeforge/repos"
-  },
+  "http": { "max_connections": 0 },
   "tftp": {
-    "asset_root": "/opt/nodeforge/tftp"
+    "windowsize": 4,
+    "max_concurrent_transfers": 4
   },
   "dhcp": {
     "subnet": "192.168.50.0/24",

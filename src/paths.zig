@@ -1,5 +1,5 @@
 //! NodeForge 安装布局的唯一默认路径定义。
-//! 业务模块只引用这里的派生常量，避免把 `/opt/nodeforge` 散落在代码各处。
+//! 业务模块只引用这里的派生常量，避免重复声明安装根。
 
 /// 默认安装根。正常部署时 config/catalog 会从该根目录下自动发现。
 pub const install_root = "/opt/nodeforge";
@@ -18,18 +18,22 @@ pub const state_dir = install_root ++ "/state";
 pub const logs_dir = install_root ++ "/logs";
 /// ISO、kernel、initrd、rootfs 等大文件资产根目录。
 pub const assets_dir = install_root ++ "/assets";
-/// 通过 HTTP `/repos/` 发布的软件仓库根目录。
-pub const repos_dir = install_root ++ "/repos";
-/// 后续 TFTP 阶段的只读启动小文件根目录。
-pub const tftp_dir = install_root ++ "/tftp";
+/// ISO 镜像根目录，HTTP `/assets/` 路由从这里发布。
+pub const iso_dir = assets_dir ++ "/iso";
+/// TFTP 启动小文件根目录。
+pub const boot_dir = assets_dir ++ "/boot";
+/// HTTP `/repos/` 发布的软件仓库根目录。
+pub const repos_dir = assets_dir ++ "/repos";
+/// Bootstrap SSH key pair 和导入公钥目录。
+pub const keys_dir = assets_dir ++ "/keys";
 /// NodeForge 小 initrd 构建产物目录。
-pub const initrd_dir = install_root ++ "/initrd";
+pub const initrd_dir = assets_dir ++ "/initrd";
 /// rootfs 构建和发布产物目录。
-pub const rootfs_dir = install_root ++ "/rootfs";
+pub const rootfs_dir = assets_dir ++ "/rootfs";
 /// boot/provisioning bundle 等声明式产物目录。
-pub const bundles_dir = install_root ++ "/bundles";
+pub const bundles_dir = assets_dir ++ "/bundles";
 /// 节点已应用 provisioning 结果记录目录。
-pub const provisioned_dir = install_root ++ "/provisioned";
+pub const provisioned_dir = state_dir ++ "/provisioned";
 /// pid、临时 socket 等运行期短生命周期文件目录。
 pub const run_dir = install_root ++ "/run";
 /// 构建、导入、解包等可清理工作目录。
@@ -58,14 +62,20 @@ pub const events_path = logs_dir ++ "/events.jsonl";
 pub const service_log_path = logs_dir ++ "/nodeforged.log";
 pub const service_path = systemd_dir ++ "/nodeforged.service";
 
-// 验证所有派生路径都以安装根 `/opt/nodeforge` 为前缀。
+// 验证所有派生路径都以唯一安装根为前缀。
 // 这是防止路径拼接错误导致文件写入非预期位置的基础回归测试。
 test "default paths are derived from the install root" {
     const std = @import("std");
 
-    try std.testing.expectEqualStrings("/opt/nodeforge", install_root);
-    try std.testing.expectEqualStrings("/opt/nodeforge/config/config.json", config_path);
-    try std.testing.expectEqualStrings("/opt/nodeforge/catalog/catalog.json", catalog_path);
-    try std.testing.expectEqualStrings("/opt/nodeforge/assets", assets_dir);
-    try std.testing.expectEqualStrings("/opt/nodeforge/repos", repos_dir);
+    try std.testing.expectEqualStrings(install_root ++ "/config/config.json", config_path);
+    try std.testing.expectEqualStrings(install_root ++ "/catalog/catalog.json", catalog_path);
+    try std.testing.expectEqualStrings(install_root ++ "/assets", assets_dir);
+    try std.testing.expectEqualStrings(assets_dir ++ "/iso", iso_dir);
+    try std.testing.expectEqualStrings(assets_dir ++ "/boot", boot_dir);
+    try std.testing.expectEqualStrings(assets_dir ++ "/repos", repos_dir);
+    try std.testing.expectEqualStrings(assets_dir ++ "/keys", keys_dir);
+    try std.testing.expectEqualStrings(assets_dir ++ "/initrd", initrd_dir);
+    try std.testing.expectEqualStrings(assets_dir ++ "/rootfs", rootfs_dir);
+    try std.testing.expectEqualStrings(assets_dir ++ "/bundles", bundles_dir);
+    try std.testing.expectEqualStrings(state_dir ++ "/provisioned", provisioned_dir);
 }

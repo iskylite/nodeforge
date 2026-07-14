@@ -179,7 +179,22 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
     while (attempts < runtime_state.DhcpState.max_leases) : (attempts += 1) {
         const revision = if (persistence) |p| p.config_revision else 0;
         const decision = resolver.resolveWithDeployment(config, if (persistence) |p| p.deployments else null, revision, request.mac(), request.architecture);
-        if (decision.install_not_armed) emitInstallNotArmed(io, persistence, decision.node_id.?);
+        // M4.2 F9: boot-gate 事件状态转换去重。
+        //
+        // DHCP 客户端一次启动周期产生 4-8+ 个包（PXE 固件 DISCOVER→OFFER→
+        // REQUEST→ACK + OS DISCOVER→OFFER→REQUEST→ACK + 续约 REQUEST），
+        // 每个包都会经过此处的 boot-gate 检查。若每次都写事件，一个未武装
+        // 节点在数秒内就会产生 8-10+ 条重复的 boot.install_not_armed 事件。
+        //
+        // BootGateSuppressor 维护 per-node 三态状态机（normal/not_armed/
+        // deploy_disabled），仅在状态转换时返回 true，避免 events.jsonl 泛滥。
+        // 详见 src/state/runtime.zig BootGateSuppressor 文档注释。
+        if (decision.node_id) |node_id| {
+            if (runtime.dhcp.gate_suppressor.shouldEmit(node_id, decision.install_not_armed, decision.deploy_disabled)) {
+                if (decision.install_not_armed) emitInstallNotArmed(io, persistence, node_id);
+                if (decision.deploy_disabled) emitDeployDisabled(io, persistence, node_id);
+            }
+        }
         const reply = processWithDeployment(config, runtime, request, if (persistence) |p| p.deployments else null, revision) orelse return null;
         if (reply.kind != .offer) return reply;
         // 已注册节点的显式保留地址对其 MAC 是独占的。
@@ -208,14 +223,35 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
     return null;
 }
 
-/// The boot gate is intentionally visible in the audit trail. No boot session
-/// exists for a held node, so this is a server-side event rather than an
-/// installer DTO and carries no credential or answer data.
+/// Emit a `boot.install_not_armed` event for a node whose install profile is
+/// held because no matching armed generation exists.
+///
+/// This is a server-side diagnostic event: no boot session exists for a held
+/// node, so it carries no credential or answer data. The event is intentionally
+/// visible in the audit trail so operators can see why PXE was denied.
+///
+/// M4.2 F9: calls are gated by `BootGateSuppressor.shouldEmit` in
+/// `offerAfterProbe` to prevent event flooding from repeated DHCP packets.
 fn emitInstallNotArmed(io: std.Io, persistence: ?*const Persistence, node_id: []const u8) void {
     const p = persistence orelse return;
     const fields = [_]events.Field{.{ .key = "node_id", .value = node_id }};
     p.writer.appendWithFields(io, p.allocator, p.events_path, "boot.install_not_armed", "install profile held: no matching armed generation", &fields) catch |err|
         observe_log.err("dhcp: install-not-armed event append failed: {t}", .{err});
+}
+
+/// M4.2 F2: emit a `boot.deploy_disabled` event when a known node with
+/// `deploy=false` receives a DHCP offer. The lease is still served for
+/// diagnostics, but no PXE bootfile is sent.
+///
+/// M4.2 F9: calls are gated by `BootGateSuppressor.shouldEmit` in
+/// `offerAfterProbe` to prevent event flooding from repeated DHCP packets.
+/// Without the suppressor, a `deploy=false` node would generate 8-10+ events
+/// per boot cycle (one per DHCP packet).
+fn emitDeployDisabled(io: std.Io, persistence: ?*const Persistence, node_id: []const u8) void {
+    const p = persistence orelse return;
+    const fields = [_]events.Field{.{ .key = "node_id", .value = node_id }};
+    p.writer.appendWithFields(io, p.allocator, p.events_path, "boot.deploy_disabled", "PXE denied: node deploy=false", &fields) catch |err|
+        observe_log.err("dhcp: deploy-disabled event append failed: {t}", .{err});
 }
 /// DHCP 协议引擎：解析请求并生成 OFFER/ACK/NAK 响应。
 ///

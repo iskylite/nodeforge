@@ -43,7 +43,7 @@ const password_hash = @import("../password_hash.zig");
 
 /// M4.1 renderer.  The original M4 entry point remains as a compatibility
 /// wrapper; all daemon answer delivery uses this common-system variant.
-pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, event_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8) ![]u8 {
+pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -84,6 +84,34 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
     try w.writeAll("  apt:\n    mirror-selection:\n      primary:\n        - uri: ");
     try render.yamlQuote(w, apt_primary_url orelse "");
     try w.print("\n    fallback: {s}\n    geoip: false\n", .{@tagName(install.apt.fallback)});
+    // ── Subiquity 原生 reporting（curtin webhook reporter）──────────────
+    //
+    // curtin 的 HTTP-POST reporter 类型名为 `webhook`（不是 `http`），
+    // 在 Ubuntu 22.04 和 24.04 中均可用（handler 注册表完全相同）。
+    //
+    // webhook reporter 的 schema：
+    //   type: webhook         # 固定
+    //   endpoint: <url>       # 必填，HTTP POST 目标
+    //   level: INFO           # 可选，默认 DEBUG
+    //   retries: 5            # 可选
+    //   timeout: 30           # 可选
+    //
+    // webhook reporter 不支持 `headers` 字段（会 TypeError）。
+    // 认证通过源 IP 校验：/subiquity-report 端点检查请求来源 IP 匹配节点 DHCP lease。
+    // OAuth（consumer_key/consumer_secret/token_key/token_secret）全部省略时为无认证 POST。
+    //
+    // webhook POST 的 JSON 事件格式（ReportingEvent.as_dict）：
+    //   {"name":"<stage>","description":"<msg>","event_type":"start|finish|result",
+    //    "origin":"curtin","timestamp":1234567890.0,"level":"INFO"}
+    // finish 事件额外含 "result":"SUCCESS|WARN|FAIL"。
+    //
+    // report_url 为空时不渲染 reporting 块（调用方未配置 subiquity-report 端点时）。
+    // ──────────────────────────────────────────────────────────────
+    if (report_url.len > 0) {
+        try w.writeAll("  reporting:\n    nodeforge:\n      type: webhook\n      endpoint: ");
+        try render.yamlQuote(w, report_url);
+        try w.writeAll("\n      level: INFO\n");
+    }
     const network = node.overrides.network orelse model.TargetNetworkConfig{};
     try renderStorageM41(w, install);
     try w.writeAll("  network:\n    version: 2\n    ethernets:\n      ");
@@ -188,6 +216,7 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
     // Subiquity performs the configured reboot.
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"completed\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.writeAll("  error-commands:\n");
+    try w.print("    - 'ERR_CMD=${{ERROR_CMD}} ERR_STATUS=${{ERROR_STATUS}} ERR_TB=${{ERROR_TRACEBACK}} && curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/x-www-form-urlencoded\" -d \"v=1&boot_session_id={s}&reason=install.subiquity_error&summary=subiquity error: $ERR_CMD $ERR_STATUS $ERR_TB\" {s} || true'\n", .{ token, session, session, log_url });
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"failed\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     if (system.connectivity.time_sync) {
         try w.writeAll("ntp:\n  enabled: true\n  servers:\n");
@@ -197,6 +226,12 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
             try w.writeByte('\n');
         }
     } else try w.writeAll("ntp:\n  enabled: false\n");
+    // cloud-init top-level hostname: always set, independent of identity stanza.
+    // When system.users is empty, identity is skipped, but hostname must still
+    // be set or the installed system defaults to "localhost".
+    try w.writeAll("hostname: ");
+    try render.yamlQuote(w, render.hostname(node));
+    try w.writeByte('\n');
     try w.writeAll("package_update: false\npackage_upgrade: false\n");
     return out.toOwnedSlice();
 }
@@ -508,7 +543,8 @@ test "apt fallback is rendered from the install profile" {
 test "M4.1 autoinstall renders target defaults and static network" {
     const node: model.NodeConfig = .{ .id = "node-04", .mac = "00:11:22:33:44:99", .arch = .aarch64, .profile = "ubuntu", .ip = "192.168.50.27", .overrides = .{ .network = .{ .mode = .static, .interface = "ens160", .address = "192.168.50.27", .prefix_len = 24, .gateway = "192.168.50.1", .dns = &.{"192.168.50.1"}, .search_domains = &.{"nodeforge.local"} } } };
     const system: model.TargetSystemConfig = .{ .localization = .{ .locale = "zh_CN.UTF-8", .timezone = "Asia/Shanghai", .keyboard = "us" }, .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} }, .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }} };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/repos/ubuntu", "http://event", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1");
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/repos/ubuntu", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1");
+    // report_url="" 表示未配置 subiquity-report 端点（不渲染 reporting 块）
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "locale: 'zh_CN.UTF-8'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "timezone: 'Asia/Shanghai'") != null);
@@ -521,7 +557,37 @@ test "M4.1 autoinstall renders target defaults and static network" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "servers:\n    - 'ntp.nodeforge.local'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "early-commands") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "error-commands") != null);
+    // reporting 块不渲染（report_url 为空时跳过）
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "reporting:") == null);
+    // curl 回调中仍含 Authorization: Bearer header（降级路径）
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Authorization: Bearer token") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "archive.ubuntu.com") == null);
+}
+
+test "M4.2 webhook reporting rendered when report_url is non-empty" {
+    // 非空 report_url 渲染 reporting 块（webhook reporter 在 22.04 和 24.04 均可用）
+    const node: model.NodeConfig = .{ .id = "node-rpt", .mac = "00:11:22:33:44:aa", .arch = .aarch64, .profile = "ubuntu", .hostname = "noderpt" };
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://event", "http://log", "http://192.168.50.1:8080/report", "0123456789abcdef0123456789abcdef", "token", "scope");
+    defer std.testing.allocator.free(bytes);
+    // reporting 块应渲染，type 必须是 webhook（不是 http）
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "reporting:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "type: webhook") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "type: http") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "endpoint:") != null);
+    // 不应渲染 headers 字段（webhook handler 不支持）
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "headers:") == null);
+    // hostname 应始终渲染
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "hostname: 'noderpt'") != null);
+}
+
+test "M4.2 hostname always rendered even without users" {
+    // 无 users 时 identity 被跳过，但 hostname 仍在顶层 cloud-config 中设置
+    const node: model.NodeConfig = .{ .id = "node-nh", .mac = "00:11:22:33:44:bb", .arch = .aarch64, .profile = "ubuntu", .hostname = "myhost" };
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "hostname: 'myhost'") != null);
+    // identity 不应出现（无 users）
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "identity:") == null);
 }
 
 test "late command keeps managed files single-line and fail-fast" {

@@ -10,7 +10,7 @@ const paths = @import("../paths.zig");
 
 pub const Error = error{ ServerAdminKeyUnavailable, InvalidPublicKey } || std.mem.Allocator.Error;
 
-const generated_dir = paths.state_dir ++ "/bootstrap-ssh";
+const generated_dir = paths.keys_dir;
 const generated_private = generated_dir ++ "/id_ed25519";
 const generated_public = generated_private ++ ".pub";
 const generated_private_temp = generated_private ++ ".tmp";
@@ -52,6 +52,49 @@ pub fn resolve(io: std.Io, allocator: std.mem.Allocator, server: model.ServerCon
     try std.Io.Dir.rename(dir, generated_public_temp, dir, generated_public, io);
     try syncDirectory(io, generated_dir);
     return readKey(io, allocator, generated_public) catch error.ServerAdminKeyUnavailable;
+}
+
+/// M4.2 F5: Resolve additional SSH public keys from config and assets directory.
+/// Scans `ssh_authorized_public_keys` from ServerConfig and the
+/// `assets/keys/` directory for `.pub` files.
+/// Returns an allocated slice of allocated key strings; caller must free each
+/// element and the slice itself.
+pub fn resolveAdditional(io: std.Io, allocator: std.mem.Allocator, server: model.ServerConfig) ![][]const u8 {
+    var keys: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (keys.items) |key| allocator.free(key);
+        keys.deinit(allocator);
+    }
+    // Config-specified additional keys.
+    for (server.ssh_authorized_public_keys) |key| {
+        if (!valid(key)) return error.InvalidPublicKey;
+        try keys.append(allocator, try allocator.dupe(u8, key));
+    }
+    // State directory scan for .pub files.
+    var dir = std.Io.Dir.cwd().openDir(io, generated_dir, .{ .iterate = true, .follow_symlinks = false }) catch {
+        return keys.toOwnedSlice(allocator);
+    };
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (iterator.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".pub")) continue;
+        if (std.mem.eql(u8, entry.name, "id_ed25519.pub")) continue;
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ generated_dir, entry.name });
+        defer allocator.free(path);
+        const key = readKey(io, allocator, path) catch continue;
+        // Deduplicate against already-collected keys.
+        var duplicate = false;
+        for (keys.items) |existing| if (sameKey(existing, key)) {
+            duplicate = true;
+            break;
+        };
+        if (duplicate) {
+            allocator.free(key);
+            continue;
+        }
+        try keys.append(allocator, key);
+    }
+    return keys.toOwnedSlice(allocator);
 }
 
 fn pathExists(io: std.Io, path: []const u8) !bool {

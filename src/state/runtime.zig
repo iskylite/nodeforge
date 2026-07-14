@@ -55,6 +55,12 @@ pub const DhcpState = struct {
     /// M3.1 单调递增的 lease 生成号。DHCP 热路径在每次真实 lease 变更后递增它；
     /// checkpoint worker 对比它与已保存的生成号，决定是否需要新的 leases.json 快照。
     lease_generation: u64 = 0,
+    /// M4.2 F9: boot-gate 事件去重器。DHCP 客户端一次启动周期产生 4-8+ 个包
+    /// （PXE 固件 + OS），`offerAfterProbe` 在每个包中检查 boot-gate 状态。
+    /// 本抑制器基于 per-node 状态转换去重，避免 `boot.install_not_armed`
+    /// 和 `boot.deploy_disabled` 事件在 events.jsonl 中泛滥。详见
+    /// `BootGateSuppressor` 文档注释。
+    gate_suppressor: BootGateSuppressor = .{},
 
     /// 提供（OFFER）一个地址但不提交为 lease。每次分配前先清理过期 offer 和隔离条目。
     /// 返回 0 表示分配失败（地址被占用或池已满）。
@@ -195,6 +201,116 @@ pub const DhcpState = struct {
             }
         }
         if (reaped) self.lease_generation += 1;
+    }
+};
+
+/// Per-node boot-gate event suppressor (M4.2 F9).
+///
+/// ## 问题背景
+///
+/// DHCP 客户端在一次启动周期内会发送多个 DISCOVER/REQUEST 包：
+/// - PXE 固件阶段：DISCOVER → OFFER → REQUEST → ACK（4 个包）
+/// - OS 内核/initrd 加载后重新获取 DHCP：DISCOVER → OFFER → REQUEST → ACK（4 个包）
+/// - lease 续约（T1 = lease_time/2）：REQUEST → ACK（每周期 2 个包）
+///
+/// `offerAfterProbe`（`dhcp/server.zig`）在每个包的处理中都会调用
+/// `resolveWithDeployment` 检查 `install_not_armed` 和 `deploy_disabled`。
+/// 在引入本抑制器之前，每次检查到异常状态都会直接调用
+/// `Writer.appendWithFields` 写入 events.jsonl，且 Writer 没有任何去重或
+/// 限速逻辑。这导致一个未武装的安装节点在数秒内产生 8-10+ 条重复的
+/// `boot.install_not_armed` 事件，污染审计日志。
+///
+/// ## 去重策略：状态转换去重
+///
+/// 本结构维护 per-node 的三态状态机（`normal`/`not_armed`/`deploy_disabled`），
+/// 只在状态**发生变化**时才允许写事件：
+/// - `normal → not_armed`：写 `boot.install_not_armed` 事件
+/// - `normal → deploy_disabled`：写 `boot.deploy_disabled` 事件
+/// - `not_armed → not_armed`：抑制（DHCP 重传/续约，状态未变）
+/// - `not_armed → normal`：静默清除（节点被重新武装，不写"恢复"事件）
+/// - `not_armed ↔ deploy_disabled`：写事件（状态类型变化）
+///
+/// ## 持久性
+///
+/// 状态仅在内存中，不持久化。daemon 重启后所有节点的状态重置为 `normal`，
+/// 下一次 DHCP 包会重新触发一次事件——这是可接受的，因为 daemon 重启本身
+/// 也需要操作员关注。与持久化方案相比，内存方案避免了重启恢复逻辑的复杂性
+/// 和潜在的状态不一致风险。
+///
+/// ## 容量与降级
+///
+/// 固定 64 个槽位（`max_tracked`），在实践中足够覆盖一个 PXE 子网的活跃
+/// 节点数。槽位耗尽时复用第一个槽位（LRU 风格），被驱逐节点的状态重置为
+/// `normal`，下次该节点发 DHCP 包时会重新触发一次事件——这是安全的降级。
+///
+/// ## 不影响审计完整性
+///
+/// 去重只影响 `boot.install_not_armed` 和 `boot.deploy_disabled` 两类
+/// 服务器侧诊断事件。DHCP 审计事件（`dhcp.discover`/`dhcp.offer`/
+/// `dhcp.ack` 等）不受影响，每个 DHCP 包仍产生完整的审计记录。
+pub const BootGateSuppressor = struct {
+    pub const max_tracked = 64;
+
+    /// 三态状态机：normal 表示节点可正常 PXE 引导。
+    const State = enum { normal, not_armed, deploy_disabled };
+
+    const Entry = struct {
+        node_id: [96]u8 = [_]u8{0} ** 96,
+        node_id_len: u8 = 0,
+        last_state: State = .normal,
+
+        fn used(self: *const Entry) bool {
+            return self.node_id_len != 0;
+        }
+        fn matches(self: *const Entry, node_id: []const u8) bool {
+            return self.used() and self.node_id_len == node_id.len and
+                std.mem.eql(u8, self.node_id[0..self.node_id_len], node_id);
+        }
+    };
+
+    entries: [max_tracked]Entry = [_]Entry{.{}} ** max_tracked,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    /// 检查是否应该写 boot-gate 事件。
+    ///
+    /// 调用方在每次 DHCP 包处理时传入当前节点的 `not_armed` 和
+    /// `deploy_disabled` 标志（两者互斥，不会同时为 true）。
+    ///
+    /// 返回 `true` 表示发生了状态转换且新状态非 `normal`（应该写事件）；
+    /// 返回 `false` 表示状态未变或回到 `normal`（应该抑制）。
+    ///
+    /// 内部自动维护 per-node 状态机，调用方无需关心状态管理细节。
+    pub fn shouldEmit(self: *BootGateSuppressor, node_id: []const u8, not_armed: bool, deploy_disabled: bool) bool {
+        const new_state: State = if (not_armed) .not_armed else if (deploy_disabled) .deploy_disabled else .normal;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = self.findOrCreate(node_id);
+        if (entry.last_state == new_state) return false;
+        entry.last_state = new_state;
+        return new_state != .normal;
+    }
+
+    fn findOrCreate(self: *BootGateSuppressor, node_id: []const u8) *Entry {
+        // 优先查找已存在的条目。
+        for (&self.entries) |*entry| {
+            if (entry.matches(node_id)) return entry;
+        }
+        // 查找空闲槽位。
+        for (&self.entries) |*entry| {
+            if (!entry.used()) {
+                @memcpy(entry.node_id[0..node_id.len], node_id);
+                entry.node_id_len = @intCast(node_id.len);
+                return entry;
+            }
+        }
+        // 所有槽位已用：复用第一个槽位（LRU 风格降级）。
+        // 被驱逐节点的状态重置为 normal，下次该节点发 DHCP 包时
+        // 会重新触发一次事件——这是安全的降级行为。
+        const entry = &self.entries[0];
+        @memcpy(entry.node_id[0..node_id.len], node_id);
+        entry.node_id_len = @intCast(node_id.len);
+        entry.last_state = .normal;
+        return entry;
     }
 };
 
@@ -340,4 +456,47 @@ test "only a static reservation may acknowledge without an offer" {
     try std.testing.expect(!state.acknowledge(&unknown_mac, candidate, false, false, 100, 60));
     try std.testing.expect(!state.acknowledge(&known_dynamic_mac, candidate, true, false, 100, 60));
     try std.testing.expect(state.acknowledge(&static_mac, candidate, true, true, 100, 60));
+}
+
+test "boot-gate suppressor emits only on state transition" {
+    var suppressor: BootGateSuppressor = .{};
+
+    // First DHCP packet: normal → not_armed → should emit
+    try std.testing.expect(suppressor.shouldEmit("r97n1", true, false));
+    // Second DHCP packet (retransmit): not_armed → not_armed → suppress
+    try std.testing.expect(!suppressor.shouldEmit("r97n1", true, false));
+    // Third DHCP packet (OS boot): still not_armed → suppress
+    try std.testing.expect(!suppressor.shouldEmit("r97n1", true, false));
+
+    // Node gets armed: not_armed → normal → suppress (no event for recovery)
+    try std.testing.expect(!suppressor.shouldEmit("r97n1", false, false));
+    // Node becomes not_armed again: normal → not_armed → should emit
+    try std.testing.expect(suppressor.shouldEmit("r97n1", true, false));
+}
+
+test "boot-gate suppressor tracks deploy_disabled independently" {
+    var suppressor: BootGateSuppressor = .{};
+
+    // not_armed → deploy_disabled is a transition → emit
+    try std.testing.expect(suppressor.shouldEmit("r97n2", true, false));
+    try std.testing.expect(!suppressor.shouldEmit("r97n2", true, false));
+    // not_armed → deploy_disabled → emit (different state)
+    try std.testing.expect(suppressor.shouldEmit("r97n2", false, true));
+    try std.testing.expect(!suppressor.shouldEmit("r97n2", false, true));
+    // deploy_disabled → normal → suppress
+    try std.testing.expect(!suppressor.shouldEmit("r97n2", false, false));
+    // normal → deploy_disabled → emit
+    try std.testing.expect(suppressor.shouldEmit("r97n2", false, true));
+}
+
+test "boot-gate suppressor tracks multiple nodes independently" {
+    var suppressor: BootGateSuppressor = .{};
+
+    try std.testing.expect(suppressor.shouldEmit("node-a", true, false));
+    // node-b is also not armed, but independent → emit
+    try std.testing.expect(suppressor.shouldEmit("node-b", true, false));
+    // node-a still not armed → suppress
+    try std.testing.expect(!suppressor.shouldEmit("node-a", true, false));
+    // node-b still not armed → suppress
+    try std.testing.expect(!suppressor.shouldEmit("node-b", true, false));
 }

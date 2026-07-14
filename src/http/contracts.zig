@@ -12,6 +12,10 @@ pub const max_reason_bytes = 128;
 pub const max_message_bytes = 1024;
 pub const max_log_summary_bytes = 2048;
 
+/// M4.2 F1: stable reason values for install failure log summaries.
+pub const reason_anaconda_error = "install.anaconda_error";
+pub const reason_subiquity_error = "install.subiquity_error";
+
 /// 稳定的 capability 传输 header 名称。token 永远不允许出现在 query string 中，
 /// 只通过 HTTP header 传输，防止通过 URL 日志泄漏。
 pub const authorization_header = "authorization";
