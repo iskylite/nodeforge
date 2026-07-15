@@ -19,6 +19,24 @@ pub const bootstrap_ttl_seconds: i64 = 15 * 60;
 /// 随 session 一起过期。这允许安装器在长时间安装过程中持续上报事件。
 pub const delivery_ttl_seconds: i64 = 2 * 60 * 60;
 pub const capability_len = 64;
+pub const node_id_capacity = 96;
+pub const profile_capacity = 128;
+
+pub const InstallPlanSnapshot = struct {
+    allocator: std.mem.Allocator,
+    json: []u8,
+    digest: [32]u8,
+    refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+
+    pub fn retain(self: *InstallPlanSnapshot) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+    pub fn release(self: *InstallPlanSnapshot) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.allocator.free(self.json);
+        self.allocator.destroy(self);
+    }
+};
 
 /// `phase` 是观察性投影而非持久化状态机；后续 M3/M4 仅能在已验证的
 /// node/session 关联上推进它。
@@ -57,12 +75,17 @@ pub const TerminalReason = enum {
 /// 不拥有它们；只有 session id、MAC 和时间戳由 Store 自己维护。
 pub const Session = struct {
     id: [id_len]u8 = [_]u8{0} ** id_len,
-    node_id: ?[]const u8 = null,
+    node_id_buf: [node_id_capacity]u8 = [_]u8{0} ** node_id_capacity,
+    node_id_len: u8 = 0,
     mac: [6]u8 = [_]u8{0} ** 6,
     lease_ip: u32 = 0,
     dhcp_xid: u32 = 0,
-    profile: ?[]const u8 = null,
+    profile_buf: [profile_capacity]u8 = [_]u8{0} ** profile_capacity,
+    profile_len: u8 = 0,
     mode: ?model.ProfileMode = null,
+    model_revision: u64 = 0,
+    deployment_generation: u64 = 0,
+    install_plan: ?*InstallPlanSnapshot = null,
     created_at: i64 = 0,
     last_seen_at: i64 = 0,
     created_mono: i64 = 0,
@@ -79,6 +102,14 @@ pub const Session = struct {
     pub fn idSlice(self: *const Session) []const u8 {
         return self.id[0..];
     }
+
+    pub fn nodeId(self: *const Session) ?[]const u8 {
+        return if (self.node_id_len == 0) null else self.node_id_buf[0..self.node_id_len];
+    }
+
+    pub fn profileName(self: *const Session) ?[]const u8 {
+        return if (self.profile_len == 0) null else self.profile_buf[0..self.profile_len];
+    }
 };
 
 /// 节点侧授权结果的唯一类型，由 M3 handler 消费。它是值拷贝，
@@ -92,6 +123,10 @@ pub const Authenticated = struct {
     lease_ip: u32,
     capability: [capability_len]u8,
     capability_issued: bool,
+    model_revision: u64,
+    deployment_generation: u64,
+    session_created_at: i64,
+    plan_digest: ?[32]u8,
 };
 
 /// M3.5 只读 TFTP boot 身份。由 `resolveTftpBoot` 返回的安全值拷贝，
@@ -140,6 +175,7 @@ pub const DhcpIdentity = struct {
     node_id: ?[]const u8,
     profile: ?[]const u8,
     mode: ?model.ProfileMode,
+    model_revision: u64 = 0,
 };
 
 /// `acquireDhcp` 的附带结果；被替换的 session 必须由调用者写出终态事件。
@@ -157,11 +193,97 @@ pub const Store = struct {
     sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions,
     mutex: std.atomic.Mutex = .unlocked,
 
+    pub fn captureInstallPlan(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, json: []const u8, model_revision: u64) !void {
+        if (!validId(session_id) or json.len == 0 or json.len > 1024 * 1024) return error.InvalidInstallPlan;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(json, &digest, .{});
+        const plan = try allocator.create(InstallPlanSnapshot);
+        const owned_json = allocator.dupe(u8, json) catch |err| {
+            allocator.destroy(plan);
+            return err;
+        };
+        plan.* = .{ .allocator = allocator, .json = owned_json, .digest = digest };
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
+            if (session.install_plan) |existing| {
+                if (!std.crypto.timing_safe.eql([32]u8, existing.digest, digest)) {
+                    plan.release();
+                    return error.InstallPlanChanged;
+                }
+                plan.release();
+                return;
+            }
+            session.install_plan = plan;
+            session.model_revision = model_revision;
+            return;
+        }
+        plan.release();
+        return error.SessionInactive;
+    }
+
+    pub fn setDeploymentGeneration(self: *Store, session_id: []const u8, generation: u64) !void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| if (session.active() and std.mem.eql(u8, session.idSlice(), session_id)) {
+            if (session.deployment_generation != 0 and session.deployment_generation != generation) return error.DeploymentGenerationChanged;
+            session.deployment_generation = generation;
+            return;
+        };
+        return error.SessionInactive;
+    }
+
+    pub fn copyInstallPlan(self: *Store, allocator: std.mem.Allocator, session_id: []const u8) !?[]u8 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
+            const plan = session.install_plan orelse return null;
+            return try allocator.dupe(u8, plan.json);
+        }
+        return null;
+    }
+
     pub fn hasActiveNode(self: *Store, node_id: []const u8, mono_now: i64) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
-        for (&self.sessions) |*session| if (session.active() and !sessionExpired(session, mono_now) and session.node_id != null and std.mem.eql(u8, session.node_id.?, node_id)) return true;
+        for (&self.sessions) |*session| if (session.active() and !sessionExpired(session, mono_now) and session.nodeId() != null and std.mem.eql(u8, session.nodeId().?, node_id)) return true;
         return false;
+    }
+
+    pub fn hasActiveInstallSource(self: *Store, source: []const u8, mono_now: i64) bool {
+        var needle_buffer: [256]u8 = undefined;
+        const needle = std.fmt.bufPrint(&needle_buffer, "\"name\":\"{s}\"", .{source}) catch return true;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or sessionExpired(session, mono_now)) continue;
+            const plan = session.install_plan orelse continue;
+            // The owned canonical plan contains several names. Pair the exact
+            // name with the install_source object prefix to avoid matching an
+            // unrelated asset suffix.
+            const marker = "\"install_source\":";
+            const start = std.mem.indexOf(u8, plan.json, marker) orelse continue;
+            const tail = plan.json[start + marker.len ..];
+            if (std.mem.indexOf(u8, tail[0..@min(tail.len, 2048)], needle) != null) return true;
+        }
+        return false;
+    }
+
+    /// 在关联确定时复制节点 ID，供传输期间固定使用；调用方不得在 I/O 后重查归属。
+    pub fn copyLinkedNodeId(self: *Store, link: Link, buffer: []u8) ?[]const u8 {
+        const session_id = link.id() orelse return null;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            const owned_node_id = session.nodeId() orelse continue;
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
+            if (owned_node_id.len > buffer.len) return null;
+            @memcpy(buffer[0..owned_node_id.len], owned_node_id);
+            return buffer[0..owned_node_id.len];
+        }
+        return null;
     }
 
     /// 为新的 MAC/XID 对创建 session，或仅在有界 DHCP 重传窗口内刷新同一 session。
@@ -304,11 +426,11 @@ pub const Store = struct {
         }
         const session = found orelse return null;
         if (sessionExpired(session, mono_now)) return null;
-        if (session.node_id == null or session.profile == null or session.mode == null) return null;
+        if (session.nodeId() == null or session.profileName() == null or session.mode == null) return null;
         return .{
             .boot_session_id = session.id,
-            .node_id = session.node_id.?,
-            .profile = session.profile.?,
+            .node_id = session.nodeId().?,
+            .profile = session.profileName().?,
             .mode = session.mode.?,
             .mac = session.mac,
             .lease_ip = session.lease_ip,
@@ -339,8 +461,8 @@ pub const Store = struct {
         var lease_match = false;
         for (&self.sessions) |*session| {
             if (!session.active() or sessionExpired(session, mono_now)) continue;
-            if (session.node_id == null or session.profile == null or session.mode == null) continue;
-            if (!std.mem.eql(u8, session.node_id.?, node_id)) continue;
+            if (session.nodeId() == null or session.profileName() == null or session.mode == null) continue;
+            if (!std.mem.eql(u8, session.nodeId().?, node_id)) continue;
             node_match = true;
             if (session.lease_ip == peer_ip) lease_match = true;
             if (session.lease_ip != peer_ip) return error.ProofMismatch;
@@ -371,8 +493,8 @@ pub const Store = struct {
         for (&self.sessions) |*session| {
             if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
             if (sessionExpired(session, mono_now)) return error.SessionInactive;
-            if (session.node_id == null or session.profile == null or session.mode == null) return error.ProofMismatch;
-            if (!std.mem.eql(u8, session.node_id.?, node_id) or !session.capability_issued or !std.mem.eql(u8, &session.capability, token)) return error.ProofMismatch;
+            if (session.nodeId() == null or session.profileName() == null or session.mode == null) return error.ProofMismatch;
+            if (!std.mem.eql(u8, session.nodeId().?, node_id) or !session.capability_issued or !tokenMatches(session, token)) return error.ProofMismatch;
             return authenticated(session);
         }
         return error.SessionInactive;
@@ -393,7 +515,7 @@ pub const Store = struct {
         for (&self.sessions) |*session| {
             if (!session.active() or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
             if (sessionExpired(session, mono_now)) return error.SessionInactive;
-            if (session.node_id == null or session.profile == null or session.mode == null or !session.capability_issued or !std.mem.eql(u8, &session.capability, token)) return error.ProofMismatch;
+            if (session.nodeId() == null or session.profileName() == null or session.mode == null or !session.capability_issued or !tokenMatches(session, token)) return error.ProofMismatch;
             return authenticated(session);
         }
         return error.SessionInactive;
@@ -503,7 +625,35 @@ pub const Store = struct {
         }
         return count;
     }
+
+    pub fn snapshot(self: *Store, destination: *[max_sessions]Session) usize {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        for (self.sessions) |session| {
+            if (!session.active() or !session.capability_issued) continue;
+            destination[count] = session;
+            if (destination[count].install_plan) |plan| plan.retain();
+            count += 1;
+        }
+        return count;
+    }
+
+    pub fn restore(self: *Store, restored: Session) !void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*slot| if (!slot.active()) {
+            slot.* = restored;
+            return;
+        };
+        return error.SessionCapacityExhausted;
+    }
 };
+
+fn tokenMatches(session: *const Session, token: []const u8) bool {
+    if (token.len != capability_len) return false;
+    return std.crypto.timing_safe.eql([capability_len]u8, session.capability, token[0..capability_len].*);
+}
 
 /// 返回用于 TTL 和重传窗口的单调秒数；绝不用于对外审计时间。
 pub fn monotonicNow() i64 {
@@ -558,18 +708,32 @@ fn newSession(io: std.Io, identity: DhcpIdentity, mono_now: i64, utc_now: i64, e
     }
     var mac: [6]u8 = undefined;
     @memcpy(&mac, identity.mac[0..6]);
-    return .{
+    var session: Session = .{
         .id = id,
-        .node_id = identity.node_id,
         .mac = mac,
         .dhcp_xid = identity.xid,
-        .profile = identity.profile,
         .mode = identity.mode,
+        .model_revision = identity.model_revision,
         .created_at = utc_now,
         .last_seen_at = utc_now,
         .created_mono = mono_now,
         .last_seen_mono = mono_now,
     };
+    try copyIdentity(&session, identity.node_id, identity.profile);
+    return session;
+}
+
+pub fn copyIdentity(session: *Session, node_id: ?[]const u8, profile: ?[]const u8) !void {
+    if (node_id) |value| {
+        if (value.len == 0 or value.len > node_id_capacity) return error.InvalidSessionIdentity;
+        @memcpy(session.node_id_buf[0..value.len], value);
+        session.node_id_len = @intCast(value.len);
+    }
+    if (profile) |value| {
+        if (value.len == 0 or value.len > profile_capacity) return error.InvalidSessionIdentity;
+        @memcpy(session.profile_buf[0..value.len], value);
+        session.profile_len = @intCast(value.len);
+    }
 }
 
 /// 在 mutex 已锁定的情况下标记 session 终态并返回终态快照。
@@ -579,20 +743,28 @@ fn terminateLocked(session: *Session, reason: TerminalReason, mono_now: i64, utc
     session.last_seen_mono = mono_now;
     session.last_seen_at = utc_now;
     if (reason == .expired) session.phase = .expired;
-    return session.*;
+    var result = session.*;
+    if (session.install_plan) |plan| plan.release();
+    session.install_plan = null;
+    result.install_plan = null;
+    return result;
 }
 
 /// 从已验证的活动 session 构造 Authenticated 值拷贝。
 /// 调用方获得的是快照，在 I/O 期间不持有 mutex。
 fn authenticated(session: *const Session) Authenticated {
     return .{
-        .node_id = session.node_id.?,
+        .node_id = session.nodeId().?,
         .boot_session_id = session.id,
-        .profile = session.profile.?,
+        .profile = session.profileName().?,
         .mode = session.mode.?,
         .lease_ip = session.lease_ip,
         .capability = session.capability,
         .capability_issued = session.capability_issued,
+        .model_revision = session.model_revision,
+        .deployment_generation = session.deployment_generation,
+        .session_created_at = session.created_at,
+        .plan_digest = if (session.install_plan) |plan| plan.digest else null,
     };
 }
 
@@ -737,7 +909,8 @@ test "repeated installer DHCP renewals preserve bootstrap proof" {
 test "terminal install event releases retry gate" {
     var store: Store = .{};
     const id = "0123456789abcdef0123456789abcdef";
-    store.sessions[0] = .{ .id = id.*, .node_id = "node-01", .profile = "install", .mode = .install, .last_seen_mono = 1 };
+    store.sessions[0] = .{ .id = id.*, .mode = .install, .last_seen_mono = 1 };
+    try copyIdentity(&store.sessions[0], "node-01", "install");
     try std.testing.expect(store.hasActiveNode("node-01", 2));
     store.finishDelivery(id, .failed, 3, 3);
     try std.testing.expect(!store.hasActiveNode("node-01", 4));
@@ -771,20 +944,55 @@ test "M3 bootstrap and capability proofs remain bound to one active lease" {
     const token: [capability_len]u8 = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".*;
     store.sessions[0] = .{
         .id = session_id,
-        .node_id = "node-01",
         .lease_ip = 0xc0a81b0a,
-        .profile = "rocky-install",
         .mode = .install,
         .last_seen_mono = 100,
         .capability = token,
         .capability_issued = true,
     };
+    try copyIdentity(&store.sessions[0], "node-01", "rocky-install");
     const bootstrap = try store.authenticateBootstrap("node-01", 0xc0a81b0a, 101);
     try std.testing.expectEqualStrings("node-01", bootstrap.node_id);
     try std.testing.expectError(error.ProofMismatch, store.authenticateBootstrap("node-01", 0xc0a81b0b, 101));
     _ = try store.authenticateCapability("node-01", &session_id, &token, 101);
     try std.testing.expectError(error.ProofMismatch, store.authenticateCapability("node-02", &session_id, &token, 101));
     try std.testing.expectError(error.SessionInactive, store.authenticateCapability("node-01", &session_id, &token, 100 + delivery_ttl_seconds));
+}
+
+test "M4.3 restored plaintext capability authenticates in constant time" {
+    const token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    var store: Store = .{};
+    var id: [id_len]u8 = undefined;
+    @memcpy(&id, "0123456789abcdef0123456789abcdef");
+    var restored_session: Session = .{
+        .id = id,
+        .mode = .install,
+        .lease_ip = 0xc0a81b10,
+        .created_at = 100,
+        .last_seen_at = 100,
+        .created_mono = 100,
+        .last_seen_mono = 100,
+        .capability_issued = true,
+        .capability = token.*,
+    };
+    try copyIdentity(&restored_session, "node-01", "install");
+    try store.restore(restored_session);
+    const checked = try store.authenticateCapability("node-01", &id, token, 101);
+    try std.testing.expectEqualStrings("node-01", checked.node_id);
+    try std.testing.expectError(error.ProofMismatch, store.authenticateCapability("node-01", &id, "0000000000000000000000000000000000000000000000000000000000000000", 101));
+}
+
+test "immutable install plan cannot change within one boot session" {
+    var store: Store = .{};
+    const acquired = try store.acquireDhcp(std.testing.io, .{ .mac = &.{ 2, 0, 0, 0, 0, 1 }, .xid = 1, .node_id = "node-01", .profile = "install", .mode = .install, .model_revision = 7 }, 1, 1);
+    const id = acquired.link.id().?;
+    try store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":7}", 7);
+    try store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":7}", 7);
+    try std.testing.expectError(error.InstallPlanChanged, store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":8}", 8));
+    const copied = (try store.copyInstallPlan(std.testing.allocator, id)).?;
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("{\"revision\":7}", copied);
+    store.finishDelivery(id, .completed, 2, 2);
 }
 
 test "DHCP offer phase alone is never an HTTP bootstrap proof" {

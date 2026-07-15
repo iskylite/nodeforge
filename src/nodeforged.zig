@@ -134,6 +134,14 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     const config_path = ctx.flag("config", []const u8);
     const catalog_path = ctx.flag("catalog", []const u8);
 
+    const transaction_dir = try nodeforge.model_transaction.directoryForConfig(ctx.allocator, config_path);
+    defer ctx.allocator.free(transaction_dir);
+    const recovered = nodeforge.model_transaction.recoverAll(ctx.io, ctx.allocator, transaction_dir) catch |err| {
+        nodeforge.observe_log.err("model: transaction recovery failed closed: {t}", .{err});
+        return err;
+    };
+    if (recovered != 0) nodeforge.observe_log.info("model: recovered {d} transaction journal(s) before validation", .{recovered});
+
     var parsed = nodeforge.config.load(ctx.io, ctx.allocator, config_path) catch |err| {
         nodeforge.observe_log.err("config: cannot load {s}", .{config_path});
         if (debug) nodeforge.observe_log.debug("config: load cause={t}", .{err});
@@ -188,7 +196,7 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         return;
     }
 
-    try nodeforge.app.run(ctx.io, ctx.allocator, &parsed.value, catalog, catalog_path);
+    try nodeforge.app.run(ctx.io, ctx.allocator, &parsed.value, config_path, catalog, catalog_path);
 }
 
 const LogOutput = enum {
@@ -229,7 +237,12 @@ fn configureLogOutput(
 
 /// 输出稳定的 daemon 名称与项目版本。
 fn printVersion(out: *std.Io.Writer) !void {
-    try out.print("nodeforged {s}\n", .{nodeforge.version.version});
+    try out.print("nodeforged {s} (commit {s}, built {s}, {s})\n", .{
+        nodeforge.version.version,
+        nodeforge.version.shortCommit(),
+        nodeforge.version.build_time,
+        if (nodeforge.version.git_dirty) "dirty" else "clean",
+    });
 }
 
 /// 判断错误是否属于用户可修正的 CLI 语法错误，用于稳定映射退出码 2。

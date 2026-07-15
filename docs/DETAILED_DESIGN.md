@@ -38,9 +38,11 @@
 | M4 | PXE 无人值守安装与基础后处理 | M1-M3 | Rocky Linux 9.7 aarch64、Ubuntu Server 22.04 LTS 安装和 `install_post` 跑通 |
 | M4.1 | 公共目标系统配置、安装生命周期与 M4 answer 纠错 | M4 | 公共系统字段、一次性 install generation/retry/drift、`$6$`/bootstrap key、storage/schema/event 及 M1-M3 横切回归在双 adapter 验收 |
 | M4.2 | 部署链路健壮性、密钥可维护性与传输性能加固 | M4.1 | 部署错误传回 nodeforged、节点级不部署开关、ISO 导入主流 OS+覆盖语义、TFTP windowsize/并发/配置项、免密公钥配置化+CLI 导入、CLI 命令体系校准 |
-| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
-| M6 | 支持矩阵增强 | M4.1、M4.2、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
-| M7 | 补充包和后处理增强 | M4.1、M4.2、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
+| M4.3 | 安装源与节点模型收口、运行态热更新和可观测性完善 | M4.2 | family/distro 正确建模、ISO 幂等导入、catalog 查看/迁移、完整 node/profile 只读视图、daemon-owned ConfigRuntime、owned session resume、传输归属、webhook 认证和构建溯源 |
+| M4.4 | HTTP API URL 契约收口与路由平面分离 | M4.3 | 节点交付/本机管理/静态制品三平面，消除重复 URL，node-bound rootfs，canonical 路由和有界迁移 |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2、M4.3、M4.4 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
+| M6 | 支持矩阵增强 | M4.1、M4.2、M4.3、M4.4、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
+| M7 | 补充包和后处理增强 | M4.1、M4.2、M4.3、M4.4、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
 
 ### 1.3 完成标准
 
@@ -56,7 +58,7 @@
 
 ### 1.4 阅读顺序与阶段依赖
 
-- M0-M7（含 M1.5、M2.5、M2.5.1、M4.1 和 M4.2）是可验收的产品阶段，按章节依赖阅读和交付。
+- M0-M7（含 M1.5、M2.5、M2.5.1、M4.1、M4.2、M4.3 和 M4.4）是可验收的产品阶段，按章节依赖阅读和交付。
 - M1 先实现正式 TFTP 只读服务，并用标准 TFTP client 验证 RRQ/OACK、重传和路径安全。
 - M1.5 在 M2 前收敛 CLI 展示层；它不改变 daemon API、配置或协议语义，但 M2+ 新命令必须复用其 formatter。
 - M2 再实现 DHCP 地址、架构识别和 bootfile 决策，最后与 M1 联调完整 PXE 入口。
@@ -95,8 +97,8 @@
 ### 2.2 核心调用路径
 
 MVP 的目标业务路径如下。M0 历史上只交付 CLI 本地文件操作和 HTTP 管理路由；当前 M1-M3 的
-DHCP/TFTP/HTTP 数据路径已有实现与验证，M4 已有实机记录，M4.1 代码与 fixture 已实现并仍在系统级
-验收，M5+ 按后续章节交付：
+DHCP/TFTP/HTTP 数据路径已有实现与验证，M4/M4.1 已有实机记录，M4.2 作为当前实现基线；M4.3 为已完成设计、
+待实现并重新系统验收的补全阶段；M4.4 随后收口 HTTP URL，M5+ 按后续章节交付：
 
 ```text
 M1+ CLI / 127.0.0.1 management HTTP
@@ -414,8 +416,9 @@ const InstallSourceConfig = struct {
     source: AssetOrRepositoryRef,
     installer_kernel: AssetRef,
     installer_initrd: AssetRef,
+    media_tree_url: ?[]const u8 = null, // 已发布安装媒体树；不等价于 package repository
     repositories: []RepositoryRef,
-    source_label: ?[]const u8 = null, // M4.2 F3: 记录 ISO 导入时的原始 family（如 openEuler/Kylin），归一后 distro 仍为 rocky
+    source_label: ?[]const u8 = null, // 原始媒体标签；M4.3 起只用于显示，不再把非 Rocky 发行版归一为 rocky
 };
 
 const ProfileConfig = struct {
@@ -485,8 +488,9 @@ const DiscoveryAction = enum {
 - `overrides.network` 是安装后系统内或无盘系统内的网络覆盖，不等同于 PXE 阶段 DHCP 保留地址 `node.ip`。DNS、gateway、search domain 都是可选字段。
 - `NodeNetworkOverride.dns` 和 `search_domains` 用空列表表示未配置；M4.1 静态网络强制 address + prefix，
   且 address 必须等于该节点的 DHCP reservation；netmask 只作为旧配置兼容输入，归一化后统一使用 prefix。
-- `oob` 是可选带外管理信息，当前只预留 IPMI；MVP 可以先只保存和展示 BMC 地址/掩码/网关、IPMI 用户名和密码。
-- IPMI 用户名和密码直接作为可选明文字段保存，不做 SecretRef、加密封装或轮换状态。
+- `oob` 是管理员声明的带外管理配置，当前只预留 IPMI；BMC 地址/掩码/网关可以展示，凭据沿用现有 desired
+  config 的 password 契约，但不得进入自动上报的 `NodeFacts`、inventory、事件或普通日志，查询默认脱敏。
+- observed facts 不得创建或覆盖 OOB 凭据；M4.3 的 inventory 持久化不是第二个 secret store。
 - IP 可以是静态保留或临时 lease，但不能单独作为部署身份，也不能单独触发安装。
 - `install_vars` 只能填充 install profile 模板中声明的变量；擦盘、分区、bootloader、安装源仍由 install profile 决定。
 - `diskless.overlay_tmpfs_size` 覆盖值必须通过 profile/global 上限校验。
@@ -502,7 +506,7 @@ const DiscoveryAction = enum {
 | `AssetConfig` | 保存物理文件路径、类型、大小、SHA256、来源和可选 kernel_release |
 | `DistroConfig` | 保存发行版族、版本、架构、安装 adapter 和包管理器 |
 | `RepositoryConfig` | 保存 apt/yum/dnf 源、mirror、GPG key、suite/component/repo id 和用途 |
-| `InstallSourceConfig` | 绑定 ISO/安装树/image 与 installer kernel/initrd、repo 列表 |
+| `InstallSourceConfig` | 绑定 ISO/安装树/image 与 installer kernel/initrd、可选 media tree、repo 列表 |
 | `RootfsConfig` | 记录 rootfs 构建输入、repo 列表、kernel_release 和发布物 |
 | `BootBundleConfig` | 绑定 diskless kernel、小 initrd、rootfs、repo，并校验一致性 |
 | `ProfileConfig` | 引用 install source 或 boot bundle，再叠加安装/无盘策略 |
@@ -513,7 +517,10 @@ const DiscoveryAction = enum {
 - Ubuntu repository 使用 apt 字段；Rocky/RHEL/Alma/Fedora 使用 dnf/yum 兼容字段。实现可以统一结构，但校验必须按 distro family 解释。
 - 标准 ISO 是 install source 的首选输入。导入时解包到 NodeForge 管理的版本目录，提取 installer kernel/initrd，并通过 `/repos/<install-source>/` 只读发布。
 - Rocky/RHEL 系 DVD ISO 具有有效 `.treeinfo` 和 `repodata` 时，自动创建基础 yum/dnf repository 并挂到 install source。
-- Ubuntu Server ISO 始终可作为 installer media 发布，且导入时始终将 ISO 内容复制到 `/repos/<source>/` 并创建 `RepositoryConfig` 条目——即使 ISO 不含完整 APT metadata（`dists/pool/Release`）。这使得 `autoinstall.apt.mirror-selection.primary` 始终有一个本地 URL 可用，阻止 Subiquity 回退到 `archive.ubuntu.com`。mirror 不完整时的行为由 profile 的 `install.apt.fallback` 决定：默认 `offline-install` 使用 squashfs；严格 HTTP APT 验收使用 `abort`。
+- Ubuntu Server ISO 始终可作为 installer media 并发布受管 media tree；只有 `dists/pool/Release` 等 APT
+  metadata 可消费时才创建 `RepositoryConfig`。不完整 media tree 由 install source 的 `media_tree_url` 提供给
+  Subiquity offline fallback，不伪装成可用 package repository，也不得回退到 `archive.ubuntu.com`。
+  profile 的 `install.apt.fallback` 决定默认 `offline-install` 或严格 `abort`。
 - `gpg_check` 默认 `false`，不要求 GPG key；只有用户明确启用时才校验 key，并向 yum/dnf/apt 输出签名检查配置。
 - install profile 的 `boot_source.install_source` 指向 `InstallSourceConfig`，renderer 再从 install source 找 installer kernel/initrd 和 repo。
 - diskless profile 的 `boot_source.boot_bundle` 指向 `BootBundleConfig`，boot resolver 再展开 kernel、小 initrd、rootfs 和 repo。
@@ -687,11 +694,12 @@ const NodeFacts = struct {
     observed_at: Timestamp,
     source: FactsSource,
     serial_number: ?[]const u8,
+    product_uuid: ?[]const u8,
+    vendor: ?[]const u8,
+    model: ?[]const u8,
     bmc_address: ?Ipv4Address,
     bmc_netmask: ?Ipv4Address,
     bmc_gateway: ?Ipv4Address,
-    ipmi_username: ?[]const u8,
-    ipmi_password: ?[]const u8,
 };
 
 const NodeStatus = struct {
@@ -711,7 +719,10 @@ const NodeStatus = struct {
 - M3.1 将 DHCP lease 与 `node_status` 拆为独立文件、锁和保存生命周期；二者不承诺跨文件事务。
 - `leases.json` 由 DHCP checkpoint worker 周期性保存；`node-status.json` 由 HTTP 的关键状态转移同步保存。
 - `events.jsonl` 只追加，不作为当前状态事实源。
-- discovery/initrd 上报的 `NodeFacts` 默认只是观察数据；只包含 SN、BMC 地址/掩码/网关、IPMI 用户名和密码。管理员确认后可回填到 `node.serial_number` 或 `node.oob.ipmi`。
+- discovery/initrd 上报的 `NodeFacts` 是非 secret observed inventory，M4.3 持久化到独立
+  `node-inventory.json`。它包含 SN、product UUID、vendor/model 和可选 BMC 网络地址，不包含 IPMI 用户名/密码。
+  `node.serial_number` 和 `node.oob` 是管理员确认的 desired 配置；observed 值不能自动覆盖它们，差异由
+  `node show` 标记。IPMI 凭据仍只存在管理员配置的 OOB 域，不得写入 inventory/Event/日志。
 
 ## 5. M0 验收标准与验证结果
 
@@ -794,7 +805,7 @@ CLI 解析、帮助信息、参数类型和默认值使用 vendored `zli v5.1.2`
 
 zli 提供 spinner，但 M0 不启用。只有后续耗时交互命令同时处于 TTY、human 输出且存在明显等待时才可启动；`--output json`、重定向、管道和 systemd 场景禁止输出动画或终端控制序列。
 
-帮助和版本属于 CLI 通用控制能力，只提供 `-h/--help` 与 `-v/--version` 参数，不定义 `help`、`version` 同名子命令。`-v/--version` 只属于顶层 `nodeforge`；`-h/--help` 由每一级命令提供。`--config`、`--catalog`、`--output` 不作为全局参数，只挂在实际读取它们的叶子命令上，必须写在该命令之后。子命令集合只保留 status、check、config、catalog 等业务入口，避免同一操作存在两套写法。
+帮助和版本属于 CLI 通用控制能力，只提供 `-h/--help` 与 `-v/--version` 参数，不定义 `help`、`version` 同名子命令。M0 的 `-v/--version` 范围曾只写顶层 `nodeforge`；M4.3 起 `nodeforge` 和 `nodeforged` 两个顶层入口都必须提供该参数，并输出一致的 SemVer、build time、git commit 和 clean/dirty。`-h/--help` 由每一级命令提供。`--config`、`--catalog`、`--output` 不作为全局参数，只挂在实际读取它们的叶子命令上，必须写在该命令之后。子命令集合只保留 status、check、config、catalog 等业务入口，避免同一操作存在两套写法。
 
 M0 短参数固定为：`nodeforge` 根命令 `-v`，叶子命令按需使用 `-c`（config）、`-C`（catalog）、`-o`（output）、`-d`（debug）；`-h` 由 zli 自动提供。`nodeforged` 为无子命令入口，使用 `-v/-c/-C/-d/-k/-K`（version/config/catalog/debug/check/check-config），并提供 `--log-output auto|terminal|file|both` 与 `--log-file <absolute-path>`。帮助页不内嵌长命令示例，但每个枚举、关联或格式不直观的参数必须在 description 中给出一个字段级 `e.g.` 值，并说明其关联参数。
 
@@ -835,7 +846,7 @@ nodeforge catalog export
 `status` 面向人工查看，输出进程、HTTP、管理路由和配置 API 的详细状态；`check`
 面向自动化健康检查，成功时只输出简短通过信息并依赖退出码表达结果。
 
-`install-source import` 需要实际解析 ISO、发布 HTTP 仓库、提取安装内核/initrd，并由 `nodeforged` 写入 catalog，因此归入 M3；M0 只定义 config/catalog 模型边界、writer 边界和最小校验。
+`assets import`（历史名 `install-source import`）需要实际解析 ISO、发布 HTTP media/repository、提取安装内核/initrd，并由 `nodeforged` 写入 catalog，因此归入 M3；M0 只定义 config/catalog 模型边界、writer 边界和最小校验。
 
 ### 5.5 配置与 catalog 校验
 
@@ -895,7 +906,9 @@ M0 日志策略：
 日志后端，并把 `LoggingConfig` 的可选字段和 `EventsConfig` 作为向后兼容的默认配置加载。
 
 - 直接执行 `nodeforged` 默认输出到 stderr。systemd unit 显式传入 `--log-output file`，默认写入 `/opt/nodeforge/logs/nodeforged.log`；目录必须由安装过程创建并对服务用户可写。需要 journal 的部署使用 `--log-output both` 覆盖 unit，或通过 systemd drop-in 替换 `ExecStart`。
-- 日常 `info` 日志包含成功监听地址、每个 HTTP 请求的 method/path/status，以及配置、校验或预检失败的错误摘要。
+- 日常 `info` 日志包含成功监听地址、控制面/boot 请求的 method/path/status，以及配置、校验或预检失败的错误摘要。
+  M4.3 起 `/repos/**` 成功 GET/HEAD/Range 服务日志按 route class 降为 debug；4xx/5xx 仍保持 info/warn，
+  业务下载事件仍按事件保留策略记录，不能用降日志等级代替审计。
 - `config.json` 的 `logging.level` 只接受 `info`（默认）和 `debug`。`nodeforged -d/--debug` 仅覆盖本次进程启动，优先于配置；它不写回配置文件。M0 当前的 debug 请求日志为 method/path；连接建立/关闭、DHCP/TFTP 报文摘要和更细协议诊断随对应服务阶段补齐，ReleaseSafe 也可使用。
 - `nodeforge` 的每个 M0 叶子命令支持 `-d/--debug`。默认只输出一行 `error: <类别>: <简短原因>: <路径>`；debug 模式在下一行追加内部错误标签，便于定位但不泄漏请求体、token 或密码。
 - M1+ 节点事件、安装阶段、无盘阶段等业务事件进入 `events.jsonl`，不与服务进程日志混为一个文件；M0 仅提供其基础类型和追加工具。
@@ -1000,8 +1013,8 @@ M0 验收结果：
 协议边界补丁（纳入 M4.1 前置回归，但归属仍为 M1）：
 
 - `blksize`、`timeout`、`tsize`、`windowsize` 的格式或范围非法时返回 option negotiation/illegal operation 错误，不能
-  静默截断；RRQ 中 `tsize` 只接受 RFC 2349 允许的查询形式。除 §7.4 的 `blksize` 主动建议外，
-  服务端不在 OACK 中添加客户端未请求的 option，也不返回大于客户端显式请求值的 `blksize`（RFC 2348）。
+  静默截断；RRQ 中 `tsize` 只接受 RFC 2349 允许的查询形式。服务端不在 OACK 中添加客户端未请求的 option，
+  也不返回大于客户端显式请求值的 `blksize`（RFC 2347/2348）。
 - 未识别 option 按 RFC 2347 忽略，已识别且接受的 option 才进入 OACK；OACK 后必须先收到 ACK block 0。
 - 客户端从当前 transfer TID 发送 ERROR 时立即终止该传输并记为 failed；未知 TID 的 DATA/ACK/ERROR 不得
   影响其他传输。超时达到重传上限后释放 socket/fd 和运行态槽位。
@@ -1064,13 +1077,13 @@ MVP 同时支持 UEFI x86_64 和 UEFI aarch64 GRUB，分别使用 `grubx64.efi`�
 ### 6.5 CLI 命令
 
 ```bash
-nodeforge tftp show
-nodeforge tftp session list
-nodeforge asset import --type bootloader --name grub-uefi-aarch64 --path grubaa64.efi --arch aarch64
-nodeforge asset import --type kernel --name rocky-9.7-aarch64-kernel --path vmlinuz-<kernel-release> --distro rocky --version 9.7 --arch aarch64 --kernel-release <kernel-release>
-nodeforge asset import --type initrd --name rocky-9.7-aarch64-nodeforge-initrd --path initrd-nodeforge.img --distro rocky --version 9.7 --arch aarch64 --kernel-release <kernel-release>
-nodeforge asset list
-nodeforge asset show rocky-9.7-aarch64-kernel
+nodeforge runtime tftp-counters
+nodeforge runtime tftp-sessions
+nodeforge assets import --type bootloader --name grub-uefi-aarch64 --path grubaa64.efi --arch aarch64
+nodeforge assets import --type kernel --name rocky-9.7-aarch64-kernel --path vmlinuz-<kernel-release> --distro rocky --version 9.7 --arch aarch64 --kernel-release <kernel-release>
+nodeforge assets import --type initrd --name rocky-9.7-aarch64-nodeforge-initrd --path initrd-nodeforge.img --distro rocky --version 9.7 --arch aarch64 --kernel-release <kernel-release>
+nodeforge assets list
+nodeforge assets show rocky-9.7-aarch64-kernel
 nodeforge asset validate
 ```
 
@@ -1369,9 +1382,9 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 ### 7.5 CLI 命令
 
 ```bash
-nodeforge dhcp show
-nodeforge runtime leases list
-nodeforge runtime unknown list
+nodeforge config export
+nodeforge runtime dhcp-leases
+nodeforge runtime dhcp-unknown
 nodeforge node list
 ```
 
@@ -2151,13 +2164,17 @@ session：在短暂重传窗口内按 MAC + XID 复用，避免同一个 DHCP �
 DISCOVER、session 进入 terminal 状态、或超过 early-phase TTL 后，必须新建 session。地址租约过期不删除
 历史 session，只将其标记为 `expired`；保留和轮转仍由 events 文件策略决定。
 
-`BootSession` 注册表是**仅进程内、固定上限**的活动关联索引，不写入 `runtime.json`，也不在 daemon
-重启后恢复。这个选择是刻意的：重启已经中断 DHCP/TFTP 服务，恢复旧 session 会让 MAC、IP 或 XID 的
-后续巧合命中被误当成同一次启动。每个进程启动生成新的 `daemon_instance_id`（同样为服务端随机 128-bit
-小写十六进制值）；EventWriter 在所有服务端 Event 上附加该保留字段，调用方不得提交或覆盖它。优雅停止时，
-服务必须在 `service.stopped` 前将仍活动的 session 以 `daemon_shutdown` 终止并追加审计事件；崩溃后无法
-补写时，下一次 `service.started` 的新 `daemon_instance_id` 是 `trace` 必须显示的 `daemon_restart_gap`，而
-不是“部署成功”或“session 已恢复”的证据。
+`BootSession` 的热索引仍是进程内固定上限结构，但 M4.3 将**已经签发 capability、进入 delivery 阶段**的
+活动 session 以 mode 0600 checkpoint 到 `boot-sessions.json`；早期 DHCP session、TFTP TID/socket、block/
+重传状态仍不持久化，避免 MAC/IP/XID 的后续巧合被误认成同一次启动。checkpoint 只保存身份、phase、UTC
+时间、captured model revision、owned immutable install plan/digest 和 capability token；checkpoint 必须为 mode 0600，
+且 token 不得进入普通查询、日志或事件。plan 使同一次安装跨 config replace/restart 仍获得相同 answer；它不表示 UDP 字节流可续传。
+
+每个进程仍生成新的 `daemon_instance_id`，EventWriter 继续在所有服务端 Event 上附加它。优雅停止时，满足
+resume 条件的 delivery session 先 checkpoint，不写 `daemon_shutdown` 终态；不满足条件的早期/过期 session
+才按旧规则终止。下次启动对剩余 TTL、node/lease/config 身份验证成功后恢复 delivery proof，并记录明确的
+`session.resumed`/instance boundary；恢复失败才形成 `daemon_restart_gap`/inactive。恢复绝不创建 install
+`armed_generation`，也不表示中断的 TFTP/HTTP 字节流被续传。
 
 活动 session 上限与 DHCP lease 上限一致，初始固定为 256；注册表以 mutex 保护，并按 session id、
 MAC+XID 和 lease IP 建立有界索引。过期或终态条目可立即从活动索引回收，历史查询始终扫描 Event v2，
@@ -2176,13 +2193,13 @@ TTL 和重传窗口只能使用服务端单调时钟判断，防止 NTP 校时�
 | 边界 | 服务端如何关联 | 必带 Event 字段 | 禁止的推断 |
 | --- | --- | --- | --- |
 | DHCP | MAC + XID 命中/创建 BootSession | 正常时为 `boot_session_id`、`mac`、`xid`、`ip`、`node_id`（已知时）；容量降级时为 `session_link_state` | 不能仅按 IP 认定节点 |
-| TFTP | 仅以客户端 IP 查找未终止、且 lease IP 匹配的 session；零或多条匹配时不猜测 | 唯一匹配时为 `boot_session_id`、`client_ip`、`filename`、`bytes_sent`；否则为对应的 `session_link_state` | 不能从文件名、TID 或最近 DHCP 事件强行绑定 |
+| TFTP | 仅以客户端 IP 查找未终止、且 lease IP 匹配的 session；零或多条匹配时不猜测 | 唯一匹配时为 `node_id`、`boot_session_id`、`client_ip`、`filename`、`bytes_sent`；否则为对应的 `session_link_state` | 不能从文件名、TID 或最近 DHCP 事件强行绑定 |
 | M3 HTTP boot config/answer/rootfs | 已认证 URL node id 与 active session 的 `node_id` 必须一致；服务端把 id 写入响应 | `node_id`、`boot_session_id`、`path`、`client_ip` | `boot_session_id` 不能替代节点认证 |
 | installer/initrd 上报 | DTO 的 session 必须等于服务端已签发且绑定该 node 的 active session | `node_id`、`boot_session_id`、`source`、`stage` | 客户端不得指定其他 node、source、服务端事件类型或时间 |
 | runner/firstboot | 从受验证的 node config/运行上下文继承 session；无 session 时创建显式 `run_id` 关联但不得伪称 boot session | `node_id`、`boot_session_id`（适用时）、`run_id`、`phase`、`step` | 不能用相同 message 合并两次执行 |
 
 TFTP 无法进行节点认证，因此它的关联仅是诊断级 best effort；只有 DHCP lease 与活动 session 唯一匹配时才
-写 `boot_session_id`。零个匹配写 `session_link_state = "no_active_lease_match"`，多个匹配写
+写服务端 session 中的 `node_id` 和 `boot_session_id`。零个匹配写 `session_link_state = "no_active_lease_match"`，多个匹配写
 `session_link_state = "ambiguous_lease_match"`；该状态在同一传输的 RRQ、完成、超时和失败事件中保持一致。
 这避免 NAT、IP 复用或并发 PXE 时把错误 bootloader 传输归到另一台节点。
 
@@ -2220,18 +2237,18 @@ M2.5.1 扩展本机只读查询，而不建立远程日志 API：
 
 ```text
 nodeforge events list --node node-01 --session <boot_session_id>
-nodeforge trace node-01 [--session <boot_session_id>] [--latest]
-nodeforge node status node-01
+nodeforge node trace node-01 [--session <boot_session_id>] [--latest]
+nodeforge node show node-01
 ```
 
 `trace` 默认选择该 node 最新的非过期 session；读取先保持轮转文件从旧到新及文件内 append 顺序，服务端 `ts`
 用于显示和时间过滤，不作为重排同一审计流的唯一依据。输出显示 phase、event type、
 安全摘要、reason、session 和缺失边界。它必须明确标注 `unlinked`（由 `no_active_lease_match` 或
 `ambiguous_lease_match` 产生）和 `gap`（例如 installer 未上报、事件文件轮转或损坏），不得把缺失事件
-渲染为成功。除 session 事件外，trace 必须读取相关时间窗内的全局 `service.started`/`service.stopped` 事件：
-若一个未终止 session 的最后事件之后出现新的 `daemon_instance_id` 的 `service.started`，插入
-`daemon_restart_gap`；Event v2 的 UTC 时间精度为秒，因此同一秒内实例 ID 变化也必须视为该边界，
-不能因显示时间相等而丢失 gap。已经以 `daemon_shutdown` 终止的 session 不产生该 gap。
+渲染为成功。除 session 事件外，trace 必须读取相关时间窗内的全局 `service.started`/`service.stopped` 事件。
+新的 `daemon_instance_id` 始终显示为进程边界；若后续有验证成功的 `session.resumed`，显示
+`daemon_restart_resumed` 而不是 gap；没有 resume 记录或恢复失败时才插入 `daemon_restart_gap`。Event v2 的
+UTC 时间精度为秒，因此同一秒内实例 ID 变化也不能丢失该边界。
 
 BootSession/bootstrap/delivery TTL 一律使用单调时钟；UTC 只用于人类时间。若同一 daemon 的新 Event `ts`
 早于上一条，writer/trace 记录 `service.clock_unreliable`/`clock_regression` gap 并继续服务，不能按编译时间猜测
@@ -2269,7 +2286,7 @@ session 终止、TFTP 唯一关联和 `events --session`；M3 实现经认证的
 验收至少包括：DHCP 重传复用、同 MAC 新 XID 新建 session、IP 复用不误关联、并发 PXE 的 TFTP ambiguous
 标记、活动注册表满时 DHCP 仍成功且 trace 显示 `capacity_exhausted`、优雅停止写入每个活动 session 的
 `daemon_shutdown`、崩溃后的新实例显示 `daemon_restart_gap`、过期/错绑 session 409、installer 与 initrd
-的合法/非法 DTO、状态幂等重试、`trace` 跨轮转时间顺序、失败摘要脱敏以及从 `nodeforge trace` 定位到失败
+的合法/非法 DTO、状态幂等重试、`trace` 跨轮转时间顺序、失败摘要脱敏以及从 `nodeforge node trace` 定位到失败
 phase 的端到端 fixture。
 
 ## 8. M3：HTTP 配置、资产、ISO 仓库和事件接口
@@ -2306,15 +2323,18 @@ M3 还必须完成 M2.5.1 定义的三项服务端责任：认证后的 boot con
    `X-Forwarded-For`、DHCP 以外的“最近 IP”或 TFTP 文件名。未知节点、无 lease 匹配或 node 不匹配不获得
    boot config/answer。
 2. **capability proof**：bootstrap 成功后，daemon 为该活动 session 生成 256-bit 随机
-   `node_access_token`，仅保存在进程内 `BootSession`，并只在已认证的 boot config/answer 输出中注入。
+   `node_access_token`，明文仅保存在当前进程 BootSession 和节点安装环境中，并只在已认证的 boot config/answer
+   输出中注入；M4.3 checkpoint 以 mode 0600 保存 token 供重启后继续验证和下发。
    客户端以 `Authorization: Bearer <token>` 和 `X-NodeForge-Session: <boot_session_id>` 提交；两者必须
    同时匹配活动 session。`boot_session_id` 只是关联键，单独永远不能授权。
 
-token 不持久化、不得出现在 URL path/query、kernel cmdline、HTTP access log、服务日志、Event fields、错误
-响应或 `/run/nodeforge/boot.json`。它只可作为 M4/M5 生成脚本或 initrd 内存中的 HTTP header 值；daemon
-重启、session supersede/expire/terminate 后立即失效。pre-bootstrap 保持 M2.5.1 的 15 分钟 TTL；一次成功的
+token 明文不得持久化，也不得出现在 URL path/query、kernel cmdline、HTTP access log、服务日志、Event fields、
+错误响应或 `/run/nodeforge/boot.json`。它只可作为 M4/M5 生成脚本或 initrd 内存中的 HTTP header 值；daemon
+重启时，满足 M4.3 resume 条件的 delivery session 可继续以保存的 hash 验证旧 token，session
+supersede/expire/terminate 或恢复身份校验失败后立即失效。pre-bootstrap 保持 M2.5.1 的 15 分钟 TTL；一次成功的
 boot config/answer 或受认证的 event/rootfs 请求进入 delivery 状态并将 TTL 延长为最近成功请求起 2 小时。
-M4/M5 的合法阶段事件会续期；过期或旧 daemon 的 session 一律返回 `409 session_inactive`。
+M4/M5 的合法阶段事件会续期；过期、未被 M4.3 resume cache 成功恢复或 superseded 的旧 session 返回
+`409 session_inactive`。
 
 #### 8.1.2 `node_status` 投影
 
@@ -2327,8 +2347,9 @@ M3 新增每节点一个受 mutex 保护、单 writer 持久化的 `NodeStatus`�
 
 它在校验 `AuthenticatedNodeSession` 和 phase transition 后更新，并按 M3.1 的独立持久化契约写入
 `state/node-status.json`。status 持久化或 EventWriter 失败均不回滚已保存的投影，HTTP 返回 5xx 以允许
-at-least-once 重试。daemon 重启时，历史投影保留供 `node status` 查看，但所有 `session_active` 置为 false；
-旧 session 不会被重新打开，trace 继续用 `daemon_restart_gap` 表达该断点。
+at-least-once 重试。daemon 重启时历史投影保留；与 `boot-sessions.json` 中 delivery session 成功匹配并恢复的
+投影保持 `session_active=true`，其余才置为 false。trace 以 `daemon_restart_resumed` 或
+`daemon_restart_gap` 明确区分两种结果。
 
 `boot.config.fetched` 是 M3 新增的 server-origin EventType。有效 bootstrap 不因缺少 TFTP 诊断事件而被
 拒绝：它从当前 DHCP/TFTP phase 转入 `boot_config_fetched`，而 `trace` 负责将缺失的 TFTP phase 显式显示为
@@ -2344,12 +2365,13 @@ M3.1 是对 M2/M2.5/M3.0 单一 `runtime.json` 持久化模型的**补充方案*
 | 域 | 持久化事实源 | 写入策略 | 重启语义 |
 | --- | --- | --- | --- |
 | DHCP lease | `state/leases.json` | 专属 checkpoint worker；有未保存变更时至多每秒一次 | 丢弃已过期 lease 后恢复 |
-| HTTP `node_status` | `state/node-status.json` | HTTP 状态转移后同步、原子保存 | 保留历史投影，并将 `session_active` 置为 false |
+| HTTP `node_status` | `state/node-status.json` | HTTP 状态转移后同步、原子保存 | 保留历史投影；只为成功恢复的 delivery session 保持 active |
 | TFTP transfer | 无 snapshot；`events.jsonl` 为审计 | 不保存 TID、block、打开文件或传输计数 | 不恢复中断传输 |
-| `BootSession` | 无 snapshot；`events.jsonl` 为审计 | 仅进程内 mutex 保护 | 不恢复 session 或 capability |
+| `BootSession` | `state/boot-sessions.json` 保存可恢复 delivery 身份、owned plan/digest 和 capability；`events.jsonl` 为审计 | 状态转移后原子 checkpoint，mode 0600 | 同里程碑 schema 下校验剩余 TTL/node/lease/model/asset 后恢复 HTTP proof 与稳定 plan；不跨 breaking milestone 恢复，也不恢复早期 DHCP/TFTP transfer 或 install arm |
 
-TFTP 必须继续通过已 ACK lease-IP 与 `BootSession` 关联，但该关联在 daemon 重启后失效；不得为了持久化
-计数或传输列表而恢复旧 TFTP session，也不得把 TFTP 纳入 DHCP 或 HTTP 的 checkpoint 锁。
+TFTP 必须继续通过已 ACK lease-IP 与 `BootSession` 关联。daemon 重启会中断原 UDP transfer/TID；恢复的
+delivery session 只能帮助后续新 RRQ 重新建立诊断关联，不得恢复旧 block/重传计数，也不得把 TFTP 纳入 DHCP
+或 HTTP 的 checkpoint 锁。
 
 DHCP 热路径完成任何实际 lease 变更（包括分配、ACK、RELEASE、DECLINE、取消 OFFER、过期回收及恢复）后只递增
 单调 `lease_generation`，不得等待 JSON 序列化、文件写入、`fsync`、rename 或目录同步。checkpoint worker 是
@@ -2371,7 +2393,7 @@ EventWriter
 失败时沿用 at-least-once 语义：已保存的 status 不回滚，响应返回 5xx。重复请求必须保持 status transition
 幂等，并可重试尚未写出的 Event。
 
-两个 snapshot 文件均采用相同的单文件耐久协议：写入唯一临时文件、`fsync` 临时文件、同目录 rename、再
+各 state snapshot 文件均采用相同的单文件耐久协议：写入唯一临时文件、`fsync` 临时文件、同目录 rename、再
 `fsync` 父目录。崩溃或断电后遗留临时文件是允许且预期的，启动时只能在受限 state 目录中识别和清理它们；
 不得承诺 SIGKILL/断电后绝无 `.tmp` 残留。每个文件独立校验 schema、容量和内容边界，坏文件仅拒绝本域
 恢复并记录 err，不得污染另一个域。
@@ -2381,9 +2403,9 @@ EventWriter
 不以删除旧文件作为启动成功条件。
 
 有序停机必须先停止并 drain HTTP，再停止 DHCP/TFTP；随后要求 DHCP checkpoint worker 完成 final flush 并
-退出。协议 worker 已退出后终止活动 `BootSession`、将所有 status 标记 inactive、最终保存
-`node-status.json`，最后才追加 `service.stopped`。这不扩展到 SIGKILL 或进程崩溃；后者由下次启动的
-`daemon_restart_gap` 表达。
+退出。协议 worker 已退出后先 checkpoint 可恢复 delivery sessions；只有不可恢复的早期/过期 BootSession
+终止并将对应 status 标记 inactive。最终保存 `boot-sessions.json`、`node-status.json` 后才追加
+`service.stopped`。SIGKILL/崩溃后下次启动根据最后一次耐久 checkpoint 决定 resumed 或 restart gap。
 
 ### 8.2 代码任务
 
@@ -2407,6 +2429,9 @@ EventWriter
 | `state/events.zig` | 复用 M2.5 唯一 JSONL writer，不新增第二个 append 路径 |
 
 ### 8.3 路由
+
+> **M4.4 覆盖**：下表只记录 M3 当时交付的 URL，供理解历史实现；M4.4 §9.13 直接删除这些 route，不提供迁移
+> alias、redirect 或兼容窗口，M5–M7 不得继续生成本表旧路径。
 
 | 路由 | 方法 | 访问条件 | 输出 |
 | --- | --- | --- | --- |
@@ -2443,8 +2468,9 @@ source/repository。每一段 path 均拒绝空段、`.`、`..`、反斜杠、NU
 下载完整文件后的完整性验证探测。严格按 RFC 7233 应返回 416，但 GRUB 将 416 视为致命错误会中止启动。
 NodeForge 在此边界情况下返回 206 + `Content-Range: bytes */<size>` + `Content-Length: 0` + 空响应体，
 满足 GRUB 验证预期且不违反 RFC 7233 语义。`offset > size` 仍返回 416。静态访问日志只记录路由模板、catalog object name、状态、字节数和耗时，不记录
-repo tail、query、Authorization 或 capability。非 debug 至少记录每个 HTTP 下载请求的对象、Range、请求字节数
-和 client；debug 额外记录精确的 Range chunk queue progress。当前 Zap/facil.io `sendfile` 是异步内核发送，服务端
+repo tail、query、Authorization 或 capability。控制面、boot 大对象和非 repo 下载在非 debug 记录对象、Range、
+请求字节数和 client；M4.3 起 `/repos/**` 成功 GET/HEAD/Range 只在 debug 记录，4xx/5xx 仍为 info/warn。
+debug 额外记录精确的 Range chunk queue progress。当前 Zap/facil.io `sendfile` 是异步内核发送，服务端
 只能诚实记录“已排队”的 chunk，不能把它伪装成对端已接收；客户端若续传会以新的 Range 请求形成下一条可观测进度。
 TFTP 则在每个 ACK 后于 debug 输出约 10% 间隔的已确认字节进度，普通 info 保留 RRQ 和最终结果。
 
@@ -2456,7 +2482,7 @@ size/type 与 snapshot manifest 不符时拒绝传输并标记 asset degraded，
 
 ### 8.4 ISO 自动仓库
 
-`nodeforge install-source import <iso-path>` 接受管理员选择的任意本地常规文件。CLI 将其原子复制到
+`nodeforge assets import <iso-path>` 接受管理员选择的任意本地常规文件。CLI 将其原子复制到
 `/opt/nodeforge/work/import/<random>-<basename>` 后只传递该 basename；daemon 不接受任意绝对路径、symlink
 或 URL。这样本机管理 API 即使被误暴露，也不会以服务用户权限读取任意宿主机文件，同时管理员不再需要先把 ISO
 手工放入固定目录。M3 使用 Linux
@@ -2483,10 +2509,12 @@ CLI 的同步成功/失败语义，发起请求的一个 HTTP worker 等待该 w
    提取 installer kernel/initrd，并计算所有即将发布资产的 SHA256。无论后续成功、失败、SIGTERM 或 worker
    收到的 SIGINT，defer/finally 都必须先 `umount` 再删除挂载点；SIGKILL 或进程崩溃后的残留由下次启动的
    受限 cleanup 扫描处理。卸载失败使导入失败并留下受限诊断目录，绝不发布 catalog。
-3. Rocky/RHEL 系必须校验 `.treeinfo` 和 `repodata/repomd.xml`；Ubuntu 必须校验 installer media，并单独检查
-   `dists/`、`pool/` 与 apt 元数据是否完整。
-4. 构建 publication plan：ISO/installer kernel/initrd asset、一个 `InstallSourceConfig`，以及 Ubuntu
-   始终创建、RHEL 系仅在元数据完整时创建的 `RepositoryConfig`。所有名字先检查冲突，绝不覆盖已发布对象。
+3. RHEL-family 先用 `.treeinfo`/installer layout 识别真实 distro/version/arch，再独立探测
+   `repodata/repomd.xml`；缺少 repodata 不否定媒体身份。Ubuntu 校验 installer media，并单独检查
+   `dists/`、`pool/` 与 APT metadata 是否完整。
+4. 构建 publication plan：ISO/installer kernel/initrd asset、一个 `InstallSourceConfig`、可选 media tree，
+   以及仅在对应包管理器 metadata 可消费时创建的零个或多个 `RepositoryConfig`。所有名字和 SHA 先按
+   M4.3 幂等状态机检查；同内容复用，同名异内容冲突，绝不覆盖已发布对象。
 5. 将完成的目录移动到受管 roots（repo tree 到 `assets/repos/<install-source>/`，TFTP 小启动文件到
    对应 `tftp.asset_root` 路径）。这些文件在 catalog 发布前不被 HTTP/TFTP resolver 暴露。
 6. 以一个 candidate 完整校验 catalog、原子写入 catalog 文件并替换内存 snapshot；只有这一步成功后资源才
@@ -2505,9 +2533,10 @@ CLI 的同步成功/失败语义，发起请求的一个 HTTP worker 等待该 w
 
 跨根目录的文件 rename 不能提供文件系统级单事务，因此“对节点原子”以 catalog publication 为边界：路由永远
 先查当前 snapshot，再打开文件。ISO 中通过元数据校验的仓库是默认基础源，用户可以追加 mirror/额外源。GPG
-检查默认关闭，仅在 repository 明确 `gpg_check = true` 时启用。Ubuntu ISO 导入时始终将
-ISO 内容复制到 `/repos/<source>/` 并创建 `RepositoryConfig` 条目，即使 ISO 不含完整
-APT metadata。默认 `install.apt.fallback=offline-install` 时，隔离 PXE 网段中
+检查默认关闭，仅在 repository 明确 `gpg_check = true` 时启用。Ubuntu ISO 导入时始终发布受管
+media tree，但只有 APT metadata 可消费时才创建 `RepositoryConfig`；不完整 media tree 由 install source 的
+`media_tree_url` 提供给 offline fallback，不冒充 package repository。默认
+`install.apt.fallback=offline-install` 时，隔离 PXE 网段中
 `apt-get update` 失败后 Subiquity 切换到离线安装；配置为 `abort` 时则立即失败，
 用于验证本地 HTTP mirror 的完整性。操作员仍可通过显式配置外部
 `repository.base_url` 来提供完整 APT 源。
@@ -2604,29 +2633,30 @@ event id，超出 M3，不得以猜测 message 相同来去重。同一次 POST 
 nodeforge runtime status
 nodeforge events list --node node-01
 nodeforge events follow --type install.failed
-nodeforge node status node-01
-nodeforge install-source import /srv/iso/Rocky-9.7-aarch64-dvd.iso
-nodeforge install-source import /srv/iso/ubuntu-22.04.5-live-server-arm64.iso --distro ubuntu --version 22.04 --arch aarch64
-nodeforge repository show rocky-9.7-aarch64-iso
+nodeforge node show node-01
+nodeforge assets import /srv/iso/Rocky-9.7-aarch64-dvd.iso
+nodeforge assets import /srv/iso/ubuntu-22.04.5-live-server-arm64.iso --distro ubuntu --version 22.04 --arch aarch64
+nodeforge assets show rocky-9.7-aarch64-iso
 ```
 
-`media import`（CLI 校准后命令名，原 `install-source import`）接受任意可读本地 ISO 路径（绝对或相对当前
+`assets import`（M4.3 canonical 命令，原 `install-source import`）接受任意可读本地 ISO 路径（绝对或相对当前
 目录）。CLI 先验证它是普通文件，原子复制到 `/opt/nodeforge/work/import/<random>-<basename>`，仅把这个受管
 basename 交给本机 daemon；导入请求结束后删除临时 copy，绝不移动或删除原始 ISO。这样既不把任意主机路径授权给
 常驻 daemon，又不把管理员的工作流限制在固定目录。
 
-`--distro`、`--version`、`--arch` 均改为可选的**覆盖**（§9.11.4 F3）：RHEL 系从 `.treeinfo`（family 白名单含
-CentOS/RHEL/AlmaLinux/Fedora 及国产化 openEuler/Kylin/AnolisOS/Sugon OS/BigCloud-Enterprise-Linux 等，全部归一
-`rocky`），Ubuntu/Debian 从 `.disk/info` 检测 tuple；指定 flag 时跳过自动检测直接采用，仍校验文件存在性和支持
-矩阵。未识别 ISO 且未指定 `--distro` 时返回友好错误提示 supported families 与 hint。归一到 `rocky` 的发行版
-catalog 记录原始 family 于 `source_label` 字段供溯源。Rocky `arch` 采用 `aarch64`/`x86_64`，Ubuntu 媒体的
-`arm64`/`amd64` 在导入器中规范化到相同模型值；Ubuntu `22.04.5` 规范化为 profile/catalog 使用的 `22.04`。
+`--distro`、`--version`、`--arch` 均为可选的**覆盖**（§9.12.2）：RHEL family 从 `.treeinfo` 识别
+CentOS/RHEL/AlmaLinux/Fedora 及国产化 openEuler/Kylin/AnolisOS/Sugon OS/BigCloud-Enterprise-Linux 等真实
+`distro/version/arch`，Ubuntu/Debian 从 `.disk/info` 检测 tuple；family 仅用于选择 installer/package-manager
+能力，不改写产品身份。指定 flag 时覆盖自动检测结果，仍校验文件存在性、媒体布局和支持矩阵。未识别 ISO 且未指定
+`--distro` 时返回友好错误提示 supported families 与 hint。`source_label` 只保存媒体显示标签，不承担真实 distro
+的替代字段。RPM 媒体的 `aarch64`/`x86_64` 与 Ubuntu 媒体的 `arm64`/`amd64` 在导入器中规范化到统一架构模型；
+Ubuntu `22.04.5` 规范化为 profile/catalog 使用的 `22.04`。
 
 `asset import --path` 仍刻意是相对于 `tftp.asset_root` 的 catalog 注册路径，而不是“导入任意文件”的 CLI；它不会复制
 数据且 daemon 需要在固定 root 内计算 digest。`config import <path>` 本来就接受任意源 JSON 路径。因此 M3.6 审计后，
-只有 `install-source import` 存在把用户输入误当作固定 staging basename 的问题。
+只有 ISO/media import 路径存在把用户输入误当作固定 staging basename 的问题。
 
-`nodeforge install render` 归 M4，因为只有该阶段拥有发行版 adapter；M3 只提供它所依赖的 `/answer` transport、模板
+`nodeforge node render` 归 M4，因为只有该阶段拥有发行版 adapter；M3 只提供它所依赖的 `/answer` transport、模板
 安全边界和认证上下文。
 
 ### 8.8 并发与 HTTP 实现选择
@@ -2651,8 +2681,9 @@ object revision/ETag，新 publication 只影响后续请求。已发布对象�
 ### 8.9 测试
 
 - `/healthz` 返回 OK。
-- bootstrap proof 只接受 active lease 的直连 peer，node/IP/session 错配、daemon 重启、过期/superseded session
-  均返回 409 且不更新 `node_status`；capability 缺失、错误、泄露到 query 或跨 node 使用均被拒绝。
+- bootstrap proof 只接受 active lease 的直连 peer；node/IP/session 错配、过期/superseded 或恢复校验失败的
+  session 返回 409 且不更新 `node_status`。daemon 重启本身不拒绝已 checkpoint 且验证成功的 delivery capability；
+  capability 缺失、错误、泄露到 query 或跨 node 使用均被拒绝。
 - rootfs 的未认证/跨 profile 请求返回 401/403；images/repos 只可读取 catalog allowlist，目录穿越、symlink、
   不存在 asset 和未发布 staging 文件均不可读。
 - Range 下载返回 206；覆盖 suffix Range、`If-Range` 命中/不命中、无效/多段 Range 的 416、连接中断后的
@@ -2718,7 +2749,7 @@ M3 按以下批次实施，前一批的 contract test 必须通过后才能进�
 4. **M3.3 node API**：实现 boot config、config、answer、events、logs 和 runtime summary，所有 domain event 都走
    M2.5 Writer；此批只交付受控 answer fixture，不实现 M4/M5 adapter。
 5. **M3.4 ISO publication**：实现 staging/import worker、受控只读 loop mount、Rocky/Ubuntu 元数据分支和 catalog
-   多对象原子 publication，再开放 `install-source import`/`repository show`。
+   多对象原子 publication，再开放 canonical `assets import/show`。
 6. **M3.5 integration**：合并 HTTP、ISO、DHCP/TFTP 并发测试；在 `r97n0` 用真实 ISO 与已认领 node 验证所有
    M3 验收项，并把实际命令、hash、并发结果与未覆盖的限制同步到验证记录。
 
@@ -2806,7 +2837,7 @@ M3.6 收敛 M3.5 代码审计发现的六项契约问题：动态 GRUB 错误语
 | ISO CLI 强制 `/opt/nodeforge/work/import/` basename | CLI 现在接受任意本地普通 ISO 路径，临时 stage 到受管目录后向 daemon 仅传 opaque basename，完成后清除临时 copy。既改善 UX，又不把任意 host path 交给常驻特权服务。 |
 | 重复输入 distro/version/arch | 三个 flag 改为可选覆盖（M4.2 §9.11.4 F3 将断言升级为覆盖语义）；RHEL 系以 `.treeinfo` family 白名单，Ubuntu/Debian 以 `.disk/info` 检测并规范化 tuple。指定 flag 时跳过自动检测直接采用。 |
 | Ubuntu install cmdline | `inst.repo` 只供 Anaconda/RHEL；Ubuntu live-server 由 casper 下载 ISO，使用 `root=/dev/ram0 ramdisk_size=1500000 ip=dhcp url=http://<server>:<port>/images/<iso-asset>`。不加入旧式 `boot=casper netboot=url`：Canonical 当前 UEFI netboot 文档（涵盖 20.04+）以 `url=` 作为 live ISO 定位参数；M4 再附加 autoinstall NoCloud 参数。M3 的 `cloud-config-url=/dev/null` 已移除，以免和 NoCloud-Net 同时声明输入；它不是“waiting for cloud-init”的充分证据，必须结合 NoCloud 请求和 cloud-init 日志区分网络、answer YAML 与 datasource 问题。 |
-| HTTP/TFTP 下载日志 | HTTP 的每个请求和 Range 在 info 记录对象、范围、字节数、client；debug 记录已排队的 Range chunk。TFTP info 记录 RRQ/完成/失败，debug 在 ACK 后按 10% 记录确认进度；重传仍为 warn。 |
+| HTTP/TFTP 下载日志 | M3 最初把每个 HTTP 请求和 Range 记为 info；M4.3 将 `/repos/**` 成功 GET/HEAD/Range 服务日志覆盖为 debug，4xx/5xx 仍为 info/warn。TFTP info 记录 RRQ/完成/失败并关联 node，debug 可记录有界进度；重传仍为 warn。 |
 | 管理 API 的权限边界 | `/api/v1/management/` 能写 catalog、触发 loop mount，故虽与 PXE HTTP 共用 listener，仍只接受 direct peer `127.0.0.1`；远端请求 403，不能通过 `X-Forwarded-For` 伪造。CLI 也没有远程 endpoint。 |
 | profile/source/bundle 关联 | config 校验现在要求 install profile 与 `InstallSourceConfig`、diskless profile 与 `BootBundleConfig` 的 distro/version/arch 三元组完全相同；install profile 还必须显式标记 `destructive=true` 与 `persistent_writes=true`。这拒绝“Ubuntu profile 引 Rocky source”或未声明持久写入的配置。 |
 | DHCP 架构一致性 | 已登记节点的 RFC 4578 PXE 架构必须与 node/profile arch 相同；不一致仍可完成 DHCP 诊断 lease，但不下发 GRUB bootfile，防止跨架构 loader 再加载错误内核。 |
@@ -2826,14 +2857,13 @@ ISO 导入从用户路径到发布的完整责任链是：`CLI fstat → atomic 
 3. 通过本机 CLI 导入媒体：
 
    ```bash
-   nodeforge install-source import /srv/iso/Rocky-9.7-aarch64-dvd.iso
-   nodeforge install-source import /srv/iso/ubuntu-22.04.5-live-server-arm64.iso
+   nodeforge assets import /srv/iso/Rocky-9.7-aarch64-dvd.iso
+   nodeforge assets import /srv/iso/ubuntu-22.04.5-live-server-arm64.iso
    ```
 
    Rocky 自动发现 `.treeinfo` 的 `rocky/9.7/aarch64`、提取 `images/pxeboot/*` 并发布 DNF repo；Ubuntu 自动发现
-   `ubuntu/22.04/aarch64`、提取 `casper/*`、校验 squashfs，并发布 ISO URL；Ubuntu 无论 APT metadata
-   是否完整都发布 `/repos/<source>/` 并创建 `RepositoryConfig`，完整性决定 apt 可用性和 fallback 结果，
-   不决定 catalog 是否存在该 repository。
+   `ubuntu/22.04/aarch64`、提取 `casper/*`、校验 squashfs，并发布 ISO URL/media tree；只有 APT metadata
+   可消费时才创建 `RepositoryConfig`，否则 install source 通过 `media_tree_url` 执行 offline fallback。
 4. 停止 daemon，使用 `config import` 写入与已发布 source 三元组完全一致的 install profiles 和 nodes，然后执行
    `config validate -c <config> -C <catalog>` 并重启 daemon。此时管理 API 仍只能从服务机本机访问，PXE 节点只访问
    TFTP、`/images` 和 `/repos`。
@@ -2848,6 +2878,10 @@ ISO 导入从用户路径到发布的完整责任链是：`CLI fstat → atomic 
 Ubuntu 参数判断以 Canonical 的 [UEFI PXE netboot 指引](https://documentation.ubuntu.com/server/how-to/installation/netboot-the-server-installer-via-uefi-pxe-on-arm-aarch64-arm64-and-x86-64-amd64/index.html) 和更新的 [amd64 netboot 指引](https://documentation.ubuntu.com/server/how-to/installation/how-to-netboot-the-server-installer-on-amd64/) 为准；两者都描述 initrd 从 `url=` 下载并挂载 live ISO。该结论是文档核验后的实现选择，不以 ISO 文件名或过时博客示例猜测。
 
 ## 9. M4：PXE 无人值守自动安装与基础后处理
+
+> **URL 阅读规则**：§9.1–§9.12 中 `/answer`、`/repos`、`/subiquity-report` 等 URL 是各阶段当时的实现名，
+> 用于保留问题根因和历史验收。M4.4 §9.13 直接覆盖为 canonical 节点交付/制品/管理路由；不实现旧 session/
+> URL 兼容，后续实现和文档不得复制旧路径。
 
 ### 9.1 目标
 
@@ -2933,9 +2967,9 @@ Ubuntu PXE 回归用例保留，不能仅以“能下载 kernel/initrd”判定�
 4. **离线 APT**：Ubuntu 的 `packages` 在 `late-commands` 前由 Subiquity/curtin 安装。若 answer
    未设置 `autoinstall.apt.mirror-selection.primary`，安装器会默认访问 `archive.ubuntu.com`。PXE 隔离网段通常没有
    NAT/DNS，表现为 `Mirror/cmd-apt-config` 后长期无新输出。NodeForge 的修复策略：
-   - **Ubuntu ISO 导入时始终发布 repo 内容**：即使 ISO 不含完整 APT metadata（`dists/pool/Release`），
-     也始终将 ISO 内容复制到 `/repos/<source>/` 并创建 `RepositoryConfig` 条目。这使得
-     `apt.mirror-selection.primary` 始终有一个本地 URL 可用。
+   - **Ubuntu ISO 导入时始终发布受管 media tree**：即使 ISO 不含完整 APT metadata
+     （`dists/pool/Release`），install source 仍提供本地 `media_tree_url`；只有 metadata 可消费时才创建
+     `RepositoryConfig`。这使 offline fallback 有本地媒体，同时不把不完整目录宣称成可用 APT repository。
    - **user-data 中始终渲染 `apt` 段**：只在 `mirror-selection.primary` 中列出 NodeForge
      发布的 `/repos/<source>/` URL，关闭 geoip，并从 profile 的 `install.apt.fallback` 渲染失败策略。
      Jammy ARM64 不能使用
@@ -3089,10 +3123,10 @@ failed
 ### 9.7 CLI 命令
 
 ```bash
-nodeforge install render node-01
-nodeforge install status node-01
-nodeforge install logs node-01
-nodeforge install retry node-01
+nodeforge node render node-01
+nodeforge node show node-01
+nodeforge node logs node-01
+nodeforge node retry node-01
 ```
 
 ### 9.8 测试
@@ -3659,7 +3693,8 @@ M0-M4 历史能力在 M4.1 的补丁归属：
   PXE 进入 wait、显式 retry rearm、重复 retry 幂等、活动 session 409 和高风险 `reinstall_policy=always`。
 - 修改 network/users/packages/password/storage 后 desired/applied drift 分类正确但不自动 arm；offline validate
   不读取 runtime。preview hash 与实际 hash 可不同，normalized plan digest 相同；同一活动 session answer 字节稳定。
-- DHCP T1/T2、lease 过期后 bootstrap 拒绝但既有 capability 在 TTL 内有效、daemon 重启 token 失效，以及
+- DHCP T1/T2、lease 过期后 bootstrap 拒绝但既有 capability 在 TTL 内有效、daemon 重启后合法 delivery
+  token 从 mode 0600 checkpoint 恢复且过期/错绑 token 失效，以及
   TFTP option/TID、UTC 回拨 trace gap、asset 丢失、ISO ENOSPC/orphan cleanup 全部作为横切回归门槛。
 
 实机/QEMU 验收：
@@ -3720,16 +3755,25 @@ NodeDeploymentControl {
   consumed_generation,
   requested_at,
   requested_by,
-  config_revision
+  config_revision,
+  // M4.3 per-generation 生命周期时间戳，见 §9.12.4 / 专项设计 §5.2
+  started_at,
+  finished_at,
+  deployed_at
 }
 ```
+
+`started_at`/`finished_at`/`deployed_at` 随 generation 走：`rearm` 武装新 generation 时必须清零，
+`consume` 写 `started_at`、`markTerminal` 写 `finished_at`（及成功时的 `deployed_at`），本 generation
+内仅首次写入以保持幂等。这样部署完成后再次 `install retry` 会清零旧时间并随新 generation 重新记录，
+状态机随之推进，而非停留在上一 generation 的时间。
 
 - install profile 首次绑定且没有 control 记录时视为 generation 1 已 armed；只有当前
   `install_generation > consumed_generation` 才可由 boot resolver 下发 installer target。
 - generation 在收到已认证 `install.started`、即进入可能擦盘的阶段时标记 consumed；仅 DHCP/TFTP/answer
   获取失败不会消耗意图。`node_status` 继续是不可倒退的观察投影，retry 绝不把 completed/failed 历史改写为
   `dhcp_discover`。
-- `nodeforge install retry <node>` 只允许 install profile 且当前无活动 install session。它在没有 pending
+- `nodeforge node retry <node>` 只允许 install profile 且当前无活动 install session。它在没有 pending
   generation 时递增并持久化 generation，写一次 `install.retry.requested`；重复调用看到 pending generation
   时返回同一个 generation，因而具有操作幂等性。命令不重启/BMC 唤醒节点，也不伪称安装已经开始。
 - 默认 `reinstall_policy=explicit`：已 consumed 且没有新 generation 的节点再次 PXE 时进入受控 wait/
@@ -3740,7 +3784,7 @@ NodeDeploymentControl {
   renewal/retransmit 或同一 BootSession 的重复 RRQ 不得创建。不得增加可长期遗忘的
   `node.overrides.force_reinstall=true`，临时重装统一使用 retry/rearm 操作。
 - 活动 session 期间 retry 返回 409 `install.session_active`；M4.1 不提供
-  `nodeforge install retry <node> --force`，也不赋予任何 install 命令“强制终止正在运行安装器”的语义。
+  `nodeforge node retry <node> --force`，也不赋予任何 node retry 命令“强制终止正在运行安装器”的语义。
   终止/BMC 控制与有预算自动重试留给 M7。
 - deployment-control 先原子持久化 generation，再追加 `install.retry.requested`；持久化失败时命令失败且不能
   只写 event/只改内存。boot resolver 使用持久 snapshot，daemon 重启后 pending/consumed 语义保持不变。
@@ -3786,8 +3830,9 @@ DHCP lease 和 BootSession delivery TTL 是两种生命周期，不能相互冒�
 - answer/boot config 首次 bootstrap 成功后签发 capability；随后 event/rootfs 等请求使用 token，在 delivery
   TTL 内独立于 DHCP lease 是否续租。每次成功的合法请求按单调时钟续期，过期/superseded 返回
   `409 session_inactive`。
-- capability 只在当前 daemon 内存中存在；daemon 重启后不能恢复。M4.1 late/error commands 只使用当前
-  installer session 的 header token。重启造成的上报缺口由 trace 明确显示，不伪造 completed。
+- M4.1 最初规定 capability 只在当前 daemon 内存中存在；M4.3 覆盖为：active delivery session 可将 token
+  持久化到 mode 0600 checkpoint，并在 TTL、node/lease/config 校验成功后跨 daemon 重启恢复；token 不进入普通查询、日志或事件。
+  无法恢复的上报缺口由 trace 明确显示，不伪造 completed；恢复也不重新 arm install generation。
 - 本地盘 firstboot 的普通 DHCP 不能自动等价为可信 PXE/installer session。M7 若需要跨重启上报，必须设计
   单独的一次性 enrollment/attestation，而不是依赖“新 lease 自动拿 token”。
 
@@ -3946,6 +3991,10 @@ hostname 从未设置，导致安装后主机名为 `localhost`。
 
 #### 9.11.4 F3：ISO 导入支持主流 OS + 覆盖语义
 
+> **M4.3 修订**：本小节记录 M4.2 当时的实现目标，其中“RHEL 系全部归一为 distro=rocky”、
+> “repository 是导入成功前置条件”和无内容级重复导入语义均已被实机验证否定。M4.3 §9.12.2
+> 以 `family` 选择 adapter、以真实 `distro` 标识产品，并允许 repository 为空；新实现以 M4.3 为准。
+
 RHEL 系 `.treeinfo` `family` 前缀白名单扩展为
 `Rocky|CentOS|CentOS Stream|RedHatEnterpriseServer|RedHatEnterpriseLinux|AlmaLinux|Fedora|OracleLinux|ScientificLinux|CloudLinux|EuroLinux`，
 加国产化 `openEuler|Kylin|Kylin Linux Advanced Server|TencentOS|TencentOS-Server|AnolisOS|UnionTech OS Server|UOS Server|npserver|TurboLinux|Sugon OS|BigCloud-Enterprise-Linux`，
@@ -3957,18 +4006,17 @@ Ubuntu 沿用 `.disk/info`；Debian 新增检测，归一 `ubuntu`。
 
 #### 9.11.5 F4：TFTP 性能优化
 
+> **M4.3 修订**：本节早期采用的“主动建议未请求 blksize”和“放大客户端请求值”不符合 RFC 2347/2348，
+> 已由 §9.12.5 覆盖。保留 windowsize、并发和 max_blksize 上限；性能优化不得突破 option 协商边界。
+
 - **windowsize (RFC 7440)**：`negotiate` 识别 `windowsize` option 回 OACK；DATA 循环改为发 `windowsize` 块
   后才等一个 ACK。处理 block number 回绕。
 - **per-client 并发**：dispatcher 收到 RRQ 后 spawn 独立线程处理，主循环立即回接。上限
   `max_concurrent_transfers`，超限时返回错误让客户端退避。
-- **配置项**：`TftpConfig` 新增 `windowsize`（默认 4）、`max_concurrent_transfers`（默认 4）。
-  除 §7.4 外服务端不在 OACK 中添加客户端未请求的 option；§7.4 blksize 升级策略：
-  (1) 客户端发送了至少一个已识别 option 但省略 `blksize` 时，主动建议 `max_blksize`（默认 1468，
-  将默认 512 升级，吞吐约 3 倍）；(2) 客户端发送的 `blksize` 小于 `max_blksize` 时（如 GRUB 发送 1024），
-  服务端在 OACK 中返回 `max_blksize`（1468）而非客户端请求值。RFC 2347 §1 规定客户端 SHOULD 接受
-  服务端返回的值；GRUB 2.06 兼容此行为，吞吐从 2.5→3.7 MB/s（+48%）。客户端请求更大块时 clamp 到
-  `max_blksize` 避免 UDP 分片。`max_blksize` 可通过 `tftp.max_blksize` 配置（默认 1468）。
-  `windowsize` 不主动建议，未请求时保持 stop-and-wait。
+- **配置项**：`TftpConfig` 已有 `windowsize`（默认 4）、`max_concurrent_transfers`（默认 4）和
+  `max_blksize`（默认 1468）。`max_blksize` 只作为上限，合法范围 8..65464；客户端请求值只能保持或
+  向下限制。所有 option 只在客户端明确请求时进入 OACK。RFC 2349 timeout option 已实现并原值回显，
+  未请求时使用内部 5 秒默认值；没有实测调优需求前不新增公开 `timeout_seconds` 配置。
 - **HTTP 加速（`node.http_accel`，实验性，默认 `false`）**：GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，
   即使服务端配置 `windowsize=4` 也回退到 stop-and-wait（~2 MB/s）。节点级 `http_accel`
   属性使 GRUB 配置中的 initrd 路径渲染为
@@ -4043,7 +4091,7 @@ nodeforge <resource> <action> [object] [options]
   catalog    目录资源（catalog.json 只读查看/校验/导出）
   runtime    运行态资源（DHCP leases/TFTP sessions/服务运行状态）
   events     审计资源（事件历史查询/跟踪/类型）
-  profile    策略资源（安装/无盘/发现 profile 管理，M6）
+  profile    策略资源（M4.3 只读发现，M6 写管理）
   provision  供应资源（provisioning bundle/step/run 管理，M7）
 ```
 
@@ -4052,7 +4100,8 @@ nodeforge <resource> <action> [object] [options]
    `config`）；`install`/`trace` 不再是顶层（归入 `node` 的 action）。
 2. action 名**语意化**：`add`/`set`/`remove`/`list`/`show` 是 CRUD；`import`/`validate`/`render`/`retry`
    是资源特有操作。单资源运行态查询只有一个 action 时省略 `list`（如 `runtime dhcp-leases`）。
-3. `deploy` 是 `node set` 的一个 flag（`node set <id> --deploy false`），不是独立命令。
+3. M4.2 曾把 `deploy` 设计成 `node set` flag；M4.3 统一为 typed 属性
+   `node set <id> deploy=false`，不是独立命令，新增字段也不再增加专用 flag。
 4. 构建产物（rootfs/initrd/boot-bundle）归入 `assets`（它们是导入/构建的资产），不独立顶层。
 5. 后续里程碑新增命令必须遵循同一 resource-action canonical form。
 
@@ -4060,10 +4109,11 @@ nodeforge <resource> <action> [object] [options]
 
 ```
 ═══ node（节点资源）═══
-  list                  列出所有已注册节点                        [M4.2 迁移]
-  show <id>             查看节点声明属性                           [M4.2 新增]
-  add <id>              添加节点（--mac --arch --profile --ip...） [M4.2 新增]
-  set <id>              修改节点属性（--deploy --ip --mac...）     [M4.2 新增]
+  list                  列出节点聚合状态/SN/部署时间               [M4.3 完整化]
+  show <id>             查看声明/profile/status/inventory          [M4.3 完整化]
+  add <id> k=v...       添加节点（typed、原子）                    [M4.3 修订]
+  set <id> k=v...       修改节点属性（typed、原子）                [M4.3 修订]
+  unset <id> key...     清除可选节点属性                           [M4.3 新增]
   remove <id>           移除节点                                   [M4.2 新增]
   render <id>           预览渲染后的安装 answer                    [M4 迁移]
   retry <id>            重新 arm 下一次 PXE 安装 generation        [M4 迁移]
@@ -4094,15 +4144,17 @@ nodeforge <resource> <action> [object] [options]
   validate              校验配置和 catalog 引用关系                 [M0 已有]
   export                导出规范化配置 JSON                         [M0 已有]
   import <path>         离线导入配置（全量替换）                    [M0 已有]
+  set k=v...            allowlist 在线配置更新                      [M4.3 新增]
   # M6 新增:
   diff                  对比两个配置快照，分类展示影响              [M6]
   apply                 在线应用配置变更                            [M6]
 
-═══ catalog（目录资源，只读）═══
+═══ catalog（目录资源）═══
   validate              校验 catalog 对象和 config 引用关系         [M0 已有]
   export                导出 catalog JSON                          [M0 已有]
-  # M6 新增:
-  show <name>           展开 install-source/repo/asset 关系链       [M6]
+  show <name>           展开 install-source/repo/asset 关系链       [M4.3 新增，只读]
+  migrate --dry-run     生成旧 catalog 迁移计划和摘要               [M4.3 新增]
+  migrate --apply --plan-digest <sha256>                            [M4.3 新增]
 
 ═══ runtime（运行态资源）═══
   status                服务运行态概要                              [M4.2 新增]
@@ -4116,8 +4168,10 @@ nodeforge <resource> <action> [object] [options]
   follow                实时跟踪新事件                              [M2.5 已有]
   types                 列出注册的事件类型                          [M2.5 已有]
 
-═══ profile（策略资源，M6）═══
-  add/list/show/update/remove/validate                             [M6]
+═══ profile（策略资源）═══
+  list                  列出 PXE tuple/引用数/校验状态              [M4.3]
+  show <name>           展开策略/capability/source/effective system [M4.3]
+  add/update/remove/validate                                      [M6]
 
 ═══ provision（供应资源，M7）═══
   bundle-list/show/create/validate/publish/plan                    [M7]
@@ -4142,7 +4196,8 @@ nodeforge <resource> <action> [object] [options]
 | `config/catalog/events` | 不变 | 各自资源 |
 | `status/check` | 不变 | 融合入口 |
 
-旧路径保留 deprecated alias 一个版本周期（zli `deprecated`+`replaced_by`），执行时输出 warning。
+M4.2 曾保留 deprecated alias 一个版本周期（zli `deprecated`+`replaced_by`）并输出 warning；该兼容窗口在
+M4.3 结束，旧路径从 help 和命令树删除并返回 unknown command。后续实现只能使用上表新命令。
 `buildCli` 拆分为按资源的 `register*Commands` 函数。
 
 ##### 后续里程碑 CLI 声明
@@ -4152,7 +4207,10 @@ resource-action canonical form：
 
 - **M5** 新增 `assets rootfs-package`/`initrd-build`/`boot-bundle-publish` 和 `node diskless-status`/`diskless-retry`/
   `diskless-overlay`。`diskless-retry` 受 `deploy=false` 限制（见 §9.10.11/§9.11.2 F2）。
-- **M6** 新增 `profile add/list/show/update/remove/validate`、`config diff/apply`、`catalog show`、
+- **M4.3** 提前只读 `profile list/show`、`catalog show <install-source>` 和可审计的
+  `catalog migrate --dry-run/--apply`，用于发现当前 PXE 策略并检查/修复既有安装源；它不开放 profile/catalog 写 CRUD。
+- **M6** 在 M4.3 只读视图上新增 `profile add/update/remove/validate`、`config diff/apply`、
+  profile/distro/repository 写 CRUD、
   `node render --format pxelinux`（BIOS PXELINUX 预览）。`deploy=false` 节点的 PXELINUX 配置不生成安装条目（§11.4）。
 - **M7** 新增 `provision bundle-list/show/create/validate/publish/plan`、`provision step-add/remove`、
   `provision run-show/status`。`provision plan --node` 对 `deploy=false` 节点标注 deploy-disabled（§12.9）。
@@ -4195,14 +4253,14 @@ resource-action canonical form：
 
 1. Kickstart `%onerror` 触发时 -> `/logs` 收到 `install.anaconda_error` + summary（含 Anaconda traceback 截断）。
 2. Ubuntu `reporting` 块 -> Subiquity 进度事件到达，`install.partitioning`/`packages` 等阶段可见。
-3. `node set <id> --deploy false` -> 节点 DHCP lease 存在但无 PXE bootfile，事件 `boot.deploy_disabled`；
-   generation gate 被绕过。`node set <id> --deploy true` 恢复。
+3. `node set <id> deploy=false` -> 节点 DHCP lease 存在但无 PXE bootfile，事件 `boot.deploy_disabled`；
+   generation gate 被绕过。`node set <id> deploy=true` 恢复。
 4. openEuler/Kylin/CentOS/RHEL/Sugon OS ISO -> `assets import` 成功，catalog distro=rocky，source_label 记原始 family。
 5. `assets import --distro rocky --version 9.7 --arch aarch64` -> 跳过自动检测。
 6. TFTP windowsize=4 -> QEMU PXE 吞吐显著优于 windowsize=1（但 GRUB 不协商 windowsize，仍为 stop-and-wait）。
 6a. `node.http_accel=true`（默认）-> GRUB 配置含 `(http,server:port)/boot/<path>` URL；
     `GET /boot/<path>` 返回 200 + catalog asset 的 SHA-256 ETag；
-    `node set <id> --http-accel false` -> GRUB 配置回退为 TFTP `/<path>`。
+    `node set <id> http_accel=false` -> GRUB 配置回退为 TFTP `/<path>`。
 6b. 106 MB initrd via HTTP < 5s（千兆网），via TFTP ~52s（stop-and-wait）。
 7. `assets key-import` + `assets key-reload` -> `node render` 含新公钥；`assets key-show` 显示来源与 fingerprint。
 8. `node add node-01 --mac 02:aa:bb:cc:dd:ef --arch aarch64 --profile rocky-install` -> config.json 原子写回，
@@ -4275,6 +4333,9 @@ M4.2 将安装目录校准为资源化布局，每个目录对应一个 CLI 顶�
 
 #### 9.11.10 节点资源变更与 config reload
 
+> **M4.3 修订**：本节的 CLI 直写文件 + daemon 有序重启仅是 M4.2 过渡实现。它会中断协议服务并清空
+> BootSession，M4.3 §9.12.6 改为 daemon-owned ConfigRuntime 和在线 node CRUD。
+
 `node add/set/remove` 由本机 CLI 执行 load-modify-validate-save，复用 `config_store.save` 的
 tmp+fsync+rename 原子写回。写回后调用 localhost-only 的 `POST /api/v1/management/config/reload`；daemon
 重新解析和校验磁盘配置，响应成功后完成有序 shutdown，由 systemd `Restart=always` 拉起并加载新快照。
@@ -4292,6 +4353,358 @@ M4.2 不获得绕过 M4.1 TargetSystemConfig 的权限。`profile.system` 仍是
 多值数组 + state 目录扫描。kickstart/autoinstall 渲染仍消费 normalized plan，adapter 不读 `/root/.ssh`
 或 state 文件。post-install 命令的异常容忍语义保持现状，不在 M4.2 范围内。
 
+### 9.12 M4.3：安装源与节点模型收口、运行态热更新和可观测性完善
+
+#### 9.12.1 阶段定位与范围
+
+M4.3 是 M4.2 实机验证后的基础契约修订，必须在 M5 前完成。它不新增第三种 installer adapter，也不提前实现
+M5 的小 initrd、M6 的完整支持矩阵或 M7 的常驻 agent；它负责确保这些阶段将要复用的发行版身份、目录、
+节点视图、配置快照、传输事件和 session 生命周期是正确且可恢复的。它只提前已实现 PXE 部署所需的
+只读 `profile list/show`、install-source `catalog show` 和旧数据迁移入口，不借机扩张后续里程碑的写 CLI 面。
+
+完整设计、代码证据、迁移细节和逐条反馈映射见：
+`docs/superpowers/specs/2026-07-15-m4_3-model-runtime-observability-design.md`。
+
+M4.3 分成 10 个可单独测试、统一验收的工作包：
+
+| 编号 | 工作包 | 核心结果 |
+| --- | --- | --- |
+| M4.3-01 | 安装介质身份与幂等导入 | `family` 选 adapter、真实 `distro` 作为产品身份、repository 可空、SHA 重复导入幂等；canonical logical id；只读 catalog 展开和 config/catalog/目录联合事务迁移 |
+| M4.3-02 | 安装目录现状验收与文档收口 | 主体已在 M4.2 实现；补冲突边界测试、清理旧路径引用，M5 不带兼容分支 |
+| M4.3-03 | 节点/profile 聚合视图与 SN | 持久化 inventory/facts、部署时间；node list/show 聚合事实；profile list/show 展开 PXE 策略、引用和 source |
+| M4.3-04 | CLI 去兼容层与属性语法 | 删除 deprecated aliases；node add/set/unset 使用 typed `k=v` |
+| M4.3-05 | TFTP 参数与 RFC | timeout option 已实现且不新增配置；补 max_blksize 上限校验，OACK 不增加未请求 option、不放大 blksize |
+| M4.3-06 | 可观测性与下载归属 | 具体 node event/gate 日志；repo 成功日志降 debug；TFTP/HTTP 传输带 node_id；`install_not_armed` 事件携带 `armed_generation`/`terminal_generation`/`requested_revision`/`desired_revision`/`next_action` 并输出 warn 级服务日志；`http.request` 审计事件增加 `traffic_class=repository\|boot\|image\|rootfs\|api` |
+| M4.3-07 | Ubuntu webhook 认证 | webhook 固定使用 direct peer + 活动 lease 的专用 bootstrap proof；相关 header 来源单独诊断，不改变 proof 模式 |
+| M4.3-08 | ConfigRuntime/ModelRuntime | daemon 是 config/catalog 唯一 writer；不可变 snapshot pair pinning；node CRUD 在线生效；结构字段返回 restart-required |
+| M4.3-09 | BootSession resume | `boot-sessions.json` 以 mode 0600 持久化身份、immutable install plan/digest、route contract 和 capability，重启恢复回调，不重新 arm install/TFTP transfer |
+| M4.3-10 | 构建溯源 | `-v/--version` 输出 SemVer、构建时间、git commit 和 clean/dirty |
+
+#### 9.12.1.1 与其他里程碑的冲突裁决
+
+M4.3 是总设计的现行契约，不是可与历史实现任选其一的方案。冲突按下表处理；历史规格和实测记录保留当时
+事实，但必须标注 superseded，M5–M7 只能继承右列边界：
+
+| 冲突 | 裁决与迁移边界 |
+| --- | --- |
+| M3/M4.2 把 RHEL-family 归一为 Rocky、把 repo 当媒体身份 | family 只选 adapter，distro 保留真实产品；repo 可空。旧 catalog 仅按可验证元数据 dry-run 迁移，歧义 fail closed |
+| M3/M4.2 重复导入报错 | 改为 SHA-256 + logical name 幂等；同名不同内容仍冲突，不原地覆盖 |
+| M2 `node list` 仅显示配置、M7 另有 status | M4.3 先提供完整节点聚合 DTO；M7 只追加 provision/reconciliation 子视图，不复制节点事实模型 |
+| profile CLI 全部留到 M6 | M4.3 提前只读 `profile list/show` 发现和诊断当前 PXE 策略；M6 仅增加 add/update/remove/validate 和引用迁移 |
+| M4.2 CLI 直写配置并 reload、M6 才计划 snapshot apply | M4.3 交付唯一 `ConfigRuntime`；M6 在同一 revision/事务模型上扩展全配置 diff/apply，不得另建 snapshot 或退回重启式 node CRUD |
+| M4.2 per-field flags 与 deprecated alias | M4.3 完成兼容窗口并删除 alias，node 使用 typed `k=v`/`unset`；历史命令只用于读旧记录 |
+| M4.2 把 `catalog show` 留到 M6、迁移无明确入口 | M4.3 提前 install-source 只读 show 和带 plan digest 的迁移 plan/apply；M6 仍负责完整 profile/distro/repository CRUD |
+| M2.5/M3 每个 HTTP 成功请求为 info | `/repos/**` 成功包流量改为 debug，错误仍为 info/warn；下载业务事件继续保留 |
+| M2.5.1/M3 规定 daemon 重启必使 token 失效 | M4.3 只恢复已签发 capability 的 active delivery session；不恢复 UDP transfer、早期 bootstrap 或 install arm |
+| M4.2 已完成资源目录迁移 | M4.3 只补边界测试和清理文档；M5–M7 不再实现或引用第二套路径 |
+| M0 只写 `nodeforge -v` | M4.3 覆盖为两个二进制共同输出构建溯源，仍只用顶层参数 |
+
+完整逐项矩阵及 schema/测试处理见 M4.3 专项设计 §13。
+
+#### 9.12.2 family、distro、repository 和重复导入
+
+`DistroConfig.family` 表达 installer/package-manager 能力家族；`DistroConfig.name` 和 catalog 的 `distro`
+必须表达真实发行版。Kylin、CentOS、Rocky、RHEL、Alma 等可以共享 `.rhel` + kickstart/dnf，但不得共享
+`distro=rocky` 或 `rocky-*` 目录。
+
+ISO 检测先解析媒体布局和 family/distro/version/arch，再探测 repository。`.treeinfo` 没有 `repository`、
+且没有可直接发布的 `repodata/repomd.xml` 时，仍发布 ISO/kernel/initrd/install source，repositories 为空；
+安装 preflight 再判断该 source 是否满足执行条件。repository manager 来自匹配的
+`DistroVersionConfig.package_manager`，不能通过字符串比较推导。
+
+这条规则必须覆盖 importer 之外的所有运行时分派：HTTP answer/render、profile preflight、repository manager、
+boot target 和 CLI 展示都从 `DistroConfig.family` 与 `DistroVersionConfig.install_adapter/package_manager` 取值。
+除集中媒体标签映射表和 fixture 外，不允许用 `distro == "rocky"`/`"ubuntu"` 决定 adapter 或包管理器。
+
+ISO SHA-256 已存在且对象完整时重复导入幂等返回；同 logical name、不同 SHA 返回 409；同 tuple、不同 name
+允许并存。发布对象不原地替换。M4.2 已误归一的 catalog 只能依据 `source_label` 做可审计 dry-run 迁移，
+歧义时停止，不能从文件名猜测。
+
+logical name 是持久 ID、URL segment 和目录名，统一使用 1..128 字节小写 ASCII：首尾为字母/数字，中间仅允许
+`[a-z0-9._-]`。禁止 Unicode、空白、斜杠、反斜杠、percent、NUL、`.`/`..`；router percent-decode 一次后复用同一
+validator。自动名称由 distro/version/arch/media-kind 做稳定 slug，显式 `name=` 必须已经 canonical，不静默改写。
+原始大小写与产品名称保存在 `source_label/display_name`，不参与路径、唯一性或 digest。
+旧 noncanonical ID 只允许以 migration-input 模式加载，不能新建引用或发布；可唯一 slug 的对象进入联合 rename plan，
+collision/外部 URL/活动 session 引用 fail closed。M4.3 验收前必须清零，不把兼容读取带入 M4.4 router。
+
+`InstallSourceConfig.media_tree_url` 以可选 `null` 字段向后兼容加载。旧 Ubuntu source 若把不完整 media tree
+登记成 repository，迁移 dry-run 先验证 APT metadata 和受管目录归属；metadata 不可消费但媒体树有效时，candidate
+移除伪 repo 引用并设置 media URL。profile/URL/目录归属有歧义时不写回。`node-inventory.json` 和
+`boot-sessions.json` 使用独立 schema；文件不存在表示空状态，不从事件猜造当前事实。
+
+M4.3 提供 `catalog show <install-source>`、`catalog migrate --dry-run` 和
+`catalog migrate --apply --plan-digest <sha256>`，CLI 只调用 canonical management API，不直接读写 JSON。show 展开
+distro/family/media tree/repositories/assets SHA/profile 反向引用；dry-run 不写入并输出 config/catalog revision、全部
+profile patch、文件动作、歧义和 canonical plan digest。
+
+install-source rename 跨 `config.json`、`catalog.json` 和目录，必须由唯一 `ModelTransactionCoordinator` 提交。
+锁序固定为 `model gate -> ConfigRuntime writer -> CatalogRuntime writer`；copy/hash 在锁外 staging，锁内复核两个
+revision、文件摘要、目标不存在、活动 session 引用并准备全部分配。随后 fsync
+`state/model-transactions/<digest>.json`，按 `prepared -> files_ready -> catalog_committed -> config_committed -> complete`
+记录可重放 rename 和 old/new 摘要；两个文件落盘后才一次发布 config/catalog immutable snapshot pair。启动在绑定
+listener 前恢复 journal：未公开事务回滚，任一 JSON 已提交则验证后向前完成，无法证明 all-old/all-new 时 fail closed。
+聚合读取通过 `ModelRuntime.acquire()` 同时 pin pair；普通单侧 mutation 也经过同一 gate，M6 必须复用该机制。
+
+M4.3 新 catalog/import CLI 直接使用 M4.4 canonical management URL。migration apply 和 ISO import 返回 202
+Operation，通过 `/api/v1/management/operations/:id` 查询，并按 M4.4 v1 DTO/Idempotency-Key 契约实现，避免 M4.4
+二次迁移新接口。0600 `state/operations.json` 持久化 operation 与 key/request digest 映射；terminal 至少保留 24 小时。
+restart 后 import staging 校验/清理并标 interrupted，已进入 model journal 的 migration 则按恢复结果重建 terminal
+operation；不能因进程重启忘记已完成副作用后重复执行同一 key。
+
+#### 9.12.3 目录冻结、CLI 和节点属性
+
+`assets/iso|boot|repos|keys|rootfs|initrd|bundles` 与 `state/provisioned` 已在 M4.2 代码中成为唯一布局；
+`packaging/install-layout.sh` 已实现旧目录迁移、config/catalog 改写、双边数据冲突拒绝和重复执行幂等。
+M4.3 不重新设计目录，只补双边数据/非目录/symlink 边界测试，清理后续章节的旧路径引用，并把通过迁移测试
+作为 M5 入口条件。M5 只消费 `paths.zig` 常量。
+
+删除所有仅输出 `Deprecated: use ...` 的命令，包括旧 `tftp`、`dhcp`、`trace` 和 runtime 嵌套路径。
+canonical CLI 只保留 `node/assets/config/catalog/runtime/events/profile` 等资源模型。
+
+> **实现状态（2026-07-16）**：deprecated alias 函数（`deprecatedAliasCommand`、`deprecatedDhcpCommand`、
+> `deprecatedTftpCommand`、`deprecatedRuntimeLeasesCommand`、`deprecatedRuntimeUnknownCommand`）已从
+> `main.zig` 删除。旧命令不再出现在 `--help` 输出中，输入旧命令返回标准 unknown-command 错误。
+
+node mutation 使用 positional `key=value` 和显式 `node unset <id> key...`。CLI 将其编码成 typed patch 发送给 daemon；
+daemon 以 `NodeConfig` schema 解析 bool/enum/IP/MAC/嵌套 overrides，未知 key 或类型错误使整个 mutation 失败。
+CLI 不再为每个新属性增加一个专用 flag。
+
+M4.3 的 CLI 完成范围冻结为：完整 node list/show 和 daemon-owned mutation、只读 profile list/show、allowlist
+`config set`、带 logical name/SHA 结果的 assets import、install-source catalog show/migrate、补齐 node 归属的
+runtime tftp-sessions，以及两个二进制的版本溯源。rootfs/initrd/boot-bundle/diskless 留 M5；全量 config diff/apply、
+profile 写操作、distro/repository CRUD 和 PXELINUX 留 M6；provision/reconcile 留 M7。不得提前增加远程 TLS/agent
+或批量编排。
+
+#### 9.12.4 完整 node list/show 与 SN 事实
+
+新增持久化 `node-inventory.json` 和 capability-authenticated `/api/v1/nodes/:id/facts`。installer/discovery 环境
+上报经过清洗的 product serial、UUID、vendor/model 和来源 session；当前没有常驻 agent，因此 inventory 是最近一次观测。
+
+`reported_at` 使用服务端接收时间，不信任 payload 时钟。inventory 同时记录 deployment generation、boot_session_id、
+session 创建序号和 facts digest；更高 generation 胜出，同 generation 只接受当前未 superseded session，同 session
+后到值覆盖。旧 generation/session 的迟到请求返回 `inventory.stale_source` 且不覆盖；相同 digest 重试幂等且不刷新时间。
+
+部署控制增加 requested/started/finished/deployed 时间：`deployed_at` 只在成功 completed 时更新，失败不覆盖。
+started/finished/deployed 是 per-generation 生命周期时间戳：`rearm` 武装新 generation 时必须清零这三个字段
+（`requested_at` 同步更新），使部署完成后再次 `install retry` 能反映新 generation 的进度，而不是残留旧值；
+`consume`/`markTerminal` 在本 generation 内保持“仅首次写入”幂等，rearm 的 `rollbackRearm` 原样恢复这三个时间戳。
+管理 API 提供所有节点列表和单节点聚合投影。config/catalog 来自同一个 ModelSnapshotPair；status/deployment/inventory
+在各自锁内复制并携带独立 revision，响应返回完整 `view_revision` vector，不把多 store 顺序读取伪装成单一事务。
+`node list` 至少显示 ID/MAC/IP/profile/status/started_at/finished_at/SN（部署开始/结束时间窗口；
+成功的 deployed_at 与 finished_at 重合，作为详情留给 `node show`，但 API JSON 同时返回三个时间字段）；
+`node show` 显示完整 NodeConfig、profile/effective system、status、generation/revision/drift 和 inventory，secret 默认脱敏。
+所有 CLI human 输出时间统一渲染为 RFC 3339 UTC 可视化时间，不再直接打印裸 epoch 整数，未发生显示 `-`。
+
+同一 snapshot/revision 还提供 `GET /api/v1/management/profiles` 和 `/profiles/:name`。`profile list` 至少显示
+name/mode/distro/version/arch/install-source/node 引用数/validation；`profile show` 展开全部非 secret ProfileConfig、
+版本 adapter/package-manager capability、install source/media tree/repositories/kernel/initrd、effective system、
+safety/reinstall policy、引用节点与 preflight 摘要。M4.3 不实现 profile mutation；M6 复用同一 DTO 增加写操作。
+
+#### 9.12.5 TFTP、HTTP 与日志事件
+
+`TftpConfig` 保持 `max_blksize`、`windowsize`、`max_concurrent_transfers` 三个运行参数；RFC 2349 timeout
+option 当前已经实现，客户端请求时原值回显，未请求时使用内部固定 5 秒默认值。没有实测调优依据前不新增
+`timeout_seconds` 公开配置。`max_blksize` 校验补齐 8..65464 上限。客户端请求 blksize 时只允许
+`min(requested, configured_max)`，客户端未请求时不主动放入 OACK。
+
+TFTP 事件当前已经存在，kernel/initrd 下载属于 `tftp.rrq/transfer.complete/transfer.error`。M4.3 将 node_id
+加入成功关联的 TFTP/HTTP 传输，无法唯一关联时写稳定 link state，使 `events list --node` 不再漏掉传输事件。
+
+`POST /events` 在认证和解析成功后记录安全的 node/stage/reason 摘要；`install_not_armed` 首次进入 gate 时
+记录 generation/revision 和下一步操作，状态不变时去重。`/repos/**` 成功包下载服务日志降为 debug，4xx/5xx
+和控制面/boot 大对象仍在正常等级。
+
+#### 9.12.6 ConfigRuntime 与在线变更
+
+`RouteContext.config` 改为 `*ConfigRuntime`，并由 `ModelRuntime` 协调不可变 ConfigSnapshot/CatalogSnapshot pair。
+每次读取 acquire 引用计数 snapshot，释放锁后可安全执行 I/O，结束后 release；不得借用 replace 后可能释放的
+slice，也不得无限保留旧 arena。涉及 profile/source 的请求 pin pair；生命周期
+跨越 replace 的 BootSession、持久 store、事件队列和异步 DTO 必须拥有 node_id/profile/MAC/IP 等深拷贝数据。
+BootSession 记录 model revision 与 profile/install-source digest，但不能为了最长两小时 session pin 整个 snapshot。
+spawn worker 必须持 snapshot 引用至结束或复制完整 owned DTO，不能只带借用 slice。
+
+install generation 通过 gate 时，从同一 pair 编译 owned `InstallPlanSnapshot`：node hostname/network、profile、
+family/distro/version/arch/adapter、effective system/users/packages/storage、install source/repository/media tree 和全部
+boot/install asset logical id + SHA。BootConfig/Kickstart/NoCloud 在该 session 内只读取这份 plan；hostname/overrides
+等 desired 变更立即发布但只标 `plan_drift`、影响下一 session，不改变当前 answer。删除 node、修改 MAC/profile/arch/IP
+或迁移当前 plan 的 source/asset 返回 409。plan 以 canonical JSON 计算 digest并随 0600 session checkpoint 持久化，
+不含 capability 明文或 private key；password 等本来由 config 明文持有且回答必需的输入仍按 secret 处理。跨重启派生
+值使用 session-owned stable scope，不能依赖 daemon_instance_id。
+
+node POST/PATCH/DELETE 在 daemon 内构造完全 owned candidate，依次完成全量校验、diff 分类、tmp+fsync+rename、
+发布新 revision 和审计事件。并发变更用 revision/ETag 防 lost update。node 和 discovery policy 在线生效；server
+bind/port、DHCP pool、asset root、TFTP 参数等返回 `config.restart_required`。活动 install session 的 MAC/profile/
+arch/IP 和 node 删除被拒绝；`deploy=false` 只阻止新 PXE，不杀死已进入安装器的 session。
+活动 session 的身份判断使用 session 自有副本；replace 后不得读取悬空值或静默切换 profile。
+
+M4.3 的 `config set <typed k=v...>` 只接受明确 allowlist 的 runtime-applicable path（首批为 discovery policy、
+logging level 和 events rotation），并复用同一 revision、全量校验、原子写盘和 snapshot publish 事务；结构字段
+直接返回 `config.restart_required`，不“先写盘再假装在线生效”。完整文件的 secret-aware `config diff/apply`、
+profile/distro/repository 影响分析仍归 M6，但必须扩展这一机制，不能实现第二条写路径。
+
+#### 9.12.7 Ubuntu webhook 和 session resume
+
+`/subiquity-report` 使用 path node + direct peer IP + 活动 install session/lease 的专用 bootstrap proof；不能因为
+请求带有与该路由无关的 Authorization 就切换到 NodeForge bearer 分支。合法无 header 和无关 header 请求都需通过，
+错误 peer、过期 session 必须 fail closed。当前日志只证明服务端看到了相关 header，不能在缺少安全诊断字段时
+断言它一定由 Curtin OAuth 产生。
+
+新增 mode 0600 的 `boot-sessions.json`，保存活动 session 身份、phase、UTC 时间、captured model revision、owned
+install plan/digest 和 capability token，checkpoint 必须为 mode 0600。M4.3 同版本重启按剩余 TTL、
+node/lease/config 身份和 immutable asset SHA 恢复，重新建立单调时钟 deadline；desired hostname/overrides drift 不阻止
+使用旧 plan，asset 缺失/变化则 fail closed。恢复后继续使用同一 token。恢复仅授权 HTTP capability、原 plan 和
+后续传输关联；已中断 TFTP UDP transfer/TID 必须重建，绝不创建或恢复 `armed_generation`。
+session/store 的字符串和嵌套值均由其自身 allocator 拥有，新建、恢复和 checkpoint 共用深拷贝 helper，不借用
+ConfigSnapshot arena。
+
+#### 9.12.8 构建信息
+
+`build.zig` 生成 CLI/daemon 共享 build-options。版本输出包含 SemVer、git commit、clean/dirty 和 UTC build time；
+build time 优先使用 `SOURCE_DATE_EPOCH`，无 git 环境接受显式 `-Dgit-commit/-Dbuild-time`，不得注入用户、hostname、
+绝对路径或 remote URL。
+
+#### 9.12.9 验收门槛
+
+1. Kylin `.treeinfo` 无 repository 仍识别 `distro=kylin` 并导入核心资产；CentOS/Rocky 同版本并存且目录不串名。
+2. 同 SHA 重复导入幂等；同名不同 SHA 返回稳定冲突；不同 logical name 可并存。
+3. 已有资源化目录迁移通过成功/幂等及新增边界测试，M5–M7 现行设计不再引用旧路径。
+4. `node list` 显示 status/started_at/finished_at/SN（RFC 3339 可视化时间）；`node show` 展开完整非 secret 参数、profile、状态、generation 和 inventory；部署完成后 `install retry` 使 deployment 时间随新 generation 清零并重新记录。
+5. deprecated CLI 全部删除；typed `k=v` 支持一次原子修改多个 node 属性，unknown/wrong type 不落盘。
+6. node CRUD 不重启 daemon；server/port 等结构字段明确返回 restart-required。
+7. TFTP 三个公开运行参数均生效；timeout 请求原值回显、缺省使用内部 5 秒；未请求 option 不出现在 OACK。
+8. node 事件日志显示 stage/reason，gate 日志给出阻止原因和 next action，repo 包成功日志只在 debug。
+9. `events list --node` 同时出现 DHCP、TFTP kernel/initrd、HTTP 和 installer 事件；下载日志能显示节点或明确无法关联。
+10. Ubuntu webhook 不再因无自定义 header 或无关 Authorization 返回 MissingProof；错误 peer仍被拒绝，header 来源有安全诊断。
+11. 安装过程中重启 daemon 后，旧 capability 能继续提交 event/log，status 恢复 active，但 install generation 未被重新 arm。
+12. 两个二进制的 `-v` 输出一致的版本、build time、commit 和 clean/dirty；可复现时间注入测试通过。
+13. `catalog show` 展开完整 install-source 关系；migration dry-run 无写入，apply 同时校验 config/catalog revision、
+    profile patch、plan digest 和文件变化；journal crash injection 后只能恢复 all-old/all-new。
+14. 运行时 adapter/package-manager/boot 路由不存在产品字符串分派，集中映射表之外的静态审计和回归测试通过。
+15. config/catalog replace/session/worker 并发测试无 UAF、torn snapshot pair、状态串扰或旧 snapshot 无界滞留；
+    活动 session 的身份/asset mutation 被拒绝，hostname/overrides 只形成 drift，同 session answer 内容保持不变。
+16. CLI/HTTP shell tests 不再调用 deprecated alias，版本断言适配 provenance，重启测试区分 resumed 和真实 restart gap。
+17. 在 M4.3 最终代码上重新完成 Rocky 9.7、Ubuntu 22.04 的 PXE 全安装至可登录；Ubuntu 安装中重启 daemon 后旧
+    callback 恢复并完成，且不自动 rearm。M4/M4.1 历史成功不能替代本轮系统回归。
+18. `profile list` 能发现所有 PXE profile、引用数和校验状态；`profile show` 完整展开 capability/source/assets/
+    effective system 且 secret 脱敏；help 中不存在 M4.3 尚未实现的 profile 写 action。
+19. importer/API/router 共用 logical id grammar；大小写、Unicode、encoded slash、dot segment、超长 ID 和 slug collision
+    在落盘前被稳定拒绝，display label 不参与路径或 digest。
+20. 旧 generation/session 的 facts 不覆盖新 inventory，重复 digest 不刷新时间；聚合 DTO 返回完整 revision vector。
+21. M4.3 session checkpoint 带 owned plan/digest；M4.3 同版本 restart 后 answer 稳定，asset mismatch fail closed，
+    TFTP UDP transfer 不被错误宣称为已恢复；M4.4 breaking cutover 不恢复 M4.3 active session。
+
+### 9.13 M4.4：HTTP API URL 契约收口与路由平面分离
+
+#### 9.13.1 阶段定位
+
+M4.4 是 M4.3 后、M5 前的 URL/路由补丁。M4.3 先交付正确的数据模型、ModelRuntime、profile/node/catalog 管理
+视图和 resumable session；M4.4 再把代码、CLI、生成器、fixture 和文档一次性替换为后续 rootfs、PXELINUX 和
+provision 都会消费的当前 HTTP 契约。
+完整设计见 `docs/superpowers/specs/2026-07-15-m4_4-http-api-url-contract-design.md`。
+
+路由分为三个互不重载的平面：
+
+| 平面 | 前缀 | 核心边界 |
+| --- | --- | --- |
+| 节点交付 API | `/api/v1/nodes/:id/**` | bootstrap/capability 必须与 path node 一致；Subiquity 是显式 bootstrap exception |
+| 本机管理 API | `/api/v1/management/**` | direct peer 固定 `127.0.0.1`，CLI/daemon 同版本 |
+| 静态制品 | `/artifacts/**` | catalog allowlist + immutable SHA/manifest，不与 `/boot` API 混用 |
+
+`/healthz` 保持无版本健康探针。静态制品不放 `/api/v1`，因为其版本由 logical name、SHA-256、ETag 和发布不可变性
+表达。当前仍是内部开发阶段，`/api/v1` 只是 canonical 组织前缀，不承诺兼容历史实现。专项设计列出的
+route/method、auth/cache、status/error、DTO 和 golden fixture 是 M4.4 当前实现/验收基线；后续开发期修改时同步更新
+设计、server、CLI 和 fixture，不保留双版本或为了内部历史新增 `/api/v2`。
+
+#### 9.13.2 Canonical 节点与制品 URL
+
+```text
+GET  /api/v1/nodes/:id/boot-config
+GET  /api/v1/nodes/:id/install-config/kickstart
+GET  /api/v1/nodes/:id/install-config/nocloud/{user-data,meta-data,vendor-data}
+POST /api/v1/nodes/:id/events
+POST /api/v1/nodes/:id/logs
+POST /api/v1/nodes/:id/installer-hooks/subiquity
+POST /api/v1/nodes/:id/facts
+GET  /api/v1/nodes/:id/artifacts/rootfs/:name                  [M5]
+
+GET/HEAD /artifacts/boot/*
+GET/HEAD /artifacts/images/:name
+GET/HEAD /artifacts/repositories/:name/*
+```
+
+NoCloud 依赖固定 leaf，不能用 Accept header 把 kickstart/user-data/meta-data 混成单一 `/answer`。BootConfig 返回
+typed `install_config.kind + url/seed_url`。含 token/hash 的 boot/install-config 响应统一 `Cache-Control: no-store,
+private`、`Pragma: no-cache`、`nosniff`、`no-referrer`；token 不进入 URL/query/access log。rootfs 同时校验 path node、
+capability node 和 profile/source，不再使用 Any capability。
+
+#### 9.13.3 Canonical management URL
+
+M4.3 新管理能力直接使用稳定 collection：`/management/nodes[/id]`、`/profiles[/name]`、
+`/install-sources[/name]`、`/catalog/migration-plans|migrations` 和 `PATCH /management/config`。M4.4 同步归一历史路径：
+
+- server/config 摘要归 `/management/status`、`/management/config`；candidate validate 创建
+  `/management/config/validations`，reload 路径删除；
+- install retry 改为 `POST /management/nodes/:id/install-generations`；
+- TFTP/DHCP 归 `/management/runtime/tftp[/sessions]` 和 `/management/runtime/dhcp/leases?scope=...`；
+- asset/install-source import 改为 POST `/management/assets`、`/management/install-sources`。
+
+动作不是靠任意裸动词后缀表达，而是创建 validation、generation、migration plan/migration 等可审计资源。
+
+v1 JSON 使用 `application/json; charset=utf-8`。collection 固定为 `items + next_cursor + view_revision`，支持
+`limit=1..200` 与 opaque cursor；聚合 DTO 的 view_revision 至少包含 config/catalog，runtime store 带自己的 revision。
+错误固定为 `error { code, message, details?, request_id }`，并统一映射 400/401/403/404/405/409/413/415/422/428/
+429/500；405 带 Allow，details 不含 secret。node/config PATCH/DELETE 必须 If-Match，缺失 428、过期 409，成功返回
+新 desired-model ETag；runtime/inventory revision 留在 no-store body 的 view_revision，不把 model ETag 当聚合缓存键。
+Node/Profile/InstallSource/Generation/Validation/MigrationPlan/Operation 以 golden JSON fixture 固化当前实现字段；
+开发期修改必须同步更新所有消费者，不保留旧 DTO。
+
+POST nodes/generation/validation/migration-plan 分别返回 201 和 Location（或已存在幂等结果）；DELETE node 返回 204。
+ISO/asset import 与 catalog migration 是长任务，返回 202 Operation + Location，并由
+`GET /api/v1/management/operations/:id` 查询。Operation 固定 id/kind/state/timestamps/progress/result/error，terminal
+时 result/error 二选一。CLI 对 generation/migration/import 等有副作用 action POST 生成必需的 Idempotency-Key；
+缺失为 400，同 key+同请求返回原资源，不同请求为 409，ISO
+最终幂等仍由 M4.3 SHA/logical-id 状态机决定。M4.4 复用 M4.3 持久 operations/key registry；restart 后 running
+import 形成稳定 interrupted failure，journal migration 按恢复结果重建 terminal operation，不能退回 memory-only registry。
+
+专项设计 §5.3 的 DTO 表是 implementation contract：NodeSummary 固定身份/profile/status/started_at/finished_at/deployed_at/SN/drift，
+NodeDetail 固定 node/profile/effective_system/deployment/runtime/inventory/view_revision 六类事实，ProfileDetail 固定
+capability/source/repositories/assets/effective-system/safety/references/validation，InstallSourceDetail 固定真实
+family/distro/version/arch/media/repositories/assets/SHA/profile refs。Generation、Validation、MigrationPlan、Operation
+也有稳定字段和 golden fixture；secret 只输出 configured/source/fingerprint 投影。
+
+HTTP node/config mutation 使用 JSON `set` object + `unset` path array，CLI 才负责把 `k=v` 编码为 typed JSON；unknown、
+父子冲突、set/unset 重复或 wrong type 全部无副作用。generation、validation、migration plan/apply、asset/import 的
+请求体和本地 path 安全边界按专项设计 §5.3 固定，body 未声明字段拒绝，不能把本地 ISO path 回显到日志或 operation。
+
+#### 9.13.4 一次性替换和 router
+
+RouteSpec、所有 URL generator、CLI client、preview、示例和 fixture 在同一变更中切到 canonical。旧 management、
+`/boot/config`、`/answer`、`/subiquity-report`、`/boot|images|repos` route 全部不注册，从第一版 M4.4 二进制起直接
+404；不实现 redirect、alias、deprecated warning、旧路由版本字段、兼容截止时间或 route-migration store。
+
+M4.4 不支持跨 M4.3→M4.4 续接正在进行的安装。切换前停止新安装、确认 session 为空并显式删除开发环境旧
+`boot-sessions.json`。由于 owned plan 的 URL 集合已变化，M4.4 提升 session schema version，loader 只实现当前
+schema；残留旧文件以 `state.schema_incompatible` 拒绝启动，不包含
+M4.3 session 识别、终止或迁移代码，也不自动 rearm generation。M4.4 新 session 的 owned plan 只包含 canonical
+URL；之后 M4.4 同版本 daemon restart 仍正常恢复。
+
+实现使用集中 RouteSpec registry，声明 method/template/plane/auth/cache/log/handler，并在测试/启动检查模板重叠、
+wildcard 吞路由、node auth、management loopback 和 sensitive cache policy。不能继续靠 `startsWith` 分支顺序维护路由。
+
+#### 9.13.5 验收门槛
+
+1. `/boot/config`、`/answer`、`/boot|images|repos` 和历史 management URL 从首次 M4.4 启动即 404；无 redirect/alias。
+2. Rocky/Ubuntu 只得到各自 canonical install-config；错误 leaf 404，method mismatch 405 + Allow。
+3. 敏感响应 no-store 且日志无 token/header/body；Subiquity 仍使用 M4.3 专用 bootstrap proof。
+4. rootfs node/capability/profile 三重绑定；artifact allowlist、Range/HEAD/ETag、path/symlink 安全回归通过。
+5. M4.3 profile/node/catalog/config/install-generation CLI 在 canonical management URL 上保持行为不变。
+6. M4.4 切换前清空 M4.3 session/checkpoint；残留旧 schema 拒绝启动且不 rearm。M4.4 新 session 只生成 canonical URL并支持同版本 restart。
+7. RouteSpec 冲突/auth/cache/log contract tests、CLI/HTTP integration、Rocky 9.7、Ubuntu 22.04 和 restart-resume
+   实机回归通过，M5–M7 现行章节不再引用旧 URL。
+8. code/RouteSpec/generator/CLI/example/fixture/M5–M7 当前章节对旧 URL 和兼容路由元数据零引用。
+9. golden fixtures 和契约测试覆盖 collection/error/operation、201/202/204、Location、ETag/If-Match、cursor/limit、
+   Idempotency-Key 与 status/error 映射；开发期变更必须同步更新设计、server、CLI 和 fixture。
+
 ## 10. M5：内存无盘启动与基础后处理
 
 ### 10.1 目标
@@ -4300,12 +4713,13 @@ M4.2 不获得绕过 M4.1 TargetSystemConfig 的权限。`profile.system` 仍是
 timezone、keyboard、离线策略、SSH/root、普通用户、额外包与节点网络以”公共 rootfs + 节点 overlay”方式
 落地。M5 不在启动时创建通用账号或安装包，账号骨架和软件依赖必须在 rootfs build 阶段解决。
 
-M5 继承 M4.2 的以下能力：`NodeConfig.deploy` 开关对 diskless 模式同样生效（`deploy=false` 时无盘节点不发
+M5 继承 M4.2/M4.3/M4.4 的以下能力：`NodeConfig.deploy` 开关对 diskless 模式同样生效（`deploy=false` 时无盘节点不发
 PXE bootfile，见 §9.10.11/§9.11.2 F2）；`NodeConfig.http_accel` 对 diskless 模式的 kernel/initrd
 同样生效（默认通过 HTTP 下载，见 §9.11.5 F4 / §5.2.1）；bootstrap admin key 多值数组与 `assets/keys/*.pub` 目录扫描
 （§9.11.6 F5），BootConfig 中的 `root_authorized_keys` 可含多个 bootstrap key；CLI canonical form
 （§9.11.7 F6），M5 新增的 `diskless`/`rootfs`/`initrd`/`boot-bundle` 命令须遵循 resource-action 模型；
-boot-gate 事件状态转换去重（§9.11.7.1 F9），M5 diskless boot-gate 事件须复用同一 `BootGateSuppressor` 模式。
+boot-gate 事件状态转换去重（§9.11.7.1 F9），M5 diskless boot-gate 事件须复用同一 `BootGateSuppressor` 模式；
+HTTP 只生成 M4.4 `/artifacts/boot/**` 与 `/api/v1/nodes/:id/artifacts/rootfs/:name`，不实现任何旧 URL alias。
 
 ### 10.2 代码任务
 
@@ -4612,7 +5026,7 @@ retry，只有 attempt 已终态失败后才需要操作员重新 arm。
 
 完善 MVP 周边兼容性和诊断能力。
 
-### 11.2 M4.1/M4.2 基线继承
+### 11.2 M4.1/M4.2/M4.3/M4.4 基线继承
 
 M6 只扩展架构、发行版版本和 bootloader，不得为新 adapter 建立第二套目标系统默认值。新增的 x86_64、
 Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 的归一化 TargetSystemConfig，并满足：
@@ -4634,17 +5048,20 @@ Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 �
   Ubuntu 22.04/24.04 fixture 不得因为 latest reference 已更新就接受未随该 install source 交付的字段。
 - 每个新 adapter/version fixture 必须覆盖默认配置和至少一组显式覆盖；不满足 M4.1 公共验收的版本不能
   标记为支持。
-- M6 的"RHEL 系 kickstart 版本能力表"消费 M4.2 §9.11.4 F3 已交付的 family 白名单归一（CentOS/RHEL/Alma/
-  Fedora 及国产化 openEuler/Kylin/AnolisOS/Sugon OS/BigCloud-Enterprise-Linux 等全部归一 `rocky`）；
-  各变体的原始 family 已记入 `InstallSourceConfig.source_label`，M6 版本能力表按 `source_label` 区分但不
-  改变归一 distro。
+- M6 的"RHEL 系 kickstart 版本能力表"消费 M4.3 §9.12.2 的 family/distro 分层：CentOS、RHEL、Alma、
+  Fedora 及国产化 openEuler/Kylin/AnolisOS/Sugon OS/BigCloud-Enterprise-Linux 可共享 RHEL-family adapter，
+  但 catalog/profile/目录必须保留真实 distro；`source_label` 只用于媒体显示，不再承担产品身份。
 - M6 的"安装错误分类"（§11.5）已含 M4.2 F1 新增的 `install.anaconda_error`/`install.subiquity_error`；
-  M6 压测固化 TFTP/HTTP 性能参数时使用 M4.2 §9.11.5 F4 已引入的 `TftpConfig` 字段（`windowsize`/
-  `max_concurrent_transfers`）和 `HttpConfig.max_connections`。节点级 `node.http_accel`（实验性，默认 `false`）
+  M6 压测固化 TFTP/HTTP 性能参数时使用 M4.3 §9.12.5 收口的 `TftpConfig` 字段（`max_blksize`/
+  `windowsize`/`max_concurrent_transfers`）和 `HttpConfig.max_connections`；只有实测证明内部 5 秒默认值
+  需要按部署调整时，才另行提议 timeout 配置。节点级
+  `node.http_accel`（实验性，默认 `false`）
   仅对 GRUB UEFI 链路生效；BIOS PXELINUX 固定使用 `pxelinux.0`（只支持 TFTP），`http_accel` 无效，
   kernel/initrd 始终走 TFTP。详见 §5.2.1。
 - M6 新增的 CLI 命令（如 `boot render --format pxelinux`）须遵循 M4.2 §9.11.7 F6 的 resource-action
-  canonical form。
+  canonical form，并复用 M4.3 typed patch/ConfigRuntime；不得恢复已删除的 deprecated alias 或 CLI 直写文件。
+- M6 的 PXELINUX、后续 NoCloud 和 profile/distro/repository API 只使用 M4.4 三平面 canonical URL/RouteSpec；
+  不得恢复 `/boot/config`、`/answer`、`/repos` 或用 redirect 维持旧生成器。
 
 ### 11.3 任务
 
@@ -4687,7 +5104,7 @@ ONTIMEOUT nodeforge
 
 LABEL nodeforge
   KERNEL install/rocky/9.7/x86_64/vmlinuz
-  APPEND initrd=install/rocky/9.7/x86_64/initrd.img inst.ks=http://192.168.50.1:8080/api/v1/nodes/node-01/answer inst.repo=http://192.168.50.1:8080/repos/rocky-9.7-x86_64-dvd/
+  APPEND initrd=install/rocky/9.7/x86_64/initrd.img inst.ks=http://192.168.50.1:8080/api/v1/nodes/node-01/install-config/kickstart inst.repo=http://192.168.50.1:8080/artifacts/repositories/rocky-9.7-x86_64-dvd/
 ```
 
 默认 `wait` 示例：
@@ -4752,15 +5169,17 @@ M6 不因某 reason 自动执行 install retry；M7 的自动策略仍受 §12.9
 把此前路线图中未落地的 `config diff/apply` 收敛到 M6 运维增强，而不新增无编号阶段：
 
 - `config diff` 对两个完整快照做纯只读、secret-aware 的结构 diff，并按 restart-required、runtime-applicable、
-  redeploy-required、M7-reconcile 四类展示影响；password 只显示 changed，不打印旧值/新值。M4.2 新增字段的
-  diff 分类：M4.2 当前实现中 `NodeConfig.deploy` 和 `ServerConfig.ssh_authorized_public_keys` 都通过有序重启
-  加载；M6 若交付带快照回收协议的 `config apply`，可再将其提升为 runtime-applicable。公钥 diff 只显示
-  fingerprint 而非完整 key blob；`TftpConfig` 各字段属 restart-required；
+  redeploy-required、M7-reconcile 四类展示影响；password 只显示 changed，不打印旧值/新值。M6 直接复用
+  M4.3 已交付的 `ConfigRuntime`、revision/ETag、snapshot pinning 和原子持久化协议：`NodeConfig.deploy`、node CRUD
+  和 discovery policy 已是 runtime-applicable，不得重新分类为“需有序重启”；server bootstrap SSH key 是否可
+  在线替换须在 M6 明确实现 runtime reconfigure，否则保持 restart-required。公钥 diff 只显示 fingerprint
+  而非完整 key blob；`TftpConfig` 各字段属 restart-required；
   `HttpConfig.max_connections` 属 restart-required；`InstallSourceConfig.source_label` 属 catalog 导入产物
   不经 `config apply`。
-- `config apply` 先构造 candidate、完整校验和引用检查，再原子写盘/替换内存 snapshot 并写
-  `config.updated`。server bind/subnet/root path 等结构字段只落盘并返回 restart-required；DHCP discovery policy
-  和已明确支持的 catalog/runtime policy 才在线切换。
+- `config apply` 是 M4.3 mutation 事务的全文件/复杂对象扩展：先构造 candidate、完整校验和引用检查，再按同一
+  revision 原子写盘/替换内存 snapshot 并写 `config.updated`，不得创建第二个 config store。server bind/subnet/
+  root path 等结构字段只有显式 `--accept-restart-required` 才可落盘并返回待重启字段；未显式接受时整个 apply
+  无副作用。DHCP discovery policy 和已明确支持的 catalog/runtime policy 在线切换。
 - apply 不自动 arm install generation、不清除 failure、不重启节点。对 completed 节点调用 §9.10.12 的
   desired/applied drift 分类；需要重装的变更由操作员另行执行 `install retry`。
 - 多节点并发渲染只读取 immutable config/catalog snapshot；每个 request 的 node/session/hasher/plan 独立，
@@ -4775,12 +5194,14 @@ M6 不因某 reason 自动执行 install retry；M7 的自动策略仍受 §12.9
 
 M4/M5 已交付 repository、standard-packages、managed-file 和统一 runner。本阶段补齐 archive、script、firstboot、CLI plan/status 和三条链路的完整回归。这里的“配置可视化”是指 CLI 按阶段、步骤和执行结果清晰组织输出，不引入 Web UI 或通用低代码配置系统。
 
-M7 不获得绕过 M4.1/M4.2/M5 目标系统策略的权限。`profile.system` 与 `node.overrides.network` 是 locale、
+M7 不获得绕过 M4.1/M4.2/M4.3/M4.4/M5 目标系统策略的权限。`profile.system` 与 `node.overrides.network` 是 locale、
 timezone、keyboard、连接策略、SSH/root、普通用户/password/sudo/key、目标系统额外包、防火墙、SELinux
 和目标网络的权威事实源；bundle 只能补充业务内容。M7 继承 M4.2 的以下约束：bootstrap admin key 多值
 合并去重规则（§9.10.6.2 / §9.11.6 F5）不变，finalizer 须对多 bootstrap key 重新断言归属；`NodeConfig.deploy`
 开关（§9.11.2 F2）使 `deploy=false` 节点不参与 auto-rearm/auto-retry；`install.anaconda_error`/
 `install.subiquity_error`（§11.5）的 retryability 遵循错误分类表，M7 auto-retry allowlist 消费该分类。
+M7 的 agent/finalizer 还必须复用 M4.3 的真实 distro、ConfigRuntime revision、node inventory 聚合视图和
+BootSession resume 语义，不得创建第二套 node facts/session store。
 
 ### 12.2 增强范围
 
@@ -4842,7 +5263,7 @@ stdout/stderr 仅保留最后 2048 bytes 的转义摘要；秘密环境变量、
 
 只支持两类补充包：
 
-- 标准包：RPM/DEB 不作为孤立文件逐个安装。它们必须进入额外 yum/dnf/apt repository，通过标准包名和包管理器安装；repository 由 HTTP `/repos/` 提供。
+- 标准包：RPM/DEB 不作为孤立文件逐个安装。它们必须进入额外 yum/dnf/apt repository，通过标准包名和包管理器安装；repository 由 HTTP `/artifacts/repositories/` 提供。
 - 非标准包：只支持 `tar.bz2`，manifest 必须包含 SHA256、解压目录和可选 `install.sh`。不在 MVP 增加 wheel、容器镜像或任意压缩格式的专用模型。
 
 `install.sh` 约定：以 bundle 解压目录为工作目录，参数固定为 `install --root <target-root>`，退出码 0 成功；必须可重复执行，禁止隐式下载未声明内容。
@@ -4866,7 +5287,7 @@ diskless_boot
 4. 下载并校验 `tar.bz2`，解压并执行其安装脚本。
 5. 原子写入 `files`，用于 `/etc/hosts`、chrony/systemd-timesyncd、resolver 和业务配置。
 6. 按声明顺序执行自定义 scripts/patch。
-7. 写入 `/opt/nodeforge/provisioned/<bundle>-<version>.json` 并上报结果。
+7. 写入 `/opt/nodeforge/state/provisioned/<bundle>-<version>.json` 并上报结果。
 8. 执行 TargetSystem finalizer，校验并固化 profile 的账号、SSH、网络、连接和安全策略。
 
 同一个 bundle 可用于：
@@ -4928,6 +5349,8 @@ nodeforge provision status node-01
 ```
 
 CLI 的 `bundle list/show/plan` 和 `status` 默认使用分组表格，`--output json` 返回同一模型。
+它们复用 M4.3 `node show` 的 node/profile/status/inventory 基础 DTO，只追加 bundle step、run 和 reconciliation
+字段；不得把完整节点视图推迟到 M7，也不得维护第二份 SN、部署时间或 node status 投影。
 
 验收必须覆盖强类型步骤校验、确定性顺序、清晰的分组输出、plan 无副作用、RPM/DEB 额外源安装、tar.bz2 安装、hosts/时间同步配置更新、自定义脚本成功与回滚提示、每个 step 的注册 Event v2 与 stdout/stderr 有界脱敏摘要，以及 kickstart、autoinstall、diskless overlay 三条链路。
 
@@ -4945,7 +5368,8 @@ M7 承接 §9.10.12 中“desired 已变化但目标系统尚未同步”的节�
 - storage/partition/bootloader/install source 以及无盘 rootfs build-time users/packages 不在线 reconcile：前者
   需要新 install generation，后者需要新 rootfs/boot bundle。generic script 仍不能覆盖 protected domain。
 - firstboot/agent 使用单独的一次性 enrollment 或已建立节点凭据换取短期 capability；不能把任意新 DHCP lease
-  当认证，也不能复用已因 daemon/节点重启失效的 installer token。
+  当认证，也不能复用 installer token。M4.3 允许 installer delivery capability 跨 daemon 重启恢复，只是为了
+  完成当前安装器回调；这不把它升级为 firstboot/agent 凭据。节点重启、session 终态/过期或身份校验失败仍使其失效。
 
 自动重试分三层：
 
@@ -4978,16 +5402,20 @@ generation 更外层的硬开关，`provision plan --node` 对 `deploy=false` �
 | 可观测性契约 | root module logFn 接线、M0 生命周期关闭、日志/事件轮转、v1/v2 reader、节点 DTO、脱敏和事件注册表 |
 | 回归测试 | 关键事件、错误分类、CLI 输出 |
 
-M4.2 回归项（§9.11.8 验收标准的测试归属）：
+M4.2/M4.3/M4.4 累积回归项（后续阶段覆盖前序过渡契约）：
 
 | 领域 | 回归内容 |
 | --- | --- |
-| F1 错误上报 | `/logs` 接收 `install.anaconda_error`/`install.subiquity_error` + summary 持久化；`/subiquity-report` 映射 Subiquity 事件到 `install.*` 阶段；kickstart `%onerror` 含 traceback 截断 |
+| F1 错误上报 | `/logs` 接收 `install.anaconda_error`/`install.subiquity_error` + summary 持久化；canonical `/installer-hooks/subiquity` 映射 Subiquity 事件到 `install.*` 阶段；kickstart `%onerror` 含 traceback 截断 |
 | F2 deploy 开关 | `deploy=false` 节点 DHCP lease 存在但无 PXE bootfile（DHCP/TFTP fixture）；`boot.deploy_disabled` 事件；generation gate 被绕过；install/diskless/discovery 全模式 |
-| F3 ISO 导入 | openEuler/Kylin/CentOS/RHEL/Sugon OS/BigCloud-Enterprise-Linux ISO 导入归一 rocky + `source_label`；Debian 检测；`--distro` 覆盖跳过自动检测；未识别 ISO 友好错误 |
-| F4 TFTP 性能 | windowsize=16 vs windowsize=1 QEMU PXE 吞吐对比；块序号回绕；`max_concurrent_transfers` 上限排队 |
+| F3/M4.3-01 ISO 导入 | openEuler/Kylin/CentOS/RHEL/Sugon OS/BigCloud-Enterprise-Linux 保留真实 distro、共享 family adapter；无 repository 媒体可识别；SHA 重复导入幂等；catalog show/migration plan/apply；全局无产品字符串路由；Debian 检测；显式覆盖和未识别错误 |
+| F4/M4.3-05 TFTP | windowsize=16 vs windowsize=1 QEMU PXE 吞吐对比；块序号回绕；并发上限；三个公开参数生效；timeout 协商回归；OACK 不增加未请求 option、不放大 blksize |
 | F5 多公钥 | 多公钥去重；`assets/keys/*.pub` 目录扫描；`media key import` 复制+校验；`media key reload` 刷新 context；`media key show` 显示来源+fingerprint |
-| F6 CLI 校准 | 新命令路径（`media`/`node`/`dhcp`/`tftp`）可用；旧命令（`install-source`/`install render`/`runtime leases list`/`trace`/`asset *`）输出 deprecation warning 且仍执行；`buildCli` 拆分后的 `register*Commands` |
+| F6/M4.3-04 CLI 校准 | canonical 资源命令可用；deprecated alias 已从 help 和命令树删除并返回 unknown command；node typed `k=v`/`unset` 原子校验；M4.3 CLI 范围冻结；`buildCli` 拆分后的 `register*Commands` |
+| M4.3 profile 只读视图 | profile list/show 的引用数、validation、capability、install-source/repository/assets/effective system 和 secret 脱敏；无写 action |
+| M4.3-01/08/09 所有权与恢复 | config/catalog/目录 journal 逐状态 crash recovery；高频 ModelSnapshotPair replace + handler/worker/session 并发无 UAF/torn pair/旧 snapshot 泄漏；BootSession 自有 immutable plan；inventory stale-source 仲裁；受保护 mutation 拒绝；restart 后 capability resumed 与真实 gap 分流 |
+| M4.4 URL/router | 三平面 canonical route matrix、RouteSpec 冲突/auth/cache/log、旧 URL 全量 404、旧 session schema 拒绝、node-bound rootfs、无 redirect/alias；当前 DTO/error/operation/ETag/idempotency golden contract；Rocky/Ubuntu 全链路 |
+| M4.3 系统级回归 | Rocky 9.7、Ubuntu 22.04 在最终 M4.3 二进制上重新完成 PXE 安装至可登录；Ubuntu 安装中 daemon restart 后完成且不 rearm |
 
 测试目录：
 
@@ -5067,6 +5495,11 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
 10.6. 修复部署错误传回 nodeforged（F1）、节点级不部署开关（F2）、ISO 导入主流 OS+覆盖语义（F3）、
       TFTP windowsize/并发/配置项（F4）、免密公钥配置化（F5）、CLI 命令体系校准（F6），完成 M4.2。
       详见 §9.11。post-install 异常容忍语义保持现状不动。
+10.7. 实现 M4.3 的真实 distro/canonical logical id、config/catalog/目录 journal 迁移、ModelSnapshotPair、
+      node/profile 聚合与 typed mutation、inventory 仲裁、owned BootSession/install plan、认证恢复、日志和构建溯源；
+      完成 crash/concurrency tests，并重新完成 Rocky/Ubuntu 全安装与 Ubuntu restart-resume 后，才进入 M4.4。
+10.8. 实现 M4.4 RouteSpec、三路由平面、canonical URL generator、node-bound rootfs 契约和当前 DTO/error/operation
+      golden contract；直接删除旧 route，要求 clean session state 且拒绝旧 schema，再次通过 HTTP contract与双发行版实机回归后进入 M5。
 11. 实现 dracut module、boot bundle/rootfs/initrd capability 校验、TargetSystem BootConfig 和断点续传。
 12. 跑通 diskless squashfs overlay、目标系统 overlay 与 `rootfs_build`/`diskless_boot`，完成 M5，再实施 M6/M7 增强。
 
@@ -5176,11 +5609,17 @@ M5 diskless retry、M6 retryability/config apply 和 M7 reconciliation/自动预
 M4.2 的错误上报（`/logs` 接通、`/subiquity-report`）、节点 deploy 开关、ISO 导入覆盖语义、TFTP 性能配置、
 bootstrap key 多值化或 CLI 校准任一变化，还必须同步检查：§9.11 M4.2 验收标准、§9.10.6.2 bootstrap admin key
 合并去重规则、§11.5 错误分类表 retryability、`event_types.zig` 注册表、`config.example.json` TFTP 新配置项、
-`tests/cli.sh` 新命令树与 deprecated alias 断言、`buildCli` 拆分后的 `register*Commands` 函数。bootstrap key
-来源从单值扩展为多值数组 + state 目录扫描，但合并去重规则（§9.10.6.2）不变；CLI 校准后旧路径必须保留
-deprecated alias 一个版本周期。post-install 命令异常容忍语义不在 M4.2 范围内，保持现状。
+`tests/cli.sh` 新命令树、`buildCli` 拆分后的 `register*Commands` 函数。bootstrap key 来源从单值扩展为多值
+数组 + state 目录扫描，但合并去重规则（§9.10.6.2）不变。M4.3 已结束一个版本周期的兼容窗口并删除 deprecated
+aliases，后续不得恢复。post-install 命令异常容忍语义不在 M4.2 范围内，保持现状。
 M4.2 的 deploy 开关或 generation 交互变化还必须同步检查 M5 diskless retry（deploy 开关同样作用于 diskless
 模式）、M6 retryability/config apply 和 M7 reconciliation/自动预算。
+
+M4.3 的 family/distro、repository 可空/多条、SHA 幂等导入、资源化目录、typed node patch、ConfigRuntime、
+node inventory、传输 node 归属、webhook proof、BootSession resume 或 build provenance 任一变化，还必须同步
+检查：§9.12 验收、M5 bundle tuple/下载事件、M6 adapter 能力表/config apply、M7 reconciliation/finalizer、
+catalog/config/state schema 迁移、CLI/HTTP 集成测试和 daemon restart-resume 实测。不得退回 `distro=rocky`
+伪归一、CLI 直写 config、进程重启应用 node 属性或明文 capability 落盘。
 
 不允许出现：
 

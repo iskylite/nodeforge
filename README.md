@@ -7,6 +7,8 @@
 
 - [NodeForge PXE 特化版概要设计](docs/DESIGN.md)
 - [NodeForge 分阶段详细设计与实现计划](docs/DETAILED_DESIGN.md)
+- [M4.3 模型、运行态与可观测性专项设计](docs/superpowers/specs/2026-07-15-m4_3-model-runtime-observability-design.md)
+- [M4.4 HTTP API URL 契约专项设计](docs/superpowers/specs/2026-07-15-m4_4-http-api-url-contract-design.md)
 - [M0–M4.1 实现审计](docs/M0_M4_AUDIT.md)
 - [Rocky Linux 8.10 aarch64 VMware PXE 验证](docs/ROCKY_8_10_VALIDATION.md)
 
@@ -28,13 +30,30 @@ M4.1 同时补齐自动安装生命周期：install profile 默认一次性 gene
 desired/applied drift。TFTP option、DHCP T1/T2、trace 时钟回拨、运行期 asset 和 ISO orphan/空间预检等
 M1-M3 横切修正仍写在各自章节，但作为 M4.1 验收前置回归。
 
+M4.3 是进入 M5 前的现行补全里程碑，当前状态为“设计完成，待实现”。它会修正真实 distro/family、repository
+可空与 SHA 幂等导入，补 install-source `catalog show/migrate`、完整 node 视图、typed daemon mutation、
+只读 `profile list/show`、ConfigRuntime、可恢复且自有身份数据的 BootSession、传输归属、Ubuntu webhook proof
+和构建溯源；logical id 使用统一 path-safe grammar，跨 config/catalog/目录的迁移通过可恢复联合事务发布，活动
+BootSession 使用自有 immutable install plan，inventory 以 generation/session 仲裁迟到写入。M4.3 只提前
+已实现 PXE 部署所需的运维闭环；rootfs/diskless、完整 profile/distro/repository CRUD、全配置 diff/apply 和
+provision/reconcile 仍按 M5–M7 实现。上述基础链路改造完成后，必须重新跑通 Rocky 9.7、Ubuntu 22.04 的完整
+PXE 安装和 Ubuntu 安装中 daemon restart-resume，历史成功记录不能直接作为 M4.3 验收。
+
+M4.4 紧随 M4.3、同样必须在 M5 前完成：节点交付 API 统一到 `/api/v1/nodes/:id/**`，本机管理 API 保持
+`/api/v1/management/**`，静态制品迁移到 `/artifacts/**`；删除重复 `/boot/config`，用显式 Kickstart/NoCloud
+install-config 路径，rootfs 绑定 node capability，并以集中 RouteSpec 消除前缀匹配顺序冲突。旧 URL 不依赖
+redirect/alias，M4.4 直接替换并删除；切换前必须结束并清理 M4.3 session/checkpoint，残留旧 schema 拒绝启动且不
+自动 rearm。method/status/error、
+ETag/If-Match、idempotency、collection/operation envelope 和 golden DTO 是当前实现验收基线，不是历史兼容冻结。
+
 NodeForge 配置中所有语义为 `password` 的字段都允许填写明文，并以明文写入 JSON、导入和导出；
 包括系统用户、root、IPMI，以及未来新增的 repository/proxy/basic-auth 等密码字段。发行版安装器要求
 hash 时只在渲染/下发阶段临时转换，不能把 hash 回写成配置事实。token、session capability、SSH 私钥和
 已经生成的 password hash 不是 password 配置字段，仍按各自的短期或受限传递规则处理。
 
-[`config.example.json`](config.example.json) 只展示当前代码能够加载和校验的配置。M4.1 schema、默认值和
-迁移规则以详细设计第 9.10 节为准；相关变更必须同步更新代码、示例配置、fixture 和验证记录。
+[`config.example.json`](config.example.json) 只展示当前代码能够加载和校验的配置。已实现的 M4.1 schema、默认值
+以详细设计第 9.10 节为准；待实现的 M4.3 现行契约以第 9.12 节为准。相关变更必须同步更新代码、示例配置、
+fixture 和验证记录，不能把设计完成误写成代码已完成。
 
 ## 开发
 
@@ -111,11 +130,13 @@ Rocky Linux 9.7 aarch64 的 `192.168.27.0/24` 已完成 DHCP 生命周期、冲�
 
 ## M2.5.1 启动追踪
 
-每次 DHCP `DISCOVER`/`REQUEST` 会在 daemon 进程内创建或复用一个不可预测的
+每次 DHCP `DISCOVER`/`REQUEST` 会创建或复用一个不可预测的
 32 字符小写十六进制 `boot_session_id`（128-bit）。同一启动尝试的 DHCP 与经唯一 lease-IP 安全关联的
 TFTP 事件都会记录该 id；每条 daemon Event v2 同时带有 `daemon_instance_id`，用于识别
-服务重启边界。session 仅存在于当前进程：超时、被新 XID 替换或有序停机时，daemon 会追加
-`boot.session.terminated`，不会在重启后恢复旧关联。
+服务重启边界。现有实现的 session 仍仅存在于当前进程；M4.3 将其修订为：仅对已经签发 capability 的 active
+delivery session 在 mode 0600 checkpoint 中持久化自有身份、immutable install plan/digest、route contract 和 token，重启后恢复合法
+安装器回调及同一 answer 语义，但不恢复 UDP transfer 或 install arm。
+超时、被新 session 取代或不可恢复时才追加明确的终止/失效 reason。
 
 TFTP 不会根据文件名、传输端口或“最近 DHCP 记录”猜测节点归属。若活动 lease-IP 没有唯一
 匹配，事件保留 `session_link_state`（例如 `no_active_lease_match`、`ambiguous_lease_match`
@@ -125,8 +146,8 @@ TFTP 不会根据文件名、传输端口或“最近 DHCP 记录”猜测节点
 
 ```bash
 nodeforge events list --node node-01 --session 0123456789abcdef0123456789abcdef
-nodeforge trace node-01 --latest
-nodeforge trace node-01 --session 0123456789abcdef0123456789abcdef --output json
+nodeforge node trace node-01 --latest
+nodeforge node trace node-01 --session 0123456789abcdef0123456789abcdef --output json
 ```
 
 `trace` 仅展示具有直接 session 证据的事件，并把容量耗尽、损坏 JSONL 记录和 daemon

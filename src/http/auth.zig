@@ -86,6 +86,13 @@ pub fn authenticate(store: *boot_session.Store, node_id: []const u8, peer: []con
     return .{ .proof = .bootstrap, .session = try store.authenticateBootstrap(node_id, try parsePeerIpv4(peer), mono_now) };
 }
 
+/// Curtin webhook 使用固定的 direct-peer bootstrap proof。与该 proof 无关的
+/// Authorization header 不得把请求切换到通用 capability 分支。
+pub fn authenticateWebhook(store: *boot_session.Store, node_id: []const u8, peer: []const u8, mono_now: i64) !Result {
+    if (!nodeIdSafe(node_id)) return error.InvalidNodeId;
+    return .{ .proof = .bootstrap, .session = try store.authenticateBootstrap(node_id, try parsePeerIpv4(peer), mono_now) };
+}
+
 /// 认证资产下载请求。只接受 capability 认证（不支持 bootstrap）。
 ///
 /// 资产下载（如 ISO、rootfs）需要比 bootstrap 更强的认证，

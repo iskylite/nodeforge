@@ -11,8 +11,11 @@ const zap = @import("zap");
 const model = @import("../model.zig");
 const config_validate = @import("../config/validate.zig");
 const config_load = @import("../config/load.zig");
+const node_mutation = @import("../config/node_mutation.zig");
 const runtime_state = @import("../state/runtime.zig");
 const catalog_runtime = @import("../state/catalog_runtime.zig");
+const config_runtime = @import("../state/config_runtime.zig");
+const model_runtime = @import("../state/model_runtime.zig");
 const observe_error = @import("../observe/error.zig");
 const observe_log = @import("../observe/log.zig");
 const events = @import("../state/events.zig");
@@ -23,21 +26,33 @@ const auth = @import("auth.zig");
 const lookup = @import("../catalog.zig");
 const asset_validate = @import("../assets/validate.zig");
 const iso_import = @import("../catalog/iso_import.zig");
+const catalog_migration = @import("../catalog/migration.zig");
+const model_transaction = @import("../state/model_transaction.zig");
+const config_store = @import("../config/store.zig");
+const catalog_store = @import("../catalog/store.zig");
 const dhcp_server = @import("../dhcp/server.zig");
 const status_store = @import("../state/status_store.zig");
+const boot_session_store = @import("../state/boot_session_store.zig");
 const deployment_control = @import("../state/deployment_control.zig");
+const node_inventory = @import("../state/node_inventory.zig");
+const operations = @import("../state/operations.zig");
 const log = std.log.scoped(.http);
 
 const RouteContext = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     config: *const model.AppConfig,
+    configs: *config_runtime.ConfigRuntime,
     catalog: *catalog_runtime.CatalogRuntime,
+    models: *model_runtime.ModelRuntime,
+    catalog_snapshot: *const catalog_runtime.Snapshot,
     runtime: *const runtime_state.RuntimeState,
     event_writer: *events.Writer,
     sessions: *boot_session.Store,
     statuses: *node_status.Store,
     deployments: *deployment_control.Store,
+    inventories: *node_inventory.Store,
+    operations: *operations.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     /// M4.2 F5：来自配置和状态目录的额外 SSH 公钥。
@@ -66,10 +81,11 @@ const RequestMeta = struct {
 // Zap 的底层 listener 暴露一个进程全局请求回调。NodeForge 有意设计为
 // 单进程、单 listener 设备，因此此指针在 `zap.start` 的整个阻塞生命周期内
 // 保持有效，且之后永远不会被修改。
-var active_context: ?*const RouteContext = null;
+var active_context: ?*RouteContext = null;
 /// ISO 导入互斥锁。ISO 导入需要 loop-mount 能力并发布多对象 catalog 候选，
 /// 限制为 daemon 范围内单一 worker，防止并发本地 CLI 请求耗尽 mount 或竞争发布。
 var iso_import_mutex: std.atomic.Mutex = .unlocked;
+var config_mutation_mutex: std.atomic.Mutex = .unlocked;
 
 /// 在所有 IPv4 接口上启动唯一的 NodeForge HTTP listener。
 ///
@@ -81,13 +97,16 @@ pub fn serve(
     allocator: std.mem.Allocator,
     ip: []const u8,
     port: u16,
-    config: *const model.AppConfig,
+    configs: *config_runtime.ConfigRuntime,
     catalog: *catalog_runtime.CatalogRuntime,
+    models: *model_runtime.ModelRuntime,
     runtime: *const runtime_state.RuntimeState,
     event_writer: *events.Writer,
     sessions: *boot_session.Store,
     statuses: *node_status.Store,
     deployments: *deployment_control.Store,
+    inventories: *node_inventory.Store,
+    operation_store: *operations.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     additional_keys: []const []const u8,
@@ -98,17 +117,25 @@ pub fn serve(
     reload_requested: *std.atomic.Value(bool),
 ) !void {
     if (!std.mem.eql(u8, ip, "0.0.0.0")) return error.InvalidHttpBindAddress;
+    const initial_pair = models.acquire();
+    defer initial_pair.release();
+    const config = initial_pair.config.value();
 
-    const context = RouteContext{
+    var context = RouteContext{
         .io = io,
         .allocator = allocator,
         .config = config,
+        .configs = configs,
         .catalog = catalog,
+        .models = models,
+        .catalog_snapshot = initial_pair.catalog,
         .runtime = runtime,
         .event_writer = event_writer,
         .sessions = sessions,
         .statuses = statuses,
         .deployments = deployments,
+        .inventories = inventories,
+        .operations = operation_store,
         .config_revision = config_revision,
         .bootstrap_key = bootstrap_key,
         .additional_keys = additional_keys,
@@ -169,7 +196,14 @@ fn getClientIp(request: zap.Request) []const u8 {
 /// - `GET  /api/v1/management/dhcp/unknown`       — M2 未认领节点列表
 /// - `POST /api/v1/management/assets/import`      — M1 资产导入（daemon 写入 catalog）
 fn route(request: zap.Request) !void {
-    const context = active_context orelse return error.MissingRouteContext;
+    const shared_context = active_context orelse return error.MissingRouteContext;
+    const model_pair = shared_context.models.acquire();
+    defer model_pair.release();
+    var request_context = shared_context.*;
+    request_context.config = model_pair.config.value();
+    request_context.config_revision = model_pair.config.revision;
+    request_context.catalog_snapshot = model_pair.catalog;
+    const context = &request_context;
     const path = request.path orelse return notFound(request, undefined_meta(context));
     const method = request.method orelse return notFound(request, undefined_meta(context));
     const started = std.Io.Clock.awake.now(context.io);
@@ -205,39 +239,30 @@ fn route(request: zap.Request) !void {
         if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/events")) return nodeEvent(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/logs")) return nodeLog(request, context, node_route.node_id, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/facts")) return nodeFacts(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/subiquity-report")) return subiquityReport(request, context, node_route.node_id, meta);
         };
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/config/status"))
         return json(request, .ok, "{\"ok\":true,\"result\":{\"config\":\"valid\"}}\n", meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/validate")) {
-        context.catalog.lock();
-        defer context.catalog.unlock();
-        config_validate.validate(context.config, &context.catalog.value) catch |err| return validationError(request, err, meta);
+        const catalog_snapshot = context.catalog_snapshot;
+        config_validate.validate(context.config, catalog_snapshot.value()) catch |err| return validationError(request, err, meta);
         return json(request, .ok, "{\"ok\":true,\"result\":{}}\n", meta);
     }
-    // M4.2: config reload - 通知 daemon 重新加载 config.json（node add/set/remove 后调用）。
-    // 客户端（nodeforge CLI）通过 localhost POST 触发；daemon 先校验新配置，
-    // 再设置 reload 标志，响应后停止 facil.io 事件循环退出，由 systemd 自动重启。
+    // M4.3: 兼容 CLI 的 reload 请求现在执行在线 snapshot publish，不退出 daemon。
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/reload")) {
-        // 先校验新配置文件可解析且合法
-        const parsed = config_load.load(context.io, context.allocator, context.config_path) catch {
-            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"config.reload_failed\",\"message\":\"failed to load config.json\"}}\n", meta);
+        applyConfigFromDisk(context) catch |err| {
+            observe_log.err("config reload failed: {t}", .{err});
+            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"config.reload_failed\",\"message\":\"cannot validate or publish config.json\"}}\n", meta);
         };
-        var parsed_mut = parsed;
-        defer parsed_mut.deinit();
-        config_validate.validateConfig(&parsed_mut.value) catch {
-            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"config.reload_failed\",\"message\":\"config.json validation failed\"}}\n", meta);
-        };
-        // 设置 reload 标志，serve() 返回后 app.zig 将退出让 systemd 重启
-        context.reload_requested.store(true, .release);
-        // 响应客户端后停止 facil.io 事件循环，使 zap.start() 返回
-        // 从而触发正常 shutdown 序列，systemd 随后自动重启加载新配置。
-        // 必须在此 return，否则 fall-through 到 notFound 会在已关闭的
-        // 连接上 setHeader，触发 zap error.HttpSetHeader。
-        try json(request, .ok, "{\"ok\":true,\"result\":{\"reload\":\"requested\"}}\n", meta);
-        zap.stop();
-        return;
+        return json(request, .ok, "{\"ok\":true,\"result\":{\"reload\":\"applied_online\"}}\n", meta);
+    }
+    if (std.mem.eql(u8, method, "PATCH") and std.mem.eql(u8, path, "/api/v1/management/config")) return managementConfigSet(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/nodes")) return managementNodeAdd(request, context, meta);
+    if (nodePath(path, "/api/v1/management/nodes/")) |node_id| {
+        if (std.mem.eql(u8, method, "PATCH")) return managementNodeSet(request, context, node_id, meta);
+        if (std.mem.eql(u8, method, "DELETE")) return managementNodeRemove(request, context, node_id, meta);
     }
     if (std.mem.eql(u8, method, "POST")) if (installRetryPath(path)) |node_id| return installRetry(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/server/status")) {
@@ -251,6 +276,10 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime")) {
         return runtimeSummary(request, context, meta);
     }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/nodes")) return managementNodes(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/nodes/")) |node_id| return managementNode(request, context, node_id, meta);
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfiles(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfile(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/api/v1/management/nodes/")) if (managementNodePath(path)) |node_id| {
         return managementNodeStatus(request, context, node_id, meta);
     };
@@ -269,9 +298,13 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/assets/import")) {
         return importAsset(request, context, meta);
     }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/install-sources/import")) {
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/install-sources")) {
         return importInstallSource(request, context, meta);
     }
+    if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/install-sources/")) |name| return managementInstallSource(request, context, name, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/migration-plans")) return catalogMigrationPlan(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/migrations")) return catalogMigrationApply(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/operations/")) |operation_id| return managementOperation(request, context, operation_id, meta);
     return notFound(request, meta);
 }
 
@@ -293,6 +326,18 @@ fn nodePath(path: []const u8, prefix: []const u8) ?[]const u8 {
     const node_id = path[prefix.len..];
     if (!auth.nodeIdSafe(node_id)) return null;
     return node_id;
+}
+
+fn logicalPath(path: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const value = path[prefix.len..];
+    return if (config_validate.validLogicalId(value)) value else null;
+}
+
+test "logical resource route accepts canonical dots but rejects encoded paths" {
+    try std.testing.expectEqualStrings("ubuntu-22.04-install", logicalPath("/profiles/ubuntu-22.04-install", "/profiles/").?);
+    try std.testing.expect(logicalPath("/profiles/ubuntu%2fescape", "/profiles/") == null);
+    try std.testing.expect(logicalPath("/profiles/../escape", "/profiles/") == null);
 }
 
 fn splitNodeRoute(tail: []const u8) ?NodeRoute {
@@ -323,34 +368,31 @@ fn repoRoute(path: []const u8) ?RepoRoute {
 }
 
 fn imageAsset(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
-    context.catalog.lock();
+    const catalog_snapshot = context.catalog_snapshot;
     // Casper 仅在 kernel `url=` 值以 `.iso` 结尾时接受网络 ISO。Catalog 资产
     // ID 是逻辑名，不一定有该后缀，因此 `/images/<asset>.iso` 是 ISO 资产的
     // 只读别名。
-    const asset = lookup.findAsset(&context.catalog.value, name) orelse if (std.mem.endsWith(u8, name, ".iso") and name.len > ".iso".len)
-        lookup.findAsset(&context.catalog.value, name[0 .. name.len - ".iso".len])
+    const asset = lookup.findAsset(catalog_snapshot.value(), name) orelse if (std.mem.endsWith(u8, name, ".iso") and name.len > ".iso".len)
+        lookup.findAsset(catalog_snapshot.value(), name[0 .. name.len - ".iso".len])
     else
         null;
     if (asset == null or asset.?.kind != .iso) {
-        context.catalog.unlock();
         return notFound(request, meta);
     }
     const path = asset.?.path;
     const checksum = asset.?.sha256;
-    context.catalog.unlock();
     return staticFile(request, context, context.config.http.asset_root, path, checksum, meta);
 }
 
 fn rootfsAsset(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticateAsset(context.sessions, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     const asset_info = blk: {
-        context.catalog.lock();
-        defer context.catalog.unlock();
+        const catalog_snapshot = context.catalog_snapshot;
         const profile = lookup.findProfile(context.config, checked.profile) orelse return notFound(request, meta);
         if (profile.mode != .diskless) return nodeAuthError(request, error.ProofMismatch, meta);
-        const bundle = lookup.findBootBundle(&context.catalog.value, profile.boot_bundle orelse return notFound(request, meta)) orelse return notFound(request, meta);
+        const bundle = lookup.findBootBundle(catalog_snapshot.value(), profile.boot_bundle orelse return notFound(request, meta)) orelse return notFound(request, meta);
         if (!std.mem.eql(u8, bundle.rootfs, name)) return nodeAuthError(request, error.ProofMismatch, meta);
-        const asset = lookup.findAsset(&context.catalog.value, name) orelse return notFound(request, meta);
+        const asset = lookup.findAsset(catalog_snapshot.value(), name) orelse return notFound(request, meta);
         if (asset.kind != .rootfs) return notFound(request, meta);
         // Catalog 分配在 daemon 生命周期内是只追加的，因此这些 slice 在
         // unlock 后仍然有效，可安全用于传输。
@@ -386,18 +428,16 @@ fn bootFileRoute(path: []const u8) ?[]const u8 {
 /// Catalog 白名单 + ETag checksum 支持条件请求和断点续传。
 fn bootFile(request: zap.Request, context: *const RouteContext, relative: []const u8, meta: RequestMeta) !void {
     const asset_info = blk: {
-        context.catalog.lock();
-        defer context.catalog.unlock();
-        const asset = lookup.findAssetByPath(&context.catalog.value, relative) orelse return notFound(request, meta);
+        const catalog_snapshot = context.catalog_snapshot;
+        const asset = lookup.findAssetByPath(catalog_snapshot.value(), relative) orelse return notFound(request, meta);
         break :blk .{ .path = asset.path, .checksum = asset.sha256 };
     };
     return staticFile(request, context, context.config.tftp.asset_root, asset_info.path, asset_info.checksum, meta);
 }
 
 fn repositoryAsset(request: zap.Request, context: *const RouteContext, name: []const u8, tail: []const u8, meta: RequestMeta) !void {
-    context.catalog.lock();
-    const repository = lookup.findRepository(&context.catalog.value, name);
-    context.catalog.unlock();
+    const catalog_snapshot = context.catalog_snapshot;
+    const repository = lookup.findRepository(catalog_snapshot.value(), name);
     if (repository == null) return notFound(request, meta);
     const root = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ context.config.http.repository_root, name });
     defer context.allocator.free(root);
@@ -511,7 +551,10 @@ fn sendManagedFile(request: zap.Request, context: *const RouteContext, file: *st
     try request.setHeader("accept-ranges", "bytes");
     request.setContentTypeFromFilename(relative) catch try request.setHeader("content-type", "application/octet-stream");
     // M3.6 下载日志：info 记录每个 HTTP 下载请求的对象、范围、字节数和客户端 IP。
-    log.info("HTTP download request GET {s} (range={d}+{d}/{d}, client={s})", .{ relative, range.offset, range.length, total_size, meta.client_ip });
+    if (std.mem.startsWith(u8, request_path, "/repos/"))
+        log.debug("HTTP repository request GET {s} (range={d}+{d}/{d}, client={s})", .{ relative, range.offset, range.length, total_size, meta.client_ip })
+    else
+        log.info("HTTP download request GET {s} (range={d}+{d}/{d}, client={s})", .{ relative, range.offset, range.length, total_size, meta.client_ip });
     const result = zap.fio.http_sendfile(request.h, file.handle, @intCast(range.length), @intCast(range.offset));
     if (result != 0) return error.SendFile;
     // M3.6 下载日志：facil.io 拥有异步 sendfile 完成回调。我们有意将其标记为
@@ -542,25 +585,41 @@ fn rangeNotSatisfiable(request: zap.Request, context: *const RouteContext, size:
 fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const RouteContext, relative: []const u8, status: u16, bytes_sent: u64, object_size: u64, meta: RequestMeta) void {
     const duration_us = meta.started.durationTo(std.Io.Clock.awake.now(meta.io)).toMicroseconds();
     const response_state = if (std.mem.eql(u8, method, "GET") and status >= 200 and status < 300) "queued" else "completed";
-    log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, asset={s}, object_bytes={d}, response_state={s})", .{
-        method, path, status, bytes_sent, duration_us, meta.client_ip, relative, object_size, response_state,
-    });
+    const peer_ip = auth.parsePeerIpv4(meta.client_ip) catch 0;
+    const identity = if (peer_ip != 0) context.sessions.resolveTftpBoot(peer_ip, boot_session.monotonicNow()) else null;
+    if (std.mem.startsWith(u8, path, "/repos/"))
+        log.debug("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, node={s}, asset={s}, object_bytes={d}, response_state={s})", .{ method, path, status, bytes_sent, duration_us, meta.client_ip, if (identity) |value| value.node_id else "-", relative, object_size, response_state })
+    else
+        log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, node={s}, asset={s}, object_bytes={d}, response_state={s})", .{ method, path, status, bytes_sent, duration_us, meta.client_ip, if (identity) |value| value.node_id else "-", relative, object_size, response_state });
 
     var status_text: [4]u8 = undefined;
     var bytes_text: [20]u8 = undefined;
     var object_bytes_text: [20]u8 = undefined;
     var duration_text: [20]u8 = undefined;
-    const fields = [_]events.Field{
-        .{ .key = "method", .value = method },
-        .{ .key = "path", .value = path },
-        .{ .key = "status", .value = std.fmt.bufPrint(&status_text, "{d}", .{status}) catch "0" },
-        .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{bytes_sent}) catch "0" },
-        .{ .key = "object_bytes", .value = std.fmt.bufPrint(&object_bytes_text, "{d}", .{object_size}) catch "0" },
-        .{ .key = "client_ip", .value = meta.client_ip },
-        .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
-        .{ .key = "response_state", .value = response_state },
-    };
-    context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "http.request", "HTTP request completed", &fields) catch |err|
+    // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
+    // 使生产环境可按 traffic_class 查询和过滤不同类型的 HTTP 流量，
+    // 例如只看 repository 下载或 boot 文件传输。
+    //   repository -> /repos/**
+    //   image      -> /images/**
+    //   boot       -> /boot/**
+    //   rootfs     -> /rootfs/**
+    //   api        -> 管理端点、安装 answer、事件上报等控制面请求
+    const traffic_class: []const u8 = if (std.mem.startsWith(u8, path, "/repos/")) "repository" else if (std.mem.startsWith(u8, path, "/images/")) "image" else if (std.mem.startsWith(u8, path, "/boot/")) "boot" else if (std.mem.startsWith(u8, path, "/rootfs/")) "rootfs" else "api";
+    var fields: [11]events.Field = undefined;
+    var count: usize = 0;
+    inline for ([_]events.Field{
+        .{ .key = "method", .value = method }, .{ .key = "path", .value = path }, .{ .key = "status", .value = std.fmt.bufPrint(&status_text, "{d}", .{status}) catch "0" }, .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{bytes_sent}) catch "0" }, .{ .key = "object_bytes", .value = std.fmt.bufPrint(&object_bytes_text, "{d}", .{object_size}) catch "0" }, .{ .key = "client_ip", .value = meta.client_ip }, .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" }, .{ .key = "response_state", .value = response_state }, .{ .key = "traffic_class", .value = traffic_class },
+    }) |field| {
+        fields[count] = field;
+        count += 1;
+    }
+    if (identity) |value| {
+        fields[count] = .{ .key = "node_id", .value = value.node_id };
+        count += 1;
+        fields[count] = .{ .key = "boot_session_id", .value = value.boot_session_id[0..] };
+        count += 1;
+    }
+    context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "http.request", "HTTP request completed", fields[0..count]) catch |err|
         observe_log.err("http: event append failed: {t}", .{err});
 }
 
@@ -611,12 +670,19 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
         request.getHeader("x-nodeforge-session"),
         boot_session.monotonicNow(),
     ) catch |err| return nodeAuthError(request, err, meta);
+    if (checked.session.mode == .install and checked.proof == .bootstrap and checked.session.plan_digest == null) {
+        const plan_json = buildInstallPlan(context, node_id, checked.session.profile) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
+        defer context.allocator.free(plan_json);
+        context.sessions.captureInstallPlan(context.allocator, checked.session.boot_session_id[0..], plan_json, context.config_revision) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"boot session plan is already pinned to different inputs\"}}\n", meta);
+    }
+    if (checked.proof == .bootstrap) pinSessionGeneration(context, checked.session) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"deployment.generation_unavailable\",\"message\":\"cannot pin deployment generation to boot session\"}}\n", meta);
     const session = if (checked.proof == .bootstrap)
         context.sessions.issueCapability(context.io, checked.session.boot_session_id[0..], boot_session.monotonicNow(), unixNow()) catch |err| return nodeAuthError(request, err, meta)
     else blk: {
         context.sessions.touchDelivery(checked.session.boot_session_id[0..], boot_session.monotonicNow(), unixNow());
         break :blk checked.session;
     };
+    if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist delivery session\"}}\n", meta);
 
     context.statuses.update(node_id, session.boot_session_id[0..], context.daemon_instance_id, .boot_config_fetched, null, unixNow(), true) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
@@ -650,15 +716,16 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
             const answer_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/answer", .{ base, node_id });
             defer context.allocator.free(answer_url);
             try output.writer.print(",\"answer_url\":{f}", .{std.json.fmt(answer_url, .{})});
-            context.catalog.lock();
-            defer context.catalog.unlock();
-            const profile = lookup.findProfile(context.config, session.profile) orelse return notFound(request, meta);
-            const source = lookup.findInstallSource(&context.catalog.value, profile.install_source orelse return notFound(request, meta)) orelse return notFound(request, meta);
+            const plan_bytes = (try context.sessions.copyInstallPlan(context.allocator, session.boot_session_id[0..])) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_missing\",\"message\":\"boot session has no immutable install plan\"}}\n", meta);
+            defer context.allocator.free(plan_bytes);
+            const parsed_plan = std.json.parseFromSlice(InstallPlanEnvelope, context.allocator, plan_bytes, .{ .allocate = .alloc_always }) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"immutable install plan cannot be decoded\"}}\n", meta);
+            defer parsed_plan.deinit();
+            const source = &parsed_plan.value.install_source;
             try output.writer.print(",\"installer\":{{\"source\":{f},\"kernel\":{f},\"initrd\":{f}}},\"repository_urls\":[", .{
                 std.json.fmt(source.name, .{}), std.json.fmt(source.installer_kernel, .{}), std.json.fmt(source.installer_initrd, .{}),
             });
             for (source.repositories, 0..) |repository_name, index| {
-                const repository = lookup.findRepository(&context.catalog.value, repository_name) orelse return notFound(request, meta);
+                const repository = findRepositoryIn(parsed_plan.value.catalog_repositories, repository_name) orelse return notFound(request, meta);
                 if (index != 0) try output.writer.writeByte(',');
                 try output.writer.print("{f}", .{std.json.fmt(repository.base_url, .{})});
             }
@@ -677,23 +744,51 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
 /// 或 Autoinstall user-data/meta-data（Ubuntu）。首次获取时接受 bootstrap
 /// proof（peer IP 匹配）并升级为 capability token；后续请求使用 capability proof。
 const AnswerFormat = enum { kickstart, user_data, meta_data, vendor_data };
+const InstallPlanEnvelope = struct {
+    schema_version: u32,
+    model_revision: u64,
+    node: model.NodeConfig,
+    profile: model.ProfileConfig,
+    distro: model.DistroConfig,
+    install_source: model.InstallSourceConfig,
+    kernel: model.AssetConfig,
+    initrd: model.AssetConfig,
+    catalog_repositories: []const model.RepositoryConfig,
+    provisioning_bundles: []const model.ProvisioningBundle,
+    delivery: struct { server_ip: []const u8, http_port: u16 },
+};
 fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []const u8, format: AnswerFormat, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
+    if (checked.proof == .bootstrap and checked.session.plan_digest == null) {
+        const plan_json = buildInstallPlan(context, node_id, checked.session.profile) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
+        defer context.allocator.free(plan_json);
+        context.sessions.captureInstallPlan(context.allocator, checked.session.boot_session_id[0..], plan_json, context.config_revision) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"boot session plan is already pinned to different inputs\"}}\n", meta);
+    }
+    if (checked.proof == .bootstrap) pinSessionGeneration(context, checked.session) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"deployment.generation_unavailable\",\"message\":\"cannot pin deployment generation to boot session\"}}\n", meta);
     const session = if (checked.proof == .bootstrap)
         context.sessions.issueCapability(context.io, checked.session.boot_session_id[0..], boot_session.monotonicNow(), unixNow()) catch |err| return nodeAuthError(request, err, meta)
     else
         checked.session;
+    const plan_bytes = (try context.sessions.copyInstallPlan(context.allocator, session.boot_session_id[0..])) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_missing\",\"message\":\"boot session has no immutable install plan\"}}\n", meta);
+    defer context.allocator.free(plan_bytes);
+    const parsed_plan = std.json.parseFromSlice(InstallPlanEnvelope, context.allocator, plan_bytes, .{ .allocate = .alloc_always }) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"immutable install plan cannot be decoded\"}}\n", meta);
+    defer parsed_plan.deinit();
+    const plan = &parsed_plan.value;
     context.sessions.touchDelivery(session.boot_session_id[0..], boot_session.monotonicNow(), unixNow());
+    if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist delivery session\"}}\n", meta);
     const event_url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/events", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
     defer context.allocator.free(event_url);
     const log_url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/logs", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
     defer context.allocator.free(log_url);
-    const node = lookup.findNode(context.config, node_id) orelse return notFound(request, meta);
-    const profile = lookup.findProfile(context.config, session.profile) orelse return notFound(request, meta);
+    const facts_url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/facts", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
+    defer context.allocator.free(facts_url);
+    const node = &plan.node;
+    const profile = &plan.profile;
     // M4.2: Subiquity webhook reporting 在 22.04 和 24.04 均可用（curtin handler 相同）。
     // 始终为 Ubuntu 传入 report_url；webhook reporter 无认证，端点通过源 IP 校验。
-    const report_url: []const u8 = if (std.mem.eql(u8, profile.distro, "ubuntu")) blk: {
+    const distro = &plan.distro;
+    const report_url: []const u8 = if (distro.family == .ubuntu) blk: {
         const url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/subiquity-report", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
         break :blk url;
     } else "";
@@ -717,20 +812,21 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
         .apt = install_orig.apt,
     } else install_orig;
     const system = try @import("../profile/install.zig").effectiveSystem(profile);
-    const bundle = if (install.bundle) |name| findProvisioningBundle(context.config, name) else null;
-    var password_scope_buffer: [128]u8 = undefined;
-    const password_scope = try std.fmt.bufPrint(&password_scope_buffer, "{s}:{s}:{d}", .{ context.daemon_instance_id.*[0..], session.boot_session_id[0..], context.config_revision });
+    const bundle = if (install.bundle) |name| findProvisioningBundleIn(plan.provisioning_bundles, name) else null;
+    var password_scope_buffer: [96]u8 = undefined;
+    // Salt scope must survive daemon restart. The session id is random and the
+    // captured model revision is immutable for this delivery; daemon instance
+    // identity would make the same checkpoint render different password hashes.
+    const password_scope = try std.fmt.bufPrint(&password_scope_buffer, "{s}:{d}", .{ session.boot_session_id[0..], session.model_revision });
     // APT 源 URL 解析：Ubuntu ISO 导入时始终创建 repository 条目
     //（即使 ISO 不含完整 APT metadata），因此 findRepository 应总能找到。
     // 保留 fallback 逻辑以兼容手动配置场景：当 repository 不存在时，
     // 构造 /repos/<source_name>/ URL，使 apt 请求快速 404 而非 DNS 超时。
     const apt_primary_url = if (format == .user_data) blk: {
-        context.catalog.lock();
-        defer context.catalog.unlock();
-        const source = lookup.findInstallSource(&context.catalog.value, profile.install_source orelse break :blk null) orelse break :blk null;
-        if (std.mem.eql(u8, source.distro, "ubuntu")) {
+        const source = &plan.install_source;
+        if (plan.distro.family == .ubuntu) {
             // Ubuntu: 优先使用 repository.base_url；若不存在则构造 fallback URL
-            const repository = lookup.findRepository(&context.catalog.value, source.name);
+            const repository = findRepositoryIn(plan.catalog_repositories, source.name);
             if (repository) |repo| if (repo.manager == .apt) break :blk repo.base_url;
             break :blk try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/repos/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
         }
@@ -738,15 +834,13 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     } else null;
     const body = switch (format) {
         .meta_data => try @import("../profile/adapter/ubuntu.zig").renderMetaData(context.allocator, node),
-        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserDataM41(context.allocator, node, install, system, context.bootstrap_key, bundle, apt_primary_url, event_url, log_url, report_url, session.boot_session_id[0..], session.capability[0..], password_scope),
+        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserDataM41(context.allocator, node, install, system, context.bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session.boot_session_id[0..], session.capability[0..], password_scope),
         .vendor_data => try context.allocator.dupe(u8, ""),
         .kickstart => blk: {
-            context.catalog.lock();
-            defer context.catalog.unlock();
-            const source = lookup.findInstallSource(&context.catalog.value, profile.install_source orelse return notFound(request, meta)) orelse return notFound(request, meta);
+            const source = &plan.install_source;
             const install_root = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/repos/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
             defer context.allocator.free(install_root);
-            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope);
+            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, facts_url, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope);
         },
     };
     defer context.allocator.free(body);
@@ -766,6 +860,8 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
         var duration_text: [20]u8 = undefined;
         const req_path = request.path orelse "<missing>";
         const req_method = request.method orelse "OTHER";
+        // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
+        const traffic_class: []const u8 = if (std.mem.startsWith(u8, req_path, "/repos/")) "repository" else if (std.mem.startsWith(u8, req_path, "/images/")) "image" else if (std.mem.startsWith(u8, req_path, "/boot/")) "boot" else if (std.mem.startsWith(u8, req_path, "/rootfs/")) "rootfs" else "api";
         const fields = [_]events.Field{
             .{ .key = "method", .value = req_method },
             .{ .key = "path", .value = req_path },
@@ -773,11 +869,45 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
             .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{body.len}) catch "0" },
             .{ .key = "client_ip", .value = meta.client_ip },
             .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
+            .{ .key = "traffic_class", .value = traffic_class },
         };
         context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "http.request", "HTTP request completed", &fields) catch |err|
             observe_log.err("http: event append failed: {t}", .{err});
     }
     try request.sendBody(body);
+}
+
+fn buildInstallPlan(context: *const RouteContext, node_id: []const u8, profile_name: []const u8) ![]u8 {
+    const node = lookup.findNode(context.config, node_id) orelse return error.MissingNode;
+    const profile = lookup.findProfile(context.config, profile_name) orelse return error.MissingProfile;
+    const distro = lookup.findDistro(context.config, profile.distro) orelse return error.MissingDistro;
+    const catalog_snapshot = context.catalog_snapshot;
+    const source = lookup.findInstallSource(catalog_snapshot.value(), profile.install_source orelse return error.MissingInstallSource) orelse return error.MissingInstallSource;
+    const kernel = lookup.findAsset(catalog_snapshot.value(), source.installer_kernel) orelse return error.MissingAsset;
+    const initrd = lookup.findAsset(catalog_snapshot.value(), source.installer_initrd) orelse return error.MissingAsset;
+    return std.json.Stringify.valueAlloc(context.allocator, .{
+        .schema_version = @as(u32, 1),
+        .model_revision = context.config_revision,
+        .node = node.*,
+        .profile = profile.*,
+        .distro = distro.*,
+        .install_source = source.*,
+        .kernel = kernel.*,
+        .initrd = initrd.*,
+        .catalog_repositories = catalog_snapshot.value().repositories,
+        .provisioning_bundles = context.config.provisioning_bundles,
+        .delivery = .{ .server_ip = context.config.server.server_ip, .http_port = context.config.server.http_port },
+    }, .{});
+}
+
+fn findRepositoryIn(repositories: []const model.RepositoryConfig, name: []const u8) ?*const model.RepositoryConfig {
+    for (repositories) |*repository| if (std.mem.eql(u8, repository.name, name)) return repository;
+    return null;
+}
+
+fn findProvisioningBundleIn(bundles: []const model.ProvisioningBundle, name: []const u8) ?*const model.ProvisioningBundle {
+    for (bundles) |*bundle| if (std.mem.eql(u8, bundle.name, name)) return bundle;
+    return null;
 }
 
 fn findProvisioningBundle(config: *const model.AppConfig, name: []const u8) ?*const model.ProvisioningBundle {
@@ -798,7 +928,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
     // generation 仅在安装器自身报告已启动时被消费，
     // 而非 DHCP、TFTP 或 answer 下发成功时消费。
     if (checked.session.mode == .install and std.mem.eql(u8, event.value.stage, "started")) {
-        const consumed = context.deployments.consume(node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot consume install generation\"}}\n", meta);
+        const consumed = context.deployments.consumeAt(node_id, unixNow()) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot consume install generation\"}}\n", meta);
         deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
             if (consumed) |result| context.deployments.rollbackConsume(node_id, result);
             observe_log.err("deployment-control save failed: {t}", .{err});
@@ -806,7 +936,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
         };
     }
     if (checked.session.mode == .install and terminal) {
-        const terminal_result = context.deployments.markTerminal(node_id, std.mem.eql(u8, event.value.stage, "completed"));
+        const terminal_result = context.deployments.markTerminalAt(node_id, std.mem.eql(u8, event.value.stage, "completed"), unixNow());
         deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
             if (terminal_result) |result| context.deployments.rollbackTerminal(node_id, result);
             observe_log.err("deployment-control applied revision save failed: {t}", .{err});
@@ -861,6 +991,50 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
     return json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
+fn nodeFacts(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
+    if (checked.proof != .capability) return nodeAuthError(request, error.MissingProof, meta);
+    if (!bodyWithin(request, 8 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"body_too_large\",\"message\":\"facts body too large\"}}\n", meta);
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"missing facts body\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(node_inventory.Facts, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"invalid facts body\"}}\n", meta);
+    defer parsed.deinit();
+    var facts = parsed.value;
+    if (facts.serial_number) |value| if (value.len == 0) {
+        facts.serial_number = null;
+    };
+    if (facts.product_uuid) |value| if (value.len == 0) {
+        facts.product_uuid = null;
+    };
+    if (facts.vendor) |value| if (value.len == 0) {
+        facts.vendor = null;
+    };
+    if (facts.model) |value| if (value.len == 0) {
+        facts.model = null;
+    };
+    if (facts.serial_number) |value| {
+        if (isFirmwarePlaceholder(value)) facts.serial_number = null;
+    }
+    _ = context.inventories.put(node_id, checked.session.boot_session_id[0..], checked.session.deployment_generation, checked.session.session_created_at, facts, unixNow()) catch |err| switch (err) {
+        error.StaleSource => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"inventory.stale_source\",\"message\":\"facts came from a stale session\"}}\n", meta),
+        else => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"facts rejected\"}}\n", meta),
+    };
+    node_inventory.save(context.io, context.allocator, paths.node_inventory_path, context.inventories) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"inventory.persist_failed\",\"message\":\"cannot persist facts\"}}\n", meta);
+    context.sessions.touchDelivery(checked.session.boot_session_id[0..], boot_session.monotonicNow(), unixNow());
+    return json(request, .ok, "{\"ok\":true}\n", meta);
+}
+
+fn pinSessionGeneration(context: *const RouteContext, session: boot_session.Authenticated) !void {
+    const generation: u64 = if (session.mode == .install) blk: {
+        const deployment = context.deployments.view(session.node_id) orelse return error.DeploymentGenerationUnavailable;
+        break :blk deployment.armed_generation orelse deployment.consumed_generation orelse deployment.terminal_generation orelse return error.DeploymentGenerationUnavailable;
+    } else 0;
+    try context.sessions.setDeploymentGeneration(session.boot_session_id[0..], generation);
+}
+
+fn isFirmwarePlaceholder(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "To Be Filled By O.E.M.") or std.ascii.eqlIgnoreCase(value, "Default string") or std.ascii.eqlIgnoreCase(value, "Unknown");
+}
+
 /// M4.2 F1：Subiquity/curtin 原生 webhook reporting 回调。
 /// curtin 的 `ReportingEvent.as_dict` 使用 `name`、`description`、
 /// `event_type` 和可选 `result` 字段，不是 NodeForge `/events` DTO 的
@@ -872,7 +1046,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
 /// Bootstrap 认证验证请求来源于活跃 boot session 的 DHCP lease IP，
 /// 这对隔离的 PXE 部署网络已足够。
 fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
-    const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
+    const checked = auth.authenticateWebhook(context.sessions, node_id, meta.client_ip, boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
     if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"body_too_large\",\"message\":\"subiquity report body too large\"}}\n", meta);
     try request.parseBody();
@@ -906,7 +1080,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
     const delivery_terminal = std.mem.eql(u8, stage, "completed");
     const mapped = mapStage(.install, stage) orelse return json(request, .ok, "{\"ok\":true}\n", meta);
     if (std.mem.eql(u8, stage, "started")) {
-        const consumed = context.deployments.consume(node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot consume install generation\"}}\n", meta);
+        const consumed = context.deployments.consumeAt(node_id, unixNow()) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot consume install generation\"}}\n", meta);
         deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
             if (consumed) |result| context.deployments.rollbackConsume(node_id, result);
             observe_log.err("deployment-control save failed: {t}", .{err});
@@ -914,7 +1088,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
         };
     }
     if (deployment_terminal) {
-        const terminal_result = context.deployments.markTerminal(node_id, std.mem.eql(u8, stage, "completed"));
+        const terminal_result = context.deployments.markTerminalAt(node_id, std.mem.eql(u8, stage, "completed"), unixNow());
         deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments) catch |err| {
             if (terminal_result) |result| context.deployments.rollbackTerminal(node_id, result);
             observe_log.err("deployment-control applied revision save failed: {t}", .{err});
@@ -1096,8 +1270,16 @@ fn persistStatus(context: *const RouteContext) bool {
     context.statuses.snapshot(&snapshot);
     while (!context.status_io_mutex.tryLock()) std.Thread.yield() catch {};
     defer context.status_io_mutex.unlock();
-    status_store.save(context.io, context.allocator, context.node_status_path, &snapshot, unixNow()) catch |err| {
+    status_store.save(context.io, context.allocator, context.node_status_path, &snapshot, context.statuses.currentRevision(), unixNow()) catch |err| {
         observe_log.err("status: persistence failed: {t}", .{err});
+        return false;
+    };
+    return true;
+}
+
+fn checkpointSessions(context: *const RouteContext) bool {
+    boot_session_store.save(context.io, context.allocator, paths.boot_sessions_path, context.sessions, unixNow()) catch |err| {
+        observe_log.err("boot-session: persistence failed: {t}", .{err});
         return false;
     };
     return true;
@@ -1127,6 +1309,8 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
         observe_log.err("asset: import failed for {s}: {t}", .{ path, err });
         return assetInputError(request, "unreadable asset", meta);
     };
+    context.models.lock();
+    defer context.models.unlock();
     context.catalog.addAsset(context.io, context.config, .{
         .name = name,
         .kind = kind,
@@ -1147,17 +1331,59 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
 /// 替换仅在完整候选存在后才被序列化。
 fn importInstallSource(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     const filename = request.getParamSlice("filename") orelse return assetInputError(request, "missing filename", meta);
+    const declared_sha256 = request.getParamSlice("sha256") orelse return assetInputError(request, "missing sha256", meta);
+    if (declared_sha256.len != 64 or !allLowerHex(declared_sha256)) return assetInputError(request, "invalid sha256", meta);
+    const name = request.getParamSlice("name");
+    if (name) |value| if (!config_validate.validLogicalId(value)) return assetInputError(request, "invalid logical name", meta);
     const distro = request.getParamSlice("distro");
     const version = request.getParamSlice("version");
     const arch_text = request.getParamSlice("arch");
     const arch = if (arch_text) |value| std.meta.stringToEnum(model.Arch, value) orelse return assetInputError(request, "invalid arch", meta) else null;
+    const idempotency_key = request.getHeader("idempotency-key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_key_required\",\"message\":\"Idempotency-Key header is required\"}}\n", meta);
+    var digest_buf: [32]u8 = undefined;
+    const digest_input = try std.fmt.allocPrint(context.allocator, "sha256={s}&name={s}&distro={s}&version={s}&arch={s}", .{ declared_sha256, name orelse "", distro orelse "", version orelse "", arch_text orelse "" });
+    defer context.allocator.free(digest_input);
+    std.crypto.hash.sha2.Sha256.hash(digest_input, &digest_buf, .{});
+    var digest_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&digest_hex, "{x}", .{digest_buf}) catch unreachable;
+    const begun = context.operations.beginRequest(context.io, idempotency_key, &digest_hex, .install_source_import, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"request.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for a different request\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create durable operation\"}}\n", meta);
+    operations.save(context.io, context.allocator, paths.operations_path, context.operations) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"operation.persist_failed\",\"message\":\"cannot persist operation\"}}\n", meta);
+    if (begun.reused) return operationResponse(request, begun.entry, true, meta);
+    var operation_done = false;
+    defer if (!operation_done) {
+        _ = context.operations.fail(begun.entry.idSlice(), "operation.failed", unixNow()) catch {};
+        operations.save(context.io, context.allocator, paths.operations_path, context.operations) catch {};
+    };
+    var input_hash: [64]u8 = undefined;
+    asset_validate.sha256File(context.io, paths.import_dir, filename, &input_hash) catch |err| return assetInputError(request, @errorName(err), meta);
+    if (!std.mem.eql(u8, &input_hash, declared_sha256)) return assetInputError(request, "ContentDigestMismatch", meta);
+    context.catalog.lock();
+    const catalog_snapshot = context.catalog.acquireLocked();
+    for (catalog_snapshot.value().assets) |asset| {
+        if (asset.kind != .iso or asset.sha256 == null or !std.mem.eql(u8, asset.sha256.?, &input_hash)) continue;
+        for (catalog_snapshot.value().install_sources) |source| if (std.mem.eql(u8, source.source_asset, asset.name)) {
+            catalog_snapshot.release();
+            context.catalog.unlock();
+            const completed = try context.operations.succeed(begun.entry.idSlice(), source.name, unixNow());
+            try operations.save(context.io, context.allocator, paths.operations_path, context.operations);
+            operation_done = true;
+            return operationResponse(request, completed, true, meta);
+        };
+    }
+    if (name) |requested_name| for (catalog_snapshot.value().install_sources) |source| if (std.mem.eql(u8, source.name, requested_name)) {
+        catalog_snapshot.release();
+        context.catalog.unlock();
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install_source.name_conflict\",\"message\":\"logical name already refers to different content\"}}\n", meta);
+    };
+    catalog_snapshot.release();
+    context.catalog.unlock();
     if (!iso_import_mutex.tryLock()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install_source.busy\",\"message\":\"another ISO import is running\"}}\n", meta);
     defer iso_import_mutex.unlock();
     var task: IsoImportTask = .{
         .io = context.io,
         .allocator = context.allocator,
         .config = context.config,
-        .request = .{ .filename = filename, .distro = distro, .version = version, .arch = arch },
+        .request = .{ .filename = filename, .name = name, .distro = distro, .version = version, .arch = arch },
     };
     const worker = std.Thread.spawn(.{}, runIsoImport, .{&task}) catch |err| {
         observe_log.err("ISO import worker could not start: {t}", .{err});
@@ -1169,6 +1395,8 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
         observe_log.err("ISO import failed: {t}", .{err});
         return assetInputError(request, @errorName(err), meta);
     };
+    context.models.lock();
+    defer context.models.unlock();
     context.catalog.publishInstallSource(context.io, context.config, imported) catch |err| {
         // importMedia 已经将不可变文件复制到受管根目录。
         // 被拒绝的候选不得积累不可访问的 public-root 孤儿文件
@@ -1177,9 +1405,167 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
         observe_log.err("ISO catalog publication failed: {t}", .{err});
         return assetInputError(request, @errorName(err), meta);
     };
-    var body: [256]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"install_source\":{f}}}}}\n", .{std.json.fmt(imported.source_name, .{})});
-    try json(request, .ok, rendered, meta);
+    const completed = try context.operations.succeed(begun.entry.idSlice(), imported.source_name, unixNow());
+    try operations.save(context.io, context.allocator, paths.operations_path, context.operations);
+    operation_done = true;
+    try operationResponse(request, completed, true, meta);
+}
+
+fn managementOperation(request: zap.Request, context: *const RouteContext, operation_id: []const u8, meta: RequestMeta) !void {
+    const operation = context.operations.get(operation_id, unixNow()) orelse return notFound(request, meta);
+    return operationResponse(request, operation, false, meta);
+}
+
+fn catalogMigrationPlan(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    if (request.body) |body| if (body.len != 0 and !std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "{}"))
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"request.unknown_field\",\"message\":\"migration plan currently accepts an empty object\"}}\n", meta);
+    var plan = catalog_migration.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"migration.plan_failed\",\"message\":\"cannot construct migration plan\"}}\n", meta);
+    defer plan.deinit();
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"applicable\":{s},\"plan\":", .{ std.json.fmt(&plan.digest, .{}), if (plan.applicable()) "true" else "false" });
+    try output.writer.writeAll(plan.canonical_json);
+    try output.writer.writeAll("}}\n");
+    return json(request, .created, output.written(), meta);
+}
+
+fn managementInstallSource(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const source = lookup.findInstallSource(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    const distro = lookup.findDistro(context.config, source.distro) orelse return notFound(request, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"install_source\":{f},\"family\":{f},\"repositories\":[", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(source.*, .{}), std.json.fmt(@tagName(distro.family), .{}) });
+    for (source.repositories, 0..) |repository_name, index| {
+        const repository = lookup.findRepository(context.catalog_snapshot.value(), repository_name) orelse return notFound(request, meta);
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("{f}", .{std.json.fmt(repository.*, .{})});
+    }
+    try output.writer.writeAll("],\"assets\":[");
+    const asset_names = [_][]const u8{ source.source_asset, source.installer_kernel, source.installer_initrd };
+    for (asset_names, 0..) |asset_name, index| {
+        const asset = lookup.findAsset(context.catalog_snapshot.value(), asset_name) orelse return notFound(request, meta);
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("{f}", .{std.json.fmt(asset.*, .{})});
+    }
+    try output.writer.writeAll("],\"profiles\":[");
+    var first = true;
+    for (context.config.profiles) |profile| if (profile.install_source) |source_name| if (std.mem.eql(u8, source_name, name)) {
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        try output.writer.print("{f}", .{std.json.fmt(profile.name, .{})});
+    };
+    try output.writer.writeAll("]}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+const MigrationApplyRequest = struct { plan_digest: []const u8 };
+
+fn catalogMigrationApply(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    const idempotency_key = request.getHeader("idempotency-key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_key_required\",\"message\":\"Idempotency-Key header is required\"}}\n", meta);
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"migration.invalid_request\",\"message\":\"missing request body\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(MigrationApplyRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"migration.invalid_request\",\"message\":\"invalid request body\"}}\n", meta);
+    defer parsed.deinit();
+    if (parsed.value.plan_digest.len != 64 or !allLowerHex(parsed.value.plan_digest)) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"migration.invalid_digest\",\"message\":\"plan_digest must be 64 lowercase hexadecimal characters\"}}\n", meta);
+    const begun = context.operations.beginRequest(context.io, idempotency_key, parsed.value.plan_digest, .catalog_migration, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"request.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for another migration\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create migration operation\"}}\n", meta);
+    try operations.save(context.io, context.allocator, paths.operations_path, context.operations);
+    if (begun.reused) return operationResponse(request, begun.entry, true, meta);
+    var operation_done = false;
+    defer if (!operation_done) {
+        _ = context.operations.fail(begun.entry.idSlice(), "migration.failed", unixNow()) catch {};
+        operations.save(context.io, context.allocator, paths.operations_path, context.operations) catch {};
+    };
+    context.models.lock();
+    defer context.models.unlock();
+    if (context.configs.currentRevision() != context.config_revision or context.catalog.currentRevision() != context.catalog_snapshot.revision)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"model.revision_conflict\",\"message\":\"model changed after migration plan was read\"}}\n", meta);
+    var plan = try catalog_migration.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision);
+    defer plan.deinit();
+    if (!std.mem.eql(u8, &plan.digest, parsed.value.plan_digest)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"model.revision_conflict\",\"message\":\"plan digest no longer identifies the current model\"}}\n", meta);
+    if (!plan.applicable()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"migration.blocked\",\"message\":\"migration plan contains blockers\"}}\n", meta);
+    for (plan.renames) |rename| if (context.sessions.hasActiveInstallSource(rename.source, boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"migration.active_session\",\"message\":\"an active boot session owns a source in this plan\"}}\n", meta);
+    if (plan.renames.len == 0) {
+        const completed = try context.operations.succeed(begun.entry.idSlice(), &plan.digest, unixNow());
+        try operations.save(context.io, context.allocator, paths.operations_path, context.operations);
+        operation_done = true;
+        return operationResponse(request, completed, true, meta);
+    }
+    var candidate = try catalog_migration.candidates(context.allocator, context.config, context.catalog_snapshot.value(), &plan);
+    defer candidate.deinit();
+    const config_json = try config_store.render(context.allocator, &candidate.config.value);
+    defer context.allocator.free(config_json);
+    const catalog_json = try catalog_store.render(context.allocator, &candidate.catalog.value);
+    defer context.allocator.free(catalog_json);
+    var moves = try migrationMoves(context.allocator, context.config, context.catalog_snapshot.value(), &candidate.catalog.value, &plan);
+    defer moves.deinit();
+    const config_revision = try deployment_control.revisionForConfig(context.allocator, &candidate.config.value);
+    const prepared_config = try context.configs.prepare(candidate.config.value, config_revision);
+    var snapshots_published = false;
+    defer if (!snapshots_published) prepared_config.release();
+    const prepared_catalog = try context.catalog.prepare(candidate.catalog.value, context.catalog_snapshot.revision + 1);
+    defer if (!snapshots_published) prepared_catalog.release();
+    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
+    defer context.allocator.free(transaction_dir);
+    model_transaction.commit(context.io, context.allocator, transaction_dir, &plan.digest, context.config_path, context.catalog.path, config_json, catalog_json, moves.items.items, null) catch |err| {
+        observe_log.err("catalog migration transaction failed: {t}", .{err});
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.transaction_failed\",\"message\":\"migration transaction did not commit\"}}\n", meta);
+    };
+    // All fallible snapshot allocation is complete before the durable commit.
+    // From here publication only swaps pointers while the model gate is held.
+    context.configs.publishPrepared(prepared_config);
+    context.catalog.lock();
+    context.catalog.publishPreparedLocked(prepared_catalog);
+    context.catalog.unlock();
+    snapshots_published = true;
+    const completed = try context.operations.succeed(begun.entry.idSlice(), &plan.digest, unixNow());
+    try operations.save(context.io, context.allocator, paths.operations_path, context.operations);
+    operation_done = true;
+    return operationResponse(request, completed, true, meta);
+}
+
+const MigrationMoves = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(model_transaction.Move) = .empty,
+    owned: std.ArrayList([]u8) = .empty,
+    fn deinit(self: *MigrationMoves) void {
+        for (self.owned.items) |value| self.allocator.free(value);
+        self.owned.deinit(self.allocator);
+        self.items.deinit(self.allocator);
+    }
+    fn add(self: *MigrationMoves, old: []u8, new: []u8) !void {
+        try self.owned.append(self.allocator, old);
+        errdefer _ = self.owned.pop();
+        try self.owned.append(self.allocator, new);
+        try self.items.append(self.allocator, .{ .old = old, .new = new });
+    }
+};
+
+fn migrationMoves(allocator: std.mem.Allocator, config: *const model.AppConfig, old_catalog: *const model.Catalog, new_catalog: *const model.Catalog, plan: *const catalog_migration.Plan) !MigrationMoves {
+    var result: MigrationMoves = .{ .allocator = allocator };
+    errdefer result.deinit();
+    for (plan.renames) |rename| {
+        try result.add(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.repository_root, rename.source }), try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.repository_root, rename.target }));
+        try result.add(try std.fmt.allocPrint(allocator, "{s}/install/{s}", .{ config.tftp.asset_root, rename.source }), try std.fmt.allocPrint(allocator, "{s}/install/{s}", .{ config.tftp.asset_root, rename.target }));
+    }
+    for (old_catalog.assets, new_catalog.assets) |old, new| {
+        if (old.kind != .iso or std.mem.eql(u8, old.path, new.path)) continue;
+        try result.add(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.asset_root, old.path }), try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.asset_root, new.path }));
+    }
+    return result;
+}
+
+fn allLowerHex(value: []const u8) bool {
+    for (value) |byte| if (!(std.ascii.isDigit(byte) or (byte >= 'a' and byte <= 'f'))) return false;
+    return true;
+}
+
+fn operationResponse(request: zap.Request, operation: operations.Entry, accepted: bool, meta: RequestMeta) !void {
+    var body: [768]u8 = undefined;
+    var location: [256]u8 = undefined;
+    const location_value = try std.fmt.bufPrint(&location, "/api/v1/management/operations/{s}", .{operation.idSlice()});
+    try request.setHeader("location", location_value);
+    const rendered = try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"id\":{f},\"kind\":{f},\"state\":{f},\"created_at\":{d},\"updated_at\":{d},\"result\":{f},\"error_code\":{f}}}}}\n", .{ std.json.fmt(operation.idSlice(), .{}), std.json.fmt(@tagName(operation.kind), .{}), std.json.fmt(@tagName(operation.state), .{}), operation.created_at, operation.updated_at, std.json.fmt(operation.resultSlice(), .{}), std.json.fmt(operation.errorSlice(), .{}) });
+    return json(request, if (accepted) .accepted else .ok, rendered, meta);
 }
 
 const IsoImportTask = struct {
@@ -1270,6 +1656,289 @@ fn runtimeSummary(request: zap.Request, context: *const RouteContext, meta: Requ
     try json(request, .ok, output.written(), meta);
 }
 
+const NodeAddRequest = struct {
+    id: []const u8,
+    mac: []const u8,
+    arch: model.Arch,
+    profile: []const u8,
+    ip: ?[]const u8 = null,
+    hostname: ?[]const u8 = null,
+    deploy: bool = true,
+    http_accel: bool = false,
+};
+
+const ConfigSetRequest = struct {
+    logging_level: ?model.LogLevel = null,
+    events_max_size_mb: ?u16 = null,
+    events_keep: ?u8 = null,
+    policy_default_action: ?model.DiscoveryAction = null,
+    policy_default_profile: ?[]const u8 = null,
+    policy_allow_unknown_diskless: ?bool = null,
+    server_http_port: ?u16 = null,
+    tftp_max_blksize: ?u16 = null,
+};
+
+fn managementConfigSet(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"config.invalid\",\"message\":\"missing request body\"}}\n", meta);
+    const parsed_patch = std.json.parseFromSlice(ConfigSetRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"config.invalid\",\"message\":\"invalid or restart-required config field\"}}\n", meta);
+    defer parsed_patch.deinit();
+    if (parsed_patch.value.server_http_port != null or parsed_patch.value.tftp_max_blksize != null) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"config.restart_required\",\"message\":\"requested field requires daemon restart\"}}\n", meta);
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    var parsed = config_load.load(context.io, context.allocator, context.config_path) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.load_failed\",\"message\":\"cannot load config\"}}\n", meta);
+    defer parsed.deinit();
+    var candidate = parsed.value;
+    if (parsed_patch.value.logging_level) |value| candidate.logging.level = value;
+    if (parsed_patch.value.events_max_size_mb) |value| candidate.events.max_size_mb = value;
+    if (parsed_patch.value.events_keep) |value| candidate.events.keep = value;
+    if (parsed_patch.value.policy_default_action) |value| candidate.policy.default_action = value;
+    if (parsed_patch.value.policy_default_profile) |value| candidate.policy.default_profile = value;
+    if (parsed_patch.value.policy_allow_unknown_diskless) |value| candidate.policy.allow_unknown_diskless = value;
+    config_validate.validateConfig(&candidate) catch |err| return validationError(request, err, meta);
+    const catalog_snapshot = context.catalog_snapshot;
+    config_validate.validate(&candidate, catalog_snapshot.value()) catch |err| return validationError(request, err, meta);
+    @import("../config/store.zig").save(context.io, context.allocator, context.config_path, &candidate) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.persist_failed\",\"message\":\"cannot persist config\"}}\n", meta);
+    const revision = deployment_control.revisionForConfig(context.allocator, &candidate) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.revision_failed\",\"message\":\"cannot compute revision\"}}\n", meta);
+    context.configs.publish(candidate, revision) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.publish_failed\",\"message\":\"cannot publish config snapshot\"}}\n", meta);
+    context.event_writer.configure(candidate.events.max_size_mb, candidate.events.keep);
+    observe_log.setLevel(candidate.logging.level);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
+}
+
+const NodeSetRequest = struct {
+    mac: ?[]const u8 = null,
+    arch: ?model.Arch = null,
+    profile: ?[]const u8 = null,
+    ip: ?[]const u8 = null,
+    hostname: ?[]const u8 = null,
+    deploy: ?bool = null,
+    http_accel: ?bool = null,
+    unset: []const []const u8 = &.{},
+};
+
+fn applyConfigFromDisk(context: *RouteContext) !void {
+    var parsed = try config_load.load(context.io, context.allocator, context.config_path);
+    defer parsed.deinit();
+    try config_validate.validateConfig(&parsed.value);
+    const catalog_snapshot = context.catalog_snapshot;
+    try config_validate.validate(&parsed.value, catalog_snapshot.value());
+    const revision = try deployment_control.revisionForConfig(context.allocator, &parsed.value);
+    try context.configs.publish(parsed.value, revision);
+    // This request remains pinned to its original snapshot. Subsequent requests
+    // acquire the newly published generation at route entry.
+    context.config_revision = revision;
+    for (context.config.nodes) |node| if (lookup.findProfile(context.config, node.profile)) |profile| if (profile.mode == .install) try context.deployments.ensureInitial(node.id, revision, unixNow());
+    try deployment_control.save(context.io, context.allocator, paths.deployment_control_path, context.deployments);
+}
+
+fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"missing request body\"}}\n", meta);
+    var parsed = std.json.parseFromSlice(NodeAddRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"invalid node properties\"}}\n", meta);
+    defer parsed.deinit();
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    const value = parsed.value;
+    node_mutation.addNode(context.io, context.allocator, context.config_path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .ip = value.ip, .hostname = value.hostname, .deploy = value.deploy, .http_accel = value.http_accel }) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.mutation_failed\",\"message\":\"node could not be added\"}}\n", meta);
+    applyConfigFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.publish_failed\",\"message\":\"node persisted but snapshot publish failed\"}}\n", meta);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
+}
+
+fn managementNodeSet(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"missing request body\"}}\n", meta);
+    var parsed = std.json.parseFromSlice(NodeSetRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"invalid node properties\"}}\n", meta);
+    defer parsed.deinit();
+    var clears_ip = false;
+    for (parsed.value.unset) |key| if (std.mem.eql(u8, key, "ip")) {
+        clears_ip = true;
+    };
+    const protected_change = parsed.value.mac != null or parsed.value.arch != null or parsed.value.profile != null or parsed.value.ip != null or clears_ip;
+    if (protected_change and context.sessions.hasActiveNode(node_id, boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.active_session_conflict\",\"message\":\"protected identity is pinned by an active boot session\"}}\n", meta);
+    var params: node_mutation.SetParams = .{ .mac = parsed.value.mac, .arch = parsed.value.arch, .profile = parsed.value.profile, .deploy = parsed.value.deploy, .http_accel = parsed.value.http_accel };
+    if (parsed.value.ip) |value| {
+        params.ip_set = true;
+        params.ip = value;
+    }
+    if (parsed.value.hostname) |value| {
+        params.hostname_set = true;
+        params.hostname = value;
+    }
+    for (parsed.value.unset) |key| {
+        if (std.mem.eql(u8, key, "ip")) {
+            params.ip_set = true;
+            params.ip = null;
+        } else if (std.mem.eql(u8, key, "hostname")) {
+            params.hostname_set = true;
+            params.hostname = null;
+        } else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_unset\",\"message\":\"only ip and hostname can be unset\"}}\n", meta);
+    }
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    node_mutation.setNode(context.io, context.allocator, context.config_path, node_id, params) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.mutation_failed\",\"message\":\"node could not be updated\"}}\n", meta);
+    applyConfigFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.publish_failed\",\"message\":\"node persisted but snapshot publish failed\"}}\n", meta);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
+}
+
+fn managementNodeRemove(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    if (context.sessions.hasActiveNode(node_id, boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.active_session_conflict\",\"message\":\"node is pinned by an active boot session\"}}\n", meta);
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    node_mutation.removeNode(context.io, context.allocator, context.config_path, node_id) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.mutation_failed\",\"message\":\"node could not be removed\"}}\n", meta);
+    applyConfigFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.publish_failed\",\"message\":\"node persisted but snapshot publish failed\"}}\n", meta);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
+}
+
+fn ifMatchCurrent(request: zap.Request, context: *RouteContext) bool {
+    const raw = request.getHeader("if-match") orelse return false;
+    const value = if (raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"') raw[1 .. raw.len - 1] else raw;
+    const expected = std.fmt.parseInt(u64, value, 10) catch return false;
+    return expected == context.configs.currentRevision();
+}
+
+fn revisionConflict(request: zap.Request, meta: RequestMeta) !void {
+    return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"config.revision_conflict\",\"message\":\"If-Match does not identify the current config revision\"}}\n", meta);
+}
+
+fn managementNodes(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"nodes\":[", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision() });
+    for (context.config.nodes, 0..) |node, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        const status = context.statuses.get(node.id);
+        const inventory = context.inventories.get(node.id);
+        try output.writer.print("{{\"id\":{f},\"mac\":{f},\"ip\":", .{ std.json.fmt(node.id, .{}), std.json.fmt(node.mac, .{}) });
+        if (node.ip) |ip| try output.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try output.writer.writeAll("null");
+        try output.writer.print(",\"profile\":{f},\"status\":", .{std.json.fmt(node.profile, .{})});
+        if (status) |value| try output.writer.print("{f}", .{std.json.fmt(@tagName(value.phase), .{})}) else try output.writer.writeAll("null");
+        // 部署开始/结束时间为 per-generation 生命周期时间戳：started_at 对应
+        // install.started，finished_at 对应首次 terminal；deployed_at 仅在成功
+        // completed 时更新。三者随 retry 重新武装而清零，见 deployment_control。
+        if (context.deployments.view(node.id)) |deployment| {
+            try output.writer.writeAll(",\"started_at\":");
+            if (deployment.started_at != 0) try output.writer.print("{d}", .{deployment.started_at}) else try output.writer.writeAll("null");
+            try output.writer.writeAll(",\"finished_at\":");
+            if (deployment.finished_at != 0) try output.writer.print("{d}", .{deployment.finished_at}) else try output.writer.writeAll("null");
+            try output.writer.writeAll(",\"deployed_at\":");
+            if (deployment.deployed_at != 0) try output.writer.print("{d}", .{deployment.deployed_at}) else try output.writer.writeAll("null");
+        } else try output.writer.writeAll(",\"started_at\":null,\"finished_at\":null,\"deployed_at\":null");
+        try output.writer.writeAll(",\"serial_number\":");
+        if (inventory) |value| if (value.serial_number) |serial| try output.writer.print("{f}", .{std.json.fmt(serial, .{})}) else try output.writer.writeAll("null") else try output.writer.writeAll("null");
+        try output.writer.writeByte('}');
+    }
+    try output.writer.writeAll("]}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementNode(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const node = lookup.findNode(context.config, node_id) orelse return notFound(request, meta);
+    const profile = lookup.findProfile(context.config, node.profile) orelse return notFound(request, meta);
+    const status = context.statuses.get(node_id);
+    const deployment = context.deployments.view(node_id);
+    const inventory = context.inventories.get(node_id);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{f},\"profile\":{{\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), std.json.fmt(node, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}) });
+    try writeEffectiveSystem(&output.writer, profile);
+    try output.writer.writeAll(",\"status\":");
+    if (status) |value| try output.writer.print("{{\"phase\":{f},\"boot_session_id\":{f},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}}}", .{
+        std.json.fmt(@tagName(value.phase), .{}),
+        std.json.fmt(value.boot_session_id[0..], .{}),
+        value.last_event_at,
+        if (value.last_error) "true" else "false",
+        std.json.fmt(value.reasonSlice(), .{}),
+        if (value.session_active) "true" else "false",
+    }) else try output.writer.writeAll("null");
+    try output.writer.writeAll(",\"deployment\":");
+    if (deployment) |value| try output.writer.print("{f}", .{std.json.fmt(value, .{})}) else try output.writer.writeAll("null");
+    try output.writer.writeAll(",\"inventory\":");
+    if (inventory) |value| try output.writer.print("{f}", .{std.json.fmt(value, .{})}) else try output.writer.writeAll("null");
+    try output.writer.writeAll("}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn writeEffectiveSystem(writer: *std.Io.Writer, profile: *const model.ProfileConfig) !void {
+    const system = @import("../profile/install.zig").effectiveSystem(profile) catch return error.InvalidEffectiveSystem;
+    try writer.print("{{\"localization\":{f},\"connectivity\":{f},\"ssh\":{{\"enabled\":{s},\"password_authentication\":{s},\"root_login\":{f},\"root_password_configured\":{s},\"root_authorized_key_count\":{d}}},\"security\":{f},\"users\":[", .{
+        std.json.fmt(system.localization, .{}),
+        std.json.fmt(system.connectivity, .{}),
+        if (system.ssh.enabled) "true" else "false",
+        if (system.ssh.password_authentication) "true" else "false",
+        std.json.fmt(@tagName(system.ssh.root_login), .{}),
+        if (system.ssh.root_password != null) "true" else "false",
+        system.ssh.root_authorized_keys.len,
+        std.json.fmt(system.security, .{}),
+    });
+    for (system.users, 0..) |user, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.print("{{\"name\":{f},\"sudo\":{s},\"password_configured\":{s},\"authorized_key_count\":{d}}}", .{ std.json.fmt(user.name, .{}), if (user.sudo) "true" else "false", if (user.password != null) "true" else "false", user.ssh_authorized_keys.len });
+    }
+    try writer.writeAll("],\"packages\":");
+    try std.json.Stringify.value(system.packages, .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn managementProfiles(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"profiles\":[");
+    for (context.config.profiles, 0..) |profile, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        var refs: usize = 0;
+        for (context.config.nodes) |node| if (std.mem.eql(u8, node.profile, profile.name)) {
+            refs += 1;
+        };
+        try output.writer.print("{{\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"install_source\":", .{ std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}) });
+        if (profile.install_source) |source| try output.writer.print("{f}", .{std.json.fmt(source, .{})}) else try output.writer.writeAll("null");
+        try output.writer.print(",\"nodes\":{d},\"valid\":true}}", .{refs});
+    }
+    try output.writer.writeAll("]}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementProfile(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const profile = lookup.findProfile(context.config, name) orelse return notFound(request, meta);
+    const distro = lookup.findDistro(context.config, profile.distro) orelse return notFound(request, meta);
+    const capability = lookup.findDistroVersion(context.config, profile.distro, profile.version, profile.arch) orelse return notFound(request, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"capability\":{{\"family\":{f},\"install_adapter\":{f},\"package_manager\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}), std.json.fmt(@tagName(distro.family), .{}), std.json.fmt(@tagName(capability.install_adapter), .{}), std.json.fmt(@tagName(capability.package_manager), .{}) });
+    try writeEffectiveSystem(&output.writer, profile);
+    try output.writer.writeAll(",\"install_source\":");
+    const catalog_snapshot = context.catalog_snapshot;
+    if (profile.install_source) |source_name| {
+        const source = lookup.findInstallSource(catalog_snapshot.value(), source_name) orelse return notFound(request, meta);
+        try output.writer.print("{f},\"assets\":[", .{std.json.fmt(source.*, .{})});
+        const asset_names = [_][]const u8{ source.source_asset, source.installer_kernel, source.installer_initrd };
+        for (asset_names, 0..) |asset_name, index| {
+            const asset = lookup.findAsset(catalog_snapshot.value(), asset_name) orelse return notFound(request, meta);
+            if (index != 0) try output.writer.writeByte(',');
+            try output.writer.print("{f}", .{std.json.fmt(asset.*, .{})});
+        }
+        try output.writer.writeByte(']');
+    } else try output.writer.writeAll("null,\"assets\":[]");
+    try output.writer.writeAll(",\"nodes\":[");
+    var first = true;
+    for (context.config.nodes) |node| if (std.mem.eql(u8, node.profile, name)) {
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        try output.writer.print("{f}", .{std.json.fmt(node.id, .{})});
+    };
+    try output.writer.writeAll("]}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
 fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const status = context.statuses.get(node_id) orelse return notFound(request, meta);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
@@ -1290,6 +1959,7 @@ fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node
             deployment.requested_at,
             std.json.fmt(@tagName(deployment.requested_by), .{}),
         });
+        try output.writer.print(",\"deployment_started_at\":{d},\"deployment_finished_at\":{d},\"deployed_at\":{d}", .{ deployment.started_at, deployment.finished_at, deployment.deployed_at });
     }
     try output.writer.writeAll("}}\n");
     try json(request, .ok, output.written(), meta);
@@ -1396,6 +2066,8 @@ fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, met
             var status_text: [4]u8 = undefined;
             var bytes_text: [20]u8 = undefined;
             var duration_text: [20]u8 = undefined;
+            // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
+            const traffic_class: []const u8 = if (std.mem.startsWith(u8, path, "/repos/")) "repository" else if (std.mem.startsWith(u8, path, "/images/")) "image" else if (std.mem.startsWith(u8, path, "/boot/")) "boot" else if (std.mem.startsWith(u8, path, "/rootfs/")) "rootfs" else "api";
             const fields = [_]events.Field{
                 .{ .key = "method", .value = method },
                 .{ .key = "path", .value = path },
@@ -1403,6 +2075,7 @@ fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, met
                 .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{body.len}) catch "0" },
                 .{ .key = "client_ip", .value = meta.client_ip },
                 .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
+                .{ .key = "traffic_class", .value = traffic_class },
             };
             context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "http.request", "HTTP request completed", &fields) catch |err|
                 observe_log.err("http: event append failed: {t}", .{err});

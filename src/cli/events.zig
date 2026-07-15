@@ -38,11 +38,6 @@ pub fn read(io: std.Io, allocator: std.mem.Allocator, base_path: []const u8, fil
         readFile(io, allocator, path, filters, rows, &count, &skipped) catch |err| if (err != error.FileNotFound) return err;
     }
     readFile(io, allocator, base_path, filters, rows, &count, &skipped) catch |err| if (err != error.FileNotFound) return err;
-    if (count > filters.limit) {
-        const start = count - filters.limit;
-        std.mem.copyForwards(events.ReadEvent, rows[0..filters.limit], rows[start..count]);
-        count = filters.limit;
-    }
     return .{ .count = count, .skipped = skipped };
 }
 
@@ -81,6 +76,18 @@ pub fn fieldsText(allocator: std.mem.Allocator, fields: []const events.Field) ![
     return output.toOwnedSlice();
 }
 
+/// 将事件时间戳归一化为人类可读的 RFC 3339 展示值。
+/// daemon 新写入的事件已是 RFC 3339，原样返回；仅 `unix:<seconds>` 这种
+/// 旧/紧凑格式被转换为 UTC 可视化时间，使 CLI 任何输出位置的时间展示一致。
+/// 解析失败时退回原值，绝不丢弃记录。
+pub fn displayTs(buffer: *[20]u8, ts: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, ts, events.unix_timestamp_prefix)) {
+        const seconds = std.fmt.parseInt(i64, ts[events.unix_timestamp_prefix.len..], 10) catch return ts;
+        return events.rfc3339FromUnix(buffer, seconds) catch ts;
+    }
+    return ts;
+}
+
 pub fn parseTime(value: []const u8) !i64 {
     if (std.mem.startsWith(u8, value, events.unix_timestamp_prefix)) return std.fmt.parseInt(i64, value[events.unix_timestamp_prefix.len..], 10);
     if (value.len != 20 or value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':' or value[19] != 'Z') return error.InvalidTimestamp;
@@ -113,10 +120,30 @@ fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, filters:
         };
         defer parsed.deinit();
         if (!matches(parsed.value, filters)) continue;
-        if (count.* == rows.len) return error.TooManyEvents;
-        rows[count.*] = try cloneEvent(allocator, parsed.value);
-        count.* += 1;
+        const capacity = @min(rows.len, filters.limit);
+        if (capacity == 0) continue;
+        const cloned = try cloneEvent(allocator, parsed.value);
+        if (count.* == capacity) {
+            freeEvent(allocator, rows[0]);
+            std.mem.copyForwards(events.ReadEvent, rows[0 .. capacity - 1], rows[1..capacity]);
+            rows[capacity - 1] = cloned;
+        } else {
+            rows[count.*] = cloned;
+            count.* += 1;
+        }
     }
+}
+
+pub fn freeEvent(allocator: std.mem.Allocator, event: events.ReadEvent) void {
+    allocator.free(event.ts);
+    allocator.free(event.type);
+    allocator.free(event.message);
+    for (event.fields) |field_value| {
+        allocator.free(field_value.key);
+        allocator.free(field_value.value);
+    }
+    allocator.free(event.fields);
+    if (event.node) |node_value| allocator.free(node_value);
 }
 
 fn cloneEvent(allocator: std.mem.Allocator, source: events.ReadEvent) !events.ReadEvent {
@@ -143,4 +170,24 @@ test "filters accept a session id only when present in fields" {
     };
     try std.testing.expect(matches(event, &.{ .session = "0123456789abcdef0123456789abcdef" }));
     try std.testing.expect(!matches(event, &.{ .session = "abcdef0123456789abcdef0123456789" }));
+}
+
+test "read keeps the newest bounded matches" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const relative_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(relative_root);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, relative_root, std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/events.jsonl", .{root});
+    defer std.testing.allocator.free(path);
+    try @import("../state/dhcp_store.zig").atomicWrite(std.testing.io, path, "{\"ts\":\"unix:1\",\"type\":\"one\",\"message\":\"\"}\n" ++
+        "{\"ts\":\"unix:2\",\"type\":\"two\",\"message\":\"\"}\n" ++
+        "{\"ts\":\"unix:3\",\"type\":\"three\",\"message\":\"\"}\n");
+    var rows: [2]events.ReadEvent = undefined;
+    const result = try read(std.testing.io, std.testing.allocator, path, &.{ .limit = 2 }, &rows);
+    defer for (rows[0..result.count]) |event| freeEvent(std.testing.allocator, event);
+    try std.testing.expectEqual(@as(usize, 2), result.count);
+    try std.testing.expectEqualStrings("two", rows[0].type);
+    try std.testing.expectEqualStrings("three", rows[1].type);
 }

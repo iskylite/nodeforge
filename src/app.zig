@@ -21,14 +21,20 @@ const tftp_server = @import("tftp/server.zig");
 const dhcp_server = @import("dhcp/server.zig");
 const runtime_state = @import("state/runtime.zig");
 const catalog_runtime = @import("state/catalog_runtime.zig");
+const config_runtime = @import("state/config_runtime.zig");
+const model_runtime = @import("state/model_runtime.zig");
 const observe_log = @import("observe/log.zig");
 const paths = @import("paths.zig");
 const dhcp_store = @import("state/dhcp_store.zig");
 const status_store = @import("state/status_store.zig");
 const events = @import("state/events.zig");
 const boot_session = @import("state/boot_session.zig");
+const boot_session_store = @import("state/boot_session_store.zig");
 const node_status = @import("state/node_status.zig");
 const deployment_control = @import("state/deployment_control.zig");
+const node_inventory = @import("state/node_inventory.zig");
+const operations = @import("state/operations.zig");
+const model_transaction = @import("state/model_transaction.zig");
 
 /// 启动 M1 TFTP 与唯一 HTTP listener。
 ///
@@ -41,6 +47,7 @@ pub fn run(
     io: std.Io,
     allocator: std.mem.Allocator,
     config: *const model.AppConfig,
+    config_path: []const u8,
     catalog: *const model.Catalog,
     catalog_path: []const u8,
 ) !void {
@@ -64,8 +71,34 @@ pub fn run(
     try boot_session.generateId(io, &daemon_instance_id);
     try event_writer.setDaemonInstanceId(daemon_instance_id);
     var sessions: boot_session.Store = .{};
+    const restored_sessions = boot_session_store.load(io, allocator, paths.boot_sessions_path, config, catalog, &sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
+        error.FileNotFound => 0,
+        else => {
+            observe_log.err("boot-session: refusing invalid checkpoint: {t}", .{err});
+            return err;
+        },
+    };
+    if (restored_sessions != 0) observe_log.info("boot-session: resumed {d} delivery session(s)", .{restored_sessions});
     var deployments: deployment_control.Store = .{};
+    var inventories = node_inventory.Store.init(allocator);
+    defer inventories.deinit();
+    node_inventory.load(io, allocator, paths.node_inventory_path, &inventories) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    var operation_store: operations.Store = .{};
+    operations.load(io, allocator, paths.operations_path, &operation_store, current_time) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    const transaction_dir = try model_transaction.directoryForConfig(allocator, config_path);
+    defer allocator.free(transaction_dir);
+    _ = try operations.reconcileMigrationRecovery(io, allocator, transaction_dir, &operation_store, current_time);
+    try operations.save(io, allocator, paths.operations_path, &operation_store);
+    try operations.clearMigrationRecoveryRecords(io, allocator, transaction_dir);
     const config_revision = try deployment_control.revisionForConfig(allocator, config);
+    var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);
+    defer live_config.deinit();
     deployment_control.load(io, allocator, paths.deployment_control_path, &deployments) catch |err| switch (err) {
         error.FileNotFound => {},
         else => {
@@ -117,16 +150,19 @@ pub fn run(
         .sessions = &sessions,
         .deployments = &deployments,
         .config_revision = config_revision,
+        .configs = &live_config,
     };
-    var live_catalog = catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
+    var live_catalog = try catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
+    defer live_catalog.deinit();
+    var live_models = model_runtime.ModelRuntime.init(&live_config, &live_catalog);
     // DHCP 需要 wildcard 接收 socket 以处理客户端广播。DHCP 服务器将配置的
     // PXE NIC 作为 Linux socket 级别的边界；TFTP 保持绑定在广告的 unicast 地址。
     const dhcp_socket = try dhcp_server.bind(io, config.server.server_ip, config.server.bind_interface);
     var stop_workers = std.atomic.Value(bool).init(false);
-    var dhcp_thread = try std.Thread.spawn(.{}, runDhcp, .{ io, dhcp_socket, config, &runtime, &persistence, &stop_workers });
+    var dhcp_thread = try std.Thread.spawn(.{}, runDhcp, .{ io, dhcp_socket, &live_config, &runtime, &persistence, &stop_workers });
     observe_log.info("dhcp: listening on udp://{s}:{d}", .{ config.server.server_ip, dhcp_server.port });
     const tftp_socket = try tftp_server.bind(io, config.server.server_ip);
-    var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, allocator, tftp_socket, config, &live_catalog, &runtime, &event_writer, &sessions, &stop_workers });
+    var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, allocator, tftp_socket, &live_models, &runtime, &event_writer, &sessions, &stop_workers });
     observe_log.info("tftp: listening on udp://{s}:{d}", .{ config.server.server_ip, tftp_server.port });
 
     // M3.1：启动 DHCP lease checkpoint worker。它是 leases.json 的唯一写入者，
@@ -145,20 +181,23 @@ pub fn run(
         allocator,
         "0.0.0.0",
         config.server.http_port,
-        config,
+        &live_config,
         &live_catalog,
+        &live_models,
         &runtime,
         &event_writer,
         &sessions,
         &statuses,
         &deployments,
+        &inventories,
+        &operation_store,
         config_revision,
         bootstrap_key,
         additional_keys,
         &daemon_instance_id,
         &status_io_mutex,
         paths.node_status_path,
-        paths.config_path,
+        config_path,
         &reload_requested,
     ) catch |err| {
         serve_error = err;
@@ -194,6 +233,11 @@ pub fn run(
     checkpoint_flush_stop.store(true, .release);
     checkpoint_thread.join();
 
+    // 已签发 capability 的 delivery session 在有序重启前保存到权限为 0600
+    // 的 checkpoint；下一实例继续使用同一 token 和 session 身份。
+    boot_session_store.save(io, allocator, paths.boot_sessions_path, &sessions, now()) catch |err|
+        observe_log.err("boot-session: checkpoint failed: {t}", .{err});
+
     // worker 已退出后才终止活动 session，确保不会再有 DHCP/TFTP 事件引用它们；
     // 每个 session 仍单独写审计终态，随后才写全局 service.stopped。
     var terminated: [boot_session.max_sessions]boot_session.Session = undefined;
@@ -206,7 +250,7 @@ pub fn run(
         statuses.snapshot(&status_snapshot);
         while (!status_io_mutex.tryLock()) std.Thread.yield() catch {};
         defer status_io_mutex.unlock();
-        status_store.save(io, allocator, paths.node_status_path, &status_snapshot, now()) catch |err|
+        status_store.save(io, allocator, paths.node_status_path, &status_snapshot, statuses.currentRevision(), now()) catch |err|
             observe_log.err("status: final persistence failed: {t}", .{err});
     }
 
@@ -308,21 +352,20 @@ fn runCheckpoint(
     }
 }
 
-fn runDhcp(io: std.Io, socket: std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: *const dhcp_server.Persistence, stop: *const std.atomic.Value(bool)) void {
-    dhcp_server.serveSocket(io, socket, config, runtime, persistence, stop) catch |err| observe_log.err("dhcp: stopped: {t}", .{err});
+fn runDhcp(io: std.Io, socket: std.Io.net.Socket, configs: *config_runtime.ConfigRuntime, runtime: *runtime_state.RuntimeState, persistence: *const dhcp_server.Persistence, stop: *const std.atomic.Value(bool)) void {
+    dhcp_server.serveSocket(io, socket, configs, runtime, persistence, stop) catch |err| observe_log.err("dhcp: stopped: {t}", .{err});
 }
 
 fn runTftp(
     io: std.Io,
     allocator: std.mem.Allocator,
     socket: std.Io.net.Socket,
-    config: *const model.AppConfig,
-    catalog: *catalog_runtime.CatalogRuntime,
+    models: *model_runtime.ModelRuntime,
     runtime: *runtime_state.RuntimeState,
     event_writer: *events.Writer,
     sessions: *boot_session.Store,
     stop: *const std.atomic.Value(bool),
 ) void {
-    tftp_server.serveSocket(io, allocator, socket, config, catalog, runtime, event_writer, sessions, stop) catch |err|
+    tftp_server.serveSocket(io, allocator, socket, models, runtime, event_writer, sessions, stop) catch |err|
         observe_log.err("tftp: stopped: {t}", .{err});
 }

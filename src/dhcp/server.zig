@@ -18,6 +18,7 @@ const runtime_state = @import("../state/runtime.zig");
 const boot_session = @import("../state/boot_session.zig");
 const events = @import("../state/events.zig");
 const deployment_control = @import("../state/deployment_control.zig");
+const config_runtime = @import("../state/config_runtime.zig");
 const observe_log = @import("../observe/log.zig");
 const paths = @import("../paths.zig");
 const log = std.log.scoped(.dhcp);
@@ -60,19 +61,24 @@ pub const Persistence = struct {
     /// daemon 已校验配置快照的稳定摘要。待执行的破坏性 generation
     /// 只能在此精确 revision 上启动。
     config_revision: u64 = 0,
+    configs: ?*config_runtime.ConfigRuntime = null,
 };
+
+fn persistenceRevision(value: *const Persistence) u64 {
+    return if (value.configs) |configs| configs.currentRevision() else value.config_revision;
+}
 
 /// 在同一 UDP worker 中处理 DHCP 和 session 生命周期。
 ///
 /// DISCOVER/REQUEST 才会创建或刷新 session；RELEASE/DECLINE 仅撤销其 lease-IP
 /// 关联。这样不会把客户端的释放包误解为新的启动尝试，并让之后的 TFTP 只能按
 /// 已 ACK 的唯一 IP 找到 session。
-pub fn serveSocket(io: std.Io, owned: std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence, stop: ?*const std.atomic.Value(bool)) !void {
+pub fn serveSocket(io: std.Io, owned: std.Io.net.Socket, configs: *config_runtime.ConfigRuntime, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned;
     defer socket.close(io);
-    try serveSocketOn(io, &socket, config, runtime, persistence, stop);
+    try serveSocketOn(io, &socket, configs, runtime, persistence, stop);
 }
-pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence, stop: ?*const std.atomic.Value(bool)) !void {
+pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, configs: *config_runtime.ConfigRuntime, runtime: *runtime_state.RuntimeState, persistence: ?*const Persistence, stop: ?*const std.atomic.Value(bool)) !void {
     while (true) {
         if (if (stop) |flag| flag.load(.acquire) else false) return;
         var bytes: [1500]u8 = undefined;
@@ -87,6 +93,9 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, config: *const mode
             log.debug("dropped malformed packet: {t}", .{err});
             continue;
         };
+        const config_snapshot = configs.acquire();
+        defer config_snapshot.release();
+        const config = config_snapshot.value();
         expireSessions(io, persistence);
         var session_link: ?boot_session.Link = null;
         const request_kind = request.message_type orelse .inform;
@@ -147,7 +156,8 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
     };
     if (!always or !deployments.canAutoRearm(node_id)) return;
     const requested_at = now();
-    const rearm = deployments.rearm(node_id, p.config_revision, requested_at, .policy_always) catch |err| {
+    const revision = persistenceRevision(p);
+    const rearm = deployments.rearm(node_id, revision, requested_at, .policy_always) catch |err| {
         observe_log.err("dhcp: automatic install generation unavailable: {t}", .{err});
         return;
     };
@@ -163,7 +173,7 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
     const fields = [_]events.Field{
         .{ .key = "node_id", .value = node_id },
         .{ .key = "generation", .value = std.fmt.bufPrint(&generation_text, "{d}", .{rearm.generation}) catch "0" },
-        .{ .key = "config_revision", .value = std.fmt.bufPrint(&revision_text, "{d}", .{p.config_revision}) catch "0" },
+        .{ .key = "config_revision", .value = std.fmt.bufPrint(&revision_text, "{d}", .{revision}) catch "0" },
         .{ .key = "requested_at", .value = std.fmt.bufPrint(&requested_at_text, "{d}", .{requested_at}) catch "0" },
         .{ .key = "requested_by", .value = "policy_always" },
     };
@@ -177,7 +187,7 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
 fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, persistence: ?*const Persistence, session_link: ?*const boot_session.Link) ?packet.Reply {
     var attempts: usize = 0;
     while (attempts < runtime_state.DhcpState.max_leases) : (attempts += 1) {
-        const revision = if (persistence) |p| p.config_revision else 0;
+        const revision = if (persistence) |p| persistenceRevision(p) else 0;
         const decision = resolver.resolveWithDeployment(config, if (persistence) |p| p.deployments else null, revision, request.mac(), request.architecture);
         // M4.2 F9: boot-gate 事件状态转换去重。
         //
@@ -191,7 +201,7 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
         // 详见 src/state/runtime.zig BootGateSuppressor 文档注释。
         if (decision.node_id) |node_id| {
             if (runtime.dhcp.gate_suppressor.shouldEmit(node_id, decision.install_not_armed, decision.deploy_disabled)) {
-                if (decision.install_not_armed) emitInstallNotArmed(io, persistence, node_id);
+                if (decision.install_not_armed) emitInstallNotArmed(io, persistence, node_id, if (persistence) |p| p.deployments else null, revision);
                 if (decision.deploy_disabled) emitDeployDisabled(io, persistence, node_id);
             }
         }
@@ -223,17 +233,60 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
     return null;
 }
 
-/// 为因无匹配已武装 generation 而被暂停的节点发出 `boot.install_not_armed` 事件。
+/// 为因无匹配已武装 generation 而被暂停的节点发出 `boot.install_not_armed` 事件
+/// 和 warn 级服务日志。
 ///
 /// 这是服务端诊断事件：被暂停的节点不存在 boot session，
 /// 因此不携带任何凭据或 answer 数据。该事件有意在审计记录中可见，
 /// 以便操作员了解 PXE 被拒绝的原因。
 ///
+/// M4.3-06：事件增加 `armed_generation`、`terminal_generation`、
+/// `requested_revision`、`desired_revision` 和 `next_action` 字段，
+/// 同时输出 warn 级服务日志，使操作员无需查询事件流即可发现暂停原因。
+///
 /// M4.2 F9：调用由 `offerAfterProbe` 中的 `BootGateSuppressor.shouldEmit`
 /// 控制，防止重复 DHCP 包导致事件泛滥。
-fn emitInstallNotArmed(io: std.Io, persistence: ?*const Persistence, node_id: []const u8) void {
+fn emitInstallNotArmed(io: std.Io, persistence: ?*const Persistence, node_id: []const u8, deployments: ?*deployment_control.Store, desired_revision: u64) void {
     const p = persistence orelse return;
-    const fields = [_]events.Field{.{ .key = "node_id", .value = node_id }};
+    // 读取 deployment control 的只读投影。节点未在 deployment store 中登记时
+    // 使用全零默认值，使日志输出稳定且安全——不暴露 store 内部状态。
+    const empty_view = deployment_control.View{
+        .next_generation = 0,
+        .armed_generation = null,
+        .consumed_generation = null,
+        .terminal_generation = null,
+        .requested_revision = 0,
+        .applied_revision = 0,
+        .requested_at = 0,
+        .started_at = 0,
+        .finished_at = 0,
+        .deployed_at = 0,
+        .requested_by = .initial,
+    };
+    const view = if (deployments) |d| d.view(node_id) orelse empty_view else empty_view;
+    var armed_gen_buf: [24]u8 = undefined;
+    var terminal_gen_buf: [24]u8 = undefined;
+    var req_rev_buf: [24]u8 = undefined;
+    var desired_rev_buf: [24]u8 = undefined;
+    // M4.3-06 §8.2：armed_generation/terminal_generation 为 null 时显示 0，
+    // 使操作员能区分“从未 arm”与“已 arm 但已 terminal”两种状态。
+    const armed_gen_text = std.fmt.bufPrint(&armed_gen_buf, "{d}", .{view.armed_generation orelse 0}) catch "0";
+    const terminal_gen_text = std.fmt.bufPrint(&terminal_gen_buf, "{d}", .{view.terminal_generation orelse 0}) catch "0";
+    // requested_revision 是已武装 generation 锁定的 config revision；
+    // desired_revision 是当前请求使用的 revision。两者不等说明
+    // 配置在 arm 后发生了变更，需要重新 arm 才能匹配新计划。
+    const req_rev_text = std.fmt.bufPrint(&req_rev_buf, "{d}", .{view.requested_revision}) catch "0";
+    const desired_rev_text = std.fmt.bufPrint(&desired_rev_buf, "{d}", .{desired_revision}) catch "0";
+    const next_action = "nodeforge node retry <node_id>";
+    const fields = [_]events.Field{
+        .{ .key = "node_id", .value = node_id },
+        .{ .key = "armed_generation", .value = armed_gen_text },
+        .{ .key = "terminal_generation", .value = terminal_gen_text },
+        .{ .key = "requested_revision", .value = req_rev_text },
+        .{ .key = "desired_revision", .value = desired_rev_text },
+        .{ .key = "next_action", .value = next_action },
+    };
+    observe_log.warn("dhcp: PXE withheld for {s}: install_not_armed (armed_generation={s}, terminal_generation={s}, requested_revision={s}, desired_revision={s})", .{ node_id, armed_gen_text, terminal_gen_text, req_rev_text, desired_rev_text });
     p.writer.appendWithFields(io, p.allocator, p.events_path, "boot.install_not_armed", "install profile held: no matching armed generation", &fields) catch |err|
         observe_log.err("dhcp: install-not-armed event append failed: {t}", .{err});
 }
@@ -384,7 +437,7 @@ fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const m
     // 被暂停的破坏性 profile 仍需获得诊断 DHCP lease，
     // 但不能获取携带 capability 的 boot session。这样的 session
     // 会使安全的 `install retry` 操作返回 409，即使从未服务过安装器。
-    const decision = resolver.resolveWithDeployment(config, p.deployments, p.config_revision, request.mac(), request.architecture);
+    const decision = resolver.resolveWithDeployment(config, p.deployments, persistenceRevision(p), request.mac(), request.architecture);
     if (decision.install_not_armed) return null;
     const result = p.sessions.acquireDhcp(io, .{
         .mac = request.mac(),
@@ -392,6 +445,7 @@ fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const m
         .node_id = decision.node_id,
         .profile = decision.profile,
         .mode = decision.mode,
+        .model_revision = persistenceRevision(p),
     }, boot_session.monotonicNow(), now()) catch |err| {
         observe_log.warn("dhcp: boot session allocation unavailable: {t}", .{err});
         return .capacity_exhausted;
@@ -427,11 +481,11 @@ pub fn emitSessionTermination(io: std.Io, persistence: *const Persistence, sessi
         .{ .key = "", .value = "" },
     };
     var count: usize = 5;
-    if (session.node_id) |node_id| {
+    if (session.nodeId()) |node_id| {
         fields[count] = .{ .key = "node_id", .value = node_id };
         count += 1;
     }
-    if (session.profile) |profile| {
+    if (session.profileName()) |profile| {
         fields[count] = .{ .key = "profile", .value = profile };
         count += 1;
     }

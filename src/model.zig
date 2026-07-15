@@ -91,11 +91,10 @@ pub const TftpConfig = struct {
     windowsize: u16 = 4,
     /// 服务端提供并作为上限的最大 TFTP 块大小（RFC 2348 blksize option）。
     /// 默认 1468 是以太网 MTU 最优值：1500 − 20 (IP) − 8 (UDP) − 4 (TFTP)，
-    /// 使每个 DATA 包恰好填满一个以太网帧而不触发 IP 分片（约为 RFC 1350
-    /// 默认 512 字节的 3 倍）。两种用法：(1) §7.4 当客户端省略 blksize 时在
-    /// OACK 中主动建议此值；(2) 将客户端请求的 blksize 向下限制到此值
-    ///（RFC 2348 允许返回更小的值）。jumbo-frame 链路可调高，受限链路调低。
-    /// 必须 ≥ 8。
+    /// 使每个 DATA 包恰好填满一个以太网帧而不触发 IP 分片。它只作为客户端
+    /// 明确请求 blksize 时的服务端上限；OACK 不增加未请求的 option，也不把
+    /// 客户端请求值放大。jumbo-frame 链路可调高，受限链路调低。
+    /// 必须在 RFC 2348 允许的 8..65464 范围内。
     max_blksize: u16 = 1468,
     /// M4.2 F4: 每个客户端的最大并发 TFTP 传输数。
     /// 每个 RRQ 启动一个独立线程，拥有自己的 TID socket。
@@ -260,6 +259,8 @@ pub const InstallSourceConfig = struct {
     installer_kernel: []const u8,
     /// 安装器 initrd 资产名称；必须指向 kind 为 `installer_initrd` 的资产。
     installer_initrd: []const u8,
+    /// 受管安装媒体树 URL；它不代表可由包管理器消费的 repository。
+    media_tree_url: ?[]const u8 = null,
     /// 关联仓库名称列表；每个名称必须能在 catalog.repositories 中找到。
     repositories: []const []const u8 = &.{},
 };

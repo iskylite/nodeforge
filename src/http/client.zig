@@ -42,6 +42,9 @@ pub const AssetImport = struct {
 pub const InstallSourceImport = struct {
     /// 已暂存到 import_dir 的 ISO 文件名（不含路径前缀），由 CLI 生成。
     filename: []const u8,
+    content_sha256: []const u8,
+    idempotency_key: []const u8,
+    name: ?[]const u8 = null,
     /// 可选的发行版断言；daemon 从 ISO 元数据检测后与之比对。
     distro: ?[]const u8 = null,
     /// 可选的版本断言；daemon 从 ISO 元数据检测后与之比对。
@@ -144,6 +147,86 @@ pub fn dhcpLeasesJson(io: std.Io, port: u16, unknown_only: bool, output: []u8) !
     return managementJson(io, port, if (unknown_only) "/api/v1/management/dhcp/unknown" else "/api/v1/management/dhcp/leases", output);
 }
 
+pub fn nodesJson(io: std.Io, port: u16, node_id: ?[]const u8, output: []u8) !?[]const u8 {
+    var path_buffer: [256]u8 = undefined;
+    const path = if (node_id) |id| std.fmt.bufPrint(&path_buffer, "/api/v1/management/nodes/{s}", .{id}) catch return error.InvalidNodeId else "/api/v1/management/nodes";
+    return managementJson(io, port, path, output);
+}
+
+pub fn profilesJson(io: std.Io, port: u16, name: ?[]const u8, output: []u8) !?[]const u8 {
+    var path_buffer: [256]u8 = undefined;
+    const path = if (name) |id| std.fmt.bufPrint(&path_buffer, "/api/v1/management/profiles/{s}", .{id}) catch return error.InvalidProfileName else "/api/v1/management/profiles";
+    return managementJson(io, port, path, output);
+}
+
+pub fn installSourceJson(io: std.Io, port: u16, name: []const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(name)) return error.InvalidInstallSourceName;
+    var path: [256]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&path, "/api/v1/management/install-sources/{s}", .{name});
+    return managementJson(io, port, rendered, output);
+}
+
+pub fn catalogMigrationPlanJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    return managementPostJson(io, port, "/api/v1/management/catalog/migration-plans", "{}", null, output);
+}
+
+pub fn catalogMigrationApplyJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
+    if (digest.len != 64 or !querySafe(digest)) return error.InvalidPlanDigest;
+    var body: [96]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&body, "{{\"plan_digest\":{f}}}", .{std.json.fmt(digest, .{})});
+    return managementPostJson(io, port, "/api/v1/management/catalog/migrations", rendered, digest, output);
+}
+
+pub fn nodeAdd(io: std.Io, port: u16, body: []const u8) Status {
+    const revision = managementRevision(io, port) orelse return .{ .reachable = true, .healthy = false };
+    return managementMutation(io, port, "POST", "/api/v1/management/nodes", body, revision);
+}
+
+pub fn nodeSet(io: std.Io, port: u16, node_id: []const u8, body: []const u8) Status {
+    if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
+    var path: [256]u8 = undefined;
+    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}", .{node_id}) catch return .{ .reachable = false, .healthy = false };
+    const revision = managementRevision(io, port) orelse return .{ .reachable = true, .healthy = false };
+    return managementMutation(io, port, "PATCH", value, body, revision);
+}
+
+pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8) Status {
+    if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
+    var path: [256]u8 = undefined;
+    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}", .{node_id}) catch return .{ .reachable = false, .healthy = false };
+    const revision = managementRevision(io, port) orelse return .{ .reachable = true, .healthy = false };
+    return managementMutation(io, port, "DELETE", value, "", revision);
+}
+
+pub fn configSet(io: std.Io, port: u16, body: []const u8) Status {
+    const revision = managementRevision(io, port) orelse return .{ .reachable = true, .healthy = false };
+    return managementMutation(io, port, "PATCH", "/api/v1/management/config", body, revision);
+}
+
+fn managementMutation(io: std.Io, port: u16, method: []const u8, path: []const u8, body: []const u8, revision: u64) Status {
+    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return .{ .reachable = false, .healthy = false };
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return .{ .reachable = false, .healthy = false };
+    defer stream.close(io);
+    var send_buffer: [4096]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    writer.interface.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nIf-Match: \"{d}\"\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ method, path, revision, body.len, body }) catch return .{ .reachable = true, .healthy = false };
+    writer.interface.flush() catch return .{ .reachable = true, .healthy = false };
+    var recv_buffer: [2048]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    const status_line = reader.interface.takeDelimiterInclusive('\n') catch return .{ .reachable = true, .healthy = false };
+    return .{ .reachable = true, .healthy = std.mem.findPosLinear(u8, status_line, 0, " 200 ") != null };
+}
+
+fn managementRevision(io: std.Io, port: u16) ?u64 {
+    var buffer: [128 * 1024]u8 = undefined;
+    const maybe_body = managementJson(io, port, "/api/v1/management/nodes", &buffer) catch return null;
+    const body = maybe_body orelse return null;
+    const Response = struct { result: struct { view_revision: struct { config: u64 } } };
+    const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.result.view_revision.config;
+}
+
 fn managementJson(io: std.Io, port: u16, path: []const u8, output: []u8) !?[]const u8 {
     const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return null;
     var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return null;
@@ -164,6 +247,30 @@ fn managementJson(io: std.Io, port: u16, path: []const u8, output: []u8) !?[]con
     if (body.len > output.len) return error.ResponseTooLarge;
     @memcpy(output[0..body.len], body);
     return output[0..body.len];
+}
+
+fn managementPostJson(io: std.Io, port: u16, path: []const u8, body: []const u8, idempotency_key: ?[]const u8, output: []u8) !?[]const u8 {
+    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return null;
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return null;
+    defer stream.close(io);
+    var send_buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    try writer.interface.print("POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n", .{path});
+    if (idempotency_key) |key| try writer.interface.print("Idempotency-Key: {s}\r\n", .{key});
+    try writer.interface.print("Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
+    try writer.interface.flush();
+    var recv_buffer: [12 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    const status_line = reader.interface.takeDelimiterInclusive('\n') catch return null;
+    if (std.mem.findPosLinear(u8, status_line, 0, " 200 ") == null and std.mem.findPosLinear(u8, status_line, 0, " 201 ") == null and std.mem.findPosLinear(u8, status_line, 0, " 202 ") == null) return null;
+    while (true) {
+        const line = reader.interface.takeDelimiterInclusive('\n') catch return null;
+        if (std.mem.eql(u8, line, "\r\n") or std.mem.eql(u8, line, "\n")) break;
+    }
+    const response_body = reader.interface.takeDelimiterInclusive('\n') catch return null;
+    if (response_body.len > output.len) return error.ResponseTooLarge;
+    @memcpy(output[0..response_body.len], response_body);
+    return output[0..response_body.len];
 }
 
 /// 请求 daemon 导入资产并写入 catalog。
@@ -207,8 +314,8 @@ pub fn importAsset(io: std.Io, port: u16, asset: AssetImport) !bool {
 /// 发送，参数放在 query string 中，Content-Length 为 0。
 /// 返回 `true` 表示 daemon 接受了导入（HTTP 200），`false` 表示拒绝或连接失败。
 pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) !bool {
-    if (!querySafe(request.filename)) return error.InvalidInstallSourceField;
-    inline for ([_]?[]const u8{ request.distro, request.version, request.arch }) |optional|
+    if (!querySafe(request.filename) or request.content_sha256.len != 64 or request.idempotency_key.len == 0 or request.idempotency_key.len > 128 or !querySafe(request.idempotency_key)) return error.InvalidInstallSourceField;
+    inline for ([_]?[]const u8{ request.name, request.distro, request.version, request.arch }) |optional|
         if (optional) |value|
             if (!querySafe(value)) return error.InvalidInstallSourceField;
     const address = try std.Io.net.IpAddress.parseIp4(management.client_ip, port);
@@ -216,16 +323,17 @@ pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) 
     defer stream.close(io);
     var send_buffer: [2048]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
-    try writer.interface.print("POST /api/v1/management/install-sources/import?filename={s}", .{request.filename});
+    try writer.interface.print("POST /api/v1/management/install-sources?filename={s}&sha256={s}", .{ request.filename, request.content_sha256 });
+    if (request.name) |value| try writer.interface.print("&name={s}", .{value});
     if (request.distro) |value| try writer.interface.print("&distro={s}", .{value});
     if (request.version) |value| try writer.interface.print("&version={s}", .{value});
     if (request.arch) |value| try writer.interface.print("&arch={s}", .{value});
-    try writer.interface.writeAll(" HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    try writer.interface.print(" HTTP/1.1\r\nHost: 127.0.0.1\r\nIdempotency-Key: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{request.idempotency_key});
     try writer.interface.flush();
     var recv_buffer: [1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
     const status = reader.interface.takeDelimiterInclusive('\n') catch return false;
-    return std.mem.findPosLinear(u8, status, 0, " 200 ") != null;
+    return std.mem.findPosLinear(u8, status, 0, " 200 ") != null or std.mem.findPosLinear(u8, status, 0, " 202 ") != null;
 }
 
 /// 检查值是否可安全嵌入 HTTP query string。

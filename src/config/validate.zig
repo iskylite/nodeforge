@@ -36,6 +36,7 @@ pub const ValidationError = error{
     DhcpPoolOrder,
     NodeOutsideDhcpSubnet,
     EmptyObjectName,
+    InvalidLogicalId,
     DuplicateObjectName,
     UnsupportedDistroTuple,
     DistroAdapterMismatch,
@@ -113,7 +114,7 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     if (config.tftp.asset_root.len == 0) return error.EmptyTftpAssetRoot;
     // M4.2 F4：校验 TFTP 性能配置
     if (config.tftp.max_concurrent_transfers > 64) return error.InvalidTftpConcurrency;
-    if (config.tftp.max_blksize < 8) return error.InvalidTftpBlksize;
+    if (config.tftp.max_blksize < 8 or config.tftp.max_blksize > 65464) return error.InvalidTftpBlksize;
     try validateObservability(config);
     try validateDhcp(&config.dhcp);
     try uniqueNamed(model.DistroConfig, config.distros);
@@ -170,9 +171,27 @@ pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Cat
 fn uniqueNamed(comptime T: type, items: []const T) ValidationError!void {
     for (items, 0..) |item, i| {
         if (item.name.len == 0) return error.EmptyObjectName;
+        if (!validLogicalId(item.name)) return error.InvalidLogicalId;
         for (items[i + 1 ..]) |other|
             if (std.mem.eql(u8, item.name, other.name)) return error.DuplicateObjectName;
     }
+}
+
+pub fn validLogicalId(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128 or !std.ascii.isAlphanumeric(value[0]) or !std.ascii.isAlphanumeric(value[value.len - 1])) return false;
+    for (value) |byte| {
+        if (std.ascii.isUpper(byte)) return false;
+        if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '.' or byte == '_' or byte == '-')) return false;
+    }
+    return !std.mem.eql(u8, value, ".") and !std.mem.eql(u8, value, "..");
+}
+
+test "M4.3 logical ids are canonical path-safe lowercase ASCII" {
+    try std.testing.expect(validLogicalId("kylin-v10-aarch64-dvd"));
+    try std.testing.expect(validLogicalId("rocky_9.7-aarch64"));
+    try std.testing.expect(!validLogicalId("Rocky-9"));
+    try std.testing.expect(!validLogicalId("../rocky"));
+    try std.testing.expect(!validLogicalId("岩石-9"));
 }
 
 fn validateDistros(config: *const model.AppConfig) ValidationError!void {

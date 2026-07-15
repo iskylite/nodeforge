@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const model = @import("../model.zig");
+const lookup = @import("../catalog.zig");
 const paths = @import("../paths.zig");
 const assets = @import("../assets/validate.zig");
 
@@ -23,6 +24,7 @@ const assets = @import("../assets/validate.zig");
 /// 如果提供的断言值与检测结果不一致，导入被拒绝（error.MediaTupleMismatch）。
 pub const Request = struct {
     filename: []const u8,
+    name: ?[]const u8 = null,
     /// 可选的操作员断言。导入器从可信媒体元数据检测三元组，
     /// 并拒绝与提供值不一致的断言。
     distro: ?[]const u8 = null,
@@ -102,7 +104,7 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     try unmountIso(io, allocator, mount_point);
     mounted = false;
 
-    const source_name = try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-iso", .{ detected.distro, detected.version, @tagName(detected.arch) });
+    const source_name = if (request.name) |name| try allocator.dupe(u8, name) else try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-iso", .{ detected.distro, detected.version, @tagName(detected.arch) });
     const iso_rel = try allocator.dupe(u8, request.filename);
     const kernel_rel = try std.fmt.allocPrint(allocator, "install/{s}/vmlinuz", .{source_name});
     const initrd_rel = try std.fmt.allocPrint(allocator, "install/{s}/initrd.img", .{source_name});
@@ -137,7 +139,8 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     try copyFileNoClobber(io, allocator, input, iso_destination, &iso_created);
     try copyFileNoClobber(io, allocator, mounted_kernel, kernel_destination, &kernel_created);
     try copyFileNoClobber(io, allocator, mounted_initrd, initrd_destination, &initrd_created);
-    if (media.repository_base != null) try copyTreeNoClobber(io, allocator, staged_repo, repo_destination, &repository_created);
+    // 媒体树始终发布；是否同时暴露为 package repository 由 metadata 完整性决定。
+    try copyTreeNoClobber(io, allocator, staged_repo, repo_destination, &repository_created);
 
     var iso_hash: [64]u8 = undefined;
     var kernel_hash: [64]u8 = undefined;
@@ -153,14 +156,16 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     } else &.{};
     const distro_name = try allocator.dupe(u8, detected.distro);
     const distro_version = try allocator.dupe(u8, detected.version);
+    const version_capability = lookup.findDistroVersion(config, detected.distro, detected.version, detected.arch) orelse return error.MediaTupleMismatch;
+    const media_tree_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}/repos/{s}", .{ config.server.server_ip, config.server.http_port, source_name });
     const result: Result = .{
         .source_name = source_name,
         .source_label = detected.source_label,
         .iso_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .kind = .iso, .path = iso_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &iso_hash) },
         .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
         .initrd_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .kind = .installer_initrd, .path = initrd_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &initrd_hash) },
-        .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = if (std.mem.eql(u8, detected.distro, "rocky")) .dnf else .apt, .base_url = if (base.len == 0) try std.fmt.allocPrint(allocator, "http://{s}:{d}/repos/{s}", .{ config.server.server_ip, config.server.http_port, source_name }) else try std.fmt.allocPrint(allocator, "http://{s}:{d}/repos/{s}/{s}", .{ config.server.server_ip, config.server.http_port, source_name, base }) } else null,
-        .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .repositories = repository_names },
+        .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = version_capability.package_manager, .base_url = if (base.len == 0) try allocator.dupe(u8, media_tree_url) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base }) } else null,
+        .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names },
     };
     retain_outputs = true;
     return result;
@@ -178,7 +183,7 @@ pub fn cleanupPublishedOutputs(io: std.Io, allocator: std.mem.Allocator, config:
     defer allocator.free(initrd);
     const repository = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.repository_root, result.source_name }) catch return;
     defer allocator.free(repository);
-    removeOutputPaths(io, allocator, iso, kernel, initrd, repository, result.repository != null);
+    removeOutputPaths(io, allocator, iso, kernel, initrd, repository, true);
 }
 
 fn removeOutputPaths(io: std.Io, allocator: std.mem.Allocator, iso: []const u8, kernel: []const u8, initrd: []const u8, repository: []const u8, has_repository: bool) void {
@@ -210,6 +215,7 @@ const MediaLayout = struct {
 
 /// 检测到的媒体信息。包含从 ISO 元数据提取的 distro/version/arch 和媒体布局。
 const DetectedMedia = struct {
+    family: model.DistroFamily,
     distro: []const u8,
     version: []const u8,
     arch: model.Arch,
@@ -276,17 +282,22 @@ fn detectRockyMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []con
     else
         try std.fmt.allocPrint(allocator, "{s}/repodata/repomd.xml", .{repository_path});
     defer allocator.free(repomd_path);
-    _ = try assets.verifyRegularFile(io, mount_point, repomd_path);
     const family = rhelFamily(treeinfo) orelse return error.MediaTupleMismatch;
+    const distro = distroForRhelFamily(family) orelse return error.MediaTupleMismatch;
+    const has_repository = blk: {
+        _ = assets.verifyRegularFile(io, mount_point, repomd_path) catch break :blk false;
+        break :blk true;
+    };
     const version = valueFor(treeinfo, "version") orelse return error.MediaMetadataMissing;
     const arch_text = valueFor(treeinfo, "arch") orelse return error.MediaMetadataMissing;
     const arch = std.meta.stringToEnum(model.Arch, arch_text) orelse return error.UnsupportedImportArchitecture;
     return .{
-        .distro = "rocky",
+        .family = .rhel,
+        .distro = distro,
         .version = try allocator.dupe(u8, version),
         .arch = arch,
         .source_label = try allocator.dupe(u8, family),
-        .layout = .{ .kernel_path = "images/pxeboot/vmlinuz", .initrd_path = "images/pxeboot/initrd.img", .repository_base = try allocator.dupe(u8, repository_path) },
+        .layout = .{ .kernel_path = "images/pxeboot/vmlinuz", .initrd_path = "images/pxeboot/initrd.img", .repository_base = if (has_repository) try allocator.dupe(u8, repository_path) else null },
     };
 }
 
@@ -332,16 +343,36 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
     // ubuntuRepositoryComplete 检测 ISO 是否有完整 APT metadata（dists/pool/Release）。
     // 检测结果保留用于诊断，但不再决定是否创建 repository——Ubuntu ISO 始终创建。
     const has_repository = try ubuntuRepositoryComplete(io, allocator, mount_point, tuple.version, tuple.arch);
-    _ = has_repository;
     return .{
+        .family = .ubuntu,
         .distro = "ubuntu",
         .version = try allocator.dupe(u8, tuple.version),
         .arch = tuple.arch,
         // Ubuntu ISO 始终以根目录作为 repository_base（空字符串表示根）。
         // 即使 ISO 没有 dists/pool，发布 ISO 内容仍能让 apt 快速失败
         // 而非挂起在 DNS 超时上。
-        .layout = .{ .kernel_path = "casper/vmlinuz", .initrd_path = "casper/initrd", .repository_base = "" },
+        .layout = .{ .kernel_path = "casper/vmlinuz", .initrd_path = "casper/initrd", .repository_base = if (has_repository) "" else null },
     };
+}
+
+fn distroForRhelFamily(family: []const u8) ?[]const u8 {
+    const mappings = [_]struct { prefix: []const u8, distro: []const u8 }{
+        .{ .prefix = "Rocky", .distro = "rocky" },
+        .{ .prefix = "CentOS", .distro = "centos" },
+        .{ .prefix = "AlmaLinux", .distro = "alma" },
+        .{ .prefix = "Red Hat Enterprise Linux", .distro = "rhel" },
+        .{ .prefix = "Kylin Linux Advanced Server", .distro = "kylin" },
+        .{ .prefix = "Kylin", .distro = "kylin" },
+        .{ .prefix = "openEuler", .distro = "openeuler" },
+        .{ .prefix = "TencentOS", .distro = "tencentos" },
+        .{ .prefix = "AnolisOS", .distro = "anolis" },
+        .{ .prefix = "UnionTech", .distro = "uos" },
+        .{ .prefix = "UOS", .distro = "uos" },
+        .{ .prefix = "Sugon OS", .distro = "sugon" },
+        .{ .prefix = "BigCloud-Enterprise-Linux", .distro = "bclinux" },
+    };
+    for (mappings) |mapping| if (std.mem.startsWith(u8, family, mapping.prefix)) return mapping.distro;
+    return null;
 }
 
 /// 检查 `casper/` 目录中是否存在至少一个 `.squashfs` 文件。
@@ -584,10 +615,10 @@ test "Ubuntu disk metadata detects the profile tuple without CLI flags" {
     const tuple = parseUbuntuDiskInfo("Ubuntu-Server 22.04.5 LTS \"Jammy Jellyfish\" - Release arm64 (20230810)").?;
     try std.testing.expectEqualStrings("22.04", tuple.version);
     try std.testing.expectEqual(model.Arch.aarch64, tuple.arch);
-    var detected: DetectedMedia = .{ .distro = "ubuntu", .version = tuple.version, .arch = tuple.arch, .layout = undefined };
+    var detected: DetectedMedia = .{ .family = .ubuntu, .distro = "ubuntu", .version = tuple.version, .arch = tuple.arch, .layout = undefined };
     applyRequestedTuple(.{ .filename = "fixture.iso" }, &detected);
     try std.testing.expectEqualStrings("ubuntu", detected.distro);
-    var overridden: DetectedMedia = .{ .distro = "ubuntu", .version = tuple.version, .arch = tuple.arch, .layout = undefined };
+    var overridden: DetectedMedia = .{ .family = .ubuntu, .distro = "ubuntu", .version = tuple.version, .arch = tuple.arch, .layout = undefined };
     applyRequestedTuple(.{ .filename = "fixture.iso", .distro = "rocky" }, &overridden);
     try std.testing.expectEqualStrings("rocky", overridden.distro);
 }

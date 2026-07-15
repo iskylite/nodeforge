@@ -17,6 +17,8 @@ const std = @import("std");
 const model = @import("../model.zig");
 const lookup = @import("../catalog.zig");
 const catalog_runtime = @import("../state/catalog_runtime.zig");
+const model_runtime = @import("../state/model_runtime.zig");
+const config_runtime = @import("../state/config_runtime.zig");
 const packet = @import("packet.zig");
 const runtime_state = @import("../state/runtime.zig");
 const events = @import("../state/events.zig");
@@ -43,9 +45,11 @@ const max_retries: u8 = 5;
 ///
 /// `config` 提供 TFTP asset root 路径；`catalog` 提供资产白名单快照；
 /// `runtime` 记录会话计数和活动列表。三者必须在 `serve` 的整个生命周期内保持有效。
-pub fn serve(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
-    const socket = try bind(io, config.server.server_ip);
-    try serveSocket(io, allocator, socket, config, catalog, runtime, event_writer, sessions, stop);
+pub fn serve(io: std.Io, allocator: std.mem.Allocator, models: *model_runtime.ModelRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
+    const pair = models.acquire();
+    defer pair.release();
+    const socket = try bind(io, pair.config.value().server.server_ip);
+    try serveSocket(io, allocator, socket, models, runtime, event_writer, sessions, stop);
 }
 
 /// 绑定固定 UDP 69；供 daemon 在启动其他 listener 前确认 TFTP 可用。
@@ -60,7 +64,7 @@ pub fn bind(io: std.Io, server_ip: []const u8) !std.Io.net.Socket {
 /// 主循环只负责接收和分发。`max_concurrent_transfers <= 1` 保留串行模式；
 /// 大于 1 时为每个 RRQ 启动有界 worker，worker 使用复制后的 datagram，绝不
 /// 借用下一轮 receive 会覆盖的栈缓冲区。
-pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
+pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, models: *model_runtime.ModelRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned_socket;
     defer socket.close(io);
     var active_transfers = std.atomic.Value(u8).init(0);
@@ -80,26 +84,33 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
         };
         switch (message) {
             .rrq => |request| {
+                const pair = models.acquire();
+                const config = pair.config.value();
                 const limit = config.tftp.max_concurrent_transfers;
                 if (limit <= 1) {
-                    try handleRrq(io, allocator, incoming.from, request, config, catalog, runtime, event_writer, sessions);
+                    defer pair.release();
+                    try handleRrq(io, allocator, incoming.from, request, config, pair.catalog, runtime, event_writer, sessions);
                     continue;
                 }
                 if (!reserveTransferSlot(&active_transfers, limit)) {
+                    pair.release();
                     try sendError(&socket, io, &incoming.from, .undefined, "server busy, retry later");
                     continue;
                 }
                 const datagram = allocator.dupe(u8, incoming.data) catch |err| {
+                    pair.release();
                     _ = active_transfers.fetchSub(1, .acq_rel);
                     return err;
                 };
                 const context = allocator.create(TransferWorker) catch |err| {
+                    pair.release();
                     allocator.free(datagram);
                     _ = active_transfers.fetchSub(1, .acq_rel);
                     return err;
                 };
-                context.* = .{ .io = io, .allocator = allocator, .datagram = datagram, .remote = incoming.from, .config = config, .catalog = catalog, .runtime = runtime, .event_writer = event_writer, .sessions = sessions, .active = &active_transfers };
+                context.* = .{ .io = io, .allocator = allocator, .datagram = datagram, .remote = incoming.from, .pair = pair, .runtime = runtime, .event_writer = event_writer, .sessions = sessions, .active = &active_transfers };
                 const thread = std.Thread.spawn(.{}, runTransferWorker, .{context}) catch |err| {
+                    pair.release();
                     _ = active_transfers.fetchSub(1, .acq_rel);
                     allocator.free(datagram);
                     allocator.destroy(context);
@@ -128,8 +139,7 @@ const TransferWorker = struct {
     allocator: std.mem.Allocator,
     datagram: []u8,
     remote: std.Io.net.IpAddress,
-    config: *const model.AppConfig,
-    catalog: *catalog_runtime.CatalogRuntime,
+    pair: model_runtime.Pair,
     runtime: *runtime_state.RuntimeState,
     event_writer: ?*events.Writer,
     sessions: ?*boot_session.Store,
@@ -141,25 +151,28 @@ fn runTransferWorker(context: *TransferWorker) void {
     defer _ = context.active.fetchSub(1, .acq_rel);
     defer context.allocator.destroy(context);
     defer context.allocator.free(context.datagram);
+    defer context.pair.release();
     var options: [max_options]packet.Option = undefined;
     const message = packet.parse(context.datagram, &options) catch return;
     const request = switch (message) {
         .rrq => |value| value,
         else => return,
     };
-    handleRrq(context.io, context.allocator, context.remote, request, context.config, context.catalog, context.runtime, context.event_writer, context.sessions) catch |err|
+    handleRrq(context.io, context.allocator, context.remote, request, context.pair.config.value(), context.pair.catalog, context.runtime, context.event_writer, context.sessions) catch |err|
         observe_log.err("tftp: worker failed: {t}", .{err});
 }
 
-fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddress, request: packet.Request, config: *const model.AppConfig, catalog: *catalog_runtime.CatalogRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store) !void {
+fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddress, request: packet.Request, config: *const model.AppConfig, catalog: *const catalog_runtime.Snapshot, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store) !void {
     const session = runtime.tftp.begin(request.filename);
     var session_link: ?boot_session.Link = null;
     if (sessions) |store| session_link = store.associateTftp(clientIpv4(&remote) orelse 0, boot_session.monotonicNow(), now());
+    var linked_node_buffer: [96]u8 = undefined;
+    const linked_node_id = if (session_link) |link| if (sessions) |store| store.copyLinkedNodeId(link, &linked_node_buffer) else null else null;
     if (session_link) |*link| {
         if (link.id()) |id| log.info("RRQ {s} session={s}", .{ request.filename, id }) else log.warn("RRQ {s} session_link_state={s}", .{ request.filename, link.state().? });
     } else log.info("RRQ {s}", .{request.filename});
     const started = std.Io.Clock.awake.now(io);
-    emit(event_writer, io, allocator, &remote, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, if (session_link) |*link| link else null);
+    emit(event_writer, io, allocator, &remote, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, linked_node_id, if (session_link) |*link| link else null);
 
     const is_virtual = isVirtualGrubConfig(request.filename);
     const bytes_sent = if (is_virtual)
@@ -170,7 +183,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
                 error.BootAccessDenied, error.BootTargetUnavailable, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected virtual config {s} from {f}: {t}", .{ request.filename, remote, err }),
                 else => observe_log.err("tftp: virtual config transfer failed for {s}: {t}", .{ request.filename, err }),
             }
-            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
             const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
                 error.BootAccessDenied => .{ .code = .access_violation, .message = "boot configuration requires an active DHCP lease" },
                 error.BootTargetUnavailable => .{ .code = .access_violation, .message = "boot configuration unavailable for this node" },
@@ -179,16 +192,16 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
             };
             try sendEphemeralError(io, &remote, response.code, response.message);
             return;
-       }
-      else
-           transfer(io, &remote, request, config.tftp.asset_root, catalog, config.tftp.windowsize, config.tftp.max_blksize) catch |err| {
-           runtime.tftp.finish(session, false);
+        }
+    else
+        transfer(io, &remote, request, config.tftp.asset_root, catalog, config.tftp.windowsize, config.tftp.max_blksize) catch |err| {
+            runtime.tftp.finish(session, false);
             if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
             switch (err) {
                 error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, remote, err }),
                 else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
             }
-            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
             const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
                 error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
                 error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
@@ -203,7 +216,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
     if (session_link) |*link| {
         if (link.id()) |boot_id| observe_log.info("tftp: transfer completed {s} ({d} bytes) session={s}", .{ request.filename, bytes_sent, boot_id }) else observe_log.info("tftp: transfer completed {s} ({d} bytes) session_link_state={s}", .{ request.filename, bytes_sent, link.state().? });
     } else observe_log.info("tftp: transfer completed {s} ({d} bytes)", .{ request.filename, bytes_sent });
-    emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), if (session_link) |*link| link else null);
+    emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
 }
 
 fn sendEphemeralError(io: std.Io, remote: *const std.Io.net.IpAddress, code: packet.ErrorCode, message: []const u8) !void {
@@ -281,7 +294,7 @@ fn transferVirtualConfig(
     remote: *const std.Io.net.IpAddress,
     request: packet.Request,
     config: *const model.AppConfig,
-    catalog: *catalog_runtime.CatalogRuntime,
+    catalog: *const catalog_runtime.Snapshot,
     sessions: ?*boot_session.Store,
 ) !u64 {
     if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
@@ -291,16 +304,14 @@ fn transferVirtualConfig(
     const identity = store.resolveTftpBoot(client_ip, boot_session.monotonicNow()) orelse return error.BootAccessDenied;
 
     var cmdline_buf: [512]u8 = undefined;
-    catalog.lock();
     var config_buf: [2048]u8 = undefined;
     var kernel_grub: [256]u8 = undefined;
     var initrd_grub: [256]u8 = undefined;
     const rendered = blk: {
-        defer catalog.unlock();
         // 在 catalog 锁内解析 boot target 并渲染 GRUB 配置。
         // 渲染结果写入栈缓冲区，在 TFTP I/O 开始前就已完成自包含，
         // 因此慢速客户端不会长时间持有 catalog mutex。
-        const target = boot_target.resolve(identity, config, &catalog.value, config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
+        const target = boot_target.resolve(identity, config, catalog.value(), config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
         const node = lookup.findNode(config, identity.node_id) orelse return error.BootTargetUnavailable;
         // M4.2 F4：node.http_accel 是实验性功能（默认 false）。
         // 启用时，initrd 路径渲染为 GRUB HTTP URL
@@ -420,8 +431,8 @@ fn transfer(
     remote: *const std.Io.net.IpAddress,
     request: packet.Request,
     asset_root: []const u8,
-   catalog: *catalog_runtime.CatalogRuntime,
-   max_windowsize: u16,
+    catalog: *const catalog_runtime.Snapshot,
+    max_windowsize: u16,
     max_blksize: u16,
 ) !u64 {
     if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
@@ -618,13 +629,13 @@ fn negotiate(options: []const packet.Option, file_size: u64, max_windowsize: u16
     var settings: Settings = .{};
     for (options) |option| {
         if (std.ascii.eqlIgnoreCase(option.name, "blksize")) {
-           const value = std.fmt.parseInt(u16, option.value, 10) catch return error.InvalidOption;
-           if (value < 8 or value > max_block_size) return error.InvalidOption;
+            const value = std.fmt.parseInt(u16, option.value, 10) catch return error.InvalidOption;
+            if (value < 8 or value > max_block_size) return error.InvalidOption;
             // blksize 升级：当客户端请求的 blksize 小于 max_blksize（默认 1468）时，
             // 服务端在 OACK 中返回 max_blksize。RFC 2347 §1 规定客户端 SHOULD 接受
             // 服务端返回的值。GRUB 2.06 兼容此行为，吞吐提升 ~48%（1024→1468）。
             // 客户端请求更大块时 clamp 到 max_blksize 避免 UDP 分片。
-            settings.block_size = if (value < max_blksize) max_blksize else @min(value, max_blksize);
+            settings.block_size = @min(value, max_blksize);
             settings.use_blksize = true;
         } else if (std.ascii.eqlIgnoreCase(option.name, "timeout")) {
             const value = std.fmt.parseInt(u8, option.value, 10) catch return error.InvalidOption;
@@ -642,15 +653,6 @@ fn negotiate(options: []const packet.Option, file_size: u64, max_windowsize: u16
             settings.windowsize = if (max_windowsize > 0) @min(value, max_windowsize) else value;
             settings.use_windowsize = max_windowsize > 0;
         }
-    }
-    // §7.4 主动建议：客户端发送了至少一个已识别 option（证明支持 RFC 2347 option
-    // extension）但未发送 blksize 时，在 OACK 中建议 Ethernet MTU 最优块大小，
-    // 将默认 512 字节/块升级到 1468，吞吐提升约 3 倍。不覆盖客户端显式发送的
-    // blksize（此时 use_blksize 已在循环中置位），也不对零 option 客户端触发
-    // （hasOptions() 为假，避免向不期望 OACK 的客户端发送）。
-   if (!settings.use_blksize and settings.hasOptions()) {
-        settings.block_size = max_blksize;
-        settings.use_blksize = true;
     }
     return settings;
 }
@@ -723,20 +725,25 @@ fn sendError(socket: *std.Io.net.Socket, io: std.Io, remote: *const std.Io.net.I
 ///
 /// 关联结果在传输开始时确定，同一 RRQ 的 success/error 事件复用它；传输期间
 /// 不重新查询 Store，避免 session 过期或新 lease 把一条传输拆到不同 session。
-fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remote: *const std.Io.net.IpAddress, filename: []const u8, event_type: []const u8, message: []const u8, bytes_sent: u64, duration_us: i64, session_link: ?*const boot_session.Link) void {
+fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remote: *const std.Io.net.IpAddress, filename: []const u8, event_type: []const u8, message: []const u8, bytes_sent: u64, duration_us: i64, node_id: ?[]const u8, session_link: ?*const boot_session.Link) void {
     const target = writer orelse return;
     var bytes_text: [20]u8 = undefined;
     var duration_text: [20]u8 = undefined;
     var client_ip: [64]u8 = undefined;
-    var fields: [6]events.Field = .{
+    var fields: [7]events.Field = .{
         .{ .key = "filename", .value = filename },
         .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{bytes_sent}) catch "0" },
         .{ .key = "client_ip", .value = std.fmt.bufPrint(&client_ip, "{f}", .{remote}) catch "unknown" },
         .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
         .{ .key = "", .value = "" },
         .{ .key = "", .value = "" },
+        .{ .key = "", .value = "" },
     };
     var count: usize = 4;
+    if (node_id) |id| {
+        fields[count] = .{ .key = "node_id", .value = id };
+        count += 1;
+    }
     if (session_link) |link| {
         if (link.id()) |id| {
             fields[count] = .{ .key = "boot_session_id", .value = id };
@@ -779,8 +786,9 @@ pub fn isSafeRelativePath(path: []const u8) bool {
 /// 检查路径是否在当前 catalog 的资产清单中。
 /// 只有同时通过路径安全检查和 catalog 白名单的文件才可被 TFTP 提供。
 /// catalog 的锁在 `containsAssetPath` 内部获取和释放。
-fn isManifestPath(catalog: *catalog_runtime.CatalogRuntime, path: []const u8) bool {
-    return catalog.containsAssetPath(path);
+fn isManifestPath(catalog: *const catalog_runtime.Snapshot, path: []const u8) bool {
+    for (catalog.value().assets) |asset| if (std.mem.eql(u8, asset.path, path)) return true;
+    return false;
 }
 
 test "rejects unsafe TFTP paths" {
@@ -833,23 +841,19 @@ test "M4.2 F4 concurrent transfer limit rejects excess RRQ" {
     try std.testing.expect(reserveTransferSlot(&active, 2));
 }
 
-test "§7.4 proactively suggests blksize=1468 when client omits it" {
-    // 客户端发送了已识别 option（tsize=0）但省略 blksize。
-    // 服务端在 OACK 中主动建议 blksize=1468（吞吐提升约 3 倍）。
+test "OACK only includes explicitly requested options" {
     const opts = [_]packet.Option{
         .{ .name = "tsize", .value = "0" },
     };
     const s = try negotiate(&opts, 65536, 4, 1468);
-    try std.testing.expect(s.use_blksize);
-    try std.testing.expectEqual(@as(usize, 1468), s.block_size);
+    try std.testing.expect(!s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 512), s.block_size);
     try std.testing.expect(s.use_tsize);
     var values: [4][20]u8 = undefined;
     var options: [4]packet.Option = undefined;
     const oack = s.oackOptions(65536, &values, &options);
-    try std.testing.expectEqual(@as(usize, 2), oack.len);
-    try std.testing.expectEqualStrings("blksize", oack[0].name);
-    try std.testing.expectEqualStrings("1468", oack[0].value);
-    try std.testing.expectEqualStrings("tsize", oack[1].name);
+    try std.testing.expectEqual(@as(usize, 1), oack.len);
+    try std.testing.expectEqualStrings("tsize", oack[0].name);
 }
 
 test "§7.4 no proactive blksize when client sends no options" {
@@ -874,15 +878,14 @@ test "§7.4 no proactive blksize when client sends only an unknown option" {
     try std.testing.expect(!s.hasOptions());
 }
 
-test "§7.4 server upgrades client's explicit blksize" {
-    // 客户端发送 blksize=1024 -> 服务端升级到 1468（max_blksize）。
+test "server preserves client blksize below configured maximum" {
     const opts = [_]packet.Option{
         .{ .name = "blksize", .value = "1024" },
         .{ .name = "tsize", .value = "0" },
     };
     const s = try negotiate(&opts, 4096, 4, 1468);
     try std.testing.expect(s.use_blksize);
-    try std.testing.expectEqual(@as(usize, 1468), s.block_size);
+    try std.testing.expectEqual(@as(usize, 1024), s.block_size);
 }
 
 test "blksize clamps down to server max_blksize" {
@@ -896,27 +899,22 @@ test "blksize clamps down to server max_blksize" {
     try std.testing.expectEqual(@as(usize, 1468), s.block_size);
 }
 
-test "blksize upgrades sub-optimal client value to max_blksize" {
-    // 客户端请求 1024（< 服务端最大 1468）-> 升级到 1468。
-    // RFC 2347 §1：客户端 SHOULD 接受 OACK 中服务端建议的值。
-    // GRUB 2.06 兼容；吞吐提升约 48%（2.5→3.7 MB/s）。
+test "blksize never exceeds client request" {
     const opts = [_]packet.Option{
         .{ .name = "blksize", .value = "1024" },
     };
     const s = try negotiate(&opts, 65536, 4, 1468);
     try std.testing.expect(s.use_blksize);
-    try std.testing.expectEqual(@as(usize, 1468), s.block_size);
+    try std.testing.expectEqual(@as(usize, 1024), s.block_size);
 }
 
-test "§7.4 proactive suggestion uses configured max_blksize" {
-    // 当 max_blksize 被调优（如 jumbo frame 用 8192）时，
-    // 主动建议该值而非默认 1468。
+test "OACK does not add unrequested blksize" {
     const opts = [_]packet.Option{
         .{ .name = "tsize", .value = "0" },
     };
     const s = try negotiate(&opts, 65536, 4, 8192);
-    try std.testing.expect(s.use_blksize);
-    try std.testing.expectEqual(@as(usize, 8192), s.block_size);
+    try std.testing.expect(!s.use_blksize);
+    try std.testing.expectEqual(@as(usize, 512), s.block_size);
 }
 
 test "identifies virtual GRUB config filenames" {

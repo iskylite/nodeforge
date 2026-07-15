@@ -1,7 +1,4 @@
-//! daemon 持有的可变 catalog 快照。
-//!
-//! 所有 catalog 写入都经由本类型：先构造候选快照、完整校验、原子落盘，最后替换内存视图。
-//! TFTP 与 HTTP 读取只在锁内取得短生命周期的数据，避免读取到半更新 slice。
+//! Ref-counted immutable catalog generations owned by the daemon.
 
 const std = @import("std");
 const model = @import("../model.zig");
@@ -9,98 +6,141 @@ const catalog_store = @import("../catalog/store.zig");
 const validate = @import("../config/validate.zig");
 const iso_import = @import("../catalog/iso_import.zig");
 
-pub const CatalogRuntime = struct {
+pub const Snapshot = struct {
     allocator: std.mem.Allocator,
-    path: []const u8,
-    value: model.Catalog,
-    // 此锁保护 catalog 发布，同时 UDP 和 HTTP worker 读取它。
-    // `atomic.Mutex` 是同步的，因此不会将 catalog 读取耦合到
-    // daemon 的特定 `std.Io` 后端。
-    mutex: std.atomic.Mutex = .unlocked,
+    parsed: std.json.Parsed(model.Catalog),
+    revision: u64,
+    refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 
-    pub fn init(allocator: std.mem.Allocator, path: []const u8, initial: *const model.Catalog) CatalogRuntime {
-        return .{ .allocator = allocator, .path = path, .value = initial.* };
-    }
-
-    /// 获取短期 catalog 发布锁。catalog 操作只复制元数据并原子替换小型 JSON 文件，
-    /// 因此基于 yield 的自旋锁使同步 HTTP/UDP 接口独立于 Io 循环。
-    pub fn lock(self: *CatalogRuntime) void {
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
-    }
-
-    /// 释放由 `lock` 获取的 catalog 发布锁。
-    pub fn unlock(self: *CatalogRuntime) void {
-        self.mutex.unlock();
-    }
-
-    /// 判断给定相对路径是否是当前 manifest 的受管资产。
-    pub fn containsAssetPath(self: *CatalogRuntime, path: []const u8) bool {
-        self.lock();
-        defer self.unlock();
-        for (self.value.assets) |asset| if (std.mem.eql(u8, asset.path, path)) return true;
-        return false;
-    }
-
-    /// 将一个已解析、已复制的资产写入 catalog，并立即发布内存快照。
-    pub fn addAsset(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, asset: model.AssetConfig) !void {
-        self.lock();
-        defer self.unlock();
-        for (self.value.assets) |existing| if (std.mem.eql(u8, existing.name, asset.name)) return error.DuplicateObjectName;
-
-        const owned = try copyAsset(self.allocator, asset);
-        const next_assets = try self.allocator.alloc(model.AssetConfig, self.value.assets.len + 1);
-        @memcpy(next_assets[0..self.value.assets.len], self.value.assets);
-        next_assets[self.value.assets.len] = owned;
-        var candidate = self.value;
-        candidate.assets = next_assets;
-        try validate.validate(config, &candidate);
-        try catalog_store.save(io, self.allocator, self.path, &candidate);
-        self.value = candidate;
-    }
-
-    /// 在一次 catalog 替换中发布关联的 ISO、安装器资产、可选仓库和安装入口。
-    /// 文件可能已存在于不同的受管根中，但在本方法成功之前没有任何东西能解析它们。
-    pub fn publishInstallSource(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, imported: iso_import.Result) !void {
-        self.lock();
-        defer self.unlock();
-        const assets_to_add = [_]model.AssetConfig{ imported.iso_asset, imported.kernel_asset, imported.initrd_asset };
-        for (assets_to_add) |asset| {
-            for (self.value.assets) |existing| if (std.mem.eql(u8, existing.name, asset.name)) return error.DuplicateObjectName;
-        }
-        if (imported.repository) |repository| for (self.value.repositories) |existing| if (std.mem.eql(u8, existing.name, repository.name)) return error.DuplicateObjectName;
-        for (self.value.install_sources) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
-
-        const next_assets = try self.allocator.alloc(model.AssetConfig, self.value.assets.len + assets_to_add.len);
-        @memcpy(next_assets[0..self.value.assets.len], self.value.assets);
-        @memcpy(next_assets[self.value.assets.len..], &assets_to_add);
-        const repository_count: usize = if (imported.repository == null) 0 else 1;
-        const next_repositories = try self.allocator.alloc(model.RepositoryConfig, self.value.repositories.len + repository_count);
-        @memcpy(next_repositories[0..self.value.repositories.len], self.value.repositories);
-        if (imported.repository) |repository| next_repositories[self.value.repositories.len] = repository;
-        const next_sources = try self.allocator.alloc(model.InstallSourceConfig, self.value.install_sources.len + 1);
-        @memcpy(next_sources[0..self.value.install_sources.len], self.value.install_sources);
-        next_sources[self.value.install_sources.len] = imported.install_source;
-        var candidate = self.value;
-        candidate.assets = next_assets;
-        candidate.repositories = next_repositories;
-        candidate.install_sources = next_sources;
-        try validate.validate(config, &candidate);
-        try catalog_store.save(io, self.allocator, self.path, &candidate);
-        self.value = candidate;
+    pub fn value(self: *const Snapshot) *const model.Catalog { return &self.parsed.value; }
+    pub fn release(self: *const Snapshot) void {
+        const mutable: *Snapshot = @constCast(self);
+        if (mutable.refs.fetchSub(1, .acq_rel) != 1) return;
+        mutable.parsed.deinit();
+        const allocator = mutable.allocator;
+        allocator.destroy(mutable);
     }
 };
 
-/// 在 catalog 发布前拷贝所有可能来自 HTTP 请求的字符串。
-/// 请求缓冲区在路由处理完成后立即释放，因此 catalog 必须拥有自己的字符串副本。
-fn copyAsset(allocator: std.mem.Allocator, source: model.AssetConfig) !model.AssetConfig {
-    return .{
-        .name = try allocator.dupe(u8, source.name),
-        .kind = source.kind,
-        .path = try allocator.dupe(u8, source.path),
-        .distro = if (source.distro) |v| try allocator.dupe(u8, v) else null,
-        .version = if (source.version) |v| try allocator.dupe(u8, v) else null,
-        .arch = source.arch,
-        .kernel_release = if (source.kernel_release) |v| try allocator.dupe(u8, v) else null,
-        .sha256 = if (source.sha256) |v| try allocator.dupe(u8, v) else null,
-    };
+pub const CatalogRuntime = struct {
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    current: std.atomic.Value(*Snapshot),
+    writer: std.atomic.Mutex = .unlocked,
+
+    pub fn init(allocator: std.mem.Allocator, path: []const u8, initial: *const model.Catalog) !CatalogRuntime {
+        const snapshot = try createSnapshot(allocator, initial.*, 1);
+        return .{ .allocator = allocator, .path = path, .current = std.atomic.Value(*Snapshot).init(snapshot) };
+    }
+    pub fn deinit(self: *CatalogRuntime) void { self.current.load(.acquire).release(); }
+    pub fn lock(self: *CatalogRuntime) void { lockMutex(&self.writer); }
+    pub fn unlock(self: *CatalogRuntime) void { self.writer.unlock(); }
+    pub fn acquire(self: *CatalogRuntime) *const Snapshot {
+        self.lock();
+        defer self.unlock();
+        return self.acquireLocked();
+    }
+    pub fn acquireLocked(self: *CatalogRuntime) *const Snapshot {
+        const snapshot = self.current.load(.acquire);
+        _ = snapshot.refs.fetchAdd(1, .monotonic);
+        return snapshot;
+    }
+    pub fn currentRevision(self: *CatalogRuntime) u64 {
+        const snapshot = self.acquire();
+        defer snapshot.release();
+        return snapshot.revision;
+    }
+    pub fn containsAssetPath(self: *CatalogRuntime, path: []const u8) bool {
+        const snapshot = self.acquire();
+        defer snapshot.release();
+        for (snapshot.value().assets) |asset| if (std.mem.eql(u8, asset.path, path)) return true;
+        return false;
+    }
+
+    pub fn addAsset(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, asset: model.AssetConfig) !void {
+        self.lock();
+        defer self.unlock();
+        const old = self.acquireLocked();
+        defer old.release();
+        for (old.value().assets) |existing| if (std.mem.eql(u8, existing.name, asset.name)) return error.DuplicateObjectName;
+        const next_assets = try self.allocator.alloc(model.AssetConfig, old.value().assets.len + 1);
+        defer self.allocator.free(next_assets);
+        @memcpy(next_assets[0..old.value().assets.len], old.value().assets);
+        next_assets[old.value().assets.len] = asset;
+        var candidate = old.value().*;
+        candidate.assets = next_assets;
+        try validate.validate(config, &candidate);
+        try catalog_store.save(io, self.allocator, self.path, &candidate);
+        try self.publishLocked(candidate, old.revision + 1);
+    }
+
+    pub fn publishInstallSource(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, imported: iso_import.Result) !void {
+        self.lock();
+        defer self.unlock();
+        const old = self.acquireLocked();
+        defer old.release();
+        const value = old.value();
+        const additions = [_]model.AssetConfig{ imported.iso_asset, imported.kernel_asset, imported.initrd_asset };
+        for (additions) |asset| for (value.assets) |existing| if (std.mem.eql(u8, existing.name, asset.name)) return error.DuplicateObjectName;
+        if (imported.repository) |repository| for (value.repositories) |existing| if (std.mem.eql(u8, existing.name, repository.name)) return error.DuplicateObjectName;
+        for (value.install_sources) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
+        const assets = try self.allocator.alloc(model.AssetConfig, value.assets.len + additions.len);
+        defer self.allocator.free(assets);
+        @memcpy(assets[0..value.assets.len], value.assets);
+        @memcpy(assets[value.assets.len..], &additions);
+        const repo_count: usize = if (imported.repository == null) 0 else 1;
+        const repositories = try self.allocator.alloc(model.RepositoryConfig, value.repositories.len + repo_count);
+        defer self.allocator.free(repositories);
+        @memcpy(repositories[0..value.repositories.len], value.repositories);
+        if (imported.repository) |repository| repositories[value.repositories.len] = repository;
+        const sources = try self.allocator.alloc(model.InstallSourceConfig, value.install_sources.len + 1);
+        defer self.allocator.free(sources);
+        @memcpy(sources[0..value.install_sources.len], value.install_sources);
+        sources[value.install_sources.len] = imported.install_source;
+        var candidate = value.*;
+        candidate.assets = assets;
+        candidate.repositories = repositories;
+        candidate.install_sources = sources;
+        try validate.validate(config, &candidate);
+        try catalog_store.save(io, self.allocator, self.path, &candidate);
+        try self.publishLocked(candidate, old.revision + 1);
+    }
+
+    pub fn publishLocked(self: *CatalogRuntime, candidate: model.Catalog, revision: u64) !void {
+        const next = try self.prepare(candidate, revision);
+        self.publishPreparedLocked(next);
+    }
+    pub fn prepare(self: *CatalogRuntime, candidate: model.Catalog, revision: u64) !*Snapshot {
+        return createSnapshot(self.allocator, candidate, revision);
+    }
+    pub fn publishPreparedLocked(self: *CatalogRuntime, next: *Snapshot) void {
+        const previous = self.current.swap(next, .acq_rel);
+        previous.release();
+    }
+};
+
+fn createSnapshot(allocator: std.mem.Allocator, value: model.Catalog, revision: u64) !*Snapshot {
+    const bytes = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(model.Catalog, allocator, bytes, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    const snapshot = try allocator.create(Snapshot);
+    snapshot.* = .{ .allocator = allocator, .parsed = parsed, .revision = revision };
+    return snapshot;
+}
+fn lockMutex(mutex: *std.atomic.Mutex) void { while (!mutex.tryLock()) std.Thread.yield() catch {}; }
+
+test "old catalog generation survives replacement until reader release" {
+    var runtime = try CatalogRuntime.init(std.testing.allocator, "/tmp/catalog.json", &.{});
+    defer runtime.deinit();
+    const old = runtime.acquire();
+    runtime.lock();
+    try runtime.publishLocked(.{ .assets = &.{.{ .name = "new", .kind = .iso, .path = "new.iso" }} }, 2);
+    runtime.unlock();
+    try std.testing.expectEqual(@as(usize, 0), old.value().assets.len);
+    old.release();
+    const current = runtime.acquire();
+    defer current.release();
+    try std.testing.expectEqual(@as(u64, 2), current.revision);
+    try std.testing.expectEqualStrings("new", current.value().assets[0].name);
 }

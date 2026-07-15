@@ -5,6 +5,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const zli = b.dependency("zli", .{});
     const zap = b.dependency("zap", .{ .target = target, .optimize = optimize });
+    const build_options = b.addOptions();
+    const git_commit = b.option([]const u8, "git-commit", "Git commit recorded in version output") orelse commandOutput(b, &.{ "git", "rev-parse", "HEAD" }) orelse "unknown";
+    const build_time = b.option([]const u8, "build-time", "UTC build time recorded in version output") orelse commandOutput(b, &.{ "sh", "-c", "if [ -n \"${SOURCE_DATE_EPOCH:-}\" ]; then date -u -r \"$SOURCE_DATE_EPOCH\" '+%Y-%m-%dT%H:%M:%SZ'; else date -u '+%Y-%m-%dT%H:%M:%SZ'; fi" }) orelse "unknown";
+    const git_dirty = if (commandOutput(b, &.{ "git", "status", "--porcelain", "--untracked-files=no" })) |status| status.len != 0 else false;
+    build_options.addOption([]const u8, "version", "0.1.0");
+    build_options.addOption([]const u8, "git_commit", git_commit);
+    build_options.addOption(bool, "git_dirty", git_dirty);
+    build_options.addOption([]const u8, "build_time", build_time);
 
     // 核心模块是两个二进制共享的唯一业务实现，避免 CLI 与守护进程行为分叉。
     const core = b.addModule("nodeforge", .{
@@ -16,6 +24,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zap", .module = zap.module("zap") },
         },
     });
+    core.addOptions("build_options", build_options);
 
     // nodeforged 承载协议服务和本机管理接口。
     const daemon = b.addExecutable(.{
@@ -86,4 +95,15 @@ pub fn build(b: *std.Build) void {
     layout_tests.addFileArg(b.path("tests/install-layout.sh"));
     layout_tests.step.dependOn(&http_tests.step);
     test_step.dependOn(&layout_tests.step);
+}
+
+fn commandOutput(b: *std.Build, argv: []const []const u8) ?[]const u8 {
+    const result = std.process.run(b.allocator, b.graph.io, .{ .argv = argv, .stdout_limit = .limited(16 * 1024), .stderr_limit = .limited(16 * 1024) }) catch return null;
+    defer b.allocator.free(result.stdout);
+    defer b.allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    return b.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n")) catch null;
 }

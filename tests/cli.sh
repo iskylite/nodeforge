@@ -66,7 +66,9 @@ for command in \
     "config export" \
     "catalog" \
     "catalog validate" \
-    "catalog export"; do
+    "catalog export" \
+    "catalog show" \
+    "catalog migrate"; do
     "$cli" $command --help >"$tmp/help-$(echo "$command" | tr ' ' '-')"
     if grep -q "Examples:" "$tmp/help-$(echo "$command" | tr ' ' '-')"; then
         echo "help must not embed examples: $command" >&2
@@ -97,8 +99,9 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-test "$("$cli" --version)" = "nodeforge 0.1.0"
-test "$("$cli" -v)" = "nodeforge 0.1.0"
+"$cli" --version | grep -Eq '^nodeforge 0\.1\.0 \(commit [0-9a-f]{12}|unknown'
+"$cli" -v | grep -Fq 'built '
+"$daemon" --version | grep -Eq '^nodeforged 0\.1\.0 \(commit [0-9a-f]{12}|unknown'
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then
@@ -114,6 +117,12 @@ done
 "$cli" config validate -c "$root/config.example.json" -C "$root/catalog.example.json" -o json >"$tmp/validate"
 grep -q '"ok":true' "$tmp/validate"
 grep -q "$root/config.example.json" "$tmp/validate"
+"$cli" catalog show --help >"$tmp/catalog-show-help"
+grep -Fq 'install-source' "$tmp/catalog-show-help"
+if grep -Eq '^   .*--catalog' "$tmp/catalog-show-help"; then
+    echo "catalog show must query daemon rather than read catalog.json" >&2
+    exit 1
+fi
 
 # M1.5 human output is an aligned, headered table rather than tabs. The
 # contract runs with stdout redirected, so it also proves no ANSI bytes leak
@@ -204,8 +213,8 @@ grep -q -- "--log-output" "$tmp/daemon-help"
 grep -q -- "--log-file" "$tmp/daemon-help"
 grep -q -- "-k, --check" "$tmp/daemon-help"
 grep -q -- "-K, --check-config" "$tmp/daemon-help"
-test "$("$daemon" --version)" = "nodeforged 0.1.0"
-test "$("$daemon" -v)" = "nodeforged 0.1.0"
+"$daemon" --version | grep -Fq 'built '
+"$daemon" -v | grep -Fq 'commit '
 "$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" >"$tmp/daemon-check-config" 2>&1
 grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* info \[nodeforge\] config: valid ' "$tmp/daemon-check-config"
 

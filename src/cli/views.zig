@@ -6,11 +6,13 @@
 const std = @import("std");
 const table = @import("table.zig");
 const model = @import("../model.zig");
+const audit_events = @import("../state/events.zig");
 
 pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const u8 };
 pub const TftpSessionRow = struct { id: []const u8, phase: []const u8, filename: []const u8 };
 pub const DhcpLeaseRow = struct { ip: []const u8, mac: []const u8, phase: []const u8, expires_at: []const u8 };
-pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8 };
+pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8, status: []const u8, started_at: []const u8, finished_at: []const u8, serial_number: []const u8 };
+pub const ProfileRow = struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: []const u8, nodes: []const u8, valid: []const u8 };
 pub const EventRow = struct { ts: []const u8, event_type: []const u8, node: []const u8, message: []const u8, fields: []const u8 };
 pub const EventTypeRow = struct { name: []const u8, description: []const u8, level: []const u8 };
 
@@ -67,15 +69,29 @@ pub fn dhcpLeases(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_on
 }
 
 pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
-    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" } };
-    var cells: [256][4][]const u8 = undefined;
+    // 节点列表展示部署开始/结束时间窗口（STARTED/FINISHED）；成功的
+    // deployed 时间与 finished 重合，作为详情留给 `node show`，列表不再单独列出。
+    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "started_at", .title = "STARTED" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
+    var cells: [256][8][]const u8 = undefined;
     var table_rows: [256]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
     for (rows, 0..) |row, i| {
-        cells[i] = .{ row.id, row.mac, row.ip, row.profile };
+        cells[i] = .{ row.id, row.mac, row.ip, row.profile, row.status, row.started_at, row.finished_at, row.serial_number };
         table_rows[i] = .{ .cells = &cells[i] };
     }
     try table.render(writer, &columns, table_rows[0..rows.len], "No nodes registered.", .{});
+}
+
+pub fn profiles(writer: *std.Io.Writer, rows: []const ProfileRow) !void {
+    const columns = [_]table.Column{ .{ .key = "name", .title = "NAME" }, .{ .key = "mode", .title = "MODE" }, .{ .key = "distro", .title = "DISTRO" }, .{ .key = "version", .title = "VERSION" }, .{ .key = "arch", .title = "ARCH" }, .{ .key = "source", .title = "INSTALL_SOURCE" }, .{ .key = "nodes", .title = "NODES", .alignment = .right }, .{ .key = "valid", .title = "VALID" } };
+    var cells: [256][8][]const u8 = undefined;
+    var table_rows: [256]table.Row = undefined;
+    if (rows.len > table_rows.len) return error.TooManyRows;
+    for (rows, 0..) |row, index| {
+        cells[index] = .{ row.name, row.mode, row.distro, row.version, row.arch, row.install_source, row.nodes, row.valid };
+        table_rows[index] = .{ .cells = &cells[index] };
+    }
+    try table.render(writer, &columns, table_rows[0..rows.len], "No profiles configured.", .{});
 }
 
 pub fn events(writer: *std.Io.Writer, rows: []const EventRow) !void {
@@ -165,6 +181,15 @@ pub fn status(writer: *std.Io.Writer, process: bool, http: bool, management: boo
     try writer.print("{s}\n", .{if (config) "OK config valid" else "FAIL config unavailable"});
 }
 
+/// 将 epoch 秒格式化为 RFC 3339 UTC 可视化时间。CLI human 输出统一使用该函数，
+/// 不再直接打印裸 epoch 整数；0 或负值（未发生）返回 "-"。
+/// 复用 daemon 事件写入器已校验过的 `events.rfc3339FromUnix`，保证 CLI 与审计
+/// 事件的时间展示语义一致。
+pub fn formatTimestamp(buffer: *[20]u8, epoch: i64) []const u8 {
+    if (epoch <= 0) return "-";
+    return audit_events.rfc3339FromUnix(buffer, epoch) catch "-";
+}
+
 /// 所有详情/状态块的 label 统一缩进和对齐宽度。使用 display-width-aware 填充，
 /// 确保包含 CJK 字符的 label 也能正确对齐。
 const label_width: usize = 12;
@@ -184,4 +209,24 @@ fn detailField(writer: *std.Io.Writer, label: []const u8, value: []const u8) !vo
     try writeLabel(writer, label);
     try table.writeEscaped(writer, value);
     try writer.writeByte('\n');
+}
+
+test "formatTimestamp renders RFC 3339 visualization time" {
+    var buffer: [20]u8 = undefined;
+    try std.testing.expectEqualStrings("2026-07-11T08:30:00Z", formatTimestamp(&buffer, 1783758600));
+    try std.testing.expectEqualStrings("-", formatTimestamp(&buffer, 0));
+    try std.testing.expectEqualStrings("-", formatTimestamp(&buffer, -1));
+}
+
+test "node list table shows deployment start and end columns" {
+    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "started_at", .title = "STARTED" }, .{ .key = "finished_at", .title = "FINISHED" } };
+    const cells = [_][]const u8{ "node-01", "2026-07-11T08:30:00Z", "2026-07-11T08:45:00Z" };
+    const rows = [_]table.Row{.{ .cells = &cells }};
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try table.render(&writer, &columns, &rows, "empty", .{});
+    const out = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "STARTED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FINISHED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2026-07-11T08:30:00Z") != null);
 }

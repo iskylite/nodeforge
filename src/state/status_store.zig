@@ -13,6 +13,7 @@ const dhcp_store = @import("dhcp_store.zig");
 /// M3.1 `node-status.json` schema。
 pub const StatusFile = struct {
     schema_version: u32 = 3,
+    revision: u64 = 0,
     saved_at: i64,
     statuses: []const node_status.Status,
 };
@@ -23,10 +24,10 @@ io_mutex: std.atomic.Mutex = .unlocked,
 
 /// 原子保存节点状态快照到 `node-status.json`。
 /// 调用方必须已在 node_status.Store mutex 下获取一致快照（通过 `snapshot`）。
-pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, statuses: *const [node_status.max_statuses]node_status.Status, now: i64) !void {
+pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, statuses: *const [node_status.max_statuses]node_status.Status, revision: u64, now: i64) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try std.json.Stringify.value(StatusFile{ .saved_at = now, .statuses = statuses }, .{ .whitespace = .indent_2 }, &output.writer);
+    try std.json.Stringify.value(StatusFile{ .revision = revision, .saved_at = now, .statuses = statuses }, .{ .whitespace = .indent_2 }, &output.writer);
     try output.writer.writeByte('\n');
     try dhcp_store.atomicWrite(io, path, output.written());
 }
@@ -42,7 +43,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     if (parsed.value.schema_version != 3 or parsed.value.statuses.len > node_status.max_statuses) return error.InvalidStatusState;
     var snapshot = [_]node_status.Status{.{}} ** node_status.max_statuses;
     for (parsed.value.statuses, 0..) |status, i| snapshot[i] = status;
-    store.restoreInactive(&snapshot);
+    store.restoreInactive(&snapshot, parsed.value.revision);
 }
 
 /// 从旧版 `runtime.json` 文件迁移节点状态。只提取 status 部分；
@@ -55,5 +56,5 @@ pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
     if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 2) or parsed.value.statuses.len > node_status.max_statuses) return error.InvalidRuntimeState;
     var snapshot = [_]node_status.Status{.{}} ** node_status.max_statuses;
     for (parsed.value.statuses, 0..) |status, i| snapshot[i] = status;
-    store.restoreInactive(&snapshot);
+    store.restoreInactive(&snapshot, 1);
 }

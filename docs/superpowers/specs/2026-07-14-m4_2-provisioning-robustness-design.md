@@ -5,6 +5,22 @@
 - 依赖：M4.1 基线；是 M4/M4.1 安装链路的直接延续，在 M5 之前交付
 - 插入位置：`docs/DETAILED_DESIGN.md` §9.11 M4.2
 
+> **历史规格，后续修订（2026-07-15）**：M4.3 实机复核否定或完成收口了本稿的以下过渡契约：
+> (1) RHEL-family 介质不能统一归一为 `distro=rocky`，必须保留真实 distro；
+> (2) node CRUD 不能靠 CLI 直写配置并重启 daemon；
+> (3) daemon 重启不应必然使正在安装的 BootSession/capability 失效。
+> 此外 repository 不再是识别 ISO 的前置条件，重复导入改为 SHA-256 幂等语义，TFTP option 协商按 RFC 收口。
+> 本稿的 node per-field flags 被 typed `k=v`/`unset` 取代；deprecated alias 的一个版本兼容窗口在 M4.3 结束；
+> `node list/show` 改为聚合 desired/profile/status/deployment/inventory。资源目录迁移本身已经由 M4.2 实现，
+> M4.3 只做边界测试和现行文档清理，不重新开发第二套迁移。
+> M4.3 还将 install-source 的只读 `catalog show` 和带 plan digest 的 `catalog migrate --dry-run/--apply`
+> 提前作为旧数据修复入口，并提前只读 `profile list/show` 以发现当前 PXE 策略；M6 仍负责 profile 写操作、
+> distro/repository CRUD 和完整 config diff/apply。M4.3 必须修改
+> 现有实现与测试，并重新完成 Rocky/Ubuntu 全安装和 Ubuntu restart-resume，不能只更新设计文档。
+> M4.4 随后统一本文出现的历史 `/boot/config`、`/answer`、`/repos`、`/subiquity-report` 和 management 动词路径；
+> 本稿仅保留当时实现语义，现行 URL 以 M4.4 专项设计为准。
+> 新契约见 `2026-07-15-m4_3-model-runtime-observability-design.md`；与本稿冲突时以 M4.3 为准。
+
 ## 1. 背景与问题陈述
 
 M4/M4.1 交付了 kickstart/autoinstall 渲染、受控 post-install provisioning 和安装生命周期事件上报。
@@ -81,7 +97,7 @@ M5/M6/M7 继承 M4.2 的以下变更，不得假设旧行为：
 | F4 TftpConfig 字段 | M6 压测固化使用 M4.2 已引入的字段名 | M6 (§11.3) |
 | F4 `node.http_accel` | M5 diskless 模式的 kernel/initrd 同样适用 HTTP 加速；仅对 GRUB UEFI 生效，M6 BIOS PXELINUX 固定使用 `pxelinux.0`（TFTP only），`http_accel` 无效 | M5 (§10.4)、M6 (§11.4) |
 | F5 多公钥 | M5 BootConfig `root_authorized_keys` 可含多个 bootstrap key；M7 finalizer 须断言多 key 归属 | M5 (§10.6)、M7 (§12.3) |
-| F6 CLI 8 资源模型 | M5/M6/M7 新增命令须遵循 resource-action 模型；M5 构建产物归入 `assets`，M6 profile 独立顶层，M7 provision 独立顶层 | M5 (§10.7)、M6 (§11.4)、M7 (§12.8) |
+| F6 CLI 8 资源模型 | 后续命令须遵循 resource-action 模型；M4.3 已提前 profile 只读顶层，M5 构建产物归入 `assets`，M6 增加 profile 写 action，M7 provision 独立顶层 | M4.3 (§9.12)、M5 (§10.7)、M6 (§11.4)、M7 (§12.8) |
 | F6 node 原子变更 + reload | M6 config diff/apply 须识别 node add/set/remove 的有序重启语义；M6 profile/distro/repo CRUD 复用同一原子写回模式 | M6 (§11.6) |
 | F6 安装目录资源化 | M5 构建产物路径（rootfs/initrd/boot-bundle）须使用新布局 `assets/rootfs/`/`assets/initrd/`/`assets/bundles/`；M7 provisioned 归 `state/provisioned/` | M5 (§10.2)、M7 (§12.2) |
 | F1 `log_url` 注入 | BootConfig 共同字段增加 `log_url`；M5 initrd 如需失败摘要可复用 `/logs` | M5 (§10.4) |
@@ -682,7 +698,7 @@ nodeforge <resource> <action> [object] [options]
   catalog    目录资源（catalog.json 只读查看/校验/导出）
   runtime    运行态资源（DHCP leases/TFTP sessions/服务运行状态）
   events     审计资源（事件历史查询/跟踪/类型）
-  profile    策略资源（安装/无盘/发现 profile 管理，M6）
+  profile    策略资源（本稿原留 M6；M4.3 提前只读 list/show）
   provision  供应资源（provisioning bundle/step/run 管理，M7）
 ```
 
@@ -737,11 +753,12 @@ nodeforge <resource> <action> [object] [options]
   diff                  对比两个配置快照，分类展示影响              [M6]
   apply                 在线应用配置变更                            [M6]
 
-═══ catalog（目录资源，只读）═══
+═══ catalog（目录资源；M4.3 前仅只读）═══
   validate              校验 catalog 对象和 config 引用关系         [M0 已有]
   export                导出 catalog JSON                          [M0 已有]
-  # M6 新增:
-  show <name>           展开 install-source/repo/asset 关系链       [M6]
+  # M4.2 当时规划（M4.3 已覆盖）:
+  show <name>           展开 install-source/repo/asset 关系链       [改由 M4.3]
+  migrate --dry-run/--apply --plan-digest                           [M4.3]
 
 ═══ runtime（运行态资源）═══
   status                服务运行态概要                              [M4.2 新增]
@@ -755,8 +772,9 @@ nodeforge <resource> <action> [object] [options]
   follow                实时跟踪新事件                              [M2.5 已有]
   types                 列出注册的事件类型                          [M2.5 已有]
 
-═══ profile（策略资源，M6）═══
-  add/list/show/update/remove/validate                             [M6]
+═══ profile（策略资源；M4.3 覆盖）═══
+  list/show                                                       [改由 M4.3]
+  add/update/remove/validate                                      [M6]
 
 ═══ provision（供应资源，M7）═══
   bundle-list/show/create/validate/publish/plan                    [M7]
@@ -834,11 +852,17 @@ M4.2 校准为资源化布局：
 
 ### 9.8 后续里程碑 CLI 声明
 
+> **M4.3 覆盖**：下列内容是 M4.2 当时的规划。现行边界已把 install-source 的只读 `catalog show` 和旧 catalog
+> 的 digest-protected migrate plan/apply 和只读 profile list/show 提前到 M4.3；M6 仍保留 profile 写操作、
+> distro/repository CRUD、支持矩阵
+> 和 config diff/apply，其余 M5/M7 命令归属不变。
+
 M4.2 只校准 M0-M4.1 已有的命令并新增 node CRUD 和 assets key 管理。后续里程碑新增命令必须遵循同一
 resource-action canonical form：
 - **M5** 新增 `assets rootfs-package`/`initrd-build`/`boot-bundle-publish` 和 `node diskless-status`/`diskless-retry`/
   `diskless-overlay`。`diskless-retry` 受 `deploy=false` 限制（§4.5）。
-- **M6** 新增 `profile add/list/show/update/remove/validate`、`config diff/apply`、`catalog show`、
+- **M6** 在 M4.3 `profile list/show` 上新增 `profile add/update/remove/validate`、`config diff/apply`、
+  profile/distro/repository 写 CRUD、
   `node render --format pxelinux`（BIOS PXELINUX 预览）。
 - **M7** 新增 `provision bundle-list/show/create/validate/publish/plan`、`provision step-add/remove`、
   `provision run-show/status`。

@@ -124,7 +124,8 @@ fn resolveInstall(
     // - Ubuntu live-server 由 casper（initramfs 中的脚本）通过 HTTP 下载 ISO，
     //   loop mount 后进入 Subiquity 安装器。
     // - RHEL 系由 Anaconda 直接从 DNF repository 下载安装树（RPM 包）。
-    const cmdline = if (std.mem.eql(u8, source.distro, "ubuntu")) blk: {
+    const distro = lookup.findDistro(config, source.distro) orelse return null;
+    const cmdline = if (distro.family == .ubuntu) blk: {
         // Ubuntu 的 live-server 安装器基于 casper。`inst.repo` 是 Anaconda 专用
         // 参数，在此被忽略；casper 需要已发布的 ISO URL 来下载并 loop mount ISO。
         // 额外的 live-server 参数匹配 Canonical 的 netboot 指引：
@@ -238,6 +239,7 @@ fn toGrubPath(asset_path: []const u8) ?[]const u8 {
 test "resolve install target returns kernel/initrd/repo cmdline" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.27.128", .http_port = 18080 },
+        .distros = &.{.{ .name = "rocky", .family = .rhel, .versions = &.{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }} }},
         .profiles = &.{.{
             .name = "rocky-install",
             .mode = .install,
@@ -292,6 +294,7 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
 test "resolve diskless target returns config url cmdline" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.27.128", .http_port = 18080 },
+        .distros = &.{.{ .name = "ubuntu", .family = .ubuntu, .versions = &.{.{ .version = "22.04", .archs = &.{.aarch64}, .install_adapter = .autoinstall, .package_manager = .apt }} }},
         .profiles = &.{.{
             .name = "ubuntu-diskless",
             .mode = .diskless,
@@ -338,6 +341,7 @@ test "resolve diskless target returns config url cmdline" {
 test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.27.128", .http_port = 18080 },
+        .distros = &.{.{ .name = "ubuntu", .family = .ubuntu, .versions = &.{.{ .version = "22.04", .archs = &.{.aarch64}, .install_adapter = .autoinstall, .package_manager = .apt }} }},
         .profiles = &.{.{ .name = "ubuntu-install", .mode = .install, .distro = "ubuntu", .version = "22.04", .arch = .aarch64, .install_source = "ubuntu-22.04-aarch64-iso" }},
     };
     const catalog: model.Catalog = .{

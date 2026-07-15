@@ -26,6 +26,9 @@ pub const Entry = struct {
     /// 安装器完成时报告为成功安装的 revision。
     applied_revision: u64 = 0,
     requested_at: i64 = 0,
+    started_at: i64 = 0,
+    finished_at: i64 = 0,
+    deployed_at: i64 = 0,
     requested_by: RequestSource = .initial,
 
     pub fn node(self: *const Entry) []const u8 {
@@ -50,10 +53,13 @@ pub const DiskEntry = struct {
     consumed_revision: u64 = 0,
     applied_revision: u64 = 0,
     requested_at: i64 = 0,
+    started_at: i64 = 0,
+    finished_at: i64 = 0,
+    deployed_at: i64 = 0,
     requested_by: RequestSource = .initial,
 };
 
-pub const File = struct { schema_version: u32 = 1, entries: []const DiskEntry = &.{} };
+pub const File = struct { schema_version: u32 = 2, revision: u64 = 0, entries: []const DiskEntry = &.{} };
 
 pub const RearmResult = struct {
     generation: u64,
@@ -64,6 +70,12 @@ pub const RearmResult = struct {
     previous_requested_revision: u64 = 0,
     previous_requested_at: i64 = 0,
     previous_requested_by: RequestSource = .initial,
+    /// rearm 前该条目记录的 per-generation 生命周期时间戳。rearm 会为新
+    /// generation 清零这些字段；持久化失败回滚时必须原样恢复，否则一次
+    /// 失败的 retry 会清空历史部署时间。
+    previous_started_at: i64 = 0,
+    previous_finished_at: i64 = 0,
+    previous_deployed_at: i64 = 0,
 };
 
 pub const ConsumeResult = struct {
@@ -86,11 +98,15 @@ pub const View = struct {
     requested_revision: u64,
     applied_revision: u64,
     requested_at: i64,
+    started_at: i64,
+    finished_at: i64,
+    deployed_at: i64,
     requested_by: RequestSource,
 };
 
 pub const Store = struct {
     entries: [max_entries]Entry = [_]Entry{.{}} ** max_entries,
+    revision: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
 
     /// 首次观测武装 generation 1。已有条目永远不会
@@ -127,6 +143,10 @@ pub const Store = struct {
 
     /// `install.started` 精确消费当前已武装的 generation。
     pub fn consume(self: *Store, node_id: []const u8) !?ConsumeResult {
+        return self.consumeAt(node_id, 0);
+    }
+
+    pub fn consumeAt(self: *Store, node_id: []const u8, timestamp: i64) !?ConsumeResult {
         lock(&self.mutex);
         defer self.mutex.unlock();
         const entry = try self.findOrCreateLocked(node_id);
@@ -138,12 +158,22 @@ pub const Store = struct {
         };
         entry.consumed_generation = generation;
         entry.consumed_revision = entry.requested_revision;
+        if (entry.started_at == 0 and timestamp != 0) entry.started_at = timestamp;
+        entry.finished_at = 0;
         entry.armed_generation = null;
         return result;
     }
 
     /// 幂等地武装下一个破坏性 generation。调用方在执行此状态变更前
     /// 已检查 profile/session 约束。
+    ///
+    /// started/finished/deployed 是 per-generation 生命周期时间戳（见专项设计
+    /// §5.2）：每个 generation 拥有自己的首次 started、首次 terminal 与成功
+    /// deployed。武装一个新 generation 等于开启一次全新的部署生命周期，因此
+    /// 必须把上一 generation 残留的 started/finished/deployed 清零，否则部署
+    /// 完成后再次 retry 会继续显示旧 generation 的时间，状态机看似没有推进。
+    /// consumed/terminal generation 作为历史不在此处清零，由后续 consume/
+    /// markTerminal 为新 generation 覆盖。
     pub fn rearm(self: *Store, node_id: []const u8, revision: u64, requested_at: i64, requested_by: RequestSource) !RearmResult {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -159,22 +189,34 @@ pub const Store = struct {
                 .previous_requested_revision = entry.requested_revision,
                 .previous_requested_at = entry.requested_at,
                 .previous_requested_by = entry.requested_by,
+                .previous_started_at = entry.started_at,
+                .previous_finished_at = entry.finished_at,
+                .previous_deployed_at = entry.deployed_at,
             };
             entry.armed_generation = entry.next_generation;
             entry.next_generation += 1;
             entry.requested_revision = revision;
             entry.requested_at = requested_at;
             entry.requested_by = requested_by;
+            entry.started_at = 0;
+            entry.finished_at = 0;
+            entry.deployed_at = 0;
             return previous;
         }
         const generation = entry.next_generation;
         const previous_next = entry.next_generation;
+        const previous_started = entry.started_at;
+        const previous_finished = entry.finished_at;
+        const previous_deployed = entry.deployed_at;
         entry.next_generation += 1;
         entry.armed_generation = generation;
         entry.requested_revision = revision;
         entry.requested_at = requested_at;
         entry.requested_by = requested_by;
-        return .{ .generation = generation, .changed = true, .previous_next_generation = previous_next, .previous_requested_revision = entry.consumed_revision };
+        entry.started_at = 0;
+        entry.finished_at = 0;
+        entry.deployed_at = 0;
+        return .{ .generation = generation, .changed = true, .previous_next_generation = previous_next, .previous_requested_revision = entry.consumed_revision, .previous_started_at = previous_started, .previous_finished_at = previous_finished, .previous_deployed_at = previous_deployed };
     }
 
     pub fn rollbackConsume(self: *Store, node_id: []const u8, result: ConsumeResult) void {
@@ -201,6 +243,9 @@ pub const Store = struct {
             entry.requested_revision = result.previous_requested_revision;
             entry.requested_at = result.previous_requested_at;
             entry.requested_by = result.previous_requested_by;
+            entry.started_at = result.previous_started_at;
+            entry.finished_at = result.previous_finished_at;
+            entry.deployed_at = result.previous_deployed_at;
             return;
         };
     }
@@ -216,6 +261,10 @@ pub const Store = struct {
     /// 完成是唯一推进已应用期望状态的节点。
     /// 失败的尝试保留其消费历史，永远不会自动重新武装。
     pub fn markTerminal(self: *Store, node_id: []const u8, applied: bool) ?TerminalResult {
+        return self.markTerminalAt(node_id, applied, 0);
+    }
+
+    pub fn markTerminalAt(self: *Store, node_id: []const u8, applied: bool, timestamp: i64) ?TerminalResult {
         lock(&self.mutex);
         defer self.mutex.unlock();
         for (&self.entries) |*entry| if (entry.used() and std.mem.eql(u8, entry.node(), node_id)) {
@@ -226,7 +275,11 @@ pub const Store = struct {
                     .previous_applied_revision = entry.applied_revision,
                 };
                 entry.terminal_generation = generation;
-                if (applied) entry.applied_revision = entry.consumed_revision;
+                if (entry.finished_at == 0 and timestamp != 0) entry.finished_at = timestamp;
+                if (applied) {
+                    entry.applied_revision = entry.consumed_revision;
+                    if (entry.deployed_at == 0 and timestamp != 0) entry.deployed_at = timestamp;
+                }
                 return result;
             }
             return null;
@@ -263,6 +316,9 @@ pub const Store = struct {
             .requested_revision = entry.requested_revision,
             .applied_revision = entry.applied_revision,
             .requested_at = entry.requested_at,
+            .started_at = entry.started_at,
+            .finished_at = entry.finished_at,
+            .deployed_at = entry.deployed_at,
             .requested_by = entry.requested_by,
         };
         return null;
@@ -272,6 +328,22 @@ pub const Store = struct {
         lock(&self.mutex);
         defer self.mutex.unlock();
         out.* = self.entries;
+    }
+    pub fn snapshotForSave(self: *Store, out: *[max_entries]Entry) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        out.* = self.entries;
+        return self.revision + 1;
+    }
+    pub fn commitRevision(self: *Store, revision: u64) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        if (revision > self.revision) self.revision = revision;
+    }
+    pub fn currentRevision(self: *Store) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.revision;
     }
 
     fn findOrCreateLocked(self: *Store, node_id: []const u8) !*Entry {
@@ -293,10 +365,11 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    if (parsed.value.schema_version != 1 or parsed.value.entries.len > max_entries) return error.InvalidDeploymentControl;
+    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 2) or parsed.value.entries.len > max_entries) return error.InvalidDeploymentControl;
     lock(&store.mutex);
     defer store.mutex.unlock();
     store.entries = [_]Entry{.{}} ** max_entries;
+    store.revision = parsed.value.revision;
     var count: usize = 0;
     for (parsed.value.entries) |disk_entry| {
         // Version-1 固定数组文件包含 256 条记录。空记录的字符串为 96 字节
@@ -318,6 +391,9 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         entry.consumed_revision = disk_entry.consumed_revision;
         entry.applied_revision = disk_entry.applied_revision;
         entry.requested_at = disk_entry.requested_at;
+        entry.started_at = disk_entry.started_at;
+        entry.finished_at = disk_entry.finished_at;
+        entry.deployed_at = disk_entry.deployed_at;
         entry.requested_by = disk_entry.requested_by;
         count += 1;
     }
@@ -328,7 +404,12 @@ fn validGenerations(entry: DiskEntry) bool {
     if (entry.armed_generation) |generation| if (generation == 0 or generation >= entry.next_generation) return false;
     if (entry.consumed_generation) |generation| if (generation == 0 or generation >= entry.next_generation) return false;
     if (entry.terminal_generation) |generation| {
-        if (entry.consumed_generation == null or generation != entry.consumed_generation.?) return false;
+        // terminal_generation 是上一个完成（或失败）的 generation；
+        // consumed_generation 是当前正在进行的 generation。新安装开始时
+        // consumed 会递增到新 generation，但 terminal 仍保留上一次的值，
+        // 因此 terminal <= consumed 是合法的（正在进行的安装比上次完成的更新）。
+        // 仅 terminal > consumed 是非法的（上次完成的比当前消费的更新，逻辑矛盾）。
+        if (entry.consumed_generation == null or generation > entry.consumed_generation.?) return false;
     }
     return true;
 }
@@ -354,7 +435,7 @@ pub fn revisionForConfig(allocator: std.mem.Allocator, config: *const model.AppC
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store) !void {
     var entries: [max_entries]Entry = undefined;
-    store.snapshot(&entries);
+    const revision = store.snapshotForSave(&entries);
     var used: [max_entries]DiskEntry = undefined;
     var used_len: usize = 0;
     // 取指针：按值遍历 `for (entries) |entry|` 会导致序列化切片指向
@@ -372,15 +453,19 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
             .consumed_revision = entry.consumed_revision,
             .applied_revision = entry.applied_revision,
             .requested_at = entry.requested_at,
+            .started_at = entry.started_at,
+            .finished_at = entry.finished_at,
+            .deployed_at = entry.deployed_at,
             .requested_by = entry.requested_by,
         };
         used_len += 1;
     }
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try std.json.Stringify.value(File{ .entries = used[0..used_len] }, .{ .whitespace = .indent_2 }, &output.writer);
+    try std.json.Stringify.value(File{ .revision = revision, .entries = used[0..used_len] }, .{ .whitespace = .indent_2 }, &output.writer);
     try output.writer.writeByte('\n');
     try dhcp_store.atomicWrite(io, path, output.written());
+    store.commitRevision(revision);
 }
 
 fn lock(mutex: *std.atomic.Mutex) void {
@@ -445,6 +530,46 @@ test "completion records applied revision without arming another install" {
     try std.testing.expect(!store.isArmed("node-01"));
     try std.testing.expect(!store.isDrifted("node-01", 11));
     try std.testing.expect(store.isDrifted("node-01", 12));
+}
+
+test "retry resets per-generation deployment timestamps" {
+    // 部署完成后再次 retry：rearm 必须为新 generation 清零 started/finished/
+    // deployed，使随后的 consume/markTerminal 记录新时间，而不是残留旧值。
+    var store: Store = .{};
+    try store.ensureInitial("node-01", 1, 10);
+    _ = (try store.consumeAt("node-01", 100)).?;
+    _ = store.markTerminalAt("node-01", true, 200);
+    const first = store.view("node-01").?;
+    try std.testing.expectEqual(@as(i64, 100), first.started_at);
+    try std.testing.expectEqual(@as(i64, 200), first.finished_at);
+    try std.testing.expectEqual(@as(i64, 200), first.deployed_at);
+
+    _ = try store.rearm("node-01", 1, 300, .operator);
+    const rearmed = store.view("node-01").?;
+    try std.testing.expectEqual(@as(i64, 0), rearmed.started_at);
+    try std.testing.expectEqual(@as(i64, 0), rearmed.finished_at);
+    try std.testing.expectEqual(@as(i64, 0), rearmed.deployed_at);
+    try std.testing.expect(store.isArmed("node-01"));
+
+    _ = (try store.consumeAt("node-01", 400)).?;
+    _ = store.markTerminalAt("node-01", true, 500);
+    const retried = store.view("node-01").?;
+    try std.testing.expectEqual(@as(i64, 400), retried.started_at);
+    try std.testing.expectEqual(@as(i64, 500), retried.finished_at);
+    try std.testing.expectEqual(@as(i64, 500), retried.deployed_at);
+}
+
+test "rearm rollback restores per-generation deployment timestamps" {
+    var store: Store = .{};
+    try store.ensureInitial("node-01", 1, 10);
+    _ = (try store.consumeAt("node-01", 100)).?;
+    _ = store.markTerminalAt("node-01", true, 200);
+    const result = try store.rearm("node-01", 2, 300, .operator);
+    store.rollbackRearm("node-01", result);
+    const restored = store.view("node-01").?;
+    try std.testing.expectEqual(@as(i64, 100), restored.started_at);
+    try std.testing.expectEqual(@as(i64, 200), restored.finished_at);
+    try std.testing.expectEqual(@as(i64, 200), restored.deployed_at);
 }
 
 test "compact deployment state preserves node id bytes" {

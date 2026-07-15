@@ -51,6 +51,7 @@ pub const Status = struct {
 
 pub const Store = struct {
     entries: [max_statuses]Status = [_]Status{.{}} ** max_statuses,
+    revision: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
 
     pub fn update(self: *Store, node_id: []const u8, session_id: []const u8, daemon_id: []const u8, phase: Phase, reason: ?[]const u8, timestamp: i64, active: bool) !void {
@@ -82,14 +83,20 @@ pub const Store = struct {
             @memcpy(entry.reason[0..len], value[0..len]);
             entry.reason_len = @intCast(len);
         }
+        self.revision += 1;
     }
 
     pub fn deactivateAll(self: *Store) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
+        var changed = false;
         for (&self.entries) |*entry| {
-            if (entry.used()) entry.session_active = false;
+            if (entry.used() and entry.session_active) {
+                entry.session_active = false;
+                changed = true;
+            }
         }
+        if (changed) self.revision += 1;
     }
 
     pub fn get(self: *Store, node_id: []const u8) ?Status {
@@ -104,13 +111,19 @@ pub const Store = struct {
         defer self.mutex.unlock();
         destination.* = self.entries;
     }
+    pub fn currentRevision(self: *Store) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.revision;
+    }
 
     /// 恢复的投影仅为历史观测。daemon 重启永远不会恢复 capability
     /// 或使旧 boot session 变为活跃。
-    pub fn restoreInactive(self: *Store, source: *const [max_statuses]Status) void {
+    pub fn restoreInactive(self: *Store, source: *const [max_statuses]Status, revision: u64) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         self.entries = source.*;
+        self.revision = revision;
         for (&self.entries) |*entry| {
             if (entry.used()) entry.session_active = false;
         }
@@ -165,7 +178,7 @@ test "restored status retains history but invalidates old session" {
     var snapshot: [max_statuses]Status = undefined;
     original.snapshot(&snapshot);
     var restored: Store = .{};
-    restored.restoreInactive(&snapshot);
+    restored.restoreInactive(&snapshot, original.currentRevision());
     const status = restored.get("n1").?;
     try std.testing.expectEqual(Phase.running, status.phase);
     try std.testing.expect(!status.session_active);

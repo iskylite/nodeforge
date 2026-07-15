@@ -36,6 +36,9 @@ sed \
     -e "s/\"http_port\": 8080/\"http_port\": $port/" \
     -e 's/"bind_interface": "enp1s0"/"bind_interface": "lo"/' \
     "$root/config.example.json" > "$tmp/config.json"
+sed '/"policy": {/i\
+  "profiles": [{"name":"discovery","mode":"discovery","distro":"rocky","version":"9.7","arch":"aarch64"}],' "$tmp/config.json" > "$tmp/config.with-profile"
+mv "$tmp/config.with-profile" "$tmp/config.json"
 
 "$daemon" -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
 pid=$!
@@ -58,13 +61,57 @@ grep -Fqx '{"ok":true,"result":{"service":"running"}}' "$tmp/status"
 curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/validate" >"$tmp/validate"
 grep -Fqx '{"ok":true,"result":{}}' "$tmp/validate"
 
+# M4.3 reload publishes a new immutable config snapshot without restarting the daemon.
+sed 's/"level": "info"/"level": "debug"/' "$tmp/config.json" >"$tmp/config.next"
+mv "$tmp/config.next" "$tmp/config.json"
+curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/reload" >"$tmp/reload"
+grep -Fq '"reload":"applied_online"' "$tmp/reload"
+kill -0 "$pid"
+
+# M4.3 runtime-safe config set publishes in-process; listener fields are
+# classified restart-required and leave the file unchanged.
+"$cli" config set logging.level=info events.keep=4 -c "$tmp/config.json" >"$tmp/config-set"
+kill -0 "$pid"
+grep -Fq '"level": "info"' "$tmp/config.json"
+grep -Fq '"keep": 4' "$tmp/config.json"
+before_restart_required=$(sha256sum "$tmp/config.json" | awk '{print $1}')
+if "$cli" config set server.http_port=29999 -c "$tmp/config.json" >"$tmp/config-restart" 2>&1; then
+    echo "restart-required config mutation unexpectedly succeeded" >&2
+    exit 1
+fi
+after_restart_required=$(sha256sum "$tmp/config.json" | awk '{print $1}')
+test "$before_restart_required" = "$after_restart_required"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-view"
+grep -Fq '"nodes":[]' "$tmp/nodes-view"
+grep -Eq '"view_revision":\{"config":[0-9]+,"catalog":[0-9]+,"node_status":[0-9]+,"deployment":[0-9]+,"inventory":[0-9]+\}' "$tmp/nodes-view"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles" >"$tmp/profiles-view"
+grep -Fq '"name":"discovery"' "$tmp/profiles-view"
+
+# M4.3 daemon-owned node mutations persist and publish without restarting.
+daemon_pid=$pid
+"$cli" node add test-node mac=02:00:00:00:00:11 arch=aarch64 profile=discovery -c "$tmp/config.json" >"$tmp/node-add"
+kill -0 "$daemon_pid"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes/test-node" >"$tmp/node-after-add"
+grep -Fq '"id":"test-node"' "$tmp/node-after-add"
+"$cli" node set test-node hostname=worker-11 -c "$tmp/config.json" >"$tmp/node-set"
+kill -0 "$daemon_pid"
+grep -Fq '"hostname": "worker-11"' "$tmp/config.json"
+"$cli" node unset test-node hostname -c "$tmp/config.json" >"$tmp/node-unset"
+kill -0 "$daemon_pid"
+if grep -Fq '"hostname": "worker-11"' "$tmp/config.json"; then
+    echo "node unset did not clear hostname" >&2
+    exit 1
+fi
+"$cli" node remove test-node -c "$tmp/config.json" >"$tmp/node-remove"
+kill -0 "$daemon_pid"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-after-remove"
+grep -Fq '"nodes":[]' "$tmp/nodes-after-remove"
+
 # M2 read-only DHCP/runtime commands consume the validated local config and
 # daemon management routes. The empty pool is still a useful contract check.
-"$cli" dhcp show -c "$tmp/config.json" >"$tmp/dhcp-show"
-grep -Fqx '  Subnet       127.0.0.0/24' "$tmp/dhcp-show"
-"$cli" runtime leases list -c "$tmp/config.json" >"$tmp/dhcp-leases"
+"$cli" runtime dhcp-leases -c "$tmp/config.json" >"$tmp/dhcp-leases"
 grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No DHCP leases\.)' "$tmp/dhcp-leases"
-"$cli" runtime unknown list -c "$tmp/config.json" >"$tmp/dhcp-unknown"
+"$cli" runtime dhcp-unknown -c "$tmp/config.json" >"$tmp/dhcp-unknown"
 grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No unknown clients\.)' "$tmp/dhcp-unknown"
 "$cli" node list -c "$tmp/config.json" >"$tmp/node-list"
 grep -Fqx 'No nodes registered.' "$tmp/node-list"
@@ -85,6 +132,42 @@ fi
 curl --silent --fail-with-body "http://127.0.0.1:$port/not-found" >"$tmp/not-found" 2>&1 || true
 grep -Fqx '{"ok":false,"error":{"code":"http.not_found","message":"route not found"}}' "$tmp/not-found"
 
+# M4.3 durable operation: the first failed import records a terminal operation;
+# retrying the same key reuses it instead of executing the side effect again.
+op_status=$(curl --silent -o "$tmp/op-first" -w '%{http_code}' -X POST -H 'Idempotency-Key: missing-iso-test' "http://127.0.0.1:$port/api/v1/management/install-sources?filename=missing.iso&sha256=0000000000000000000000000000000000000000000000000000000000000000")
+test "$op_status" = 400
+op_status=$(curl --silent -o "$tmp/op-reused" -w '%{http_code}' -X POST -H 'Idempotency-Key: missing-iso-test' "http://127.0.0.1:$port/api/v1/management/install-sources?filename=another-missing.iso&sha256=0000000000000000000000000000000000000000000000000000000000000000")
+test "$op_status" = 202
+grep -Fq '"state":"failed"' "$tmp/op-reused"
+operation_id=$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' "$tmp/op-reused")
+test ${#operation_id} = 32
+
+# M4.3 migration dry-run is daemon-owned, side-effect free and reproducible
+# for the same config/catalog revision pair.
+plan_status=$(curl --silent -o "$tmp/migration-plan-1" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans")
+test "$plan_status" = 201
+grep -Fq '"applicable":true' "$tmp/migration-plan-1"
+grep -Fq '"renames":[]' "$tmp/migration-plan-1"
+curl --silent --fail -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans" >"$tmp/migration-plan-2"
+digest_1=$(sed -n 's/.*"plan_digest":"\([0-9a-f]*\)".*/\1/p' "$tmp/migration-plan-1")
+digest_2=$(sed -n 's/.*"plan_digest":"\([0-9a-f]*\)".*/\1/p' "$tmp/migration-plan-2")
+test ${#digest_1} = 64
+test "$digest_1" = "$digest_2"
+"$cli" catalog migrate --dry-run -c "$tmp/config.json" >"$tmp/migration-plan-cli"
+grep -Fq 'Applicable: yes' "$tmp/migration-plan-cli"
+config_before_migration=$(cksum "$tmp/config.json")
+catalog_present_before=false
+test -e "$tmp/catalog.json" && catalog_present_before=true
+"$cli" catalog migrate --apply --plan-digest "$digest_1" -c "$tmp/config.json" >"$tmp/migration-apply-cli"
+grep -Fq '"kind":"catalog_migration"' "$tmp/migration-apply-cli"
+grep -Fq '"state":"succeeded"' "$tmp/migration-apply-cli"
+test ! -e "$tmp/model-transactions/$digest_1.json"
+test "$config_before_migration" = "$(cksum "$tmp/config.json")"
+test "$catalog_present_before" = false
+curl --silent --fail -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans" >"$tmp/migration-plan-after-noop"
+digest_after_noop=$(sed -n 's/.*"plan_digest":"\([0-9a-f]*\)".*/\1/p' "$tmp/migration-plan-after-noop")
+test "$digest_1" = "$digest_after_noop"
+
 stop_daemon
 "$daemon" -d -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/debug-daemon.out" 2>"$tmp/debug-daemon.err" &
 pid=$!
@@ -98,6 +181,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     sleep 0.1
 done
 test "$ready" = true
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/operations/$operation_id" >"$tmp/op-after-restart"
+grep -Fq '"state":"failed"' "$tmp/op-after-restart"
 if ! grep -Fq 'http: request received GET /healthz' "$tmp/debug-daemon.err"; then
     cat "$tmp/debug-daemon.out" "$tmp/debug-daemon.err" >&2
     exit 1

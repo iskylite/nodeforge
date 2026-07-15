@@ -58,6 +58,10 @@ pub const leases_path = state_dir ++ "/leases.json";
 /// 与 DHCP checkpoint worker 的 lease 文件锁竞争。
 pub const node_status_path = state_dir ++ "/node-status.json";
 pub const deployment_control_path = state_dir ++ "/deployment-control.json";
+pub const boot_sessions_path = state_dir ++ "/boot-sessions.json";
+pub const node_inventory_path = state_dir ++ "/node-inventory.json";
+pub const operations_path = state_dir ++ "/operations.json";
+pub const model_transactions_dir = state_dir ++ "/model-transactions";
 pub const events_path = logs_dir ++ "/events.jsonl";
 pub const service_log_path = logs_dir ++ "/nodeforged.log";
 pub const service_path = systemd_dir ++ "/nodeforged.service";

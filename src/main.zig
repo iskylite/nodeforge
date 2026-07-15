@@ -117,9 +117,15 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     }, configExportHandler);
     try addConfigPathFlag(config_export);
     try addDebugFlag(config_export);
+    const config_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Apply runtime-safe configuration properties" }, configSetHandler);
+    try config_set.addPositionalArg(.{ .name = "properties", .description = "Typed runtime properties as key=value", .required = true, .variadic = true });
+    try addConfigPathFlag(config_set);
+    try addOutputFlag(config_set);
+    try addDebugFlag(config_set);
     try config.addCommands(&.{
         config_validate,
         config_export,
+        config_set,
         try configImportCommand(init_options),
     });
 
@@ -145,9 +151,28 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     }, catalogExportHandler);
     try addCatalogPathFlag(catalog_export);
     try addDebugFlag(catalog_export);
+    const catalog_show = try zli.Command.init(init_options, .{
+        .name = "show",
+        .description = "Show expanded install-source relationships",
+    }, catalogShowHandler);
+    try catalog_show.addPositionalArg(.{ .name = "install-source", .description = "Canonical install source name", .required = true });
+    try addConfigPathFlag(catalog_show);
+    try addOutputFlag(catalog_show);
+    try addDebugFlag(catalog_show);
+    const catalog_migrate = try zli.Command.init(init_options, .{ .name = "migrate", .description = "Plan or apply canonical catalog migration" }, catalogMigrateHandler);
+    try catalog_migrate.addFlags(&.{
+        .{ .name = "dry-run", .description = "Generate a side-effect-free migration plan", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "apply", .description = "Apply a previously generated plan", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "plan-digest", .description = "SHA-256 digest returned by --dry-run", .type = .String, .default_value = .{ .String = "" } },
+    });
+    try addConfigPathFlag(catalog_migrate);
+    try addOutputFlag(catalog_migrate);
+    try addDebugFlag(catalog_migrate);
     try catalog.addCommands(&.{
         catalog_validate,
         catalog_export,
+        catalog_show,
+        catalog_migrate,
     });
 
     // ── node 资源（节点 CRUD + 部署生命周期）──────────────────────────
@@ -170,33 +195,24 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     const node_add = try zli.Command.init(init_options, .{ .name = "add", .description = "Add a registered node" }, nodeAddHandler);
     try node_add.addPositionalArg(.{ .name = "node_id", .description = "Unique node identifier", .required = true });
-    try node_add.addFlags(&.{
-        .{ .name = "mac", .description = "MAC address (e.g. 02:aa:bb:cc:dd:ef)", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "Architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "profile", .description = "Profile name to bind", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "ip", .description = "Static DHCP reservation IP", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "hostname", .description = "Node hostname", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "deploy", .description = "Deploy flag: true or false (default true)", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "http-accel", .description = "HTTP acceleration for initrd (experimental, default false)", .type = .String, .default_value = .{ .String = "" } },
-    });
+    try node_add.addPositionalArg(.{ .name = "properties", .description = "Typed properties as key=value", .required = true, .variadic = true });
     try addConfigPathFlag(node_add);
     try addOutputFlag(node_add);
     try addDebugFlag(node_add);
 
     const node_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Modify node attributes" }, nodeSetHandler);
     try node_set.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
-    try node_set.addFlags(&.{
-        .{ .name = "mac", .description = "New MAC address", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "New architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "profile", .description = "New profile name", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "ip", .description = "New static IP", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "hostname", .description = "New hostname", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "deploy", .description = "Deploy flag: true or false", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "http-accel", .description = "HTTP acceleration: true or false (experimental, default false)", .type = .String, .default_value = .{ .String = "" } },
-    });
+    try node_set.addPositionalArg(.{ .name = "properties", .description = "Typed properties as key=value", .required = true, .variadic = true });
     try addConfigPathFlag(node_set);
     try addOutputFlag(node_set);
     try addDebugFlag(node_set);
+
+    const node_unset = try zli.Command.init(init_options, .{ .name = "unset", .description = "Clear optional node attributes" }, nodeUnsetHandler);
+    try node_unset.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try node_unset.addPositionalArg(.{ .name = "keys", .description = "Optional property names to clear", .required = true, .variadic = true });
+    try addConfigPathFlag(node_unset);
+    try addOutputFlag(node_unset);
+    try addDebugFlag(node_unset);
 
     const node_remove = try zli.Command.init(init_options, .{ .name = "remove", .description = "Remove a registered node" }, nodeRemoveHandler);
     try node_remove.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
@@ -230,7 +246,19 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     });
     try addOutputFlag(node_trace);
 
-    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_remove, node_render, node_retry, node_trace });
+    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_render, node_retry, node_trace });
+
+    const profile = try zli.Command.init(init_options, .{ .name = "profile", .description = "Inspect PXE profiles" }, showCurrentHelp);
+    const profile_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List PXE profiles" }, profileListHandler);
+    try addConfigPathFlag(profile_list);
+    try addOutputFlag(profile_list);
+    try addDebugFlag(profile_list);
+    const profile_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show a PXE profile" }, profileShowHandler);
+    try profile_show.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
+    try addConfigPathFlag(profile_show);
+    try addOutputFlag(profile_show);
+    try addDebugFlag(profile_show);
+    try profile.addCommands(&.{ profile_list, profile_show });
 
     // ── assets 资源（ISO/资产导入管理）──────────────────────────────────
     const assets = try zli.Command.init(init_options, .{
@@ -283,9 +311,6 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         rt_tftp_counters,
         rt_tftp_sessions,
         try runtimeStatusCommand(init_options),
-        // M4.2 F6：为向后兼容保留的废弃子命令
-        try deprecatedRuntimeLeasesCommand(init_options),
-        try deprecatedRuntimeUnknownCommand(init_options),
     });
 
     const events = try zli.Command.init(init_options, .{
@@ -308,17 +333,10 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         config,
         catalog,
         node,
+        profile,
         assets,
         runtime,
         events,
-        // M4.2 F6：为向后兼容保留的废弃别名。
-        // 每个别名在委托到新命令路径前会先输出废弃警告。
-        try deprecatedAliasCommand(init_options, "import-iso", "assets import"),
-        try deprecatedAliasCommand(init_options, "install-render", "node render"),
-        try deprecatedAliasCommand(init_options, "install-retry", "node retry"),
-        try deprecatedAliasCommand(init_options, "trace", "node trace"),
-        try deprecatedDhcpCommand(init_options),
-        try deprecatedTftpCommand(init_options),
     });
     return root;
 }
@@ -335,6 +353,7 @@ fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
     try command.addPositionalArg(.{ .name = "iso-path", .description = "Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso", .required = true });
     try command.addFlags(&.{
         .{ .name = "distro", .description = "Override auto-detected distro; e.g. rocky, ubuntu, debian. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "name", .description = "Explicit canonical logical name; e.g. rocky-9.7-aarch64-dvd", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Override auto-detected version; e.g. 9.7, 22.04. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "arch", .description = "Override auto-detected arch; e.g. aarch64, x86_64. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
     });
@@ -557,6 +576,67 @@ fn catalogExportHandler(ctx: zli.CommandContext) !void {
     try ctx.writer.writeAll(bytes);
 }
 
+fn catalogShowHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_config.deinit();
+    const name = ctx.positional_args[0];
+    var response: [256 * 1024]u8 = undefined;
+    const body = nodeforge.management_client.installSourceJson(ctx.io, parsed_config.value.server.http_port, name, &response) catch null orelse {
+        try ctx.writer.print("error: install source '{s}' was not found or daemon is unavailable\n", .{name});
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (output_json) return ctx.writer.writeAll(body);
+    const Response = struct { result: struct { family: []const u8, install_source: model.InstallSourceConfig, repositories: []const model.RepositoryConfig, assets: []const model.AssetConfig, profiles: []const []const u8 } };
+    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidManagementResponse;
+    defer parsed.deinit();
+    const source = parsed.value.result.install_source;
+    try ctx.writer.print("{s}  {s}/{s}/{s}  family={s}\n", .{ source.name, source.distro, source.version, @tagName(source.arch), parsed.value.result.family });
+    try ctx.writer.print("  media_tree={s}\n  repositories={d} assets={d} profiles={d}\n", .{ source.media_tree_url orelse "-", parsed.value.result.repositories.len, parsed.value.result.assets.len, parsed.value.result.profiles.len });
+    for (parsed.value.result.assets) |asset| try ctx.writer.print("  asset {s} {s} sha256={s}\n", .{ asset.name, asset.path, asset.sha256 orelse "-" });
+}
+
+fn catalogMigrateHandler(ctx: zli.CommandContext) !void {
+    const dry_run = ctx.flag("dry-run", bool);
+    const apply = ctx.flag("apply", bool);
+    const digest = ctx.flag("plan-digest", []const u8);
+    if (dry_run == apply or (apply and digest.len != 64) or (dry_run and digest.len != 0)) {
+        try ctx.writer.writeAll("error: catalog migrate requires exactly one of --dry-run or --apply; --apply requires --plan-digest <64-hex>\n");
+        setExitCode(ctx, 2);
+        return;
+    }
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_config.deinit();
+    var response: [256 * 1024]u8 = undefined;
+    const body = (if (apply) nodeforge.management_client.catalogMigrationApplyJson(ctx.io, parsed_config.value.server.http_port, digest, &response) else nodeforge.management_client.catalogMigrationPlanJson(ctx.io, parsed_config.value.server.http_port, &response)) catch null orelse {
+        try ctx.writer.writeAll("error: catalog migration plan request failed\n");
+        setExitCode(ctx, 1);
+        return;
+    };
+    if (apply) {
+        try ctx.writer.writeAll(body);
+        return;
+    }
+    // The daemon response is the canonical diagnostic artifact. Human mode is
+    // intentionally concise until apply adds an operation lifecycle view.
+    if (outputJsonFromContext(ctx) orelse false) return ctx.writer.writeAll(body);
+    const Response = struct { result: struct { plan_digest: []const u8, applicable: bool, plan: struct { renames: []const std.json.Value, blockers: []const std.json.Value } } };
+    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch {
+        try ctx.writer.writeAll("error: invalid migration plan response\n");
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed.deinit();
+    try ctx.writer.print("Plan digest: {s}\nRenames: {d}\nBlockers: {d}\nApplicable: {s}\n", .{ parsed.value.result.plan_digest, parsed.value.result.plan.renames.len, parsed.value.result.plan.blockers.len, if (parsed.value.result.applicable) "yes" else "no" });
+}
+
 /// 导入一个已存在的 root 受管文件，计算其 SHA-256 摘要，校验候选 catalog
 /// 后原子发布新 manifest。
 ///
@@ -643,8 +723,14 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
     defer parsed_config.deinit();
     const iso_path = ctx.getArg("iso-path") orelse unreachable;
     const distro = ctx.flag("distro", []const u8);
+    const name = ctx.flag("name", []const u8);
     const version = ctx.flag("version", []const u8);
     const arch = ctx.flag("arch", []const u8);
+    if (name.len != 0 and !nodeforge.config_validate.validLogicalId(name)) {
+        try ctx.writer.writeAll("error: install-source: invalid canonical --name\n");
+        setExitCode(ctx, 2);
+        return;
+    }
     if (arch.len != 0 and std.meta.stringToEnum(nodeforge.model.Arch, arch) == null) {
         try ctx.writer.writeAll("error: install-source: unsupported --arch\n");
         setExitCode(ctx, 2);
@@ -662,8 +748,12 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
         ctx.allocator.free(staged.path);
     }
     if (!output_json) try ctx.writer.print("Staged ISO ({d} bytes) from {s}; validating and importing\n", .{ staged.size, iso_path });
+    const import_key = installImportKey(staged.sha256, if (name.len == 0) null else name, if (distro.len == 0) null else distro, if (version.len == 0) null else version, if (arch.len == 0) null else arch);
     const imported = nodeforge.management_client.importInstallSource(ctx.io, parsed_config.value.server.http_port, .{
         .filename = staged.filename,
+        .content_sha256 = &staged.sha256,
+        .idempotency_key = &import_key,
+        .name = if (name.len == 0) null else name,
         .distro = if (distro.len == 0) null else distro,
         .version = if (version.len == 0) null else version,
         .arch = if (arch.len == 0) null else arch,
@@ -686,6 +776,7 @@ const StagedInstallIso = struct {
     filename: []u8,
     path: []u8,
     size: u64,
+    sha256: [64]u8,
 };
 
 /// 将管理员指定的 ISO 原子复制到 daemon 受管的暂存目录。
@@ -713,7 +804,20 @@ fn stageInstallIso(io: std.Io, allocator: std.mem.Allocator, source: []const u8)
     errdefer allocator.free(destination);
     try std.Io.Dir.cwd().createDirPath(io, nodeforge.paths.import_dir);
     try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, io, .{ .permissions = .default_file, .replace = false });
-    return .{ .filename = filename, .path = destination, .size = stat.size };
+    var checksum: [64]u8 = undefined;
+    try nodeforge.asset_validate.sha256File(io, nodeforge.paths.import_dir, filename, &checksum);
+    return .{ .filename = filename, .path = destination, .size = stat.size, .sha256 = checksum };
+}
+
+fn installImportKey(content_sha256: [64]u8, name: ?[]const u8, distro: ?[]const u8, version: ?[]const u8, arch: ?[]const u8) [64]u8 {
+    var hash_state = std.crypto.hash.sha2.Sha256.init(.{});
+    inline for (.{ @as(?[]const u8, &content_sha256), name, distro, version, arch }) |value| {
+        if (value) |bytes| hash_state.update(bytes);
+        hash_state.update(&.{0});
+    }
+    var raw: [32]u8 = undefined;
+    hash_state.final(&raw);
+    return std.fmt.bytesToHex(raw, .lower);
 }
 
 fn assetListHandler(ctx: zli.CommandContext) !void {
@@ -1051,21 +1155,84 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    if (output_json) {
-        try ctx.writer.writeAll("{\"nodes\":[");
-        for (config.value.nodes, 0..) |item, i| {
-            if (i != 0) try ctx.writer.writeByte(',');
-            try ctx.writer.print("{{\"id\":{f},\"mac\":{f},\"ip\":", .{ std.json.fmt(item.id, .{}), std.json.fmt(item.mac, .{}) });
-            if (item.ip) |ip| try ctx.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try ctx.writer.writeAll("null");
-            try ctx.writer.print(",\"profile\":{f}}}", .{std.json.fmt(item.profile, .{})});
-        }
-        try ctx.writer.writeAll("]}\n");
+    var response: [128 * 1024]u8 = undefined;
+    const body = try nodeforge.management_client.nodesJson(ctx.io, config.value.server.http_port, null, &response);
+    if (body == null) {
+        try ctx.writer.writeAll("error: node: local daemon management API unavailable\n");
+        setExitCode(ctx, 1);
         return;
     }
+    if (output_json) {
+        try ctx.writer.writeAll(body.?);
+        return;
+    }
+    const Response = struct {
+        ok: bool,
+        result: struct {
+            view_revision: struct { config: u64, catalog: u64, inventory: u64 },
+            nodes: []const struct { id: []const u8, mac: []const u8, ip: ?[]const u8, profile: []const u8, status: ?[]const u8, started_at: ?i64, finished_at: ?i64, serial_number: ?[]const u8 },
+        },
+    };
+    var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        try ctx.writer.print("error: node: malformed daemon response ({t})\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed.deinit();
     var rows: [256]views.NodeRow = undefined;
-    if (config.value.nodes.len > rows.len) return error.TooManyNodes;
-    for (config.value.nodes, 0..) |item, i| rows[i] = .{ .id = item.id, .mac = item.mac, .ip = item.ip orelse "-", .profile = item.profile };
-    try views.nodes(ctx.writer, rows[0..config.value.nodes.len]);
+    // 部署开始/结束时间格式化为 RFC 3339 可视化时间，列表不再展示裸 epoch。
+    var started_buf: [256][20]u8 = undefined;
+    var finished_buf: [256][20]u8 = undefined;
+    if (parsed.value.result.nodes.len > rows.len) return error.TooManyNodes;
+    for (parsed.value.result.nodes, 0..) |item, i| rows[i] = .{ .id = item.id, .mac = item.mac, .ip = item.ip orelse "-", .profile = item.profile, .status = item.status orelse "-", .started_at = views.formatTimestamp(&started_buf[i], item.started_at orelse 0), .finished_at = views.formatTimestamp(&finished_buf[i], item.finished_at orelse 0), .serial_number = item.serial_number orelse "-" };
+    try views.nodes(ctx.writer, rows[0..parsed.value.result.nodes.len]);
+}
+
+fn profileListHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var response: [128 * 1024]u8 = undefined;
+    const body = try nodeforge.management_client.profilesJson(ctx.io, config.value.server.http_port, null, &response);
+    if (body == null) {
+        try ctx.writer.writeAll("error: profile: local daemon management API unavailable\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    if (output_json) return ctx.writer.writeAll(body.?);
+    const Response = struct { result: struct { profiles: []const struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: ?[]const u8, nodes: usize, valid: bool } } };
+    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try ctx.writer.writeAll("error: profile: malformed daemon response\n");
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed.deinit();
+    var rows: [256]views.ProfileRow = undefined;
+    var counts: [256][24]u8 = undefined;
+    if (parsed.value.result.profiles.len > rows.len) return error.TooManyProfiles;
+    for (parsed.value.result.profiles, 0..) |profile, index| rows[index] = .{ .name = profile.name, .mode = profile.mode, .distro = profile.distro, .version = profile.version, .arch = profile.arch, .install_source = profile.install_source orelse "-", .nodes = try std.fmt.bufPrint(&counts[index], "{d}", .{profile.nodes}), .valid = if (profile.valid) "yes" else "no" };
+    try views.profiles(ctx.writer, rows[0..parsed.value.result.profiles.len]);
+}
+
+fn profileShowHandler(ctx: zli.CommandContext) !void {
+    _ = outputJsonFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    var response: [128 * 1024]u8 = undefined;
+    const body = try nodeforge.management_client.profilesJson(ctx.io, config.value.server.http_port, name, &response);
+    if (body == null) {
+        try ctx.writer.writeAll("error: profile: local daemon management API unavailable\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    try ctx.writer.writeAll(body.?);
 }
 
 /// 离线 answer 预览有意使用明显的非密钥占位符。
@@ -1119,7 +1286,12 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     std.debug.print("password_hash_scope=preview config_revision={d} plan_digest={d} package_availability=installer-media\n", .{ config_revision, plan_digest });
     // APT 源 URL 解析：与 HTTP answerFixture 保持一致的 fallback 逻辑。
     // Ubuntu ISO 导入时始终创建 repository，但手动配置场景可能缺失。
-    const apt_primary_url = if (std.mem.eql(u8, source.distro, "ubuntu")) blk: {
+    const distro = nodeforge.catalog.findDistro(&config.value, source.distro) orelse {
+        try ctx.writer.writeAll("error: install: distro unavailable\n");
+        setExitCode(ctx, 1);
+        return;
+    };
+    const apt_primary_url = if (distro.family == .ubuntu) blk: {
         const repository = nodeforge.catalog.findRepository(catalog.value(), source.name);
         if (repository) |repo| if (repo.manager == .apt) break :blk repo.base_url;
         break :blk try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/repos/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
@@ -1130,13 +1302,13 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     defer ctx.allocator.free(bootstrap_key);
     const bundle = if (install.bundle) |name| findBundle(&config.value, name) else null;
     // M4.2：webhook 上报对所有 Ubuntu 版本可用（curtin handler 相同）
-    const preview_report_url: []const u8 = if (std.mem.eql(u8, source.distro, "ubuntu")) "<report-url>" else "";
-    const answer = if (std.mem.eql(u8, source.distro, "ubuntu"))
-        try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, event_url, "<log-url>", preview_report_url, "<boot-session>", "<capability>", &preview_scope)
+    const preview_report_url: []const u8 = if (distro.family == .ubuntu) "<report-url>" else "";
+    const answer = if (distro.family == .ubuntu)
+        try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, "<facts-url>", event_url, "<log-url>", preview_report_url, "<boot-session>", "<capability>", &preview_scope)
     else blk: {
         const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/repos/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
         defer ctx.allocator.free(install_root);
-        break :blk try nodeforge.kickstart.renderAnswerM41(ctx.allocator, node, install, system, bootstrap_key, install_root, bundle, event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope);
+        break :blk try nodeforge.kickstart.renderAnswerM41(ctx.allocator, node, install, system, bootstrap_key, install_root, bundle, "<facts-url>", event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope);
     };
     defer ctx.allocator.free(answer);
     try ctx.writer.writeAll(answer);
@@ -1157,64 +1329,75 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
 
 // ── M4.2 node CRUD handlers ───────────────────────────────────────
 
+fn configSetHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const Patch = struct {
+        logging_level: ?model.LogLevel = null,
+        events_max_size_mb: ?u16 = null,
+        events_keep: ?u8 = null,
+        policy_default_action: ?model.DiscoveryAction = null,
+        policy_default_profile: ?[]const u8 = null,
+        policy_allow_unknown_diskless: ?bool = null,
+        server_http_port: ?u16 = null,
+        tftp_max_blksize: ?u16 = null,
+    };
+    var patch: Patch = .{};
+    var seen: u8 = 0;
+    for (ctx.positional_args) |item| {
+        const equal = std.mem.indexOfScalar(u8, item, '=') orelse return nodePropertyError(ctx, error.InvalidAttribute);
+        const key = item[0..equal];
+        const value = item[equal + 1 ..];
+        const bit: u8 = if (std.mem.eql(u8, key, "logging.level")) 1 else if (std.mem.eql(u8, key, "events.max_size_mb")) 2 else if (std.mem.eql(u8, key, "events.keep")) 4 else if (std.mem.eql(u8, key, "policy.default_action")) 8 else if (std.mem.eql(u8, key, "policy.default_profile")) 16 else if (std.mem.eql(u8, key, "policy.allow_unknown_diskless")) 32 else if (std.mem.eql(u8, key, "server.http_port")) 64 else if (std.mem.eql(u8, key, "tftp.max_blksize")) 128 else return nodePropertyError(ctx, error.UnknownAttribute);
+        if (seen & bit != 0) return nodePropertyError(ctx, error.DuplicateAttribute);
+        seen |= bit;
+        switch (bit) {
+            1 => patch.logging_level = std.meta.stringToEnum(model.LogLevel, value) orelse return nodePropertyError(ctx, error.InvalidAttribute),
+            2 => patch.events_max_size_mb = std.fmt.parseInt(u16, value, 10) catch return nodePropertyError(ctx, error.InvalidAttribute),
+            4 => patch.events_keep = std.fmt.parseInt(u8, value, 10) catch return nodePropertyError(ctx, error.InvalidAttribute),
+            8 => patch.policy_default_action = std.meta.stringToEnum(model.DiscoveryAction, value) orelse return nodePropertyError(ctx, error.InvalidAttribute),
+            16 => patch.policy_default_profile = value,
+            32 => patch.policy_allow_unknown_diskless = parseStrictBool(value) orelse return nodePropertyError(ctx, error.InvalidAttribute),
+            64 => patch.server_http_port = std.fmt.parseInt(u16, value, 10) catch return nodePropertyError(ctx, error.InvalidAttribute),
+            128 => patch.tftp_max_blksize = std.fmt.parseInt(u16, value, 10) catch return nodePropertyError(ctx, error.InvalidAttribute),
+            else => unreachable,
+        }
+    }
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, patch, .{ .emit_null_optional_fields = false });
+    defer ctx.allocator.free(body);
+    if (!nodeforge.management_client.configSet(ctx.io, config.value.server.http_port, body).healthy) {
+        try ctx.writer.writeAll("error: config set rejected by daemon\n");
+        setExitCode(ctx, 1);
+        return;
+    }
+    if (output_json) try ctx.writer.writeAll("{\"ok\":true}\n") else try views.success(ctx.writer, "configuration applied online", &.{});
+}
+
 fn nodeAddHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const config_path = ctx.flag("config", []const u8);
     const node_id = ctx.getArg("node_id") orelse return;
-    const mac = ctx.flag("mac", []const u8);
-    const arch_str = ctx.flag("arch", []const u8);
-    const profile = ctx.flag("profile", []const u8);
-    const ip = ctx.flag("ip", []const u8);
-    const hostname = ctx.flag("hostname", []const u8);
-    const deploy_str = ctx.flag("deploy", []const u8);
-    const http_accel_str = ctx.flag("http-accel", []const u8);
+    const patch = parseNodeProperties(ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
+    const mac = patch.mac orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
+    const arch = patch.arch orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
+    const profile = patch.profile orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
 
-    if (mac.len == 0 or profile.len == 0 or arch_str.len == 0) {
-        try ctx.writer.print("error: --mac, --arch and --profile are required\n", .{});
-        setExitCode(ctx, 1);
-        return;
-    }
-    const arch: model.Arch = if (std.mem.eql(u8, arch_str, "aarch64")) .aarch64 else if (std.mem.eql(u8, arch_str, "x86_64")) .x86_64 else {
-        try ctx.writer.print("error: --arch must be aarch64 or x86_64\n", .{});
-        setExitCode(ctx, 1);
-        return;
-    };
-    const ip_val: ?[]const u8 = if (ip.len > 0) ip else null;
-    const hostname_val: ?[]const u8 = if (hostname.len > 0) hostname else null;
-    // M4.2 F8：--deploy 严格布尔解析
-    const deploy_val: bool = if (deploy_str.len == 0) true else if (std.mem.eql(u8, deploy_str, "true") or std.mem.eql(u8, deploy_str, "1")) true else if (std.mem.eql(u8, deploy_str, "false") or std.mem.eql(u8, deploy_str, "0")) false else {
-        try ctx.writer.print("error: --deploy must be true or false\n", .{});
-        setExitCode(ctx, 1);
-        return;
-    };
-    // M4.2 F4：--http-accel 严格布尔解析（默认 false）
-    const http_accel_val: bool = if (http_accel_str.len == 0) false else if (std.mem.eql(u8, http_accel_str, "true") or std.mem.eql(u8, http_accel_str, "1")) true else if (std.mem.eql(u8, http_accel_str, "false") or std.mem.eql(u8, http_accel_str, "0")) false else {
-        try ctx.writer.print("error: --http-accel must be true or false\n", .{});
-        setExitCode(ctx, 1);
-        return;
-    };
-
-    node_mutation.addNode(ctx.io, ctx.allocator, config_path, .{
-        .id = node_id,
-        .mac = mac,
-        .arch = arch,
-        .profile = profile,
-        .ip = ip_val,
-        .hostname = hostname_val,
-        .deploy = deploy_val,
-        .http_accel = http_accel_val,
-    }) catch |err| {
-        try printMutationError(ctx, err, "add", node_id);
-        setExitCode(ctx, 1);
-        return;
-    };
-    // 通知 daemon 重新加载 config.json
     var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
-    if (!try requestNodeConfigReload(ctx, config.value.server.http_port, node_id)) return;
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .id = node_id, .mac = mac, .arch = arch, .profile = profile, .ip = patch.ip, .hostname = patch.hostname, .deploy = patch.deploy orelse true, .http_accel = patch.http_accel orelse false }, .{});
+    defer ctx.allocator.free(body);
+    if (!nodeforge.management_client.nodeAdd(ctx.io, config.value.server.http_port, body).healthy) {
+        try ctx.writer.print("error: node add failed for {s}: daemon rejected mutation\n", .{node_id});
+        setExitCode(ctx, 1);
+        return;
+    }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node added", &.{ .{ .label = "Node", .value = node_id }, .{ .label = "MAC", .value = mac }, .{ .label = "Profile", .value = profile } });
 }
 
@@ -1222,67 +1405,106 @@ fn nodeSetHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const config_path = ctx.flag("config", []const u8);
     const node_id = ctx.getArg("node_id") orelse return;
-    const mac = ctx.flag("mac", []const u8);
-    const arch_str = ctx.flag("arch", []const u8);
-    const profile = ctx.flag("profile", []const u8);
-    const ip = ctx.flag("ip", []const u8);
-    const hostname = ctx.flag("hostname", []const u8);
-    const deploy_str = ctx.flag("deploy", []const u8);
-    const http_accel_str = ctx.flag("http-accel", []const u8);
-
-    var params: node_mutation.SetParams = .{};
-    if (mac.len > 0) params.mac = mac;
-    if (arch_str.len > 0) params.arch = if (std.mem.eql(u8, arch_str, "aarch64")) .aarch64 else if (std.mem.eql(u8, arch_str, "x86_64")) .x86_64 else {
-        try ctx.writer.print("error: --arch must be aarch64 or x86_64\n", .{});
-        setExitCode(ctx, 1);
-        return;
-    };
-    if (profile.len > 0) params.profile = profile;
-    if (ip.len > 0) {
+    const patch = parseNodeProperties(ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
+    var params: node_mutation.SetParams = .{ .mac = patch.mac, .arch = patch.arch, .profile = patch.profile, .deploy = patch.deploy, .http_accel = patch.http_accel };
+    if (patch.ip) |value| {
         params.ip_set = true;
-        params.ip = ip;
+        params.ip = value;
     }
-    if (hostname.len > 0) {
+    if (patch.hostname) |value| {
         params.hostname_set = true;
-        params.hostname = hostname;
-    }
-    if (deploy_str.len > 0) {
-        // M4.2 F8：严格布尔解析 — 拒绝歧义值
-        if (std.mem.eql(u8, deploy_str, "true") or std.mem.eql(u8, deploy_str, "1")) {
-            params.deploy = true;
-        } else if (std.mem.eql(u8, deploy_str, "false") or std.mem.eql(u8, deploy_str, "0")) {
-            params.deploy = false;
-        } else {
-            try ctx.writer.print("error: --deploy must be true or false\n", .{});
-            setExitCode(ctx, 1);
-            return;
-        }
-    }
-    if (http_accel_str.len > 0) {
-        if (std.mem.eql(u8, http_accel_str, "true") or std.mem.eql(u8, http_accel_str, "1")) {
-            params.http_accel = true;
-        } else if (std.mem.eql(u8, http_accel_str, "false") or std.mem.eql(u8, http_accel_str, "0")) {
-            params.http_accel = false;
-        } else {
-            try ctx.writer.print("error: --http-accel must be true or false\n", .{});
-            setExitCode(ctx, 1);
-            return;
-        }
+        params.hostname = value;
     }
 
-    node_mutation.setNode(ctx.io, ctx.allocator, config_path, node_id, params) catch |err| {
-        try printMutationError(ctx, err, "set", node_id);
-        setExitCode(ctx, 1);
-        return;
-    };
-    // 通知 daemon 重新加载 config.json
     var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
-    if (!try requestNodeConfigReload(ctx, config.value.server.http_port, node_id)) return;
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .mac = params.mac, .arch = params.arch, .profile = params.profile, .ip = if (params.ip_set) params.ip else null, .hostname = if (params.hostname_set) params.hostname else null, .deploy = params.deploy, .http_accel = params.http_accel }, .{ .emit_null_optional_fields = false });
+    defer ctx.allocator.free(body);
+    if (!nodeforge.management_client.nodeSet(ctx.io, config.value.server.http_port, node_id, body).healthy) {
+        try ctx.writer.print("error: node set failed for {s}: daemon rejected mutation\n", .{node_id});
+        setExitCode(ctx, 1);
+        return;
+    }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node updated", &.{.{ .label = "Node", .value = node_id }});
+}
+
+fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const config_path = ctx.flag("config", []const u8);
+    const node_id = ctx.getArg("node_id") orelse return;
+    var params: node_mutation.SetParams = .{};
+    for (ctx.positional_args[1..]) |key| {
+        if (std.mem.eql(u8, key, "ip")) {
+            if (params.ip_set) return nodePropertyError(ctx, error.DuplicateAttribute);
+            params.ip_set = true;
+            params.ip = null;
+        } else if (std.mem.eql(u8, key, "hostname")) {
+            if (params.hostname_set) return nodePropertyError(ctx, error.DuplicateAttribute);
+            params.hostname_set = true;
+            params.hostname = null;
+        } else return nodePropertyError(ctx, error.AttributeNotOptional);
+    }
+    var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var unset: [2][]const u8 = undefined;
+    var unset_len: usize = 0;
+    if (params.ip_set) {
+        unset[unset_len] = "ip";
+        unset_len += 1;
+    }
+    if (params.hostname_set) {
+        unset[unset_len] = "hostname";
+        unset_len += 1;
+    }
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .unset = unset[0..unset_len] }, .{});
+    defer ctx.allocator.free(body);
+    if (!nodeforge.management_client.nodeSet(ctx.io, config.value.server.http_port, node_id, body).healthy) {
+        try ctx.writer.print("error: node unset failed for {s}: daemon rejected mutation\n", .{node_id});
+        setExitCode(ctx, 1);
+        return;
+    }
+    if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node attributes cleared", &.{.{ .label = "Node", .value = node_id }});
+}
+
+const NodeProperties = struct { mac: ?[]const u8 = null, arch: ?model.Arch = null, profile: ?[]const u8 = null, ip: ?[]const u8 = null, hostname: ?[]const u8 = null, deploy: ?bool = null, http_accel: ?bool = null };
+fn parseNodeProperties(values: []const []const u8) !NodeProperties {
+    var result: NodeProperties = .{};
+    var seen: u8 = 0;
+    for (values) |item| {
+        const equal = std.mem.indexOfScalar(u8, item, '=') orelse return error.InvalidAttribute;
+        const key = item[0..equal];
+        const value = item[equal + 1 ..];
+        if (key.len == 0 or value.len == 0) return error.InvalidAttribute;
+        const bit: u8 = if (std.mem.eql(u8, key, "mac")) 1 else if (std.mem.eql(u8, key, "arch")) 2 else if (std.mem.eql(u8, key, "profile")) 4 else if (std.mem.eql(u8, key, "ip")) 8 else if (std.mem.eql(u8, key, "hostname")) 16 else if (std.mem.eql(u8, key, "deploy")) 32 else if (std.mem.eql(u8, key, "http_accel")) 64 else return error.UnknownAttribute;
+        if (seen & bit != 0) return error.DuplicateAttribute;
+        seen |= bit;
+        switch (bit) {
+            1 => result.mac = value,
+            2 => result.arch = std.meta.stringToEnum(model.Arch, value) orelse return error.InvalidAttribute,
+            4 => result.profile = value,
+            8 => result.ip = value,
+            16 => result.hostname = value,
+            32 => result.deploy = parseStrictBool(value) orelse return error.InvalidAttribute,
+            64 => result.http_accel = parseStrictBool(value) orelse return error.InvalidAttribute,
+            else => unreachable,
+        }
+    }
+    return result;
+}
+fn parseStrictBool(value: []const u8) ?bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return null;
+}
+fn nodePropertyError(ctx: zli.CommandContext, err: anyerror) void {
+    ctx.writer.print("error: node attributes: {s}\n", .{@errorName(err)}) catch {};
+    setExitCode(ctx, 2);
 }
 
 fn nodeRemoveHandler(ctx: zli.CommandContext) !void {
@@ -1290,17 +1512,16 @@ fn nodeRemoveHandler(ctx: zli.CommandContext) !void {
     const config_path = ctx.flag("config", []const u8);
     const node_id = ctx.getArg("node_id") orelse return;
 
-    node_mutation.removeNode(ctx.io, ctx.allocator, config_path, node_id) catch |err| {
-        try printMutationError(ctx, err, "remove", node_id);
-        setExitCode(ctx, 1);
-        return;
-    };
     var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
-    if (!try requestNodeConfigReload(ctx, config.value.server.http_port, node_id)) return;
+    if (!nodeforge.management_client.nodeRemove(ctx.io, config.value.server.http_port, node_id).healthy) {
+        try ctx.writer.print("error: node remove failed for {s}: daemon rejected mutation\n", .{node_id});
+        setExitCode(ctx, 1);
+        return;
+    }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node removed", &.{.{ .label = "Node", .value = node_id }});
 }
 
@@ -1314,42 +1535,57 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
 
-    // 查找节点
-    var found: ?model.NodeConfig = null;
-    for (config.value.nodes) |n| {
-        if (std.mem.eql(u8, n.id, node_id)) {
-            found = n;
-            break;
-        }
+    var response: [128 * 1024]u8 = undefined;
+    const body = try nodeforge.management_client.nodesJson(ctx.io, config.value.server.http_port, node_id, &response);
+    if (body == null) {
+        try ctx.writer.print("error: node not found or daemon unavailable: {s}\n", .{node_id});
+        setExitCode(ctx, 1);
+        return;
     }
-    const node = found orelse {
-        try ctx.writer.print("error: node not found: {s}\n", .{node_id});
+    if (output_json) {
+        try ctx.writer.writeAll(body.?);
+        return;
+    }
+    const Response = struct {
+        result: struct {
+            node: model.NodeConfig,
+            profile: struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8 },
+            effective_system: struct {
+                localization: model.LocalizationConfig,
+                connectivity: model.ConnectivityPolicy,
+                ssh: struct { enabled: bool, password_authentication: bool, root_login: []const u8, root_password_configured: bool, root_authorized_key_count: usize },
+                security: model.TargetSecurityConfig,
+                users: []const struct { name: []const u8, sudo: bool, password_configured: bool, authorized_key_count: usize },
+                packages: []const []const u8,
+            },
+            status: ?struct { phase: []const u8, last_event_at: i64, last_error: bool, reason: []const u8, session_active: bool },
+            deployment: ?nodeforge.deployment_control.View,
+            inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, reported_at: i64 },
+        },
+    };
+    var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try ctx.writer.writeAll("error: node: malformed daemon response\n");
         setExitCode(ctx, 1);
         return;
     };
-
-    if (output_json) {
-        try ctx.writer.print("{{\"id\":{f},\"mac\":{f},\"arch\":\"{s}\",\"profile\":{f},\"ip\":", .{
-            std.json.fmt(node.id, .{}),
-            std.json.fmt(node.mac, .{}),
-            @tagName(node.arch),
-            std.json.fmt(node.profile, .{}),
-        });
-        if (node.ip) |ip| {
-            try ctx.writer.print("{f}", .{std.json.fmt(ip, .{})});
-        } else {
-            try ctx.writer.print("null", .{});
-        }
-        try ctx.writer.print(",\"hostname\":", .{});
-        if (node.hostname) |h| {
-            try ctx.writer.print("{f}", .{std.json.fmt(h, .{})});
-        } else {
-            try ctx.writer.print("null", .{});
-        }
-        try ctx.writer.print(",\"deploy\":{s},\"http_accel\":{s}}}\n", .{ if (node.deploy) "true" else "false", if (node.http_accel) "true" else "false" });
-    } else {
-        try views.nodeDetail(ctx.writer, node);
-    }
+    defer parsed.deinit();
+    try views.nodeDetail(ctx.writer, parsed.value.result.node);
+    const result = parsed.value.result;
+    try ctx.writer.print("Profile\n  Name         {s}\n  Mode         {s}\n  Distro       {s} {s} {s}\n", .{ result.profile.name, result.profile.mode, result.profile.distro, result.profile.version, result.profile.arch });
+    try ctx.writer.print("Effective system\n  Locale       {s}\n  Timezone     {s}\n  SSH          enabled={s} password_auth={s} root_password_configured={s}\n  Users        {d}\n  Packages     {d}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, if (result.effective_system.ssh.enabled) "yes" else "no", if (result.effective_system.ssh.password_authentication) "yes" else "no", if (result.effective_system.ssh.root_password_configured) "yes" else "no", result.effective_system.users.len, result.effective_system.packages.len });
+    // 所有时间字段统一渲染为 RFC 3339 可视化时间，避免直接输出裸 epoch。
+    var last_event_buf: [20]u8 = undefined;
+    var requested_buf: [20]u8 = undefined;
+    var started_buf: [20]u8 = undefined;
+    var finished_buf: [20]u8 = undefined;
+    var deployed_buf: [20]u8 = undefined;
+    var reported_buf: [20]u8 = undefined;
+    try ctx.writer.writeAll("Runtime\n");
+    if (result.status) |status| try ctx.writer.print("  Phase        {s}\n  Active       {s}\n  Last event   {s}\n  Reason       {s}\n", .{ status.phase, if (status.session_active) "yes" else "no", views.formatTimestamp(&last_event_buf, status.last_event_at), if (status.reason.len == 0) "-" else status.reason }) else try ctx.writer.writeAll("  Phase        -\n");
+    try ctx.writer.writeAll("Deployment\n");
+    if (result.deployment) |deployment| try ctx.writer.print("  Generation   {f}\n  Requested    {s}\n  Started      {s}\n  Finished     {s}\n  Deployed     {s}\n", .{ std.json.fmt(deployment.consumed_generation, .{}), views.formatTimestamp(&requested_buf, deployment.requested_at), views.formatTimestamp(&started_buf, deployment.started_at), views.formatTimestamp(&finished_buf, deployment.finished_at), views.formatTimestamp(&deployed_buf, deployment.deployed_at) }) else try ctx.writer.writeAll("  Generation   -\n");
+    try ctx.writer.writeAll("Inventory\n");
+    if (result.inventory) |inventory| try ctx.writer.print("  SN           {s}\n  UUID         {s}\n  Vendor       {s}\n  Model        {s}\n  Reported     {s}\n", .{ inventory.serial_number orelse "-", inventory.product_uuid orelse "-", inventory.vendor orelse "-", inventory.model orelse "-", views.formatTimestamp(&reported_buf, inventory.reported_at) }) else try ctx.writer.writeAll("  SN           -\n");
 }
 
 fn printMutationError(ctx: zli.CommandContext, err: anyerror, action: []const u8, node_id: []const u8) !void {
@@ -1408,8 +1644,9 @@ fn eventsListHandler(ctx: zli.CommandContext) !void {
         return;
     }
     var display: [1000]views.EventRow = undefined;
+    var ts_buf: [1000][20]u8 = undefined;
     for (rows[0..result.count], 0..) |event, index| display[index] = .{
-        .ts = event.ts,
+        .ts = cli_events.displayTs(&ts_buf[index], event.ts),
         .event_type = event.type,
         .node = cli_events.node(event) orelse "-",
         .message = event.message,
@@ -1467,7 +1704,10 @@ fn eventsFollowHandler(ctx: zli.CommandContext) !void {
             if (output_json) {
                 try std.json.Stringify.value(event, .{}, ctx.writer);
                 try ctx.writer.writeByte('\n');
-            } else try views.eventLine(ctx.writer, event.ts, event.type, try cli_events.fieldsText(ctx.allocator, event.fields), event.message);
+            } else {
+                var follow_ts_buf: [20]u8 = undefined;
+                try views.eventLine(ctx.writer, cli_events.displayTs(&follow_ts_buf, event.ts), event.type, try cli_events.fieldsText(ctx.allocator, event.fields), event.message);
+            }
             try ctx.writer.flush();
         }
     }
@@ -1623,7 +1863,8 @@ fn traceHandler(ctx: zli.CommandContext) !void {
     if (terminal_reason) |reason| try ctx.writer.print("  Terminal     {s}\n", .{reason});
     if (trace_count == 0) try ctx.writer.writeAll("No safely associated events recorded.\n") else {
         try ctx.writer.writeAll("Events\n");
-        for (trace_events[0..trace_count]) |event| try views.eventLine(ctx.writer, event.ts, event.type, try cli_events.fieldsText(ctx.allocator, event.fields), event.message);
+        var trace_ts_buf: [20]u8 = undefined;
+        for (trace_events[0..trace_count]) |event| try views.eventLine(ctx.writer, cli_events.displayTs(&trace_ts_buf, event.ts), event.type, try cli_events.fieldsText(ctx.allocator, event.fields), event.message);
     }
     if (gap_count != 0) {
         try ctx.writer.writeAll("Gaps\n");
@@ -1939,7 +2180,12 @@ fn jsonBool(value: bool) []const u8 {
 
 /// 输出稳定的 CLI 名称与项目版本。
 fn printVersion(out: *std.Io.Writer) !void {
-    try out.print("nodeforge {s}\n", .{nodeforge.version.version});
+    try out.print("nodeforge {s} (commit {s}, built {s}, {s})\n", .{
+        nodeforge.version.version,
+        nodeforge.version.shortCommit(),
+        nodeforge.version.build_time,
+        if (nodeforge.version.git_dirty) "dirty" else "clean",
+    });
 }
 
 // ── M4.2 F6：runtime status + 废弃别名 ─────────────────────
@@ -1981,122 +2227,4 @@ fn runtimeStatusHandler(ctx: zli.CommandContext) !void {
         try ctx.writer.print("  TFTP Transfers   started={d} completed={d} failed={d}\n", .{ tftp.started, tftp.completed, tftp.failed });
     }
     if (!mgmt.healthy) setExitCode(ctx, 1);
-}
-
-/// 创建一个废弃别名命令：zli 原生 deprecated + replaced_by 支持，
-/// 执行时自动输出 warning 并返回 CommandDeprecated 错误（退出码 2）。
-fn deprecatedAliasCommand(init_options: zli.InitOptions, old_name: []const u8, new_cmd: []const u8) !*zli.Command {
-    return try zli.Command.init(init_options, .{
-        .name = old_name,
-        .description = "Deprecated alias — see help for the current command tree",
-        .deprecated = true,
-        .replaced_by = new_cmd,
-    }, showCurrentHelp);
-}
-
-// ── 废弃的 `dhcp` 顶层命令 ──────────────────────────────
-
-fn deprecatedDhcpCommand(init_options: zli.InitOptions) !*zli.Command {
-    const dhcp = try zli.Command.init(init_options, .{
-        .name = "dhcp",
-        .description = "Deprecated: use 'config export' for static config or 'runtime dhcp-leases' for runtime state",
-    }, showCurrentHelp);
-    const show = try zli.Command.init(init_options, .{
-        .name = "show",
-        .description = "Deprecated: show DHCP static configuration",
-    }, deprecatedDhcpShowHandler);
-    try addConfigPathFlag(show);
-    try addOutputFlag(show);
-    try addDebugFlag(show);
-    try dhcp.addCommands(&.{show});
-    return dhcp;
-}
-
-fn deprecatedDhcpShowHandler(ctx: zli.CommandContext) !void {
-    try ctx.writer.writeAll("warning: 'dhcp show' is deprecated. Use 'config export' for static config or 'runtime dhcp-leases' for runtime state.\n");
-    try dhcpShowHandler(ctx);
-}
-
-// ── 废弃的 `tftp` 顶层命令 ──────────────────────────────
-
-fn deprecatedTftpCommand(init_options: zli.InitOptions) !*zli.Command {
-    const tftp = try zli.Command.init(init_options, .{
-        .name = "tftp",
-        .description = "Deprecated: use 'runtime tftp-counters' and 'runtime tftp-sessions'",
-    }, showCurrentHelp);
-    const show = try zli.Command.init(init_options, .{
-        .name = "show",
-        .description = "Deprecated: show TFTP transfer counters",
-    }, deprecatedTftpShowHandler);
-    try addConfigPathFlag(show);
-    try addOutputFlag(show);
-    try addDebugFlag(show);
-    const session = try zli.Command.init(init_options, .{
-        .name = "session",
-        .description = "Deprecated: TFTP session subcommands",
-    }, showCurrentHelp);
-    const list = try zli.Command.init(init_options, .{
-        .name = "list",
-        .description = "Deprecated: list TFTP transfer sessions",
-    }, deprecatedTftpSessionListHandler);
-    try addConfigPathFlag(list);
-    try addOutputFlag(list);
-    try addDebugFlag(list);
-    try session.addCommands(&.{list});
-    try tftp.addCommands(&.{ show, session });
-    return tftp;
-}
-
-fn deprecatedTftpShowHandler(ctx: zli.CommandContext) !void {
-    try ctx.writer.writeAll("warning: 'tftp show' is deprecated. Use 'runtime tftp-counters' instead.\n");
-    try tftpShowHandler(ctx);
-}
-
-fn deprecatedTftpSessionListHandler(ctx: zli.CommandContext) !void {
-    try ctx.writer.writeAll("warning: 'tftp session list' is deprecated. Use 'runtime tftp-sessions' instead.\n");
-    try tftpSessionListHandler(ctx);
-}
-
-// ── 废弃的 `runtime leases` / `runtime unknown` 子命令 ──────
-
-fn deprecatedRuntimeLeasesCommand(init_options: zli.InitOptions) !*zli.Command {
-    const leases = try zli.Command.init(init_options, .{
-        .name = "leases",
-        .description = "Deprecated: use 'runtime dhcp-leases'",
-    }, showCurrentHelp);
-    const list = try zli.Command.init(init_options, .{
-        .name = "list",
-        .description = "Deprecated: list active DHCP leases",
-    }, deprecatedRuntimeLeasesListHandler);
-    try addConfigPathFlag(list);
-    try addOutputFlag(list);
-    try addDebugFlag(list);
-    try leases.addCommands(&.{list});
-    return leases;
-}
-
-fn deprecatedRuntimeLeasesListHandler(ctx: zli.CommandContext) !void {
-    try ctx.writer.writeAll("warning: 'runtime leases list' is deprecated. Use 'runtime dhcp-leases' instead.\n");
-    try runtimeLeasesHandler(ctx);
-}
-
-fn deprecatedRuntimeUnknownCommand(init_options: zli.InitOptions) !*zli.Command {
-    const unknown = try zli.Command.init(init_options, .{
-        .name = "unknown",
-        .description = "Deprecated: use 'runtime dhcp-unknown'",
-    }, showCurrentHelp);
-    const list = try zli.Command.init(init_options, .{
-        .name = "list",
-        .description = "Deprecated: list unclaimed DHCP clients",
-    }, deprecatedRuntimeUnknownListHandler);
-    try addConfigPathFlag(list);
-    try addOutputFlag(list);
-    try addDebugFlag(list);
-    try unknown.addCommands(&.{list});
-    return unknown;
-}
-
-fn deprecatedRuntimeUnknownListHandler(ctx: zli.CommandContext) !void {
-    try ctx.writer.writeAll("warning: 'runtime unknown list' is deprecated. Use 'runtime dhcp-unknown' instead.\n");
-    try runtimeUnknownHandler(ctx);
 }

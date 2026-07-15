@@ -30,6 +30,7 @@ pub const catalog = @import("catalog.zig");
 pub const catalog_store = @import("catalog/store.zig");
 /// M3 ISO 导入器：通过只读 loop mount 从 DVD ISO 提取安装介质并发布到 catalog。
 pub const iso_import = @import("catalog/iso_import.zig");
+pub const catalog_migration = @import("catalog/migration.zig");
 /// Daemon 应用入口：绑定端口、启动 DHCP/TFTP/HTTP 服务和管理信号处理。
 pub const app = @import("app.zig");
 /// 启动配置加载器：从 JSON 文件解析 AppConfig，失败时返回结构化错误。
@@ -46,6 +47,12 @@ pub const preflight = @import("preflight.zig");
 pub const runtime_state = @import("state/runtime.zig");
 /// PXE boot session 注册表：关联 DHCP→TFTP→HTTP 启动链路的进程内状态。
 pub const boot_session = @import("state/boot_session.zig");
+pub const boot_session_store = @import("state/boot_session_store.zig");
+pub const node_inventory = @import("state/node_inventory.zig");
+pub const operations = @import("state/operations.zig");
+pub const config_runtime = @import("state/config_runtime.zig");
+pub const model_runtime = @import("state/model_runtime.zig");
+pub const model_transaction = @import("state/model_transaction.zig");
 /// 节点状态跟踪：记录已注册节点的当前启动阶段和终态。
 pub const node_status = @import("state/node_status.zig");
 /// Catalog 运行时快照：管理 catalog 的原子替换和只读引用计数。
@@ -118,6 +125,7 @@ test {
     _ = catalog;
     _ = catalog_store;
     _ = iso_import;
+    _ = catalog_migration;
     _ = app;
     _ = config;
     _ = config_store;
@@ -128,6 +136,8 @@ test {
     _ = boot_session;
     _ = node_status;
     _ = catalog_runtime;
+    _ = model_runtime;
+    _ = model_transaction;
     _ = events;
     _ = event_types;
     _ = dhcp_store;

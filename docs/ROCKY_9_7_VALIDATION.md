@@ -1,5 +1,12 @@
 # Rocky Linux 9.7 分阶段验证记录与待办
 
+> **历史实测记录说明（2026-07-15）**：本文保留各日期当时实际执行的命令和结果，不是 M4.3 后的现行接口契约。
+> 其中“重复 ISO 导入被拒绝是正确行为”已被 SHA-256 + logical name 幂等语义覆盖；`tftp/`、`repos/`、
+> `provisioned/` 等旧顶层路径已由 M4.2 迁移到 `assets/*`、`state/provisioned/`；旧 `tftp`、`dhcp`、`trace`、
+> `install-source` CLI 仅用于还原历史验证步骤，M4.3 后应使用 canonical 资源命令。判断当前设计和新验收时以
+> 模型/CLI 以 `DETAILED_DESIGN.md` §9.12 与 M4.3 专项设计为准，HTTP URL 以 §9.13 与 M4.4 专项设计为准；
+> 不能据本文旧成功条件恢复过渡行为。
+
 M0 已在 Rocky Linux 9.7 aarch64 实机完成 systemd、HTTP、CLI、端口独占和 debug 验证；结果以
 [`DETAILED_DESIGN.md` 第 5 节](DETAILED_DESIGN.md#5-m0-验收标准与验证结果)为准。本文是追加式验证
 日志：已勾选项表示对应日期和环境下曾实际通过，不代表后续阶段自动通过；未勾选项是当前待办。
@@ -7,6 +14,30 @@ M4/M4.1 的 Rocky 9.7 与 Ubuntu 22.04 正向安装、登录和生命周期链�
 异常/负向条目继续保持未勾选。Rocky 8.10 aarch64 因 VMware/Apple-Silicon 的 64 KiB page-granule
 不兼容单独暂缓，详见 `ROCKY_8_10_VALIDATION.md`；M5+ 尚未实现。任何新能力仍必须在实际目标机验证后
 才可勾选，不能把设计、renderer fixture 或较早阶段成功当成系统级通过。
+
+## M4.3 系统级重新验收（待实现后执行）
+
+M4.3 会改动 ISO/catalog 身份、adapter 分派、ConfigRuntime、BootSession 认证恢复和 CLI，因此下列项目是新的
+完成门槛，不得由本文 M4/M4.1 的历史成功记录代替：
+
+- [ ] 使用最终 M4.3 二进制重新导入并部署 Rocky Linux 9.7，完成 PXE 全安装、重启和登录验证。
+- [ ] 使用最终 M4.3 二进制重新导入并部署 Ubuntu Server 22.04，完成 PXE 全安装、重启和登录验证。
+- [ ] Ubuntu 安装已进入 active delivery 后重启 nodeforged；旧 capability/webhook 回调恢复、安装最终完成，
+      `boot.session.resumed` 可审计，且 `armed_generation` 没有被自动重建。
+- [ ] 验证 `catalog show`、migration dry-run/plan digest、node list/show、TFTP/HTTP node 归属和 canonical CLI；
+      记录二进制 commit/build time、配置 revision、ISO SHA-256 和关键事件时间线。
+- [ ] 验证 `profile list/show` 能显示当前 PXE profile、引用节点、adapter/package-manager capability、install source、
+      repository/资产和 effective system，且 secret 只显示来源/存在性。
+
+完成前，M4.3 状态保持“设计完成，待实现/待实机验收”。
+
+## M4.4 URL 契约重新验收（待 M4.3 后执行）
+
+- [ ] Rocky/Ubuntu 生成内容只引用 `/api/v1/nodes/:id/**` 与 `/artifacts/**` canonical URL；不依赖 redirect。
+- [ ] `/boot/config`、`/answer`、旧静态和旧 management URL 在兼容窗口结束后返回 404；错误 method 返回 405。
+- [ ] boot/install-config 响应为 no-store，日志不包含 token/header/body；rootfs token 不能跨 node 使用。
+- [ ] M4.3 恢复的 legacy active session 在剩余 TTL 内可完成，新 session 只获得 canonical URL；窗口结束不 rearm。
+- [ ] 使用最终 M4.4 二进制再次完成 Rocky 9.7、Ubuntu 22.04 全安装和 Ubuntu restart-resume。
 
 ## 环境
 
