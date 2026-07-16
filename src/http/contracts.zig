@@ -21,6 +21,27 @@ pub const reason_subiquity_error = "install.subiquity_error";
 pub const authorization_header = "authorization";
 pub const session_header = "x-nodeforge-session";
 
+/// M4.5 stable management envelopes. Resource payloads remain endpoint
+/// specific; these common shapes are pinned by golden fixtures.
+pub fn Success(comptime T: type) type {
+    return struct { ok: bool, result: T };
+}
+
+pub const ErrorEnvelope = struct {
+    ok: bool,
+    @"error": struct { code: []const u8, message: []const u8, details: ?std.json.Value = null, request_id: ?[]const u8 = null },
+};
+
+pub const Operation = struct {
+    id: []const u8,
+    kind: []const u8,
+    state: []const u8,
+    created_at: i64,
+    updated_at: i64,
+    result: []const u8,
+    error_code: []const u8,
+};
+
 pub const NodeEvent = struct {
     v: u8,
     boot_session_id: []const u8,
@@ -67,4 +88,55 @@ test "M3 DTO boundaries reject untrusted free-form data" {
     try validateNodeEvent(.{ .v = 1, .boot_session_id = "0123456789abcdef0123456789abcdef", .stage = "rootfs_verified", .reason = "sha256_ok", .message = "verified" });
     try std.testing.expectError(error.InvalidNodeEvent, validateNodeEvent(.{ .v = 1, .boot_session_id = "bad", .stage = "running" }));
     try std.testing.expectError(error.InvalidNodeEvent, validateNodeEvent(.{ .v = 1, .boot_session_id = "0123456789abcdef0123456789abcdef", .stage = "running", .message = "line1\nline2" }));
+}
+
+test "M4.5 golden collection envelope matches items/next_cursor/view_revision" {
+    const Collection = Success(struct {
+        items: []const struct { id: []const u8 },
+        next_cursor: ?[]const u8,
+        view_revision: u64,
+    });
+    const parsed = try std.json.parseFromSlice(Collection, std.testing.allocator, @embedFile("fixtures/m4_5-collection.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.ok);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.result.items.len);
+    try std.testing.expectEqualStrings("node-01", parsed.value.result.items[0].id);
+    try std.testing.expect(parsed.value.result.next_cursor == null);
+    try std.testing.expectEqual(@as(u64, 42), parsed.value.result.view_revision);
+}
+
+test "M4.5 golden error envelope carries code/message/request_id" {
+    const parsed = try std.json.parseFromSlice(ErrorEnvelope, std.testing.allocator, @embedFile("fixtures/m4_5-error.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(!parsed.value.ok);
+    try std.testing.expectEqualStrings("http.precondition_required", parsed.value.@"error".code);
+    try std.testing.expect(parsed.value.@"error".request_id != null);
+    try std.testing.expectEqual(@as(usize, 32), parsed.value.@"error".request_id.?.len);
+}
+
+test "M4.5 golden operation envelope carries terminal state" {
+    const parsed = try std.json.parseFromSlice(Success(Operation), std.testing.allocator, @embedFile("fixtures/m4_5-operation.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.ok);
+    try std.testing.expectEqualStrings("succeeded", parsed.value.result.state);
+    try std.testing.expectEqualStrings("install_source_import", parsed.value.result.kind);
+}
+
+test "M4.5 golden created envelope matches 201 resource result" {
+    const Created = Success(struct { node_id: []const u8, revision: u64 });
+    const parsed = try std.json.parseFromSlice(Created, std.testing.allocator, @embedFile("fixtures/m4_5-created.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.ok);
+    try std.testing.expectEqualStrings("node-01", parsed.value.result.node_id);
+    try std.testing.expectEqual(@as(u64, 42), parsed.value.result.revision);
+}
+
+test "M4.5 golden resource detail envelope carries canonical metadata" {
+    const Resource = Success(struct { name: []const u8, kind: []const u8, path: []const u8, sha256: ?[]const u8 });
+    const parsed = try std.json.parseFromSlice(Resource, std.testing.allocator, @embedFile("fixtures/m4_5-resource.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.ok);
+    try std.testing.expectEqualStrings("rocky-kernel", parsed.value.result.name);
+    try std.testing.expectEqualStrings("kernel", parsed.value.result.kind);
+    try std.testing.expect(parsed.value.result.sha256 != null);
 }

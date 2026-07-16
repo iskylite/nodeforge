@@ -23,7 +23,6 @@ pub const TftpCounters = struct {
 
 /// M1 资产导入请求的受约束元数据。由 CLI 构造，通过本地 HTTP POST 发送给 daemon。
 /// daemon 负责计算 SHA-256、校验路径安全性和原子写入 catalog。
-/// 所有字段在发送前经过 `querySafe` 检查，拒绝包含 URL 特殊字符的值。
 pub const AssetImport = struct {
     name: []const u8,
     kind: []const u8,
@@ -54,7 +53,8 @@ pub const InstallSourceImport = struct {
 };
 
 /// 探测管理接口 `/healthz`。
-/// 使用 `Connection: close` 保证能够以 EOF 作为响应结束，不实现通用 HTTP 客户端。
+/// M4.5 公共 reader 校验状态行、headers 和 Content-Length；健康探针只消费状态，
+/// 并使用 `Connection: close` 保持本机连接生命周期简单且有界。
 pub fn health(io: std.Io, port: u16) Status {
     return probeAt(io, management.client_ip, port, "/healthz", "GET");
 }
@@ -88,17 +88,11 @@ pub fn validateActiveConfig(io: std.Io, port: u16) Status {
 }
 
 /// 通过仅限本机的 API 显式武装一个 install generation。
-pub fn installRetry(io: std.Io, port: u16, node_id: []const u8) Status {
+pub fn installGenerations(io: std.Io, port: u16, node_id: []const u8) Status {
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
     const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/install-generations", .{node_id}) catch return .{ .reachable = false, .healthy = false };
     return probeAt(io, management.client_ip, port, value, "POST");
-}
-
-/// M4.4: config/reload 路由已删除。此函数现在探测 /management/status 作为替代。
-/// 调用方应迁移到 managementStatus。
-pub fn configReload(io: std.Io, port: u16) Status {
-    return managementStatus(io, port);
 }
 
 /// 探测 M1 TFTP 运行态路由。仅由本机 daemon 提供，不接受远程地址。
@@ -112,23 +106,13 @@ pub fn tftpStatus(io: std.Io, port: u16) Status {
 /// 解析使用简单的字符串查找提取 `started`/`completed`/`failed` 三个数字字段，
 /// 不依赖通用 JSON 库以保持 CLI 依赖最小化。
 pub fn tftpCounters(io: std.Io, port: u16) TftpCounters {
-    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return .{};
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return .{};
-    defer stream.close(io);
-    var send_buffer: [512]u8 = undefined;
-    var writer = stream.writer(io, &send_buffer);
-    writer.interface.print("GET /api/v1/management/runtime/tftp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{}) catch return .{ .reachable = true };
-    writer.interface.flush() catch return .{ .reachable = true };
-    var recv_buffer: [2048]u8 = undefined;
-    var reader = stream.reader(io, &recv_buffer);
-    const status_line = reader.interface.takeDelimiterInclusive('\n') catch return .{ .reachable = true };
-    if (std.mem.findPosLinear(u8, status_line, 0, " 200 ") == null) return .{ .reachable = true };
-    while (true) {
-        const line = reader.interface.takeDelimiterInclusive('\n') catch return .{ .reachable = true };
-        if (std.mem.eql(u8, line, "\r\n") or std.mem.eql(u8, line, "\n")) break;
-    }
-    const body = reader.interface.takeDelimiterInclusive('\n') catch return .{ .reachable = true };
-    return .{ .reachable = true, .healthy = true, .started = jsonCounter(body, "\"started\":"), .completed = jsonCounter(body, "\"completed\":"), .failed = jsonCounter(body, "\"failed\":") };
+    var buffer: [4096]u8 = undefined;
+    const maybe_body = managementJson(io, port, "/api/v1/management/runtime/tftp", &buffer) catch return .{ .reachable = true };
+    const body = maybe_body orelse return .{ .reachable = true };
+    const Response = struct { result: struct { started: u64, completed: u64, failed: u64 } };
+    const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, body, .{}) catch return .{ .reachable = true };
+    defer parsed.deinit();
+    return .{ .reachable = true, .healthy = true, .started = parsed.value.result.started, .completed = parsed.value.result.completed, .failed = parsed.value.result.failed };
 }
 
 /// 获取 daemon 生成的 TFTP 会话列表 JSON，并写入调用方提供的缓冲区。
@@ -159,6 +143,18 @@ pub fn profilesJson(io: std.Io, port: u16, name: ?[]const u8, output: []u8) !?[]
     return managementJson(io, port, path, output);
 }
 
+/// M4.5：分页获取一个 collection 页。`cursor` 为 null 取首页，否则取后续页；
+/// 每页请求 `limit=200` 以减少往返。`path` 是 collection 根路径（如
+/// `/api/v1/management/nodes`）。调用方按响应中的 `next_cursor` 决定是否继续。
+pub fn collectionPageJson(io: std.Io, port: u16, path: []const u8, cursor: ?[]const u8, output: []u8) !?[]const u8 {
+    var request_path: [320]u8 = undefined;
+    const rendered = if (cursor) |c|
+        try std.fmt.bufPrint(&request_path, "{s}?cursor={s}&limit=200", .{ path, c })
+    else
+        try std.fmt.bufPrint(&request_path, "{s}?limit=200", .{path});
+    return managementJson(io, port, rendered, output);
+}
+
 pub fn installSourceJson(io: std.Io, port: u16, name: []const u8, output: []u8) !?[]const u8 {
     if (!querySafe(name)) return error.InvalidInstallSourceName;
     var path: [256]u8 = undefined;
@@ -167,48 +163,64 @@ pub fn installSourceJson(io: std.Io, port: u16, name: []const u8, output: []u8) 
 }
 
 pub fn catalogMigrationPlanJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
-    return managementPostJson(io, port, "/api/v1/management/catalog/migration-plans", "{}", null, output);
+    const reply = try managementPostJson(io, port, "/api/v1/management/catalog/migration-plans", "{}", null, output, null);
+    if (reply.status < 200 or reply.status >= 300) return null;
+    return reply.body;
 }
 
 pub fn catalogMigrationApplyJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
     if (digest.len != 64 or !querySafe(digest)) return error.InvalidPlanDigest;
     var body: [96]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&body, "{{\"plan_digest\":{f}}}", .{std.json.fmt(digest, .{})});
-    return managementPostJson(io, port, "/api/v1/management/catalog/migrations", rendered, digest, output);
+    const reply = try managementPostJson(io, port, "/api/v1/management/catalog/migrations", rendered, digest, output, null);
+    if (reply.status < 200 or reply.status >= 300) return null;
+    return reply.body;
 }
 
-pub fn nodeAdd(io: std.Io, port: u16, body: []const u8) Status {
-    const revision = managementRevision(io, port) orelse return .{ .reachable = true, .healthy = false };
-    return managementMutation(io, port, "POST", "/api/v1/management/nodes", body, revision);
+/// M4.5：管理写请求结果。`reason` 在失败时指向调用方提供的 `reason_buf`，
+/// 形如 "code: message (request_id=...)"（§9.14.7：4xx/5xx 解析统一错误信封后
+/// 映射为 CLI 结构化错误）；成功或连接失败（无法解析）时为空，由调用方回退。
+pub const Mutation = struct {
+    reachable: bool,
+    healthy: bool,
+    reason: []const u8 = "",
+};
+
+pub fn nodeAdd(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutation {
+    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    return managementMutation(io, port, "POST", "/api/v1/management/nodes", body, revision, reason_buf);
 }
 
-pub fn nodeSet(io: std.Io, port: u16, node_id: []const u8, body: []const u8) Status {
+pub fn nodeSet(io: std.Io, port: u16, node_id: []const u8, body: []const u8, reason_buf: []u8) Mutation {
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
     const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}", .{node_id}) catch return .{ .reachable = false, .healthy = false };
-    const revision = managementRevision(io, port) orelse return .{ .reachable = true, .healthy = false };
-    return managementMutation(io, port, "PATCH", value, body, revision);
+    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    return managementMutation(io, port, "PATCH", value, body, revision, reason_buf);
 }
 
-pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8) Status {
+pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) Mutation {
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
     const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}", .{node_id}) catch return .{ .reachable = false, .healthy = false };
-    const revision = managementRevision(io, port) orelse return .{ .reachable = true, .healthy = false };
-    return managementMutation(io, port, "DELETE", value, "", revision);
+    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    return managementMutation(io, port, "DELETE", value, "", revision, reason_buf);
 }
 
-pub fn configSet(io: std.Io, port: u16, body: []const u8) Status {
-    const revision = managementRevision(io, port) orelse return .{ .reachable = true, .healthy = false };
-    return managementMutation(io, port, "PATCH", "/api/v1/management/config", body, revision);
+pub fn configSet(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutation {
+    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    return managementMutation(io, port, "PATCH", "/api/v1/management/config", body, revision, reason_buf);
 }
 
-/// 执行带 If-Match revision 的管理变更请求（POST/PATCH/DELETE）。
-///
-/// 所有变更端点成功时返回 200 OK（非 201），因此这里只匹配 `" 200 "` 而非
-/// 使用 `is2xx`。`probeAt` 探测的创建类端点（如 config/validations、
-/// install-generations）返回 201 Created，需要 `is2xx` 才能正确判定。
-fn managementMutation(io: std.Io, port: u16, method: []const u8, path: []const u8, body: []const u8, revision: u64) Status {
+fn mutationUnreachable(reason_buf: []u8, message: []const u8) Mutation {
+    return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "http", message) };
+}
+
+/// 执行带目标 config ETag/If-Match 的管理变更请求。
+/// M4.5 统一按 2xx 判定成功（创建类 POST 返回 201，普通变更返回 200）；
+/// 失败时解析服务端错误信封 `{code,message,request_id}` 并格式化到
+/// `reason_buf`，供 CLI 结构化输出（§9.14.7）。
+fn managementMutation(io: std.Io, port: u16, method: []const u8, path: []const u8, body: []const u8, revision: u64, reason_buf: []u8) Mutation {
     const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return .{ .reachable = false, .healthy = false };
     var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return .{ .reachable = false, .healthy = false };
     defer stream.close(io);
@@ -216,47 +228,76 @@ fn managementMutation(io: std.Io, port: u16, method: []const u8, path: []const u
     var writer = stream.writer(io, &send_buffer);
     writer.interface.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nIf-Match: \"{d}\"\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ method, path, revision, body.len, body }) catch return .{ .reachable = true, .healthy = false };
     writer.interface.flush() catch return .{ .reachable = true, .healthy = false };
-    var recv_buffer: [2048]u8 = undefined;
+    var recv_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
-    const status_line = reader.interface.takeDelimiterInclusive('\n') catch return .{ .reachable = true, .healthy = false };
-    return .{ .reachable = true, .healthy = std.mem.findPosLinear(u8, status_line, 0, " 200 ") != null };
+    var body_out: [4096]u8 = undefined;
+    const reply = readHttpResponse(&reader.interface, &body_out, null) catch |err|
+        return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+    if (reply.status >= 200 and reply.status < 300) return .{ .reachable = true, .healthy = true };
+    if (reply.body) |err_body|
+        return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body) };
+    return .{ .reachable = true, .healthy = false, .reason = formatHttpStatus(reason_buf, reply.status) };
 }
 
-fn managementRevision(io: std.Io, port: u16) ?u64 {
-    var buffer: [128 * 1024]u8 = undefined;
-    const maybe_body = managementJson(io, port, "/api/v1/management/nodes", &buffer) catch return null;
+/// 把服务端错误信封格式化为 "code: message (request_id=<id>)" 写入 `out` 并
+/// 返回其切片。解析失败退回通用提示；`reason` 在解析 arena `deinit` 前已写入
+/// `out`，不依赖 arena 生命周期。
+fn formatErrorReason(out: []u8, body: []const u8) []const u8 {
+    const Envelope = struct { @"error": struct { code: []const u8, message: []const u8, request_id: ?[]const u8 = null } };
+    const parsed = std.json.parseFromSlice(Envelope, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return formatPlain(out, "http", "non-2xx response with unparseable body");
+    defer parsed.deinit();
+    const e = parsed.value.@"error";
+    return std.fmt.bufPrint(out, "{s}: {s} (request_id={s})", .{ e.code, e.message, e.request_id orelse "" }) catch
+        formatPlain(out, e.code, e.message);
+}
+
+fn formatPlain(out: []u8, code: []const u8, message: []const u8) []const u8 {
+    return std.fmt.bufPrint(out, "{s}: {s}", .{ code, message }) catch "http: error";
+}
+
+fn formatTransportError(out: []u8, err: anyerror) []const u8 {
+    return std.fmt.bufPrint(out, "http: transport error ({t})", .{err}) catch "http: transport error";
+}
+
+fn formatHttpStatus(out: []u8, status: u16) []const u8 {
+    return std.fmt.bufPrint(out, "http: {d} response with no body", .{status}) catch "http: non-2xx response";
+}
+
+fn configRevision(io: std.Io, port: u16) ?u64 {
+    var buffer: [4096]u8 = undefined;
+    const maybe_body = managementJson(io, port, "/api/v1/management/config", &buffer) catch return null;
     const body = maybe_body orelse return null;
-    const Response = struct { result: struct { view_revision: struct { config: u64 } } };
+    const Response = struct { result: struct { revision: u64 } };
     const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
-    return parsed.value.result.view_revision.config;
+    return parsed.value.result.revision;
 }
+
+/// M4.5：HTTP 响应解析结果。`body` 在状态码不在允许集合或无 body 时为 null；
+/// `location` 仅在调用方提供缓冲且响应携带 Location 头时非 null，供 202
+/// Operation 轮询使用。
+const HttpReply = struct {
+    status: u16,
+    body: ?[]const u8,
+    location: ?[]const u8,
+};
+
+const no_reply: HttpReply = .{ .status = 0, .body = null, .location = null };
 
 fn managementJson(io: std.Io, port: u16, path: []const u8, output: []u8) !?[]const u8 {
-    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return null;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return null;
-    defer stream.close(io);
-    var send_buffer: [512]u8 = undefined;
-    var writer = stream.writer(io, &send_buffer);
-    try writer.interface.print("GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{path});
-    try writer.interface.flush();
-    var recv_buffer: [12 * 1024]u8 = undefined;
-    var reader = stream.reader(io, &recv_buffer);
-    const status_line = reader.interface.takeDelimiterInclusive('\n') catch return null;
-    if (std.mem.findPosLinear(u8, status_line, 0, " 200 ") == null) return null;
-    while (true) {
-        const line = reader.interface.takeDelimiterInclusive('\n') catch return null;
-        if (std.mem.eql(u8, line, "\r\n") or std.mem.eql(u8, line, "\n")) break;
-    }
-    const body = reader.interface.takeDelimiterInclusive('\n') catch return null;
-    if (body.len > output.len) return error.ResponseTooLarge;
-    @memcpy(output[0..body.len], body);
-    return output[0..body.len];
+    const reply = try getReply(io, port, path, output, null);
+    if (reply.status < 200 or reply.status >= 300) return null;
+    return reply.body;
 }
 
-fn managementPostJson(io: std.Io, port: u16, path: []const u8, body: []const u8, idempotency_key: ?[]const u8, output: []u8) !?[]const u8 {
-    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return null;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return null;
+/// M4.5：POST 管理 JSON 请求并返回完整响应（状态码、body、Location）。连接
+/// 失败时返回 `no_reply`（status=0、body=null，非错误），与历史行为一致；协议
+/// 错误（截断、超大、不支持传输编码）以 error 传播。`location_out` 非空时
+/// 捕获 Location 头，供 202 Operation 轮询使用。
+fn managementPostJson(io: std.Io, port: u16, path: []const u8, body: []const u8, idempotency_key: ?[]const u8, output: []u8, location_out: ?[]u8) !HttpReply {
+    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return no_reply;
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return no_reply;
     defer stream.close(io);
     var send_buffer: [1024]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
@@ -264,48 +305,37 @@ fn managementPostJson(io: std.Io, port: u16, path: []const u8, body: []const u8,
     if (idempotency_key) |key| try writer.interface.print("Idempotency-Key: {s}\r\n", .{key});
     try writer.interface.print("Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body });
     try writer.interface.flush();
-    var recv_buffer: [12 * 1024]u8 = undefined;
+    var recv_buffer: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
-    const status_line = reader.interface.takeDelimiterInclusive('\n') catch return null;
-    if (std.mem.findPosLinear(u8, status_line, 0, " 200 ") == null and std.mem.findPosLinear(u8, status_line, 0, " 201 ") == null and std.mem.findPosLinear(u8, status_line, 0, " 202 ") == null) return null;
-    while (true) {
-        const line = reader.interface.takeDelimiterInclusive('\n') catch return null;
-        if (std.mem.eql(u8, line, "\r\n") or std.mem.eql(u8, line, "\n")) break;
-    }
-    const response_body = reader.interface.takeDelimiterInclusive('\n') catch return null;
-    if (response_body.len > output.len) return error.ResponseTooLarge;
-    @memcpy(output[0..response_body.len], response_body);
-    return output[0..response_body.len];
+    return try readHttpResponse(&reader.interface, output, location_out);
+}
+
+/// M4.5：GET 管理 JSON 请求并返回完整响应。与 `managementPostJson` 共享
+/// `readHttpResponse`，供 202 Operation 轮询复用。
+fn getReply(io: std.Io, port: u16, path: []const u8, body_out: []u8, location_out: ?[]u8) !HttpReply {
+    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return no_reply;
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return no_reply;
+    defer stream.close(io);
+    var send_buffer: [512]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    try writer.interface.print("GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{path});
+    try writer.interface.flush();
+    var recv_buffer: [16 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    return try readHttpResponse(&reader.interface, body_out, location_out);
 }
 
 /// 请求 daemon 导入资产并写入 catalog。
 ///
-/// 所有字段在发送前经过 `querySafe` 检查，拒绝包含 `&=?#%\r\n` 的值，
-/// 防止 URL 注入。请求通过 `POST /api/v1/management/assets` 发送，
-/// 参数放在 query string 中，Content-Length 为 0。
-/// daemon 负责计算 SHA-256、校验路径和原子写入 catalog。
-/// 返回 `true` 表示 daemon 接受了导入（HTTP 200），`false` 表示拒绝或连接失败。
+/// M4.5 使用 application/json body 传输完整 canonical metadata；daemon 计算
+/// SHA-256，并根据 metadata+SHA 判断自然幂等。200/201 resource envelope 均为成功。
 pub fn importAsset(io: std.Io, port: u16, asset: AssetImport) !bool {
-    inline for ([_][]const u8{ asset.name, asset.kind, asset.path }) |value|
-        if (!querySafe(value)) return error.InvalidAssetField;
-    inline for ([_]?[]const u8{ asset.distro, asset.version, asset.arch, asset.kernel_release }) |optional|
-        if (optional) |value| if (!querySafe(value)) return error.InvalidAssetField;
-    const address = try std.Io.net.IpAddress.parseIp4(management.client_ip, port);
-    var stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
-    defer stream.close(io);
-    var send_buffer: [2048]u8 = undefined;
-    var writer = stream.writer(io, &send_buffer);
-    try writer.interface.print("POST /api/v1/management/assets?name={s}&kind={s}&path={s}", .{ asset.name, asset.kind, asset.path });
-    if (asset.distro) |value| try writer.interface.print("&distro={s}", .{value});
-    if (asset.version) |value| try writer.interface.print("&version={s}", .{value});
-    if (asset.arch) |value| try writer.interface.print("&arch={s}", .{value});
-    if (asset.kernel_release) |value| try writer.interface.print("&kernel_release={s}", .{value});
-    try writer.interface.writeAll(" HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    try writer.interface.flush();
-    var recv_buffer: [1024]u8 = undefined;
-    var reader = stream.reader(io, &recv_buffer);
-    const status = reader.interface.takeDelimiterInclusive('\n') catch return false;
-    return std.mem.findPosLinear(u8, status, 0, " 200 ") != null;
+    var body_writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer body_writer.deinit();
+    try std.json.Stringify.value(asset, .{ .emit_null_optional_fields = true }, &body_writer.writer);
+    var response: [4096]u8 = undefined;
+    const reply = try managementPostJson(io, port, "/api/v1/management/assets", body_writer.written(), null, &response, null);
+    return reply.status >= 200 and reply.status < 300;
 }
 
 /// 请求 daemon 导入已暂存的 ISO 并发布 install source。
@@ -314,52 +344,130 @@ pub fn importAsset(io: std.Io, port: u16, asset: AssetImport) !bool {
 /// 因为 ISO 已由 CLI 复制到 daemon 管控的 import_dir。
 /// daemon 在受管根内打开文件，不会接触任意 host 路径。
 ///
-/// 所有字段在发送前经过 `querySafe` 检查，拒绝包含 `&=?#%\r\n` 的值，
-/// 防止 URL 参数注入。请求通过 `POST /api/v1/management/install-sources/import`
-/// 发送，参数放在 query string 中，Content-Length 为 0。
-/// 返回 `true` 表示 daemon 接受了导入（HTTP 200），`false` 表示拒绝或连接失败。
+/// M4.5 使用 application/json body 和独立 Idempotency-Key header；202 只表示
+/// HTTP 接受。客户端按 Location 轮询 Operation 直到 terminal，只有 succeeded
+/// 才算业务成功（§9.14.4：长任务信封不随执行快慢变化）。
 pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) !bool {
     if (!querySafe(request.filename) or request.content_sha256.len != 64 or request.idempotency_key.len == 0 or request.idempotency_key.len > 128 or !querySafe(request.idempotency_key)) return error.InvalidInstallSourceField;
     inline for ([_]?[]const u8{ request.name, request.distro, request.version, request.arch }) |optional|
         if (optional) |value|
             if (!querySafe(value)) return error.InvalidInstallSourceField;
-    const address = try std.Io.net.IpAddress.parseIp4(management.client_ip, port);
-    var stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
-    defer stream.close(io);
-    var send_buffer: [2048]u8 = undefined;
-    var writer = stream.writer(io, &send_buffer);
-    try writer.interface.print("POST /api/v1/management/install-sources?filename={s}&sha256={s}", .{ request.filename, request.content_sha256 });
-    if (request.name) |value| try writer.interface.print("&name={s}", .{value});
-    if (request.distro) |value| try writer.interface.print("&distro={s}", .{value});
-    if (request.version) |value| try writer.interface.print("&version={s}", .{value});
-    if (request.arch) |value| try writer.interface.print("&arch={s}", .{value});
-    try writer.interface.print(" HTTP/1.1\r\nHost: 127.0.0.1\r\nIdempotency-Key: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{request.idempotency_key});
-    try writer.interface.flush();
-    var recv_buffer: [1024]u8 = undefined;
-    var reader = stream.reader(io, &recv_buffer);
-    const status = reader.interface.takeDelimiterInclusive('\n') catch return false;
-    return std.mem.findPosLinear(u8, status, 0, " 200 ") != null or std.mem.findPosLinear(u8, status, 0, " 202 ") != null;
+    const Wire = struct { filename: []const u8, sha256: []const u8, name: ?[]const u8, distro: ?[]const u8, version: ?[]const u8, arch: ?[]const u8 };
+    var body_writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer body_writer.deinit();
+    try std.json.Stringify.value(Wire{ .filename = request.filename, .sha256 = request.content_sha256, .name = request.name, .distro = request.distro, .version = request.version, .arch = request.arch }, .{ .emit_null_optional_fields = true }, &body_writer.writer);
+    var response: [16 * 1024]u8 = undefined;
+    var location: [256]u8 = undefined;
+    var reply = try managementPostJson(io, port, "/api/v1/management/install-sources", body_writer.written(), request.idempotency_key, &response, &location);
+    // daemon 当前同步完成，202 body 已是 terminal 状态，循环只执行一次；仅当
+    // daemon 改为异步（返回 queued/running）时才按 Location 轮询 terminal 状态。
+    var attempts: usize = 0;
+    while (attempts < 1200) : (attempts += 1) {
+        const body = reply.body orelse return false;
+        switch (operationState(body) orelse return false) {
+            .succeeded => return true,
+            .failed => return false,
+            .pending => {},
+        }
+        const next = reply.location orelse return false;
+        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+        reply = try getReply(io, port, next, &response, &location);
+    }
+    return false;
 }
 
-/// 检查值是否可安全嵌入 HTTP query string。
-/// 拒绝空字符串和包含 `&=?#%\r\n` 的值，防止 URL 参数注入。
+/// 从 Operation 信封 `{"ok":true,"result":{"state":...}}` 提取终态判定。
+/// 返回值按值拷贝，不依赖解析 arena 生命周期。
+fn operationState(body: []const u8) ?OperationState {
+    const Envelope = struct { result: struct { state: []const u8 } };
+    const parsed = std.json.parseFromSlice(Envelope, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    if (std.mem.eql(u8, parsed.value.result.state, "succeeded")) return .succeeded;
+    if (std.mem.eql(u8, parsed.value.result.state, "failed")) return .failed;
+    return .pending;
+}
+
+const OperationState = enum { succeeded, failed, pending };
+
+/// 检查 canonical path/header token。M4.5 不再用它拼接资产导入 query；这里只
+/// 保护 node/name path segment、digest 和 Idempotency-Key header。
 fn querySafe(value: []const u8) bool {
     return value.len != 0 and std.mem.indexOfAny(u8, value, "&=?#%\r\n") == null;
 }
 
-/// 从简单 JSON 响应体中提取数字字段的值。
-/// 使用字符串查找定位 `key`，然后解析到下一个 `,` 或 `}` 为止的数字。
-/// 解析失败时返回 0，不产生错误——计数器是尽力而为的运行态摘要。
-fn jsonCounter(body: []const u8, key: []const u8) u64 {
-    const start = std.mem.indexOf(u8, body, key) orelse return 0;
-    const value = body[start + key.len ..];
-    const end = std.mem.indexOfAny(u8, value, ",}") orelse value.len;
-    return std.fmt.parseInt(u64, value[0..end], 10) catch 0;
+/// M4.5：始终读取响应 body（成功与错误信封都需要），让调用方按 `status`
+/// 判定成功与否并解析错误信封。204 或 Content-Length: 0 给空 body；其余必须
+/// 有 Content-Length，避免截断/无界响应被误判。`location_out` 非空时捕获
+/// Location 头供 202 Operation 轮询使用。
+fn readHttpResponse(reader: *std.Io.Reader, output: []u8, location_out: ?[]u8) !HttpReply {
+    const status_line = reader.takeDelimiterInclusive('\n') catch return error.TruncatedResponse;
+    const first_space = std.mem.indexOfScalar(u8, status_line, ' ') orelse return error.InvalidHttpResponse;
+    if (first_space + 4 > status_line.len) return error.InvalidHttpResponse;
+    const status = std.fmt.parseInt(u16, status_line[first_space + 1 .. first_space + 4], 10) catch return error.InvalidHttpResponse;
+    var content_length: ?usize = null;
+    var location: ?[]const u8 = null;
+    while (true) {
+        const line = reader.takeDelimiterInclusive('\n') catch return error.TruncatedResponse;
+        if (std.mem.eql(u8, line, "\r\n") or std.mem.eql(u8, line, "\n")) break;
+        if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) return error.UnsupportedTransferEncoding;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            const value = std.mem.trim(u8, line["content-length:".len..], " \t\r\n");
+            content_length = std.fmt.parseInt(usize, value, 10) catch return error.InvalidHttpResponse;
+        } else if (location_out) |buf| if (std.ascii.startsWithIgnoreCase(line, "location:")) {
+            const value = std.mem.trim(u8, line["location:".len..], " \t\r\n");
+            if (value.len <= buf.len) {
+                @memcpy(buf[0..value.len], value);
+                location = buf[0..value.len];
+            }
+        };
+    }
+    const length = content_length orelse if (status == 204) @as(usize, 0) else return error.MissingContentLength;
+    if (length > output.len or length > 150 * 1024) return error.ResponseTooLarge;
+    if (length == 0) return .{ .status = status, .body = output[0..0], .location = location };
+    reader.readSliceAll(output[0..length]) catch return error.TruncatedResponse;
+    return .{ .status = status, .body = output[0..length], .location = location };
 }
 
-/// 向指定 IPv4:port 发送一个原始 HTTP 请求并检查首行状态码。
-///
-/// 使用 `Connection: close` 保证能够以 EOF 作为响应结束，不实现通用 HTTP 客户端。
+test "bounded response reader handles multiline and protocol failures" {
+    var source: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n{\n\"x\":1}");
+    var output: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("{\n\"x\":1}", (try readHttpResponse(&source, &output, null)).body.?);
+    var chunked: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+    try std.testing.expectError(error.UnsupportedTransferEncoding, readHttpResponse(&chunked, &output, null));
+    var truncated: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort");
+    try std.testing.expectError(error.TruncatedResponse, readHttpResponse(&truncated, &output, null));
+}
+
+test "readHttpResponse handles 204 empty body and captures Location" {
+    var output: [16]u8 = undefined;
+    var loc: [80]u8 = undefined;
+    var empty: std.Io.Reader = .fixed("HTTP/1.1 204 No Content\r\n\r\n");
+    const reply = try readHttpResponse(&empty, &output, &loc);
+    try std.testing.expectEqual(@as(u16, 204), reply.status);
+    try std.testing.expectEqualStrings("", reply.body.?);
+    var with_loc: std.Io.Reader = .fixed("HTTP/1.1 202 Accepted\r\nLocation: /api/v1/management/operations/abc\r\nContent-Length: 2\r\n\r\n{}");
+    const accepted = try readHttpResponse(&with_loc, &output, &loc);
+    try std.testing.expectEqual(@as(u16, 202), accepted.status);
+    try std.testing.expectEqualStrings("/api/v1/management/operations/abc", accepted.location.?);
+}
+
+test "formatErrorReason renders code/message/request_id from error envelope" {
+    var out: [256]u8 = undefined;
+    const body = "{\"ok\":false,\"error\":{\"code\":\"asset.name_conflict\",\"message\":\"asset name already identifies different canonical metadata\",\"request_id\":\"0000000000000000000000000000000a\"}}\n";
+    try std.testing.expectEqualStrings("asset.name_conflict: asset name already identifies different canonical metadata (request_id=0000000000000000000000000000000a)", formatErrorReason(&out, body));
+    try std.testing.expectEqualStrings("http.bad: oops (request_id=)", formatErrorReason(&out, "{\"ok\":false,\"error\":{\"code\":\"http.bad\",\"message\":\"oops\"}}"));
+    try std.testing.expectEqualStrings("http: non-2xx response with unparseable body", formatErrorReason(&out, "not json"));
+}
+
+test "operationState parses terminal and pending states" {
+    try std.testing.expectEqual(OperationState.succeeded, operationState("{\"ok\":true,\"result\":{\"state\":\"succeeded\"}}").?);
+    try std.testing.expectEqual(OperationState.failed, operationState("{\"ok\":true,\"result\":{\"state\":\"failed\"}}").?);
+    try std.testing.expectEqual(OperationState.pending, operationState("{\"ok\":true,\"result\":{\"state\":\"running\"}}").?);
+    try std.testing.expect(operationState("not json") == null);
+}
+
+/// 向指定 IPv4:port 发送轻量探针并严格解析三位状态码。
+/// 完整管理响应由 `readHttpResponse` 读取；探针无须保留 headers/body。
 /// 收发缓冲区在栈上分配，函数返回后自动释放。
 /// 返回的 `Status` 区分 TCP 连接可达性（`reachable`）和 HTTP 2xx 响应（`healthy`）。
 /// 接受所有 2xx 状态码：GET 探测通常返回 200，POST 创建类端点返回 201。

@@ -5023,6 +5023,33 @@ CLI 是唯一消费者，同版本更新即可。
 - 不改变节点交付 API 的认证模型（bootstrap → capability 升级流程保留）。
 - 不改变 `subiquityReport` 的 form-urlencoded 请求体格式（curtin webhook 不支持 JSON）。
 
+#### 9.14.14 实现状态与已知限制
+
+本节记录 M4.5 落地时的实现决策与遗留边界，供后续阶段对齐。所有项均已在 Rocky 9.7 aarch64
+验证目标（`root@r97n0`，以 root 运行 `tests/http.sh`）上端到端回归通过：
+
+- **错误信封 `request_id`**：`RequestMeta` 携带 32 位十六进制 `request_id`（进程内单调序号），由 `json()` 助手通过纯函数
+  `appendRequestId` 对形如 `{"ok":false,"error":{...}}\n` 的响应统一注入。成功信封、非 `}}\n` 结尾或超长 body 安全回退到原 body。
+  golden fixture `m4_5-error.json` 已钉住 `request_id` 字段。
+- **客户端 4xx/5xx 结构化映射**：`readHttpResponse` 始终读取 body（成功与错误信封都读），`HttpReply.status`/`body`/`location`
+  一并返回。管理写请求经 `Mutation{reachable,healthy,reason}`，失败时 `formatErrorReason` 把服务端错误信封
+  `{code,message,request_id}` 格式化为 `code: message (request_id=<id>)` 写入调用方缓冲；协议错误退回 `http: transport error (...)`。
+  CLI 写 handler 通过 `reportMutationFailure` 输出结构化错误（`nodeAdd`/`nodeSet`/`nodeRemove`/`configSet`）。
+- **202 Operation 轮询**：`importInstallSource` 按 `Location` 头轮询 `/management/operations/:id` 直到 terminal
+  （succeeded/failed）；daemon 当前同步完成，循环只执行一次。`catalogMigrationApplyJson` 仍为单次读取（迁移同样同步完成）。
+- **RouteSpec 契约**：`routes.specs` 是启动冲突校验（`validate`，含等价模板、重复 method 和 wildcard 吞路由检测）和
+  405/`Allow` 聚合（`allowed`）的权威源；契约测试钉住每条 spec 的 method/auth/cache/log。实际分发仍使用 `server.route`
+  的 `if` 链（设计未要求以 registry 驱动分发），wildcard 吞路由检测由 `detectConflicts` 在启动期守卫。
+- **CLI collection 分页跟随**：`node list`/`profile list` 通过 `collectionPageJson`（`limit=200` + opaque `cursor`）按
+  `next_cursor` 翻页直到取完或达到表格渲染上限（256 行，截断时提示）。字段用 arena 复制到稳定存储后渲染。
+- **`view_revision` 形状**：`nodes` collection 保留对象形式（含 `config/catalog/node_status/deployment/inventory`），
+  其余 collection（`assets`/`profiles`/`install-sources`/`operations`）为数字。两者均为 `view_revision`，golden fixture 用数字形式。
+- **CLI 渲染上限**：`node list`/`profile list` 表格渲染上限为 256 行（与 `assets`/`events` 视图一致，栈缓冲约束）；
+  超过时输出截断提示并建议通过管理 API（`limit`/`cursor`）取完整列表。
+- **测试覆盖**：`tests/http.sh` 在 macOS 因 DHCP 特权端口（67）跳过（`exit 0`），M4.5 契约的端到端验证在 Rocky 验证目标
+  以 root 运行（DHCP/TFTP 特权端口 + 单 listener 预检不变量）；Zig 单测覆盖 `appendRequestId`、`readHttpResponse`
+  （含 204/Location/非 2xx body）、`formatErrorReason`、`operationState`、RouteSpec 契约（含 wildcard 吞路由）和 golden envelope 形状。
+
 ### 9.15 M4.6：自定义内核引导参数
 
 #### 9.15.1 阶段定位

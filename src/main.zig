@@ -943,7 +943,7 @@ fn assetKeyReloadHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    const status = nodeforge.management_client.configReload(ctx.io, config.value.server.http_port);
+    const status = nodeforge.management_client.managementStatus(ctx.io, config.value.server.http_port);
     if (!status.healthy) {
         try ctx.writer.writeAll("error: assets key-reload could not reach the local daemon\n");
         setExitCode(ctx, 1);
@@ -1155,37 +1155,68 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
+    // M4.5：按 `next_cursor` 翻页直到取完或达到表格渲染上限（256）。字段借用
+    // 每页响应缓冲，故用 arena 复制到稳定存储后再渲染。`--output json` 只回显
+    // 首页信封，JSON 消费者自行跟随游标。
     var response: [128 * 1024]u8 = undefined;
-    const body = try nodeforge.management_client.nodesJson(ctx.io, config.value.server.http_port, null, &response);
-    if (body == null) {
+    const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", null, &response) catch {
         try ctx.writer.writeAll("error: node: local daemon management API unavailable\n");
         setExitCode(ctx, 1);
         return;
-    }
-    if (output_json) {
-        try ctx.writer.writeAll(body.?);
-        return;
-    }
-    const Response = struct {
-        ok: bool,
-        result: struct {
-            view_revision: struct { config: u64, catalog: u64, inventory: u64 },
-            nodes: []const struct { id: []const u8, mac: []const u8, ip: ?[]const u8, profile: []const u8, status: ?[]const u8, started_at: ?i64, finished_at: ?i64, serial_number: ?[]const u8 },
-        },
     };
-    var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
-        try ctx.writer.print("error: node: malformed daemon response ({t})\n", .{err});
+    var page_body = first orelse {
+        try ctx.writer.writeAll("error: node: local daemon management API unavailable\n");
         setExitCode(ctx, 1);
         return;
     };
-    defer parsed.deinit();
-    var rows: [256]views.NodeRow = undefined;
-    // 部署开始/结束时间格式化为 RFC 3339 可视化时间，列表不再展示裸 epoch。
-    var started_buf: [256][20]u8 = undefined;
-    var finished_buf: [256][20]u8 = undefined;
-    if (parsed.value.result.nodes.len > rows.len) return error.TooManyNodes;
-    for (parsed.value.result.nodes, 0..) |item, i| rows[i] = .{ .id = item.id, .mac = item.mac, .ip = item.ip orelse "-", .profile = item.profile, .status = item.status orelse "-", .started_at = views.formatTimestamp(&started_buf[i], item.started_at orelse 0), .finished_at = views.formatTimestamp(&finished_buf[i], item.finished_at orelse 0), .serial_number = item.serial_number orelse "-" };
-    try views.nodes(ctx.writer, rows[0..parsed.value.result.nodes.len]);
+    if (output_json) {
+        try ctx.writer.writeAll(page_body);
+        return;
+    }
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rows: std.ArrayList(views.NodeRow) = .empty;
+    var cursor_buf: [256]u8 = undefined;
+    var cursor: ?[]const u8 = null;
+    var truncated = false;
+    const NodeItem = struct { id: []const u8, mac: []const u8, ip: ?[]const u8, profile: []const u8, status: ?[]const u8, started_at: ?i64, finished_at: ?i64, serial_number: ?[]const u8 };
+    const Response = struct { ok: bool, result: struct { items: []const NodeItem, next_cursor: ?[]const u8 } };
+    while (true) {
+        const parsed = std.json.parseFromSlice(Response, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+            try ctx.writer.writeAll("error: node: malformed daemon response\n");
+            setExitCode(ctx, 1);
+            return;
+        };
+        for (parsed.value.result.items) |item| {
+            if (rows.items.len >= 256) {
+                truncated = true;
+                break;
+            }
+            var started_buf: [20]u8 = undefined;
+            var finished_buf: [20]u8 = undefined;
+            try rows.append(a, .{
+                .id = try a.dupe(u8, item.id),
+                .mac = try a.dupe(u8, item.mac),
+                .ip = try a.dupe(u8, item.ip orelse "-"),
+                .profile = try a.dupe(u8, item.profile),
+                .status = try a.dupe(u8, item.status orelse "-"),
+                .started_at = try a.dupe(u8, views.formatTimestamp(&started_buf, item.started_at orelse 0)),
+                .finished_at = try a.dupe(u8, views.formatTimestamp(&finished_buf, item.finished_at orelse 0)),
+                .serial_number = try a.dupe(u8, item.serial_number orelse "-"),
+            });
+        }
+        if (truncated) break;
+        if (parsed.value.result.next_cursor) |nc| {
+            if (nc.len <= cursor_buf.len) {
+                @memcpy(cursor_buf[0..nc.len], nc);
+                cursor = cursor_buf[0..nc.len];
+            } else break;
+        } else break;
+        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", cursor, &response) catch null) orelse break;
+    }
+    try views.nodes(ctx.writer, rows.items);
+    if (truncated) try ctx.writer.writeAll("note: output truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
 
 fn profileListHandler(ctx: zli.CommandContext) !void {
@@ -1195,30 +1226,67 @@ fn profileListHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
+    // M4.5：按 `next_cursor` 翻页取全部 profile（上限 256 行）。`--output json`
+    // 只回显首页信封，JSON 消费者自行跟随游标。
     var response: [128 * 1024]u8 = undefined;
-    const body = try nodeforge.management_client.profilesJson(ctx.io, config.value.server.http_port, null, &response);
-    if (body == null) {
+    const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", null, &response) catch {
         try ctx.writer.writeAll("error: profile: local daemon management API unavailable\n");
         setExitCode(ctx, 1);
         return;
-    }
-    if (output_json) return ctx.writer.writeAll(body.?);
-    const Response = struct { result: struct { profiles: []const struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: ?[]const u8, nodes: usize, valid: bool } } };
-    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-        try ctx.writer.writeAll("error: profile: malformed daemon response\n");
+    };
+    var page_body = first orelse {
+        try ctx.writer.writeAll("error: profile: local daemon management API unavailable\n");
         setExitCode(ctx, 1);
         return;
     };
-    defer parsed.deinit();
-    var rows: [256]views.ProfileRow = undefined;
-    var counts: [256][24]u8 = undefined;
-    if (parsed.value.result.profiles.len > rows.len) return error.TooManyProfiles;
-    for (parsed.value.result.profiles, 0..) |profile, index| rows[index] = .{ .name = profile.name, .mode = profile.mode, .distro = profile.distro, .version = profile.version, .arch = profile.arch, .install_source = profile.install_source orelse "-", .nodes = try std.fmt.bufPrint(&counts[index], "{d}", .{profile.nodes}), .valid = if (profile.valid) "yes" else "no" };
-    try views.profiles(ctx.writer, rows[0..parsed.value.result.profiles.len]);
+    if (output_json) return ctx.writer.writeAll(page_body);
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var rows: std.ArrayList(views.ProfileRow) = .empty;
+    var cursor_buf: [256]u8 = undefined;
+    var cursor: ?[]const u8 = null;
+    var truncated = false;
+    const ProfileItem = struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: ?[]const u8, nodes: usize, valid: bool };
+    const Response = struct { ok: bool, result: struct { items: []const ProfileItem, next_cursor: ?[]const u8 } };
+    while (true) {
+        const parsed = std.json.parseFromSlice(Response, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+            try ctx.writer.writeAll("error: profile: malformed daemon response\n");
+            setExitCode(ctx, 1);
+            return;
+        };
+        for (parsed.value.result.items) |profile| {
+            if (rows.items.len >= 256) {
+                truncated = true;
+                break;
+            }
+            var count_buf: [24]u8 = undefined;
+            try rows.append(a, .{
+                .name = try a.dupe(u8, profile.name),
+                .mode = try a.dupe(u8, profile.mode),
+                .distro = try a.dupe(u8, profile.distro),
+                .version = try a.dupe(u8, profile.version),
+                .arch = try a.dupe(u8, profile.arch),
+                .install_source = try a.dupe(u8, profile.install_source orelse "-"),
+                .nodes = try a.dupe(u8, try std.fmt.bufPrint(&count_buf, "{d}", .{profile.nodes})),
+                .valid = try a.dupe(u8, if (profile.valid) "yes" else "no"),
+            });
+        }
+        if (truncated) break;
+        if (parsed.value.result.next_cursor) |nc| {
+            if (nc.len <= cursor_buf.len) {
+                @memcpy(cursor_buf[0..nc.len], nc);
+                cursor = cursor_buf[0..nc.len];
+            } else break;
+        } else break;
+        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", cursor, &response) catch null) orelse break;
+    }
+    try views.profiles(ctx.writer, rows.items);
+    if (truncated) try ctx.writer.writeAll("note: output truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
 
 fn profileShowHandler(ctx: zli.CommandContext) !void {
-    _ = outputJsonFromContext(ctx) orelse return;
+    const output_json = outputJsonFromContext(ctx) orelse return;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
@@ -1232,7 +1300,53 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
         setExitCode(ctx, 1);
         return;
     }
-    try ctx.writer.writeAll(body.?);
+    if (output_json) return ctx.writer.writeAll(body.?);
+
+    // M4.5 keeps the HTTP DTO machine-oriented while the CLI renders a stable,
+    // scannable human view. Never dump the compact wire JSON in human mode.
+    const Response = struct {
+        result: struct {
+            model_revision: struct { config: u64, catalog: u64 },
+            name: []const u8,
+            mode: []const u8,
+            distro: []const u8,
+            version: []const u8,
+            arch: []const u8,
+            capability: struct { family: []const u8, install_adapter: []const u8, package_manager: []const u8 },
+            effective_system: struct {
+                localization: struct { locale: []const u8, timezone: []const u8, keyboard: []const u8 },
+                connectivity: struct { mode: []const u8, time_sync: bool, ntp_servers: []const []const u8 },
+                ssh: struct { enabled: bool, password_authentication: bool, root_login: []const u8, root_password_configured: bool, root_authorized_key_count: usize },
+                security: struct { firewall: []const u8, selinux: []const u8 },
+                users: []const std.json.Value,
+                packages: []const []const u8,
+            },
+            install_source: ?struct { name: []const u8, source_label: []const u8, media_tree_url: ?[]const u8, repositories: []const []const u8 },
+            assets: []const struct { name: []const u8, kind: []const u8, path: []const u8, sha256: ?[]const u8 },
+            nodes: []const []const u8,
+        },
+    };
+    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        try ctx.writer.print("error: profile: malformed daemon response ({t})\n", .{err});
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed.deinit();
+    const result = parsed.value.result;
+    try ctx.writer.print("Profile {s}\n", .{result.name});
+    try ctx.writer.print("  Mode          {s}\n  Platform      {s} {s} ({s})\n  Family        {s}\n  Adapter       {s}\n  Packages      {s}\n", .{ result.mode, result.distro, result.version, result.arch, result.capability.family, result.capability.install_adapter, result.capability.package_manager });
+    try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Firewall      {s}\n  SELinux       {s}\n  Users         {d}\n  Packages      {d}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, result.effective_system.connectivity.mode, if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.security.firewall, result.effective_system.security.selinux, result.effective_system.users.len, result.effective_system.packages.len });
+    if (result.install_source) |source| {
+        try ctx.writer.print("\nInstall source\n  Name          {s}\n  Label         {s}\n  Media tree    {s}\n  Repositories  {d}\n", .{ source.name, source.source_label, source.media_tree_url orelse "-", source.repositories.len });
+    } else try ctx.writer.writeAll("\nInstall source  -\n");
+    try ctx.writer.print("\nAssets ({d})\n", .{result.assets.len});
+    for (result.assets) |asset| try ctx.writer.print("  {s}\n    Kind        {s}\n    Path        {s}\n    SHA-256     {s}\n", .{ asset.name, asset.kind, asset.path, asset.sha256 orelse "-" });
+    try ctx.writer.print("\nNodes ({d})", .{result.nodes.len});
+    if (result.nodes.len == 0) try ctx.writer.writeAll("\n  -\n") else {
+        try ctx.writer.writeByte('\n');
+        for (result.nodes) |node| try ctx.writer.print("  {s}\n", .{node});
+    }
+    try ctx.writer.print("\nModel revision\n  Config        {d}\n  Catalog       {d}\n", .{ result.model_revision.config, result.model_revision.catalog });
 }
 
 /// 离线 answer 预览有意使用明显的非密钥占位符。
@@ -1322,12 +1436,23 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
-    const status = nodeforge.management_client.installRetry(ctx.io, config.value.server.http_port, node_id);
+    const status = nodeforge.management_client.installGenerations(ctx.io, config.value.server.http_port, node_id);
     if (output_json) try ctx.writer.print("{{\"ok\":{s},\"node_id\":{f}}}\n", .{ if (status.healthy) "true" else "false", std.json.fmt(node_id, .{}) }) else if (status.healthy) try ctx.writer.print("install generation rearmed for {s}; waiting for next PXE\n", .{node_id}) else try ctx.writer.print("error: install retry failed for {s}\n", .{node_id});
     if (!status.healthy) setExitCode(ctx, 1);
 }
 
 // ── M4.2 node CRUD handlers ───────────────────────────────────────
+
+/// M4.5：把管理写请求的失败结果映射为 CLI 结构化错误。`result.reason` 非空时
+/// 直接输出服务端错误信封（code/message/request_id），否则（连接失败）输出
+/// `fallback`。始终置非零退出码。
+fn reportMutationFailure(ctx: zli.CommandContext, result: nodeforge.management_client.Mutation, fallback: []const u8) !void {
+    if (result.reason.len > 0)
+        try ctx.writer.print("error: {s}\n", .{result.reason})
+    else
+        try ctx.writer.print("error: {s}\n", .{fallback});
+    setExitCode(ctx, 1);
+}
 
 fn configSetHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
@@ -1369,9 +1494,10 @@ fn configSetHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, patch, .{ .emit_null_optional_fields = false });
     defer ctx.allocator.free(body);
-    if (!nodeforge.management_client.configSet(ctx.io, config.value.server.http_port, body).healthy) {
-        try ctx.writer.writeAll("error: config set rejected by daemon\n");
-        setExitCode(ctx, 1);
+    var reason: [256]u8 = undefined;
+    const config_result = nodeforge.management_client.configSet(ctx.io, config.value.server.http_port, body, &reason);
+    if (!config_result.healthy) {
+        try reportMutationFailure(ctx, config_result, "config set failed: daemon unreachable");
         return;
     }
     if (output_json) try ctx.writer.writeAll("{\"ok\":true}\n") else try views.success(ctx.writer, "configuration applied online", &.{});
@@ -1393,9 +1519,10 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .id = node_id, .mac = mac, .arch = arch, .profile = profile, .ip = patch.ip, .hostname = patch.hostname, .deploy = patch.deploy orelse true, .http_accel = patch.http_accel orelse false }, .{});
     defer ctx.allocator.free(body);
-    if (!nodeforge.management_client.nodeAdd(ctx.io, config.value.server.http_port, body).healthy) {
-        try ctx.writer.print("error: node add failed for {s}: daemon rejected mutation\n", .{node_id});
-        setExitCode(ctx, 1);
+    var reason: [256]u8 = undefined;
+    const node_result = nodeforge.management_client.nodeAdd(ctx.io, config.value.server.http_port, body, &reason);
+    if (!node_result.healthy) {
+        try reportMutationFailure(ctx, node_result, "node add failed: daemon unreachable");
         return;
     }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node added", &.{ .{ .label = "Node", .value = node_id }, .{ .label = "MAC", .value = mac }, .{ .label = "Profile", .value = profile } });
@@ -1423,9 +1550,10 @@ fn nodeSetHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .mac = params.mac, .arch = params.arch, .profile = params.profile, .ip = if (params.ip_set) params.ip else null, .hostname = if (params.hostname_set) params.hostname else null, .deploy = params.deploy, .http_accel = params.http_accel }, .{ .emit_null_optional_fields = false });
     defer ctx.allocator.free(body);
-    if (!nodeforge.management_client.nodeSet(ctx.io, config.value.server.http_port, node_id, body).healthy) {
-        try ctx.writer.print("error: node set failed for {s}: daemon rejected mutation\n", .{node_id});
-        setExitCode(ctx, 1);
+    var reason: [256]u8 = undefined;
+    const node_result = nodeforge.management_client.nodeSet(ctx.io, config.value.server.http_port, node_id, body, &reason);
+    if (!node_result.healthy) {
+        try reportMutationFailure(ctx, node_result, "node set failed: daemon unreachable");
         return;
     }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node updated", &.{.{ .label = "Node", .value = node_id }});
@@ -1464,9 +1592,10 @@ fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
     }
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .unset = unset[0..unset_len] }, .{});
     defer ctx.allocator.free(body);
-    if (!nodeforge.management_client.nodeSet(ctx.io, config.value.server.http_port, node_id, body).healthy) {
-        try ctx.writer.print("error: node unset failed for {s}: daemon rejected mutation\n", .{node_id});
-        setExitCode(ctx, 1);
+    var reason: [256]u8 = undefined;
+    const node_result = nodeforge.management_client.nodeSet(ctx.io, config.value.server.http_port, node_id, body, &reason);
+    if (!node_result.healthy) {
+        try reportMutationFailure(ctx, node_result, "node unset failed: daemon unreachable");
         return;
     }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node attributes cleared", &.{.{ .label = "Node", .value = node_id }});
@@ -1517,9 +1646,10 @@ fn nodeRemoveHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    if (!nodeforge.management_client.nodeRemove(ctx.io, config.value.server.http_port, node_id).healthy) {
-        try ctx.writer.print("error: node remove failed for {s}: daemon rejected mutation\n", .{node_id});
-        setExitCode(ctx, 1);
+    var reason: [256]u8 = undefined;
+    const node_result = nodeforge.management_client.nodeRemove(ctx.io, config.value.server.http_port, node_id, &reason);
+    if (!node_result.healthy) {
+        try reportMutationFailure(ctx, node_result, "node remove failed: daemon unreachable");
         return;
     }
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node removed", &.{.{ .label = "Node", .value = node_id }});
@@ -1605,7 +1735,7 @@ fn printMutationError(ctx: zli.CommandContext, err: anyerror, action: []const u8
 /// reload 失败不能回滚已持久化配置，因此错误信息必须明确区分“写盘成功”与
 /// “运行态尚未切换”，避免 CLI 错报整次 mutation 成功。
 fn requestNodeConfigReload(ctx: zli.CommandContext, port: u16, node_id: []const u8) !bool {
-    const status = nodeforge.management_client.configReload(ctx.io, port);
+    const status = nodeforge.management_client.managementStatus(ctx.io, port);
     if (status.healthy) return true;
     try ctx.writer.print("error: node config saved for {s}, but daemon reload was not requested; restart nodeforged manually\n", .{node_id});
     setExitCode(ctx, 1);

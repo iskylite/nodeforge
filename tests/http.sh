@@ -76,13 +76,26 @@ if "$cli" config set server.http_port=29999 -c "$tmp/config.json" >"$tmp/config-
     echo "restart-required config mutation unexpectedly succeeded" >&2
     exit 1
 fi
+# M4.5：CLI 把 4xx/5xx 错误信封映射为结构化输出（code + request_id）。
+grep -Fq 'config.restart_required' "$tmp/config-restart"
+grep -Fq 'request_id=' "$tmp/config-restart"
 after_restart_required=$(sha256sum "$tmp/config.json" | awk '{print $1}')
 test "$before_restart_required" = "$after_restart_required"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-view"
-grep -Fq '"nodes":[]' "$tmp/nodes-view"
+grep -Fq '"items":[]' "$tmp/nodes-view"
 grep -Eq '"view_revision":\{"config":[0-9]+,"catalog":[0-9]+,"node_status":[0-9]+,"deployment":[0-9]+,"inventory":[0-9]+\}' "$tmp/nodes-view"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles" >"$tmp/profiles-view"
 grep -Fq '"name":"discovery"' "$tmp/profiles-view"
+
+# M4.5 collection pagination (§9.14.11.1#3): limit 校验与 cursor/view_revision 字段。
+pg_bad=$(curl --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes?limit=0")
+test "$pg_bad" = 400
+pg_bad=$(curl --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes?limit=999")
+test "$pg_bad" = 400
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes?limit=1" >"$tmp/pg"
+grep -Fq '"items":' "$tmp/pg"
+grep -Fq '"next_cursor":' "$tmp/pg"
+grep -Fq '"view_revision":' "$tmp/pg"
 
 # M4.3 daemon-owned node mutations persist and publish without restarting.
 daemon_pid=$pid
@@ -102,7 +115,7 @@ fi
 "$cli" node remove test-node -c "$tmp/config.json" >"$tmp/node-remove"
 kill -0 "$daemon_pid"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-after-remove"
-grep -Fq '"nodes":[]' "$tmp/nodes-after-remove"
+grep -Fq '"items":[]' "$tmp/nodes-after-remove"
 
 # M2 read-only DHCP/runtime commands consume the validated local config and
 # daemon management routes. The empty pool is still a useful contract check.
@@ -127,13 +140,18 @@ if "$daemon" -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/second-daemon" 
 fi
 
 curl --silent --fail-with-body "http://127.0.0.1:$port/not-found" >"$tmp/not-found" 2>&1 || true
-grep -Fqx '{"ok":false,"error":{"code":"http.not_found","message":"route not found"}}' "$tmp/not-found"
+# M4.5：错误信封带 request_id，用前缀子串校验 code/message 并断言 request_id 存在。
+grep -Fq '{"ok":false,"error":{"code":"http.not_found","message":"route not found","request_id":"' "$tmp/not-found"
+grep -Eq '"request_id":"[0-9a-f]{32}"' "$tmp/not-found"
 
 # M4.3 durable operation: the first failed import records a terminal operation;
 # retrying the same key reuses it instead of executing the side effect again.
-op_status=$(curl --silent -o "$tmp/op-first" -w '%{http_code}' -X POST -H 'Idempotency-Key: missing-iso-test' "http://127.0.0.1:$port/api/v1/management/install-sources?filename=missing.iso&sha256=0000000000000000000000000000000000000000000000000000000000000000")
+# Key includes the shell PID so prior runs' persisted operations don't make the
+# first call reuse an existing operation (which would return 202, not 400).
+iso_key="missing-iso-test-$$"
+op_status=$(curl --silent -o "$tmp/op-first" -w '%{http_code}' -X POST -H "Idempotency-Key: $iso_key" -H 'Content-Type: application/json' --data '{"filename":"missing.iso","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}' "http://127.0.0.1:$port/api/v1/management/install-sources")
 test "$op_status" = 400
-op_status=$(curl --silent -o "$tmp/op-reused" -w '%{http_code}' -X POST -H 'Idempotency-Key: missing-iso-test' "http://127.0.0.1:$port/api/v1/management/install-sources?filename=another-missing.iso&sha256=0000000000000000000000000000000000000000000000000000000000000000")
+op_status=$(curl --silent -o "$tmp/op-reused" -w '%{http_code}' -X POST -H "Idempotency-Key: $iso_key" -H 'Content-Type: application/json' --data '{"filename":"another-missing.iso","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}' "http://127.0.0.1:$port/api/v1/management/install-sources")
 test "$op_status" = 202
 grep -Fq '"state":"failed"' "$tmp/op-reused"
 operation_id=$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' "$tmp/op-reused")
@@ -142,7 +160,7 @@ test ${#operation_id} = 32
 # M4.3 migration dry-run is daemon-owned, side-effect free and reproducible
 # for the same config/catalog revision pair.
 plan_status=$(curl --silent -o "$tmp/migration-plan-1" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans")
-test "$plan_status" = 201
+test "$plan_status" = 200
 grep -Fq '"applicable":true' "$tmp/migration-plan-1"
 grep -Fq '"renames":[]' "$tmp/migration-plan-1"
 curl --silent --fail -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans" >"$tmp/migration-plan-2"
@@ -164,6 +182,22 @@ test "$catalog_present_before" = false
 curl --silent --fail -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans" >"$tmp/migration-plan-after-noop"
 digest_after_noop=$(sed -n 's/.*"plan_digest":"\([0-9a-f]*\)".*/\1/p' "$tmp/migration-plan-after-noop")
 test "$digest_1" = "$digest_after_noop"
+
+# M4.5：HTTP 契约补全--405+Allow、415、428、统一安全头和错误信封 request_id。
+allow_status=$(curl --silent -o "$tmp/mna" -D "$tmp/mna-headers" -w '%{http_code}' -X PUT "http://127.0.0.1:$port/api/v1/management/config")
+test "$allow_status" = 405
+grep -Eqi '^allow:[[:space:]]*get,[[:space:]]*patch' "$tmp/mna-headers"
+grep -Fq '"code":"http.method_not_allowed"' "$tmp/mna"
+grep -Fq '"request_id"' "$tmp/mna"
+mt_status=$(curl --silent -o "$tmp/mt" -w '%{http_code}' -X POST -H 'Content-Type: text/plain' --data 'x' "http://127.0.0.1:$port/api/v1/management/assets")
+test "$mt_status" = 415
+grep -Fq '"code":"http.unsupported_media_type"' "$tmp/mt"
+precond_status=$(curl --silent -o "$tmp/precond" -w '%{http_code}' -X PATCH -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/config")
+test "$precond_status" = 428
+grep -Fq '"code":"http.precondition_required"' "$tmp/precond"
+curl --silent -D "$tmp/sec-headers" -o /dev/null "http://127.0.0.1:$port/api/v1/management/config"
+grep -Eqi '^cache-control:[[:space:]]*no-store,[[:space:]]*private' "$tmp/sec-headers"
+grep -Eqi '^x-content-type-options:[[:space:]]*nosniff' "$tmp/sec-headers"
 
 stop_daemon
 "$daemon" -d -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/debug-daemon.out" 2>"$tmp/debug-daemon.err" &

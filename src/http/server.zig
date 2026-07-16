@@ -36,6 +36,7 @@ const boot_session_store = @import("../state/boot_session_store.zig");
 const deployment_control = @import("../state/deployment_control.zig");
 const node_inventory = @import("../state/node_inventory.zig");
 const operations = @import("../state/operations.zig");
+const routes = @import("routes.zig");
 const log = std.log.scoped(.http);
 
 const RouteContext = struct {
@@ -76,6 +77,9 @@ const RequestMeta = struct {
     client_ip: []const u8,
     /// 请求开始时间戳，用于计算响应延迟。
     started: std.Io.Timestamp,
+    /// M4.5：32 位十六进制请求标识，写入每个错误信封的 `request_id`，
+    /// 便于 CLI 把失败关联回具体请求。全 0 表示路由元数据就绪前生成的响应。
+    request_id: [32]u8 = [_]u8{'0'} ** 32,
 };
 
 // Zap 的底层 listener 暴露一个进程全局请求回调。NodeForge 有意设计为
@@ -86,6 +90,16 @@ var active_context: ?*RouteContext = null;
 /// 限制为 daemon 范围内单一 worker，防止并发本地 CLI 请求耗尽 mount 或竞争发布。
 var iso_import_mutex: std.atomic.Mutex = .unlocked;
 var config_mutation_mutex: std.atomic.Mutex = .unlocked;
+
+/// M4.5：单调递增的请求序号，用于生成 `request_id`。本机 daemon 请求量小，
+/// 进程内序号足以区分；进程重启从 0 重新开始，不承诺跨进程全局唯一。
+var request_counter: std.atomic.Value(u64) = .{ .raw = 0 };
+
+/// 用 32 位零填充十六进制写入请求标识（序号足够区分本机 daemon 的请求）。
+fn nextRequestId(out: *[32]u8) void {
+    const seq = request_counter.fetchAdd(1, .monotonic);
+    _ = std.fmt.bufPrint(out, "{x:0>32}", .{seq}) catch unreachable;
+}
 
 /// 在所有 IPv4 接口上启动唯一的 NodeForge HTTP listener。
 ///
@@ -116,6 +130,7 @@ pub fn serve(
     config_path: []const u8,
     reload_requested: *std.atomic.Value(bool),
 ) !void {
+    try routes.validate();
     if (!std.mem.eql(u8, ip, "0.0.0.0")) return error.InvalidHttpBindAddress;
     const initial_pair = models.acquire();
     defer initial_pair.release();
@@ -203,9 +218,26 @@ fn route(request: zap.Request) !void {
     const method = request.method orelse return notFound(request, undefined_meta(context));
     const started = std.Io.Clock.awake.now(context.io);
     const client_ip = getClientIp(request);
-    const meta = RequestMeta{ .io = context.io, .client_ip = client_ip, .started = started };
+    var meta = RequestMeta{ .io = context.io, .client_ip = client_ip, .started = started };
+    nextRequestId(&meta.request_id);
 
     observe_log.debug("http: request received {s} {s}", .{ method, path });
+
+    // M4.5 request contract: every non-empty JSON API body must declare its
+    // media type. Subiquity's curtin webhook is the single form-urlencoded
+    // exception mandated by the installer protocol.
+    if (request.body) |body| if (body.len != 0 and
+        !std.mem.endsWith(u8, path, "/installer-hooks/subiquity") and
+        (std.mem.startsWith(u8, path, "/api/v1/") and !jsonRequest(request)))
+        return unsupportedMediaType(request, meta);
+
+    // M4.5：管理写请求体必须有界。仅当请求声明了 Content-Length 且超过 64 KiB
+    // 时返回 413；空 body 的写请求（如 config/validations、install-generations）
+    // 不声明或声明 0，不触发 413，交由 handler 处理。
+    if (std.mem.startsWith(u8, path, "/api/v1/management/") and
+        (std.mem.eql(u8, method, "POST") or std.mem.eql(u8, method, "PATCH")) and
+        managementBodyTooLarge(request))
+        return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"management request body exceeds 64 KiB limit\"}}\n", meta);
 
     // M3.6 管理平面安全边界：管理 API 能写 catalog 状态并触发特权 ISO mount，
     // 它与 PXE HTTP 数据路由共用 listener 只是为了部署便利，永远不用于远程管理。
@@ -250,7 +282,7 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/validations")) {
         const catalog_snapshot = context.catalog_snapshot;
         config_validate.validate(context.config, catalog_snapshot.value()) catch |err| return validationError(request, err, meta);
-        return json(request, .created, "{\"ok\":true,\"result\":{}}\n", meta);
+        return json(request, .ok, "{\"ok\":true,\"result\":{}}\n", meta);
     }
     if (std.mem.eql(u8, method, "PATCH") and std.mem.eql(u8, path, "/api/v1/management/config")) return managementConfigSet(request, context, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/nodes")) return managementNodeAdd(request, context, meta);
@@ -282,13 +314,19 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/assets")) {
         return importAsset(request, context, meta);
     }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/assets")) return managementAssets(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/assets/")) |name| return managementAsset(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/install-sources")) {
         return importInstallSource(request, context, meta);
     }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/install-sources")) return managementInstallSources(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/install-sources/")) |name| return managementInstallSource(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/migration-plans")) return catalogMigrationPlan(request, context, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/migrations")) return catalogMigrationApply(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/operations/")) |operation_id| return managementOperation(request, context, operation_id, meta);
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/operations")) return managementOperations(request, context, meta);
+    var allow_buffer: [128]u8 = undefined;
+    if (routes.allowed(path, &allow_buffer)) |allow| return methodNotAllowed(request, allow, meta);
     return notFound(request, meta);
 }
 
@@ -380,8 +418,6 @@ fn imageAsset(request: zap.Request, context: *const RouteContext, name: []const 
     const checksum = asset.?.sha256;
     return staticFile(request, context, context.config.http.asset_root, path, checksum, meta);
 }
-
-
 
 /// M4.2 F4：从 `tftp.asset_root` 提供启动文件（kernel/initrd）。
 /// Catalog 白名单 + ETag checksum 支持条件请求和断点续传。
@@ -821,7 +857,13 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     defer context.allocator.free(body);
     request.setStatus(.ok);
     try request.setHeader("content-type", "text/plain; charset=utf-8");
-    try request.setHeader("cache-control", "no-store");
+    // M4.5：install-config 携带 password hash / SSH key，必须与 boot-config 一样
+    // 设置完整安全头（no-store/private + nosniff + no-referrer + no-cache），
+    // 不再只设 no-store。
+    try request.setHeader("cache-control", "no-store, private");
+    try request.setHeader("pragma", "no-cache");
+    try request.setHeader("x-content-type-options", "nosniff");
+    try request.setHeader("referrer-policy", "no-referrer");
     // `sendBody` 可能立即将响应交回 facil.io；在交接前记录借用的路由段，
     // 而非之后保留 request 拥有的 slice 用于诊断。
     log.info("GET installer answer -> 200 (node={s}, client={s})", .{ node_id, meta.client_ip });
@@ -835,9 +877,9 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
         var duration_text: [20]u8 = undefined;
         const req_path = request.path orelse "<missing>";
         const req_method = request.method orelse "OTHER";
-    // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
-    // M4.4: 静态制品路径从旧前缀切换到 /artifacts/** canonical URL。
-    const traffic_class: []const u8 = if (std.mem.startsWith(u8, req_path, "/artifacts/repositories/")) "repository" else if (std.mem.startsWith(u8, req_path, "/artifacts/images/")) "image" else if (std.mem.startsWith(u8, req_path, "/artifacts/boot/")) "boot" else "api";
+        // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
+        // M4.4: 静态制品路径从旧前缀切换到 /artifacts/** canonical URL。
+        const traffic_class: []const u8 = if (std.mem.startsWith(u8, req_path, "/artifacts/repositories/")) "repository" else if (std.mem.startsWith(u8, req_path, "/artifacts/images/")) "image" else if (std.mem.startsWith(u8, req_path, "/artifacts/boot/")) "boot" else "api";
         const fields = [_]events.Field{
             .{ .key = "method", .value = req_method },
             .{ .key = "path", .value = req_path },
@@ -894,12 +936,12 @@ fn findProvisioningBundle(config: *const model.AppConfig, name: []const u8) ?*co
 fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.proof != .capability) return nodeAuthError(request, error.MissingProof, meta);
-    if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"body_too_large\",\"message\":\"node event body too large\"}}\n", meta);
+    if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"node event body too large\"}}\n", meta);
     var event = parseNodeEvent(request, context.allocator) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_event\",\"message\":\"invalid node event\"}}\n", meta);
     defer event.params.deinit();
     @import("contracts.zig").validateNodeEvent(event.value) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_event\",\"message\":\"invalid node event\"}}\n", meta);
     if (!std.mem.eql(u8, event.value.boot_session_id, checked.session.boot_session_id[0..])) return nodeAuthError(request, error.ProofMismatch, meta);
-    const mapped = mapStage(checked.session.mode, event.value.stage) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"stage_invalid\",\"message\":\"stage not allowed for profile mode\"}}\n", meta);
+    const mapped = mapStage(checked.session.mode, event.value.stage) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.stage_invalid\",\"message\":\"stage not allowed for profile mode\"}}\n", meta);
     const terminal = std.mem.eql(u8, event.value.stage, "completed") or std.mem.eql(u8, event.value.stage, "failed");
     // generation 仅在安装器自身报告已启动时被消费，
     // 而非 DHCP、TFTP 或 answer 下发成功时消费。
@@ -945,7 +987,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
 fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.proof != .capability) return nodeAuthError(request, error.MissingProof, meta);
-    if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"body_too_large\",\"message\":\"node log body too large\"}}\n", meta);
+    if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"node log body too large\"}}\n", meta);
     var summary = parseLogSummary(request, context.allocator) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_log\",\"message\":\"invalid node log summary\"}}\n", meta);
     defer summary.params.deinit();
     @import("contracts.zig").validateLogSummary(summary.value) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_log\",\"message\":\"invalid node log summary\"}}\n", meta);
@@ -953,7 +995,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
     const event_type = switch (checked.session.mode) {
         .install => "install.failed",
         .diskless => "diskless.failed",
-        .discovery => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"stage_invalid\",\"message\":\"logs unavailable for discovery\"}}\n", meta),
+        .discovery => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.stage_invalid\",\"message\":\"logs unavailable for discovery\"}}\n", meta),
     };
     context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, .failed, summary.value.reason, unixNow(), false) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
@@ -970,7 +1012,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
 fn nodeFacts(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.proof != .capability) return nodeAuthError(request, error.MissingProof, meta);
-    if (!bodyWithin(request, 8 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"body_too_large\",\"message\":\"facts body too large\"}}\n", meta);
+    if (!bodyWithin(request, 8 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"facts body too large\"}}\n", meta);
     const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"missing facts body\"}}\n", meta);
     const parsed = std.json.parseFromSlice(node_inventory.Facts, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"invalid facts body\"}}\n", meta);
     defer parsed.deinit();
@@ -1024,7 +1066,7 @@ fn isFirmwarePlaceholder(value: []const u8) bool {
 fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticateWebhook(context.sessions, node_id, meta.client_ip, boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
-    if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"body_too_large\",\"message\":\"subiquity report body too large\"}}\n", meta);
+    if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"subiquity report body too large\"}}\n", meta);
     try request.parseBody();
     var params = try request.parametersToOwnedList(context.allocator);
     defer params.deinit();
@@ -1222,6 +1264,15 @@ fn bodyWithin(request: zap.Request, maximum: usize) bool {
     return value <= maximum;
 }
 
+/// M4.5：管理写请求体上限判定。仅当请求声明了 Content-Length 且解析成功、
+/// 且值超过 64 KiB 时返回 true；缺头、空 body 或解析失败均返回 false（不误伤
+/// config/validations、install-generations 这类无 body 的写请求）。
+fn managementBodyTooLarge(request: zap.Request) bool {
+    const cl = request.getHeader("content-length") orelse return false;
+    const len = std.fmt.parseInt(usize, std.mem.trim(u8, cl, " \t"), 10) catch return false;
+    return len > 64 * 1024;
+}
+
 fn nodeAuthError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
     // 刻意仅记录稳定的错误标签和 direct peer；
     // 凭据、headers 和请求体永远不会被记录。
@@ -1230,7 +1281,7 @@ fn nodeAuthError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
     observe_log.warn("node auth rejected client={s} reason={t}", .{ meta.client_ip, err });
     return switch (err) {
         error.MissingProof => json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"node.missing_proof\",\"message\":\"node proof required\"}}\n", meta),
-        error.SessionInactive => json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"session_inactive\",\"message\":\"boot session inactive\"}}\n", meta),
+        error.SessionInactive => json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.session_inactive\",\"message\":\"boot session inactive\"}}\n", meta),
         error.ProofMismatch => json(request, .forbidden, "{\"ok\":false,\"error\":{\"code\":\"node.proof_mismatch\",\"message\":\"node proof does not match request\"}}\n", meta),
         else => json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_request\",\"message\":\"invalid node request\"}}\n", meta),
     };
@@ -1263,41 +1314,53 @@ fn checkpointSessions(context: *const RouteContext) bool {
 
 /// 为时间不重要的提前退出构造占位 meta。
 fn undefined_meta(context: *const RouteContext) RequestMeta {
-    return .{ .io = context.io, .client_ip = "unknown", .started = std.Io.Clock.awake.now(context.io) };
+    var meta = RequestMeta{ .io = context.io, .client_ip = "unknown", .started = std.Io.Clock.awake.now(context.io) };
+    nextRequestId(&meta.request_id);
+    return meta;
 }
 
 /// 通过 daemon 注册一个已存在的资产，只有 daemon 能发布新的 catalog 快照。
 /// 查询字段有意只接受受约束的 M1 CLI 词汇表；任意文件路径和已解码的 URL
 /// 字符串会被与直接 TFTP 服务相同的资产校验器拒绝。
 fn importAsset(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
-    const name = request.getParamSlice("name") orelse return assetInputError(request, "missing name", meta);
-    const path = request.getParamSlice("path") orelse return assetInputError(request, "missing path", meta);
-    const kind_text = request.getParamSlice("kind") orelse return assetInputError(request, "missing kind", meta);
-    const kind = std.meta.stringToEnum(model.AssetKind, kind_text) orelse return assetInputError(request, "invalid kind", meta);
-    const distro = request.getParamSlice("distro");
-    const version = request.getParamSlice("version");
-    const arch_text = request.getParamSlice("arch");
-    const has_tuple = distro != null or version != null or arch_text != null;
-    if (has_tuple and (distro == null or version == null or arch_text == null)) return assetInputError(request, "incomplete distro tuple", meta);
-    const arch = if (arch_text) |value| std.meta.stringToEnum(model.Arch, value) orelse return assetInputError(request, "invalid arch", meta) else null;
+    if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
+    const AssetRequest = struct { name: []const u8, kind: model.AssetKind, path: []const u8, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null, kernel_release: ?[]const u8 = null };
+    const body = request.body orelse return assetInputError(request, "missing body", meta);
+    const parsed = std.json.parseFromSlice(AssetRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid JSON body", meta);
+    defer parsed.deinit();
+    const value = parsed.value;
+    const has_tuple = value.distro != null or value.version != null or value.arch != null;
+    if (has_tuple and (value.distro == null or value.version == null or value.arch == null)) return assetInputError(request, "incomplete distro tuple", meta);
     var checksum: [64]u8 = undefined;
-    @import("../assets/validate.zig").sha256File(context.io, context.config.tftp.asset_root, path, &checksum) catch |err| {
-        observe_log.err("asset: import failed for {s}: {t}", .{ path, err });
+    @import("../assets/validate.zig").sha256File(context.io, context.config.tftp.asset_root, value.path, &checksum) catch |err| {
+        observe_log.err("asset: import failed for {s}: {t}", .{ value.path, err });
         return assetInputError(request, "unreadable asset", meta);
     };
+    if (lookup.findAsset(context.catalog_snapshot.value(), value.name)) |existing| {
+        const same = existing.kind == value.kind and std.mem.eql(u8, existing.path, value.path) and optionalEqual(existing.distro, value.distro) and optionalEqual(existing.version, value.version) and existing.arch == value.arch and optionalEqual(existing.kernel_release, value.kernel_release) and optionalEqual(existing.sha256, &checksum);
+        if (!same) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"asset.name_conflict\",\"message\":\"asset name already identifies different canonical metadata\"}}\n", meta);
+        var reused: [384]u8 = undefined;
+        const response = try std.fmt.bufPrint(&reused, "{{\"ok\":true,\"result\":{{\"name\":{f},\"kind\":{f},\"sha256\":{f}}}}}\n", .{ std.json.fmt(existing.name, .{}), std.json.fmt(@tagName(existing.kind), .{}), std.json.fmt(existing.sha256.?, .{}) });
+        return json(request, .ok, response, meta);
+    }
     context.models.lock();
     defer context.models.unlock();
     context.catalog.addAsset(context.io, context.config, .{
-        .name = name,
-        .kind = kind,
-        .path = path,
-        .distro = distro,
-        .version = version,
-        .arch = arch,
-        .kernel_release = request.getParamSlice("kernel_release"),
+        .name = value.name,
+        .kind = value.kind,
+        .path = value.path,
+        .distro = value.distro,
+        .version = value.version,
+        .arch = value.arch,
+        .kernel_release = value.kernel_release,
         .sha256 = &checksum,
     }) catch |err| return assetInputError(request, @errorName(err), meta);
-    try json(request, .ok, "{\"ok\":true}\n", meta);
+    var location: [320]u8 = undefined;
+    const location_value = try std.fmt.bufPrint(&location, "/api/v1/management/assets/{s}", .{value.name});
+    try request.setHeader("location", location_value);
+    var response_buffer: [384]u8 = undefined;
+    const response = try std.fmt.bufPrint(&response_buffer, "{{\"ok\":true,\"result\":{{\"name\":{f},\"kind\":{f},\"sha256\":{f}}}}}\n", .{ std.json.fmt(value.name, .{}), std.json.fmt(@tagName(value.kind), .{}), std.json.fmt(&checksum, .{}) });
+    try json(request, .created, response, meta);
 }
 
 /// M3.6：本地管理请求等待一个有界 import worker，但昂贵的 mount/copy/hash
@@ -1306,15 +1369,20 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
 /// 保留另一个 worker 供数据面请求使用。Publication 保留在此处，使 catalog
 /// 替换仅在完整候选存在后才被序列化。
 fn importInstallSource(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
-    const filename = request.getParamSlice("filename") orelse return assetInputError(request, "missing filename", meta);
-    const declared_sha256 = request.getParamSlice("sha256") orelse return assetInputError(request, "missing sha256", meta);
+    if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
+    const ImportRequest = struct { filename: []const u8, sha256: []const u8, name: ?[]const u8 = null, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null };
+    const body = request.body orelse return assetInputError(request, "missing body", meta);
+    const parsed = std.json.parseFromSlice(ImportRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid JSON body", meta);
+    defer parsed.deinit();
+    const filename = parsed.value.filename;
+    const declared_sha256 = parsed.value.sha256;
     if (declared_sha256.len != 64 or !allLowerHex(declared_sha256)) return assetInputError(request, "invalid sha256", meta);
-    const name = request.getParamSlice("name");
+    const name = parsed.value.name;
     if (name) |value| if (!config_validate.validLogicalId(value)) return assetInputError(request, "invalid logical name", meta);
-    const distro = request.getParamSlice("distro");
-    const version = request.getParamSlice("version");
-    const arch_text = request.getParamSlice("arch");
-    const arch = if (arch_text) |value| std.meta.stringToEnum(model.Arch, value) orelse return assetInputError(request, "invalid arch", meta) else null;
+    const distro = parsed.value.distro;
+    const version = parsed.value.version;
+    const arch = parsed.value.arch;
+    const arch_text = if (arch) |value| @tagName(value) else null;
     const idempotency_key = request.getHeader("idempotency-key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_key_required\",\"message\":\"Idempotency-Key header is required\"}}\n", meta);
     var digest_buf: [32]u8 = undefined;
     const digest_input = try std.fmt.allocPrint(context.allocator, "sha256={s}&name={s}&distro={s}&version={s}&arch={s}", .{ declared_sha256, name orelse "", distro orelse "", version orelse "", arch_text orelse "" });
@@ -1322,7 +1390,7 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     std.crypto.hash.sha2.Sha256.hash(digest_input, &digest_buf, .{});
     var digest_hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&digest_hex, "{x}", .{digest_buf}) catch unreachable;
-    const begun = context.operations.beginRequest(context.io, idempotency_key, &digest_hex, .install_source_import, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"request.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for a different request\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create durable operation\"}}\n", meta);
+    const begun = context.operations.beginRequest(context.io, idempotency_key, &digest_hex, .install_source_import, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for a different request\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create durable operation\"}}\n", meta);
     operations.save(context.io, context.allocator, paths.operations_path, context.operations) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"operation.persist_failed\",\"message\":\"cannot persist operation\"}}\n", meta);
     if (begun.reused) return operationResponse(request, begun.entry, true, meta);
     var operation_done = false;
@@ -1392,6 +1460,113 @@ fn managementOperation(request: zap.Request, context: *const RouteContext, opera
     return operationResponse(request, operation, false, meta);
 }
 
+const Page = struct { offset: usize, limit: usize };
+
+fn pageRequest(request: zap.Request, collection: []const u8, revision: u64) !Page {
+    const limit = if (request.getParamSlice("limit")) |raw| std.fmt.parseInt(usize, raw, 10) catch return error.InvalidCursor else 100;
+    if (limit < 1 or limit > 200) return error.InvalidCursor;
+    const cursor = request.getParamSlice("cursor") orelse return .{ .offset = 0, .limit = limit };
+    var decoded: [128]u8 = undefined;
+    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(cursor) catch return error.InvalidCursor;
+    if (decoded_len > decoded.len) return error.InvalidCursor;
+    std.base64.url_safe_no_pad.Decoder.decode(decoded[0..decoded_len], cursor) catch return error.InvalidCursor;
+    var parts = std.mem.splitScalar(u8, decoded[0..decoded_len], ':');
+    const cursor_collection = parts.next() orelse return error.InvalidCursor;
+    const cursor_revision = std.fmt.parseInt(u64, parts.next() orelse return error.InvalidCursor, 10) catch return error.InvalidCursor;
+    const offset = std.fmt.parseInt(usize, parts.next() orelse return error.InvalidCursor, 10) catch return error.InvalidCursor;
+    if (parts.next() != null or !std.mem.eql(u8, cursor_collection, collection)) return error.InvalidCursor;
+    if (cursor_revision != revision) return error.StaleCursor;
+    return .{ .offset = offset, .limit = limit };
+}
+
+fn writeNextCursor(writer: *std.Io.Writer, collection: []const u8, revision: u64, next: usize, total: usize) !void {
+    try writer.writeAll(",\"next_cursor\":");
+    if (next >= total) return writer.writeAll("null");
+    var plain: [96]u8 = undefined;
+    const token = try std.fmt.bufPrint(&plain, "{s}:{d}:{d}", .{ collection, revision, next });
+    var encoded: [128]u8 = undefined;
+    const value = std.base64.url_safe_no_pad.Encoder.encode(&encoded, token);
+    try writer.print("{f}", .{std.json.fmt(value, .{})});
+}
+
+fn pageError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
+    if (err == error.StaleCursor) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"pagination.snapshot_changed\",\"message\":\"cursor snapshot is no longer current\"}}\n", meta);
+    return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"pagination.invalid_cursor\",\"message\":\"limit or cursor is invalid\"}}\n", meta);
+}
+
+fn managementAssets(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const all = context.catalog_snapshot.value().assets;
+    const page = pageRequest(request, "assets", context.catalog_snapshot.revision) catch |err| return pageError(request, err, meta);
+    const end = @min(page.offset + page.limit, all.len);
+    if (page.offset > all.len) return pageError(request, error.InvalidCursor, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    for (all[page.offset..end], 0..) |asset, i| {
+        if (i != 0) try output.writer.writeByte(',');
+        try output.writer.print("{f}", .{std.json.fmt(asset, .{})});
+    }
+    try output.writer.writeByte(']');
+    try writeNextCursor(&output.writer, "assets", context.catalog_snapshot.revision, end, all.len);
+    try output.writer.print(",\"view_revision\":{d}}}}}\n", .{context.catalog_snapshot.revision});
+    try setRevisionEtag(request, context.catalog_snapshot.revision);
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementAsset(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const asset = lookup.findAsset(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    var output: [2048]u8 = undefined;
+    const body = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{f}}}\n", .{std.json.fmt(asset.*, .{})});
+    try setRevisionEtag(request, context.catalog_snapshot.revision);
+    return json(request, .ok, body, meta);
+}
+
+fn managementInstallSources(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const all = context.catalog_snapshot.value().install_sources;
+    const page = pageRequest(request, "install-sources", context.catalog_snapshot.revision) catch |err| return pageError(request, err, meta);
+    const end = @min(page.offset + page.limit, all.len);
+    if (page.offset > all.len) return pageError(request, error.InvalidCursor, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    for (all[page.offset..end], 0..) |source, i| {
+        if (i != 0) try output.writer.writeByte(',');
+        try output.writer.print("{f}", .{std.json.fmt(source, .{})});
+    }
+    try output.writer.writeByte(']');
+    try writeNextCursor(&output.writer, "install-sources", context.catalog_snapshot.revision, end, all.len);
+    try output.writer.print(",\"view_revision\":{d}}}}}\n", .{context.catalog_snapshot.revision});
+    try setRevisionEtag(request, context.catalog_snapshot.revision);
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementOperations(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    var all: [operations.max_operations]operations.Entry = undefined;
+    context.operations.snapshot(&all);
+    var used: [operations.max_operations]operations.Entry = undefined;
+    var count: usize = 0;
+    for (all) |entry| if (entry.used()) {
+        used[count] = entry;
+        count += 1;
+    };
+    const revision: u64 = @intCast(count);
+    const page = pageRequest(request, "operations", revision) catch |err| return pageError(request, err, meta);
+    const end = @min(page.offset + page.limit, count);
+    if (page.offset > count) return pageError(request, error.InvalidCursor, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    for (used[page.offset..end], 0..) |entry, i| {
+        if (i != 0) try output.writer.writeByte(',');
+        try writeOperation(&output.writer, entry);
+    }
+    try output.writer.writeByte(']');
+    try writeNextCursor(&output.writer, "operations", revision, end, count);
+    try output.writer.print(",\"view_revision\":{d}}}}}\n", .{revision});
+    try setRevisionEtag(request, revision);
+    return json(request, .ok, output.written(), meta);
+}
+
 fn catalogMigrationPlan(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     if (request.body) |body| if (body.len != 0 and !std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "{}"))
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"request.unknown_field\",\"message\":\"migration plan currently accepts an empty object\"}}\n", meta);
@@ -1403,7 +1578,7 @@ fn catalogMigrationPlan(request: zap.Request, context: *const RouteContext, meta
     try output.writer.print("{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"applicable\":{s},\"plan\":", .{ std.json.fmt(&plan.digest, .{}), if (plan.applicable()) "true" else "false" });
     try output.writer.writeAll(plan.canonical_json);
     try output.writer.writeAll("}}\n");
-    return json(request, .created, output.written(), meta);
+    return json(request, .ok, output.written(), meta);
 }
 
 fn managementInstallSource(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
@@ -1443,7 +1618,7 @@ fn catalogMigrationApply(request: zap.Request, context: *RouteContext, meta: Req
     const parsed = std.json.parseFromSlice(MigrationApplyRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"migration.invalid_request\",\"message\":\"invalid request body\"}}\n", meta);
     defer parsed.deinit();
     if (parsed.value.plan_digest.len != 64 or !allLowerHex(parsed.value.plan_digest)) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"migration.invalid_digest\",\"message\":\"plan_digest must be 64 lowercase hexadecimal characters\"}}\n", meta);
-    const begun = context.operations.beginRequest(context.io, idempotency_key, parsed.value.plan_digest, .catalog_migration, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"request.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for another migration\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create migration operation\"}}\n", meta);
+    const begun = context.operations.beginRequest(context.io, idempotency_key, parsed.value.plan_digest, .catalog_migration, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for another migration\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create migration operation\"}}\n", meta);
     try operations.save(context.io, context.allocator, paths.operations_path, context.operations);
     if (begun.reused) return operationResponse(request, begun.entry, true, meta);
     var operation_done = false;
@@ -1535,6 +1710,26 @@ fn allLowerHex(value: []const u8) bool {
     return true;
 }
 
+fn optionalEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn jsonRequest(request: zap.Request) bool {
+    const raw = request.getHeader("content-type") orelse return false;
+    const media_type = std.mem.trim(u8, std.mem.sliceTo(raw, ';'), " \t");
+    return std.ascii.eqlIgnoreCase(media_type, "application/json");
+}
+
+fn unsupportedMediaType(request: zap.Request, meta: RequestMeta) !void {
+    return json(request, .unsupported_media_type, "{\"ok\":false,\"error\":{\"code\":\"http.unsupported_media_type\",\"message\":\"Content-Type must be application/json\"}}\n", meta);
+}
+
+fn setRevisionEtag(request: zap.Request, revision: u64) !void {
+    var buffer: [32]u8 = undefined;
+    try request.setHeader("etag", try std.fmt.bufPrint(&buffer, "\"{d}\"", .{revision}));
+}
+
 fn operationResponse(request: zap.Request, operation: operations.Entry, accepted: bool, meta: RequestMeta) !void {
     var body: [768]u8 = undefined;
     var location: [256]u8 = undefined;
@@ -1542,6 +1737,10 @@ fn operationResponse(request: zap.Request, operation: operations.Entry, accepted
     try request.setHeader("location", location_value);
     const rendered = try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"id\":{f},\"kind\":{f},\"state\":{f},\"created_at\":{d},\"updated_at\":{d},\"result\":{f},\"error_code\":{f}}}}}\n", .{ std.json.fmt(operation.idSlice(), .{}), std.json.fmt(@tagName(operation.kind), .{}), std.json.fmt(@tagName(operation.state), .{}), operation.created_at, operation.updated_at, std.json.fmt(operation.resultSlice(), .{}), std.json.fmt(operation.errorSlice(), .{}) });
     return json(request, if (accepted) .accepted else .ok, rendered, meta);
+}
+
+fn writeOperation(writer: *std.Io.Writer, operation: operations.Entry) !void {
+    try writer.print("{{\"id\":{f},\"kind\":{f},\"state\":{f},\"created_at\":{d},\"updated_at\":{d},\"result\":{f},\"error_code\":{f}}}", .{ std.json.fmt(operation.idSlice(), .{}), std.json.fmt(@tagName(operation.kind), .{}), std.json.fmt(@tagName(operation.state), .{}), operation.created_at, operation.updated_at, std.json.fmt(operation.resultSlice(), .{}), std.json.fmt(operation.errorSlice(), .{}) });
 }
 
 const IsoImportTask = struct {
@@ -1564,12 +1763,6 @@ fn assetInputError(request: zap.Request, message: []const u8, meta: RequestMeta)
     var buffer: [256]u8 = undefined;
     const body = try std.fmt.bufPrint(&buffer, "{{\"ok\":false,\"error\":{{\"code\":\"asset.invalid\",\"message\":{f}}}}}\n", .{std.json.fmt(message, .{})});
     try json(request, .bad_request, body, meta);
-}
-
-fn managementNodePath(path: []const u8) ?[]const u8 {
-    // M4.4: 旧 /management/nodes/:id/status 路由已删除，使用 /management/nodes/:id 聚合端点。
-    _ = path;
-    return null;
 }
 
 fn installGenerationsPath(path: []const u8) ?[]const u8 {
@@ -1640,6 +1833,7 @@ fn managementConfigGet(request: zap.Request, context: *const RouteContext, meta:
     };
     var body: [256]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"config\":\"{s}\",\"revision\":{d},\"catalog_revision\":{d}}}}}\n", .{ if (config_valid) "valid" else "invalid", context.config_revision, context.catalog_snapshot.revision });
+    try setRevisionEtag(request, context.config_revision);
     return json(request, .ok, rendered, meta);
 }
 
@@ -1713,7 +1907,10 @@ fn managementConfigSet(request: zap.Request, context: *RouteContext, meta: Reque
     context.configs.publish(candidate, revision) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.publish_failed\",\"message\":\"cannot publish config snapshot\"}}\n", meta);
     context.event_writer.configure(candidate.events.max_size_mb, candidate.events.keep);
     observe_log.setLevel(candidate.logging.level);
-    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
+    var result: [128]u8 = undefined;
+    const response = try std.fmt.bufPrint(&result, "{{\"ok\":true,\"result\":{{\"revision\":{d}}}}}\n", .{revision});
+    try setRevisionEtag(request, revision);
+    return json(request, .ok, response, meta);
 }
 
 const NodeSetRequest = struct {
@@ -1754,7 +1951,12 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
     const value = parsed.value;
     node_mutation.addNode(context.io, context.allocator, context.config_path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .ip = value.ip, .hostname = value.hostname, .deploy = value.deploy, .http_accel = value.http_accel }) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.mutation_failed\",\"message\":\"node could not be added\"}}\n", meta);
     applyConfigFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.publish_failed\",\"message\":\"node persisted but snapshot publish failed\"}}\n", meta);
-    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
+    var location: [320]u8 = undefined;
+    try request.setHeader("location", try std.fmt.bufPrint(&location, "/api/v1/management/nodes/{s}", .{value.id}));
+    var result: [256]u8 = undefined;
+    const response = try std.fmt.bufPrint(&result, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(value.id, .{}), context.config_revision });
+    try setRevisionEtag(request, context.config_revision);
+    return json(request, .created, response, meta);
 }
 
 fn managementNodeSet(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
@@ -1815,14 +2017,19 @@ fn ifMatchCurrent(request: zap.Request, context: *RouteContext) bool {
 }
 
 fn revisionConflict(request: zap.Request, meta: RequestMeta) !void {
+    if (request.getHeader("if-match") == null)
+        return json(request, .precondition_required, "{\"ok\":false,\"error\":{\"code\":\"http.precondition_required\",\"message\":\"If-Match is required\"}}\n", meta);
     return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"config.revision_conflict\",\"message\":\"If-Match does not identify the current config revision\"}}\n", meta);
 }
 
 fn managementNodes(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const page = pageRequest(request, "nodes", context.config_revision) catch |err| return pageError(request, err, meta);
+    if (page.offset > context.config.nodes.len) return pageError(request, error.InvalidCursor, meta);
+    const end = @min(page.offset + page.limit, context.config.nodes.len);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"nodes\":[", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision() });
-    for (context.config.nodes, 0..) |node, index| {
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"items\":[", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision() });
+    for (context.config.nodes[page.offset..end], 0..) |node, index| {
         if (index != 0) try output.writer.writeByte(',');
         const status = context.statuses.get(node.id);
         const inventory = context.inventories.get(node.id);
@@ -1845,7 +2052,10 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
         if (inventory) |value| if (value.serial_number) |serial| try output.writer.print("{f}", .{std.json.fmt(serial, .{})}) else try output.writer.writeAll("null") else try output.writer.writeAll("null");
         try output.writer.writeByte('}');
     }
-    try output.writer.writeAll("]}}\n");
+    try output.writer.writeByte(']');
+    try writeNextCursor(&output.writer, "nodes", context.config_revision, end, context.config.nodes.len);
+    try output.writer.writeAll("}}\n");
+    try setRevisionEtag(request, context.config_revision);
     return json(request, .ok, output.written(), meta);
 }
 
@@ -1898,10 +2108,13 @@ fn writeEffectiveSystem(writer: *std.Io.Writer, profile: *const model.ProfileCon
 }
 
 fn managementProfiles(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const page = pageRequest(request, "profiles", context.config_revision) catch |err| return pageError(request, err, meta);
+    if (page.offset > context.config.profiles.len) return pageError(request, error.InvalidCursor, meta);
+    const end = @min(page.offset + page.limit, context.config.profiles.len);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.writeAll("{\"ok\":true,\"result\":{\"profiles\":[");
-    for (context.config.profiles, 0..) |profile, index| {
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    for (context.config.profiles[page.offset..end], 0..) |profile, index| {
         if (index != 0) try output.writer.writeByte(',');
         var refs: usize = 0;
         for (context.config.nodes) |node| if (std.mem.eql(u8, node.profile, profile.name)) {
@@ -1911,7 +2124,10 @@ fn managementProfiles(request: zap.Request, context: *const RouteContext, meta: 
         if (profile.install_source) |source| try output.writer.print("{f}", .{std.json.fmt(source, .{})}) else try output.writer.writeAll("null");
         try output.writer.print(",\"nodes\":{d},\"valid\":true}}", .{refs});
     }
-    try output.writer.writeAll("]}}\n");
+    try output.writer.writeByte(']');
+    try writeNextCursor(&output.writer, "profiles", context.config_revision, end, context.config.profiles.len);
+    try output.writer.print(",\"view_revision\":{d}}}}}\n", .{context.config_revision});
+    try setRevisionEtag(request, context.config_revision);
     return json(request, .ok, output.written(), meta);
 }
 
@@ -2051,19 +2267,63 @@ fn notFound(request: zap.Request, meta: RequestMeta) !void {
     try json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"http.not_found\",\"message\":\"route not found\"}}\n", meta);
 }
 
+fn methodNotAllowed(request: zap.Request, allow: []const u8, meta: RequestMeta) !void {
+    try request.setHeader("allow", allow);
+    try json(request, .method_not_allowed, "{\"ok\":false,\"error\":{\"code\":\"http.method_not_allowed\",\"message\":\"method not allowed\"}}\n", meta);
+}
+
+/// M4.5：为错误信封补充 `request_id`。所有错误响应统一形如
+/// `{"ok":false,"error":{...}}\n`；这里在 error 对象闭合前（结构性的 `}}\n`）
+/// 插入 `,"request_id":"<hex>"`。成功信封 (`{"ok":true,`) 与结尾非 `}}\n`
+/// 的响应保持原样，避免破坏 boot/install-config 等非错误或非标准响应。
+/// 纯函数，便于单测；返回 null 表示不重写，调用方回退到原 body。
+fn appendRequestId(body: []const u8, request_id: []const u8, out: []u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, body, "{\"ok\":false,")) return null;
+    if (!std.mem.endsWith(u8, body, "}}\n")) return null;
+    const tail = ",\"request_id\":\"";
+    const suffix = "\"}}\n";
+    const needed = (body.len - 3) + tail.len + request_id.len + suffix.len;
+    if (needed > out.len) return null;
+    var n: usize = 0;
+    @memcpy(out[n .. n + body.len - 3], body[0 .. body.len - 3]);
+    n += body.len - 3;
+    @memcpy(out[n .. n + tail.len], tail);
+    n += tail.len;
+    @memcpy(out[n .. n + request_id.len], request_id);
+    n += request_id.len;
+    @memcpy(out[n .. n + suffix.len], suffix);
+    return out[0 .. n + suffix.len];
+}
+
+test "appendRequestId injects request_id only into error envelopes" {
+    var out: [256]u8 = undefined;
+    const id = "0000000000000000000000000000000a";
+    const err = "{\"ok\":false,\"error\":{\"code\":\"http.not_found\",\"message\":\"route not found\"}}\n";
+    const rewritten = appendRequestId(err, id, &out).?;
+    try std.testing.expectEqualStrings("{\"ok\":false,\"error\":{\"code\":\"http.not_found\",\"message\":\"route not found\",\"request_id\":\"0000000000000000000000000000000a\"}}\n", rewritten);
+    // 成功信封不重写。
+    try std.testing.expect(appendRequestId("{\"ok\":true,\"result\":{}}\n", id, &out) == null);
+    // 结尾非 }}\n 的响应安全回退到原 body。
+    try std.testing.expect(appendRequestId("{\"ok\":false,\"error\":{}}", id, &out) == null);
+}
+
 /// 通过 Zap 发送 JSON 响应并记录方法、路径、状态码、字节数、持续时间和
 /// 客户端 IP。请求体和凭据永远不会进入日志。
 fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, meta: RequestMeta) !void {
     request.setStatus(status);
+    // M4.5：错误信封统一补充 request_id，便于 CLI 关联失败请求；成功信封、
+    // 非 JSON 或超长 body 安全回退到原 body（appendRequestId 返回 null）。
+    var envelope: [4096]u8 = undefined;
+    const effective_body = appendRequestId(body, &meta.request_id, &envelope) orelse body;
     const duration_us = meta.started.durationTo(std.Io.Clock.awake.now(meta.io)).toMicroseconds();
     const is_health = std.mem.eql(u8, request.path orelse "", "/healthz");
     if (is_health) log.debug("{s} {s} -> {d} ({d} bytes, {d}us, client={s})", .{
-        request.method orelse "OTHER", request.path orelse "<missing>", @intFromEnum(status), body.len, duration_us, meta.client_ip,
+        request.method orelse "OTHER", request.path orelse "<missing>", @intFromEnum(status), effective_body.len, duration_us, meta.client_ip,
     }) else log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s})", .{
         request.method orelse "OTHER",
         request.path orelse "<missing>",
         @intFromEnum(status),
-        body.len,
+        effective_body.len,
         duration_us,
         meta.client_ip,
     });
@@ -2080,7 +2340,7 @@ fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, met
                 .{ .key = "method", .value = method },
                 .{ .key = "path", .value = path },
                 .{ .key = "status", .value = std.fmt.bufPrint(&status_text, "{d}", .{@intFromEnum(status)}) catch "0" },
-                .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{body.len}) catch "0" },
+                .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{effective_body.len}) catch "0" },
                 .{ .key = "client_ip", .value = meta.client_ip },
                 .{ .key = "duration_us", .value = std.fmt.bufPrint(&duration_text, "{d}", .{duration_us}) catch "0" },
                 .{ .key = "traffic_class", .value = traffic_class },
@@ -2092,7 +2352,9 @@ fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, met
     // 直接设置 header 而非使用 `sendJson`：Zap 的助手会发出自己的
     // debug 行，即使 NodeForge 配置为 info 级别日志。
     try request.setHeader("content-type", "application/json");
-    try request.sendBody(body);
+    try request.setHeader("cache-control", "no-store, private");
+    try request.setHeader("x-content-type-options", "nosniff");
+    try request.sendBody(effective_body);
 }
 
 test "Zap-backed route module compiles" {

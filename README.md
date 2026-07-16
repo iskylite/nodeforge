@@ -55,7 +55,14 @@ hash 时只在渲染/下发阶段临时转换，不能把 hash 回写成配置�
 已经生成的 password hash 不是 password 配置字段，仍按各自的短期或受限传递规则处理。
 
 [`config.example.json`](config.example.json) 只展示当前代码能够加载和校验的配置。已实现基线与待实现的
-M4.5–M4.7 契约分别以详细设计 §9.14–§9.16 为准。相关变更必须同步更新代码、示例配置、
+M4.5 已实施 HTTP 契约补全：集中 RouteSpec（含启动冲突/wildcard 吞路由检测）与 405/Allow、JSON 导入 body、
+统一安全头和状态码（创建 201/变更 200/校验 200/长任务 202）、错误码命名空间化（`node.*`/`http.*`/`operation.*`）、
+错误信封 `request_id`、客户端 4xx/5xx 结构化错误映射、目标 ETag/If-Match（428/409）、413/415 请求校验、
+有界 cursor 分页（CLI `node list`/`profile list` 跟随 `next_cursor`）、持久 Operation 幂等语义、客户端 202 轮询
+以及完整有界 response reader（含 204/空 body/非 2xx body）。install-config 与 boot-config 同样设置完整安全头。
+M4.5 契约已在 Rocky 9.7 aarch64 验证目标以 root 端到端回归（详见 §9.14.14）。
+M4.6–M4.7 契约分别以详细设计
+§9.15–§9.16 为准。相关变更必须同步更新代码、示例配置、
 fixture 和验证记录，不能把设计完成误写成代码已完成。
 
 ## 开发

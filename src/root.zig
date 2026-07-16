@@ -68,6 +68,7 @@ pub const status_store = @import("state/status_store.zig");
 pub const deployment_control = @import("state/deployment_control.zig");
 /// CLI 管理客户端：通过本机 HTTP 管理 API 与 daemon 通信。
 pub const management_client = @import("http/client.zig");
+pub const http_routes = @import("http/routes.zig");
 /// 管理 API 约定：固定 loopback 连接地址和安全边界常量。
 pub const management = @import("http/management.zig");
 /// HTTP 服务端：PXE 数据路由（kernel/initrd/ISO/rootfs 下载）和管理 API 路由。
