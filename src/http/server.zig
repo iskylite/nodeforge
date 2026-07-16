@@ -290,6 +290,7 @@ fn route(request: zap.Request) !void {
         if (std.mem.eql(u8, method, "PATCH")) return managementNodeSet(request, context, node_id, meta);
         if (std.mem.eql(u8, method, "DELETE")) return managementNodeRemove(request, context, node_id, meta);
     }
+    if (std.mem.eql(u8, method, "PATCH")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfileSet(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (installGenerationsPath(path)) |node_id| return installGenerations(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime")) {
         return runtimeSummary(request, context, meta);
@@ -845,13 +846,13 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     } else null;
     const body = switch (format) {
         .meta_data => try @import("../profile/adapter/ubuntu.zig").renderMetaData(context.allocator, node),
-        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserDataM41(context.allocator, node, install, system, context.bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session.boot_session_id[0..], session.capability[0..], password_scope),
+        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserDataM41(context.allocator, node, install, system, context.bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session.boot_session_id[0..], session.capability[0..], password_scope, profile.kernel_args),
         .vendor_data => try context.allocator.dupe(u8, ""),
         .kickstart => blk: {
             const source = &plan.install_source;
             const install_root = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
             defer context.allocator.free(install_root);
-            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, facts_url, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope);
+            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, facts_url, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope, profile.kernel_args);
         },
     };
     defer context.allocator.free(body);
@@ -1924,6 +1925,47 @@ const NodeSetRequest = struct {
     unset: []const []const u8 = &.{},
 };
 
+const ProfileKernelArgsRequest = struct { kernel_args: ?[]const u8 };
+
+test "profile kernel args patch requires the single typed field" {
+    const set = try std.json.parseFromSlice(ProfileKernelArgsRequest, std.testing.allocator, "{\"kernel_args\":\"iommu=pt\"}", .{});
+    defer set.deinit();
+    try std.testing.expectEqualStrings("iommu=pt", set.value.kernel_args.?);
+    const unset = try std.json.parseFromSlice(ProfileKernelArgsRequest, std.testing.allocator, "{\"kernel_args\":null}", .{});
+    defer unset.deinit();
+    try std.testing.expect(unset.value.kernel_args == null);
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(ProfileKernelArgsRequest, std.testing.allocator, "{}", .{}));
+}
+
+/// M4.6 的唯一 profile 写入口。活动 session 已经固定了 PXE/answer 计划，
+/// 因此引用该 profile 的任一节点仍有活动 session 时拒绝变更；成功写入后新
+/// config revision 在线发布，install 节点仍需显式 `node retry` 武装新计划。
+fn managementProfileSet(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"missing request body\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(ProfileKernelArgsRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"only kernel_args string or null is accepted\"}}\n", meta);
+    defer parsed.deinit();
+    if (lookup.findProfile(context.config, name) == null) return notFound(request, meta);
+    for (context.config.nodes) |node| {
+        if (!std.mem.eql(u8, node.profile, name)) continue;
+        if (context.sessions.hasActiveNode(node.id, boot_session.monotonicNow()))
+            return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.active_session_conflict\",\"message\":\"kernel args are pinned by an active boot session\"}}\n", meta);
+    }
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    @import("../config/profile_mutation.zig").setKernelArgs(context.io, context.allocator, context.config_path, name, parsed.value.kernel_args) catch |err| switch (err) {
+        error.InvalidKernelArgs, error.KernelArgsRequiresBootloader => return validationError(request, err, meta),
+        error.ProfileNotFound => return notFound(request, meta),
+        else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"profile.persist_failed\",\"message\":\"cannot persist profile kernel args\"}}\n", meta),
+    };
+    applyConfigFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"config.publish_failed\",\"message\":\"profile persisted but snapshot publish failed\"}}\n", meta);
+    try setRevisionEtag(request, context.config_revision);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
+}
+
 fn applyConfigFromDisk(context: *RouteContext) !void {
     var parsed = try config_load.load(context.io, context.allocator, context.config_path);
     defer parsed.deinit();
@@ -2043,17 +2085,22 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
             if (deploymentPhaseFallback(value)) |phase| try output.writer.print("{f}", .{std.json.fmt(phase, .{})}) else try output.writer.writeAll("null")
         else
             try output.writer.writeAll("null");
-        // 部署开始/结束时间为 per-generation 生命周期时间戳：started_at 对应
-        // install.started，finished_at 对应首次 terminal；deployed_at 仅在成功
-        // completed 时更新。三者随 retry 重新武装而清零，见 deployment_control。
+        // 三个时间使用部署任务语义，而不是把内部状态字段名直接暴露给用户：
+        // Start=requested_at，Install=install.started/started_at，
+        // Finished=首次 terminal/finished_at。Install 后续可与 diskless 的实际
+        // 启动阶段并列扩展，Start/Finished 仍保持任务边界不变。
         if (deployment) |value| {
-            try output.writer.writeAll(",\"started_at\":");
-            if (value.started_at != 0) try output.writer.print("{d}", .{value.started_at}) else try output.writer.writeAll("null");
+            const times = deploymentTimes(value);
+            try output.writer.writeAll(",\"start_at\":");
+            if (times.start_at != 0) try output.writer.print("{d}", .{times.start_at}) else try output.writer.writeAll("null");
+            try output.writer.writeAll(",\"install_at\":");
+            if (times.install_at != 0) try output.writer.print("{d}", .{times.install_at}) else try output.writer.writeAll("null");
             try output.writer.writeAll(",\"finished_at\":");
-            if (value.finished_at != 0) try output.writer.print("{d}", .{value.finished_at}) else try output.writer.writeAll("null");
+            if (times.finished_at != 0) try output.writer.print("{d}", .{times.finished_at}) else try output.writer.writeAll("null");
             try output.writer.writeAll(",\"deployed_at\":");
             if (value.deployed_at != 0) try output.writer.print("{d}", .{value.deployed_at}) else try output.writer.writeAll("null");
-        } else try output.writer.writeAll(",\"started_at\":null,\"finished_at\":null,\"deployed_at\":null");
+            try output.writer.print(",\"drifted\":{s}", .{if (value.applied_revision != 0 and value.applied_revision != context.config_revision) "true" else "false"});
+        } else try output.writer.writeAll(",\"start_at\":null,\"install_at\":null,\"finished_at\":null,\"deployed_at\":null,\"drifted\":false");
         try output.writer.writeAll(",\"serial_number\":");
         if (inventory) |value| if (value.serial_number) |serial| try output.writer.print("{f}", .{std.json.fmt(serial, .{})}) else try output.writer.writeAll("null") else try output.writer.writeAll("null");
         try output.writer.writeByte('}');
@@ -2073,7 +2120,7 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     const inventory = context.inventories.get(node_id);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{f},\"profile\":{{\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), std.json.fmt(node, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}) });
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{f},\"profile\":{{\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"install_source\":{f},\"boot_bundle\":{f},\"kernel_args\":{f},\"safety\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), std.json.fmt(node, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.safety, .{}) });
     try writeEffectiveSystem(&output.writer, profile);
     try output.writer.writeAll(",\"status\":");
     if (status) |value| try output.writer.print("{{\"phase\":{f},\"boot_session_id\":{f},\"model_revision\":{d},\"deployment_generation\":{d},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}}}", .{
@@ -2087,7 +2134,25 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
         if (value.session_active) "true" else "false",
     }) else try output.writer.writeAll("null");
     try output.writer.writeAll(",\"deployment\":");
-    if (deployment) |value| try output.writer.print("{f}", .{std.json.fmt(value, .{})}) else try output.writer.writeAll("null");
+    if (deployment) |value| {
+        const times = deploymentTimes(value);
+        try output.writer.print("{{\"current_generation\":{f},\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"drifted\":{s},\"requested_by\":{f},\"start_at\":{d},\"install_at\":{d},\"finished_at\":{d},\"successful_generation\":{d},\"deployed_at\":{d}}}", .{
+            std.json.fmt(value.currentGeneration(), .{}),
+            std.json.fmt(value.armed_generation, .{}),
+            std.json.fmt(value.consumed_generation, .{}),
+            std.json.fmt(value.terminal_generation, .{}),
+            value.requested_revision,
+            value.applied_revision,
+            context.config_revision,
+            if (value.applied_revision != 0 and value.applied_revision != context.config_revision) "true" else "false",
+            std.json.fmt(@tagName(value.requested_by), .{}),
+            times.start_at,
+            times.install_at,
+            times.finished_at,
+            value.deployed_generation,
+            value.deployed_at,
+        });
+    } else try output.writer.writeAll("null");
     try output.writer.writeAll(",\"inventory\":");
     if (inventory) |value| try output.writer.print("{f}", .{std.json.fmt(value, .{})}) else try output.writer.writeAll("null");
     try output.writer.writeAll("}}\n");
@@ -2138,6 +2203,35 @@ fn deploymentPhaseFallback(view: deployment_control.View) ?[]const u8 {
         return if (view.deployed_generation == consumed) "completed" else "failed";
     if (view.started_at != 0) return "install_started";
     return null;
+}
+
+const DeploymentTimes = struct { start_at: i64, install_at: i64, finished_at: i64 };
+
+/// 对外时间名称与内部状态字段的唯一映射。Start/Finished 是部署任务边界；
+/// Install 是 install.started 的阶段点。M5 添加 diskless 阶段时必须扩展并列
+/// 字段，不能改变这三个字段的既有含义。
+fn deploymentTimes(view: deployment_control.View) DeploymentTimes {
+    return .{ .start_at = view.requested_at, .install_at = view.started_at, .finished_at = view.finished_at };
+}
+
+test "deployment time projection maps task and install boundaries" {
+    const view: deployment_control.View = .{
+        .next_generation = 2,
+        .armed_generation = null,
+        .consumed_generation = 1,
+        .terminal_generation = 1,
+        .requested_revision = 42,
+        .applied_revision = 42,
+        .requested_at = 10,
+        .started_at = 20,
+        .finished_at = 30,
+        .deployed_at = 30,
+        .requested_by = .operator,
+    };
+    const times = deploymentTimes(view);
+    try std.testing.expectEqual(@as(i64, 10), times.start_at);
+    try std.testing.expectEqual(@as(i64, 20), times.install_at);
+    try std.testing.expectEqual(@as(i64, 30), times.finished_at);
 }
 
 test "management node fallback stays on the current generation" {
@@ -2243,7 +2337,7 @@ fn managementProfile(request: zap.Request, context: *const RouteContext, name: [
     const capability = lookup.findDistroVersion(context.config, profile.distro, profile.version, profile.arch) orelse return notFound(request, meta);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"capability\":{{\"family\":{f},\"install_adapter\":{f},\"package_manager\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}), std.json.fmt(@tagName(distro.family), .{}), std.json.fmt(@tagName(capability.install_adapter), .{}), std.json.fmt(@tagName(capability.package_manager), .{}) });
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"boot_bundle\":{f},\"kernel_args\":{f},\"safety\":{f},\"validation\":{{\"valid\":true}},\"capability\":{{\"family\":{f},\"install_adapter\":{f},\"package_manager\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.safety, .{}), std.json.fmt(@tagName(distro.family), .{}), std.json.fmt(@tagName(capability.install_adapter), .{}), std.json.fmt(@tagName(capability.package_manager), .{}) });
     try writeEffectiveSystem(&output.writer, profile);
     try output.writer.writeAll(",\"install_source\":");
     const catalog_snapshot = context.catalog_snapshot;
@@ -2290,7 +2384,7 @@ fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node
             value.requested_at,
             std.json.fmt(@tagName(value.requested_by), .{}),
         });
-        try output.writer.print(",\"deployment_started_at\":{d},\"deployment_finished_at\":{d},\"deployed_at\":{d}", .{ value.started_at, value.finished_at, value.deployed_at });
+        try output.writer.print(",\"deployment_start_at\":{d},\"deployment_install_at\":{d},\"deployment_finished_at\":{d},\"deployed_at\":{d}", .{ value.requested_at, value.started_at, value.finished_at, value.deployed_at });
     }
     try output.writer.writeAll("}}\n");
     try json(request, .ok, output.written(), meta);

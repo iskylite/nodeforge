@@ -356,7 +356,7 @@ fn transferVirtualConfig(
     const store = sessions orelse return error.BootAccessDenied;
     const identity = store.resolveTftpBoot(client_ip, boot_session.monotonicNow()) orelse return error.BootAccessDenied;
 
-    var cmdline_buf: [512]u8 = undefined;
+    var cmdline_buf: [1024]u8 = undefined;
     var config_buf: [2048]u8 = undefined;
     var kernel_grub: [256]u8 = undefined;
     var initrd_grub: [256]u8 = undefined;

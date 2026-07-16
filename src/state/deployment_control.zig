@@ -28,8 +28,11 @@ pub const Entry = struct {
     consumed_revision: u64 = 0,
     /// 安装器完成时报告为成功安装的 revision。
     applied_revision: u64 = 0,
+    /// 当前 generation 被武装的时间；CLI/API 将其显示为整个部署任务的 Start。
     requested_at: i64 = 0,
+    /// 安装器报告 `install.started`、generation 被消费的时间；CLI/API 显示为 Install。
     started_at: i64 = 0,
+    /// 当前 generation 首次进入 terminal 的时间；CLI/API 显示为 Finished。
     finished_at: i64 = 0,
     /// 最近一次成功部署所属 generation；与当前 armed/consumed generation 分离。
     deployed_generation: u64 = 0,
@@ -467,9 +470,90 @@ pub fn revisionForConfig(allocator: std.mem.Allocator, config: *const model.AppC
     defer json.deinit();
     try std.json.Stringify.value(config.*, .{}, &json.writer);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(json.written(), &digest, .{});
+    // M4.6 在 ProfileConfig 末尾新增 optional kernel_args。缺省与 null 语义
+    // 相同，不能仅因新二进制认识该字段就改变 config revision，否则滚动升级
+    // 会切断活动 session/status 的来源关联。非空 kernel_args 仍保留在 canonical
+    // 字节中，并按预期产生新的 revision。
+    hashConfigRevision(json.written(), &digest);
     const value = std.mem.readInt(u64, digest[0..8], .big);
     return if (value == 0) 1 else value;
+}
+
+fn hashConfigRevision(bytes: []const u8, digest: *[std.crypto.hash.sha2.Sha256.digest_length]u8) void {
+    const omitted_default = ",\"kernel_args\":null";
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var remaining = bytes;
+    while (std.mem.indexOf(u8, remaining, omitted_default)) |index| {
+        hash.update(remaining[0..index]);
+        remaining = remaining[index + omitted_default.len ..];
+    }
+    hash.update(remaining);
+    hash.final(digest);
+}
+
+test "M4.6 null kernel args preserve the pre-field config revision" {
+    const LegacyProfile = struct {
+        name: []const u8,
+        mode: model.ProfileMode,
+        distro: []const u8,
+        version: []const u8,
+        arch: model.Arch,
+        install_source: ?[]const u8 = null,
+        boot_bundle: ?[]const u8 = null,
+        safety: model.ProfileSafetyConfig = .{},
+        system: model.TargetSystemConfig = .{},
+        install: ?model.InstallConfig = null,
+    };
+    var profiles = [_]model.ProfileConfig{.{
+        .name = "rocky-install",
+        .mode = .install,
+        .distro = "rocky",
+        .version = "9.7",
+        .arch = .aarch64,
+        .install_source = "rocky-source",
+        .install = .{},
+    }};
+    var config: model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+        .profiles = &profiles,
+    };
+    const profile = config.profiles[0];
+    const legacy_profiles = [_]LegacyProfile{.{
+        .name = profile.name,
+        .mode = profile.mode,
+        .distro = profile.distro,
+        .version = profile.version,
+        .arch = profile.arch,
+        .install_source = profile.install_source,
+        .boot_bundle = profile.boot_bundle,
+        .safety = profile.safety,
+        .system = profile.system,
+        .install = profile.install,
+    }};
+    const legacy_config = .{
+        .schema_version = config.schema_version,
+        .server = config.server,
+        .http = config.http,
+        .tftp = config.tftp,
+        .dhcp = config.dhcp,
+        .capacity = config.capacity,
+        .logging = config.logging,
+        .events = config.events,
+        .distros = config.distros,
+        .profiles = &legacy_profiles,
+        .nodes = config.nodes,
+        .provisioning_bundles = config.provisioning_bundles,
+        .policy = config.policy,
+    };
+    const legacy_json = try std.json.Stringify.valueAlloc(std.testing.allocator, legacy_config, .{});
+    defer std.testing.allocator.free(legacy_json);
+    var legacy_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(legacy_json, &legacy_digest, .{});
+    const expected = std.mem.readInt(u64, legacy_digest[0..8], .big);
+    try std.testing.expectEqual(if (expected == 0) @as(u64, 1) else expected, try revisionForConfig(std.testing.allocator, &config));
+
+    profiles[0].kernel_args = "iommu=pt";
+    try std.testing.expect((try revisionForConfig(std.testing.allocator, &config)) != expected);
 }
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store) !void {
@@ -595,7 +679,7 @@ test "completion records applied revision without arming another install" {
 }
 
 test "retry resets current attempt timestamps but preserves last successful deployment" {
-    // rearm 清零当前尝试的 started/finished，但最近成功 deployed 必须保留，
+    // rearm 清零当前尝试的 install/finished，但最近成功 deployed 必须保留，
     // 直到新 generation 真正完成后再原子替换。
     var store: Store = .{};
     try store.ensureInitial("node-01", 1, 10);

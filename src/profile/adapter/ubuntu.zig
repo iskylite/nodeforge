@@ -43,7 +43,7 @@ const password_hash = @import("../password_hash.zig");
 
 /// M4.1 渲染器。原始 M4 入口点保留为兼容包装；
 /// 所有 daemon answer 下发均使用此 common-system 变体。
-pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8) ![]u8 {
+pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -173,6 +173,14 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"installer_started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.writeAll("  late-commands:\n");
+    if (kernel_args) |args| {
+        const grub_command = try std.fmt.allocPrint(allocator, "mkdir -p /target/etc/default/grub.d && printf '%s\\n' 'GRUB_CMDLINE_LINUX=\"${{GRUB_CMDLINE_LINUX}} {s}\"' > /target/etc/default/grub.d/99-nodeforge.cfg && chmod 0644 /target/etc/default/grub.d/99-nodeforge.cfg", .{args});
+        defer allocator.free(grub_command);
+        try w.writeAll("    - ");
+        try render.yamlQuote(w, grub_command);
+        try w.writeByte('\n');
+        try w.writeAll("    - 'curtin in-target --target=/target -- update-grub'\n");
+    }
     if (system.ssh.enabled) {
         const root_login = @tagName(system.ssh.root_login);
         const sshd = try std.fmt.allocPrint(allocator, "printf '%s\\n' 'PermitRootLogin {s}' 'PasswordAuthentication {s}' > /target/etc/ssh/sshd_config.d/60-nodeforge.conf", .{ root_login, if (system.ssh.password_authentication) "yes" else "no" });
@@ -548,7 +556,7 @@ test "apt fallback is rendered from the install profile" {
 test "M4.1 autoinstall renders target defaults and static network" {
     const node: model.NodeConfig = .{ .id = "node-04", .mac = "00:11:22:33:44:99", .arch = .aarch64, .profile = "ubuntu", .ip = "192.168.50.27", .overrides = .{ .network = .{ .mode = .static, .interface = "ens160", .address = "192.168.50.27", .prefix_len = 24, .gateway = "192.168.50.1", .dns = &.{"192.168.50.1"}, .search_domains = &.{"nodeforge.local"} } } };
     const system: model.TargetSystemConfig = .{ .localization = .{ .locale = "zh_CN.UTF-8", .timezone = "Asia/Shanghai", .keyboard = "us" }, .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} }, .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }} };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/artifacts/repositories/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1");
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/artifacts/repositories/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
     // report_url="" 表示未配置 subiquity-report 端点（不渲染 reporting 块）
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "locale: 'zh_CN.UTF-8'") != null);
@@ -570,12 +578,13 @@ test "M4.1 autoinstall renders target defaults and static network" {
     // curl 回调中仍含 Authorization: Bearer header（降级路径）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "Authorization: Bearer token") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "archive.ubuntu.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "99-nodeforge.cfg") == null);
 }
 
 test "M4.2 webhook reporting rendered when report_url is non-empty" {
     // 非空 report_url 渲染 reporting 块（webhook reporter 在 22.04 和 24.04 均可用）
     const node: model.NodeConfig = .{ .id = "node-rpt", .mac = "00:11:22:33:44:aa", .arch = .aarch64, .profile = "ubuntu", .hostname = "noderpt" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "http://192.168.50.1:8080/report", "0123456789abcdef0123456789abcdef", "token", "scope");
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "http://192.168.50.1:8080/report", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     // reporting 块应渲染，type 必须是 webhook（不是 http）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "reporting:") != null);
@@ -591,7 +600,7 @@ test "M4.2 webhook reporting rendered when report_url is non-empty" {
 test "M4.2 hostname always rendered even without users" {
     // 显式空 users 保留 root-only；目标 hostname 必须位于 autoinstall.user-data。
     const node: model.NodeConfig = .{ .id = "node-nh", .mac = "00:11:22:33:44:bb", .arch = .aarch64, .profile = "ubuntu", .hostname = "myhost" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{ .users = &.{} }, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope");
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{ .users = &.{} }, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "  user-data:\n    hostname: 'myhost'\n    preserve_hostname: false\n    disable_root: false") != null);
     // identity 不应出现（无 users）
@@ -600,11 +609,21 @@ test "M4.2 hostname always rendered even without users" {
 
 test "M4.2 autoinstall renders default nodeforge identity" {
     const node: model.NodeConfig = .{ .id = "node-default", .mac = "00:11:22:33:44:bc", .arch = .aarch64, .profile = "ubuntu", .hostname = "ubuntu-default" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope");
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "identity:\n    hostname: 'ubuntu-default'\n    username: 'nodeforge'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "name: 'nodeforge'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "groups: [sudo]") != null);
+}
+
+test "M4.6 autoinstall persists literal kernel args in GRUB drop-in" {
+    const node: model.NodeConfig = .{ .id = "node-kargs", .mac = "00:11:22:33:44:bd", .arch = .aarch64, .profile = "ubuntu" };
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", "iommu=pt hugepages=4");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/default/grub.d/99-nodeforge.cfg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "GRUB_CMDLINE_LINUX=\"${GRUB_CMDLINE_LINUX} iommu=pt hugepages=4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "chmod 0644") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "curtin in-target --target=/target -- update-grub") != null);
 }
 
 test "late command keeps managed files single-line and fail-fast" {

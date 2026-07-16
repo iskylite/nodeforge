@@ -24,7 +24,7 @@ const runner = @import("../../provision/runner.zig");
 const password_hash = @import("../password_hash.zig");
 
 /// M4.1 Kickstart 渲染器，从共享的 TargetSystemConfig 生成。
-pub fn renderAnswerM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, repo_url: []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8) ![]u8 {
+pub fn renderAnswerM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, repo_url: []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -80,7 +80,12 @@ pub fn renderAnswerM41(allocator: std.mem.Allocator, node: *const model.NodeConf
         };
         try w.print("part {s} --fstype={s} --size={d}\n", .{ mount, fs, part.size_mib });
     }
-    if (install.bootloader.install) try w.print("bootloader --boot-drive={s}\n", .{install.storage.boot_disk[5..]});
+    if (install.bootloader.install) {
+        if (kernel_args) |args|
+            try w.print("bootloader --boot-drive={s} --append=\"{s}\"\n", .{ install.storage.boot_disk[5..], args })
+        else
+            try w.print("bootloader --boot-drive={s}\n", .{install.storage.boot_disk[5..]});
+    }
     if (system.ssh.root_password) |plain| {
         const salt = password_hash.sessionSalt(password_scope, "root");
         const hash = try password_hash.sha512Crypt(allocator, plain, &salt);
@@ -271,7 +276,7 @@ test "kickstart renders UEFI defaults and installer event hook" {
 
 test "M4.1 kickstart renders root crypt and security defaults" {
     const node: model.NodeConfig = .{ .id = "node-02", .mac = "00:11:22:33:44:66", .arch = .aarch64, .profile = "rocky" };
-    const bytes = try renderAnswerM41(std.testing.allocator, &node, .{}, .{ .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }}, .packages = &.{"vim"} }, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1");
+    const bytes = try renderAnswerM41(std.testing.allocator, &node, .{}, .{ .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }}, .packages = &.{"vim"} }, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "rootpw --iscrypted $6$") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "user --name=admin --password=$6$") != null);
@@ -280,6 +285,7 @@ test "M4.1 kickstart renders root crypt and security defaults" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "selinux --disabled") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "systemctl mask firewalld") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "bootloader --location=none") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "--append=") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "%pre") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "http://facts") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "product_serial") != null);
@@ -289,15 +295,22 @@ test "M4.1 kickstart renders root crypt and security defaults" {
 
 test "M4.2 kickstart renders default nodeforge account" {
     const node: model.NodeConfig = .{ .id = "node-default", .mac = "00:11:22:33:44:67", .arch = .x86_64, .profile = "rocky" };
-    const bytes = try renderAnswerM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope");
+    const bytes = try renderAnswerM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "user --name=nodeforge --password=$6$") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--groups=wheel") != null);
 }
 
+test "M4.6 kickstart persists kernel args with bootloader append" {
+    const node: model.NodeConfig = .{ .id = "node-kargs", .mac = "00:11:22:33:44:68", .arch = .aarch64, .profile = "rocky" };
+    const bytes = try renderAnswerM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope", "iommu=pt hugepages=4");
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "bootloader --boot-drive=sda --append=\"iommu=pt hugepages=4\"") != null);
+}
+
 test "M4.1 kickstart static target network uses Anaconda netmask syntax" {
     const node: model.NodeConfig = .{ .id = "node-03", .mac = "00:11:22:33:44:77", .arch = .aarch64, .profile = "rocky", .overrides = .{ .network = .{ .mode = .static, .interface = "ens192", .match_mac = "00:11:22:33:44:77", .address = "192.168.50.20", .prefix_len = 24, .search_domains = &.{"nodeforge.local"} } } };
-    const bytes = try renderAnswerM41(std.testing.allocator, &node, .{}, .{ .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} } }, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1");
+    const bytes = try renderAnswerM41(std.testing.allocator, &node, .{}, .{ .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} } }, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--netmask=255.255.255.0") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--prefix=") == null);

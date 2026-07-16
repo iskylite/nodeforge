@@ -23,6 +23,7 @@ const model = @import("../model.zig");
 const lookup = @import("../catalog.zig");
 const grub = @import("grub.zig");
 const boot_session = @import("../state/boot_session.zig");
+const log = std.log.scoped(.boot_target);
 
 /// 从 boot_session 模块再导出 TFTP boot 身份类型，确保 TFTP handler 和
 /// boot target resolver 共享同一个类型定义，避免出现影子类型。
@@ -143,11 +144,15 @@ fn resolveInstall(
         // 默认 URL，NoCloud-Net 仍是唯一的 M4 answer source。
         const source_asset = lookup.findAsset(catalog, source.source_asset) orelse return null;
         if (source_asset.kind != .iso) return null;
-        break :blk std.fmt.bufPrint(
+        const base = std.fmt.bufPrint(
             cmdline_buf,
             "boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=dhcp url=http://{s}:{d}/artifacts/images/{s}.iso cloud-config-url=/dev/null autoinstall ds=nocloud-net\\;s=http://{s}:{d}/api/v1/nodes/{s}/install-config/nocloud/",
             .{ config.server.server_ip, config.server.http_port, source.source_asset, server_ip, http_port, identity.node_id },
         ) catch return null;
+        break :blk appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
+            log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.node_id, profile.kernel_args.?.len });
+            return null;
+        };
     } else blk: {
         // RHEL 系（Rocky/CentOS）安装 cmdline。
         // - ip=dhcp：通过 DHCP 获取网络配置
@@ -160,7 +165,11 @@ fn resolveInstall(
         // and follow the treeinfo repository pointer itself.
         var install_root_buf: [256]u8 = undefined;
         const install_root = std.fmt.bufPrint(&install_root_buf, "http://{s}:{d}/artifacts/repositories/{s}", .{ server_ip, http_port, source.name }) catch return null;
-        break :blk std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s} inst.ks=http://{s}:{d}/api/v1/nodes/{s}/install-config/kickstart", .{ install_root, server_ip, http_port, identity.node_id }) catch return null;
+        const base = std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s} inst.ks=http://{s}:{d}/api/v1/nodes/{s}/install-config/kickstart", .{ install_root, server_ip, http_port, identity.node_id }) catch return null;
+        break :blk appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
+            log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.node_id, profile.kernel_args.?.len });
+            return null;
+        };
     };
 
     return .{
@@ -201,11 +210,15 @@ fn resolveDiskless(
 
     // cmdline 包含 nodeforge.config URL，节点 initrd 通过该 URL 拉取 BootConfig。
     // BootConfig 包含 rootfs 下载地址、capability token 和事件上报 URL。
-    const cmdline = std.fmt.bufPrint(cmdline_buf, "ip=dhcp nodeforge.config=http://{s}:{d}/api/v1/nodes/{s}/boot-config", .{
+    const base = std.fmt.bufPrint(cmdline_buf, "ip=dhcp nodeforge.config=http://{s}:{d}/api/v1/nodes/{s}/boot-config", .{
         server_ip,
         http_port,
         identity.node_id,
     }) catch return null;
+    const cmdline = appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
+        log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.node_id, profile.kernel_args.?.len });
+        return null;
+    };
 
     return .{
         .kernel_path = kernel_path,
@@ -213,6 +226,15 @@ fn resolveDiskless(
         .cmdline = cmdline,
         .arch = profile.arch,
     };
+}
+
+fn appendKernelArgs(buf: []u8, base: []const u8, kernel_args: ?[]const u8) ?[]const u8 {
+    const extra = kernel_args orelse return base;
+    if (extra.len == 0) return base;
+    if (base.len + 1 + extra.len > buf.len) return null;
+    buf[base.len] = ' ';
+    @memcpy(buf[base.len + 1 ..][0..extra.len], extra);
+    return buf[0 .. base.len + 1 + extra.len];
 }
 
 /// 将 catalog asset path 转为 GRUB 路径（以 `/` 开头的相对路径）。
@@ -247,6 +269,7 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
             .version = "9.7",
             .arch = .aarch64,
             .install_source = "rocky-9.7-iso",
+            .kernel_args = "iommu=pt hugepages=4",
         }},
     };
     const catalog: model.Catalog = .{
@@ -281,7 +304,7 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
         .mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xef },
         .lease_ip = 0xc0a81bc8,
     };
-    var cmdline_buf: [512]u8 = undefined;
+    var cmdline_buf: [1024]u8 = undefined;
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     try std.testing.expectEqualStrings("install/rocky/vmlinuz", target.kernel_path);
     try std.testing.expectEqualStrings("install/rocky/initrd.img", target.initrd_path);
@@ -290,6 +313,7 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
     // M4 appends the authenticated node-specific Kickstart endpoint.
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.ks=http://") != null);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "install-config/kickstart") != null);
+    try std.testing.expect(std.mem.endsWith(u8, target.cmdline, " iommu=pt hugepages=4"));
 }
 
 test "resolve diskless target returns config url cmdline" {
@@ -303,6 +327,7 @@ test "resolve diskless target returns config url cmdline" {
             .version = "22.04",
             .arch = .aarch64,
             .boot_bundle = "ubuntu-bundle",
+            .kernel_args = "iommu=pt",
         }},
     };
     const catalog: model.Catalog = .{
@@ -329,11 +354,12 @@ test "resolve diskless target returns config url cmdline" {
         .mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xf0 },
         .lease_ip = 0xc0a81bc9,
     };
-    var cmdline_buf: [512]u8 = undefined;
+    var cmdline_buf: [1024]u8 = undefined;
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     try std.testing.expectEqualStrings("boot/vmlinuz", target.kernel_path);
     try std.testing.expectEqualStrings("boot/initrd.img", target.initrd_path);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "nodeforge.config=http://192.168.27.128:18080/api/v1/nodes/node-02/boot-config") != null);
+    try std.testing.expect(std.mem.endsWith(u8, target.cmdline, " iommu=pt"));
 }
 
 // M3.6 关键测试：验证 Ubuntu install 使用 `url=`（casper ISO 下载）而非
@@ -343,7 +369,7 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.27.128", .http_port = 18080 },
         .distros = &.{.{ .name = "ubuntu", .family = .ubuntu, .versions = &.{.{ .version = "22.04", .archs = &.{.aarch64}, .install_adapter = .autoinstall, .package_manager = .apt }} }},
-        .profiles = &.{.{ .name = "ubuntu-install", .mode = .install, .distro = "ubuntu", .version = "22.04", .arch = .aarch64, .install_source = "ubuntu-22.04-aarch64-iso" }},
+        .profiles = &.{.{ .name = "ubuntu-install", .mode = .install, .distro = "ubuntu", .version = "22.04", .arch = .aarch64, .install_source = "ubuntu-22.04-aarch64-iso", .kernel_args = "iommu=pt" }},
     };
     const catalog: model.Catalog = .{
         .assets = &.{
@@ -354,7 +380,7 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
         .install_sources = &.{.{ .name = "ubuntu-22.04-aarch64-iso", .distro = "ubuntu", .version = "22.04", .arch = .aarch64, .source_asset = "ubuntu-iso", .installer_kernel = "ubuntu-kernel", .installer_initrd = "ubuntu-initrd" }},
     };
     const identity: TftpBootIdentity = .{ .boot_session_id = "0123456789abcdef0123456789abcdef".*, .node_id = "node-ubuntu", .profile = "ubuntu-install", .mode = .install, .mac = .{ 2, 170, 187, 204, 221, 1 }, .lease_ip = 0xc0a81bc8 };
-    var cmdline_buf: [512]u8 = undefined;
+    var cmdline_buf: [1024]u8 = undefined;
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     // 必须包含 url= 参数指向已发布的 ISO HTTP URL。
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "url=http://192.168.27.128:18080/artifacts/images/ubuntu-iso.iso") != null);
@@ -365,6 +391,7 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "cloud-config-url=/dev/null") != null);
     // 绝不能包含 inst.repo=，那是 Anaconda/RHEL 专用参数。
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.repo=") == null);
+    try std.testing.expect(std.mem.endsWith(u8, target.cmdline, " iommu=pt"));
 }
 
 test "resolve discovery returns null" {
@@ -400,4 +427,19 @@ test "rejects path with backslash" {
 // 路径安全校验测试：拒绝空路径。
 test "rejects empty path" {
     try std.testing.expect(toGrubPath("") == null);
+}
+
+test "M4.6 append kernel args handles maximum and overflow" {
+    var extra: [256]u8 = undefined;
+    @memset(&extra, 'x');
+    var enough: [262]u8 = undefined;
+    const base = try std.fmt.bufPrint(&enough, "base", .{});
+    try std.testing.expectEqualStrings("base", appendKernelArgs(&enough, base, null).?);
+    const combined = appendKernelArgs(&enough, base, &extra).?;
+    try std.testing.expectEqual(@as(usize, 261), combined.len);
+    try std.testing.expect(std.mem.startsWith(u8, combined, "base "));
+
+    var short: [260]u8 = undefined;
+    const short_base = try std.fmt.bufPrint(&short, "base", .{});
+    try std.testing.expect(appendKernelArgs(&short, short_base, &extra) == null);
 }

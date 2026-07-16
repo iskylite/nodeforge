@@ -41,6 +41,8 @@ pub const config_store = @import("config/store.zig");
 pub const config_validate = @import("config/validate.zig");
 /// M4.2 节点资源增删改：load-modify-validate-save 原子写回 config.json。
 pub const node_mutation = @import("config/node_mutation.zig");
+/// M4.6 profile kernel_args 的受限 load-modify-validate-save 写入器。
+pub const profile_mutation = @import("config/profile_mutation.zig");
 /// 启动前预检：检查端口可用性、目录权限和必需的系统 capability。
 pub const preflight = @import("preflight.zig");
 /// 进程内运行时状态：DHCP lease 表、TFTP 传输计数器和 catalog 运行时快照。
@@ -134,6 +136,7 @@ test {
     _ = config_store;
     _ = config_validate;
     _ = node_mutation;
+    _ = profile_mutation;
     _ = preflight;
     _ = runtime_state;
     _ = capacity;

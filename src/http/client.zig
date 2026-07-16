@@ -207,6 +207,21 @@ pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) 
     return managementMutation(io, port, "DELETE", value, "", revision, reason_buf);
 }
 
+/// M4.6 只允许修改 profile 的 `kernel_args` 字段。通用 profile CRUD 留给
+/// M4.7 catalog transaction；这里仍使用 config ETag 防止覆盖并发修改。
+pub fn profileSetKernelArgs(io: std.Io, port: u16, name: []const u8, kernel_args: ?[]const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
+    var path: [256]u8 = undefined;
+    const value = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}", .{name}) catch return .{ .reachable = false, .healthy = false };
+    var body: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&body);
+    writer.writeAll("{\"kernel_args\":") catch return .{ .reachable = true, .healthy = false };
+    std.json.Stringify.value(kernel_args, .{}, &writer) catch return .{ .reachable = true, .healthy = false };
+    writer.writeByte('}') catch return .{ .reachable = true, .healthy = false };
+    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    return managementMutation(io, port, "PATCH", value, writer.buffered(), revision, reason_buf);
+}
+
 pub fn configSet(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutation {
     const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
     return managementMutation(io, port, "PATCH", "/api/v1/management/config", body, revision, reason_buf);

@@ -80,6 +80,8 @@ pub const ValidationError = error{
     InvalidReinstallPolicy,
     InvalidTftpConcurrency,
     InvalidTftpBlksize,
+    InvalidKernelArgs,
+    KernelArgsRequiresBootloader,
 };
 
 /// 完整校验启动配置和 catalog 的引用关系。
@@ -129,6 +131,65 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     try uniqueNamed(model.DistroConfig, config.distros);
     try uniqueNamed(model.ProfileConfig, config.profiles);
     try validateDistros(config);
+    for (config.profiles) |profile| try validateKernelArgs(config, profile);
+}
+
+fn validateKernelArgs(config: *const model.AppConfig, profile: model.ProfileConfig) ValidationError!void {
+    const value = profile.kernel_args orelse return;
+    if (value.len == 0) return;
+    if (profile.mode == .discovery) return error.InvalidKernelArgs;
+    const family: ?model.DistroFamily = if (lookup.findDistro(config, profile.distro)) |distro| distro.family else null;
+    if (!validKernelArgs(value, profile.mode, family)) return error.InvalidKernelArgs;
+    if (profile.mode == .install) {
+        const install = profile.install orelse return error.KernelArgsRequiresBootloader;
+        if (!install.bootloader.install) return error.KernelArgsRequiresBootloader;
+    }
+}
+
+/// 校验已经 canonicalize 的 M4.6 token 列表。保留名只与第一个 `=` 前的
+/// 参数名精确比较，绝不做子串匹配。
+pub fn validKernelArgs(value: []const u8, mode: model.ProfileMode, family: ?model.DistroFamily) bool {
+    if (value.len == 0 or value.len > 256) return false;
+    for (value) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or byte == '=' or byte == '.' or byte == '-' or
+            byte == '_' or byte == ',' or byte == ':' or byte == ' ')) return false;
+    }
+
+    var tokens = std.mem.tokenizeScalar(u8, value, ' ');
+    var token_count: usize = 0;
+    while (tokens.next()) |token| {
+        token_count += 1;
+        const name = kernelArgName(token);
+        if (name.len == 0 or name[0] == '-' or reservedKernelArg(name, mode, family)) return false;
+
+        var previous = std.mem.tokenizeScalar(u8, value, ' ');
+        var previous_count: usize = 0;
+        while (previous.next()) |candidate| {
+            if (previous_count == token_count - 1) break;
+            if (std.mem.eql(u8, kernelArgName(candidate), name)) return false;
+            previous_count += 1;
+        }
+    }
+    return token_count != 0;
+}
+
+fn kernelArgName(token: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, token, '=') orelse token.len;
+    return token[0..end];
+}
+
+fn reservedKernelArg(name: []const u8, mode: model.ProfileMode, family: ?model.DistroFamily) bool {
+    const common = [_][]const u8{ "ip", "root", "initrd", "BOOT_IMAGE", "nodeforge.config", "boot_session_id", "token", "capability" };
+    for (common) |reserved| if (std.mem.eql(u8, name, reserved)) return true;
+    if (mode != .install) return false;
+    if (family == .rhel) {
+        const rhel = [_][]const u8{ "rd.neednet", "inst.ks", "inst.repo", "inst.stage2" };
+        for (rhel) |reserved| if (std.mem.eql(u8, name, reserved)) return true;
+    } else if (family == .ubuntu) {
+        const ubuntu = [_][]const u8{ "boot", "url", "cloud-config-url", "autoinstall", "ds", "ramdisk_size" };
+        for (ubuntu) |reserved| if (std.mem.eql(u8, name, reserved)) return true;
+    }
+    return false;
 }
 
 fn validateObservability(config: *const model.AppConfig) ValidationError!void {
@@ -673,6 +734,46 @@ test "M4.8 explicit state capacity must fit the compiled safety ceiling" {
     try std.testing.expectError(error.InvalidManagedCapacity, validateConfig(&config));
     config.capacity.managed_entries = 1024;
     try validateConfig(&config);
+}
+
+test "M4.6 kernel args accept hardware parameters and reject injection" {
+    try std.testing.expect(validKernelArgs("iommu=pt hugepagesz=1G hugepages=4", .install, .rhel));
+    try std.testing.expect(validKernelArgs("vfio-pci.ids=10de:1b06,8086:1a16 isolcpus=0,2,4-7", .diskless, .ubuntu));
+    try std.testing.expect(!validKernelArgs("iommu=pt;reboot", .install, .rhel));
+    try std.testing.expect(!validKernelArgs("foo='bar'", .install, .rhel));
+    try std.testing.expect(!validKernelArgs("foo=$bar", .install, .rhel));
+    try std.testing.expect(!validKernelArgs("-debug", .diskless, .ubuntu));
+    try std.testing.expect(!validKernelArgs("iommu=pt iommu=strict", .install, .rhel));
+}
+
+test "M4.6 reserved kernel args use exact mode-aware token names" {
+    try std.testing.expect(!validKernelArgs("inst.ks=http", .install, .rhel));
+    try std.testing.expect(!validKernelArgs("url=http", .install, .ubuntu));
+    try std.testing.expect(!validKernelArgs("nodeforge.config=x", .diskless, .ubuntu));
+    try std.testing.expect(validKernelArgs("foo.inst.ks=1", .install, .rhel));
+    try std.testing.expect(validKernelArgs("url=http", .diskless, .ubuntu));
+}
+
+test "M4.6 kernel args length boundary is 256 bytes" {
+    var accepted: [256]u8 = undefined;
+    @memset(&accepted, 'a');
+    accepted[1] = '=';
+    try std.testing.expect(validKernelArgs(&accepted, .diskless, .ubuntu));
+    var rejected: [257]u8 = undefined;
+    @memset(&rejected, 'a');
+    rejected[1] = '=';
+    try std.testing.expect(!validKernelArgs(&rejected, .diskless, .ubuntu));
+}
+
+test "M4.6 discovery rejects kernel args and install requires bootloader" {
+    var config: model.AppConfig = .{
+        .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" },
+        .distros = &.{.{ .name = "rocky", .family = .rhel, .versions = &.{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }} }},
+        .profiles = &.{.{ .name = "discovery", .mode = .discovery, .distro = "rocky", .version = "9.7", .arch = .aarch64, .kernel_args = "iommu=pt" }},
+    };
+    try std.testing.expectError(error.InvalidKernelArgs, validateConfig(&config));
+    config.profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .install_source = "rocky", .install = .{ .bootloader = .{ .install = false } }, .kernel_args = "iommu=pt" }};
+    try std.testing.expectError(error.KernelArgsRequiresBootloader, validateConfig(&config));
 }
 
 test "拒绝格式错误的 SHA256" {

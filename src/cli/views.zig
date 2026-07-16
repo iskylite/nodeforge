@@ -13,7 +13,7 @@ const model = @import("../model.zig");
 pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const u8 };
 pub const TftpSessionRow = struct { id: []const u8, phase: []const u8, filename: []const u8 };
 pub const DhcpLeaseRow = struct { ip: []const u8, mac: []const u8, phase: []const u8, expires_at: []const u8 };
-pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8, status: []const u8, started_at: []const u8, finished_at: []const u8, serial_number: []const u8 };
+pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8, status: []const u8, start_at: []const u8, install_at: []const u8, finished_at: []const u8, serial_number: []const u8 };
 pub const ProfileRow = struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: []const u8, nodes: []const u8, valid: []const u8 };
 pub const EventRow = struct { ts: []const u8, event_type: []const u8, node: []const u8, message: []const u8, fields: []const u8 };
 pub const EventTypeRow = struct { name: []const u8, description: []const u8, level: []const u8 };
@@ -71,14 +71,14 @@ pub fn dhcpLeases(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_on
 }
 
 pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
-    // 节点列表展示部署开始/结束时间窗口（STARTED/FINISHED）；成功的
-    // deployed 时间与 finished 重合，作为详情留给 `node show`，列表不再单独列出。
-    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "started_at", .title = "STARTED" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
-    var cells: [256][8][]const u8 = undefined;
+    // Start/Install/Finished 分别映射任务武装、实际安装阶段开始和任务终态，
+    // 避免把内部 requested_at/started_at 字段名误当成用户语义。
+    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "start_at", .title = "START" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
+    var cells: [256][9][]const u8 = undefined;
     var table_rows: [256]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
     for (rows, 0..) |row, i| {
-        cells[i] = .{ row.id, row.mac, row.ip, row.profile, row.status, row.started_at, row.finished_at, row.serial_number };
+        cells[i] = .{ row.id, row.mac, row.ip, row.profile, row.status, row.start_at, row.install_at, row.finished_at, row.serial_number };
         table_rows[i] = .{ .cells = &cells[i] };
     }
     try table.render(writer, &columns, table_rows[0..rows.len], "No nodes registered.", .{});
@@ -145,6 +145,30 @@ pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
     try detailField(writer, "Hostname", node.hostname orelse "-");
     try detailField(writer, "Deploy", if (node.deploy) "true" else "false");
     try detailField(writer, "HTTP accel", if (node.http_accel) "true" else "false");
+    if (node.overrides.network) |network| {
+        try writer.writeAll("  Network override\n");
+        try detailField(writer, "Mode", @tagName(network.mode));
+        try detailField(writer, "Interface", network.interface orelse "-");
+        try detailField(writer, "Match MAC", network.match_mac orelse "-");
+        try detailField(writer, "Address", network.address orelse "-");
+        if (network.prefix_len) |prefix| {
+            try writeLabel(writer, "Prefix length");
+            try writer.print("{d}\n", .{prefix});
+        } else try detailField(writer, "Prefix length", "-");
+        try detailField(writer, "Gateway", network.gateway orelse "-");
+        try writeStringList(writer, "DNS", network.dns);
+        try writeStringList(writer, "Search domains", network.search_domains);
+    } else try detailField(writer, "Network override", "-");
+}
+
+fn writeStringList(writer: *std.Io.Writer, label: []const u8, values: []const []const u8) !void {
+    try writeLabel(writer, label);
+    if (values.len == 0) return writer.writeAll("-\n");
+    for (values, 0..) |value, index| {
+        if (index != 0) try writer.writeAll(", ");
+        try table.writeEscaped(writer, value);
+    }
+    try writer.writeByte('\n');
 }
 
 /// check 失败时仍使用人类可读的状态块；它与 `status` 共享字段对齐而不改变退出码。
@@ -230,15 +254,16 @@ test "formatTimestamp renders local 24-hour visualization time" {
     try std.testing.expectEqualStrings("-", formatTimestamp(&buffer, -1));
 }
 
-test "node list table shows deployment start and end columns" {
-    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "started_at", .title = "STARTED" }, .{ .key = "finished_at", .title = "FINISHED" } };
-    const cells = [_][]const u8{ "node-01", "2026-07-11 16:30:00", "2026-07-11 16:45:00" };
+test "node list table shows task start install and finish columns" {
+    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "start_at", .title = "START" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" } };
+    const cells = [_][]const u8{ "node-01", "2026-07-11 16:29:00", "2026-07-11 16:30:00", "2026-07-11 16:45:00" };
     const rows = [_]table.Row{.{ .cells = &cells }};
     var buffer: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try table.render(&writer, &columns, &rows, "empty", .{});
     const out = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "STARTED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "START") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "INSTALL") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FINISHED") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "2026-07-11 16:30:00") != null);
 }

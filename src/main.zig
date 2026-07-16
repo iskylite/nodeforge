@@ -248,7 +248,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_render, node_retry, node_trace });
 
-    const profile = try zli.Command.init(init_options, .{ .name = "profile", .description = "Inspect PXE profiles" }, showCurrentHelp);
+    const profile = try zli.Command.init(init_options, .{ .name = "profile", .description = "Inspect PXE profiles and manage kernel arguments" }, showCurrentHelp);
     const profile_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List PXE profiles" }, profileListHandler);
     try addConfigPathFlag(profile_list);
     try addOutputFlag(profile_list);
@@ -258,7 +258,19 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_show);
     try addOutputFlag(profile_show);
     try addDebugFlag(profile_show);
-    try profile.addCommands(&.{ profile_list, profile_show });
+    const profile_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Set profile kernel arguments" }, profileSetHandler);
+    try profile_set.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
+    try profile_set.addPositionalArg(.{ .name = "property", .description = "kernel_args=<space-separated arguments>", .required = true });
+    try addConfigPathFlag(profile_set);
+    try addOutputFlag(profile_set);
+    try addDebugFlag(profile_set);
+    const profile_unset = try zli.Command.init(init_options, .{ .name = "unset", .description = "Clear profile kernel arguments" }, profileUnsetHandler);
+    try profile_unset.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
+    try profile_unset.addPositionalArg(.{ .name = "property", .description = "Must be kernel_args", .required = true });
+    try addConfigPathFlag(profile_unset);
+    try addOutputFlag(profile_unset);
+    try addDebugFlag(profile_unset);
+    try profile.addCommands(&.{ profile_list, profile_show, profile_set, profile_unset });
 
     // ── assets 资源（ISO/资产导入管理）──────────────────────────────────
     const assets = try zli.Command.init(init_options, .{
@@ -1180,7 +1192,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     var cursor_buf: [256]u8 = undefined;
     var cursor: ?[]const u8 = null;
     var truncated = false;
-    const NodeItem = struct { id: []const u8, mac: []const u8, ip: ?[]const u8, profile: []const u8, status: ?[]const u8, started_at: ?i64, finished_at: ?i64, serial_number: ?[]const u8 };
+    const NodeItem = struct { id: []const u8, mac: []const u8, ip: ?[]const u8, profile: []const u8, status: ?[]const u8, start_at: ?i64, install_at: ?i64, finished_at: ?i64, serial_number: ?[]const u8 };
     const Response = struct { ok: bool, result: struct { items: []const NodeItem, next_cursor: ?[]const u8 } };
     while (true) {
         const parsed = std.json.parseFromSlice(Response, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
@@ -1193,7 +1205,8 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
                 truncated = true;
                 break;
             }
-            var started_buf: [20]u8 = undefined;
+            var start_buf: [20]u8 = undefined;
+            var install_buf: [20]u8 = undefined;
             var finished_buf: [20]u8 = undefined;
             try rows.append(a, .{
                 .id = try a.dupe(u8, item.id),
@@ -1201,7 +1214,8 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
                 .ip = try a.dupe(u8, item.ip orelse "-"),
                 .profile = try a.dupe(u8, item.profile),
                 .status = try a.dupe(u8, item.status orelse "-"),
-                .started_at = try a.dupe(u8, views.formatTimestamp(&started_buf, item.started_at orelse 0)),
+                .start_at = try a.dupe(u8, views.formatTimestamp(&start_buf, item.start_at orelse 0)),
+                .install_at = try a.dupe(u8, views.formatTimestamp(&install_buf, item.install_at orelse 0)),
                 .finished_at = try a.dupe(u8, views.formatTimestamp(&finished_buf, item.finished_at orelse 0)),
                 .serial_number = try a.dupe(u8, item.serial_number orelse "-"),
             });
@@ -1312,6 +1326,10 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
             distro: []const u8,
             version: []const u8,
             arch: []const u8,
+            boot_bundle: ?[]const u8,
+            kernel_args: ?[]const u8,
+            safety: model.ProfileSafetyConfig,
+            validation: struct { valid: bool },
             capability: struct { family: []const u8, install_adapter: []const u8, package_manager: []const u8 },
             effective_system: struct {
                 localization: struct { locale: []const u8, timezone: []const u8, keyboard: []const u8 },
@@ -1334,7 +1352,8 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     defer parsed.deinit();
     const result = parsed.value.result;
     try ctx.writer.print("Profile {s}\n", .{result.name});
-    try ctx.writer.print("  Mode          {s}\n  Platform      {s} {s} ({s})\n  Family        {s}\n  Adapter       {s}\n  Packages      {s}\n", .{ result.mode, result.distro, result.version, result.arch, result.capability.family, result.capability.install_adapter, result.capability.package_manager });
+    try ctx.writer.print("  Mode          {s}\n  Platform      {s} {s} ({s})\n  Family        {s}\n  Adapter       {s}\n  Packages      {s}\n  Boot bundle   {s}\n  Kernel args   {s}\n  Valid         {s}\n", .{ result.mode, result.distro, result.version, result.arch, result.capability.family, result.capability.install_adapter, result.capability.package_manager, result.boot_bundle orelse "-", result.kernel_args orelse "-", if (result.validation.valid) "yes" else "no" });
+    try ctx.writer.print("\nSafety\n  Unknown safe  {s}\n  Destructive   {s}\n  Persistent    {s}\n  Reinstall     {s}\n", .{ if (result.safety.safe_for_unknown) "yes" else "no", if (result.safety.destructive) "yes" else "no", if (result.safety.persistent_writes) "yes" else "no", @tagName(result.safety.reinstall_policy) });
     try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Firewall      {s}\n  SELinux       {s}\n  Users         {d}\n  Packages      {d}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, result.effective_system.connectivity.mode, if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.security.firewall, result.effective_system.security.selinux, result.effective_system.users.len, result.effective_system.packages.len });
     if (result.install_source) |source| {
         try ctx.writer.print("\nInstall source\n  Name          {s}\n  Label         {s}\n  Media tree    {s}\n  Repositories  {d}\n", .{ source.name, source.source_label, source.media_tree_url orelse "-", source.repositories.len });
@@ -1347,6 +1366,46 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
         for (result.nodes) |node| try ctx.writer.print("  {s}\n", .{node});
     }
     try ctx.writer.print("\nModel revision\n  Config        {d}\n  Catalog       {d}\n", .{ result.model_revision.config, result.model_revision.catalog });
+}
+
+fn profileSetHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const name = ctx.getArg("name") orelse return;
+    const property = ctx.getArg("property") orelse return;
+    const prefix = "kernel_args=";
+    if (!std.mem.startsWith(u8, property, prefix) or property.len == prefix.len) return profilePropertyError(ctx, error.InvalidKernelArgsProperty);
+    try mutateProfileKernelArgs(ctx, name, property[prefix.len..], output_json, "profile kernel args updated");
+}
+
+fn profileUnsetHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const name = ctx.getArg("name") orelse return;
+    const property = ctx.getArg("property") orelse return;
+    if (!std.mem.eql(u8, property, "kernel_args")) return profilePropertyError(ctx, error.InvalidKernelArgsProperty);
+    try mutateProfileKernelArgs(ctx, name, null, output_json, "profile kernel args cleared");
+}
+
+fn mutateProfileKernelArgs(ctx: zli.CommandContext, name: []const u8, kernel_args: ?[]const u8, output_json: bool, summary: []const u8) !void {
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.profileSetKernelArgs(ctx.io, config.value.server.http_port, name, kernel_args, &reason);
+    if (!result.healthy) {
+        try reportMutationFailure(ctx, result, "profile kernel args update failed: daemon unreachable");
+        return;
+    }
+    if (output_json)
+        try ctx.writer.print("{{\"ok\":true,\"profile\":{f},\"kernel_args\":{f}}}\n", .{ std.json.fmt(name, .{}), std.json.fmt(kernel_args, .{}) })
+    else
+        try views.success(ctx.writer, summary, &.{ .{ .label = "Profile", .value = name }, .{ .label = "Kernel args", .value = kernel_args orelse "-" }, .{ .label = "Install nodes", .value = "run node retry before the next install" } });
+}
+
+fn profilePropertyError(ctx: zli.CommandContext, err: anyerror) void {
+    ctx.writer.print("error: profile attributes: {s}; expected kernel_args=<value> or unset kernel_args\n", .{@errorName(err)}) catch {};
+    setExitCode(ctx, 2);
 }
 
 /// 离线 answer 预览有意使用明显的非密钥占位符。
@@ -1418,11 +1477,11 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     // M4.2：webhook 上报对所有 Ubuntu 版本可用（curtin handler 相同）
     const preview_report_url: []const u8 = if (distro.family == .ubuntu) "<report-url>" else "";
     const answer = if (distro.family == .ubuntu)
-        try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, "<facts-url>", event_url, "<log-url>", preview_report_url, "<boot-session>", "<capability>", &preview_scope)
+        try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, "<facts-url>", event_url, "<log-url>", preview_report_url, "<boot-session>", "<capability>", &preview_scope, profile.kernel_args)
     else blk: {
         const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
         defer ctx.allocator.free(install_root);
-        break :blk try nodeforge.kickstart.renderAnswerM41(ctx.allocator, node, install, system, bootstrap_key, install_root, bundle, "<facts-url>", event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope);
+        break :blk try nodeforge.kickstart.renderAnswerM41(ctx.allocator, node, install, system, bootstrap_key, install_root, bundle, "<facts-url>", event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope, profile.kernel_args);
     };
     defer ctx.allocator.free(answer);
     try ctx.writer.writeAll(answer);
@@ -1678,8 +1737,9 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     }
     const Response = struct {
         result: struct {
+            view_revision: struct { config: u64, catalog: u64, node_status: u64, deployment: u64, inventory: u64 },
             node: model.NodeConfig,
-            profile: struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8 },
+            profile: struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: ?[]const u8, boot_bundle: ?[]const u8, kernel_args: ?[]const u8, safety: model.ProfileSafetyConfig },
             effective_system: struct {
                 localization: model.LocalizationConfig,
                 connectivity: model.ConnectivityPolicy,
@@ -1688,9 +1748,9 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
                 users: []const struct { name: []const u8, sudo: bool, password_configured: bool, authorized_key_count: usize },
                 packages: []const []const u8,
             },
-            status: ?struct { phase: []const u8, last_event_at: i64, last_error: bool, reason: []const u8, session_active: bool },
-            deployment: ?nodeforge.deployment_control.View,
-            inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, reported_at: i64, deployment_generation: u64 = 0 },
+            status: ?struct { phase: []const u8, boot_session_id: []const u8, model_revision: u64, deployment_generation: u64, last_event_at: i64, last_error: bool, reason: []const u8, session_active: bool },
+            deployment: ?struct { current_generation: ?u64, armed_generation: ?u64, consumed_generation: ?u64, terminal_generation: ?u64, requested_revision: u64, applied_revision: u64, desired_revision: u64, drifted: bool, requested_by: []const u8, start_at: i64, install_at: i64, finished_at: i64, successful_generation: u64, deployed_at: i64 },
+            inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, reported_at: i64, deployment_generation: u64 = 0, session_created_at: i64, boot_session_id: []const u8 },
         },
     };
     var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
@@ -1699,37 +1759,35 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed.deinit();
-    try views.nodeDetail(ctx.writer, parsed.value.result.node);
     const result = parsed.value.result;
-    try ctx.writer.print("Profile\n  Name         {s}\n  Mode         {s}\n  Distro       {s} {s} {s}\n", .{ result.profile.name, result.profile.mode, result.profile.distro, result.profile.version, result.profile.arch });
-    try ctx.writer.print("Effective system\n  Locale       {s}\n  Timezone     {s}\n  SSH          enabled={s} password_auth={s} root_password_configured={s}\n  Users        {d}\n  Packages     {d}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, if (result.effective_system.ssh.enabled) "yes" else "no", if (result.effective_system.ssh.password_authentication) "yes" else "no", if (result.effective_system.ssh.root_password_configured) "yes" else "no", result.effective_system.users.len, result.effective_system.packages.len });
-    // 所有时间字段统一渲染为 RFC 3339 可视化时间，避免直接输出裸 epoch。
+    try views.nodeDetail(ctx.writer, result.node);
+    try ctx.writer.print("\nProfile\n  Name          {s}\n  Mode          {s}\n  Platform      {s} {s} ({s})\n  Install src   {s}\n  Boot bundle   {s}\n  Kernel args   {s}\n  Unknown safe  {s}\n  Destructive   {s}\n  Persistent    {s}\n  Reinstall     {s}\n  More          nodeforge profile show {s}\n", .{ result.profile.name, result.profile.mode, result.profile.distro, result.profile.version, result.profile.arch, result.profile.install_source orelse "-", result.profile.boot_bundle orelse "-", result.profile.kernel_args orelse "-", if (result.profile.safety.safe_for_unknown) "yes" else "no", if (result.profile.safety.destructive) "yes" else "no", if (result.profile.safety.persistent_writes) "yes" else "no", @tagName(result.profile.safety.reinstall_policy), result.profile.name });
+    try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Root keys     {d}\n  Firewall      {s}\n  SELinux       {s}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, @tagName(result.effective_system.connectivity.mode), if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.ssh.root_authorized_key_count, @tagName(result.effective_system.security.firewall), @tagName(result.effective_system.security.selinux) });
+    try ctx.writer.print("  NTP servers   {d}\n", .{result.effective_system.connectivity.ntp_servers.len});
+    for (result.effective_system.connectivity.ntp_servers) |server| try ctx.writer.print("    - {s}\n", .{server});
+    try ctx.writer.print("  Users         {d}\n", .{result.effective_system.users.len});
+    for (result.effective_system.users) |user| try ctx.writer.print("    - {s}: sudo={s} password={s} keys={d}\n", .{ user.name, if (user.sudo) "yes" else "no", if (user.password_configured) "configured" else "not configured", user.authorized_key_count });
+    try ctx.writer.print("  Packages      {d}\n", .{result.effective_system.packages.len});
+    for (result.effective_system.packages) |package| try ctx.writer.print("    - {s}\n", .{package});
+
+    // 人类视图使用本地 24 小时时间；JSON 保留 epoch。Start/Install/Finished
+    // 分别是任务武装、实际安装阶段和终态，不再复用含糊的 Started 标签。
     var last_event_buf: [20]u8 = undefined;
-    var requested_buf: [20]u8 = undefined;
-    var started_buf: [20]u8 = undefined;
+    var start_buf: [20]u8 = undefined;
+    var install_buf: [20]u8 = undefined;
     var finished_buf: [20]u8 = undefined;
     var deployed_buf: [20]u8 = undefined;
     var reported_buf: [20]u8 = undefined;
-    try ctx.writer.writeAll("Runtime\n");
-    if (result.status) |status|
-        try ctx.writer.print("  Phase        {s}\n  Active       {s}\n  Last event   {s}\n  Reason       {s}\n", .{ status.phase, if (status.session_active) "yes" else "no", views.formatTimestamp(&last_event_buf, status.last_event_at), if (status.reason.len == 0) "-" else status.reason })
-    else if (result.deployment) |deployment| {
-        const phase: []const u8 = if (deployment.armed_generation != null)
-            "pending"
-        else if (deployment.consumed_generation) |generation|
-            if (deployment.terminal_generation == generation)
-                if (deployment.deployed_generation == generation) "completed" else "failed"
-            else if (deployment.started_at != 0) "install_started" else "-"
-        else
-            "-";
-        try ctx.writer.print("  Phase        {s} (deployment fallback)\n", .{phase});
-    } else try ctx.writer.writeAll("  Phase        -\n");
-    try ctx.writer.writeAll("Deployment\n");
+    var source_session_buf: [20]u8 = undefined;
+    try ctx.writer.writeAll("\nDeployment\n");
     if (result.deployment) |deployment| {
-        try ctx.writer.print("  Current gen  {f}\n  Requested    {s}\n  Started      {s}\n  Finished     {s}\n  Success gen  {d}\n  Deployed     {s}\n", .{ std.json.fmt(deployment.currentGeneration(), .{}), views.formatTimestamp(&requested_buf, deployment.requested_at), views.formatTimestamp(&started_buf, deployment.started_at), views.formatTimestamp(&finished_buf, deployment.finished_at), deployment.deployed_generation, views.formatTimestamp(&deployed_buf, deployment.deployed_at) });
+        try ctx.writer.print("  Current gen   {f}\n  Armed gen     {f}\n  Consumed gen  {f}\n  Terminal gen  {f}\n  Requested rev {d}\n  Applied rev   {d}\n  Desired rev   {d}\n  Drifted       {s}\n  Requested by  {s}\n  Start         {s}\n  Install       {s}\n  Finished      {s}\n  Success gen   {d}\n  Deployed      {s}\n", .{ std.json.fmt(deployment.current_generation, .{}), std.json.fmt(deployment.armed_generation, .{}), std.json.fmt(deployment.consumed_generation, .{}), std.json.fmt(deployment.terminal_generation, .{}), deployment.requested_revision, deployment.applied_revision, deployment.desired_revision, if (deployment.drifted) "yes" else "no", deployment.requested_by, views.formatTimestamp(&start_buf, deployment.start_at), views.formatTimestamp(&install_buf, deployment.install_at), views.formatTimestamp(&finished_buf, deployment.finished_at), deployment.successful_generation, views.formatTimestamp(&deployed_buf, deployment.deployed_at) });
     } else try ctx.writer.writeAll("  Generation   -\n");
-    try ctx.writer.writeAll("Inventory\n");
-    if (result.inventory) |inventory| try ctx.writer.print("  SN           {s}\n  UUID         {s}\n  Vendor       {s}\n  Model        {s}\n  Generation   {d}\n  Reported     {s}\n", .{ inventory.serial_number orelse "-", inventory.product_uuid orelse "-", inventory.vendor orelse "-", inventory.model orelse "-", inventory.deployment_generation, views.formatTimestamp(&reported_buf, inventory.reported_at) }) else try ctx.writer.writeAll("  SN           -\n");
+    try ctx.writer.writeAll("\nRuntime\n");
+    if (result.status) |status| try ctx.writer.print("  Phase         {s}\n  Active        {s}\n  Last error    {s}\n  Last event    {s}\n  Reason        {s}\n  Session       {s}\n  Model rev     {d}\n  Generation    {d}\n", .{ status.phase, if (status.session_active) "yes" else "no", if (status.last_error) "yes" else "no", views.formatTimestamp(&last_event_buf, status.last_event_at), if (status.reason.len == 0) "-" else status.reason, status.boot_session_id, status.model_revision, status.deployment_generation }) else try ctx.writer.writeAll("  Phase         -\n");
+    try ctx.writer.writeAll("\nInventory\n");
+    if (result.inventory) |inventory| try ctx.writer.print("  SN            {s}\n  UUID          {s}\n  Vendor        {s}\n  Model         {s}\n  Generation    {d}\n  Session       {s}\n  Session start {s}\n  Reported      {s}\n", .{ inventory.serial_number orelse "-", inventory.product_uuid orelse "-", inventory.vendor orelse "-", inventory.model orelse "-", inventory.deployment_generation, inventory.boot_session_id, views.formatTimestamp(&source_session_buf, inventory.session_created_at), views.formatTimestamp(&reported_buf, inventory.reported_at) }) else try ctx.writer.writeAll("  SN            -\n");
+    try ctx.writer.print("\nView revisions\n  Config        {d}\n  Catalog       {d}\n  Node status   {d}\n  Deployment    {d}\n  Inventory     {d}\n", .{ result.view_revision.config, result.view_revision.catalog, result.view_revision.node_status, result.view_revision.deployment, result.view_revision.inventory });
 }
 
 fn printMutationError(ctx: zli.CommandContext, err: anyerror, action: []const u8, node_id: []const u8) !void {

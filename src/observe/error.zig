@@ -23,7 +23,11 @@ pub const Response = struct {
 /// 把配置校验错误转换成稳定错误码；详细类型保留在 message 中便于定位。
 pub fn fromValidation(err: anyerror) Problem {
     return .{
-        .code = "config.invalid",
+        .code = switch (err) {
+            error.InvalidKernelArgs => "profile.kernel_args_invalid",
+            error.KernelArgsRequiresBootloader => "profile.kernel_args_requires_bootloader",
+            else => "config.invalid",
+        },
         .message = @errorName(err),
         .hint = "run nodeforge config validate and correct the referenced object",
     };
@@ -47,4 +51,9 @@ test "错误响应是可解析 JSON" {
         "config.invalid",
         parsed.value.object.get("error").?.object.get("code").?.string,
     );
+}
+
+test "M4.6 kernel args validation errors have stable field codes" {
+    try std.testing.expectEqualStrings("profile.kernel_args_invalid", fromValidation(error.InvalidKernelArgs).code);
+    try std.testing.expectEqualStrings("profile.kernel_args_requires_bootloader", fromValidation(error.KernelArgsRequiresBootloader).code);
 }

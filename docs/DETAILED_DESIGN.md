@@ -4513,21 +4513,24 @@ profile 写操作、distro/repository CRUD 和 PXELINUX 留 M6；provision/recon
 session 创建序号和 facts digest；更高 generation 胜出，同 generation 只接受当前未 superseded session，同 session
 后到值覆盖。旧 generation/session 的迟到请求返回 `inventory.stale_source` 且不覆盖；相同 digest 重试幂等且不刷新时间。
 
-部署控制增加 requested/started/finished/deployed 时间：`deployed_at` 只在成功 completed 时更新，失败不覆盖。
-started/finished/deployed 是 per-generation 生命周期时间戳：`rearm` 武装新 generation 时必须清零这三个字段
-（`requested_at` 同步更新），使部署完成后再次 `install retry` 能反映新 generation 的进度，而不是残留旧值；
-`consume`/`markTerminal` 在本 generation 内保持“仅首次写入”幂等，rearm 的 `rollbackRearm` 原样恢复这三个时间戳。
+部署控制维护 requested/install-started/finished/deployed 时间：`requested_at` 是整个部署任务的 Start；
+内部 `started_at` 是 `install.started` 的破坏性 generation 消费边界，对外显示为 Install；`finished_at`
+是任务 Finished。`deployed_at` 只在成功 completed 时更新，失败不覆盖。`rearm` 武装新 generation 时更新
+`requested_at` 并清零 started/finished，使新任务不残留上一代进度；`consume`/`markTerminal` 在本 generation
+内保持“仅首次写入”幂等，`rollbackRearm` 原样恢复这些时间戳。
 管理 API 提供所有节点列表和单节点聚合投影。config/catalog 来自同一个 ModelSnapshotPair；status/deployment/inventory
 在各自锁内复制并携带独立 revision，响应返回完整 `view_revision` vector，不把多 store 顺序读取伪装成单一事务。
-`node list` 至少显示 ID/MAC/IP/profile/status/started_at/finished_at/SN（部署开始/结束时间窗口；
-成功的 deployed_at 与 finished_at 重合，作为详情留给 `node show`，但 API JSON 同时返回三个时间字段）；
+`node list` 至少显示 ID/MAC/IP/profile/status/Start/Install/Finished/SN：API 字段依次为
+`start_at=requested_at`、`install_at=started_at`、`finished_at`。后续 diskless 继承 Start/Finished 任务边界，
+另行定义与 Install 并列的实际启动阶段。成功的 deployed_at 与 finished_at 重合，作为详情留给 `node show`；
 `node show` 显示完整 NodeConfig、profile/effective system、status、generation/revision/drift 和 inventory，secret 默认脱敏。
 所有 CLI human 输出时间统一渲染为 RFC 3339 UTC 可视化时间，不再直接打印裸 epoch 整数，未发生显示 `-`。
 
 同一 snapshot/revision 还提供 `GET /api/v1/management/profiles` 和 `/profiles/:name`。`profile list` 至少显示
 name/mode/distro/version/arch/install-source/node 引用数/validation；`profile show` 展开全部非 secret ProfileConfig、
 版本 adapter/package-manager capability、install source/media tree/repositories/kernel/initrd、effective system、
-safety/reinstall policy、引用节点与 preflight 摘要。M4.3 不实现 profile mutation；M6 复用同一 DTO 增加写操作。
+safety/reinstall policy、引用节点与 preflight 摘要。M4.3 不实现通用 profile mutation；M4.6 只增加
+`kernel_args` 的受限 set/unset，M4.7 复用同一 DTO/事务边界增加完整实体写操作。
 
 #### 9.12.5 TFTP、HTTP 与日志事件
 
@@ -4604,7 +4607,7 @@ build time 优先使用 `SOURCE_DATE_EPOCH`，无 git 环境接受显式 `-Dgit-
 1. Kylin `.treeinfo` 无 repository 仍识别 `distro=kylin` 并导入核心资产；CentOS/Rocky 同版本并存且目录不串名。
 2. 同 SHA 重复导入幂等；同名不同 SHA 返回稳定冲突；不同 logical name 可并存。
 3. 已有资源化目录迁移通过成功/幂等及新增边界测试，M5–M7 现行设计不再引用旧路径。
-4. `node list` 显示当前 generation 的 status/started_at/finished_at/SN；`node show` 分开显示 current generation 与 last successful generation/deployed_at。retry 只清零当前尝试时间，不删除最近成功事实。
+4. `node list` 显示当前 generation 的 status/Start/Install/Finished/SN；`node show` 分开显示 current generation 与 last successful generation/deployed_at。retry 更新 Start、清零新任务的 Install/Finished，但不删除最近成功事实。
 5. deprecated CLI 全部删除；typed `k=v` 支持一次原子修改多个 node 属性，unknown/wrong type 不落盘。
 6. node CRUD 不重启 daemon；server/port 等结构字段明确返回 restart-required。
 7. TFTP 三个公开运行参数均生效；timeout 请求原值回显、缺省使用内部 5 秒；未请求 option 不出现在 OACK。
@@ -4702,8 +4705,8 @@ ISO/asset import 与 catalog migration 是长任务，返回 202 Operation + Loc
 最终幂等仍由 M4.3 SHA/logical-id 状态机决定。M4.4 复用 M4.3 持久 operations/key registry；restart 后 running
 import 形成稳定 interrupted failure，journal migration 按恢复结果重建 terminal operation，不能退回 memory-only registry。
 
-专项设计 §5.3 的 DTO 表是 implementation contract：NodeSummary 固定身份/profile/status/started_at/finished_at/deployed_at/SN/drift，
-NodeDetail 固定 node/profile/effective_system/deployment/runtime/inventory/view_revision 六类事实，ProfileDetail 固定
+专项设计 §5.3 的 DTO 表是 implementation contract：NodeSummary 固定身份/profile/status/start_at/install_at/finished_at/deployed_at/SN/drift，
+NodeDetail 固定 node/profile/effective_system/deployment/runtime/inventory/view_revision 七类事实，ProfileDetail 固定
 capability/source/repositories/assets/effective-system/safety/references/validation，InstallSourceDetail 固定真实
 family/distro/version/arch/media/repositories/assets/SHA/profile refs。Generation、Validation、MigrationPlan、Operation
 也有稳定字段和 golden fixture；secret 只输出 configured/source/fingerprint 投影。
@@ -5069,13 +5072,18 @@ CLI 是唯一消费者，同版本更新即可。
 
 ### 9.15 M4.6：自定义内核引导参数
 
+> **完成状态（2026-07-17）：已实现。** 本地与 `r97n0`（Rocky Linux 9.7 aarch64）全量回归通过；
+> r97n0 的 adapter/负向校验记录见 `docs/ROCKY_9_7_VALIDATION.md`。真实 PXE 重装后的目标机
+> `/proc/cmdline` 验收仍需在下一次受控安装窗口执行，不能由 renderer/schema 验证替代。
+
 #### 9.15.1 阶段定位
 
 M4.6 在 M4.5 后交付自定义内核引导参数（`profile.kernel_args`）能力。该能力横切 PXE 安装和无盘两条
 链路：PXE 引导时追加到 kernel cmdline 末尾；安装后在目标系统中通过 Kickstart `bootloader --append`
 或 Autoinstall `late-commands` GRUB drop-in 持久化；无盘启动时由 initrd 从 `/proc/cmdline` 透传到
-运行系统。M4.6 不改变 DHCP/TFTP/HTTP 协议语义，不引入新路由，不修改安装器 adapter 的 storage/bootloader
-plan 逻辑——只在现有渲染路径的末尾追加用户声明的参数。
+运行系统。M4.6 不改变 DHCP/TFTP/PXE 数据协议语义；管理面新增一个仅限 loopback、带 If-Match 的 profile
+PATCH，只允许修改 `kernel_args`。它不修改安装器 adapter 的 storage/bootloader plan 逻辑——只在现有
+渲染路径的末尾追加用户声明的参数。
 
 #### 9.15.2 配置模型
 
@@ -5205,6 +5213,9 @@ UEFI 路径行为一致。详见 §11.4 更新。
 | `boot/target.zig` | `resolveInstall`/`resolveDiskless` 调用 `appendKernelArgs`，缓冲区扩容至 1024，溢出 `log.warn` |
 | `profile/adapter/kickstart.zig` | `bootloader` 指令追加 `--append` |
 | `profile/adapter/ubuntu.zig` | `late-commands` 追加 GRUB drop-in 写入和 `update-grub` |
+| `config/profile_mutation.zig` | 仅对 `kernel_args` 执行 load/copy/canonicalize/validate/atomic-save |
+| `http/server.zig` / `http/client.zig` | loopback PATCH、If-Match、活动 session 冲突和结构化错误 |
+| `main.zig` | `profile show` 展示参数；`profile set/unset` 提供受限修改入口 |
 | `catalog.example.json` / `config.example.json` | 示例增加 `kernel_args` 字段 |
 | 测试 fixture | 双 adapter `kernel_args` fixture（空值/典型值/边界长度 256/保留关键字/注入字符拒绝） |
 
@@ -5227,7 +5238,8 @@ M4.3 drift 规则拒绝或留待下一 generation，daemon restart-resume 后 an
 7. **adapter/schema**：RHEL 8/9 通过对应 pykickstart/ksvalidator；Ubuntu 22.04/24.04 通过 autoinstall schema，
    exact fixture 证明 drop-in 中保留字面量 `${GRUB_CMDLINE_LINUX}`、mode 为 0644，并执行 in-target update-grub。
 8. **会话稳定性**：active plan 捕获 canonical 参数，profile 漂移不改变已签发 answer，同版本 restart-resume 稳定。
-9. **实机与回归**：Rocky/Ubuntu 普通和 recovery entry 验证持久参数；M4.5 全部门槛继续通过。
+9. **CLI/API**：`profile show` 展示 canonical 值；set/unset 原子生效，非法输入无副作用，活动 session 返回稳定冲突。
+10. **实机与回归**：Rocky/Ubuntu 普通和 recovery entry 验证持久参数；M4.5 全部门槛继续通过。
 
 #### 9.15.11 不在 M4.6 范围内
 

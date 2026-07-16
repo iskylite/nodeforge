@@ -338,6 +338,9 @@ pub const ProfileConfig = struct {
     /// install mode 的安装器输入。保留 optional 以兼容 M3 catalog/boot
     /// fixture；M4 renderer 对缺省值采用安全的最小安装配置。
     install: ?InstallConfig = null,
+    /// M4.6：追加到 PXE kernel cmdline，并由安装器持久化到目标系统 GRUB。
+    /// 加载时会折叠空格；安全校验拒绝保留参数名和 shell/配置注入字符。
+    kernel_args: ?[]const u8 = null,
 };
 
 pub const LocalizationConfig = struct {

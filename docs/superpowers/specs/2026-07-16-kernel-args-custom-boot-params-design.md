@@ -1,7 +1,7 @@
 # 自定义内核引导参数（kernel_args）设计
 
 - 日期：2026-07-16（2026-07-16 更新：补充 pykickstart/autoinstall 官方文档依据）
-- 状态：设计完成，待实现
+- 状态：已实现并通过本地回归（2026-07-17）；r97n0 验证见 `docs/ROCKY_9_7_VALIDATION.md`
 - 前置：M4.5
 - 权威位置：`docs/DETAILED_DESIGN.md` §9.15（M4.6）；本文件给出实现细化，冲突时以 §9.15 的后续修订为准
 - 目标：为 profile 增加 `kernel_args` 字段，使 `iommu=pt`、`intel_iommu=on`、`hugepagesz=1G hugepages=4` 等内核参数可配置，覆盖 PXE 引导和目标系统持久 GRUB 两条链路
@@ -124,8 +124,20 @@ bootloader --boot-drive=sda
 
 1. 内核参数（如 `iommu=pt`）通常按硬件型号/用途分组，profile 正是为此设计
 2. node 级覆盖会与 profile 的 distro/version/arch 三元组产生交互复杂性
-3. 当前 CLI 没有 `profile add/set` 命令（profile 只通过 JSON 配置），node 级覆盖也无 CLI 入口
+3. M4.6 提供 profile 级 `show/set/unset` 运维闭环，但刻意不提供 node 级覆盖入口
 4. 如果后续确有节点级需求，可在 `NodeOverrideConfig` 中增加 `kernel_args`，但 MVP 不做
+
+对应命令为：
+
+```text
+nodeforge profile show rocky-install-aarch64
+nodeforge profile set rocky-install-aarch64 'kernel_args=iommu=pt hugepages=4'
+nodeforge profile unset rocky-install-aarch64 kernel_args
+```
+
+set/unset 通过本机 management PATCH、目标 ETag/If-Match、活动 boot session 冲突检查和原子
+load-copy-canonicalize-validate-save 执行。它不是通用 profile CRUD；install profile 修改后仍需显式
+`node retry` 武装包含新参数的 generation。
 
 ### 2.3 discovery 模式不注入
 
@@ -556,8 +568,9 @@ M5 diskless initrd 从 `/proc/cmdline` 解析所有参数。`kernel_args` 中的
 5. **`src/profile/adapter/kickstart.zig`**：改造 `bootloader` 指令 + 调整 `renderAnswerM41` 签名
 6. **`src/profile/adapter/ubuntu.zig`**：在 `late-commands` 中增加 GRUB 配置 + 调整 `renderUserDataM41` 签名
 7. **`src/http/server.zig`**：调整 `installConfig` 调用处，传入 `kernel_args`
-8. **文档更新**：DETAILED_DESIGN.md、DESIGN.md
-9. **测试**：运行全部测试确保无回归
+8. **`src/config/profile_mutation.zig` / HTTP client/server / CLI**：增加仅限 `kernel_args` 的 show/set/unset
+9. **文档更新**：DETAILED_DESIGN.md、DESIGN.md
+10. **测试**：运行全部测试确保无回归
 
 ## 8A. 官方文档参考
 
@@ -582,6 +595,7 @@ M5 diskless initrd 从 `/proc/cmdline` 解析所有参数。`kernel_args` 中的
 
 - 不实现 `cmdline_template` 模板方案
 - 不在 `NodeConfig` 中增加 node 级 `kernel_args` 覆盖
+- 不实现通用 profile add/remove 或其他字段 mutation；M4.6 只开放 `kernel_args` set/unset
 - 不在 BootConfig JSON 中增加 `kernel_args` 字段（M5 再决定）
 - 不自动追加 `selinux=0`（作为独立特性）
 - 不实现 PXELINUX 渲染器（M6）

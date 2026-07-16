@@ -34,7 +34,7 @@ M1-M3 横切修正仍写在各自章节，但作为 M4.1 验收前置回归。
 
 M4.3 已落地；M4.4 的 canonical URL、三平面隔离与双发行版主链路也已验证可行。它们完成了真实 distro/family、repository
 可空与 SHA 幂等导入，补 install-source `catalog show/migrate`、完整 node 视图、typed daemon mutation、
-只读 `profile list/show`、ConfigRuntime、可恢复且自有身份数据的 BootSession、传输归属、Ubuntu webhook proof
+`profile list/show`（M4.6 追加受限 `kernel_args` set/unset）、ConfigRuntime、可恢复且自有身份数据的 BootSession、传输归属、Ubuntu webhook proof
 和构建溯源；logical id 使用统一 path-safe grammar，跨 config/catalog/目录的迁移通过可恢复联合事务发布，活动
 BootSession 使用自有 immutable install plan，inventory 以 generation/session 仲裁迟到写入。M4.3 只提前
 已实现 PXE 部署所需的运维闭环；rootfs/diskless、完整 profile/distro/repository CRUD、全配置 diff/apply 和
@@ -112,6 +112,11 @@ UDP/67 在多网卡主机上失去接口边界。
 CLI 使用仓库内固定的 `zli v5.1.2`。命令、参数、默认值和说明由同一命令树生成，
 新增参数不需要再同步维护手写 help。zli 的 spinner 能力暂未启用；未来只在 TTY 的
 耗时 human 输出命令中按需使用，JSON、管道和 systemd 场景保持无动画输出。
+
+M4.6 内核参数通过 profile 管理：`nodeforge profile show <name>` 查看，
+`nodeforge profile set <name> 'kernel_args=iommu=pt hugepages=4'` 修改，
+`nodeforge profile unset <name> kernel_args` 清除。修改会拒绝引用该 profile 的活动 boot session；
+install profile 还需对目标节点执行 `nodeforge node retry <node>`，显式武装包含新参数的 generation。
 
 NodeForge 只有一个 HTTP listener，默认端口 `8080`，健康检查、管理 API 和 M3+ PXE 数据路由
 复用该端口。listener 绑定 `0.0.0.0:<http_port>`；管理路由在入口检查 direct peer，只接受

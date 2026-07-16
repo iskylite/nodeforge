@@ -512,6 +512,46 @@ M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CL
 安装结果自动推定为通过。后续验证继续记录 profile、node、ISO/repository、answer hash、目标地址、抓包
 和安装后命令输出；失败也追加日期、症状和根因。
 
+### 2026-07-17：M4.6 kernel_args 实现与 r97n0 验证
+
+- 将当前工作树同步到 `root@r97n0:/root/NodeForge/`，使用 Zig 0.16.0 在 Rocky Linux 9.7
+  aarch64 上执行 `zig build test --summary all`：192/192 单元测试通过，CLI、HTTP 和安装布局
+  三组集成测试全部通过。
+- 使用活动 catalog 的 Rocky 9.7 与 Ubuntu 22.04 profile 做 renderer 验证。输入
+  `"  iommu=pt   hugepages=4  "` 经 config load/export canonicalize 为
+  `"iommu=pt hugepages=4"`；Rocky answer 生成
+  `bootloader --boot-drive=nvme0n1 --append="iommu=pt hugepages=4"`，并通过
+  `ksvalidator --version RHEL9`。answer SHA-256 为
+  `a24d667f9081ba02b2046535beb23bdf3121b6474a0943db69f7968101f3ba4f`。
+- Ubuntu answer 将 `iommu=pt isolcpus=0,2` 写入
+  `/target/etc/default/grub.d/99-nodeforge.cfg`，保留字面量 `${GRUB_CMDLINE_LINUX}`、设置 0644，
+  下一条命令为 `curtin in-target --target=/target -- update-grub`；PyYAML 解析和逐字段断言通过。
+  answer SHA-256 为 `0105062e3108575958a7334ecdcdaa3d9f1d310314bf4430ff9f1625ee4df71a`。
+- 负向校验确认 `iommu=pt;reboot` 返回 `InvalidKernelArgs`，配置 kernel args 但关闭
+  `install.bootloader.install` 返回 `KernelArgsRequiresBootloader`。测试期间仅暂时停止 nodeforged
+  释放 67/69/18080；完成后服务恢复为 active/running，`NRestarts=0`，三端口监听和
+  `nodeforge check` 均通过。
+- 本轮没有触发 r97n1 擦盘重装，因此尚未把“安装后目标系统 `/proc/cmdline` 与 GRUB 普通/recovery
+  entry 均含参数”勾为实机通过；该项保留到下一次受控 PXE 安装窗口。
+- 随后将 M4.6 ReleaseSafe aarch64 二进制正式部署到 `/opt/nodeforge/bin`。部署检查发现新增的默认
+  `kernel_args: null` 若直接参与 typed JSON hash，会让未修改的 config 在二进制升级后产生新 revision，
+  从而使升级前 active session 的 `node show.status` 被 provenance 门控隐藏。`revisionForConfig` 已加入
+  向后兼容 canonical hash：仅省略语义为空的 `kernel_args:null`，非空参数仍改变 revision。升级前后
+  config revision 均为 `12655880631858739881`，generation 6 的 `install_started`、开始时间
+  `2026-07-17 03:07:27` 和详细 status 在 daemon 重启后完整保留。
+- 首次 M4.6 部署二进制 SHA-256：
+  `nodeforge=6b110bdb32e7e858da1d8a3e285428486f2a9190864e94c7aa601b946cbb9867`、
+  `nodeforged=dfa6845ee2c2767b539bc4c8c7f6adc5e2441e178a4277e2ae3dd505f47d48f7`；
+  备份位于 `/opt/nodeforge/backups/20260717-031637`。部署后服务 active/running、`NRestarts=0`，
+  DHCP/67、TFTP/69、HTTP/18080 和 `nodeforge check` 全部正常。
+- 后续语义复审撤销了实验性的 `boot_started_at`/schema 3 方案：整个任务的 `Start` 应稳定对应
+  `requested_at`，`Install` 对应内部 `started_at`/`install.started`，`Finished` 对应 terminal
+  `finished_at`。列表固定显示 `START / INSTALL / FINISHED`；这套边界可直接延伸到 diskless，后者只需
+  增加与 Install 并列的实际启动阶段，而不重新解释 Start。deployment-control 因此继续使用 schema 2。
+- 同一复审补齐 `profile show/set/unset kernel_args`、完整结构化 `node show` 和本地回归。此前包含
+  `boot_started_at` 的二进制/状态验证只作为被否决方案的历史记录，不是当前发布候选；当前源码须在新的
+  ReleaseSafe aarch64 构建和受控部署验证后再记录二进制 SHA、schema 与服务状态。
+
 ### 2026-07-13/14：`r97n1` Rocky 9.7 与 Ubuntu 22.04 自动部署复验
 
 - **环境与配置**：PXE 服务为 `r97n0`（管理地址 `192.168.26.128`，PXE 地址

@@ -86,6 +86,19 @@ grep -Fq '"items":[]' "$tmp/nodes-view"
 grep -Eq '"view_revision":\{"config":[0-9]+,"catalog":[0-9]+,"node_status":[0-9]+,"deployment":[0-9]+,"inventory":[0-9]+\}' "$tmp/nodes-view"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles" >"$tmp/profiles-view"
 grep -Fq '"name":"discovery"' "$tmp/profiles-view"
+"$cli" profile show discovery -c "$tmp/config.json" >"$tmp/profile-show"
+grep -Fq 'Kernel args   -' "$tmp/profile-show"
+# M4.6 的窄 profile mutation：null/unset 可幂等应用；discovery 非空参数必须
+# 由稳定校验错误拒绝，并且不能改变配置文件。
+"$cli" profile unset discovery kernel_args -c "$tmp/config.json" >"$tmp/profile-unset"
+before_kernel_reject=$(sha256sum "$tmp/config.json" | awk '{print $1}')
+if "$cli" profile set discovery 'kernel_args=iommu=pt' -c "$tmp/config.json" >"$tmp/profile-set-invalid" 2>&1; then
+    echo "discovery profile unexpectedly accepted kernel args" >&2
+    exit 1
+fi
+grep -Fq 'profile.kernel_args_invalid' "$tmp/profile-set-invalid"
+after_kernel_reject=$(sha256sum "$tmp/config.json" | awk '{print $1}')
+test "$before_kernel_reject" = "$after_kernel_reject"
 
 # M4.5 collection pagination (§9.14.11.1#3): limit 校验与 cursor/view_revision 字段。
 pg_bad=$(curl --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes?limit=0")
@@ -103,6 +116,10 @@ daemon_pid=$pid
 kill -0 "$daemon_pid"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes/test-node" >"$tmp/node-after-add"
 grep -Fq '"id":"test-node"' "$tmp/node-after-add"
+"$cli" node show test-node -c "$tmp/config.json" >"$tmp/node-show"
+for section in 'Node test-node' 'Profile' 'Effective system' 'Deployment' 'Runtime' 'Inventory' 'View revisions'; do
+    grep -Fq "$section" "$tmp/node-show"
+done
 "$cli" node set test-node hostname=worker-11 -c "$tmp/config.json" >"$tmp/node-set"
 kill -0 "$daemon_pid"
 grep -Fq '"hostname": "worker-11"' "$tmp/config.json"

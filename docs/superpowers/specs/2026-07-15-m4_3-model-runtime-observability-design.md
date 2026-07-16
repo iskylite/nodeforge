@@ -406,16 +406,16 @@ inventory 原子写入独立文件，daemon 启动恢复。服务端不接受客
 
 避免“部署时间”语义含糊，持久化以下时间：
 
-- `deployment_requested_at`：generation arm 时间；
-- `deployment_started_at`：第一次接受 `install.started` 的时间；
+- `deployment_start_at`：generation arm/request 时间，是整个部署任务的 Start；
+- `deployment_install_at`：第一次接受 `install.started` 的时间，是安装链路实际开始执行的 Install；
 - `deployment_finished_at`：本 generation 首次 terminal 时间；
 - `deployed_at`：最近一次成功 `install.completed` 的时间，失败不得覆盖；
 - `last_event_at`：最近一次状态事件时间。
 
-这些字段随 generation 一起恢复，重复事件必须幂等，不得刷新首次 started/terminal 时间。
+这些字段随 generation 一起恢复，重复事件必须幂等，不得刷新首次 install/terminal 时间。
 
-per-generation 语义要求：`rearm` 武装一个新 generation 时，只清零上一 generation 的
-`started_at`/`finished_at`（`requested_at` 同步更新）。`deployed_at` 明确定义为最近一次成功时间，
+per-generation 语义要求：`rearm` 武装一个新 generation 时更新 `requested_at`（新的 Start），并清零上一 generation 的
+`started_at`/`finished_at`（新的 Install/Finished 尚未发生）。`deployed_at` 明确定义为最近一次成功时间，
 必须与 `deployed_generation` 一起跨 retry/失败保留，直到下一 generation 成功后才替换。
 `consume`/`markTerminal` 在本 generation 内保持幂等，不重复刷新。
 `consumed_generation`/`terminal_generation` 作为历史不清零，由后续 consume/markTerminal
@@ -441,12 +441,14 @@ runtime store 是带各自 revision 的观察值。实现不得把依次读取�
 `node list` 默认列展示部署开始/结束时间窗口：
 
 ```text
-ID  MAC  IP  PROFILE  STATUS  STARTED  FINISHED  SN
+ID  MAC  IP  PROFILE  STATUS  START  INSTALL  FINISHED  SN
 ```
 
-`started_at`/`finished_at` 来自 deployment_control 的 per-generation 生命周期时间戳；
+列表 `start_at` 取 deployment_control 的 `requested_at`，`install_at` 取内部 `started_at`/`install.started`，
+`finished_at` 来自 per-generation terminal 时间。三者明确区分任务边界与安装阶段；后续 diskless 复用
+Start/Finished 任务边界，并为其实际启动阶段定义与 Install 并列的字段，不能重新解释 Start；
 成功的 `deployed_at` 与 `finished_at` 重合，作为详情留给 `node show`，列表不再单独列出，
-但 management API JSON 仍同时返回 `started_at`/`finished_at`/`deployed_at` 三个字段。
+management API JSON 返回 `start_at`/`install_at`/`finished_at`，并在详情中保留最近成功的 `deployed_at`。
 
 所有 CLI human 输出时间统一渲染为 RFC 3339 UTC 可视化时间（复用事件写入器的
 `rfc3339FromUnix`），不再直接打印裸 epoch 整数；未发生（0）显示 `-`，旧 `unix:<seconds>`
@@ -457,9 +459,10 @@ ID  MAC  IP  PROFILE  STATUS  STARTED  FINISHED  SN
 1. Node：全部 NodeConfig 字段；
 2. Profile：名称、mode、distro/version/arch、install source/boot bundle、safety；
 3. Effective system：合并后的 locale/network/SSH/security/users/packages，secret 值默认脱敏；
-4. Deployment：generation、revision、drift、requested/started/finished/deployed 时间；
+4. Deployment：generation、revision、drift、Start/Install/Finished 和最近成功 deployed 时间；
 5. Runtime：phase、session active、last error/reason；
-6. Inventory：SN、UUID、vendor/model、reported time/source。
+6. Inventory：SN、UUID、vendor/model、reported time/source；
+7. View revisions：config/catalog/status/deployment/inventory 的独立 revision vector。
 
 `--output json` 提供完整稳定结构。密码、capability、private key 永不输出；“完整”指所有非 secret 参数及 secret 的
 存在性/来源，不等于把明文密码打印到终端。
@@ -486,7 +489,8 @@ GET /api/v1/management/profiles/:name
 （adapter/package manager）、install source/media tree/repositories/kernel/initrd、effective system、安全/重装策略、
 引用该 profile 的 node id 和当前 validation/preflight 摘要。secret 只显示 configured/source/fingerprint，不能输出值。
 
-M4.3 只提供发现和诊断，不提供 `profile add/update/remove`。profile mutation 会影响多个节点的 install plan、drift、
+M4.3 只提供发现和诊断，不提供 `profile add/update/remove`。M4.6 仅为 `kernel_args` 增加
+`profile set <name> 'kernel_args=…'` / `profile unset <name> kernel_args` 的受限 mutation；通用 profile mutation 会影响多个节点的 install plan、drift、
 活动 session 保护和引用迁移，仍由 M6 在 ConfigRuntime revision/diff/apply 基础上实现。CLI `node show` 的 profile
 部分是摘要并链接/提示 `profile show <name>`，不能替代完整 profile DTO。
 
@@ -906,7 +910,7 @@ ConfigRuntime 不等于所有字段都热生效，bind/port/root/TFTP 参数仍�
 | `src/tftp/server.zig` | RFC 合规协商、timeout 现状回归测试、node_id 事件/日志 |
 | `src/dhcp/server.zig` | gate 决策日志与 deployment 字段 |
 | `src/main.zig`、`src/http/client.zig` | 删除 deprecated 命令；k=v/unset；node/profile 聚合 list/show；catalog show/migrate 客户端；CLI 时间统一渲染为 RFC 3339 可视化时间 |
-| `src/cli/views.zig` | 新 node/profile list 列和完整 show 分组；`formatTimestamp` 可视化时间；node list 增 STARTED/FINISHED 列 |
+| `src/cli/views.zig` | 新 node/profile list 列和完整 show 分组；`formatTimestamp` 可视化时间；node list 增 START/INSTALL/FINISHED 列 |
 | `src/cli/events.zig` | `displayTs` 把旧 `unix:<seconds>` 事件时间归一化为 RFC 3339 展示 |
 | `src/version.zig`、`build.zig` | build-options 注入和统一版本输出 |
 | `src/paths.zig`、`packaging/install-layout.sh` | 原则上无需改动；只在新增迁移边界测试发现缺陷时修正 |

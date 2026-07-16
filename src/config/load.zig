@@ -28,9 +28,38 @@ pub fn load(
     );
     defer allocator.free(bytes);
 
-    return std.json.parseFromSlice(model.AppConfig, allocator, bytes, .{
+    var parsed = try std.json.parseFromSlice(model.AppConfig, allocator, bytes, .{
         .allocate = .alloc_always,
     });
+    canonicalizeKernelArgs(&parsed.value);
+    return parsed;
+}
+
+/// M4.6 canonical 形式：去掉首尾 ASCII 空格、把连续空格折叠为一个，空结果
+/// 表示为 null。解析后的字符串由 JSON arena 持有，因此原地压缩不会改变所有权。
+pub fn canonicalizeKernelArgs(config: *model.AppConfig) void {
+    const profiles = @constCast(config.profiles);
+    for (profiles) |*profile| {
+        const value = profile.kernel_args orelse continue;
+        const bytes = @constCast(value);
+        var read: usize = 0;
+        var write: usize = 0;
+        var pending_space = false;
+        while (read < bytes.len) : (read += 1) {
+            if (bytes[read] == ' ') {
+                if (write != 0) pending_space = true;
+                continue;
+            }
+            if (pending_space) {
+                bytes[write] = ' ';
+                write += 1;
+                pending_space = false;
+            }
+            bytes[write] = bytes[read];
+            write += 1;
+        }
+        profile.kernel_args = if (write == 0) null else bytes[0..write];
+    }
 }
 
 test "load parses a minimal config" {
@@ -90,4 +119,18 @@ test "M4.2 target users default unless explicitly empty" {
     const empty = try std.json.parseFromSlice(model.TargetSystemConfig, std.testing.allocator, "{\"users\":[]}", .{});
     defer empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty.value.users.len);
+}
+
+test "M4.6 load canonicalizes kernel args" {
+    var parsed = try std.json.parseFromSlice(
+        model.AppConfig,
+        std.testing.allocator,
+        \\{"server":{"server_ip":"192.168.50.1"},"profiles":[{"name":"p","mode":"diskless","distro":"ubuntu","version":"22.04","arch":"aarch64","kernel_args":"  iommu=pt   isolcpus=0,2  "},{"name":"empty","mode":"discovery","distro":"rocky","version":"9.7","arch":"aarch64","kernel_args":"   "}]}
+    ,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    canonicalizeKernelArgs(&parsed.value);
+    try std.testing.expectEqualStrings("iommu=pt isolcpus=0,2", parsed.value.profiles[0].kernel_args.?);
+    try std.testing.expect(parsed.value.profiles[1].kernel_args == null);
 }

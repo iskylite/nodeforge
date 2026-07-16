@@ -46,6 +46,7 @@ pub const specs = [_]RouteSpec{
     .{ .method = "POST", .template = "/api/v1/management/nodes/:id/install-generations", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "PATCH", .template = "/api/v1/management/profiles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/assets", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/assets", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/assets/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
@@ -190,6 +191,8 @@ test "Allow aggregation reflects registered methods for detail and collection pa
     try std.testing.expectEqualStrings("GET, PATCH", allowed("/api/v1/management/config", &buffer).?);
     // 资产 detail 只注册了 GET，PUT/DELETE 应得到 405 + Allow: GET。
     try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/assets/rocky-kernel", &buffer).?);
+    // M4.6 profile detail 既可查看，也只允许 PATCH kernel_args。
+    try std.testing.expectEqualStrings("GET, PATCH", allowed("/api/v1/management/profiles/rocky-install", &buffer).?);
     // 真正不存在的路径返回 null（404），而非空 Allow。
     try std.testing.expect(allowed("/api/v1/management/never-registered", &buffer) == null);
 }
