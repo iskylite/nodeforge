@@ -1,85 +1,296 @@
-//! NodeForge 安装布局的唯一默认路径定义。
-//! 业务模块只引用这里的派生常量，避免重复声明安装根。
+//! NodeForge 运行时安装路径自举。
+//!
+//! M4.7 起业务代码不再从编译期字符串拼出 `/opt/nodeforge/**`。进程必须先从
+//! 显式 `--install-root` 或真实可执行文件位置证明安装根有效，再发布一次只读
+//! `Paths`。marker、成对二进制或 `bin/` 布局不成立时一律 fail closed。
 
-/// 默认安装根。正常部署时 config/catalog 会从该根目录下自动发现。
-pub const install_root = "/opt/nodeforge";
+const std = @import("std");
 
-/// 可执行文件目录。`/usr/bin/nodeforge` 和 `/usr/bin/nodeforged` 只做软链接。
-pub const bin_dir = install_root ++ "/bin";
-/// systemd unit 的真实存放位置；`/etc/systemd/system` 只做软链接，便于整体卸载。
-pub const systemd_dir = install_root ++ "/systemd";
-/// 人工维护的启动配置目录。
-pub const config_dir = install_root ++ "/config";
-/// `nodeforged` 维护的管理 catalog 目录。
-pub const catalog_dir = install_root ++ "/catalog";
-/// 运行态快照目录，不能反向成为启动配置事实源。
-pub const state_dir = install_root ++ "/state";
-/// 结构化事件和服务日志目录；systemd 默认写入这里，交互式模式可选 stderr。
-pub const logs_dir = install_root ++ "/logs";
-/// ISO、kernel、initrd、rootfs 等大文件资产根目录。
-pub const assets_dir = install_root ++ "/assets";
-/// ISO 镜像根目录，HTTP `/assets/` 路由从这里发布。
-pub const iso_dir = assets_dir ++ "/iso";
-/// TFTP 启动小文件根目录。
-pub const boot_dir = assets_dir ++ "/boot";
-/// HTTP `/artifacts/repositories/` 发布的软件仓库根目录。
-pub const repos_dir = assets_dir ++ "/repos";
-/// Bootstrap SSH key pair 和导入公钥目录。
-pub const keys_dir = assets_dir ++ "/keys";
-/// NodeForge 小 initrd 构建产物目录。
-pub const initrd_dir = assets_dir ++ "/initrd";
-/// rootfs 构建和发布产物目录。
-pub const rootfs_dir = assets_dir ++ "/rootfs";
-/// boot/provisioning bundle 等声明式产物目录。
-pub const bundles_dir = assets_dir ++ "/bundles";
-/// 节点已应用 provisioning 结果记录目录。
-pub const provisioned_dir = state_dir ++ "/provisioned";
-/// pid、临时 socket 等运行期短生命周期文件目录。
-pub const run_dir = install_root ++ "/run";
-/// 构建、导入、解包等可清理工作目录。
-pub const work_dir = install_root ++ "/work";
-/// Daemon 管控的 ISO 临时暂存目录。
-///
-/// M3.6 安全设计：CLI 接受管理员指定的任意本地 ISO 路径后，先将文件原子复制
-/// 到此受管目录，然后仅向本机 daemon 的管理端点传递生成的不透明文件名
-///（不含路径前缀）。这样常驻特权 daemon 永远不会接触任意 host 路径，
-/// 既改善了 UX（用户不用手动把 ISO 放到固定位置），又不把任意文件系统
-/// 访问能力交给网络服务。CLI 完成导入后负责删除临时副本。
-pub const import_dir = work_dir ++ "/import";
+pub const default_install_root = "/opt/nodeforge";
+pub const root_marker_name = ".nodeforge-root";
 
-pub const config_path = config_dir ++ "/config.json";
-pub const catalog_path = catalog_dir ++ "/catalog.json";
-pub const runtime_path = state_dir ++ "/runtime.json";
-/// M3.1 DHCP lease 快照文件路径；取代了 `runtime.json` 中的 lease 部分。
-/// 该文件由 DHCP checkpoint worker 周期性写入，用于持久化当前活动租约。
-pub const leases_path = state_dir ++ "/leases.json";
-/// M3.1 节点状态快照文件路径；取代了 `runtime.json` 中的状态部分。
-/// 该文件由 HTTP 管理路由在节点状态变更时写入，使用独立的 I/O 锁避免
-/// 与 DHCP checkpoint worker 的 lease 文件锁竞争。
-pub const node_status_path = state_dir ++ "/node-status.json";
-pub const deployment_control_path = state_dir ++ "/deployment-control.json";
-pub const boot_sessions_path = state_dir ++ "/boot-sessions.json";
-pub const node_inventory_path = state_dir ++ "/node-inventory.json";
-pub const operations_path = state_dir ++ "/operations.json";
-pub const model_transactions_dir = state_dir ++ "/model-transactions";
-pub const events_path = logs_dir ++ "/events.jsonl";
-pub const service_log_path = logs_dir ++ "/nodeforged.log";
-pub const service_path = systemd_dir ++ "/nodeforged.service";
+/// 一个进程内不可变的完整路径投影。全部字符串由调用 `resolve`/`discover` 时的
+/// allocator 持有，通常使用进程 arena；测试可显式 `deinit`。
+pub const Paths = struct {
+    install_root: []const u8,
+    marker_path: []const u8,
+    bin_dir: []const u8,
+    nodeforge_path: []const u8,
+    nodeforged_path: []const u8,
+    systemd_dir: []const u8,
+    config_dir: []const u8,
+    catalog_dir: []const u8,
+    state_dir: []const u8,
+    logs_dir: []const u8,
+    assets_dir: []const u8,
+    iso_dir: []const u8,
+    boot_dir: []const u8,
+    repos_dir: []const u8,
+    keys_dir: []const u8,
+    bootstrap_private_key_path: []const u8,
+    bootstrap_public_key_path: []const u8,
+    bootstrap_private_key_temp_path: []const u8,
+    bootstrap_public_key_temp_path: []const u8,
+    initrd_dir: []const u8,
+    rootfs_dir: []const u8,
+    bundles_dir: []const u8,
+    provisioned_dir: []const u8,
+    run_dir: []const u8,
+    work_dir: []const u8,
+    import_dir: []const u8,
+    config_path: []const u8,
+    /// M4.7b 前兼容单文件输入；完成 manifest 迁移后仅用于 legacy 检测。
+    legacy_catalog_path: []const u8,
+    runtime_path: []const u8,
+    leases_path: []const u8,
+    node_status_path: []const u8,
+    deployment_control_path: []const u8,
+    boot_sessions_path: []const u8,
+    node_inventory_path: []const u8,
+    operations_path: []const u8,
+    model_transactions_dir: []const u8,
+    events_path: []const u8,
+    service_log_path: []const u8,
+    service_path: []const u8,
 
-// 验证所有派生路径都以唯一安装根为前缀。
-// 这是防止路径拼接错误导致文件写入非预期位置的基础回归测试。
-test "default paths are derived from the install root" {
-    const std = @import("std");
+    /// 从现存根目录解析路径并验证 marker 与成对二进制。`realPathFileAlloc`
+    /// 同时消除 `..` 和 symlink；解析结果必须与调用方文本路径不同也无妨，但
+    /// 后续所有写入只使用 canonical root。
+    pub fn resolve(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !Paths {
+        if (!std.fs.path.isAbsolute(root)) return error.InstallRootNotAbsolute;
+        if (hasDotDot(root)) return error.InvalidInstallRoot;
+        const input_stat = try std.Io.Dir.cwd().statFile(io, root, .{ .follow_symlinks = false });
+        if (input_stat.kind == .sym_link) return error.InstallRootSymlink;
+        const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator);
+        defer allocator.free(canonical);
+        var result = try derive(allocator, canonical);
+        errdefer result.deinit(allocator);
+        try result.validateLayout(io);
+        return result;
+    }
 
-    try std.testing.expectEqualStrings(install_root ++ "/config/config.json", config_path);
-    try std.testing.expectEqualStrings(install_root ++ "/catalog/catalog.json", catalog_path);
-    try std.testing.expectEqualStrings(install_root ++ "/assets", assets_dir);
-    try std.testing.expectEqualStrings(assets_dir ++ "/iso", iso_dir);
-    try std.testing.expectEqualStrings(assets_dir ++ "/boot", boot_dir);
-    try std.testing.expectEqualStrings(assets_dir ++ "/repos", repos_dir);
-    try std.testing.expectEqualStrings(assets_dir ++ "/keys", keys_dir);
-    try std.testing.expectEqualStrings(assets_dir ++ "/initrd", initrd_dir);
-    try std.testing.expectEqualStrings(assets_dir ++ "/rootfs", rootfs_dir);
-    try std.testing.expectEqualStrings(assets_dir ++ "/bundles", bundles_dir);
-    try std.testing.expectEqualStrings(state_dir ++ "/provisioned", provisioned_dir);
+    /// 从操作系统提供的真实 executable 位置发现根，不信任 argv[0] 或 PATH。
+    /// `realPathFileAlloc` 会继续解析软链后的真实位置。
+    /// 只有标准根会作为兜底候选，且同样必须通过完整布局校验。
+    pub fn discover(io: std.Io, allocator: std.mem.Allocator) !Paths {
+        const reported = std.process.executablePathAlloc(io, allocator) catch |cause| {
+            return resolve(io, allocator, default_install_root) catch return cause;
+        };
+        defer allocator.free(reported);
+        const executable = std.Io.Dir.cwd().realPathFileAlloc(io, reported, allocator) catch |cause| {
+            return resolve(io, allocator, default_install_root) catch return cause;
+        };
+        defer allocator.free(executable);
+        const bin = std.fs.path.dirname(executable) orelse return error.InvalidExecutableLayout;
+        if (!std.mem.eql(u8, std.fs.path.basename(bin), "bin")) {
+            return resolve(io, allocator, default_install_root) catch return error.InvalidExecutableLayout;
+        }
+        const root = std.fs.path.dirname(bin) orelse return error.InvalidExecutableLayout;
+        return resolve(io, allocator, root) catch |cause| {
+            if (std.mem.eql(u8, root, default_install_root)) return cause;
+            return resolve(io, allocator, default_install_root) catch return cause;
+        };
+    }
+
+    /// setup 在创建 marker 前需要一个只派生、不声称部署有效的候选路径。
+    /// 该入口仍要求绝对、canonical、已存在且为目录；它不写盘。
+    pub fn candidate(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !Paths {
+        if (!std.fs.path.isAbsolute(root)) return error.InstallRootNotAbsolute;
+        if (hasDotDot(root)) return error.InvalidInstallRoot;
+        if (std.Io.Dir.cwd().statFile(io, root, .{ .follow_symlinks = false })) |stat| {
+            if (stat.kind == .sym_link) return error.InstallRootSymlink;
+        } else |err| if (err != error.FileNotFound) return err;
+        const canonical: [:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                const parent = std.fs.path.dirname(root) orelse return error.InvalidInstallRoot;
+                const base = std.fs.path.basename(root);
+                if (base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) return error.InvalidInstallRoot;
+                const canonical_parent = try std.Io.Dir.cwd().realPathFileAlloc(io, parent, allocator);
+                defer allocator.free(canonical_parent);
+                const joined = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ canonical_parent, base });
+                defer allocator.free(joined);
+                break :blk try allocator.dupeZ(u8, joined);
+            },
+            else => return err,
+        };
+        defer allocator.free(canonical);
+        return derive(allocator, canonical);
+    }
+
+    pub fn deinit(self: *Paths, allocator: std.mem.Allocator) void {
+        inline for (std.meta.fields(Paths)) |field| allocator.free(@field(self, field.name));
+        self.* = undefined;
+    }
+
+    fn validateLayout(self: *const Paths, io: std.Io) !void {
+        const cwd = std.Io.Dir.cwd();
+        var marker = try cwd.openFile(io, self.marker_path, .{ .mode = .read_only });
+        marker.close(io);
+        inline for (.{ self.nodeforge_path, self.nodeforged_path }) |binary_path| {
+            var binary = try cwd.openFile(io, binary_path, .{ .mode = .read_only });
+            defer binary.close(io);
+            const stat = try binary.stat(io);
+            if (stat.kind != .file) return error.InvalidExecutableLayout;
+        }
+    }
+};
+
+var global: ?Paths = null;
+
+/// 发布全局路径只能发生一次，防止命令解析后再切换写入边界。
+pub fn init(value: Paths) error{AlreadyInitialized}!void {
+    if (global != null) return error.AlreadyInitialized;
+    global = value;
+}
+
+/// 业务代码不得在缺少自举时偷偷回落到 `/opt/nodeforge`。
+pub fn current() error{PathsNotInitialized}!*const Paths {
+    return if (global) |*value| value else error.PathsNotInitialized;
+}
+
+/// 已经完成入口自举的业务代码使用该入口。若调用顺序被破坏会立即终止，
+/// 而不是把空路径或默认路径继续传进特权文件操作；可恢复的初始化流程和测试
+/// 使用 `current()` 获取显式错误。
+pub fn require() *const Paths {
+    return current() catch @panic("NodeForge paths used before bootstrap");
+}
+
+/// 在构造任何 CLI 默认值之前扫描唯一的 bootstrap flag 并发布路径。
+/// 这里只识别 `--install-root VALUE`/`--install-root=VALUE`；其余语法仍由
+/// zli 负责，因此预扫描不会改变业务参数的校验或所有权。
+pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args) !void {
+    var iterator = args.iterate();
+    _ = iterator.next();
+    var explicit: ?[]const u8 = null;
+    var setup = false;
+    while (iterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "setup")) setup = true;
+        if (std.mem.eql(u8, arg, "--install-root")) {
+            explicit = iterator.next() orelse return error.MissingInstallRootValue;
+        } else if (std.mem.startsWith(u8, arg, "--install-root=")) {
+            explicit = arg["--install-root=".len..];
+            if (explicit.?.len == 0) return error.MissingInstallRootValue;
+        }
+    }
+    const value = if (explicit) |root|
+        if (setup) try Paths.candidate(io, allocator, root) else try Paths.resolve(io, allocator, root)
+    else
+        try Paths.discover(io, allocator);
+    try init(value);
+}
+
+fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
+    return .{
+        .install_root = try allocator.dupe(u8, root),
+        .marker_path = try join(allocator, root, root_marker_name),
+        .bin_dir = try join(allocator, root, "bin"),
+        .nodeforge_path = try join(allocator, root, "bin/nodeforge"),
+        .nodeforged_path = try join(allocator, root, "bin/nodeforged"),
+        .systemd_dir = try join(allocator, root, "systemd"),
+        .config_dir = try join(allocator, root, "config"),
+        .catalog_dir = try join(allocator, root, "catalog"),
+        .state_dir = try join(allocator, root, "state"),
+        .logs_dir = try join(allocator, root, "logs"),
+        .assets_dir = try join(allocator, root, "assets"),
+        .iso_dir = try join(allocator, root, "assets/iso"),
+        .boot_dir = try join(allocator, root, "assets/boot"),
+        .repos_dir = try join(allocator, root, "assets/repos"),
+        .keys_dir = try join(allocator, root, "assets/keys"),
+        .bootstrap_private_key_path = try join(allocator, root, "assets/keys/id_ed25519"),
+        .bootstrap_public_key_path = try join(allocator, root, "assets/keys/id_ed25519.pub"),
+        .bootstrap_private_key_temp_path = try join(allocator, root, "assets/keys/id_ed25519.tmp"),
+        .bootstrap_public_key_temp_path = try join(allocator, root, "assets/keys/id_ed25519.tmp.pub"),
+        .initrd_dir = try join(allocator, root, "assets/initrd"),
+        .rootfs_dir = try join(allocator, root, "assets/rootfs"),
+        .bundles_dir = try join(allocator, root, "assets/bundles"),
+        .provisioned_dir = try join(allocator, root, "state/provisioned"),
+        .run_dir = try join(allocator, root, "run"),
+        .work_dir = try join(allocator, root, "work"),
+        .import_dir = try join(allocator, root, "work/import"),
+        .config_path = try join(allocator, root, "config/config.json"),
+        .legacy_catalog_path = try join(allocator, root, "catalog/catalog.json"),
+        .runtime_path = try join(allocator, root, "state/runtime.json"),
+        .leases_path = try join(allocator, root, "state/leases.json"),
+        .node_status_path = try join(allocator, root, "state/node-status.json"),
+        .deployment_control_path = try join(allocator, root, "state/deployment-control.json"),
+        .boot_sessions_path = try join(allocator, root, "state/boot-sessions.json"),
+        .node_inventory_path = try join(allocator, root, "state/node-inventory.json"),
+        .operations_path = try join(allocator, root, "state/operations.json"),
+        .model_transactions_dir = try join(allocator, root, "state/model-transactions"),
+        .events_path = try join(allocator, root, "logs/events.jsonl"),
+        .service_log_path = try join(allocator, root, "logs/nodeforged.log"),
+        .service_path = try join(allocator, root, "systemd/nodeforged.service"),
+    };
+}
+
+fn join(allocator: std.mem.Allocator, root: []const u8, suffix: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, suffix });
+}
+
+fn hasDotDot(value: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, value, std.fs.path.sep);
+    while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return true;
+    return false;
+}
+
+fn createTestLayout(io: std.Io, root: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, root);
+    const bin = try std.fmt.allocPrint(std.testing.allocator, "{s}/bin", .{root});
+    defer std.testing.allocator.free(bin);
+    try cwd.createDirPath(io, bin);
+    inline for (.{ root_marker_name, "bin/nodeforge", "bin/nodeforged" }) |suffix| {
+        const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ root, suffix });
+        defer std.testing.allocator.free(path);
+        var file = try cwd.createFile(io, path, .{ .truncate = true });
+        file.close(io);
+    }
+}
+
+test "runtime paths resolve a custom marked install root" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    try createTestLayout(std.testing.io, root);
+
+    var value = try Paths.resolve(std.testing.io, std.testing.allocator, root);
+    defer value.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(root, value.install_root);
+    try std.testing.expectEqualStrings("config/config.json", value.config_path[root.len + 1 ..]);
+    try std.testing.expectEqualStrings("catalog/catalog.json", value.legacy_catalog_path[root.len + 1 ..]);
+}
+
+test "runtime paths fail closed without marker or paired binaries" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temp.dir.realPath(std.testing.io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    try std.testing.expectError(error.FileNotFound, Paths.resolve(std.testing.io, std.testing.allocator, root));
+}
+
+test "runtime paths reject relative roots and duplicate init" {
+    try std.testing.expectError(error.InstallRootNotAbsolute, Paths.resolve(std.testing.io, std.testing.allocator, "../nodeforge"));
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temp.dir.realPath(std.testing.io, &root_buffer);
+    const first = try Paths.candidate(std.testing.io, std.heap.page_allocator, root_buffer[0..root_len]);
+    try init(first);
+    try std.testing.expectError(error.AlreadyInitialized, init(first));
+}
+
+test "runtime paths reject dot-dot and a symlink root" {
+    try std.testing.expectError(error.InvalidInstallRoot, Paths.candidate(std.testing.io, std.testing.allocator, "/tmp/../tmp/nodeforge"));
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.createDir(std.testing.io, "real", .default_dir);
+    try temp.dir.symLink(std.testing.io, "real", "link", .{});
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temp.dir.realPath(std.testing.io, &buffer);
+    const link = try std.fmt.allocPrint(std.testing.allocator, "{s}/link", .{buffer[0..root_len]});
+    defer std.testing.allocator.free(link);
+    try std.testing.expectError(error.InstallRootSymlink, Paths.candidate(std.testing.io, std.testing.allocator, link));
 }

@@ -97,12 +97,51 @@ pub fn validate(config: *const model.AppConfig, catalog: *const model.Catalog) V
     try validatePolicy(config);
 }
 
+/// M4.7 显式三层校验入口：shape 校验不会把“文件可解析”误报为完整模型可运行。
+pub fn validateConfigShape(config: *const model.AppConfig) ValidationError!void {
+    var startup = config.*;
+    startup.distros = &.{};
+    startup.profiles = &.{};
+    startup.nodes = &.{};
+    startup.provisioning_bundles = &.{};
+    try validateConfig(&startup);
+}
+
+pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void {
+    if (catalog.schema_version != 1 and catalog.schema_version != 2) return error.UnsupportedSchemaVersion;
+    try uniqueNamed(model.DistroConfig, catalog.distros);
+    try uniqueNamed(model.ProfileConfig, catalog.profiles);
+    try uniqueNamed(model.ProvisioningBundle, catalog.provisioning_bundles);
+    try uniqueNamed(model.RepositoryConfig, catalog.repositories);
+    try uniqueNamed(model.AssetConfig, catalog.assets);
+    try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
+    try uniqueNamed(model.BootBundleConfig, catalog.boot_bundles);
+    for (catalog.nodes, 0..) |node, index| {
+        if (node.id.len == 0 or !validMac(node.mac)) return error.InvalidNodeMac;
+        for (catalog.nodes[index + 1 ..]) |other| {
+            if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
+            if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
+        }
+    }
+    for (catalog.assets) |asset| {
+        asset_validate.validateRelativePath(asset.path) catch return error.UnsafeAssetPath;
+        if (asset.sha256) |digest| if (!validSha256(digest)) return error.InvalidSha256;
+    }
+}
+
+pub fn validateModel(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
+    try validateConfigShape(config);
+    try validateCatalogShape(catalog);
+    const effective = model.projectCatalog(config.*, catalog);
+    try validate(&effective, catalog);
+}
+
 /// 只校验启动配置自身的格式和内部一致性。
 ///
 /// 不检查 catalog 引用关系，适用于 CLI 在 catalog 尚未加载时
 /// 对 config 做快速预检。
 pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
-    if (config.schema_version != 1) return error.UnsupportedSchemaVersion;
+    if (config.schema_version != 1 and config.schema_version != 2) return error.UnsupportedSchemaVersion;
     if (config.server.name.len == 0) return error.EmptyServerName;
     if (config.server.bind_interface) |iface| {
         if (iface.len == 0) return error.EmptyBindInterface;
@@ -230,7 +269,7 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
 /// 需要 config 已经通过 `validateConfig`；catalog 中的 distro/version/arch
 /// 必须能在 config 的支持矩阵中找到，asset kind 必须与引用方期望一致。
 pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version != 1) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version != 1 and catalog.schema_version != 2) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.RepositoryConfig, catalog.repositories);
     try uniqueNamed(model.AssetConfig, catalog.assets);
     try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
@@ -632,8 +671,11 @@ fn validSha256(value: []const u8) bool {
     return true;
 }
 
+const test_http: model.HttpConfig = .{ .asset_root = "/tmp/nodeforge/iso", .repository_root = "/tmp/nodeforge/repos" };
+const test_tftp: model.TftpConfig = .{ .asset_root = "/tmp/nodeforge/boot" };
+
 test "最小配置和空 catalog 有效" {
-    const config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
+    const config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
     const cat: model.Catalog = .{};
     try validate(&config, &cat);
 }
@@ -689,6 +731,8 @@ test "DHCP requires an explicit PXE interface" {
 test "install profile must match its install source tuple" {
     const config: model.AppConfig = .{
         .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" },
+        .http = test_http,
+        .tftp = test_tftp,
         .distros = &.{
             .{ .name = "rocky", .family = .rhel, .versions = &.{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }} },
             .{ .name = "ubuntu", .family = .ubuntu, .versions = &.{.{ .version = "22.04", .archs = &.{.aarch64}, .install_adapter = .autoinstall, .package_manager = .apt }} },
@@ -717,7 +761,7 @@ test "拒绝 IPv6 和非法 HTTP 端口" {
 }
 
 test "DHCP 地址池和静态保留必须位于服务子网" {
-    var config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
+    var config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
     config.dhcp.pool_end = "192.168.51.10";
     try std.testing.expectError(error.DhcpPoolOutsideSubnet, validateConfig(&config));
     config.dhcp.pool_end = "192.168.50.10";
@@ -726,7 +770,7 @@ test "DHCP 地址池和静态保留必须位于服务子网" {
 }
 
 test "M4.8 explicit state capacity must fit the compiled safety ceiling" {
-    var config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
+    var config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
     config.dhcp.max_leases = 2049;
     try std.testing.expectError(error.InvalidDhcpCapacity, validateConfig(&config));
     config.dhcp.max_leases = null;
@@ -768,6 +812,8 @@ test "M4.6 kernel args length boundary is 256 bytes" {
 test "M4.6 discovery rejects kernel args and install requires bootloader" {
     var config: model.AppConfig = .{
         .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" },
+        .http = test_http,
+        .tftp = test_tftp,
         .distros = &.{.{ .name = "rocky", .family = .rhel, .versions = &.{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }} }},
         .profiles = &.{.{ .name = "discovery", .mode = .discovery, .distro = "rocky", .version = "9.7", .arch = .aarch64, .kernel_args = "iommu=pt" }},
     };
@@ -777,7 +823,7 @@ test "M4.6 discovery rejects kernel args and install requires bootloader" {
 }
 
 test "拒绝格式错误的 SHA256" {
-    const config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
+    const config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
     const catalog: model.Catalog = .{
         .assets = &.{.{
             .name = "invalid-checksum",

@@ -1311,9 +1311,9 @@ fail closed。logical id 使用统一的小写 ASCII path-safe grammar，展示�
 | --- | --- | --- | --- |
 | 启动/站点配置 | `config.json` | M0 重启 `nodeforged` | server IP、bind interface、HTTP/管理共用端口、资产根目录、安全默认值 |
 | 内置/静态能力 | 代码内置 + 可选配置覆盖 | 重启 `nodeforged` | distro 支持矩阵、adapter 能力表、默认模板 |
-| 人工声明策略（M1+） | `config.json` 或 `config apply` | profile/provisioning bundle 修改需重启；DHCP discovery 策略支持在线切换 | profile、provisioning bundle、默认 discovery/diskless 策略 |
+| 启动与站点策略 | `config.json` 或未来 `config apply` | 离线校验后重启；运行中只读 | server/http/tftp/dhcp/logging/events/policy |
 | 管理 catalog（M1+） | CLI 发起请求，`nodeforged` 导入、构建、扫描、发布 | `nodeforged` 写入 catalog 并更新内存视图，运行期可见 | asset、repository、install source、rootfs、initrd、boot bundle |
-| 批量初始化（M1+） | CLI 导入清单，`nodeforged` 校验和落盘 | `nodeforged` 按对象写入 config/catalog/runtime，必要时提示重启 | 批量导入节点、资产 manifest、repository/install source 清单 |
+| 批量初始化（M1+） | CLI 导入清单，`nodeforged` 校验和落盘 | 管理实体写 catalog，运行事实写 runtime；不回写启动 config | 批量导入节点、profile、资产 manifest、repository/install source 清单 |
 | 运行期常变对象（M1+） | CLI/API 请求，`nodeforged` 执行 | 在线生效或写入 runtime/catalog 后由服务读取 | 节点认领、节点 profile 绑定、未知节点策略开关、租约/会话操作 |
 | 观测排障 | CLI/API | 只读 | status、node status、events list/follow、leases list、journal 或本地文件日志 |
 
@@ -1353,7 +1353,7 @@ sequenceDiagram
 - CLI/API 修改 config/catalog 时由 `nodeforged` 的唯一 ModelTransactionCoordinator 串行提交，锁序固定为 model gate、ConfigRuntime writer、CatalogRuntime writer；服务通过引用计数 snapshot pair 读取。
 - 单文件修改先准备全部分配，再写临时 JSON、fsync、rename，最后发布内存；跨 config/catalog/目录的修改必须写 recovery journal，启动在 listener 前恢复到可证明的 all-old 或 all-new。
 - 写入失败返回明确错误；不得依赖“尽量回滚内存”。磁盘成功后内存发布所需资源必须预分配，联合事务不能以 split-brain 状态对外服务。
-- profile、provisioning bundle 等人工声明策略，MVP 可以要求通过配置文件或 `config apply` 修改并重启服务生效。
+- profile、node、distro、provisioning bundle 都属于 Catalog；运行期 mutation 走 manifest 事务并发布新快照，不能重新塞回 AppConfig。
 - repository、install source、rootfs、initrd、boot bundle 等由导入/构建/发布产生的对象，不要求手写进 `config.json`；它们由 `nodeforged` 写入 catalog，并由服务在运行期间读取。
 - 已绑定 socket 的参数，例如绑定网卡、server IP、HTTP/管理共用端口，MVP 可以提示需要重启 `nodeforged`。
 - DHCP/TFTP 生产端口不能配置，不能通过 CLI 或启动参数修改。

@@ -68,6 +68,7 @@ fn chmod(io: std.Io, allocator: std.mem.Allocator, mode: []const u8, path: []con
 }
 
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: *const model.AppConfig, catalog: *const model.Catalog, store: *boot_session.Store, utc_now: i64, mono_now: i64) !usize {
+    _ = config; // retained in the public signature for checkpoint schema compatibility
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
@@ -78,10 +79,10 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
         if (!boot_session.validId(record.boot_session_id) or !validCapability(&record.capability) or utc_now < record.last_seen_at) continue;
         const elapsed = utc_now - record.last_seen_at;
         if (elapsed >= boot_session.delivery_ttl_seconds) continue;
-        const node = findNode(config, record.node_id) orelse continue;
+        const node = findNode(catalog, record.node_id) orelse continue;
         const node_mac = parseMac(node.mac) catch continue;
         if (!std.mem.eql(u8, node.profile, record.profile) or !std.mem.eql(u8, &record.mac, &node_mac)) continue;
-        const profile = findProfile(config, record.profile) orelse continue;
+        const profile = findProfile(catalog, record.profile) orelse continue;
         if (profile.mode != record.mode) continue;
         var id: [boot_session.id_len]u8 = undefined;
         @memcpy(&id, record.boot_session_id);
@@ -134,12 +135,12 @@ fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-fn findNode(config: *const model.AppConfig, id: []const u8) ?*const model.NodeConfig {
-    for (config.nodes) |*node| if (std.mem.eql(u8, node.id, id)) return node;
+fn findNode(catalog: *const model.Catalog, id: []const u8) ?*const model.NodeConfig {
+    for (catalog.nodes) |*node| if (std.mem.eql(u8, node.id, id)) return node;
     return null;
 }
-fn findProfile(config: *const model.AppConfig, name: []const u8) ?*const model.ProfileConfig {
-    for (config.profiles) |*profile| if (std.mem.eql(u8, profile.name, name)) return profile;
+fn findProfile(catalog: *const model.Catalog, name: []const u8) ?*const model.ProfileConfig {
+    for (catalog.profiles) |*profile| if (std.mem.eql(u8, profile.name, name)) return profile;
     return null;
 }
 fn parseMac(text: []const u8) ![6]u8 {

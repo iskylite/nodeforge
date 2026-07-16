@@ -187,7 +187,7 @@ pub const Mutation = struct {
 };
 
 pub fn nodeAdd(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutation {
-    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "POST", "/api/v1/management/nodes", body, revision, reason_buf);
 }
 
@@ -195,7 +195,7 @@ pub fn nodeSet(io: std.Io, port: u16, node_id: []const u8, body: []const u8, rea
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
     const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}", .{node_id}) catch return .{ .reachable = false, .healthy = false };
-    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "PATCH", value, body, revision, reason_buf);
 }
 
@@ -203,12 +203,12 @@ pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) 
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
     const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}", .{node_id}) catch return .{ .reachable = false, .healthy = false };
-    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "DELETE", value, "", revision, reason_buf);
 }
 
-/// M4.6 只允许修改 profile 的 `kernel_args` 字段。通用 profile CRUD 留给
-/// M4.7 catalog transaction；这里仍使用 config ETag 防止覆盖并发修改。
+/// 只允许修改 profile 的 `kernel_args` 字段；使用 catalog ETag 防止覆盖
+/// 其他 profile/node mutation 已发布的新 generation。
 pub fn profileSetKernelArgs(io: std.Io, port: u16, name: []const u8, kernel_args: ?[]const u8, reason_buf: []u8) Mutation {
     if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
@@ -218,7 +218,7 @@ pub fn profileSetKernelArgs(io: std.Io, port: u16, name: []const u8, kernel_args
     writer.writeAll("{\"kernel_args\":") catch return .{ .reachable = true, .healthy = false };
     std.json.Stringify.value(kernel_args, .{}, &writer) catch return .{ .reachable = true, .healthy = false };
     writer.writeByte('}') catch return .{ .reachable = true, .healthy = false };
-    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "PATCH", value, writer.buffered(), revision, reason_buf);
 }
 
@@ -231,7 +231,7 @@ fn mutationUnreachable(reason_buf: []u8, message: []const u8) Mutation {
     return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "http", message) };
 }
 
-/// 执行带目标 config ETag/If-Match 的管理变更请求。
+/// 执行带目标资源 ETag/If-Match 的管理变更请求。
 /// M4.5 统一按 2xx 判定成功（创建类 POST 返回 201，普通变更返回 200）；
 /// 失败时解析服务端错误信封 `{code,message,request_id}` 并格式化到
 /// `reason_buf`，供 CLI 结构化输出（§9.14.7）。
@@ -287,6 +287,16 @@ fn configRevision(io: std.Io, port: u16) ?u64 {
     const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
     return parsed.value.result.revision;
+}
+
+fn catalogRevision(io: std.Io, port: u16) ?u64 {
+    var buffer: [4096]u8 = undefined;
+    const maybe_body = managementJson(io, port, "/api/v1/management/config", &buffer) catch return null;
+    const body = maybe_body orelse return null;
+    const Response = struct { result: struct { catalog_revision: u64 } };
+    const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.result.catalog_revision;
 }
 
 /// M4.5：HTTP 响应解析结果。`body` 在状态码不在允许集合或无 body 时为 null；

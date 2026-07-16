@@ -102,7 +102,7 @@ fn resolveInstall(
     _ = identity.mac;
     _ = identity.lease_ip;
     // 按 profile 名称查找启动配置中的 profile 定义。
-    const profile = lookup.findProfile(config, identity.profile) orelse return null;
+    const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
     // install profile 必须引用一个 install source。
     const source_name = profile.install_source orelse return null;
     // 在 catalog 中查找已发布的 install source（由 ISO 导入流程创建）。
@@ -125,7 +125,7 @@ fn resolveInstall(
     // - Ubuntu live-server 由 casper（initramfs 中的脚本）通过 HTTP 下载 ISO，
     //   loop mount 后进入 Subiquity 安装器。
     // - RHEL 系由 Anaconda 直接从 DNF repository 下载安装树（RPM 包）。
-    const distro = lookup.findDistro(config, source.distro) orelse return null;
+    const distro = lookup.findDistro(catalog, source.distro) orelse lookup.findDistro(config, source.distro) orelse return null;
     const cmdline = if (distro.family == .ubuntu) blk: {
         // Ubuntu 的 live-server 安装器基于 casper。`inst.repo` 是 Anaconda 专用
         // 参数，在此被忽略；casper 需要已发布的 ISO URL 来下载并 loop mount ISO。
@@ -194,7 +194,7 @@ fn resolveDiskless(
     http_port: u16,
     cmdline_buf: []u8,
 ) ?BootTarget {
-    const profile = lookup.findProfile(config, identity.profile) orelse return null;
+    const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
     const bundle_name = profile.boot_bundle orelse return null;
     const bundle = lookup.findBootBundle(catalog, bundle_name) orelse return null;
 

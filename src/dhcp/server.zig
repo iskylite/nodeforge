@@ -162,7 +162,7 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
         return;
     };
     if (!rearm.changed) return;
-    deployment_control.save(io, p.allocator, paths.deployment_control_path, deployments) catch |err| {
+    deployment_control.save(io, p.allocator, paths.require().deployment_control_path, deployments) catch |err| {
         deployments.rollbackRearm(node_id, rearm);
         observe_log.err("dhcp: automatic install generation persistence failed: {t}", .{err});
         return;

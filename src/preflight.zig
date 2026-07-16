@@ -53,7 +53,9 @@ pub fn checkInstallSourcePrerequisites(io: std.Io, allocator: std.mem.Allocator)
     if (!hasLinuxCapSysAdmin(io, allocator)) return error.InstallSourceCapabilityUnavailable;
     commandSucceeds(io, allocator, &.{ "mount", "--version" }) catch return error.InstallSourceMountUnavailable;
     commandSucceeds(io, allocator, &.{ "umount", "--version" }) catch return error.InstallSourceMountUnavailable;
-    std.Io.Dir.cwd().createDirPath(io, @import("paths.zig").work_dir ++ "/mount-check") catch return error.InstallSourceMountUnavailable;
+    const mount_check = std.fmt.allocPrint(allocator, "{s}/mount-check", .{@import("paths.zig").require().work_dir}) catch return error.InstallSourceMountUnavailable;
+    defer allocator.free(mount_check);
+    std.Io.Dir.cwd().createDirPath(io, mount_check) catch return error.InstallSourceMountUnavailable;
 }
 
 fn hasLinuxCapSysAdmin(io: std.Io, allocator: std.mem.Allocator) bool {

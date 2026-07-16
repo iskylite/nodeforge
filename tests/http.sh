@@ -14,6 +14,16 @@ tmp=${TMPDIR:-/tmp}/nodeforge-http-test-$$
 port=$((20000 + ($$ % 10000)))
 mkdir -p "$tmp"
 
+# Exercise M4.7 executable-based install-root discovery rather than allowing
+# test-only fallback paths.
+install="$tmp/install"
+mkdir -p "$install/bin"
+cp "$cli" "$install/bin/nodeforge"
+cp "$daemon" "$install/bin/nodeforged"
+: >"$install/.nodeforge-root"
+cli="$install/bin/nodeforge"
+daemon="$install/bin/nodeforged"
+
 pid=
 stop_daemon() {
     if [ -n "$pid" ]; then
@@ -62,25 +72,24 @@ grep -Fq '"config_valid":true' "$tmp/status"
 curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/validations" >"$tmp/validate"
 grep -Fqx '{"ok":true,"result":{}}' "$tmp/validate"
 
-# M4.4: config/reload route deleted; config mutations now use PATCH /management/config
-# which publishes in-process. The CLI config set test below exercises this path.
-
-# M4.3 runtime-safe config set publishes in-process; listener fields are
-# classified restart-required and leave the file unchanged.
-"$cli" config set logging.level=info events.keep=4 -c "$tmp/config.json" >"$tmp/config-set"
+# M4.7 makes startup config offline-only. The compatibility PATCH route returns
+# a stable actionable conflict and must never rewrite config.json.
+before_offline_only=$(sha256sum "$tmp/config.json" | awk '{print $1}')
+if "$cli" config set logging.level=info events.keep=4 -c "$tmp/config.json" >"$tmp/config-set" 2>&1; then
+    echo "online startup config mutation unexpectedly succeeded" >&2
+    exit 1
+fi
 kill -0 "$pid"
-grep -Fq '"level": "info"' "$tmp/config.json"
-grep -Fq '"keep": 4' "$tmp/config.json"
-before_restart_required=$(sha256sum "$tmp/config.json" | awk '{print $1}')
+grep -Fq 'config.offline_only' "$tmp/config-set"
+test "$before_offline_only" = "$(sha256sum "$tmp/config.json" | awk '{print $1}')"
 if "$cli" config set server.http_port=29999 -c "$tmp/config.json" >"$tmp/config-restart" 2>&1; then
-    echo "restart-required config mutation unexpectedly succeeded" >&2
+    echo "online listener config mutation unexpectedly succeeded" >&2
     exit 1
 fi
 # M4.5：CLI 把 4xx/5xx 错误信封映射为结构化输出（code + request_id）。
-grep -Fq 'config.restart_required' "$tmp/config-restart"
+grep -Fq 'config.offline_only' "$tmp/config-restart"
 grep -Fq 'request_id=' "$tmp/config-restart"
-after_restart_required=$(sha256sum "$tmp/config.json" | awk '{print $1}')
-test "$before_restart_required" = "$after_restart_required"
+test "$before_offline_only" = "$(sha256sum "$tmp/config.json" | awk '{print $1}')"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-view"
 grep -Fq '"items":[]' "$tmp/nodes-view"
 grep -Eq '"view_revision":\{"config":[0-9]+,"catalog":[0-9]+,"node_status":[0-9]+,"deployment":[0-9]+,"inventory":[0-9]+\}' "$tmp/nodes-view"

@@ -41,7 +41,7 @@ pub const Decision = struct {
 /// 按已注册 MAC 或 unknown-client policy 解析启动行为和可审计的配置身份。
 ///
 /// 解析顺序：
-/// 1. 遍历 config.nodes，按 MAC 匹配已注册节点。
+/// 1. 遍历投影到本次不可变模型视图的 catalog nodes，按 MAC 匹配已注册节点。
 ///    - 如果匹配到，检查 PXE 架构是否与节点配置一致（M3.6）。
 ///    - 架构一致：返回对应架构的 GRUB bootfile 和 profile/mode。
 ///    - 架构不一致：仍返回 known=true 和 profile/mode（lease 可发放用于诊断），

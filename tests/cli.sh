@@ -8,6 +8,17 @@ tmp=${TMPDIR:-/tmp}/nodeforge-cli-test-$$
 mkdir -p "$tmp"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
+# M4.7 bootstrap deliberately rejects build-cache binaries: a valid process
+# image must live in a marked install root with its same-build sibling. Copy
+# both artifacts so this contract exercises the production discovery path.
+install="$tmp/install"
+mkdir -p "$install/bin"
+cp "$cli" "$install/bin/nodeforge"
+cp "$daemon" "$install/bin/nodeforged"
+: >"$install/.nodeforge-root"
+cli="$install/bin/nodeforge"
+daemon="$install/bin/nodeforged"
+
 "$cli" --help >"$tmp/root-help"
 grep -q "NodeForge administration CLI" "$tmp/root-help"
 grep -q "Available commands:" "$tmp/root-help"

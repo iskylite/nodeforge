@@ -4,7 +4,7 @@
 //! 所有类型和函数都从本模块或其子模块引用。
 //!
 //! 模块层次：
-//! - `model` / `paths` / `version`：编译期已知的事实模型和路径常量。
+//! - `model` / `paths` / `version`：事实模型、启动时只初始化一次的路径投影和构建版本。
 //! - `config` / `config_store` / `config_validate`：启动配置的加载、持久化和校验。
 //! - `catalog` / `catalog_store` / `iso_import`：节点 catalog 的管理、持久化和 ISO 导入。
 //! - `app` / `preflight`：daemon 应用入口和启动前预检。
@@ -20,8 +20,10 @@ const std = @import("std");
 
 /// 配置事实模型：定义 AppConfig、Catalog、Asset、Profile 等核心结构体。
 pub const model = @import("model.zig");
-/// 受管路径常量：定义 import_dir、work_dir、events_path 等安全边界路径。
+/// 运行时受管路径：从已验证 install root 派生 import/work/events 等安全边界。
 pub const paths = @import("paths.zig");
+/// M4.7 安装初始化、legacy 迁移、reset 与 systemd unit 生成。
+pub const setup = @import("setup.zig");
 /// 项目版本字符串，从 build.zon 注入。
 pub const version = @import("version.zig");
 /// Catalog 查找工具：按名称查找 distro/profile/asset/repository 等对象。
@@ -39,9 +41,9 @@ pub const config = @import("config/load.zig");
 pub const config_store = @import("config/store.zig");
 /// 配置和 catalog 校验器：纯函数校验所有不变量和跨文件引用关系。
 pub const config_validate = @import("config/validate.zig");
-/// M4.2 节点资源增删改：load-modify-validate-save 原子写回 config.json。
+/// 节点资源增删改：load-modify-validate-save 事务写回 catalog/nodes.json。
 pub const node_mutation = @import("config/node_mutation.zig");
-/// M4.6 profile kernel_args 的受限 load-modify-validate-save 写入器。
+/// Profile kernel_args 的受限、规范化 catalog 事务写入器。
 pub const profile_mutation = @import("config/profile_mutation.zig");
 /// 启动前预检：检查端口可用性、目录权限和必需的系统 capability。
 pub const preflight = @import("preflight.zig");
@@ -126,6 +128,7 @@ pub const cli_events = @import("cli/events.zig");
 test {
     _ = model;
     _ = paths;
+    _ = setup;
     _ = version;
     _ = catalog;
     _ = catalog_store;

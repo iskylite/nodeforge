@@ -10,6 +10,7 @@
 - [M4.3 模型、运行态与可观测性专项设计](docs/superpowers/specs/2026-07-15-m4_3-model-runtime-observability-design.md)
 - [M4.4 HTTP API URL 契约专项设计](docs/superpowers/specs/2026-07-15-m4_4-http-api-url-contract-design.md)
 - [M4.6 自定义内核引导参数专项设计](docs/superpowers/specs/2026-07-16-kernel-args-custom-boot-params-design.md)
+- [M4.7 路径、模型存储与 setup 验证记录](docs/M4_7_VALIDATION.md)
 - [M4.8 并发容量扩展与启动时动态派生专项设计](docs/superpowers/specs/2026-07-17-concurrency-capacity-scaling-design.md)
 - [M0–M4.1 实现审计](docs/M0_M4_AUDIT.md)
 - [Rocky Linux 8.10 aarch64 VMware PXE 验证](docs/ROCKY_8_10_VALIDATION.md)
@@ -46,8 +47,8 @@ M4.4 已将节点交付 API 统一到 `/api/v1/nodes/:id/**`，本机管理 API 
 install-config 路径并把 rootfs 绑定 node capability；集中 RouteSpec/405 等工程化遗留统一转入 M4.5。旧 URL 不依赖
 redirect/alias，M4.4 直接替换并删除；切换前必须结束并清理 M4.3 session/checkpoint，残留旧 schema 拒绝启动且不
 自动 rearm。M4.5–M4.8 是进入 M5 前的现行补全方案（M4.8 编号在 M4.7 之后、实施早于 M4.6）：M4.5 承接 RouteSpec/405、golden DTO、分页、目标 ETag、
-持久 Operation/Idempotency-Key 和健壮 HTTP client；M4.6 增加安全 canonical 的 `profile.kernel_args`；M4.7
-通过 runtime Paths、schema/manifest、多文件事务和 `nodeforge setup` 收口部署与 config/catalog ownership；M4.8 将 5 处定长 256 上限升级为“2048 安全天花板 + 启动时 effective 派生”，加入紧凑状态持久化、TFTP 并发 `auto=max(128,2×核)` 与 DHCP `ping_timeout` 优化，使运维在安全天花板内仅靠配置即可把批量部署规模调到 512/1024（详见 §9.17）。
+持久 Operation/Idempotency-Key 和健壮 HTTP client；M4.6 增加安全 canonical 的 `profile.kernel_args`；M4.7 已通过
+runtime Paths、schema 2、manifest/entity 事务和 `nodeforge setup` 收口部署与 config/catalog ownership；M4.8 将 5 处定长 256 上限升级为“2048 安全天花板 + 启动时 effective 派生”，加入紧凑状态持久化、TFTP 并发 `auto=max(128,2×核)` 与 DHCP `ping_timeout` 优化，使运维在安全天花板内仅靠配置即可把批量部署规模调到 512/1024（详见 §9.17）。
 它们不回改 M4.4 已验证 URL 和安装链路，但 M5–M7 必须消费完成后的统一模型。
 
 NodeForge 配置中所有语义为 `password` 的字段都允许填写明文，并以明文写入 JSON、导入和导出；
@@ -62,9 +63,8 @@ M4.5 已实施 HTTP 契约补全：集中 RouteSpec（含启动冲突/wildcard �
 有界 cursor 分页（CLI `node list`/`profile list` 跟随 `next_cursor`）、持久 Operation 幂等语义、客户端 202 轮询
 以及完整有界 response reader（含 204/空 body/非 2xx body）。install-config 与 boot-config 同样设置完整安全头。
 M4.5 契约已在 Rocky 9.7 aarch64 验证目标以 root 端到端回归（详见 §9.14.14）。
-M4.6–M4.8 契约分别以详细设计
-§9.15–§9.17 为准（M4.8 实施早于 M4.6）。相关变更必须同步更新代码、示例配置、
-fixture 和验证记录，不能把设计完成误写成代码已完成。
+M4.6–M4.8 契约分别以详细设计 §9.15–§9.17 为准（M4.8 实施早于 M4.6）。M4.6/M4.7 已落地并有自动验证；
+M4.7 的 systemd 激活/回滚仍必须在 Rocky 主机完成实机清单后才能形成部署环境验收结论。
 
 ## 开发
 
@@ -95,15 +95,26 @@ make arm64-debug    # 交叉编译 aarch64 Debug 二进制
 `make arm64` 使用 `aarch64-linux-gnu`；可通过 `ARM64_TARGET=<zig-target>` 覆盖目标三元组。
 交叉构建产物仍位于 `zig-out/bin/`，再次执行 `make build` 可恢复本机架构产物。
 
-当前实现正常安装默认使用 `/opt/nodeforge/config/config.json` 和单文件 catalog。M4.7 后默认根仍为
-`/opt/nodeforge`，但 catalog 变为 `catalog/manifest.json` + entity files，自定义根由 runtime Paths/marker 发现；
-`--config`/`--catalog` 只用于开发、迁移和排障，后者届时指向目录。
+正常安装默认根是 `/opt/nodeforge`，config 使用 schema 2 的 `config/config.json`，catalog 使用
+`catalog/manifest.json` + 8 个 entity files。自定义根由真实 executable、`.nodeforge-root` 和成对二进制布局发现；
+`--config`/`--catalog` 只用于开发、迁移和排障，后者指向 catalog 目录。
 
-当前安装布局的事实源是 `src/paths.zig` 的默认根；M4.7 将其升级为启动时初始化一次的 runtime `Paths`。ISO、TFTP
+安装布局的事实源是 `src/paths.zig` 启动时初始化一次的 runtime `Paths`。ISO、TFTP
 启动文件、仓库、密钥、rootfs、initrd 与 bundle 分别位于 `assets/iso`、`assets/boot`、`assets/repos`、
 `assets/keys`、`assets/rootfs`、`assets/initrd`、`assets/bundles`；运行态 provisioning 结果位于
-`state/provisioned`。升级旧安装前先停止服务并执行 `packaging/install-layout.sh`；它会迁移旧数据、更新
-config/catalog、移除旧路径，并从同一事实源渲染 systemd unit。
+`state/provisioned`。新装或旧 schema 迁移使用同版本、同架构且同时包含 `nodeforge`/`nodeforged` 的 bundle：
+
+```bash
+./nodeforge setup --install-root /srv/nodeforge --non-interactive --yes \
+  --bind-interface enp1s0 --server-ip 192.168.50.1 \
+  --subnet 192.168.50.0/24 --pool-start 192.168.50.100 --pool-end 192.168.50.200
+./nodeforge setup --install-root /srv/nodeforge --generate-systemd --print
+./nodeforge setup --install-root /srv/nodeforge --reset-state --non-interactive --yes
+```
+
+`setup --reconfigure` 对 schema 1 执行带 marker/备份的幂等迁移；`--reset-state` 先恢复事务，再生成带 SHA-256
+manifest 的备份；reset 检测到 daemon 可达时会拒绝执行，必须先停服务。`--generate-systemd --install --yes` 才触发 systemd 生命周期操作，并在模型加载或 loopback
+`/healthz` 失败时恢复旧 unit 与启停状态。
 
 `config.example.json` 中的 `server.bind_interface = "enp1s0"` 是 Linux PXE 网卡占位值；部署
 DHCP 前必须替换为承载 `server.server_ip` 的实际接口。当前 DHCPv4 服务会拒绝空值，避免 wildcard

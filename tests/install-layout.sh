@@ -6,8 +6,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 test_root="$tmp/nodeforge"
-mkdir -p "$tmp/repo/src" "$tmp/repo/packaging/systemd"
-sed "s|/opt/nodeforge|$test_root|" "$repo_root/src/paths.zig" >"$tmp/repo/src/paths.zig"
+mkdir -p "$tmp/repo/packaging/systemd"
 cp "$repo_root/packaging/install-layout.sh" "$tmp/repo/packaging/"
 cp "$repo_root/packaging/systemd/nodeforged.service" "$tmp/repo/packaging/systemd/nodeforged.service"
 
@@ -29,7 +28,7 @@ cat >"$test_root/catalog/catalog.json" <<'EOF'
 {"assets":[{"name":"iso","kind":"iso","path":"iso/rocky.iso"},{"name":"legacy-iso","kind":"iso","path":"legacy.iso"},{"name":"kernel","kind":"kernel","path":"install/rocky/vmlinuz"}]}
 EOF
 
-sh "$tmp/repo/packaging/install-layout.sh"
+NODEFORGE_INSTALL_ROOT="$test_root" sh "$tmp/repo/packaging/install-layout.sh"
 
 [ ! -e "$test_root/tftp" ]
 [ ! -e "$test_root/repos" ]
@@ -48,4 +47,4 @@ sh "$tmp/repo/packaging/install-layout.sh"
 [ "$(jq -r '.assets[2].path' "$test_root/catalog/catalog.json")" = "install/rocky/vmlinuz" ]
 grep -Fq "WorkingDirectory=$test_root" "$test_root/systemd/nodeforged.service"
 
-sh "$tmp/repo/packaging/install-layout.sh"
+NODEFORGE_INSTALL_ROOT="$test_root" sh "$tmp/repo/packaging/install-layout.sh"

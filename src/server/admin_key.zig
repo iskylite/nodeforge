@@ -9,11 +9,21 @@ const paths = @import("../paths.zig");
 
 pub const Error = error{ ServerAdminKeyUnavailable, InvalidPublicKey } || std.mem.Allocator.Error;
 
-const generated_dir = paths.keys_dir;
-const generated_private = generated_dir ++ "/id_ed25519";
-const generated_public = generated_private ++ ".pub";
-const generated_private_temp = generated_private ++ ".tmp";
-const generated_public_temp = generated_private_temp ++ ".pub";
+fn generatedDir() []const u8 {
+    return paths.require().keys_dir;
+}
+fn generatedPrivate() []const u8 {
+    return paths.require().bootstrap_private_key_path;
+}
+fn generatedPublic() []const u8 {
+    return paths.require().bootstrap_public_key_path;
+}
+fn generatedPrivateTemp() []const u8 {
+    return paths.require().bootstrap_private_key_temp_path;
+}
+fn generatedPublicTemp() []const u8 {
+    return paths.require().bootstrap_public_key_temp_path;
+}
 
 pub fn resolve(io: std.Io, allocator: std.mem.Allocator, server: model.ServerConfig) ![]u8 {
     // 显式多公钥数组是最高优先级事实源。第一个 key 作为兼容旧渲染接口的
@@ -31,37 +41,37 @@ pub fn resolve(io: std.Io, allocator: std.mem.Allocator, server: model.ServerCon
     for ([_][]const u8{ "/root/.ssh/id_rsa.pub", "/root/.ssh/id_ed25519.pub" }) |path| {
         if (readKey(io, allocator, path)) |key| return key else |_| {}
     }
-    if (readKey(io, allocator, generated_public)) |key| {
+    if (readKey(io, allocator, generatedPublic())) |key| {
         errdefer allocator.free(key);
-        if (!try pairMatches(io, allocator, generated_private, key)) return error.ServerAdminKeyUnavailable;
+        if (!try pairMatches(io, allocator, generatedPrivate(), key)) return error.ServerAdminKeyUnavailable;
         return key;
     } else |err| if (err != error.FileNotFound) return error.ServerAdminKeyUnavailable;
-    if (try pathExists(io, generated_private)) return error.ServerAdminKeyUnavailable;
-    try std.Io.Dir.cwd().createDirPath(io, generated_dir);
+    if (try pathExists(io, generatedPrivate())) return error.ServerAdminKeyUnavailable;
+    try std.Io.Dir.cwd().createDirPath(io, generatedDir());
     const dir = std.Io.Dir.cwd();
-    dir.deleteFile(io, generated_private_temp) catch {};
-    dir.deleteFile(io, generated_public_temp) catch {};
-    errdefer dir.deleteFile(io, generated_private_temp) catch {};
-    errdefer dir.deleteFile(io, generated_public_temp) catch {};
-    const result = std.process.run(allocator, io, .{ .argv = &.{ "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", generated_private_temp }, .stdout_limit = .limited(1024), .stderr_limit = .limited(4096) }) catch return error.ServerAdminKeyUnavailable;
+    dir.deleteFile(io, generatedPrivateTemp()) catch {};
+    dir.deleteFile(io, generatedPublicTemp()) catch {};
+    errdefer dir.deleteFile(io, generatedPrivateTemp()) catch {};
+    errdefer dir.deleteFile(io, generatedPublicTemp()) catch {};
+    const result = std.process.run(allocator, io, .{ .argv = &.{ "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", generatedPrivateTemp() }, .stdout_limit = .limited(1024), .stderr_limit = .limited(4096) }) catch return error.ServerAdminKeyUnavailable;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     switch (result.term) {
         .exited => |code| if (code != 0) return error.ServerAdminKeyUnavailable,
         else => return error.ServerAdminKeyUnavailable,
     }
-    const public_key = readKey(io, allocator, generated_public_temp) catch return error.ServerAdminKeyUnavailable;
+    const public_key = readKey(io, allocator, generatedPublicTemp()) catch return error.ServerAdminKeyUnavailable;
     defer allocator.free(public_key);
-    if (!try pairMatches(io, allocator, generated_private_temp, public_key)) return error.ServerAdminKeyUnavailable;
-    try chmod(io, allocator, generated_dir, "700");
-    try chmod(io, allocator, generated_private_temp, "600");
-    try chmod(io, allocator, generated_public_temp, "644");
-    try syncFile(io, generated_private_temp);
-    try syncFile(io, generated_public_temp);
-    try std.Io.Dir.rename(dir, generated_private_temp, dir, generated_private, io);
-    try std.Io.Dir.rename(dir, generated_public_temp, dir, generated_public, io);
-    try syncDirectory(io, generated_dir);
-    return readKey(io, allocator, generated_public) catch error.ServerAdminKeyUnavailable;
+    if (!try pairMatches(io, allocator, generatedPrivateTemp(), public_key)) return error.ServerAdminKeyUnavailable;
+    try chmod(io, allocator, generatedDir(), "700");
+    try chmod(io, allocator, generatedPrivateTemp(), "600");
+    try chmod(io, allocator, generatedPublicTemp(), "644");
+    try syncFile(io, generatedPrivateTemp());
+    try syncFile(io, generatedPublicTemp());
+    try std.Io.Dir.rename(dir, generatedPrivateTemp(), dir, generatedPrivate(), io);
+    try std.Io.Dir.rename(dir, generatedPublicTemp(), dir, generatedPublic(), io);
+    try syncDirectory(io, generatedDir());
+    return readKey(io, allocator, generatedPublic()) catch error.ServerAdminKeyUnavailable;
 }
 
 /// M4.2 F5：解析主 key 之外需要一并注入的 SSH 公钥。
@@ -114,7 +124,7 @@ fn readImportedKeys(io: std.Io, allocator: std.mem.Allocator) ![][]const u8 {
         for (names.items) |name| allocator.free(name);
         names.deinit(allocator);
     }
-    var dir = std.Io.Dir.cwd().openDir(io, generated_dir, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(io, generatedDir(), .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return allocator.alloc([]const u8, 0),
         else => return err,
     };
@@ -137,7 +147,7 @@ fn readImportedKeys(io: std.Io, allocator: std.mem.Allocator) ![][]const u8 {
         imported.deinit(allocator);
     }
     for (names.items) |name| {
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ generated_dir, name });
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ generatedDir(), name });
         defer allocator.free(path);
         const key = readKey(io, allocator, path) catch continue;
         var duplicate = false;
@@ -281,13 +291,13 @@ pub fn sourceLabel(io: std.Io, allocator: std.mem.Allocator, server: model.Serve
         if (sameKey(configured, key)) return allocator.dupe(u8, "config:server.ssh_authorized_public_key");
     }
 
-    var directory = std.Io.Dir.cwd().openDir(io, generated_dir, .{ .iterate = true, .follow_symlinks = false }) catch null;
+    var directory = std.Io.Dir.cwd().openDir(io, generatedDir(), .{ .iterate = true, .follow_symlinks = false }) catch null;
     if (directory) |*dir| {
         defer dir.close(io);
         var iterator = dir.iterate();
         while (iterator.next(io) catch null) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".pub")) continue;
-            const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ generated_dir, entry.name });
+            const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ generatedDir(), entry.name });
             const candidate = readKey(io, allocator, path) catch {
                 allocator.free(path);
                 continue;

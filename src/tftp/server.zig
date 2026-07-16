@@ -365,7 +365,7 @@ fn transferVirtualConfig(
         // 渲染结果写入栈缓冲区，在 TFTP I/O 开始前就已完成自包含，
         // 因此慢速客户端不会长时间持有 catalog mutex。
         const target = boot_target.resolve(identity, config, catalog.value(), config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
-        const node = lookup.findNode(config, identity.node_id) orelse return error.BootTargetUnavailable;
+        const node = lookup.findNode(catalog.value(), identity.node_id) orelse return error.BootTargetUnavailable;
         // M4.2 F4：node.http_accel 是实验性功能（默认 false）。
         // 启用时，initrd 路径渲染为 GRUB HTTP URL
         // `(http,server:port)/artifacts/boot/<path>` 而非 TFTP `/<path>`。
@@ -842,7 +842,7 @@ fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remot
             count += 1;
         }
     }
-    target.appendWithFields(io, allocator, @import("../paths.zig").events_path, event_type, message, fields[0..count]) catch |err|
+    target.appendWithFields(io, allocator, @import("../paths.zig").require().events_path, event_type, message, fields[0..count]) catch |err|
         observe_log.err("tftp: event append failed: {t}", .{err});
 }
 

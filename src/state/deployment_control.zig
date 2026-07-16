@@ -6,6 +6,19 @@
 const std = @import("std");
 const dhcp_store = @import("dhcp_store.zig");
 const model = @import("../model.zig");
+const config_store = @import("../config/store.zig");
+const catalog_store = @import("../catalog/store.zig");
+
+pub const ModelRevision = struct {
+    config: u64,
+    catalog: u64,
+    desired_digest: [64]u8,
+
+    pub fn desiredRevision(self: ModelRevision) u64 {
+        const value = std.fmt.parseInt(u64, self.desired_digest[0..16], 16) catch unreachable;
+        return if (value == 0) 1 else value;
+    }
+};
 const capacity = @import("capacity.zig");
 
 /// M4.8: 投影表内存天花板；生效容量由 `Store.effective` 在启动时按
@@ -466,44 +479,34 @@ fn validNodeId(value: []const u8) bool {
 /// 仅以不透明 u64 存储；此辅助函数不会将密码、密钥或序列化配置
 /// 写入日志/事件/状态文件。
 pub fn revisionForConfig(allocator: std.mem.Allocator, config: *const model.AppConfig) !u64 {
-    var json: std.Io.Writer.Allocating = .init(allocator);
-    defer json.deinit();
-    try std.json.Stringify.value(config.*, .{}, &json.writer);
+    const json = try config_store.render(allocator, config);
+    defer allocator.free(json);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    // M4.6 在 ProfileConfig 末尾新增 optional kernel_args。缺省与 null 语义
-    // 相同，不能仅因新二进制认识该字段就改变 config revision，否则滚动升级
-    // 会切断活动 session/status 的来源关联。非空 kernel_args 仍保留在 canonical
-    // 字节中，并按预期产生新的 revision。
-    hashConfigRevision(json.written(), &digest);
+    // config_store 只渲染 schema 2 启动字段；profile.kernel_args 等 Catalog
+    // mutation 因而不会伪装成 config revision，滚动升级也不会切断启动配置来源。
+    std.crypto.hash.sha2.Sha256.hash(json, &digest, .{});
     const value = std.mem.readInt(u64, digest[0..8], .big);
     return if (value == 0) 1 else value;
 }
 
-fn hashConfigRevision(bytes: []const u8, digest: *[std.crypto.hash.sha2.Sha256.digest_length]u8) void {
-    const omitted_default = ",\"kernel_args\":null";
+/// config/catalog 两条 revision 与不可变期望模型 digest 的统一投影。catalog
+/// mutation 不再伪装成 config revision；部署控制使用 digest 折叠值判断 drift。
+pub fn revisionForModel(allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *const model.Catalog) !ModelRevision {
+    const config_json = try config_store.render(allocator, config);
+    defer allocator.free(config_json);
+    const catalog_json = try catalog_store.render(allocator, catalog);
+    defer allocator.free(catalog_json);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    var remaining = bytes;
-    while (std.mem.indexOf(u8, remaining, omitted_default)) |index| {
-        hash.update(remaining[0..index]);
-        remaining = remaining[index + omitted_default.len ..];
-    }
-    hash.update(remaining);
-    hash.final(digest);
+    hash.update(config_json);
+    hash.update(catalog_json);
+    var raw: [32]u8 = undefined;
+    hash.final(&raw);
+    var desired: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&desired, "{x}", .{raw}) catch unreachable;
+    return .{ .config = try revisionForConfig(allocator, config), .catalog = if (catalog.revision == 0) 1 else catalog.revision, .desired_digest = desired };
 }
 
-test "M4.6 null kernel args preserve the pre-field config revision" {
-    const LegacyProfile = struct {
-        name: []const u8,
-        mode: model.ProfileMode,
-        distro: []const u8,
-        version: []const u8,
-        arch: model.Arch,
-        install_source: ?[]const u8 = null,
-        boot_bundle: ?[]const u8 = null,
-        safety: model.ProfileSafetyConfig = .{},
-        system: model.TargetSystemConfig = .{},
-        install: ?model.InstallConfig = null,
-    };
+test "M4.7 config revision excludes catalog-owned profiles" {
     var profiles = [_]model.ProfileConfig{.{
         .name = "rocky-install",
         .mode = .install,
@@ -517,42 +520,10 @@ test "M4.6 null kernel args preserve the pre-field config revision" {
         .server = .{ .server_ip = "192.168.50.1" },
         .profiles = &profiles,
     };
-    const profile = config.profiles[0];
-    const legacy_profiles = [_]LegacyProfile{.{
-        .name = profile.name,
-        .mode = profile.mode,
-        .distro = profile.distro,
-        .version = profile.version,
-        .arch = profile.arch,
-        .install_source = profile.install_source,
-        .boot_bundle = profile.boot_bundle,
-        .safety = profile.safety,
-        .system = profile.system,
-        .install = profile.install,
-    }};
-    const legacy_config = .{
-        .schema_version = config.schema_version,
-        .server = config.server,
-        .http = config.http,
-        .tftp = config.tftp,
-        .dhcp = config.dhcp,
-        .capacity = config.capacity,
-        .logging = config.logging,
-        .events = config.events,
-        .distros = config.distros,
-        .profiles = &legacy_profiles,
-        .nodes = config.nodes,
-        .provisioning_bundles = config.provisioning_bundles,
-        .policy = config.policy,
-    };
-    const legacy_json = try std.json.Stringify.valueAlloc(std.testing.allocator, legacy_config, .{});
-    defer std.testing.allocator.free(legacy_json);
-    var legacy_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(legacy_json, &legacy_digest, .{});
-    const expected = std.mem.readInt(u64, legacy_digest[0..8], .big);
-    try std.testing.expectEqual(if (expected == 0) @as(u64, 1) else expected, try revisionForConfig(std.testing.allocator, &config));
-
+    const expected = try revisionForConfig(std.testing.allocator, &config);
     profiles[0].kernel_args = "iommu=pt";
+    try std.testing.expectEqual(expected, try revisionForConfig(std.testing.allocator, &config));
+    config.events.keep += 1;
     try std.testing.expect((try revisionForConfig(std.testing.allocator, &config)) != expected);
 }
 

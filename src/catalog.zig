@@ -5,19 +5,19 @@
 const model = @import("model.zig");
 
 /// 按名称查找发行版。
-pub fn findDistro(config: *const model.AppConfig, name: []const u8) ?*const model.DistroConfig {
-    for (config.distros) |*item| if (equal(item.name, name)) return item;
+pub fn findDistro(source: anytype, name: []const u8) ?*const model.DistroConfig {
+    for (source.distros) |*item| if (equal(item.name, name)) return item;
     return null;
 }
 
 /// 查找发行版版本，并同时确认目标架构已经列入支持矩阵。
 pub fn findDistroVersion(
-    config: *const model.AppConfig,
+    source: anytype,
     distro_name: []const u8,
     version: []const u8,
     arch: model.Arch,
 ) ?*const model.DistroVersionConfig {
-    const distro = findDistro(config, distro_name) orelse return null;
+    const distro = findDistro(source, distro_name) orelse return null;
     for (distro.versions) |*item| {
         if (!equal(item.version, version)) continue;
         for (item.archs) |item_arch| if (item_arch == arch) return item;
@@ -56,14 +56,14 @@ pub fn findBootBundle(catalog: *const model.Catalog, name: []const u8) ?*const m
 }
 
 /// 按稳定名称查找 profile。
-pub fn findProfile(config: *const model.AppConfig, name: []const u8) ?*const model.ProfileConfig {
-    for (config.profiles) |*item| if (equal(item.name, name)) return item;
+pub fn findProfile(source: anytype, name: []const u8) ?*const model.ProfileConfig {
+    for (source.profiles) |*item| if (equal(item.name, name)) return item;
     return null;
 }
 
 /// 按节点 ID 查找已显式认领的节点。安装 answer 只能为这类节点渲染。
-pub fn findNode(config: *const model.AppConfig, id: []const u8) ?*const model.NodeConfig {
-    for (config.nodes) |*item| if (equal(item.id, id)) return item;
+pub fn findNode(source: anytype, id: []const u8) ?*const model.NodeConfig {
+    for (source.nodes) |*item| if (equal(item.id, id)) return item;
     return null;
 }
 

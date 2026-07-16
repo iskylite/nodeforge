@@ -18,9 +18,27 @@ pub fn main(init: std.process.Init) void {
     var stdin_buffer: [1024]u8 = undefined;
     var stdin_file = std.Io.File.Reader.init(.stdin(), init.io, &stdin_buffer);
 
+    if (versionOnly(init.minimal.args)) {
+        printVersion(&stdout_file.interface) catch std.process.exit(1);
+        stdout_file.interface.flush() catch {};
+        return;
+    }
+
+    nodeforge.paths.bootstrap(init.io, init.arena.allocator(), init.minimal.args) catch |err| {
+        nodeforge.observe_log.err("install root bootstrap failed: {t}", .{err});
+        std.process.exit(1);
+    };
+
     const exit_code = run(init, &stdout_file.interface, &stdin_file.interface) catch 1;
     stdout_file.interface.flush() catch {};
     if (exit_code != 0) std.process.exit(exit_code);
+}
+
+fn versionOnly(args: std.process.Args) bool {
+    var iterator = args.iterate();
+    _ = iterator.next();
+    const flag = iterator.next() orelse return false;
+    return (std.mem.eql(u8, flag, "--version") or std.mem.eql(u8, flag, "-v")) and iterator.next() == null;
 }
 
 /// 构建并执行一次 `nodeforged` 参数解析。
@@ -46,13 +64,17 @@ fn run(init: std.process.Init, out: *std.Io.Writer, in: *std.Io.Reader) !u8 {
 /// 声明 `nodeforged` 的完整命令树、默认路径和三种运行模式。
 /// 正常部署无需路径参数；`--config` 和 `--catalog` 仅用于开发、迁移或诊断覆盖。
 fn buildCli(init_options: zli.InitOptions) !*zli.Command {
+    const help = try std.fmt.allocPrint(
+        init_options.allocator,
+        "Normal deployments load config and catalog from {s}.\nUse overrides for development, testing, migration, or temporary diagnostics.",
+        .{nodeforge.paths.require().install_root},
+    );
     const root = try zli.Command.init(init_options, .{
         .name = "nodeforged",
         .description = "NodeForge daemon",
         .version = semantic_version,
         .usage = "nodeforged [options]",
-        .help = "Normal deployments load config and catalog from " ++ nodeforge.paths.install_root ++ ".\n" ++
-            "Use overrides for development, testing, migration, or temporary diagnostics.",
+        .help = help,
     }, daemonHandler);
     try root.addFlags(&.{
         .{
@@ -63,18 +85,24 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
             .default_value = .{ .Bool = false },
         },
         .{
+            .name = "install-root",
+            .description = "Explicit marked NodeForge install root",
+            .type = .String,
+            .default_value = .{ .String = "" },
+        },
+        .{
             .name = "config",
             .shortcut = "c",
             .description = "Override config JSON path",
             .type = .String,
-            .default_value = .{ .String = nodeforge.config.default_path },
+            .default_value = .{ .String = nodeforge.config.defaultPath() },
         },
         .{
             .name = "catalog",
             .shortcut = "C",
             .description = "Override catalog JSON path",
             .type = .String,
-            .default_value = .{ .String = nodeforge.catalog_store.default_path },
+            .default_value = .{ .String = nodeforge.catalog_store.defaultPath() },
         },
         .{
             .name = "check-config",
@@ -105,7 +133,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         },
         .{
             .name = "log-file",
-            .description = "Override the file destination for --log-output file/both (default: " ++ nodeforge.paths.service_log_path ++ ")",
+            .description = "Override the file destination for --log-output file/both (default: <install-root>/logs/nodeforged.log)",
             .type = .String,
             .default_value = .{ .String = "" },
         },
@@ -155,19 +183,53 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         .err => .err,
     });
 
+    // Only the discovered default model is auto-migrated. Explicit overrides
+    // are diagnostic inputs and must never be rewritten as a side effect.
+    if (parsed.value.schema_version == 1 and
+        std.mem.eql(u8, config_path, nodeforge.paths.require().config_path) and
+        std.mem.eql(u8, catalog_path, nodeforge.paths.require().catalog_dir))
+    {
+        if (try nodeforge.setup.migrateLegacy(ctx.io, ctx.allocator, nodeforge.paths.require())) {
+            parsed.deinit();
+            parsed = try nodeforge.config.load(ctx.io, ctx.allocator, config_path);
+            nodeforge.observe_log.info("model: migrated schema-1 config/catalog to M4.7 manifest layout", .{});
+        }
+    }
+
     var parsed_catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path) catch |err| switch (err) {
-        error.FileNotFound => null,
+        error.FileNotFound => blk: {
+            // A missing manifest is only initialized for the discovered catalog
+            // directory. Explicit legacy `.json` diagnostics remain read-only.
+            if (std.mem.endsWith(u8, catalog_path, ".json")) {
+                const initial = nodeforge.catalog_store.empty();
+                try nodeforge.catalog_store.save(ctx.io, ctx.allocator, catalog_path, &initial);
+                break :blk try nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path);
+            }
+            try nodeforge.catalog_store.initializeEmpty(ctx.io, ctx.allocator, catalog_path);
+            break :blk try nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path);
+        },
         else => {
             nodeforge.observe_log.err("catalog: cannot load {s}", .{catalog_path});
             if (debug) nodeforge.observe_log.debug("catalog: load cause={t}", .{err});
             return err;
         },
     };
-    defer if (parsed_catalog) |*catalog| catalog.deinit();
-    const empty_catalog = nodeforge.catalog_store.empty();
-    const catalog = if (parsed_catalog) |*loaded| &loaded.value else &empty_catalog;
+    defer parsed_catalog.deinit();
+    const stored_catalog = &parsed_catalog.value;
+    // schema 1 inputs retain managed entities in config. They are projected
+    // into an in-memory Catalog for validation; setup/migration publishes the
+    // durable manifest layout before production startup.
+    var catalog_value = stored_catalog.*;
+    if (catalog_value.distros.len == 0) catalog_value.distros = parsed.value.distros;
+    if (catalog_value.profiles.len == 0) catalog_value.profiles = parsed.value.profiles;
+    if (catalog_value.nodes.len == 0) catalog_value.nodes = parsed.value.nodes;
+    if (catalog_value.provisioning_bundles.len == 0) catalog_value.provisioning_bundles = parsed.value.provisioning_bundles;
+    if (parsed.value.schema_version == 1 and std.mem.endsWith(u8, catalog_path, ".json"))
+        try nodeforge.catalog_store.save(ctx.io, ctx.allocator, catalog_path, &catalog_value);
+    var effective_config = nodeforge.model.projectCatalog(parsed.value, &catalog_value);
+    const catalog = &catalog_value;
 
-    nodeforge.config_validate.validate(&parsed.value, catalog) catch |err| {
+    nodeforge.config_validate.validate(&effective_config, catalog) catch |err| {
         nodeforge.observe_log.err("config: validation failed: {s}", .{config_path});
         if (debug) nodeforge.observe_log.debug("config: validation cause={t}", .{err});
         return err;
@@ -196,7 +258,7 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         return;
     }
 
-    try nodeforge.app.run(ctx.io, ctx.allocator, &parsed.value, config_path, catalog, catalog_path);
+    try nodeforge.app.run(ctx.io, ctx.allocator, &effective_config, config_path, catalog, catalog_path);
 }
 
 const LogOutput = enum {
@@ -224,7 +286,7 @@ fn configureLogOutput(
     }
 
     const configured_file: nodeforge.model.FileLogConfig = logging.file orelse .{
-        .path = nodeforge.paths.service_log_path,
+        .path = nodeforge.paths.require().service_log_path,
         .max_size_mb = 50,
         .keep = 3,
     };

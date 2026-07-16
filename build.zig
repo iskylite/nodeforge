@@ -95,6 +95,13 @@ pub fn build(b: *std.Build) void {
     layout_tests.addFileArg(b.path("tests/install-layout.sh"));
     layout_tests.step.dependOn(&http_tests.step);
     test_step.dependOn(&layout_tests.step);
+
+    const setup_tests = b.addSystemCommand(&.{"sh"});
+    setup_tests.addFileArg(b.path("tests/setup.sh"));
+    setup_tests.addArtifactArg(cli);
+    setup_tests.addArtifactArg(daemon);
+    setup_tests.step.dependOn(&layout_tests.step);
+    test_step.dependOn(&setup_tests.step);
 }
 
 fn commandOutput(b: *std.Build, argv: []const []const u8) ?[]const u8 {

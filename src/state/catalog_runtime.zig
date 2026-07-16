@@ -12,7 +12,9 @@ pub const Snapshot = struct {
     revision: u64,
     refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 
-    pub fn value(self: *const Snapshot) *const model.Catalog { return &self.parsed.value; }
+    pub fn value(self: *const Snapshot) *const model.Catalog {
+        return &self.parsed.value;
+    }
     pub fn release(self: *const Snapshot) void {
         const mutable: *Snapshot = @constCast(self);
         if (mutable.refs.fetchSub(1, .acq_rel) != 1) return;
@@ -29,12 +31,18 @@ pub const CatalogRuntime = struct {
     writer: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8, initial: *const model.Catalog) !CatalogRuntime {
-        const snapshot = try createSnapshot(allocator, initial.*, 1);
+        const snapshot = try createSnapshot(allocator, initial.*, if (initial.revision == 0) 1 else initial.revision);
         return .{ .allocator = allocator, .path = path, .current = std.atomic.Value(*Snapshot).init(snapshot) };
     }
-    pub fn deinit(self: *CatalogRuntime) void { self.current.load(.acquire).release(); }
-    pub fn lock(self: *CatalogRuntime) void { lockMutex(&self.writer); }
-    pub fn unlock(self: *CatalogRuntime) void { self.writer.unlock(); }
+    pub fn deinit(self: *CatalogRuntime) void {
+        self.current.load(.acquire).release();
+    }
+    pub fn lock(self: *CatalogRuntime) void {
+        lockMutex(&self.writer);
+    }
+    pub fn unlock(self: *CatalogRuntime) void {
+        self.writer.unlock();
+    }
     pub fn acquire(self: *CatalogRuntime) *const Snapshot {
         self.lock();
         defer self.unlock();
@@ -68,6 +76,7 @@ pub const CatalogRuntime = struct {
         @memcpy(next_assets[0..old.value().assets.len], old.value().assets);
         next_assets[old.value().assets.len] = asset;
         var candidate = old.value().*;
+        candidate.revision = old.revision + 1;
         candidate.assets = next_assets;
         try validate.validate(config, &candidate);
         try catalog_store.save(io, self.allocator, self.path, &candidate);
@@ -98,6 +107,7 @@ pub const CatalogRuntime = struct {
         @memcpy(sources[0..value.install_sources.len], value.install_sources);
         sources[value.install_sources.len] = imported.install_source;
         var candidate = value.*;
+        candidate.revision = old.revision + 1;
         candidate.assets = assets;
         candidate.repositories = repositories;
         candidate.install_sources = sources;
@@ -128,7 +138,9 @@ fn createSnapshot(allocator: std.mem.Allocator, value: model.Catalog, revision: 
     snapshot.* = .{ .allocator = allocator, .parsed = parsed, .revision = revision };
     return snapshot;
 }
-fn lockMutex(mutex: *std.atomic.Mutex) void { while (!mutex.tryLock()) std.Thread.yield() catch {}; }
+fn lockMutex(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
+}
 
 test "old catalog generation survives replacement until reader release" {
     var runtime = try CatalogRuntime.init(std.testing.allocator, "/tmp/catalog.json", &.{});

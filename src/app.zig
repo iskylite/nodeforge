@@ -72,7 +72,7 @@ pub fn run(
     try boot_session.generateId(io, &daemon_instance_id);
     try event_writer.setDaemonInstanceId(daemon_instance_id);
     var sessions: boot_session.Store = .{};
-    const restored_sessions = boot_session_store.load(io, allocator, paths.boot_sessions_path, config, catalog, &sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
+    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, &sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
         error.FileNotFound => 0,
         else => {
             observe_log.err("boot-session: refusing invalid checkpoint: {t}", .{err});
@@ -97,24 +97,26 @@ pub fn run(
         observe_log.warn("capacity: lease/session derived={d} exceeds compiled ceiling={d}; effective capacity is clamped", .{ lease_cap, runtime_state.DhcpState.max_leases });
     if (managed_cap > node_status.max_statuses)
         observe_log.warn("capacity: managed derived={d} exceeds compiled ceiling={d}; effective capacity is clamped", .{ managed_cap, node_status.max_statuses });
-    node_inventory.load(io, allocator, paths.node_inventory_path, &inventories) catch |err| switch (err) {
+    node_inventory.load(io, allocator, paths.require().node_inventory_path, &inventories) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
     var operation_store: operations.Store = .{};
-    operations.load(io, allocator, paths.operations_path, &operation_store, current_time) catch |err| switch (err) {
+    operations.load(io, allocator, paths.require().operations_path, &operation_store, current_time) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
     const transaction_dir = try model_transaction.directoryForConfig(allocator, config_path);
     defer allocator.free(transaction_dir);
     _ = try operations.reconcileMigrationRecovery(io, allocator, transaction_dir, &operation_store, current_time);
-    try operations.save(io, allocator, paths.operations_path, &operation_store);
+    try operations.save(io, allocator, paths.require().operations_path, &operation_store);
     try operations.clearMigrationRecoveryRecords(io, allocator, transaction_dir);
-    const config_revision = try deployment_control.revisionForConfig(allocator, config);
+    const model_revision = try deployment_control.revisionForModel(allocator, config, catalog);
+    const config_revision = model_revision.config;
+    const desired_revision = model_revision.desiredRevision();
     var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);
     defer live_config.deinit();
-    deployment_control.load(io, allocator, paths.deployment_control_path, &deployments) catch |err| switch (err) {
+    deployment_control.load(io, allocator, paths.require().deployment_control_path, &deployments) catch |err| switch (err) {
         error.FileNotFound => {},
         else => {
             observe_log.err("deployment-control: refusing startup with invalid state: {t}", .{err});
@@ -125,9 +127,9 @@ pub fn run(
     // 不能把 clamp 前派生值或加载前默认值误报为生效容量。
     observe_log.info("capacity: subnet={s} derived={d}, lease/session effective={d}/{d} (ceiling {d}); managed nodes={d}, status={d} inventory={d} deployment={d} (ceiling {d}); tftp concurrency={d}; ping_timeout_ms={d}", .{ config.dhcp.subnet, lease_cap, runtime.dhcp.effective, sessions.effective, runtime_state.DhcpState.max_leases, config.nodes.len, statuses.effective, inventories.capacity, deployments.effective, node_status.max_statuses, tftp_conc, config.dhcp.ping_timeout_ms });
     for (config.nodes) |node| if (forProfile(config, node.profile)) |profile| if (profile.mode == .install) {
-        deployments.ensureInitial(node.id, config_revision, current_time) catch |err| return err;
+        deployments.ensureInitial(node.id, desired_revision, current_time) catch |err| return err;
     };
-    try deployment_control.save(io, allocator, paths.deployment_control_path, &deployments);
+    try deployment_control.save(io, allocator, paths.require().deployment_control_path, &deployments);
     const bootstrap_key = try @import("server/admin_key.zig").resolve(io, allocator, config.server);
     defer allocator.free(bootstrap_key);
     const additional_keys = try @import("server/admin_key.zig").resolveAdditional(io, allocator, config.server);
@@ -141,33 +143,32 @@ pub fn run(
     // node-status.json。两者互不争用。
     var status_io_mutex: std.atomic.Mutex = .unlocked;
     var checkpoint_flush_stop = std.atomic.Value(bool).init(false);
-    // M4.2：config reload 标志。HTTP handler 在 node add/set/remove 写入
-    // config.json 后设置此标志。serve() 在下一个事件循环 tick 后返回；
-    // app.zig 随后干净退出，systemd 用新配置重启。
+    // 保留的有序退出信号，仅供需要完整重启的生命周期操作使用。M4.7 的
+    // node/profile 变更发布 catalog 快照，不再改写 config 或触发 reload。
     var reload_requested = std.atomic.Value(bool).init(false);
 
-    event_writer.appendWithFields(io, allocator, paths.events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
+    event_writer.appendWithFields(io, allocator, paths.require().events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
         observe_log.err("events: unable to record configuration load: {t}", .{err});
     for (config.nodes) |node| if (deployments.view(node.id)) |deployment| {
-        if (deployment.applied_revision != 0 and deployment.applied_revision != config_revision) {
+        if (deployment.applied_revision != 0 and deployment.applied_revision != desired_revision) {
             var applied_text: [24]u8 = undefined;
             var desired_text: [24]u8 = undefined;
             const fields = [_]events.Field{
                 .{ .key = "node_id", .value = node.id },
                 .{ .key = "applied_revision", .value = std.fmt.bufPrint(&applied_text, "{d}", .{deployment.applied_revision}) catch "0" },
-                .{ .key = "desired_revision", .value = std.fmt.bufPrint(&desired_text, "{d}", .{config_revision}) catch "0" },
+                .{ .key = "desired_revision", .value = std.fmt.bufPrint(&desired_text, "{d}", .{desired_revision}) catch "0" },
             };
-            event_writer.appendWithFields(io, allocator, paths.events_path, "install.configuration_drifted", "installed node configuration differs from current desired state", &fields) catch |err|
+            event_writer.appendWithFields(io, allocator, paths.require().events_path, "install.configuration_drifted", "installed node configuration differs from current desired state", &fields) catch |err|
                 observe_log.err("events: unable to record install drift: {t}", .{err});
         }
     };
     const persistence: dhcp_server.Persistence = .{
         .allocator = allocator,
-        .events_path = paths.events_path,
+        .events_path = paths.require().events_path,
         .writer = &event_writer,
         .sessions = &sessions,
         .deployments = &deployments,
-        .config_revision = config_revision,
+        .config_revision = desired_revision,
         .configs = &live_config,
     };
     var live_catalog = try catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
@@ -185,7 +186,7 @@ pub fn run(
 
     // M3.1：启动 DHCP lease checkpoint worker。它是 leases.json 的唯一写入者，
     // 运行直到有序关闭时收到 flush-and-stop 命令。
-    var checkpoint_thread = try std.Thread.spawn(.{}, runCheckpoint, .{ io, allocator, &runtime.dhcp, paths.leases_path, &checkpoint_flush_stop });
+    var checkpoint_thread = try std.Thread.spawn(.{}, runCheckpoint, .{ io, allocator, &runtime.dhcp, paths.require().leases_path, &checkpoint_flush_stop });
     observe_log.info("dhcp: lease checkpoint worker started", .{});
 
     // HTTP 明确绑定所有 IPv4 地址。`server.server_ip` 是给裸机节点使用的
@@ -214,16 +215,15 @@ pub fn run(
         additional_keys,
         &daemon_instance_id,
         &status_io_mutex,
-        paths.node_status_path,
+        paths.require().node_status_path,
         config_path,
         &reload_requested,
     ) catch |err| {
         serve_error = err;
     };
 
-    // M4.2：如果请求了 config reload（node add/set/remove），干净退出
-    // 以便 systemd 用新 config.json 重启 daemon。这比原地配置替换更简单
-    // 且更安全（后者需要重新初始化 DHCP/TFTP/HTTP 状态机）。
+    // 若未来的离线 config apply 请求了有序退出，在这里进入统一关闭序列；
+    // catalog mutation 不会设置此标志。
     if (reload_requested.load(.acquire)) {
         observe_log.info("config: reload requested, exiting for systemd restart", .{});
         // 进入正常关闭流程，然后 systemd 自动重启。
@@ -253,7 +253,7 @@ pub fn run(
 
     // 已签发 capability 的 delivery session 在有序重启前保存到权限为 0600
     // 的 checkpoint；下一实例继续使用同一 token 和 session 身份。
-    boot_session_store.save(io, allocator, paths.boot_sessions_path, &sessions, now()) catch |err|
+    boot_session_store.save(io, allocator, paths.require().boot_sessions_path, &sessions, now()) catch |err|
         observe_log.err("boot-session: checkpoint failed: {t}", .{err});
 
     // worker 已退出后才终止活动 session，确保不会再有 DHCP/TFTP 事件引用它们；
@@ -268,13 +268,13 @@ pub fn run(
         statuses.snapshot(&status_snapshot);
         while (!status_io_mutex.tryLock()) std.Thread.yield() catch {};
         defer status_io_mutex.unlock();
-        status_store.save(io, allocator, paths.node_status_path, &status_snapshot, statuses.currentRevision(), now()) catch |err|
+        status_store.save(io, allocator, paths.require().node_status_path, &status_snapshot, statuses.currentRevision(), now()) catch |err|
             observe_log.err("status: final persistence failed: {t}", .{err});
     }
 
     for (terminated[0..terminated_count]) |session| dhcp_server.emitSessionTermination(io, &persistence, session);
 
-    event_writer.appendWithFields(io, allocator, paths.events_path, "service.stopped", "orderly shutdown complete", &.{}) catch |err|
+    event_writer.appendWithFields(io, allocator, paths.require().events_path, "service.stopped", "orderly shutdown complete", &.{}) catch |err|
         observe_log.err("events: unable to record service stop: {t}", .{err});
 
     observe_log.info("shutdown: complete", .{});
@@ -290,10 +290,10 @@ fn forProfile(config: *const model.AppConfig, name: []const u8) ?*const model.Pr
 /// M3.1：从 `leases.json` 加载 DHCP lease。如果新文件不存在，
 /// 尝试从旧版 `runtime.json` 迁移。
 fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.DhcpState, now_val: i64) void {
-    dhcp_store.load(io, allocator, paths.leases_path, dhcp, now_val) catch |err| switch (err) {
+    dhcp_store.load(io, allocator, paths.require().leases_path, dhcp, now_val) catch |err| switch (err) {
         error.FileNotFound => {
             // 新文件缺失：尝试从旧版 runtime.json 迁移 lease。
-            dhcp_store.migrateLegacy(io, allocator, paths.runtime_path, dhcp, now_val) catch |legacy_err| switch (legacy_err) {
+            dhcp_store.migrateLegacy(io, allocator, paths.require().runtime_path, dhcp, now_val) catch |legacy_err| switch (legacy_err) {
                 error.FileNotFound => {},
                 else => observe_log.err("dhcp: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),
             };
@@ -305,10 +305,10 @@ fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.Dhc
 /// M3.1: Load node statuses from `node-status.json`.  If the new file does not
 /// exist, attempt to migrate from the legacy `runtime.json`.
 fn loadStatuses(io: std.Io, allocator: std.mem.Allocator, store: *node_status.Store) void {
-    status_store.load(io, allocator, paths.node_status_path, store) catch |err| switch (err) {
+    status_store.load(io, allocator, paths.require().node_status_path, store) catch |err| switch (err) {
         error.FileNotFound => {
             // New file missing: try legacy runtime.json migration for statuses.
-            status_store.migrateLegacy(io, allocator, paths.runtime_path, store) catch |legacy_err| switch (legacy_err) {
+            status_store.migrateLegacy(io, allocator, paths.require().runtime_path, store) catch |legacy_err| switch (legacy_err) {
                 error.FileNotFound => {},
                 else => observe_log.err("status: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),
             };

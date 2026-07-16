@@ -6,8 +6,10 @@ const std = @import("std");
 const model = @import("../model.zig");
 const paths = @import("../paths.zig");
 
-/// 默认启动配置路径。正常安装时无需传参，守护进程会自动读取此位置。
-pub const default_path = paths.config_path;
+/// 默认启动配置路径。必须在进程路径自举完成后调用。
+pub fn defaultPath() []const u8 {
+    return paths.require().config_path;
+}
 /// 配置文件最大允许 4 MiB，防止错误路径或异常文件耗尽内存。
 pub const max_config_bytes = 4 * 1024 * 1024;
 

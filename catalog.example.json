@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "repositories": [
     {
       "name": "rocky-9.7-aarch64-dvd",
@@ -46,8 +46,55 @@
       "source_asset": "rocky-9.7-aarch64-dvd-iso",
       "installer_kernel": "rocky-9.7-aarch64-installer-kernel",
       "installer_initrd": "rocky-9.7-aarch64-installer-initrd",
-      "repositories": ["rocky-9.7-aarch64-dvd"]
+      "repositories": [
+        "rocky-9.7-aarch64-dvd"
+      ]
     }
   ],
-  "boot_bundles": []
+  "boot_bundles": [],
+  "revision": 0,
+  "distros": [
+    {
+      "name": "rocky",
+      "family": "rhel",
+      "versions": [
+        {
+          "version": "9.7",
+          "archs": [
+            "aarch64",
+            "x86_64"
+          ],
+          "install_adapter": "kickstart",
+          "package_manager": "dnf"
+        },
+        {
+          "version": "8.10",
+          "archs": [
+            "aarch64",
+            "x86_64"
+          ],
+          "install_adapter": "kickstart",
+          "package_manager": "dnf"
+        }
+      ]
+    },
+    {
+      "name": "ubuntu",
+      "family": "ubuntu",
+      "versions": [
+        {
+          "version": "22.04",
+          "archs": [
+            "aarch64",
+            "x86_64"
+          ],
+          "install_adapter": "autoinstall",
+          "package_manager": "apt"
+        }
+      ]
+    }
+  ],
+  "profiles": [],
+  "nodes": [],
+  "provisioning_bundles": []
 }

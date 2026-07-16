@@ -5253,6 +5253,9 @@ M4.3 drift 规则拒绝或留待下一 generation，daemon restart-resume 后 an
 
 ### 9.16 M4.7：路径自举、config/catalog 边界重构与部署初始化
 
+> 实现校验状态（2026-07-17）：M4.7a–c 代码已落地。§9.16.8 记录设计复核后的修正、自动验证范围和
+> 仍需在 Rocky Linux 执行的 systemd 实机验收，避免把 macOS 构建验证误写成生产部署结论。
+
 #### 9.16.1 目标
 
 解决三个相互关联的架构问题：
@@ -5313,7 +5316,7 @@ pub const Paths = struct {
     // ... 全部路径字段
 
     pub fn discover(io: std.Io, allocator: std.mem.Allocator) !Paths { ... }
-    pub fn resolve(allocator: std.mem.Allocator, root: []const u8) !Paths { ... }
+    pub fn resolve(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !Paths { ... }
     pub fn deinit(self: *Paths, allocator: std.mem.Allocator) void { ... }
 };
 
@@ -5404,6 +5407,10 @@ catalog/（读写，仅 daemon，通过 CLI/API 管理）
 
 **config.json 变为纯启动配置**：只管"服务在哪、监听什么端口、网络怎么配"。人工写好后不再被运行时
 修改。`config apply`（M6）修改它时完整重载 daemon，不是运行时热改。
+
+实现中的 `AppConfig` 类型暂时保留 schema 1 的四个 entity slice，目的仅是一次性迁移输入和将 Catalog 投影给尚未
+拆签名的协议代码；`config_store.StartupConfig` 是唯一可序列化形状，schema 2 永不写出这些字段。这是有删除条件的
+兼容层，不是 ownership 回退。
 
 **catalog 变为完整运行时模型**：profiles、nodes、distros 全部由 daemon 通过 CLI/API 管理
 （`node add/set/remove`、未来的 `profile add/update`）。daemon 是 catalog 的唯一 writer。
@@ -5515,10 +5522,10 @@ restart→health-check→rollback 流程，不另建在线 store。
 **命令结构**：
 
 ```bash
-# 交互式（默认，自动检测一切）
+# 使用文档可见的隔离实验网默认参数（不自动安装 systemd）
 nodeforge setup
 
-# 非交互式 + 自动检测
+# 非交互式；生产环境推荐显式给出全部网络参数
 nodeforge setup --non-interactive
 
 # 非交互式 + 覆盖关键参数
@@ -5528,7 +5535,7 @@ nodeforge setup --non-interactive \
   --server-ip 192.168.27.128 \
   --yes
 
-# 已有部署离线重配置（candidate 校验、重启、健康检查、失败回滚）
+# 已有部署离线重配置（candidate 校验/迁移；服务生命周期由下一条显式执行）
 nodeforge setup --reconfigure [--non-interactive --yes]
 
 # 只生成 systemd unit
@@ -5550,7 +5557,8 @@ nodeforge setup --reset-state [--non-interactive --yes]
 nodeforge setup --dry-run
 ```
 
-**交互式流程**：
+**原交互式推荐草案**：下列界面只说明未来候选展示方式；按本节“网卡参数设计复核修正”，M4.7 不自动选择网卡，
+当前实现以显式 flags/文档默认值为准。破坏性操作仍保留交互式 yes/no 确认。
 
 ```text
 $ nodeforge setup
@@ -5656,8 +5664,10 @@ WantedBy=multi-user.target
 setup 写 unit 后执行 daemon-reload、enable、start，并以 `/healthz` + model load 双重检查；任一步失败恢复旧 unit/config、
 恢复服务原启停状态并保留诊断备份。普通 management CLI 仍不提供通用 `systemctl` wrapper；setup lifecycle 是唯一例外。
 
-**网卡检测**：交互式自动读取 `/sys/class/net/` 枚举接口，用 `ioctl(SIOCGIFADDR)` 获取 IP 和掩码，
-读取 `/proc/net/route` 找有默认路由的接口，基于 IP/掩码自动推导子网 CIDR 和地址池推荐范围。
+**网卡参数的设计复核修正**：实现不把“有默认路由”当作 PXE 网卡的可靠证据。多网卡部署中默认路由通常位于
+管理网，静默选择会把 DHCP 发到错误广播域。setup 因此提供显式 `--bind-interface/--server-ip/--subnet/
+--pool-start/--pool-end`，无覆盖时只使用文档可见的隔离实验网默认值；它不声称自动检测。`--install` 前仍由完整
+模型加载、daemon preflight 与健康检查裁决。后续若增加交互推荐，只能展示候选并要求操作员确认，不能自动选定。
 
 **重置时基于旧配置推荐**：读取已有 `config.json`，每个字段作为默认值显示在 `[方括号]` 中。如果环境
 未变（网卡仍存在、IP 仍可用），旧值就是推荐值；如果环境已变，自动检测新值并标注变化。
@@ -5693,6 +5703,30 @@ provisioned markers 和可安全归档的 completed journal，保留 config/cata
 - `nodeforge setup --generate-systemd` 输出的 unit 文件中路径与自举发现一致，`ExecStart` 不含 `--config`。
 - `setup --reconfigure/reset-state/reset-all/purge-data` 的确认、备份、事务恢复、systemd rollback、健康检查和权限测试通过；
   config/catalog/model revision 与 active BootSession plan digest 在重启前后保持契约一致。
+
+#### 9.16.8 实现校验与设计结论（2026-07-17）
+
+实现按三个 gate 顺序完成，并对原方案作以下可执行化修正：
+
+- 自举使用 `std.process.executablePathAlloc` 和 canonical real path，不把 Linux 专属 `/proc/self/exe` 写成跨平台前提；
+  只有 `setup --install-root` 可在 marker 创建前取得 candidate Paths，普通命令仍要求 marker 与成对二进制。
+- config schema 与 catalog layout schema 独立版本化。manifest 是唯一 commit point；transaction id 由 catalog revision
+  和固定顺序的 8 个 entity digest 重算，loader 不信任 manifest 自报值。
+- legacy migration marker 是允许 old/new 短暂共存的唯一证据；即使在 config schema 2 已发布后崩溃，重跑也会验证
+  新 manifest、备份并清理 legacy 文件。无 marker 的 mixed layout 始终拒绝。
+- reset 先恢复 catalog/model journal，备份目录写 `manifest.json` 及每个状态文件 SHA-256 后才删除源文件。
+- config 与 catalog 事实文件统一收紧为 0600，私有目录为 0700，其余安装目录为 0750。bundle 必须含相同 build
+  provenance 的 `nodeforge`/`nodeforged`；marker 最后创建。
+- systemd install 先保存旧 link、enabled/active 状态；daemon-reload、enable/start、完整模型加载或 loopback health
+  任一失败，恢复 unit 和原启停状态。该分支需要 root，破坏性非交互调用必须显式 `--yes`。
+- `ModelRevision` 分为 config revision、catalog revision 和 desired digest；schema 2 config revision 不再因 profile/node
+  mutation 改变，部署 drift 消费 desired digest。
+
+自动验证覆盖 202 个测试：custom root/marker/symlink/重复 init、双二进制 bundle、schema 1 迁移与迁移续跑、manifest
+digest、catalog 三个 crash point、无关 entity 不重写、reset digest 备份、config offline-only、M4.6 kernel_args 和
+node 完整视图/时间语义。本机及 aarch64-linux ReleaseSafe 构建属于可移植性验证；`systemctl` 激活、capability、
+owner/mode 和真实 `/healthz` rollback 仍须按 `docs/M4_7_VALIDATION.md` 在 Rocky Linux root 环境执行，完成前不形成
+“生产部署已验收”结论。
 
 ### 9.17 M4.8：并发容量扩展与启动时动态派生
 

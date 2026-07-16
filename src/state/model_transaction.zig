@@ -1,6 +1,7 @@
 //! Crash-recoverable publication of config.json and catalog.json as one model.
 const std = @import("std");
 const dhcp_store = @import("dhcp_store.zig");
+const paths = @import("../paths.zig");
 
 pub const State = enum { prepared, files_ready, catalog_committed, config_committed, complete, cleanup_pending };
 pub const CrashPoint = enum { after_prepared, after_files_ready, after_catalog, after_config };
@@ -9,7 +10,9 @@ pub const RecoveryOutcome = enum { rolled_back, committed };
 const RecoveryRecord = struct { schema_version: u32 = 1, plan_digest: []const u8, outcome: RecoveryOutcome };
 
 pub fn directoryForConfig(allocator: std.mem.Allocator, config_path: []const u8) ![]u8 {
-    if (std.mem.eql(u8, config_path, @import("../paths.zig").config_path)) return allocator.dupe(u8, @import("../paths.zig").model_transactions_dir);
+    const runtime_paths: ?*const paths.Paths = paths.current() catch null;
+    if (runtime_paths) |value| if (std.mem.eql(u8, config_path, value.config_path))
+        return allocator.dupe(u8, value.model_transactions_dir);
     const parent = std.fs.path.dirname(config_path) orelse ".";
     return std.fmt.allocPrint(allocator, "{s}/model-transactions", .{parent});
 }

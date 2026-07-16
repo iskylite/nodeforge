@@ -71,14 +71,14 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     // `sha256File` 在受管根下以 NOFOLLOW+RESOLVE_BENEATH 方式打开文件，
     // 验证暂存输入是普通非符号链接文件。同时计算 SHA-256 用于 catalog 发布。
     var input_hash: [64]u8 = undefined;
-    try assets.sha256File(io, paths.import_dir, request.filename, &input_hash);
-    const input = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ paths.import_dir, request.filename });
+    try assets.sha256File(io, paths.require().import_dir, request.filename, &input_hash);
+    const input = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ paths.require().import_dir, request.filename });
     defer allocator.free(input);
 
     var random: [16]u8 = undefined;
     try io.randomSecure(&random);
     const tag = std.fmt.bytesToHex(random, .lower);
-    const work = try std.fmt.allocPrint(allocator, "{s}/iso-import-{s}", .{ paths.work_dir, tag[0..] });
+    const work = try std.fmt.allocPrint(allocator, "{s}/iso-import-{s}", .{ paths.require().work_dir, tag[0..] });
     defer allocator.free(work);
     const mount_point = try std.fmt.allocPrint(allocator, "{s}/mnt", .{work});
     defer allocator.free(mount_point);

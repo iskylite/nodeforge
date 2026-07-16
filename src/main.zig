@@ -31,6 +31,12 @@ pub fn main(init: std.process.Init) !void {
     var stdin_buffer: [1024]u8 = undefined;
     var stdin_file = std.Io.File.Reader.init(.stdin(), init.io, &stdin_buffer);
 
+    nodeforge.paths.bootstrap(init.io, init.arena.allocator(), init.minimal.args) catch |err| {
+        try out.print("error: install root bootstrap failed: {t}\n", .{err});
+        try out.flush();
+        std.process.exit(1);
+    };
+
     const exit_code = try run(init, out, &stdin_file.interface);
     out.flush() catch {};
     if (exit_code != 0) std.process.exit(exit_code);
@@ -75,6 +81,12 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
             .description = "Show version and exit",
             .type = .Bool,
             .default_value = .{ .Bool = false },
+        },
+        .{
+            .name = "install-root",
+            .description = "Explicit marked NodeForge install root (must precede the command)",
+            .type = .String,
+            .default_value = .{ .String = "" },
         },
     });
 
@@ -242,7 +254,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try node_trace.addFlags(&.{
         .{ .name = "session", .description = "Exact 32-character boot session identifier", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "latest", .description = "Select the latest retained session (default when --session is omitted)", .type = .Bool, .default_value = .{ .Bool = false } },
-        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.events_path } },
+        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.require().events_path } },
     });
     try addOutputFlag(node_trace);
 
@@ -339,6 +351,32 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(events_types);
     try events.addCommands(&.{ events_list, events_follow, events_types });
 
+    const setup = try zli.Command.init(init_options, .{
+        .name = "setup",
+        .description = "Initialize, reconfigure, repair, or reset a NodeForge deployment",
+        .usage = "nodeforge setup [--install-root PATH] [options]",
+        .help = "All filesystem effects are bounded by the bootstrapped install root. Destructive non-interactive operations require --yes.",
+    }, setupHandler);
+    try setup.addFlags(&.{
+        .{ .name = "install-root", .description = "New or existing absolute install root", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "non-interactive", .description = "Do not prompt for input", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "yes", .description = "Confirm a destructive or service lifecycle action", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "reconfigure", .description = "Validate and republish an existing deployment", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "generate-systemd", .description = "Generate only the systemd unit", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "print", .description = "Print generated systemd unit instead of writing it", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "install", .description = "Install/enable/start the generated systemd unit", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "repair-dirs", .description = "Repair the canonical directory tree only", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "reset-state", .description = "Back up and clear runtime state", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "reset-all", .description = "Reset startup config and runtime state", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "purge-data", .description = "With --reset-all, also purge catalog and assets", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "dry-run", .description = "Describe the selected operation without writing", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "bind-interface", .description = "PXE bind interface for generated config", .type = .String, .default_value = .{ .String = "eth0" } },
+        .{ .name = "server-ip", .description = "PXE server IPv4 address", .type = .String, .default_value = .{ .String = "192.168.50.1" } },
+        .{ .name = "subnet", .description = "DHCP subnet CIDR", .type = .String, .default_value = .{ .String = "192.168.50.0/24" } },
+        .{ .name = "pool-start", .description = "First DHCP pool address", .type = .String, .default_value = .{ .String = "192.168.50.100" } },
+        .{ .name = "pool-end", .description = "Last DHCP pool address", .type = .String, .default_value = .{ .String = "192.168.50.200" } },
+    });
+
     try root.addCommands(&.{
         status,
         check,
@@ -349,8 +387,154 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         assets,
         runtime,
         events,
+        setup,
     });
     return root;
+}
+
+fn setupHandler(ctx: zli.CommandContext) !void {
+    const p = nodeforge.paths.require();
+    const dry_run = ctx.flag("dry-run", bool);
+    const operation_count = @as(u8, @intFromBool(ctx.flag("generate-systemd", bool))) + @as(u8, @intFromBool(ctx.flag("repair-dirs", bool))) + @as(u8, @intFromBool(ctx.flag("reset-state", bool))) + @as(u8, @intFromBool(ctx.flag("reset-all", bool))) + @as(u8, @intFromBool(ctx.flag("reconfigure", bool)));
+    if (operation_count > 1 or (ctx.flag("print", bool) and ctx.flag("install", bool)) or ((ctx.flag("print", bool) or ctx.flag("install", bool)) and !ctx.flag("generate-systemd", bool))) return error.InvalidFlagValue;
+    const destructive = ctx.flag("reset-state", bool) or ctx.flag("reset-all", bool) or ctx.flag("purge-data", bool) or ctx.flag("install", bool);
+    if (ctx.flag("purge-data", bool) and !ctx.flag("reset-all", bool)) return error.InvalidFlagValue;
+    if (destructive and !ctx.flag("yes", bool)) {
+        if (ctx.flag("non-interactive", bool)) return error.ConfirmationRequired;
+        try ctx.writer.print("This will modify {s}. Continue? [y/N]: ", .{p.install_root});
+        const answer = ctx.reader.takeDelimiter('\n') catch null;
+        if (answer == null or !(std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r"), "y") or std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r"), "yes"))) return error.ConfirmationRequired;
+    }
+    const network: nodeforge.setup.Network = .{
+        .bind_interface = ctx.flag("bind-interface", []const u8),
+        .server_ip = ctx.flag("server-ip", []const u8),
+        .subnet = ctx.flag("subnet", []const u8),
+        .pool_start = ctx.flag("pool-start", []const u8),
+        .pool_end = ctx.flag("pool-end", []const u8),
+    };
+    if (dry_run) {
+        try views.success(ctx.writer, "setup dry-run", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config", .value = p.config_path }, .{ .label = "Catalog", .value = p.catalog_dir } });
+        return;
+    }
+    if (ctx.flag("generate-systemd", bool)) {
+        const unit = try nodeforge.setup.renderSystemd(ctx.allocator, p);
+        defer ctx.allocator.free(unit);
+        if (ctx.flag("print", bool)) {
+            try ctx.writer.writeAll(unit);
+        } else {
+            try nodeforge.setup.repairDirectories(ctx.io, ctx.allocator, p);
+            try nodeforge.dhcp_store.atomicWrite(ctx.io, p.service_path, unit);
+        }
+        if (ctx.flag("install", bool)) try installSystemd(ctx, p);
+        return;
+    }
+    if (ctx.flag("repair-dirs", bool)) {
+        try nodeforge.setup.repairDirectories(ctx.io, ctx.allocator, p);
+        try views.success(ctx.writer, "directory layout repaired", &.{.{ .label = "Install root", .value = p.install_root }});
+        return;
+    }
+    if (ctx.flag("reset-state", bool) or ctx.flag("reset-all", bool)) {
+        if (std.Io.Dir.cwd().statFile(ctx.io, p.config_path, .{ .follow_symlinks = false })) |_| {
+            var running_config = try nodeforge.config.load(ctx.io, ctx.allocator, p.config_path);
+            defer running_config.deinit();
+            if (nodeforge.management_client.health(ctx.io, running_config.value.server.http_port).reachable) return error.DaemonMustBeStopped;
+        } else |err| if (err != error.FileNotFound) return err;
+        const backup = try nodeforge.setup.resetState(ctx.io, ctx.allocator, p);
+        defer ctx.allocator.free(backup);
+        if (ctx.flag("reset-all", bool)) {
+            const config_backup = try std.fmt.allocPrint(ctx.allocator, "{s}/config.json", .{backup});
+            defer ctx.allocator.free(config_backup);
+            try std.Io.Dir.copyFileAbsolute(p.config_path, config_backup, ctx.io, .{ .replace = false, .make_path = true });
+            const config = nodeforge.setup.generatedConfig(p, network);
+            try nodeforge.config_validate.validate(&config, &nodeforge.model.Catalog{});
+            try nodeforge.config_store.save(ctx.io, ctx.allocator, p.config_path, &config);
+            if (ctx.flag("purge-data", bool)) {
+                std.Io.Dir.cwd().deleteTree(ctx.io, p.catalog_dir) catch {};
+                std.Io.Dir.cwd().deleteTree(ctx.io, p.assets_dir) catch {};
+                try nodeforge.setup.repairDirectories(ctx.io, ctx.allocator, p);
+                try nodeforge.catalog_store.initializeEmpty(ctx.io, ctx.allocator, p.catalog_dir);
+            }
+        }
+        try views.success(ctx.writer, "deployment state reset", &.{ .{ .label = "Backup", .value = backup }, .{ .label = "Install root", .value = p.install_root } });
+        return;
+    }
+
+    const config_exists = blk: {
+        _ = std.Io.Dir.cwd().statFile(ctx.io, p.config_path, .{ .follow_symlinks = false }) catch break :blk false;
+        break :blk true;
+    };
+    if (!config_exists) {
+        try nodeforge.setup.initialize(ctx.io, ctx.allocator, p, network);
+        try views.success(ctx.writer, "NodeForge initialized", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config", .value = p.config_path }, .{ .label = "Catalog", .value = p.catalog_dir } });
+        return;
+    }
+    const migrated = try nodeforge.setup.migrateLegacy(ctx.io, ctx.allocator, p);
+    var config = try nodeforge.config.load(ctx.io, ctx.allocator, p.config_path);
+    defer config.deinit();
+    var catalog = try nodeforge.catalog_store.load(ctx.io, ctx.allocator, p.catalog_dir);
+    defer catalog.deinit();
+    const effective = nodeforge.model.projectCatalog(config.value, &catalog.value);
+    try nodeforge.config_validate.validate(&effective, &catalog.value);
+    const unit = try nodeforge.setup.renderSystemd(ctx.allocator, p);
+    defer ctx.allocator.free(unit);
+    try nodeforge.dhcp_store.atomicWrite(ctx.io, p.service_path, unit);
+    try views.success(ctx.writer, if (migrated) "legacy deployment migrated" else "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config schema", .value = "2" }, .{ .label = "Catalog layout", .value = "1" } });
+}
+
+/// Publish and activate the unit as one recoverable lifecycle operation. The
+/// previous link and enabled/active state are restored if systemctl, model
+/// loading, or the loopback health probe fails.
+fn installSystemd(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !void {
+    const link = "/etc/systemd/system/nodeforged.service";
+    const backup = "/etc/systemd/system/nodeforged.service.nodeforge-backup";
+    const existed = blk: {
+        _ = std.Io.Dir.cwd().statFile(ctx.io, link, .{ .follow_symlinks = false }) catch break :blk false;
+        break :blk true;
+    };
+    const was_enabled = try commandSucceeded(ctx, &.{ "systemctl", "is-enabled", "--quiet", "nodeforged.service" });
+    const was_active = try commandSucceeded(ctx, &.{ "systemctl", "is-active", "--quiet", "nodeforged.service" });
+    if (existed) try runRequired(ctx, &.{ "cp", "-P", link, backup });
+    errdefer rollbackSystemd(ctx, link, backup, existed, was_enabled, was_active);
+    try runRequired(ctx, &.{ "ln", "-sfn", p.service_path, link });
+    try runRequired(ctx, &.{ "systemctl", "daemon-reload" });
+    try runRequired(ctx, &.{ "systemctl", "enable", "--now", "nodeforged.service" });
+
+    var config = try nodeforge.config.load(ctx.io, ctx.allocator, p.config_path);
+    defer config.deinit();
+    var catalog = try nodeforge.catalog_store.load(ctx.io, ctx.allocator, p.catalog_dir);
+    defer catalog.deinit();
+    const effective = nodeforge.model.projectCatalog(config.value, &catalog.value);
+    try nodeforge.config_validate.validate(&effective, &catalog.value);
+    if (!nodeforge.management_client.health(ctx.io, config.value.server.http_port).healthy) return error.SystemdHealthCheckFailed;
+    if (existed) std.Io.Dir.cwd().deleteFile(ctx.io, backup) catch {};
+}
+
+fn rollbackSystemd(ctx: zli.CommandContext, link: []const u8, backup: []const u8, existed: bool, was_enabled: bool, was_active: bool) void {
+    _ = commandSucceeded(ctx, &.{ "rm", "-f", link }) catch false;
+    // Copy back instead of moving so the failed activation retains a unit
+    // backup for diagnosis after the previous service state is restored.
+    if (existed) _ = commandSucceeded(ctx, &.{ "cp", "-P", backup, link }) catch false;
+    _ = commandSucceeded(ctx, &.{ "systemctl", "daemon-reload" }) catch false;
+    _ = commandSucceeded(ctx, if (was_enabled) &.{ "systemctl", "enable", "nodeforged.service" } else &.{ "systemctl", "disable", "nodeforged.service" }) catch false;
+    _ = commandSucceeded(ctx, if (was_active) &.{ "systemctl", "start", "nodeforged.service" } else &.{ "systemctl", "stop", "nodeforged.service" }) catch false;
+}
+
+fn runRequired(ctx: zli.CommandContext, argv: []const []const u8) !void {
+    if (!try commandSucceeded(ctx, argv)) return error.SystemdInstallFailed;
+}
+
+fn commandSucceeded(ctx: zli.CommandContext, argv: []const []const u8) !bool {
+    const result = try std.process.run(ctx.allocator, ctx.io, .{ .argv = argv, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) });
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    return successfulTerm(result.term);
+}
+
+fn successfulTerm(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
@@ -503,7 +687,8 @@ fn configValidateHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed_catalog.deinit();
-    nodeforge.config_validate.validate(&parsed_config.value, parsed_catalog.value()) catch |err| {
+    const effective = nodeforge.model.projectCatalog(parsed_config.value, parsed_catalog.value());
+    nodeforge.config_validate.validate(&effective, parsed_catalog.value()) catch |err| {
         try printValidationError(ctx.writer, "config", config_path, err, debug);
         setExitCode(ctx, 1);
         return;
@@ -521,6 +706,11 @@ fn configExportHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed_config.deinit();
+    if (parsed_config.value.schema_version != 2 or parsed_config.value.distros.len != 0 or parsed_config.value.profiles.len != 0 or parsed_config.value.nodes.len != 0 or parsed_config.value.provisioning_bundles.len != 0) {
+        try ctx.writer.writeAll("error: config: schema-1/model migration requires nodeforge setup --reconfigure\n");
+        setExitCode(ctx, 1);
+        return;
+    }
     const bytes = try nodeforge.config_store.render(ctx.allocator, &parsed_config.value);
     defer ctx.allocator.free(bytes);
     try ctx.writer.writeAll(bytes);
@@ -537,6 +727,11 @@ fn configImportHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed_config.deinit();
+    if (parsed_config.value.schema_version != 2 or parsed_config.value.distros.len != 0 or parsed_config.value.profiles.len != 0 or parsed_config.value.nodes.len != 0 or parsed_config.value.provisioning_bundles.len != 0) {
+        try ctx.writer.writeAll("error: config: schema-1/model migration requires nodeforge setup --reconfigure\n");
+        setExitCode(ctx, 1);
+        return;
+    }
     nodeforge.config_validate.validateConfig(&parsed_config.value) catch |err| {
         try printValidationError(ctx.writer, "config", source, err, debug);
         setExitCode(ctx, 1);
@@ -565,7 +760,8 @@ fn catalogValidateHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed_catalog.deinit();
-    nodeforge.config_validate.validateCatalog(&parsed_config.value, parsed_catalog.value()) catch |err| {
+    const effective = nodeforge.model.projectCatalog(parsed_config.value, parsed_catalog.value());
+    nodeforge.config_validate.validate(&effective, parsed_catalog.value()) catch |err| {
         try printValidationError(ctx.writer, "catalog", catalog_path, err, debug);
         setExitCode(ctx, 1);
         return;
@@ -812,12 +1008,12 @@ fn stageInstallIso(io: std.Io, allocator: std.mem.Allocator, source: []const u8)
     const hex = std.fmt.bytesToHex(random, .lower);
     const filename = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ hex[0..], basename });
     errdefer allocator.free(filename);
-    const destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ nodeforge.paths.import_dir, filename });
+    const destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ nodeforge.paths.require().import_dir, filename });
     errdefer allocator.free(destination);
-    try std.Io.Dir.cwd().createDirPath(io, nodeforge.paths.import_dir);
+    try std.Io.Dir.cwd().createDirPath(io, nodeforge.paths.require().import_dir);
     try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, io, .{ .permissions = .default_file, .replace = false });
     var checksum: [64]u8 = undefined;
-    try nodeforge.asset_validate.sha256File(io, nodeforge.paths.import_dir, filename, &checksum);
+    try nodeforge.asset_validate.sha256File(io, nodeforge.paths.require().import_dir, filename, &checksum);
     return .{ .filename = filename, .path = destination, .size = stat.size, .sha256 = checksum };
 }
 
@@ -920,9 +1116,9 @@ fn assetKeyImportHandler(ctx: zli.CommandContext) !void {
     };
     defer ctx.allocator.free(key);
 
-    const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ nodeforge.paths.keys_dir, destination_name });
+    const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ nodeforge.paths.require().keys_dir, destination_name });
     defer ctx.allocator.free(destination);
-    try std.Io.Dir.cwd().createDirPath(ctx.io, nodeforge.paths.keys_dir);
+    try std.Io.Dir.cwd().createDirPath(ctx.io, nodeforge.paths.require().keys_dir);
     var atomic_file = std.Io.Dir.cwd().createFileAtomic(ctx.io, destination, .{ .permissions = .default_file, .make_path = true, .replace = false }) catch |err| {
         try ctx.writer.print("error: assets key-import cannot create destination: {t}\n", .{err});
         setExitCode(ctx, 1);
@@ -1008,7 +1204,7 @@ fn assetKeyListHandler(ctx: zli.CommandContext) !void {
         for (names.items) |name| ctx.allocator.free(name);
         names.deinit(ctx.allocator);
     }
-    var directory = std.Io.Dir.cwd().openDir(ctx.io, nodeforge.paths.keys_dir, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+    var directory = std.Io.Dir.cwd().openDir(ctx.io, nodeforge.paths.require().keys_dir, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => {
             if (output_json) try ctx.writer.writeAll("{\"keys\":[]}\n") else try ctx.writer.writeAll("No SSH public keys imported.\n");
             return;
@@ -1039,9 +1235,9 @@ fn assetRoot(config: *const nodeforge.model.AppConfig, kind: nodeforge.model.Ass
     return switch (kind) {
         .iso => config.http.asset_root,
         .bootloader, .kernel, .installer_initrd => config.tftp.asset_root,
-        .gpg_key => nodeforge.paths.keys_dir,
-        .nodeforge_initrd => nodeforge.paths.initrd_dir,
-        .rootfs => nodeforge.paths.rootfs_dir,
+        .gpg_key => nodeforge.paths.require().keys_dir,
+        .nodeforge_initrd => nodeforge.paths.require().initrd_dir,
+        .rootfs => nodeforge.paths.require().rootfs_dir,
     };
 }
 
@@ -1052,9 +1248,9 @@ test "asset validation selects the storage root by asset kind" {
         .tftp = .{ .asset_root = "/tftp-assets" },
     };
     try std.testing.expectEqualStrings("/http-assets", assetRoot(&config, .iso));
-    try std.testing.expectEqualStrings(nodeforge.paths.rootfs_dir, assetRoot(&config, .rootfs));
-    try std.testing.expectEqualStrings(nodeforge.paths.initrd_dir, assetRoot(&config, .nodeforge_initrd));
-    try std.testing.expectEqualStrings(nodeforge.paths.keys_dir, assetRoot(&config, .gpg_key));
+    try std.testing.expectEqualStrings(nodeforge.paths.require().rootfs_dir, assetRoot(&config, .rootfs));
+    try std.testing.expectEqualStrings(nodeforge.paths.require().initrd_dir, assetRoot(&config, .nodeforge_initrd));
+    try std.testing.expectEqualStrings(nodeforge.paths.require().keys_dir, assetRoot(&config, .gpg_key));
     try std.testing.expectEqualStrings("/tftp-assets", assetRoot(&config, .bootloader));
     try std.testing.expectEqualStrings("/tftp-assets", assetRoot(&config, .installer_initrd));
 }
@@ -1423,12 +1619,12 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     };
     defer catalog.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
-    const node = nodeforge.catalog.findNode(&config.value, node_id) orelse {
+    const node = nodeforge.catalog.findNode(catalog.value(), node_id) orelse {
         try ctx.writer.print("error: install: unknown node {s}\n", .{node_id});
         setExitCode(ctx, 1);
         return;
     };
-    const profile = nodeforge.catalog.findProfile(&config.value, node.profile) orelse {
+    const profile = nodeforge.catalog.findProfile(catalog.value(), node.profile) orelse {
         try ctx.writer.writeAll("error: install: node profile unavailable\n");
         setExitCode(ctx, 1);
         return;
@@ -1459,7 +1655,7 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     std.debug.print("password_hash_scope=preview config_revision={d} plan_digest={d} package_availability=installer-media\n", .{ config_revision, plan_digest });
     // APT 源 URL 解析：与 HTTP installConfig 保持一致的 fallback 逻辑。
     // Ubuntu ISO 导入时始终创建 repository，但手动配置场景可能缺失。
-    const distro = nodeforge.catalog.findDistro(&config.value, source.distro) orelse {
+    const distro = nodeforge.catalog.findDistro(catalog.value(), source.distro) orelse {
         try ctx.writer.writeAll("error: install: distro unavailable\n");
         setExitCode(ctx, 1);
         return;
@@ -2126,7 +2322,7 @@ fn addEventsFilterFlags(command: *zli.Command, comptime include_limit: bool) !vo
         .{ .name = "session", .description = "Filter by boot_session_id", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "since", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "until", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.events_path } },
+        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.require().events_path } },
     });
     if (include_limit) try command.addFlag(.{ .name = "limit", .description = "Latest matching records (1-1000)", .type = .Int, .default_value = .{ .Int = 100 } });
     try addOutputFlag(command);
@@ -2204,7 +2400,7 @@ fn addConfigPathFlag(command: *zli.Command) !void {
         .shortcut = "c",
         .description = "Config JSON path",
         .type = .String,
-        .default_value = .{ .String = nodeforge.config.default_path },
+        .default_value = .{ .String = nodeforge.config.defaultPath() },
     });
 }
 
@@ -2215,7 +2411,7 @@ fn addCatalogPathFlag(command: *zli.Command) !void {
         .shortcut = "C",
         .description = "Catalog JSON path",
         .type = .String,
-        .default_value = .{ .String = nodeforge.catalog_store.default_path },
+        .default_value = .{ .String = nodeforge.catalog_store.defaultPath() },
     });
 }
 

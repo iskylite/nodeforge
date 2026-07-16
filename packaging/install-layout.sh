@@ -1,16 +1,15 @@
 #!/bin/sh
 # Materialize the canonical NodeForge layout and migrate a pre-M4.2 install.
-# The install root is intentionally read from src/paths.zig: it has one
-# authoritative declaration and this script must not introduce a second one.
+# M4.7 binaries discover paths at runtime. Packaging accepts the target root
+# explicitly instead of scraping a compile-time Zig constant.
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-install_root=$(sed -nE 's/^pub const install_root = "([^"]+)";$/\1/p' "$repo_root/src/paths.zig")
-
-if [ -z "$install_root" ]; then
-    echo "error: unable to read install_root from src/paths.zig" >&2
-    exit 1
-fi
+install_root=${NODEFORGE_INSTALL_ROOT:-/opt/nodeforge}
+case "$install_root" in
+    /*) ;;
+    *) echo "error: NODEFORGE_INSTALL_ROOT must be absolute" >&2; exit 1 ;;
+esac
 
 require_jq() {
     command -v jq >/dev/null 2>&1 || {

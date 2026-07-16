@@ -26,7 +26,9 @@ pub const Plan = struct {
     digest: [64]u8,
     renames: []Rename,
     blockers: []Blocker,
-    pub fn applicable(self: *const Plan) bool { return self.blockers.len == 0; }
+    pub fn applicable(self: *const Plan) bool {
+        return self.blockers.len == 0;
+    }
     pub fn deinit(self: *Plan) void {
         for (self.renames) |rename| {
             self.allocator.free(rename.target);
@@ -261,7 +263,7 @@ test "typed candidates update source assets and profile without text-wide replac
     };
     const source: model.InstallSourceConfig = .{ .name = "rocky-old", .source_label = "CentOS Linux 8.4 DVD", .distro = "rocky", .version = "8.4", .arch = .x86_64, .source_asset = "rocky-old-image", .installer_kernel = "rocky-old-installer-kernel", .installer_initrd = "rocky-old-installer-initrd", .media_tree_url = "http://192.0.2.1/artifacts/repositories/rocky-old" };
     const versions = [_]model.DistroVersionConfig{.{ .version = "8.4", .archs = &.{.x86_64}, .install_adapter = .kickstart, .package_manager = .dnf }};
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .bind_interface = "eth0" }, .distros = &.{.{ .name = "centos", .family = .rhel, .versions = &versions }}, .profiles = &.{.{ .name = "legacy", .mode = .install, .distro = "rocky", .version = "8.4", .arch = .x86_64, .install_source = "rocky-old", .safety = .{ .destructive = true, .persistent_writes = true }, .install = .{} }} };
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .bind_interface = "eth0" }, .http = .{ .asset_root = "/tmp/nodeforge/iso", .repository_root = "/tmp/nodeforge/repos" }, .tftp = .{ .asset_root = "/tmp/nodeforge/boot" }, .distros = &.{.{ .name = "centos", .family = .rhel, .versions = &versions }}, .profiles = &.{.{ .name = "legacy", .mode = .install, .distro = "rocky", .version = "8.4", .arch = .x86_64, .install_source = "rocky-old", .safety = .{ .destructive = true, .persistent_writes = true }, .install = .{} }} };
     const catalog: model.Catalog = .{ .assets = &assets, .install_sources = &.{source} };
     var plan = try build(std.testing.allocator, &config, &catalog, 3, 4);
     defer plan.deinit();

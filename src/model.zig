@@ -1,12 +1,10 @@
 //! M0 阶段的强类型事实模型。
 //! `AppConfig` 保存启动/策略配置，`Catalog` 保存由 nodeforged 导入和发布的管理目录。
 
-const paths = @import("paths.zig");
-
-/// NodeForge 启动配置事实源 `paths.config_path` 的根对象。
+/// NodeForge 启动配置事实源 `<install-root>/config/config.json` 的根对象。
 pub const AppConfig = struct {
-    /// 配置格式版本；M0 仅接受版本 1。
-    schema_version: u32 = 1,
+    /// M4.7 纯启动配置 schema。版本 1 只作为一次性迁移输入。
+    schema_version: u32 = 2,
     /// 服务网广告地址、可选网卡和 HTTP/管理共用端口。
     server: ServerConfig,
     /// HTTP 资产与仓库根目录。
@@ -21,7 +19,8 @@ pub const AppConfig = struct {
     logging: LoggingConfig = .{},
     /// 业务事件审计流的轮转策略。
     events: EventsConfig = .{},
-    /// 受支持的发行版及版本矩阵。
+    /// M4.7 legacy migration staging fields。schema 2 文件禁止写出这些字段；
+    /// 运行时会从 Catalog 投影到这里，以缩小协议模块的破坏面。
     distros: []const DistroConfig = &.{},
     /// 节点可绑定的安装、无盘或发现策略。
     profiles: []const ProfileConfig = &.{},
@@ -34,11 +33,18 @@ pub const AppConfig = struct {
     policy: PolicyConfig = .{},
 };
 
-/// NodeForge 管理目录事实源 `paths.catalog_path` 的根对象。
+/// NodeForge 管理目录事实源 `<install-root>/catalog/` 的根对象。
 /// 该文件只由 `nodeforged` 写入，CLI 不直接编辑。
 pub const Catalog = struct {
-    /// 配置格式版本；M0 仅接受版本 1。
-    schema_version: u32 = 1,
+    /// 内存 catalog schema；磁盘布局另由 manifest schema 约束。
+    schema_version: u32 = 2,
+    /// manifest 的单调 catalog revision；legacy 单文件输入为 0。
+    revision: u64 = 0,
+    /// M4.7 后由 Catalog 独占的全部可管理实体。
+    distros: []const DistroConfig = &.{},
+    profiles: []const ProfileConfig = &.{},
+    nodes: []const NodeConfig = &.{},
+    provisioning_bundles: []const ProvisioningBundle = &.{},
     /// 可由 dnf/apt 直接使用的软件仓库。
     repositories: []const RepositoryConfig = &.{},
     /// 已纳管的 ISO、内核和 initrd 等文件。
@@ -48,6 +54,17 @@ pub const Catalog = struct {
     /// 无盘启动所需的同版本 kernel、initrd 和 rootfs 组合。
     boot_bundles: []const BootBundleConfig = &.{},
 };
+
+/// 将 daemon-owned catalog 实体投影到现有协议代码读取的 AppConfig 视图。
+/// 返回值只借用两侧内存，不得越过 config/catalog snapshot 生命周期。
+pub fn projectCatalog(config: AppConfig, catalog: *const Catalog) AppConfig {
+    var projected = config;
+    projected.distros = catalog.distros;
+    projected.profiles = catalog.profiles;
+    projected.nodes = catalog.nodes;
+    projected.provisioning_bundles = catalog.provisioning_bundles;
+    return projected;
+}
 
 /// 单进程服务配置。
 pub const ServerConfig = struct {
@@ -72,9 +89,10 @@ pub const ServerConfig = struct {
 /// HTTP 大文件和发行版仓库目录配置。
 pub const HttpConfig = struct {
     /// rootfs、ISO 和普通 HTTP 资产根目录。
-    asset_root: []const u8 = paths.iso_dir,
+    /// M4.7 取消编译期安装根：setup 必须写出运行时解析后的绝对路径。
+    asset_root: []const u8 = "",
     /// 通过 `/artifacts/repositories/` 只读发布的仓库根目录。
-    repository_root: []const u8 = paths.repos_dir,
+    repository_root: []const u8 = "",
     /// M4.2 F4 / M4.8: 最大并发 HTTP 连接数。0 = 不限制。
     /// **当前为 advisory、未强制**：facil.io/zap 不暴露应用级连接上限，真正的并发墙在
     /// OS 层（`ulimit -n`/`LimitNOFILE`，每下载 ~2 fd）。M6 压测后接上强制并设生产默认值。
@@ -88,7 +106,7 @@ pub const HttpConfig = struct {
 /// 防止把每项传输参数扩散为难以维护的 CLI 参数。
 pub const TftpConfig = struct {
     /// bootloader、GRUB 配置、kernel 和 initrd 的只读根目录。
-    asset_root: []const u8 = paths.boot_dir,
+    asset_root: []const u8 = "",
     /// M4.2 F4: OACK 中通告的最大 TFTP windowsize（RFC 7440）。
     /// 0 禁用 windowsize 协商（RFC 1350 停止等待模式）。
     /// 接受 1-65535 的值；客户端可以请求更小的值。
@@ -220,7 +238,7 @@ pub const DistroVersionConfig = struct {
 pub const RepositoryConfig = struct {
     /// 稳定短名称，用于 profile 和 install source 引用。
     name: []const u8,
-    /// 所属发行版名称，必须能在 `AppConfig.distros` 中找到。
+    /// 所属发行版名称，必须能在 `Catalog.distros` 中找到。
     distro: []const u8,
     /// 所属发行版版本，必须与 distro 的 versions 矩阵匹配。
     version: []const u8,
@@ -321,7 +339,7 @@ pub const ProfileConfig = struct {
     name: []const u8,
     /// 启动目的：discovery、install 或 diskless。
     mode: ProfileMode,
-    /// 发行版名称，必须能在 `AppConfig.distros` 中找到。
+    /// 发行版名称，必须能在 `Catalog.distros` 中找到。
     distro: []const u8,
     /// 发行版版本，必须与 distro 的 versions 矩阵匹配。
     version: []const u8,
@@ -431,7 +449,7 @@ pub const InstallConfig = struct {
     users: []const UserConfig = &.{},
     /// SSH 公钥列表；渲染器将其写入安装后配置的 authorized_keys。
     ssh_authorized_keys: []const []const u8 = &.{},
-    /// 可选的后处理 bundle 名称；引用 `AppConfig.provisioning_bundles` 中的条目。
+    /// 可选的后处理 bundle 名称；引用 `Catalog.provisioning_bundles` 中的条目。
     /// 渲染器将 bundle 中的步骤展开为安装后 shell 命令（`%post` 或 `late-commands`）。
     bundle: ?[]const u8 = null,
 };
@@ -576,7 +594,7 @@ pub const NodeConfig = struct {
     mac: []const u8,
     /// 节点架构，必须与所绑定 profile 的 arch 一致。
     arch: Arch,
-    /// 所绑定 profile 名称，必须能在 `AppConfig.profiles` 中找到。
+    /// 所绑定 profile 名称，必须能在 `Catalog.profiles` 中找到。
     profile: []const u8,
     /// DHCP 静态保留地址（IPv4 点分格式）；为空时从地址池动态分配。
     ip: ?[]const u8 = null,
