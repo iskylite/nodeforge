@@ -43,9 +43,10 @@
 | M4.5 | HTTP 契约补全与客户端健壮性 | M4.4 | 承接 M4.4 遗留的 RouteSpec/405/golden/分页/ETag/幂等操作，统一状态/信封/请求和有界客户端解析 |
 | M4.6 | 自定义内核引导参数 | M4.5 | `profile.kernel_args` 字段，PXE cmdline 追加、Kickstart `--append`、Autoinstall `late-commands` GRUB drop-in、安全校验和缓冲区扩容 |
 | M4.7 | 路径自举、模型存储迁移与部署初始化 | M4.6 | runtime Paths；schema+manifest+多文件事务；config/catalog ownership；bundle setup/reconfigure/reset/rollback |
-| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
-| M6 | 支持矩阵增强 | M4.1、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
-| M7 | 补充包和后处理增强 | M4.1、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
+| M4.8 | 并发容量扩展与启动时动态派生 | M4.5 | 5 处定长上限改启动时按网段/CPU/节点数动态派生（config 可覆盖）；TFTP 并发 `auto=max(128,2×核)`、`u8→u16`、去 64 校验上限；DHCP `ping_timeout 500→100`；HTTP `max_connections` 死字段处理；启动日志打印生效容量。编号在 M4.7 之后，实施早于 M4.6（横向容量优化，与 M4.6/M4.7 内容正交） |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
+| M6 | 支持矩阵增强 | M4.1、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
+| M7 | 补充包和后处理增强 | M4.1、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
 
 ### 1.3 完成标准
 
@@ -1027,6 +1028,8 @@ M0 验收结果：
   静默截断；RRQ 中 `tsize` 只接受 RFC 2349 允许的查询形式。服务端不在 OACK 中添加客户端未请求的 option，
   也不返回大于客户端显式请求值的 `blksize`（RFC 2347/2348）。
 - 未识别 option 按 RFC 2347 忽略，已识别且接受的 option 才进入 OACK；OACK 后必须先收到 ACK block 0。
+  OACK 与非末尾 DATA 共用 `max_retries=5` 和指数退避，并从同一 transfer TID 重传；ACK0 丢失不能
+  退化为等待客户端重新发 RRQ。
 - 客户端从当前 transfer TID 发送 ERROR 时立即终止该传输并记为 failed；未知 TID 的 DATA/ACK/ERROR 不得
   影响其他传输。超时达到重传上限后释放 socket/fd 和运行态槽位。
 - §7.5 `awaitAck` 健壮等待循环：在超时窗口内忽略非预期包并继续等待，而非在第一个非预期包上立即失败。
@@ -1039,14 +1042,16 @@ M0 验收结果：
   这修复了 GRUB 在 OACK 协商期间偶尔发送重复 ACK 或延迟包导致 `UnexpectedAck` 传输失败的竞态条件。
   虽然GRUB会重试RRQ并成功完成传输，但第一次失败可能使GRUB的UEFI网络栈进入不一致状态，
   最终导致 "could not seed network packet" 错误。
-- **末尾块 ACK 乐观完成与指数退避（M4.2 F4，2026-07-16 修订）**：§7.5 `awaitAck`
+- **末尾块 ACK 乐观完成与指数退避（M4.2 F4，2026-07-17 并发模型修订）**：§7.5 `awaitAck`
   超时仍返回 `error.Timeout`，由调用方（`transfer`/`transferFromMemory` 重传循环）决策：
-  末尾块（payload < `blksize`）重传 `final_block_retries=2` 次（~7s）仍零 ACK，按
-  RFC 1350 §6 视为传输成功、不发 ERROR 包（GRUB 收齐大 initrd 后转去加载不再回最终
-  ACK，与 tftpd-hpa `exit(0)` / dnsmasq `LOG_INFO "sent"` 一致）；非末尾块重传
-  `max_retries=5` 次仍无 ACK 才判失败（数据不完整，对齐 dnsmasq「中途超时为错误」，
-  区别于 tftpd-hpa 无差别 `exit(0)`）。重传基线 `default_timeout` 默认 1s、每次翻倍
-  封顶 255（`backoffSeconds`），客户端 RFC 2349 `timeout` option 仍按协商值。此修订
+  末尾块（payload < `blksize`）重传 `final_block_retries=2` 次（~7s）仍零 ACK，记录
+  `delivery unconfirmed` 后乐观完成且不发 ERROR；这是一项有界资源策略，不是 RFC 对数据交付成功的保证。
+  非末尾块重传 `max_retries=5` 次仍无 ACK 判失败。tftpd-hpa 通常由 inetd/daemon fork 为每个请求提供
+  进程隔离，timeout handler 的 `exit(0)` 只终止该请求；NodeForge 是长驻多线程 daemon，RRQ worker
+  共享全局并发计数、session 与事件状态，不能照搬无差别 `exit(0)`。传输 TID 建立后的超时/协议错误
+  只从原 worker 返回并释放槽位，不得另绑临时端口发送 ERROR；只有 transfer socket 建立前的 RRQ
+  校验拒绝才可用新 TID 返回初始 ERROR。重传基线 `default_timeout` 默认 1s、每次翻倍封顶 255
+  （`backoffSeconds`），客户端 RFC 2349 `timeout` option 仍作为退避基线。此修订
   纠正 `e14b15f` 的 3s->5s「加耐心」治标方向。纯决策逻辑
   `RetryAction`/`retryAction`/`retryLimit`/`backoffSeconds` 与 socket 解耦，有单元测试覆盖。
 - `RuntimeState.TftpState.max_sessions=32` 是 CLI 最近会话历史环的容量，不是 32 个活动传输的并发拒绝阈值，
@@ -3778,17 +3783,19 @@ NodeDeploymentControl {
   requested_at,
   requested_by,
   config_revision,
-  // M4.3 per-generation 生命周期时间戳，见 §9.12.4 / 专项设计 §5.2
+  // 当前 generation 生命周期时间戳
   started_at,
   finished_at,
+  // 最近一次成功事实（跨 retry 保留）
+  deployed_generation,
   deployed_at
 }
 ```
 
-`started_at`/`finished_at`/`deployed_at` 随 generation 走：`rearm` 武装新 generation 时必须清零，
-`consume` 写 `started_at`、`markTerminal` 写 `finished_at`（及成功时的 `deployed_at`），本 generation
-内仅首次写入以保持幂等。这样部署完成后再次 `install retry` 会清零旧时间并随新 generation 重新记录，
-状态机随之推进，而非停留在上一 generation 的时间。
+`started_at`/`finished_at` 属于当前 generation：`rearm` 时清零，`consume`/`markTerminal` 在本 generation
+内仅首次写入。`deployed_at`/`deployed_generation` 是最近一次成功事实，retry 和失败不得清零；下一次成功
+才原子替换。管理查询必须用 `armed_generation orelse consumed_generation` 作为当前代，并只展示同时匹配
+该 generation 与 config revision 的 node status，禁止把旧 profile 的 completed 与新 desired profile 拼接。
 
 - install profile 首次绑定且没有 control 记录时视为 generation 1 已 armed；只有当前
   `install_generation > consumed_generation` 才可由 boot resolver 下发 installer target。
@@ -3879,7 +3886,7 @@ DHCP lease 和 BootSession delivery TTL 是两种生命周期，不能相互冒�
 | TFTP option/TID/ERROR/超时边界 | M1 §6.3 | M4.1 回归必须通过，不新增 adapter 逻辑 |
 | DHCP T1/T2、pool/probe/identity/discovery 切换 | M2 §7.3–7.4 | 长时间安装前置补丁 |
 | TTL 单调时钟、UTC 回拨与 trace 顺序 | M2.5.1 §7.5.12.5 | trace 不得因时钟回拨伪造时序 |
-| node-status 容量 | M3.1 | 保持 `max_statuses=256`；满时拒绝新投影并记录 capacity event，不覆盖旧节点 |
+| node-status 容量 | M3.1（后由 M4.8 §9.17 取代） | 当时保持 `max_statuses=256`；M4.8 已改为 2048 安全天花板 + effective used-count 门控 |
 | runtime asset 丢失/变化 | M3 §8.3.1 | answer/repo/ISO 请求得到稳定错误，不发送错误文件 |
 | ISO 空间预检、orphan/mount 清理 | M3 §8.4 | 重复 Ubuntu/Rocky 导入和失败恢复列入验收 |
 | catalog snapshot 与进行中传输 | M3 §8.8 | 旧 fd/revision 完成，新 snapshot 只影响新请求 |
@@ -4597,7 +4604,7 @@ build time 优先使用 `SOURCE_DATE_EPOCH`，无 git 环境接受显式 `-Dgit-
 1. Kylin `.treeinfo` 无 repository 仍识别 `distro=kylin` 并导入核心资产；CentOS/Rocky 同版本并存且目录不串名。
 2. 同 SHA 重复导入幂等；同名不同 SHA 返回稳定冲突；不同 logical name 可并存。
 3. 已有资源化目录迁移通过成功/幂等及新增边界测试，M5–M7 现行设计不再引用旧路径。
-4. `node list` 显示 status/started_at/finished_at/SN（RFC 3339 可视化时间）；`node show` 展开完整非 secret 参数、profile、状态、generation 和 inventory；部署完成后 `install retry` 使 deployment 时间随新 generation 清零并重新记录。
+4. `node list` 显示当前 generation 的 status/started_at/finished_at/SN；`node show` 分开显示 current generation 与 last successful generation/deployed_at。retry 只清零当前尝试时间，不删除最近成功事实。
 5. deprecated CLI 全部删除；typed `k=v` 支持一次原子修改多个 node 属性，unknown/wrong type 不落盘。
 6. node CRUD 不重启 daemon；server/port 等结构字段明确返回 restart-required。
 7. TFTP 三个公开运行参数均生效；timeout 请求原值回显、缺省使用内部 5 秒；未请求 option 不出现在 OACK。
@@ -4745,7 +4752,7 @@ wildcard 吞路由、node auth、management loopback 和 sensitive cache policy�
 
 M4.5 是 M4.4 后的 HTTP **契约补全与客户端可靠性里程碑**。M4.4 已完成并验证 canonical URL、三平面隔离和
 Rocky/Ubuntu 主链路；M4.5 不回改这些结论，而把 M4.4 设计中尚未完整工程化的 route/method、DTO、分页、并发控制、
-幂等操作与客户端协议解析收口为可执行契约。M4.5 完成后，M4.6/M4.7/M5–M7 只能消费这一套契约。
+幂等操作与客户端协议解析收口为可执行契约。M4.5 完成后，M4.6/M4.7/M4.8/M5–M7 只能消费这一套契约。
 
 M4.5 不恢复旧 URL、不改变节点交付认证升级模型，也不为内部历史增加 `/api/v2`。允许补充 canonical collection
 对应的 detail route（例如 `GET /management/assets/:name`）和 operations 查询，因为它们是 M4.4 资源语义的闭环，
@@ -5675,6 +5682,153 @@ provisioned markers 和可安全归档的 completed journal，保留 config/cata
 - `setup --reconfigure/reset-state/reset-all/purge-data` 的确认、备份、事务恢复、systemd rollback、健康检查和权限测试通过；
   config/catalog/model revision 与 active BootSession plan digest 在重启前后保持契约一致。
 
+### 9.17 M4.8：并发容量扩展与启动时动态派生
+
+> 编号在 M4.7 之后，但实施早于 M4.6。本里程碑是横向容量优化，与 M4.6（kernel_args）和
+> M4.7（路径/存储边界）内容正交，可在 M4.5 完成后立即落地。专项设计见
+> `docs/superpowers/specs/2026-07-17-concurrency-capacity-scaling-design.md`。
+
+#### 9.17.1 目标与背景
+
+支持 512/1024 节点同时批量 PXE 部署。当前实现受三处硬约束阻碍：
+
+- **5 处定长 256 上限**（跨 DHCP/TFTP/HTTP 共享的内存定长数组，改 config 无效）：
+  `boot_session.max_sessions`（`src/state/boot_session.zig:13`）、`DhcpState.max_leases`
+  （`src/state/runtime.zig:51`）、`node_status.max_statuses`（`src/state/node_status.zig:7`）、
+  `node_inventory.max_entries`（`src/state/node_inventory.zig:4`）、
+  `deployment_control.max_entries`（`src/state/deployment_control.zig:10`）。会话/lease
+  打满后协议仍应答，但 TFTP 无法解析启动身份（`access_violation`），节点无法完成 PXE。
+- **TFTP `max_concurrent_transfers` 为全局上限**（`src/tftp/server.zig:107` 的单一原子计数器，
+  非文档所述 per-client），默认 4，校验封顶 64（`src/config/validate.zig:116`）。GRUB 的
+  TFTP 客户端不协商 RFC 7440 windowsize，每传输 RTT 限约 2 MB/s；initrd（133 MB）单传
+  需 ~66 s。
+- **DHCP OFFER 前串行 ICMP ping**（`src/dhcp/server.zig:217`，`ping_timeout_ms` 默认 500），
+  空闲 IP 最坏等满超时；1024 台突发等同分数量级串行瓶颈。
+
+目标：以“2048 条编译期安全天花板 + 启动时有效容量”替代硬编码 256，使运维在天花板内仅靠配置
+（`subnet`/`pool` 调宽 + 按需覆盖）即可把规模调到 512/1024，无需改代码重编译。
+
+#### 9.17.2 设计原则
+
+1. 共享热路径 store 保留**2048 条编译期安全天花板**，避免锁内 allocator 与不可预测内存增长；
+   启动时派生 `effective`（允许的已用条目数），config 可覆盖，取 `max(派生, config)` 后 clamp 到天花板。
+2. `dhcp.subnet` / `pool_start` / `pool_end` 由运维配置；系统**只从中派生容量，不替运维调宽**。
+3. daemon **启动时打印关键性能参数的生效值**，便于运维核对派生规模是否够。
+4. TFTP 并发为**全局语义**（PXE 客户端顺序取文件，per-client > 1 无意义；全局才是正确的
+   批量部署节流）。修正 `model.zig:99-102` docstring 与 `2026-07-14-m4_2-...md` §7.2 的
+   per-client 措辞。
+5. `http_accel` 不在 M4.8 范围；本里程碑纯 TFTP/DHCP/HTTP 三者一起考虑。
+
+#### 9.17.3 容量上限动态化
+
+5 处原 256 上限统一提升为 **2048 条编译期安全天花板**。除 inventory 已使用 ArrayList 外，协议热路径
+继续使用固定数组和锁内无分配访问；启动派生值只控制允许的**已用条目数**，不是可扫描的数组前缀：
+
+| 数组 | 派生来源（默认） | 说明 |
+|---|---|---|
+| `DhcpState.leases` | `max(usable_hosts(dhcp.subnet), config)` | 并发 lease 上限 |
+| `boot_session` | 同 leases | 并发启动数 = 并发 lease，同源 |
+| `node_status` | `max(受管节点数, config)` | 跟踪已纳管节点，与并发不同源 |
+| `node_inventory` | `max(受管节点数, config)` | 同上 |
+| `deployment_control` | `max(受管节点数, config)` | 同上 |
+
+- **并发容量**（leases + sessions）= `max(usable_hosts(dhcp.subnet CIDR), config 显式值)`。
+  `/22` -> 1022，`/24` -> 254。1024 个可用地址至少需要 `/21`（2046 hosts）；`/22` 只能支持
+  1022 个地址。显式 `dhcp.max_leases` 和 `capacity.managed_entries` 必须在 `1..2048`。
+- **受管容量**（status/inventory/deployment）= `max(受管节点数, config)`。受管节点数取
+  `config.nodes`（M4.7 后取 Catalog 节点数）。与并发容量不同源：未知节点拿 lease 但不进
+  status 投影。
+- 三者均保留 config 显式覆盖：`effective = min(2048, max(派生, 配置))`。恢复快照后还要取
+  `max(effective, restored_used)`，不因缩容隐藏历史条目。查找覆盖全部槽位，只有“创建新条目”按已用数量拒绝，
+  防止高槽位恢复数据与低槽位新数据重复。
+- `node-status.json` 使用紧凑 schema 4（变长字符串、仅写 used）；加载器以 8 MiB 上限接受现存约 4.1 MiB
+  schema 3 固定数组快照并迁移。`leases.json` 同样只写 used lease，避免 2048 个空槽造成文件膨胀。
+
+#### 9.17.4 TFTP 并发：`max_concurrent_transfers` 自动派生
+
+- 默认 = `max(128, 2 × cpu_cores)`，config 可覆盖。
+- 字段类型 `u8` -> `u16`（2×核在 ≥128 核机器会溢出 u8）。
+- 计数器 `active_transfers`（`src/tftp/server.zig:107`）：`std.atomic.Value(u8)` -> `Value(u16)`。
+- 移除 `src/config/validate.zig:116` 的 `> 64` 校验上限（否则 128 直接被拒）。
+- 启动时 `std.Thread.getCpuCount()` 派生核数。
+- 文档对齐：全局（非 per-client）+ auto 派生语义。
+- 吞吐：每传输 RTT 限 ~2 MB/s，聚合随并发线性增长至打满线。千兆下 64 并行即 ~128 MB/s
+  打满；`max(128, 2×核)` 为 10GbE/多核预留，千兆上不增反不损（线材限）。每并发 = 1 detached
+  线程 + 1 临时 UDP socket，128~192 对 OS 无压力。
+
+#### 9.17.5 DHCP `ping_timeout_ms`
+
+- 默认 `500` -> `100`。OFFER 前串行 ICMP ping（`src/dhcp/server.zig:217`），空闲 IP 最坏等满
+  超时；1024 台突发在 500 ms 下为 8 分钟级串行瓶颈，100 ms 可接受且保留 ping 防冲突语义。
+- DHCP 单线程小包循环非吞吐墙（基线 200 pps），仅 ping 是突发瓶颈。
+
+#### 9.17.6 HTTP
+
+- `http.max_connections`（`src/model.zig:71-79`）：当前为**死字段（声明但全代码未读）**。
+  M4.8 必须处理：**(a)** 接上做真正的并发上限，或 **(b)** 标注为 advisory/未强制并更新文档。
+  二选一，不得继续留作误导。
+- 单事件循环 + 异步零拷贝 sendfile（`src/http/server.zig:553`）保留；单线程非传输瓶颈；
+  120 s 超时保留。
+- 真正的并发墙在 OS 层（fd/磁盘），见 §9.17.8。
+
+#### 9.17.7 启动日志打印生效容量
+
+daemon 启动时输出派生后的生效值（日志/stdout），例如：
+
+```
+nodeforged: capacity derived
+  dhcp.subnet=192.168.0.0/21 -> usable_hosts=2046
+  max_leases=2046  max_sessions=2046  ceiling=2048
+  managed_nodes=1024 -> max_statuses/inventory/deployment=1024
+  tftp.max_concurrent_transfers=128 (max(128, 2×cores=64))
+  dhcp.ping_timeout_ms=100
+  http.max_connections=0 (unlimited/unenforced)
+```
+
+让运维一眼看到派生规模是否够、auto 并发实际取了多少。
+
+#### 9.17.8 系统层与运维（非代码，不进 M4.8 代码改动）
+
+- `ulimit -n` / systemd `LimitNOFILE` ≥ 8192（每 HTTP 下载 ~2 fd）。
+- TFTP UDP 接收缓冲：`SO_RCVBUF` / `net.core.rmem_max` 调大（port 69 dispatcher 200 ms
+  轮询，靠内核缓冲吸收突发 RRQ）。
+- 资产盘放 SSD/NVMe（installer ISO/repo 大文件，Ubuntu 2.2 GB/台 尤甚）。
+- 波次部署：`reinstall_policy=explicit` + generation 门控，每波 ≤ 派生并发容量，避免
+  UDP/69 RRQ 风暴 + DHCP ping 风暴。
+
+#### 9.17.9 容量预估（千兆，全部生效后）
+
+| 阶段 | 1024 台 | 瓶颈 |
+|---|---|---|
+| PXE 启动（TFTP 内核+initrd） | ~20 min | 千兆线 + initrd ~2 MB/s/传输 |
+| OS 安装（HTTP repo/ISO） | 数十分钟~数小时 | 磁盘 IO + 千兆线 |
+
+#### 9.17.10 不在 M4.8 范围内
+
+- `subnet` / `pool_start` / `pool_end`：运维配置，系统只读取派生，不替运维调宽。
+- `http_accel`：仍是实验性（GRUB EFI 内存碎片，`can not alloc kernel buffer` 风险），
+  不在 M4.8 改动；M4.8 不依赖 http_accel，纯 TFTP/DHCP/HTTP。
+- 实际压测生产数字：**M6 在 M4.8 动态派生基础上压测校准**，不再设置静态默认值；这替代
+  原 §11.2 中"M6 压测固化 TFTP/HTTP 性能参数"的静态值语义。
+- 数据库：单机 1000 节点仍用 JSON/JSONL，M4.8 不引入。
+
+#### 9.17.11 测试与验收
+
+- 网段派生容量：`subnet=/22` -> leases/sessions = 1022；`/21` -> 2046；`/24` -> 254。
+- auto 并发：`getCpuCount` 派生 `max(128, 2×核)`；config 显式覆盖生效。
+- > 256 并发不再被拒：leases/sessions 派生到 1022 时，第 257 台仍能完成 PXE。
+- `u16` 字段：`max_concurrent_transfers = 128/192/255` 通过校验（去 64 上限后）。
+- 启动日志：派生生效值打印正确且与实际配置一致。
+- `ping_timeout=100`：突发下 OFFER 延迟可接受，防冲突语义保留。
+- 回归：config 显式指定旧值（如 `max_concurrent_transfers=4`、容量 256）时行为不变。
+- 恢复回归：条目位于 effective 之外的历史槽位仍能查找/更新，不得在低槽位创建重复记录；已用数量达到
+  effective 才拒绝新条目。
+- 持久化回归：schema 4 只含 used 状态，旧 schema 3 大快照可读且恢复后 session 一律 inactive；
+  `leases.json` 只写 used lease。
+- 聚合一致性回归：status 必须匹配当前 model revision 与 `armed orelse consumed` generation；retry pending 显示
+  新 armed generation，不能继续显示旧 consumed generation。started/finished 属于当前尝试，最近成功的
+  deployed generation/time 跨 retry 和失败保留；inventory 明示其来源 generation。
+
 ## 10. M5：内存无盘启动与基础后处理
 
 ### 10.1 目标
@@ -6008,7 +6162,7 @@ retry，只有 attempt 已终态失败后才需要操作员重新 arm。
 
 完善 MVP 周边兼容性和诊断能力。
 
-### 11.2 M4.1–M4.7 与 M5 基线继承
+### 11.2 M4.1–M4.8 与 M5 基线继承
 
 M6 只扩展架构、发行版版本和 bootloader，不得为新 adapter 建立第二套目标系统默认值。新增的 x86_64、
 Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 的归一化 TargetSystemConfig，并满足：
@@ -6041,9 +6195,9 @@ Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 �
   Fedora 及国产化 openEuler/Kylin/AnolisOS/Sugon OS/BigCloud-Enterprise-Linux 可共享 RHEL-family adapter，
   但 catalog/profile/目录必须保留真实 distro；`source_label` 只用于媒体显示，不再承担产品身份。
 - M6 的"安装错误分类"（§11.5）已含 M4.2 F1 新增的 `install.anaconda_error`/`install.subiquity_error`；
-  M6 压测固化 TFTP/HTTP 性能参数时使用 M4.3 §9.12.5 收口的 `TftpConfig` 字段（`max_blksize`/
-  `windowsize`/`max_concurrent_transfers`）和 `HttpConfig.max_connections`；只有实测证明内部 5 秒默认值
-  需要按部署调整时，才另行提议 timeout 配置。节点级
+  M6 在 M4.8 §9.17 启动时动态派生（`max_concurrent_transfers` auto、容量上限按网段/节点数、
+  `max_connections` 处理）基础上压测校准，不再设置静态默认值；`max_blksize`/`windowsize` 仍沿用
+  M4.3 §9.12.5 收口字段。只有实测证明内部 5 秒默认值需要按部署调整时，才另行提议 timeout 配置。节点级
   `node.http_accel`（实验性，默认 `false`）
   仅对 GRUB UEFI 链路生效；BIOS PXELINUX 固定使用 `pxelinux.0`（只支持 TFTP），`http_accel` 无效，
   kernel/initrd 始终走 TFTP。详见 §5.2.1。

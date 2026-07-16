@@ -6,8 +6,11 @@
 const std = @import("std");
 const dhcp_store = @import("dhcp_store.zig");
 const model = @import("../model.zig");
+const capacity = @import("capacity.zig");
 
-pub const max_entries = 256;
+/// M4.8: 投影表内存天花板；生效容量由 `Store.effective` 在启动时按
+/// `max(受管节点数, config)` 派生（`min(派生, max_entries)`）。
+pub const max_entries = capacity.store_ceiling;
 
 pub const RequestSource = enum { initial, operator, policy_always };
 
@@ -28,6 +31,8 @@ pub const Entry = struct {
     requested_at: i64 = 0,
     started_at: i64 = 0,
     finished_at: i64 = 0,
+    /// 最近一次成功部署所属 generation；与当前 armed/consumed generation 分离。
+    deployed_generation: u64 = 0,
     deployed_at: i64 = 0,
     requested_by: RequestSource = .initial,
 
@@ -55,6 +60,7 @@ pub const DiskEntry = struct {
     requested_at: i64 = 0,
     started_at: i64 = 0,
     finished_at: i64 = 0,
+    deployed_generation: u64 = 0,
     deployed_at: i64 = 0,
     requested_by: RequestSource = .initial,
 };
@@ -88,6 +94,8 @@ pub const TerminalResult = struct {
     generation: u64,
     previous_terminal_generation: ?u64,
     previous_applied_revision: u64,
+    previous_deployed_generation: u64,
+    previous_deployed_at: i64,
 };
 
 pub const View = struct {
@@ -100,14 +108,33 @@ pub const View = struct {
     requested_at: i64,
     started_at: i64,
     finished_at: i64,
+    deployed_generation: u64 = 0,
     deployed_at: i64,
     requested_by: RequestSource,
+
+    /// 当前操作对象优先取尚待执行的 armed generation；安装开始后才转为 consumed。
+    pub fn currentGeneration(self: View) ?u64 {
+        return self.armed_generation orelse self.consumed_generation;
+    }
 };
 
 pub const Store = struct {
     entries: [max_entries]Entry = [_]Entry{.{}} ** max_entries,
+    /// M4.8: 生效投影容量，启动时按受管节点数派生收敛。
+    effective: usize = max_entries,
     revision: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
+
+    /// M4.8: 按 `max(受管节点数, config)` 派生并 clamp 到 `[1, max_entries]`。
+    pub fn setEffective(self: *Store, derived: usize) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var used: usize = 0;
+        for (self.entries) |entry| if (entry.used()) {
+            used += 1;
+        };
+        self.effective = @max(used, @max(@as(usize, 1), @min(derived, max_entries)));
+    }
 
     /// 首次观测武装 generation 1。已有条目永远不会
     /// 被 config 重载自动重新武装。
@@ -167,11 +194,9 @@ pub const Store = struct {
     /// 幂等地武装下一个破坏性 generation。调用方在执行此状态变更前
     /// 已检查 profile/session 约束。
     ///
-    /// started/finished/deployed 是 per-generation 生命周期时间戳（见专项设计
-    /// §5.2）：每个 generation 拥有自己的首次 started、首次 terminal 与成功
-    /// deployed。武装一个新 generation 等于开启一次全新的部署生命周期，因此
-    /// 必须把上一 generation 残留的 started/finished/deployed 清零，否则部署
-    /// 完成后再次 retry 会继续显示旧 generation 的时间，状态机看似没有推进。
+    /// started/finished 是当前 generation 生命周期时间戳，rearm 时清零。
+    /// deployed_at/deployed_generation 表示最近一次成功事实，必须跨 retry 保留；
+    /// 否则新 generation 尚未开始时会错误地抹掉上一次成功部署记录。
     /// consumed/terminal generation 作为历史不在此处清零，由后续 consume/
     /// markTerminal 为新 generation 覆盖。
     pub fn rearm(self: *Store, node_id: []const u8, revision: u64, requested_at: i64, requested_by: RequestSource) !RearmResult {
@@ -200,7 +225,6 @@ pub const Store = struct {
             entry.requested_by = requested_by;
             entry.started_at = 0;
             entry.finished_at = 0;
-            entry.deployed_at = 0;
             return previous;
         }
         const generation = entry.next_generation;
@@ -215,7 +239,6 @@ pub const Store = struct {
         entry.requested_by = requested_by;
         entry.started_at = 0;
         entry.finished_at = 0;
-        entry.deployed_at = 0;
         return .{ .generation = generation, .changed = true, .previous_next_generation = previous_next, .previous_requested_revision = entry.consumed_revision, .previous_started_at = previous_started, .previous_finished_at = previous_finished, .previous_deployed_at = previous_deployed };
     }
 
@@ -273,12 +296,17 @@ pub const Store = struct {
                     .generation = generation,
                     .previous_terminal_generation = entry.terminal_generation,
                     .previous_applied_revision = entry.applied_revision,
+                    .previous_deployed_generation = entry.deployed_generation,
+                    .previous_deployed_at = entry.deployed_at,
                 };
                 entry.terminal_generation = generation;
                 if (entry.finished_at == 0 and timestamp != 0) entry.finished_at = timestamp;
                 if (applied) {
                     entry.applied_revision = entry.consumed_revision;
-                    if (entry.deployed_at == 0 and timestamp != 0) entry.deployed_at = timestamp;
+                    if (entry.deployed_generation != generation and timestamp != 0) {
+                        entry.deployed_generation = generation;
+                        entry.deployed_at = timestamp;
+                    }
                 }
                 return result;
             }
@@ -293,6 +321,8 @@ pub const Store = struct {
         for (&self.entries) |*entry| if (entry.used() and std.mem.eql(u8, entry.node(), node_id) and entry.terminal_generation != null and entry.terminal_generation.? == result.generation) {
             entry.terminal_generation = result.previous_terminal_generation;
             entry.applied_revision = result.previous_applied_revision;
+            entry.deployed_generation = result.previous_deployed_generation;
+            entry.deployed_at = result.previous_deployed_at;
             return;
         };
     }
@@ -318,6 +348,7 @@ pub const Store = struct {
             .requested_at = entry.requested_at,
             .started_at = entry.started_at,
             .finished_at = entry.finished_at,
+            .deployed_generation = entry.deployed_generation,
             .deployed_at = entry.deployed_at,
             .requested_by = entry.requested_by,
         };
@@ -349,10 +380,12 @@ pub const Store = struct {
     fn findOrCreateLocked(self: *Store, node_id: []const u8) !*Entry {
         if (node_id.len == 0 or node_id.len > 96) return error.InvalidNodeId;
         var free: ?*Entry = null;
+        var used: usize = 0;
         for (&self.entries) |*entry| {
             if (entry.used() and std.mem.eql(u8, entry.node(), node_id)) return entry;
-            if (!entry.used() and free == null) free = entry;
+            if (entry.used()) used += 1 else if (free == null) free = entry;
         }
+        if (used >= self.effective) return error.DeploymentControlCapacity;
         const entry = free orelse return error.DeploymentControlCapacity;
         @memcpy(entry.node_id[0..node_id.len], node_id);
         entry.node_id_len = @intCast(node_id.len);
@@ -393,10 +426,15 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         entry.requested_at = disk_entry.requested_at;
         entry.started_at = disk_entry.started_at;
         entry.finished_at = disk_entry.finished_at;
+        entry.deployed_generation = if (disk_entry.deployed_generation == 0 and disk_entry.deployed_at != 0)
+            disk_entry.terminal_generation orelse 0
+        else
+            disk_entry.deployed_generation;
         entry.deployed_at = disk_entry.deployed_at;
         entry.requested_by = disk_entry.requested_by;
         count += 1;
     }
+    store.effective = @max(store.effective, count);
 }
 
 fn validGenerations(entry: DiskEntry) bool {
@@ -411,6 +449,7 @@ fn validGenerations(entry: DiskEntry) bool {
         // 仅 terminal > consumed 是非法的（上次完成的比当前消费的更新，逻辑矛盾）。
         if (entry.consumed_generation == null or generation > entry.consumed_generation.?) return false;
     }
+    if (entry.deployed_generation != 0 and (entry.terminal_generation == null or entry.deployed_generation > entry.terminal_generation.?)) return false;
     return true;
 }
 
@@ -455,6 +494,7 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
             .requested_at = entry.requested_at,
             .started_at = entry.started_at,
             .finished_at = entry.finished_at,
+            .deployed_generation = entry.deployed_generation,
             .deployed_at = entry.deployed_at,
             .requested_by = entry.requested_by,
         };
@@ -485,6 +525,28 @@ test "generation consumes once and retry is idempotent" {
     const repeated_retry = try store.rearm("node-01", 2, 21, .operator);
     try std.testing.expectEqual(@as(u64, 2), repeated_retry.generation);
     try std.testing.expect(!repeated_retry.changed);
+}
+
+test "current generation prefers armed work over the previous consumed generation" {
+    const pending: View = .{
+        .next_generation = 6,
+        .armed_generation = 5,
+        .consumed_generation = 4,
+        .terminal_generation = 4,
+        .requested_revision = 2,
+        .applied_revision = 1,
+        .requested_at = 10,
+        .started_at = 0,
+        .finished_at = 0,
+        .deployed_generation = 4,
+        .deployed_at = 9,
+        .requested_by = .operator,
+    };
+    try std.testing.expectEqual(@as(?u64, 5), pending.currentGeneration());
+    var running = pending;
+    running.armed_generation = null;
+    running.consumed_generation = 5;
+    try std.testing.expectEqual(@as(?u64, 5), running.currentGeneration());
 }
 
 test "retry replaces stale pending revision" {
@@ -532,9 +594,9 @@ test "completion records applied revision without arming another install" {
     try std.testing.expect(store.isDrifted("node-01", 12));
 }
 
-test "retry resets per-generation deployment timestamps" {
-    // 部署完成后再次 retry：rearm 必须为新 generation 清零 started/finished/
-    // deployed，使随后的 consume/markTerminal 记录新时间，而不是残留旧值。
+test "retry resets current attempt timestamps but preserves last successful deployment" {
+    // rearm 清零当前尝试的 started/finished，但最近成功 deployed 必须保留，
+    // 直到新 generation 真正完成后再原子替换。
     var store: Store = .{};
     try store.ensureInitial("node-01", 1, 10);
     _ = (try store.consumeAt("node-01", 100)).?;
@@ -542,13 +604,15 @@ test "retry resets per-generation deployment timestamps" {
     const first = store.view("node-01").?;
     try std.testing.expectEqual(@as(i64, 100), first.started_at);
     try std.testing.expectEqual(@as(i64, 200), first.finished_at);
+    try std.testing.expectEqual(@as(u64, 1), first.deployed_generation);
     try std.testing.expectEqual(@as(i64, 200), first.deployed_at);
 
     _ = try store.rearm("node-01", 1, 300, .operator);
     const rearmed = store.view("node-01").?;
     try std.testing.expectEqual(@as(i64, 0), rearmed.started_at);
     try std.testing.expectEqual(@as(i64, 0), rearmed.finished_at);
-    try std.testing.expectEqual(@as(i64, 0), rearmed.deployed_at);
+    try std.testing.expectEqual(@as(u64, 1), rearmed.deployed_generation);
+    try std.testing.expectEqual(@as(i64, 200), rearmed.deployed_at);
     try std.testing.expect(store.isArmed("node-01"));
 
     _ = (try store.consumeAt("node-01", 400)).?;
@@ -556,6 +620,7 @@ test "retry resets per-generation deployment timestamps" {
     const retried = store.view("node-01").?;
     try std.testing.expectEqual(@as(i64, 400), retried.started_at);
     try std.testing.expectEqual(@as(i64, 500), retried.finished_at);
+    try std.testing.expectEqual(@as(u64, 2), retried.deployed_generation);
     try std.testing.expectEqual(@as(i64, 500), retried.deployed_at);
 }
 
@@ -583,4 +648,14 @@ test "compact deployment state preserves node id bytes" {
     @memcpy(store.entries[0].node_id[0..disk.node_id_len], disk.node_id[0..disk.node_id_len]);
     store.entries[0].node_id_len = disk.node_id_len;
     try std.testing.expectEqualStrings("node-01", store.entries[0].node());
+}
+
+test "effective deployment capacity searches restored entries outside the prefix" {
+    var store: Store = .{};
+    @memcpy(store.entries[1].node_id[0..7], "node-01");
+    store.entries[1].node_id_len = 7;
+    store.setEffective(1);
+    try store.ensureInitial("node-01", 1, 1);
+    try std.testing.expect(!store.entries[0].used());
+    try std.testing.expectError(error.DeploymentControlCapacity, store.ensureInitial("node-02", 1, 1));
 }

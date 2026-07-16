@@ -32,9 +32,16 @@ pub const LegacyRuntimeFile = struct {
 /// 原子保存 DHCP lease 快照到 `leases.json`。
 /// 调用方必须已在 DhcpState mutex 下获取一致快照（通过 `snapshotWithGeneration`）。
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, leases: *const [runtime.DhcpState.max_leases]runtime.DhcpLease, now: i64) !void {
+    var compact: [runtime.DhcpState.max_leases]runtime.DhcpLease = undefined;
+    var count: usize = 0;
+    for (leases) |lease| {
+        if (!lease.used()) continue;
+        compact[count] = lease;
+        count += 1;
+    }
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try std.json.Stringify.value(LeasesFile{ .saved_at = now, .leases = leases }, .{ .whitespace = .indent_2 }, &output.writer);
+    try std.json.Stringify.value(LeasesFile{ .saved_at = now, .leases = compact[0..count] }, .{ .whitespace = .indent_2 }, &output.writer);
     try output.writer.writeByte('\n');
     try atomicWrite(io, path, output.written());
 }
@@ -89,7 +96,10 @@ pub fn atomicWrite(io: std.Io, path: []const u8, content: []const u8) !void {
 /// 某些文件系统在文件数据到达磁盘后需要显式同步目录才能使 rename 生效。
 fn syncParentDirectory(io: std.Io, path: []const u8) !void {
     const parent_path = std.fs.path.dirname(path) orelse return;
-    var parent = try std.Io.Dir.openFileAbsolute(io, parent_path, .{ .allow_directory = true });
+    var parent = if (std.fs.path.isAbsolute(parent_path))
+        try std.Io.Dir.openFileAbsolute(io, parent_path, .{ .allow_directory = true })
+    else
+        try std.Io.Dir.cwd().openFile(io, parent_path, .{ .allow_directory = true });
     defer parent.close(io);
     try parent.sync(io);
 }

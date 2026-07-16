@@ -21,20 +21,22 @@
 > 本稿仅保留当时实现语义，现行 URL 以 M4.4 专项设计为准。
 > 新契约见 `2026-07-15-m4_3-model-runtime-observability-design.md`；与本稿冲突时以 M4.3 为准。
 
-> **后续修订（2026-07-16，F4 TFTP 传输健壮性纠正）**：`e14b15f` 将 `awaitAck` 超时
+> **后续修订（2026-07-17，F4 TFTP 传输与并发模型纠正）**：`e14b15f` 将 `awaitAck` 超时
 > 3s->5s、`max_retries` 3->5 的「加耐心」方向被证明治标不治本--对 139 MB initrd，
 > GRUB 收齐文件后转去加载（解压/EFI 分配）、不再回最终 ACK（dnsmasq 源码注释
 > "some clients never send it" 即指此），无论服务端等多久都收不到末尾 ACK，最终仍判
 > 失败并误发 ERROR 包。本修订改为治本：
-> (1) **末尾块 ACK 乐观完成（RFC 1350 §6）**：等 ACK 的块若是最后一块
->（payload < blksize），重传 `final_block_retries=2` 次（1+2+4 ≈ 7s）仍零 ACK 即视为
-> 传输成功、返回已发送字节数、不发 ERROR 包，与 tftpd-hpa `exit(0)` / dnsmasq
-> `LOG_INFO "sent"` 一致；非末尾块超时仍判失败（数据确实不完整）。
+> (1) **末尾块 ACK 乐观完成**：等 ACK 的块若是最后一块（payload < blksize），重传
+> `final_block_retries=2` 次（1+2+4 ≈ 7s）仍零 ACK，记录 `delivery unconfirmed` 后乐观完成；
+> 这是资源释放策略，不是 RFC 1350 对交付成功的保证。非末尾块超时仍判失败。
 > (2) **指数退避重传**：`default_timeout` 5s->1s（与 tftpd-hpa 默认一致），每次重传
 > timeout 翻倍封顶 255；非末尾块 `max_retries=5`（对齐 `TRIES=6`，累计 ~63s）。
 > 客户端 RFC 2349 `timeout` option 仍按协商值。
-> (3) 末尾块用更小预算（~7s）是为尽快释放 worker--NodeForge 线程模型下长时间空等
-> 会占用 worker 槽（区别于 tftpd-hpa 每请求一进程的 63s 空等）。
+> (3) tftpd-hpa 常见部署为每请求进程，timeout `exit(0)` 只清理该请求；NodeForge 是共享
+> session/event/全局并发槽的长驻多线程 daemon，不能照搬无差别退出。末尾块用更小预算
+> 是为尽快释放全局 worker，非末尾块必须显式失败。
+> (4) OACK/ACK0 使用与非末尾 DATA 相同的同 TID 重传循环；传输 TID 建立后的失败只关闭
+> 原 worker，不从新临时端口发送 ERROR。
 > 实现见 `src/tftp/server.zig` `RetryAction`/`retryAction`/`retryLimit`/`backoffSeconds`
 > 及 `transfer`/`transferFromMemory` 重传循环；纯逻辑有单元测试覆盖。详见 §7.7。
 
@@ -517,26 +519,27 @@ UEFI 网络栈进入不一致状态，最终导致 "could not seed network packe
 超时窗口使用 `boot_session.monotonicNow()` 跟踪截止时间，每次收到非预期包后
 重新计算剩余时间并继续等待，确保总等待时间不超过原始 `timeout` 值。
 
-### 7.7 末尾块 ACK 乐观完成与指数退避重传（2026-07-16 修订）
+### 7.7 末尾块 ACK 乐观完成与指数退避重传（2026-07-17 并发模型修订）
 
 §7.6 描述 `awaitAck` 的**单包**健壮性，超时仍返回 `error.Timeout`。本节规定**调用方**
 （`transfer`/`transferFromMemory` 的重传循环）对 `error.Timeout` 的处理，纠正 `e14b15f`
 「末尾块 ACK 丢失即失败 + 发 ERROR 包」的误判。
 
-- **末尾块乐观完成（RFC 1350 §6）**：当前等 ACK 的块若是最后一块
-（`last_read < settings.block_size`），重传 `final_block_retries=2` 次仍零 ACK，视为
-  传输成功--末尾块数据几乎肯定已送达（GRUB 收齐 initrd 后转去加载、不再回最终 ACK），
-  返回已发送字节数，不发 TFTP ERROR 包。与 tftpd-hpa `exit(0)` / dnsmasq
-  `LOG_INFO "sent"` 一致。
+- **末尾块乐观完成**：当前等 ACK 的块若是最后一块（`last_read < settings.block_size`），
+  重传 `final_block_retries=2` 次仍零 ACK，日志记录 `delivery unconfirmed` 后返回已发送字节数，
+  不发 TFTP ERROR。DATA 是否送达无法从 ACK 缺失中判定，因此不得写成 RFC 保证的成功。
 - **非末尾块失败**：中途块 ACK 超时表示数据确实不完整，重传 `max_retries=5` 次后返回
   `error.Timeout`（对齐 dnsmasq「中途超时为错误、末尾超时为成功」；区别于 tftpd-hpa
   对两种情况都 `exit(0)` 的无差别语义）。
 - **指数退避**：`default_timeout` 1s 基线，每次重传 timeout 翻倍封顶 255（`backoffSeconds`）。
   末尾块累计 ~7s（1+2+4），非末尾块 ~63s（1+2+4+8+16+32，对齐 `TRIES=6`）。客户端
   RFC 2349 `timeout` option 仍按协商值放大基线。
-- **worker 释放**：末尾块用更小预算是为尽快释放 worker--NodeForge 线程模型
-（`max_concurrent_transfers` 个 worker 槽）下长时间空等会占用槽位，区别于 tftpd-hpa
-  每请求一进程的 63s 空等。
+- **并发模型边界**：tftpd-hpa 的 timeout handler 在常见 fork/inetd 模型中退出单个请求进程；
+  NodeForge 的 detached worker 共享全局 `max_concurrent_transfers` 槽、session 和事件状态。
+  因此中途超时必须返回失败并释放共享状态，末尾短预算只是有界资源策略，不能复制 `exit(0)` 语义。
+- **OACK 与 TID**：OACK 等 ACK0 时同样执行 `max_retries=5` 指数退避并复用 transfer TID。
+  一旦 OACK/DATA 已发送，失败不得另绑临时端口发 ERROR；只有 transfer socket 建立前的初始 RRQ
+  校验错误可从新 TID 返回 ERROR。
 
 纯决策逻辑（`RetryAction`/`retryAction`/`retryLimit`/`backoffSeconds`）与 socket 解耦，
 有单元测试覆盖；`transfer`/`transferFromMemory` 接线复用同一决策。

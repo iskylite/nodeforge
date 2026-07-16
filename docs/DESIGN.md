@@ -305,18 +305,17 @@ M6 的 BIOS PXELINUX 链路使用 `pxelinux.0`（只支持 TFTP，不支持 HTTP
 `max_blksize` 可通过配置文件 `tftp.max_blksize` 调整（默认 1468），适用于 jumbo frames
 环境（如 `max_blksize=8192`）。
 
-**TFTP 重传与末尾块 ACK 语义（M4.2 F4，2026-07-16 修订）**：重传基线超时
+**TFTP 重传与末尾块 ACK 语义（M4.2 F4，2026-07-17 并发模型修订）**：重传基线超时
 `default_timeout` 默认 1s（与 tftpd-hpa 一致），客户端可在 RRQ 中用 RFC 2349 `timeout`
 option 覆盖；每次重传 timeout 指数翻倍封顶 255s。非末尾块重传上限 `max_retries=5`
 （对齐 tftpd-hpa `TRIES=6`，1 首次 + 5 重传，累计耐心 ~63s），耗尽仍无 ACK 判失败。
 
 **末尾块 ACK 乐观完成**：等 ACK 的块若是最后一块（payload < `blksize`），重传
-`final_block_retries=2` 次（~7s）仍零 ACK，按 RFC 1350 §6 视为传输成功、不发 TFTP
-ERROR 包。根因：GRUB 收齐大 initrd 后转去加载（解压/EFI 分配），不再回最终 ACK，
-dnsmasq 源码注释 `"some clients never send it"` 即指此；tftpd-hpa `exit(0)` 与 dnsmasq
-`LOG_INFO "sent"` 同样不把它当失败。末尾块用更小预算是为尽快释放 worker（NodeForge
-线程模型，区别于 tftpd-hpa 每请求一进程）。此修订纠正 `e14b15f` 的 3s->5s「加耐心」
-治标方向。
+`final_block_retries=2` 次（~7s）仍零 ACK，记录 `delivery unconfirmed` 后乐观完成且不发 ERROR。
+ACK 缺失无法证明 DATA 已送达，这不是 RFC 对成功交付的保证。tftpd-hpa 常见的 per-request
+进程模型中 timeout `exit(0)` 只终止该请求；NodeForge 是共享全局并发槽、session 与事件状态的
+长驻多线程 daemon，因此非末尾块耗尽必须失败，末尾短预算用于有界释放 worker。OACK/ACK0
+同样从原 transfer TID 指数退避重传；传输建立后的错误不得另绑端口发送 ERROR。
 
 ### 5.3 initrd 类型边界
 

@@ -260,6 +260,7 @@ fn emitInstallNotArmed(io: std.Io, persistence: ?*const Persistence, node_id: []
         .requested_at = 0,
         .started_at = 0,
         .finished_at = 0,
+        .deployed_generation = 0,
         .deployed_at = 0,
         .requested_by = .initial,
     };

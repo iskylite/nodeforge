@@ -10,7 +10,7 @@
   "tftp": {
     "max_blksize": 1468,
     "windowsize": 4,
-    "max_concurrent_transfers": 4
+    "max_concurrent_transfers": null
   },
   "dhcp": {
     "subnet": "192.168.50.0/24",
@@ -21,8 +21,10 @@
     "lease_seconds": 1800,
     "offer_seconds": 60,
     "abandon_seconds": 3600,
-    "ping_timeout_ms": 500
+    "ping_timeout_ms": 100,
+    "max_leases": null
   },
+  "capacity": { "managed_entries": null },
   "logging": {
     "level": "info"
   },

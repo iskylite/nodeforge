@@ -414,13 +414,14 @@ inventory 原子写入独立文件，daemon 启动恢复。服务端不接受客
 
 这些字段随 generation 一起恢复，重复事件必须幂等，不得刷新首次 started/terminal 时间。
 
-per-generation 语义要求：`rearm` 武装一个新 generation 时，必须把上一 generation 残留的
-`started_at`/`finished_at`/`deployed_at` 清零（`requested_at` 同步更新为新请求时刻）。
-否则部署完成后再次 `install retry` 会继续显示旧 generation 的时间，状态机看似没有推进；
-`consume`/`markTerminal` 在本 generation 内仍保持“仅首次写入”的幂等，不重复刷新。
+per-generation 语义要求：`rearm` 武装一个新 generation 时，只清零上一 generation 的
+`started_at`/`finished_at`（`requested_at` 同步更新）。`deployed_at` 明确定义为最近一次成功时间，
+必须与 `deployed_generation` 一起跨 retry/失败保留，直到下一 generation 成功后才替换。
+`consume`/`markTerminal` 在本 generation 内保持幂等，不重复刷新。
 `consumed_generation`/`terminal_generation` 作为历史不清零，由后续 consume/markTerminal
-为新 generation 覆盖。rearm 的内存回滚（`rollbackRearm`）必须原样恢复这三个时间戳，避免一次
-持久化失败的 retry 误清空历史部署时间。
+为新 generation 覆盖。管理查询的当前代固定为 `armed_generation orelse consumed_generation`；
+node status 必须携带并匹配 `model_revision` 与 `deployment_generation`，否则只能作为历史事实，不能
+与当前 desired profile 拼成一行。
 
 ### 5.3 daemon 聚合查询 API
 
@@ -896,8 +897,8 @@ ConfigRuntime 不等于所有字段都热生效，bind/port/root/TFTP 参数仍�
 | `src/state/config_runtime.zig`（新） | 不可变 snapshot、引用计数、revision、replace/diff 分类 |
 | `src/config/node_mutation.zig` | 删除 CLI writer 职责；保留/迁移为 daemon 内 typed patch helper |
 | `src/state/node_inventory.zig`（新） | SN/UUID/vendor/model 投影和原子持久化 |
-| `src/state/node_status.zig` | `last_event_at`/phase 终态投影 |
-| `src/state/deployment_control.zig` | per-generation requested/started/finished/deployed 时间；rearm 清零与 rollback 恢复 |
+| `src/state/node_status.zig` | `last_event_at`/phase + model revision/deployment generation 来源归属 |
+| `src/state/deployment_control.zig` | 当前代 requested/started/finished；最近成功 deployed generation/time 跨 retry 保留 |
 | `src/state/boot_session.zig` | owned node/profile 身份与 InstallPlanSnapshot、node-aware Link、capability checkpoint/restore、resume |
 | `src/state/operations.zig`（新） | ISO import/catalog migration 长任务、Idempotency-Key 去重、有限保留和 operation 查询 |
 | `src/http/server.zig` | node CRUD/聚合 API、profile list/show、facts、webhook 专用认证、日志分级、HTTP 传输关联 |

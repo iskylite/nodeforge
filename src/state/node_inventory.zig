@@ -1,7 +1,10 @@
 const std = @import("std");
 const dhcp_store = @import("dhcp_store.zig");
+const capacity_policy = @import("capacity.zig");
 
-pub const max_entries = 256;
+/// M4.8: inventory 内存天花板；生效容量由 `Store.capacity` 在启动时按
+/// `max(受管节点数, config)` 派生（`min(派生, max_entries)`）。
+pub const max_entries = capacity_policy.store_ceiling;
 pub const Facts = struct { serial_number: ?[]const u8 = null, product_uuid: ?[]const u8 = null, vendor: ?[]const u8 = null, model: ?[]const u8 = null };
 pub const DiskEntry = struct { node_id: []const u8, serial_number: ?[]const u8 = null, product_uuid: ?[]const u8 = null, vendor: ?[]const u8 = null, model: ?[]const u8 = null, reported_at: i64, deployment_generation: u64, session_created_at: i64 = 0, boot_session_id: []const u8, digest: [32]u8 };
 pub const File = struct { schema_version: u32 = 1, revision: u64 = 0, entries: []const DiskEntry = &.{} };
@@ -9,6 +12,8 @@ pub const File = struct { schema_version: u32 = 1, revision: u64 = 0, entries: [
 pub const Store = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(DiskEntry) = .empty,
+    /// M4.8: 生效 inventory 容量，启动时按受管节点数派生收敛。
+    capacity: usize = max_entries,
     revision: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
 
@@ -18,6 +23,11 @@ pub const Store = struct {
     pub fn deinit(self: *Store) void {
         for (self.entries.items) |*entry| freeEntry(self.allocator, entry);
         self.entries.deinit(self.allocator);
+    }
+
+    /// M4.8: 按 `max(受管节点数, config)` 派生并 clamp 到 `[1, max_entries]`。
+    pub fn setCapacity(self: *Store, derived: usize) void {
+        self.capacity = @max(self.entries.items.len, @max(@as(usize, 1), @min(derived, max_entries)));
     }
 
     pub fn put(self: *Store, node_id: []const u8, session_id: []const u8, generation: u64, session_created_at: i64, facts: Facts, reported_at: i64) !bool {
@@ -34,7 +44,7 @@ pub const Store = struct {
             self.revision += 1;
             return true;
         };
-        if (self.entries.items.len >= max_entries) return error.InventoryCapacityExhausted;
+        if (self.entries.items.len >= self.capacity) return error.InventoryCapacityExhausted;
         try self.entries.append(self.allocator, try ownedEntry(self.allocator, node_id, session_id, generation, session_created_at, facts, reported_at, digest));
         self.revision += 1;
         return true;
@@ -83,6 +93,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     if (parsed.value.schema_version != 1 or parsed.value.entries.len > max_entries) return error.InvalidInventoryState;
     for (parsed.value.entries) |entry| try store.entries.append(store.allocator, try ownedEntry(store.allocator, entry.node_id, entry.boot_session_id, entry.deployment_generation, entry.session_created_at, .{ .serial_number = entry.serial_number, .product_uuid = entry.product_uuid, .vendor = entry.vendor, .model = entry.model }, entry.reported_at, entry.digest));
     store.revision = parsed.value.revision;
+    store.capacity = @max(store.capacity, store.entries.items.len);
 }
 
 fn ownedEntry(a: std.mem.Allocator, node: []const u8, session: []const u8, generation: u64, session_created_at: i64, facts: Facts, at: i64, digest: [32]u8) !DiskEntry {

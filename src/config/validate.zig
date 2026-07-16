@@ -8,6 +8,7 @@ const model = @import("../model.zig");
 const lookup = @import("../catalog.zig");
 const asset_validate = @import("../assets/validate.zig");
 const profile_install = @import("../profile/install.zig");
+const capacity = @import("../state/capacity.zig");
 
 /// 配置校验错误码。
 /// 所有错误均为编译期已知集合，不包含动态字符串——
@@ -29,6 +30,8 @@ pub const ValidationError = error{
     InvalidDhcpOfferTime,
     InvalidDhcpAbandonTime,
     InvalidDhcpPingTimeout,
+    InvalidDhcpCapacity,
+    InvalidManagedCapacity,
     InvalidLogRotation,
     InvalidEventsRotation,
     InvalidLogFilePath,
@@ -112,11 +115,17 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     if (config.http.asset_root.len == 0 or config.http.repository_root.len == 0)
         return error.EmptyAssetRoot;
     if (config.tftp.asset_root.len == 0) return error.EmptyTftpAssetRoot;
-    // M4.2 F4：校验 TFTP 性能配置
-    if (config.tftp.max_concurrent_transfers > 64) return error.InvalidTftpConcurrency;
+    // M4.2 F4 / M4.8：校验 TFTP 性能配置。max_concurrent_transfers 为 ?u16，
+    // 省略时启动按 max(128, 2×核) 自动派生；显式给出时只拒绝 0（非法）。
+    if (config.tftp.max_concurrent_transfers) |v| {
+        if (v == 0) return error.InvalidTftpConcurrency;
+    }
     if (config.tftp.max_blksize < 8 or config.tftp.max_blksize > 65464) return error.InvalidTftpBlksize;
     try validateObservability(config);
     try validateDhcp(&config.dhcp);
+    if (config.capacity.managed_entries) |value| {
+        if (value == 0 or value > capacity.store_ceiling) return error.InvalidManagedCapacity;
+    }
     try uniqueNamed(model.DistroConfig, config.distros);
     try uniqueNamed(model.ProfileConfig, config.profiles);
     try validateDistros(config);
@@ -148,6 +157,9 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
     if (dhcp.offer_seconds == 0) return error.InvalidDhcpOfferTime;
     if (dhcp.abandon_seconds == 0) return error.InvalidDhcpAbandonTime;
     if (dhcp.ping_timeout_ms == 0) return error.InvalidDhcpPingTimeout;
+    if (dhcp.max_leases) |value| {
+        if (value == 0 or value > capacity.store_ceiling) return error.InvalidDhcpCapacity;
+    }
     if (dhcp.router) |router| _ = std.Io.net.IpAddress.parseIp4(router, 0) catch return error.InvalidDhcpRouter;
     for (dhcp.dns) |dns| _ = std.Io.net.IpAddress.parseIp4(dns, 0) catch return error.InvalidDhcpDns;
 }
@@ -577,12 +589,12 @@ test "M4.1 repositories must use the managed local HTTP namespace" {
         .server_ip = "192.168.50.1",
         .http_port = 8080,
     } };
-try std.testing.expect(managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/ubuntu-22.04"));
-try std.testing.expect(!managedRepositoryUrl(&config, "https://archive.ubuntu.com/ubuntu"));
-try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/"));
-try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/local?mirror=external"));
-try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/../images/private"));
-try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/%2e%2e/images/private"));
+    try std.testing.expect(managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/ubuntu-22.04"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "https://archive.ubuntu.com/ubuntu"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/local?mirror=external"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/../images/private"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/%2e%2e/images/private"));
 
     const catalog: model.Catalog = .{
         .repositories = &.{.{
@@ -650,6 +662,17 @@ test "DHCP 地址池和静态保留必须位于服务子网" {
     config.dhcp.pool_end = "192.168.50.10";
     config.dhcp.pool_start = "192.168.50.20";
     try std.testing.expectError(error.DhcpPoolOrder, validateConfig(&config));
+}
+
+test "M4.8 explicit state capacity must fit the compiled safety ceiling" {
+    var config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" } };
+    config.dhcp.max_leases = 2049;
+    try std.testing.expectError(error.InvalidDhcpCapacity, validateConfig(&config));
+    config.dhcp.max_leases = null;
+    config.capacity.managed_entries = 2049;
+    try std.testing.expectError(error.InvalidManagedCapacity, validateConfig(&config));
+    config.capacity.managed_entries = 1024;
+    try validateConfig(&config);
 }
 
 test "拒绝格式错误的 SHA256" {

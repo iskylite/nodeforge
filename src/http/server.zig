@@ -677,7 +677,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
     };
     if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist delivery session\"}}\n", meta);
 
-    context.statuses.update(node_id, session.boot_session_id[0..], context.daemon_instance_id, .boot_config_fetched, null, unixNow(), true) catch |err|
+    context.statuses.updateForDeployment(node_id, session.boot_session_id[0..], context.daemon_instance_id, session.model_revision, session.deployment_generation, .boot_config_fetched, null, unixNow(), true) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     const fields = [_]events.Field{
@@ -961,7 +961,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
         };
     }
-    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, mapped.phase, event.value.reason, unixNow(), !terminal) catch |err|
+    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.deployment_generation, mapped.phase, event.value.reason, unixNow(), !terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [4]events.Field = .{
@@ -997,7 +997,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
         .diskless => "diskless.failed",
         .discovery => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.stage_invalid\",\"message\":\"logs unavailable for discovery\"}}\n", meta),
     };
-    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, .failed, summary.value.reason, unixNow(), false) catch |err|
+    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.deployment_generation, .failed, summary.value.reason, unixNow(), false) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     const fields = [_]events.Field{ .{ .key = "node_id", .value = node_id }, .{ .key = "boot_session_id", .value = checked.session.boot_session_id[0..] }, .{ .key = "reason", .value = summary.value.reason } };
@@ -1113,7 +1113,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
         };
     }
-    context.statuses.update(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, mapped.phase, null, unixNow(), !delivery_terminal) catch |err|
+    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.deployment_generation, mapped.phase, null, unixNow(), !delivery_terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [3]events.Field = .{
@@ -2031,22 +2031,28 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
     try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"items\":[", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision() });
     for (context.config.nodes[page.offset..end], 0..) |node, index| {
         if (index != 0) try output.writer.writeByte(',');
-        const status = context.statuses.get(node.id);
+        const deployment = context.deployments.view(node.id);
+        const status = currentProjectedStatus(context, node.id, deployment);
         const inventory = context.inventories.get(node.id);
         try output.writer.print("{{\"id\":{f},\"mac\":{f},\"ip\":", .{ std.json.fmt(node.id, .{}), std.json.fmt(node.mac, .{}) });
         if (node.ip) |ip| try output.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try output.writer.writeAll("null");
         try output.writer.print(",\"profile\":{f},\"status\":", .{std.json.fmt(node.profile, .{})});
-        if (status) |value| try output.writer.print("{f}", .{std.json.fmt(@tagName(value.phase), .{})}) else try output.writer.writeAll("null");
+        if (status) |value|
+            try output.writer.print("{f}", .{std.json.fmt(@tagName(value.phase), .{})})
+        else if (deployment) |value|
+            if (deploymentPhaseFallback(value)) |phase| try output.writer.print("{f}", .{std.json.fmt(phase, .{})}) else try output.writer.writeAll("null")
+        else
+            try output.writer.writeAll("null");
         // 部署开始/结束时间为 per-generation 生命周期时间戳：started_at 对应
         // install.started，finished_at 对应首次 terminal；deployed_at 仅在成功
         // completed 时更新。三者随 retry 重新武装而清零，见 deployment_control。
-        if (context.deployments.view(node.id)) |deployment| {
+        if (deployment) |value| {
             try output.writer.writeAll(",\"started_at\":");
-            if (deployment.started_at != 0) try output.writer.print("{d}", .{deployment.started_at}) else try output.writer.writeAll("null");
+            if (value.started_at != 0) try output.writer.print("{d}", .{value.started_at}) else try output.writer.writeAll("null");
             try output.writer.writeAll(",\"finished_at\":");
-            if (deployment.finished_at != 0) try output.writer.print("{d}", .{deployment.finished_at}) else try output.writer.writeAll("null");
+            if (value.finished_at != 0) try output.writer.print("{d}", .{value.finished_at}) else try output.writer.writeAll("null");
             try output.writer.writeAll(",\"deployed_at\":");
-            if (deployment.deployed_at != 0) try output.writer.print("{d}", .{deployment.deployed_at}) else try output.writer.writeAll("null");
+            if (value.deployed_at != 0) try output.writer.print("{d}", .{value.deployed_at}) else try output.writer.writeAll("null");
         } else try output.writer.writeAll(",\"started_at\":null,\"finished_at\":null,\"deployed_at\":null");
         try output.writer.writeAll(",\"serial_number\":");
         if (inventory) |value| if (value.serial_number) |serial| try output.writer.print("{f}", .{std.json.fmt(serial, .{})}) else try output.writer.writeAll("null") else try output.writer.writeAll("null");
@@ -2062,17 +2068,19 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
 fn managementNode(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const node = lookup.findNode(context.config, node_id) orelse return notFound(request, meta);
     const profile = lookup.findProfile(context.config, node.profile) orelse return notFound(request, meta);
-    const status = context.statuses.get(node_id);
     const deployment = context.deployments.view(node_id);
+    const status = currentProjectedStatus(context, node_id, deployment);
     const inventory = context.inventories.get(node_id);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{f},\"profile\":{{\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), std.json.fmt(node, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}) });
     try writeEffectiveSystem(&output.writer, profile);
     try output.writer.writeAll(",\"status\":");
-    if (status) |value| try output.writer.print("{{\"phase\":{f},\"boot_session_id\":{f},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}}}", .{
+    if (status) |value| try output.writer.print("{{\"phase\":{f},\"boot_session_id\":{f},\"model_revision\":{d},\"deployment_generation\":{d},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}}}", .{
         std.json.fmt(@tagName(value.phase), .{}),
         std.json.fmt(value.boot_session_id[0..], .{}),
+        value.model_revision,
+        value.deployment_generation,
         value.last_event_at,
         if (value.last_error) "true" else "false",
         std.json.fmt(value.reasonSlice(), .{}),
@@ -2084,6 +2092,104 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     if (inventory) |value| try output.writer.print("{f}", .{std.json.fmt(value, .{})}) else try output.writer.writeAll("null");
     try output.writer.writeAll("}}\n");
     return json(request, .ok, output.written(), meta);
+}
+
+/// 返回与当前 desired model 和当前 deployment generation 同源的状态。
+/// node list/show 是一致投影，不能把历史 session 的 phase 与新 profile/retry 拼接。
+fn currentProjectedStatus(context: *const RouteContext, node_id: []const u8, deployment: ?deployment_control.View) ?node_status.Status {
+    var status = context.statuses.get(node_id) orelse return null;
+    // schema 4 首版尚无 provenance。只在 deployment state 能以“同一 terminal
+    // generation + 同一 finished timestamp”严格佐证时补全；不能仅凭 node_id
+    // 接受旧 completed，否则 profile 修改后又会把旧结果拼到新 desired config。
+    if (status.model_revision == 0 and status.deployment_generation == 0) {
+        const view = deployment orelse return null;
+        status = corroborateLegacyStatus(status, view) orelse return null;
+    }
+    if (status.model_revision == 0 or status.model_revision != context.config_revision) return null;
+    if (status.deployment_generation != 0) {
+        const view = deployment orelse return null;
+        const current_generation = view.currentGeneration() orelse return null;
+        if (status.deployment_generation != current_generation) return null;
+    }
+    return status;
+}
+
+fn corroborateLegacyStatus(raw: node_status.Status, view: deployment_control.View) ?node_status.Status {
+    const current_generation = view.currentGeneration() orelse return null;
+    if (view.terminal_generation != current_generation or view.finished_at == 0 or raw.last_event_at != view.finished_at) return null;
+    const terminal_matches = switch (raw.phase) {
+        .completed => view.deployed_generation == current_generation,
+        .failed => view.deployed_generation != current_generation,
+        else => false,
+    };
+    if (!terminal_matches) return null;
+    var status = raw;
+    status.model_revision = view.requested_revision;
+    status.deployment_generation = current_generation;
+    return status;
+}
+
+/// status 快照不可用时，从持久 deployment state 给出保守阶段，避免已武装或
+/// 已消费 generation 在 CLI 中显示为无状态。它不推测细粒度安装阶段。
+fn deploymentPhaseFallback(view: deployment_control.View) ?[]const u8 {
+    if (view.armed_generation != null) return "pending";
+    const consumed = view.consumed_generation orelse return null;
+    if (view.terminal_generation == consumed)
+        return if (view.deployed_generation == consumed) "completed" else "failed";
+    if (view.started_at != 0) return "install_started";
+    return null;
+}
+
+test "management node fallback stays on the current generation" {
+    var view: deployment_control.View = .{
+        .next_generation = 6,
+        .armed_generation = 5,
+        .consumed_generation = 4,
+        .terminal_generation = 4,
+        .requested_revision = 2,
+        .applied_revision = 1,
+        .requested_at = 10,
+        .started_at = 0,
+        .finished_at = 0,
+        .deployed_generation = 4,
+        .deployed_at = 9,
+        .requested_by = .operator,
+    };
+    try std.testing.expectEqualStrings("pending", deploymentPhaseFallback(view).?);
+    view.armed_generation = null;
+    view.consumed_generation = 5;
+    view.started_at = 11;
+    try std.testing.expectEqualStrings("install_started", deploymentPhaseFallback(view).?);
+    view.terminal_generation = 5;
+    try std.testing.expectEqualStrings("failed", deploymentPhaseFallback(view).?);
+    view.deployed_generation = 5;
+    try std.testing.expectEqualStrings("completed", deploymentPhaseFallback(view).?);
+}
+
+test "legacy terminal status is adopted only when deployment facts corroborate it" {
+    var status: node_status.Status = .{ .phase = .completed, .last_event_at = 20 };
+    var view: deployment_control.View = .{
+        .next_generation = 6,
+        .armed_generation = null,
+        .consumed_generation = 5,
+        .terminal_generation = 5,
+        .requested_revision = 42,
+        .applied_revision = 42,
+        .requested_at = 10,
+        .started_at = 15,
+        .finished_at = 20,
+        .deployed_generation = 5,
+        .deployed_at = 20,
+        .requested_by = .operator,
+    };
+    const adopted = corroborateLegacyStatus(status, view).?;
+    try std.testing.expectEqual(@as(u64, 42), adopted.model_revision);
+    try std.testing.expectEqual(@as(u64, 5), adopted.deployment_generation);
+    view.armed_generation = 6;
+    try std.testing.expect(corroborateLegacyStatus(status, view) == null);
+    status.last_event_at = 19;
+    view.armed_generation = null;
+    try std.testing.expect(corroborateLegacyStatus(status, view) == null);
 }
 
 fn writeEffectiveSystem(writer: *std.Io.Writer, profile: *const model.ProfileConfig) !void {
@@ -2164,26 +2270,27 @@ fn managementProfile(request: zap.Request, context: *const RouteContext, name: [
 }
 
 fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
-    const status = context.statuses.get(node_id) orelse return notFound(request, meta);
+    const deployment = context.deployments.view(node_id);
+    const status = currentProjectedStatus(context, node_id, deployment) orelse return notFound(request, meta);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"id\":{f},\"boot_session_id\":{f},\"phase\":{f},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}", .{
-        std.json.fmt(status.node(), .{}),           std.json.fmt(status.boot_session_id[0..], .{}), std.json.fmt(@tagName(status.phase), .{}),      status.last_event_at,
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"id\":{f},\"boot_session_id\":{f},\"model_revision\":{d},\"deployment_generation\":{d},\"phase\":{f},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}", .{
+        std.json.fmt(status.node(), .{}),           std.json.fmt(status.boot_session_id[0..], .{}), status.model_revision,                          status.deployment_generation, std.json.fmt(@tagName(status.phase), .{}), status.last_event_at,
         if (status.last_error) "true" else "false", std.json.fmt(status.reasonSlice(), .{}),        if (status.session_active) "true" else "false",
     });
-    if (context.deployments.view(node_id)) |deployment| {
+    if (deployment) |value| {
         try output.writer.print(",\"deployment\":{{\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"drifted\":{s},\"requested_at\":{d},\"requested_by\":{f}}}", .{
-            std.json.fmt(deployment.armed_generation, .{}),
-            std.json.fmt(deployment.consumed_generation, .{}),
-            std.json.fmt(deployment.terminal_generation, .{}),
-            deployment.requested_revision,
-            deployment.applied_revision,
+            std.json.fmt(value.armed_generation, .{}),
+            std.json.fmt(value.consumed_generation, .{}),
+            std.json.fmt(value.terminal_generation, .{}),
+            value.requested_revision,
+            value.applied_revision,
             context.config_revision,
-            if (deployment.applied_revision != 0 and deployment.applied_revision != context.config_revision) "true" else "false",
-            deployment.requested_at,
-            std.json.fmt(@tagName(deployment.requested_by), .{}),
+            if (value.applied_revision != 0 and value.applied_revision != context.config_revision) "true" else "false",
+            value.requested_at,
+            std.json.fmt(@tagName(value.requested_by), .{}),
         });
-        try output.writer.print(",\"deployment_started_at\":{d},\"deployment_finished_at\":{d},\"deployed_at\":{d}", .{ deployment.started_at, deployment.finished_at, deployment.deployed_at });
+        try output.writer.print(",\"deployment_started_at\":{d},\"deployment_finished_at\":{d},\"deployed_at\":{d}", .{ value.started_at, value.finished_at, value.deployed_at });
     }
     try output.writer.writeAll("}}\n");
     try json(request, .ok, output.written(), meta);

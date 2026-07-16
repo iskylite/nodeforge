@@ -45,6 +45,8 @@ pub const node_mutation = @import("config/node_mutation.zig");
 pub const preflight = @import("preflight.zig");
 /// 进程内运行时状态：DHCP lease 表、TFTP 传输计数器和 catalog 运行时快照。
 pub const runtime_state = @import("state/runtime.zig");
+/// M4.8 启动时容量与并发派生：按网段/CPU/节点数动态计算上限，config 可覆盖。
+pub const capacity = @import("state/capacity.zig");
 /// PXE boot session 注册表：关联 DHCP→TFTP→HTTP 启动链路的进程内状态。
 pub const boot_session = @import("state/boot_session.zig");
 pub const boot_session_store = @import("state/boot_session_store.zig");
@@ -134,6 +136,7 @@ test {
     _ = node_mutation;
     _ = preflight;
     _ = runtime_state;
+    _ = capacity;
     _ = boot_session;
     _ = node_status;
     _ = catalog_runtime;

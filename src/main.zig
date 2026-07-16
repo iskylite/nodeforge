@@ -1690,7 +1690,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
             },
             status: ?struct { phase: []const u8, last_event_at: i64, last_error: bool, reason: []const u8, session_active: bool },
             deployment: ?nodeforge.deployment_control.View,
-            inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, reported_at: i64 },
+            inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, reported_at: i64, deployment_generation: u64 = 0 },
         },
     };
     var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
@@ -1711,11 +1711,25 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     var deployed_buf: [20]u8 = undefined;
     var reported_buf: [20]u8 = undefined;
     try ctx.writer.writeAll("Runtime\n");
-    if (result.status) |status| try ctx.writer.print("  Phase        {s}\n  Active       {s}\n  Last event   {s}\n  Reason       {s}\n", .{ status.phase, if (status.session_active) "yes" else "no", views.formatTimestamp(&last_event_buf, status.last_event_at), if (status.reason.len == 0) "-" else status.reason }) else try ctx.writer.writeAll("  Phase        -\n");
+    if (result.status) |status|
+        try ctx.writer.print("  Phase        {s}\n  Active       {s}\n  Last event   {s}\n  Reason       {s}\n", .{ status.phase, if (status.session_active) "yes" else "no", views.formatTimestamp(&last_event_buf, status.last_event_at), if (status.reason.len == 0) "-" else status.reason })
+    else if (result.deployment) |deployment| {
+        const phase: []const u8 = if (deployment.armed_generation != null)
+            "pending"
+        else if (deployment.consumed_generation) |generation|
+            if (deployment.terminal_generation == generation)
+                if (deployment.deployed_generation == generation) "completed" else "failed"
+            else if (deployment.started_at != 0) "install_started" else "-"
+        else
+            "-";
+        try ctx.writer.print("  Phase        {s} (deployment fallback)\n", .{phase});
+    } else try ctx.writer.writeAll("  Phase        -\n");
     try ctx.writer.writeAll("Deployment\n");
-    if (result.deployment) |deployment| try ctx.writer.print("  Generation   {f}\n  Requested    {s}\n  Started      {s}\n  Finished     {s}\n  Deployed     {s}\n", .{ std.json.fmt(deployment.consumed_generation, .{}), views.formatTimestamp(&requested_buf, deployment.requested_at), views.formatTimestamp(&started_buf, deployment.started_at), views.formatTimestamp(&finished_buf, deployment.finished_at), views.formatTimestamp(&deployed_buf, deployment.deployed_at) }) else try ctx.writer.writeAll("  Generation   -\n");
+    if (result.deployment) |deployment| {
+        try ctx.writer.print("  Current gen  {f}\n  Requested    {s}\n  Started      {s}\n  Finished     {s}\n  Success gen  {d}\n  Deployed     {s}\n", .{ std.json.fmt(deployment.currentGeneration(), .{}), views.formatTimestamp(&requested_buf, deployment.requested_at), views.formatTimestamp(&started_buf, deployment.started_at), views.formatTimestamp(&finished_buf, deployment.finished_at), deployment.deployed_generation, views.formatTimestamp(&deployed_buf, deployment.deployed_at) });
+    } else try ctx.writer.writeAll("  Generation   -\n");
     try ctx.writer.writeAll("Inventory\n");
-    if (result.inventory) |inventory| try ctx.writer.print("  SN           {s}\n  UUID         {s}\n  Vendor       {s}\n  Model        {s}\n  Reported     {s}\n", .{ inventory.serial_number orelse "-", inventory.product_uuid orelse "-", inventory.vendor orelse "-", inventory.model orelse "-", views.formatTimestamp(&reported_buf, inventory.reported_at) }) else try ctx.writer.writeAll("  SN           -\n");
+    if (result.inventory) |inventory| try ctx.writer.print("  SN           {s}\n  UUID         {s}\n  Vendor       {s}\n  Model        {s}\n  Generation   {d}\n  Reported     {s}\n", .{ inventory.serial_number orelse "-", inventory.product_uuid orelse "-", inventory.vendor orelse "-", inventory.model orelse "-", inventory.deployment_generation, views.formatTimestamp(&reported_buf, inventory.reported_at) }) else try ctx.writer.writeAll("  SN           -\n");
 }
 
 fn printMutationError(ctx: zli.CommandContext, err: anyerror, action: []const u8, node_id: []const u8) !void {

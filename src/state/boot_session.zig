@@ -6,11 +6,14 @@
 
 const std = @import("std");
 const model = @import("../model.zig");
+const capacity = @import("capacity.zig");
 
 /// 128-bit 安全随机值的固定小写十六进制编码长度。
 pub const id_len = 32;
 /// 有界内存注册表容量；耗尽时协议继续服务，但事件明确记录无法安全关联。
-pub const max_sessions = 256;
+/// M4.8: session 注册表内存天花板；生效容量由 `Store.effective` 在启动时按
+/// `max(usable_hosts(subnet), config)` 派生（`min(派生, max_sessions)`）。
+pub const max_sessions = capacity.store_ceiling;
 /// 相同 MAC/XID 在 DHCP 早期阶段的重传复用同一 session 的最长时间窗口。
 pub const retransmit_window_seconds: i64 = 30;
 /// 未继续推进的 bootstrap session 的存活时间。
@@ -191,7 +194,20 @@ pub const AcquireResult = struct {
 /// session lock 与文件 I/O 相互阻塞。
 pub const Store = struct {
     sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions,
+    /// M4.8: 生效并发 session 上限，启动时按 subnet 派生收敛。
+    effective: usize = max_sessions,
     mutex: std.atomic.Mutex = .unlocked,
+
+    /// M4.8: 按 `max(usable_hosts(subnet), config)` 派生并 clamp 到 `[1, max_sessions]`。
+    pub fn setEffective(self: *Store, derived: usize) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var active: usize = 0;
+        for (self.sessions) |session| if (session.active()) {
+            active += 1;
+        };
+        self.effective = @max(active, @max(@as(usize, 1), @min(derived, max_sessions)));
+    }
 
     pub fn captureInstallPlan(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, json: []const u8, model_revision: u64) !void {
         if (!validId(session_id) or json.len == 0 or json.len > 1024 * 1024) return error.InvalidInstallPlan;
@@ -331,10 +347,16 @@ pub const Store = struct {
             self.sessions[index] = .{};
         }
 
-        for (&self.sessions) |*session| if (!session.active()) {
+        var active: usize = 0;
+        var free: ?*Session = null;
+        for (&self.sessions) |*session| {
+            if (session.active()) active += 1 else if (free == null) free = session;
+        }
+        if (active >= self.effective) return .{ .link = .capacity_exhausted, .retired = retired };
+        if (free) |session| {
             session.* = try newSession(io, identity, mono_now, utc_now, self.sessions[0..]);
             return .{ .link = .{ .linked = session.id }, .created = true, .retired = retired };
-        };
+        }
         return .{ .link = .capacity_exhausted, .retired = retired };
     }
 
@@ -918,7 +940,9 @@ test "terminal install event releases retry gate" {
 
 test "capacity exhaustion remains explicit and bootstrap sessions expire" {
     var store: Store = .{};
-    for (0..max_sessions) |index| {
+    // M4.8: 容量改为运行时派生；用小 effective 验证门控与显式耗尽。
+    store.setEffective(4);
+    for (0..4) |index| {
         const mac = [_]u8{ @intCast(index & 0xff), @intCast(index >> 8), 0, 0, 0, 1 };
         const result = try store.acquireDhcp(std.testing.io, .{ .mac = &mac, .xid = @intCast(index + 1), .node_id = null, .profile = null, .mode = null }, 1, 1);
         try std.testing.expect(result.link == .linked);
@@ -928,8 +952,20 @@ test "capacity exhaustion remains explicit and bootstrap sessions expire" {
 
     var expired: [max_sessions]Session = undefined;
     const count = store.expire(1 + bootstrap_ttl_seconds, 2, &expired);
-    try std.testing.expectEqual(@as(usize, max_sessions), count);
+    try std.testing.expectEqual(@as(usize, 4), count);
     try std.testing.expectEqual(TerminalReason.expired, expired[0].terminal_reason.?);
+}
+
+test "effective session capacity counts restored entries outside the prefix" {
+    var store: Store = .{};
+    const first = try store.acquireDhcp(std.testing.io, .{ .mac = &.{ 1, 2, 3, 4, 5, 6 }, .xid = 1, .node_id = null, .profile = null, .mode = null }, 1, 1);
+    try std.testing.expect(first.link == .linked);
+    store.sessions[1] = store.sessions[0];
+    store.sessions[0] = .{};
+    store.setEffective(1);
+    const overflow = try store.acquireDhcp(std.testing.io, .{ .mac = &.{ 7, 8, 9, 10, 11, 12 }, .xid = 2, .node_id = null, .profile = null, .mode = null }, 2, 2);
+    try std.testing.expectEqual(Link.capacity_exhausted, overflow.link);
+    try std.testing.expect(!store.sessions[0].active());
 }
 
 test "generated identifiers are lowercase fixed-width hex" {

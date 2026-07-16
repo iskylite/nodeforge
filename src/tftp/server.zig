@@ -26,6 +26,7 @@ const boot_session = @import("../state/boot_session.zig");
 const boot_target = @import("../boot/target.zig");
 const grub = @import("../boot/grub.zig");
 const observe_log = @import("../observe/log.zig");
+const capmod = @import("../state/capacity.zig");
 const log = std.log.scoped(.tftp);
 
 /// TFTP 标准监听端口（RFC 1350）；不暴露为配置或 CLI 参数。
@@ -49,16 +50,15 @@ const max_retries: u8 = 5;
 /// ACK 超时后的重传决策（纯逻辑，便于无 socket 单元测试）。
 const RetryAction = enum {
     retransmit, // 还有重传预算，继续重传
-    optimistic_complete, // 末尾块 ACK 丢失，按 RFC 1350 §6 视为传输成功
+    optimistic_complete, // 末尾块交付无法确认；耗尽短预算后按策略乐观完成
     fail, // 非末尾块重传耗尽，判定失败
 };
 
 /// 末尾块（payload < blksize）的乐观重传上限：2 次。
-/// 配合 1s 基线 + 指数退避，末尾块最多等待 1+2+4 = 7s 即按 RFC 1350 §6
-/// 视为传输成功。末尾块数据几乎肯定已送达：GRUB 收齐 initrd 后转去加载，
-/// 不再回最终 ACK（见 dnsmasq 源码注释 "some clients never send it"）。
-/// NodeForge 线程模型下需尽快释放 worker，不能像 tftpd-hpa（每请求一进程）
-/// 那样空等 63s。
+/// 配合 1s 基线 + 指数退避，末尾块最多等待 1+2+4 = 7s。此时无法区分
+/// “DATA 已到但 ACK 丢失”和“DATA 未到”，所以日志必须标为 delivery unconfirmed。
+/// NodeForge 是共享全局并发槽的长驻多线程 daemon；相比 tftpd-hpa 常见的
+/// per-request 进程隔离，缩短末尾等待可避免不可确认请求长期占用全局 worker。
 const final_block_retries: u8 = 2;
 
 /// 根据是否末尾块返回重传上限。非末尾块用 `max_retries`（对齐 tftpd-hpa
@@ -109,8 +109,10 @@ pub fn bind(io: std.Io, server_ip: []const u8) !std.Io.net.Socket {
 pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, models: *model_runtime.ModelRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned_socket;
     defer socket.close(io);
-    var active_transfers = std.atomic.Value(u8).init(0);
+    var active_transfers = std.atomic.Value(u16).init(0);
     defer while (active_transfers.load(.acquire) != 0) std.Thread.yield() catch {};
+    // M4.8: max_concurrent_transfers 省略时按 max(128, 2×核) 自动派生；config 显式给出则覆盖。
+    const auto_concurrency: u16 = capmod.tftpConcurrency(std.Thread.getCpuCount() catch 1, null);
 
     while (true) {
         if (if (stop) |flag| flag.load(.acquire) else false) return;
@@ -128,7 +130,7 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
             .rrq => |request| {
                 const pair = models.acquire();
                 const config = pair.config.value();
-                const limit = config.tftp.max_concurrent_transfers;
+                const limit: u16 = config.tftp.max_concurrent_transfers orelse auto_concurrency;
                 if (limit <= 1) {
                     defer pair.release();
                     try handleRrq(io, allocator, incoming.from, request, config, pair.catalog, runtime, event_writer, sessions);
@@ -170,7 +172,7 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
 
 /// dispatcher 是唯一的 slot 生产者，worker 只负责递减，因此一次 load 后递增
 /// 不会与另一个生产者竞争；该约束比为单线程 dispatcher 引入 CAS 循环更清晰。
-fn reserveTransferSlot(active: *std.atomic.Value(u8), limit: u8) bool {
+fn reserveTransferSlot(active: *std.atomic.Value(u16), limit: u16) bool {
     if (active.load(.acquire) >= limit) return false;
     _ = active.fetchAdd(1, .acq_rel);
     return true;
@@ -185,7 +187,7 @@ const TransferWorker = struct {
     runtime: *runtime_state.RuntimeState,
     event_writer: ?*events.Writer,
     sessions: ?*boot_session.Store,
-    active: *std.atomic.Value(u8),
+    active: *std.atomic.Value(u16),
 };
 
 fn runTransferWorker(context: *TransferWorker) void {
@@ -226,13 +228,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
                 else => observe_log.err("tftp: virtual config transfer failed for {s}: {t}", .{ request.filename, err }),
             }
             emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
-            const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
-                error.BootAccessDenied => .{ .code = .access_violation, .message = "boot configuration requires an active DHCP lease" },
-                error.BootTargetUnavailable => .{ .code = .access_violation, .message = "boot configuration unavailable for this node" },
-                error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
-                else => .{ .code = .undefined, .message = "transfer failed" },
-            };
-            try sendEphemeralError(io, &remote, response.code, response.message);
+            if (initialErrorResponse(err)) |response| try sendEphemeralError(io, &remote, response.code, response.message);
             return;
         }
     else
@@ -244,13 +240,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
                 else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
             }
             emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
-            const response: struct { code: packet.ErrorCode, message: []const u8 } = switch (err) {
-                error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
-                error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
-                error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => .{ .code = .access_violation, .message = "access denied" },
-                else => .{ .code = .undefined, .message = "transfer failed" },
-            };
-            try sendEphemeralError(io, &remote, response.code, response.message);
+            if (initialErrorResponse(err)) |response| try sendEphemeralError(io, &remote, response.code, response.message);
             return;
         };
     runtime.tftp.finish(session, true);
@@ -261,6 +251,27 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
     emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
 }
 
+const InitialErrorResponse = struct { code: packet.ErrorCode, message: []const u8 };
+
+/// 只为传输 socket 建立前可确定的 RRQ 拒绝生成初始 ERROR。
+///
+/// tftpd-hpa 的超时处理通常只退出该请求的子进程；NodeForge 则由长驻 daemon
+/// 中的 detached worker 返回错误并释放共享并发槽。OACK/DATA 已从临时 TID
+/// 发出后，dispatcher 无法复用该已关闭 TID，另绑端口发送 ERROR 会被客户端视为
+/// unknown TID。因此 Timeout/UnexpectedAck/普通 I/O 错误只记事件，不再发包。
+fn initialErrorResponse(err: anyerror) ?InitialErrorResponse {
+    return switch (err) {
+        error.BootAccessDenied => .{ .code = .access_violation, .message = "boot configuration requires an active DHCP lease" },
+        error.BootTargetUnavailable => .{ .code = .access_violation, .message = "boot configuration unavailable for this node" },
+        error.FileNotAllowed, error.FileNotFound => .{ .code = .file_not_found, .message = "file not found" },
+        error.UnsupportedMode, error.InvalidOption => .{ .code = .illegal_operation, .message = "unsupported request" },
+        error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => .{ .code = .access_violation, .message = "access denied" },
+        else => null,
+    };
+}
+
+/// 初始 RRQ 被拒绝时，服务端尚未建立 transfer TID；此处选择临时 TID 返回
+/// ERROR 是合法初始响应。传输开始后的失败不得调用本函数。
 fn sendEphemeralError(io: std.Io, remote: *const std.Io.net.IpAddress, code: packet.ErrorCode, message: []const u8) !void {
     const local = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 0);
     var socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
@@ -424,8 +435,7 @@ fn transferFromMemory(
         var option_values: [4][20]u8 = undefined;
         var accepted: [4]packet.Option = undefined;
         const oack = try packet.encodeOack(&out, settings.oackOptions(file_size, &option_values, &accepted));
-        try socket.send(io, remote, oack);
-        try awaitAck(&socket, io, remote, 0, settings.timeout);
+        try sendOackAndAwaitAck(&socket, io, remote, oack, settings.timeout);
     }
 
     var block: u16 = 1;
@@ -435,8 +445,8 @@ fn transferFromMemory(
         const chunk = content[offset..end];
         var out: [max_block_size + 4]u8 = undefined;
         const datagram = try packet.encodeData(&out, block, chunk);
-        // 末尾块 ACK 乐观完成（RFC 1350 §6）+ 指数退避重传。
-        // 末尾块 ACK 丢失时数据几乎肯定已送达，按标准视为成功而非失败。
+        // 末尾块 ACK 乐观完成 + 指数退避重传。最终超时无法证明 DATA 已送达；
+        // 这里只执行 NodeForge 的有界 worker 释放策略，并明确记录交付未确认。
         const is_final_block = chunk.len < settings.block_size;
         const limit = retryLimit(is_final_block);
         var attempts: usize = 0;
@@ -451,7 +461,7 @@ fn transferFromMemory(
                             continue;
                         },
                         .optimistic_complete => {
-                            log.info("virtual config final block ACK lost; assuming delivery per RFC 1350 §6", .{});
+                            log.info("virtual config final block ACK missing; delivery unconfirmed, completing optimistically", .{});
                             offset += chunk.len;
                             return offset;
                         },
@@ -521,8 +531,7 @@ fn transfer(
         var option_values: [4][20]u8 = undefined;
         var accepted: [4]packet.Option = undefined;
         const oack = try packet.encodeOack(&out, settings.oackOptions(file_size, &option_values, &accepted));
-        try socket.send(io, remote, oack);
-        try awaitAck(&socket, io, remote, 0, settings.timeout);
+        try sendOackAndAwaitAck(&socket, io, remote, oack, settings.timeout);
     }
 
     var block: u16 = 1;
@@ -580,11 +589,9 @@ fn transfer(
         // 等待本窗口中实际发送的最后一块的 ACK。
         // expected_ack 必须是 last_sent_block 而非 block（block 可能已递增）。
         const expected_ack = last_sent_block;
-        // 末尾块 ACK 乐观完成（RFC 1350 §6）+ 指数退避重传。
-        // 末尾块 ACK 丢失时数据几乎肯定已送达，按标准视为成功而非失败，
-        // 且不发 ERROR 包（tftpd-hpa exit(0) / dnsmasq LOG_INFO "sent"）。
-        // 非末尾块超时仍判失败：数据确实不完整（区别于 tftpd-hpa 的无差别
-        // exit(0)，与 dnsmasq「中途超时为错误、末尾超时为成功」一致）。
+        // 末尾块采用较短预算并乐观完成；这表示 delivery unconfirmed，不是
+        // RFC 对交付成功的保证。非末尾块耗尽仍失败，因为 NodeForge 的长驻
+        // worker 必须准确释放共享槽并写出失败状态，不能照搬 hpa 子进程 exit(0)。
         const is_final_block = last_read < settings.block_size;
         const limit = retryLimit(is_final_block);
         var attempts: usize = 0;
@@ -612,7 +619,7 @@ fn transfer(
                             continue;
                         },
                         .optimistic_complete => {
-                            log.info("tftp: final block ACK lost for {s}; assuming delivery per RFC 1350 §6", .{request.filename});
+                            log.info("tftp: final block ACK missing for {s}; delivery unconfirmed, completing optimistically", .{request.filename});
                             return offset;
                         },
                         .fail => return err,
@@ -718,6 +725,25 @@ fn negotiate(options: []const packet.Option, file_size: u64, max_windowsize: u16
         }
     }
     return settings;
+}
+
+/// OACK 与普通非末尾 DATA 使用同一有界重传语义，并始终复用当前 transfer TID。
+/// tftpd-hpa 把 OACK 放在同一 timeout/retry 循环中；NodeForge 不能只发送一次，
+/// 否则 ACK0 丢失会让客户端重发 RRQ，而旧 worker 仍占用全局并发槽等待超时。
+fn sendOackAndAwaitAck(socket: *std.Io.net.Socket, io: std.Io, remote: *const std.Io.net.IpAddress, oack: []const u8, base_timeout: u8) !void {
+    var attempts: usize = 0;
+    while (true) {
+        try socket.send(io, remote, oack);
+        awaitAck(socket, io, remote, 0, backoffSeconds(base_timeout, attempts)) catch |err| {
+            if (err == error.Timeout and retryAction(false, attempts, max_retries) == .retransmit) {
+                attempts += 1;
+                log.warn("retransmit OACK attempt {d}/{d}", .{ attempts, max_retries });
+                continue;
+            }
+            return err;
+        };
+        return;
+    }
 }
 
 /// 等待指定 block number 的 ACK，超时返回 `error.Timeout`。
@@ -896,7 +922,7 @@ test "M4.2 F4 windowsize OACK includes all negotiated options" {
 }
 
 test "M4.2 F4 concurrent transfer limit rejects excess RRQ" {
-    var active = std.atomic.Value(u8).init(0);
+    var active = std.atomic.Value(u16).init(0);
     try std.testing.expect(reserveTransferSlot(&active, 2));
     try std.testing.expect(reserveTransferSlot(&active, 2));
     try std.testing.expect(!reserveTransferSlot(&active, 2));
@@ -1064,11 +1090,9 @@ test "TFTP block number: expected_ack equals last sent block (window=2)" {
 
 // ── 末尾块 ACK 乐观完成 + 指数退避回归测试 ───────────────────────
 //
-// RFC 1350 §6：发送最后一块 DATA 后，若最终 ACK 丢失，发送方无法区分
-// 「接收方已收到数据但 ACK 丢失」与「数据未送达」。标准实现（tftpd-hpa
-// 的 exit(0)、dnsmasq 的 LOG_INFO "sent"）在有限重传后将末尾块 ACK 丢失
-// 视为传输成功。NodeForge 原实现把末尾块 ACK 丢失当作 error.Timeout 失败
-// 并发送 ERROR 包，与标准行为相反。
+// 发送最后一块 DATA 后，若最终 ACK 丢失，发送方无法区分「接收方已收到数据但
+// ACK 丢失」与「DATA 未送达」。NodeForge 在有限短预算后选择 delivery-unconfirmed
+// 乐观完成以释放共享 worker；这不是 RFC 的成功交付保证。非末尾块仍失败。
 //
 // 以下测试覆盖纯决策逻辑（不涉及 socket）：
 //   - retryAction：根据「是否末尾块 / 已重传次数 / 上限」决定 retransmit /
@@ -1087,9 +1111,55 @@ test "TFTP retry: non-final block exhausted -> fail" {
     try std.testing.expectEqual(RetryAction.fail, retryAction(false, max_retries + 3, max_retries));
 }
 
-test "TFTP retry: final block exhausted -> optimistic complete (RFC 1350 §6)" {
+test "TFTP retry: final block exhausted -> delivery-unconfirmed optimistic complete" {
     try std.testing.expectEqual(RetryAction.optimistic_complete, retryAction(true, final_block_retries, final_block_retries));
     try std.testing.expectEqual(RetryAction.optimistic_complete, retryAction(true, final_block_retries + 3, final_block_retries));
+}
+
+test "TFTP established-transfer failures do not get a new-TID ERROR" {
+    try std.testing.expect(initialErrorResponse(error.Timeout) == null);
+    try std.testing.expect(initialErrorResponse(error.UnexpectedAck) == null);
+    try std.testing.expectEqual(packet.ErrorCode.file_not_found, initialErrorResponse(error.FileNotFound).?.code);
+}
+
+const OackRetryTestContext = struct {
+    socket: *std.Io.net.Socket,
+    remote: std.Io.net.IpAddress,
+    result: ?anyerror = null,
+};
+
+fn runOackRetryTest(context: *OackRetryTestContext) void {
+    const oack = [_]u8{ 0, 6, 't', 's', 'i', 'z', 'e', 0, '0', 0 };
+    sendOackAndAwaitAck(context.socket, std.testing.io, &context.remote, &oack, 1) catch |err| {
+        context.result = err;
+    };
+}
+
+test "TFTP OACK loss retransmits from the established transfer TID" {
+    const loopback = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try loopback.bind(std.testing.io, .{ .mode = .dgram, .protocol = .udp });
+    defer server.close(std.testing.io);
+    var client = try loopback.bind(std.testing.io, .{ .mode = .dgram, .protocol = .udp });
+    defer client.close(std.testing.io);
+    var context: OackRetryTestContext = .{ .socket = &server, .remote = client.address };
+    const thread = try std.Thread.spawn(.{}, runOackRetryTest, .{&context});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var buffer: [64]u8 = undefined;
+    const first = try client.receiveTimeout(std.testing.io, &buffer, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    try std.testing.expect(first.from.eql(&server.address));
+    try std.testing.expectEqual(@as(u16, 6), std.mem.readInt(u16, first.data[0..2], .big));
+    // 丢弃第一次 OACK，等待同一 server TID 的重传。
+    const second = try client.receiveTimeout(std.testing.io, &buffer, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+    try std.testing.expect(second.from.eql(&server.address));
+    try std.testing.expectEqual(@as(u16, 6), std.mem.readInt(u16, second.data[0..2], .big));
+    var ack_buffer: [4]u8 = undefined;
+    const ack = try packet.encodeAck(&ack_buffer, 0);
+    try client.send(std.testing.io, &server.address, ack);
+    thread.join();
+    joined = true;
+    try std.testing.expect(context.result == null);
 }
 
 test "TFTP retry: retryLimit uses smaller budget for final block" {

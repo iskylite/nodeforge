@@ -35,6 +35,7 @@ const deployment_control = @import("state/deployment_control.zig");
 const node_inventory = @import("state/node_inventory.zig");
 const operations = @import("state/operations.zig");
 const model_transaction = @import("state/model_transaction.zig");
+const capacity = @import("state/capacity.zig");
 
 /// 启动 M1 TFTP 与唯一 HTTP listener。
 ///
@@ -82,6 +83,20 @@ pub fn run(
     var deployments: deployment_control.Store = .{};
     var inventories = node_inventory.Store.init(allocator);
     defer inventories.deinit();
+
+    // M4.8: 启动时按网段/受管节点数/CPU 派生有效容量，config 可覆盖。
+    const lease_cap = capacity.leaseCapacity(config.dhcp.subnet, config.dhcp.max_leases);
+    const managed_cap = capacity.managedCapacity(config.nodes.len, config.capacity.managed_entries);
+    const tftp_conc = capacity.tftpConcurrency(std.Thread.getCpuCount() catch 1, config.tftp.max_concurrent_transfers);
+    runtime.dhcp.setEffective(lease_cap);
+    sessions.setEffective(lease_cap);
+    statuses.setEffective(managed_cap);
+    deployments.setEffective(managed_cap);
+    inventories.setCapacity(managed_cap);
+    if (lease_cap > runtime_state.DhcpState.max_leases)
+        observe_log.warn("capacity: lease/session derived={d} exceeds compiled ceiling={d}; effective capacity is clamped", .{ lease_cap, runtime_state.DhcpState.max_leases });
+    if (managed_cap > node_status.max_statuses)
+        observe_log.warn("capacity: managed derived={d} exceeds compiled ceiling={d}; effective capacity is clamped", .{ managed_cap, node_status.max_statuses });
     node_inventory.load(io, allocator, paths.node_inventory_path, &inventories) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -106,6 +121,9 @@ pub fn run(
             return err;
         },
     };
+    // inventory/deployment 恢复可能把 effective 下限抬高；必须在加载后报告实际值，
+    // 不能把 clamp 前派生值或加载前默认值误报为生效容量。
+    observe_log.info("capacity: subnet={s} derived={d}, lease/session effective={d}/{d} (ceiling {d}); managed nodes={d}, status={d} inventory={d} deployment={d} (ceiling {d}); tftp concurrency={d}; ping_timeout_ms={d}", .{ config.dhcp.subnet, lease_cap, runtime.dhcp.effective, sessions.effective, runtime_state.DhcpState.max_leases, config.nodes.len, statuses.effective, inventories.capacity, deployments.effective, node_status.max_statuses, tftp_conc, config.dhcp.ping_timeout_ms });
     for (config.nodes) |node| if (forProfile(config, node.profile)) |profile| if (profile.mode == .install) {
         deployments.ensureInitial(node.id, config_revision, current_time) catch |err| return err;
     };

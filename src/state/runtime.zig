@@ -4,6 +4,7 @@
 //! TFTP 计数器是仅存在于内存的原子计数器，节点状态由 status_store 独立管理。
 const std = @import("std");
 const node_status = @import("node_status.zig");
+const capacity = @import("capacity.zig");
 
 /// 进程内运行态根对象。TFTP 和 DHCP 各有独立子状态。
 pub const RuntimeState = struct {
@@ -47,9 +48,14 @@ pub const DhcpLease = struct {
 /// DHCP lease 池。使用固定大小数组和自旋锁保护并发访问。
 /// 所有 mutation 方法在锁内执行 `reapLocked` 清理过期条目。
 pub const DhcpState = struct {
-    /// lease 池最大容量。超过时新请求无法分配地址。
-    pub const max_leases = 256;
+    /// lease 池内存上限（comptime 天花板）。M4.8 后实际并发容量由
+    /// `effective` 在启动时按 `max(usable_hosts(subnet), config)` 派生，
+    /// 取 `min(派生, max_leases)`。要超过本上限需提升此常量并重编译。
+    pub const max_leases = capacity.store_ceiling;
     leases: [max_leases]DhcpLease = [_]DhcpLease{.{}} ** max_leases,
+    /// M4.8: 运行时生效的 lease 并发上限。默认取满天花板；app.zig 启动时
+    /// 调 `setEffective` 按 subnet 派生值收敛。
+    effective: usize = max_leases,
     /// 自旋锁，保护 lease 数组的并发访问。
     mutex: std.atomic.Mutex = .unlocked,
     /// M3.1 单调递增的 lease 生成号。DHCP 热路径在每次真实 lease 变更后递增它；
@@ -61,6 +67,18 @@ pub const DhcpState = struct {
     /// 和 `boot.deploy_disabled` 事件在 events.jsonl 中泛滥。详见
     /// `BootGateSuppressor` 文档注释。
     gate_suppressor: BootGateSuppressor = .{},
+
+    /// M4.8: 启动时按 `max(usable_hosts(subnet), config)` 派生并收敛生效容量。
+    /// 传入值会被 clamp 到 `[1, max_leases]`。
+    pub fn setEffective(self: *DhcpState, derived: usize) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var used: usize = 0;
+        for (self.leases) |lease| if (lease.used()) {
+            used += 1;
+        };
+        self.effective = @max(used, @max(@as(usize, 1), @min(derived, max_leases)));
+    }
 
     /// 提供（OFFER）一个地址但不提交为 lease。每次分配前先清理过期 offer 和隔离条目。
     /// 返回 0 表示分配失败（地址被占用或池已满）。
@@ -78,14 +96,20 @@ pub const DhcpState = struct {
             if (lease.ip == candidate or lease.phase == .active) return lease.ip;
             return 0;
         };
-        for (&self.leases) |*lease| if (lease.used() and lease.ip == candidate) return 0;
-        for (&self.leases) |*lease| if (!lease.used()) {
-            lease.* = .{ .phase = .offered, .known = known, .ip = candidate, .expires_at = now + @as(i64, seconds) };
-            @memcpy(&lease.mac, mac[0..6]);
-            self.lease_generation += 1;
-            return candidate;
-        };
-        return 0;
+        var used: usize = 0;
+        var free: ?*DhcpLease = null;
+        for (&self.leases) |*lease| {
+            if (lease.used()) {
+                used += 1;
+                if (lease.ip == candidate) return 0;
+            } else if (free == null) free = lease;
+        }
+        if (used >= self.effective) return 0;
+        const lease = free orelse return 0;
+        lease.* = .{ .phase = .offered, .known = known, .ip = candidate, .expires_at = now + @as(i64, seconds) };
+        @memcpy(&lease.mac, mac[0..6]);
+        self.lease_generation += 1;
+        return candidate;
     }
 
     /// 检查 `ip` 是否已是此 MAC 的活动 lease。续约场景下客户端会回答自身地址的
@@ -129,14 +153,20 @@ pub const DhcpState = struct {
             return true;
         };
         if (!static_reservation) return false;
-        for (&self.leases) |*lease| if (lease.used() and lease.ip == candidate) return false;
-        for (&self.leases) |*lease| if (!lease.used()) {
-            lease.* = .{ .phase = .active, .known = true, .ip = candidate, .expires_at = now + @as(i64, seconds) };
-            @memcpy(&lease.mac, mac[0..6]);
-            self.lease_generation += 1;
-            return true;
-        };
-        return false;
+        var used: usize = 0;
+        var free: ?*DhcpLease = null;
+        for (&self.leases) |*lease| {
+            if (lease.used()) {
+                used += 1;
+                if (lease.ip == candidate) return false;
+            } else if (free == null) free = lease;
+        }
+        if (used >= self.effective) return false;
+        const lease = free orelse return false;
+        lease.* = .{ .phase = .active, .known = true, .ip = candidate, .expires_at = now + @as(i64, seconds) };
+        @memcpy(&lease.mac, mac[0..6]);
+        self.lease_generation += 1;
+        return true;
     }
     /// 释放（RELEASE）此 MAC 的所有非隔离 lease。
     pub fn release(self: *DhcpState, mac: []const u8) bool {
@@ -456,6 +486,18 @@ test "only a static reservation may acknowledge without an offer" {
     try std.testing.expect(!state.acknowledge(&unknown_mac, candidate, false, false, 100, 60));
     try std.testing.expect(!state.acknowledge(&known_dynamic_mac, candidate, true, false, 100, 60));
     try std.testing.expect(state.acknowledge(&static_mac, candidate, true, true, 100, 60));
+}
+
+test "effective lease capacity counts restored entries outside the prefix" {
+    var state: DhcpState = .{};
+    const restored_mac = [_]u8{ 0, 1, 2, 3, 4, 5 };
+    const new_mac = [_]u8{ 0, 1, 2, 3, 4, 6 };
+    state.leases[1] = .{ .phase = .active, .ip = 0xc0a81b0a, .expires_at = 1000 };
+    @memcpy(&state.leases[1].mac, &restored_mac);
+    state.setEffective(1);
+    try std.testing.expectEqual(@as(usize, 1), state.effective);
+    try std.testing.expectEqual(@as(u32, 0), state.offer(&new_mac, 0xc0a81b0b, false, 1, 30));
+    try std.testing.expect(!state.leases[0].used());
 }
 
 test "boot-gate suppressor emits only on state transition" {

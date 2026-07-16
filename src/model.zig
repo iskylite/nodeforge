@@ -15,6 +15,8 @@ pub const AppConfig = struct {
     tftp: TftpConfig = .{},
     /// PXE 管理网 DHCPv4 策略；监听端口固定为 UDP 67。
     dhcp: DhcpConfig = .{},
+    /// M4.8 共享状态表的运行时有效容量覆盖。
+    capacity: CapacityConfig = .{},
     /// 服务日志等级；daemon `--debug` 可在本次启动临时覆盖为 debug。
     logging: LoggingConfig = .{},
     /// 业务事件审计流的轮转策略。
@@ -73,8 +75,10 @@ pub const HttpConfig = struct {
     asset_root: []const u8 = paths.iso_dir,
     /// 通过 `/artifacts/repositories/` 只读发布的仓库根目录。
     repository_root: []const u8 = paths.repos_dir,
-    /// M4.2 F4: 最大并发 HTTP 连接数。0 = 不限制。
-    /// M6 将在压力测试后设置生产默认值。
+    /// M4.2 F4 / M4.8: 最大并发 HTTP 连接数。0 = 不限制。
+    /// **当前为 advisory、未强制**：facil.io/zap 不暴露应用级连接上限，真正的并发墙在
+    /// OS 层（`ulimit -n`/`LimitNOFILE`，每下载 ~2 fd）。M6 压测后接上强制并设生产默认值。
+    /// 运维在 M6 前应直接提 `LimitNOFILE ≥ 8192` 而非依赖此字段。
     max_connections: u16 = 0,
 };
 
@@ -96,10 +100,11 @@ pub const TftpConfig = struct {
     /// 客户端请求值放大。jumbo-frame 链路可调高，受限链路调低。
     /// 必须在 RFC 2348 允许的 8..65464 范围内。
     max_blksize: u16 = 1468,
-    /// M4.2 F4: 每个客户端的最大并发 TFTP 传输数。
-    /// 每个 RRQ 启动一个独立线程，拥有自己的 TID socket。
-    /// 0 或 1 保留原始串行行为。
-    max_concurrent_transfers: u8 = 4,
+    /// M4.8: 全局并发 TFTP 传输上限（非 per-client；PXE 客户端顺序取文件，
+    /// per-client > 1 无意义，全局才是正确的批量部署节流）。
+    /// 省略时启动按 `max(128, 2×cpu_cores)` 自动派生；显式给出则按配置。
+    /// 每个 RRQ 启动一个独立线程，拥有自己的 TID socket；1 保留串行行为。
+    max_concurrent_transfers: ?u16 = null,
 };
 
 /// M2 authoritative DHCPv4 的最小站点级地址池。端口不会进入配置。
@@ -116,7 +121,18 @@ pub const DhcpConfig = struct {
     abandon_seconds: u32 = 3600,
     /// 在 OFFER 前等待 ICMP Echo Reply 的超时时间（毫秒）。0 为非法值。
     /// daemon 需要 CAP_NET_RAW 能力；探测不可用时扣留 OFFER 而非将候选地址视为可用。
-    ping_timeout_ms: u16 = 500,
+    /// M4.8: 默认 500->100，避免突发批量部署下空闲 IP 串行 ping 成为分数量级瓶颈。
+    ping_timeout_ms: u16 = 100,
+    /// M4.8: lease 并发容量显式覆盖。省略时按 `usable_hosts(subnet)` 派生；
+    /// 给出则取 `max(派生, 此值)`。实际生效 = `min(派生, DhcpState.max_leases)`。
+    max_leases: ?u32 = null,
+};
+
+/// 受管节点共享投影（status/inventory/deployment）的容量策略。
+pub const CapacityConfig = struct {
+    /// 省略时按 config.nodes 数量派生；显式值只可放大派生值。
+    /// 运行时仍受 2048 条编译期安全天花板约束。
+    managed_entries: ?u32 = null,
 };
 
 /// 服务日志配置。业务事件仍写入独立的 events.jsonl。

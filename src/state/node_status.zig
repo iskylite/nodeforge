@@ -3,8 +3,11 @@
 
 const std = @import("std");
 const boot_session = @import("boot_session.zig");
+const capacity = @import("capacity.zig");
 
-pub const max_statuses = 256;
+/// M4.8: 投影表内存天花板；生效容量由 `Store.effective` 在启动时按
+/// `max(受管节点数, config)` 派生（`min(派生, max_statuses)`）。
+pub const max_statuses = capacity.store_ceiling;
 
 pub const Phase = enum {
     boot_config_fetched,
@@ -31,6 +34,10 @@ pub const Status = struct {
     node_id_len: u8 = 0,
     boot_session_id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
     daemon_instance_id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
+    /// 该投影所属的不可变 config/model revision；0 仅表示旧格式未知。
+    model_revision: u64 = 0,
+    /// install generation；diskless/discovery 或旧格式可为 0。
+    deployment_generation: u64 = 0,
     phase: Phase = .boot_config_fetched,
     last_event_at: i64 = 0,
     last_error: bool = false,
@@ -51,14 +58,35 @@ pub const Status = struct {
 
 pub const Store = struct {
     entries: [max_statuses]Status = [_]Status{.{}} ** max_statuses,
+    /// M4.8: 生效投影容量，启动时按受管节点数派生收敛。
+    effective: usize = max_statuses,
     revision: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
 
+    /// M4.8: 按 `max(受管节点数, config)` 派生并 clamp 到 `[1, max_statuses]`。
+    pub fn setEffective(self: *Store, derived: usize) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var used: usize = 0;
+        for (self.entries) |entry| if (entry.used()) {
+            used += 1;
+        };
+        self.effective = @max(used, @max(@as(usize, 1), @min(derived, max_statuses)));
+    }
+
     pub fn update(self: *Store, node_id: []const u8, session_id: []const u8, daemon_id: []const u8, phase: Phase, reason: ?[]const u8, timestamp: i64, active: bool) !void {
+        return self.updateForDeployment(node_id, session_id, daemon_id, 0, 0, phase, reason, timestamp, active);
+    }
+
+    /// 更新带来源归属的当前状态。管理聚合必须同时匹配 model revision 与
+    /// deployment generation，不能把旧 profile/session 的 completed 拼到新 desired config。
+    pub fn updateForDeployment(self: *Store, node_id: []const u8, session_id: []const u8, daemon_id: []const u8, model_revision: u64, deployment_generation: u64, phase: Phase, reason: ?[]const u8, timestamp: i64, active: bool) !void {
         if (node_id.len == 0 or node_id.len > 96 or !boot_session.validId(session_id) or !boot_session.validId(daemon_id)) return error.InvalidNodeStatus;
         lock(&self.mutex);
         defer self.mutex.unlock();
-        var target: ?*Status = null;
+        var existing: ?*Status = null;
+        var free: ?*Status = null;
+        var used: usize = 0;
         for (&self.entries) |*entry| {
             if (entry.used() and std.mem.eql(u8, entry.node(), node_id)) {
                 // 重传或重试的 HTTP 请求属于同一个 boot session。
@@ -67,13 +95,16 @@ pub const Store = struct {
                 // 第二次配置获取）。
                 if (std.mem.eql(u8, &entry.boot_session_id, session_id) and
                     !phaseAdvances(entry.phase, phase)) return;
-                target = entry;
+                existing = entry;
                 break;
             }
-            if (!entry.used() and target == null) target = entry;
+            if (entry.used()) used += 1 else if (free == null) free = entry;
         }
-        const entry = target orelse return error.NodeStatusCapacityExhausted;
-        entry.* = .{ .phase = phase, .last_event_at = timestamp, .last_error = phase == .failed, .session_active = active };
+        const entry = existing orelse blk: {
+            if (used >= self.effective) return error.NodeStatusCapacityExhausted;
+            break :blk free orelse return error.NodeStatusCapacityExhausted;
+        };
+        entry.* = .{ .model_revision = model_revision, .deployment_generation = deployment_generation, .phase = phase, .last_event_at = timestamp, .last_error = phase == .failed, .session_active = active };
         @memcpy(entry.node_id[0..node_id.len], node_id);
         entry.node_id_len = @intCast(node_id.len);
         @memcpy(&entry.boot_session_id, session_id);
@@ -171,6 +202,15 @@ test "node status replaces only the current projection" {
     try std.testing.expectEqualStrings("network_timeout", status.reasonSlice());
 }
 
+test "node status records model revision and deployment generation provenance" {
+    var store: Store = .{};
+    const id = "0123456789abcdef0123456789abcdef";
+    try store.updateForDeployment("n1", id, id, 42, 5, .install_started, null, 10, true);
+    const status = store.get("n1").?;
+    try std.testing.expectEqual(@as(u64, 42), status.model_revision);
+    try std.testing.expectEqual(@as(u64, 5), status.deployment_generation);
+}
+
 test "restored status retains history but invalidates old session" {
     var original: Store = .{};
     const id = "0123456789abcdef0123456789abcdef";
@@ -182,6 +222,22 @@ test "restored status retains history but invalidates old session" {
     const status = restored.get("n1").?;
     try std.testing.expectEqual(Phase.running, status.phase);
     try std.testing.expect(!status.session_active);
+}
+
+test "effective status capacity searches restored entries outside the prefix" {
+    const id = "0123456789abcdef0123456789abcdef";
+    var source = [_]Status{.{}} ** max_statuses;
+    source[1].node_id_len = 2;
+    @memcpy(source[1].node_id[0..2], "n1");
+    @memcpy(&source[1].boot_session_id, id);
+    @memcpy(&source[1].daemon_instance_id, id);
+    var store: Store = .{};
+    store.restoreInactive(&source, 1);
+    store.setEffective(1);
+    try store.update("n1", id, id, .running, null, 2, true);
+    try std.testing.expectEqual(Phase.running, store.entries[1].phase);
+    try std.testing.expect(!store.entries[0].used());
+    try std.testing.expectError(error.NodeStatusCapacityExhausted, store.update("n2", id, id, .running, null, 3, true));
 }
 
 test "a retried boot config cannot regress an active install projection" {
