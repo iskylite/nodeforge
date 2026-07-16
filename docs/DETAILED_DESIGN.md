@@ -1039,6 +1039,16 @@ M0 验收结果：
   这修复了 GRUB 在 OACK 协商期间偶尔发送重复 ACK 或延迟包导致 `UnexpectedAck` 传输失败的竞态条件。
   虽然GRUB会重试RRQ并成功完成传输，但第一次失败可能使GRUB的UEFI网络栈进入不一致状态，
   最终导致 "could not seed network packet" 错误。
+- **末尾块 ACK 乐观完成与指数退避（M4.2 F4，2026-07-16 修订）**：§7.5 `awaitAck`
+  超时仍返回 `error.Timeout`，由调用方（`transfer`/`transferFromMemory` 重传循环）决策：
+  末尾块（payload < `blksize`）重传 `final_block_retries=2` 次（~7s）仍零 ACK，按
+  RFC 1350 §6 视为传输成功、不发 ERROR 包（GRUB 收齐大 initrd 后转去加载不再回最终
+  ACK，与 tftpd-hpa `exit(0)` / dnsmasq `LOG_INFO "sent"` 一致）；非末尾块重传
+  `max_retries=5` 次仍无 ACK 才判失败（数据不完整，对齐 dnsmasq「中途超时为错误」，
+  区别于 tftpd-hpa 无差别 `exit(0)`）。重传基线 `default_timeout` 默认 1s、每次翻倍
+  封顶 255（`backoffSeconds`），客户端 RFC 2349 `timeout` option 仍按协商值。此修订
+  纠正 `e14b15f` 的 3s->5s「加耐心」治标方向。纯决策逻辑
+  `RetryAction`/`retryAction`/`retryLimit`/`backoffSeconds` 与 socket 解耦，有单元测试覆盖。
 - `RuntimeState.TftpState.max_sessions=32` 是 CLI 最近会话历史环的容量，不是 32 个活动传输的并发拒绝阈值，
   不得据此返回"server busy"。当前 M1 dispatcher 串行传输的吞吐限制由 M6 压测后再决定是否引入有界 worker。
 

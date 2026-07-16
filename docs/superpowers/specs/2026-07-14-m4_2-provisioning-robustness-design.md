@@ -21,6 +21,23 @@
 > 本稿仅保留当时实现语义，现行 URL 以 M4.4 专项设计为准。
 > 新契约见 `2026-07-15-m4_3-model-runtime-observability-design.md`；与本稿冲突时以 M4.3 为准。
 
+> **后续修订（2026-07-16，F4 TFTP 传输健壮性纠正）**：`e14b15f` 将 `awaitAck` 超时
+> 3s->5s、`max_retries` 3->5 的「加耐心」方向被证明治标不治本--对 139 MB initrd，
+> GRUB 收齐文件后转去加载（解压/EFI 分配）、不再回最终 ACK（dnsmasq 源码注释
+> "some clients never send it" 即指此），无论服务端等多久都收不到末尾 ACK，最终仍判
+> 失败并误发 ERROR 包。本修订改为治本：
+> (1) **末尾块 ACK 乐观完成（RFC 1350 §6）**：等 ACK 的块若是最后一块
+>（payload < blksize），重传 `final_block_retries=2` 次（1+2+4 ≈ 7s）仍零 ACK 即视为
+> 传输成功、返回已发送字节数、不发 ERROR 包，与 tftpd-hpa `exit(0)` / dnsmasq
+> `LOG_INFO "sent"` 一致；非末尾块超时仍判失败（数据确实不完整）。
+> (2) **指数退避重传**：`default_timeout` 5s->1s（与 tftpd-hpa 默认一致），每次重传
+> timeout 翻倍封顶 255；非末尾块 `max_retries=5`（对齐 `TRIES=6`，累计 ~63s）。
+> 客户端 RFC 2349 `timeout` option 仍按协商值。
+> (3) 末尾块用更小预算（~7s）是为尽快释放 worker--NodeForge 线程模型下长时间空等
+> 会占用 worker 槽（区别于 tftpd-hpa 每请求一进程的 63s 空等）。
+> 实现见 `src/tftp/server.zig` `RetryAction`/`retryAction`/`retryLimit`/`backoffSeconds`
+> 及 `transfer`/`transferFromMemory` 重传循环；纯逻辑有单元测试覆盖。详见 §7.7。
+
 ## 1. 背景与问题陈述
 
 M4/M4.1 交付了 kickstart/autoinstall 渲染、受控 post-install provisioning 和安装生命周期事件上报。
@@ -499,6 +516,30 @@ UEFI 网络栈进入不一致状态，最终导致 "could not seed network packe
 
 超时窗口使用 `boot_session.monotonicNow()` 跟踪截止时间，每次收到非预期包后
 重新计算剩余时间并继续等待，确保总等待时间不超过原始 `timeout` 值。
+
+### 7.7 末尾块 ACK 乐观完成与指数退避重传（2026-07-16 修订）
+
+§7.6 描述 `awaitAck` 的**单包**健壮性，超时仍返回 `error.Timeout`。本节规定**调用方**
+（`transfer`/`transferFromMemory` 的重传循环）对 `error.Timeout` 的处理，纠正 `e14b15f`
+「末尾块 ACK 丢失即失败 + 发 ERROR 包」的误判。
+
+- **末尾块乐观完成（RFC 1350 §6）**：当前等 ACK 的块若是最后一块
+（`last_read < settings.block_size`），重传 `final_block_retries=2` 次仍零 ACK，视为
+  传输成功--末尾块数据几乎肯定已送达（GRUB 收齐 initrd 后转去加载、不再回最终 ACK），
+  返回已发送字节数，不发 TFTP ERROR 包。与 tftpd-hpa `exit(0)` / dnsmasq
+  `LOG_INFO "sent"` 一致。
+- **非末尾块失败**：中途块 ACK 超时表示数据确实不完整，重传 `max_retries=5` 次后返回
+  `error.Timeout`（对齐 dnsmasq「中途超时为错误、末尾超时为成功」；区别于 tftpd-hpa
+  对两种情况都 `exit(0)` 的无差别语义）。
+- **指数退避**：`default_timeout` 1s 基线，每次重传 timeout 翻倍封顶 255（`backoffSeconds`）。
+  末尾块累计 ~7s（1+2+4），非末尾块 ~63s（1+2+4+8+16+32，对齐 `TRIES=6`）。客户端
+  RFC 2349 `timeout` option 仍按协商值放大基线。
+- **worker 释放**：末尾块用更小预算是为尽快释放 worker--NodeForge 线程模型
+（`max_concurrent_transfers` 个 worker 槽）下长时间空等会占用槽位，区别于 tftpd-hpa
+  每请求一进程的 63s 空等。
+
+纯决策逻辑（`RetryAction`/`retryAction`/`retryLimit`/`backoffSeconds`）与 socket 解耦，
+有单元测试覆盖；`transfer`/`transferFromMemory` 接线复用同一决策。
 
 ## 8. F5：免密公钥配置化
 

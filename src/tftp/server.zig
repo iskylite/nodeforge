@@ -35,12 +35,54 @@ const max_options = 8;
 /// 允许的最大 `blksize` 值（RFC 2348）；超过此值的请求被拒绝。
 /// 受限于 UDP datagram 最大安全负载（65535 - 20 IP - 8 UDP = 65507）。
 const max_block_size: usize = 65_464;
-/// TFTP DATA/ACK 超时（秒），与 tftpd-hpa 默认一致。客户端未在 RRQ 发送
-/// `timeout` option 时采用此值；给 GRUB 足够时间处理大文件末尾块的 ACK。
-const default_timeout: u8 = 5;
-/// DATA 重传次数上限；超过后放弃传输（RFC 1350 建议超时重传）。与 tftpd-hpa
-/// 默认一致，配合 5s 超时应对大文件末尾块 ACK 偶发延迟。
+/// TFTP DATA/ACK 重传基线超时（秒）。客户端未在 RRQ 发送 `timeout` option 时
+/// 采用此值；与 tftpd-hpa 默认 1s 一致。重传采用指数退避（每次翻倍，见
+/// `backoffSeconds`）：中途块累计耐心 ~63s（见 `max_retries`），末尾块 ~7s
+/// 后乐观完成（见 `final_block_retries`）。
+/// 早期 5s 固定值既慢于丢包恢复、又无退避，且无法解决末尾块 ACK 丢失
+///（GRUB 收齐 initrd 后转去加载，不再回最终 ACK）。
+const default_timeout: u8 = 1;
+/// 非末尾块的重传次数上限（不含首次发送）；与 tftpd-hpa TRIES=6
+///（1 首次 + 5 重传）一致。配合 1s 基线 + 指数退避，中途块累计耐心 ~63s
+///（1+2+4+8+16+32）。末尾块用更小的 `final_block_retries`。
 const max_retries: u8 = 5;
+/// ACK 超时后的重传决策（纯逻辑，便于无 socket 单元测试）。
+const RetryAction = enum {
+    retransmit, // 还有重传预算，继续重传
+    optimistic_complete, // 末尾块 ACK 丢失，按 RFC 1350 §6 视为传输成功
+    fail, // 非末尾块重传耗尽，判定失败
+};
+
+/// 末尾块（payload < blksize）的乐观重传上限：2 次。
+/// 配合 1s 基线 + 指数退避，末尾块最多等待 1+2+4 = 7s 即按 RFC 1350 §6
+/// 视为传输成功。末尾块数据几乎肯定已送达：GRUB 收齐 initrd 后转去加载，
+/// 不再回最终 ACK（见 dnsmasq 源码注释 "some clients never send it"）。
+/// NodeForge 线程模型下需尽快释放 worker，不能像 tftpd-hpa（每请求一进程）
+/// 那样空等 63s。
+const final_block_retries: u8 = 2;
+
+/// 根据是否末尾块返回重传上限。非末尾块用 `max_retries`（对齐 tftpd-hpa
+/// TRIES=6，即 1 首次 + 5 重传，1s 基线 + 指数退避累计 ~63s）；末尾块用
+/// `final_block_retries`（~7s 后乐观完成）。
+fn retryLimit(is_final_block: bool) usize {
+    return if (is_final_block) final_block_retries else max_retries;
+}
+
+/// 根据「是否末尾块 / 当前已等待次数 / 重传上限」决定 ACK 超时后的动作。
+/// `attempts` 为已发起的等待次数（0 表示首次等待刚超时）。
+fn retryAction(is_final_block: bool, attempts: usize, limit: usize) RetryAction {
+    if (attempts < limit) return .retransmit;
+    return if (is_final_block) .optimistic_complete else .fail;
+}
+
+/// 指数退避：第 `attempt` 次等待 `base << attempt` 秒，封顶 255
+///（`awaitAck` 的 `seconds` 参数为 u8）。与 tftpd-hpa 每次重传 timeout 翻倍一致。
+fn backoffSeconds(base: u8, attempt: usize) u8 {
+    const Shift = std.math.Log2Int(u32);
+    const shift: Shift = @intCast(@min(attempt, 8));
+    const widened: u32 = @as(u32, base) << shift;
+    return @intCast(@min(widened, 255));
+}
 /// 在固定 UDP 69 上运行 TFTP RRQ dispatcher。
 ///
 /// `config` 提供 TFTP asset root 路径；`catalog` 提供资产白名单快照；
@@ -393,16 +435,28 @@ fn transferFromMemory(
         const chunk = content[offset..end];
         var out: [max_block_size + 4]u8 = undefined;
         const datagram = try packet.encodeData(&out, block, chunk);
-        // 超时重传：最多重试 max_retries 次，每次重传后等待 ACK。
-        // 这处理 UDP 丢包和客户端处理延迟，但不无限重试以避免资源浪费。
+        // 末尾块 ACK 乐观完成（RFC 1350 §6）+ 指数退避重传。
+        // 末尾块 ACK 丢失时数据几乎肯定已送达，按标准视为成功而非失败。
+        const is_final_block = chunk.len < settings.block_size;
+        const limit = retryLimit(is_final_block);
         var attempts: usize = 0;
         while (true) {
             try socket.send(io, remote, datagram);
-            awaitAck(&socket, io, remote, block, settings.timeout) catch |err| {
-                if (err == error.Timeout and attempts < max_retries) {
-                    attempts += 1;
-                    log.warn("retransmit virtual config block {d} attempt {d}/{d}", .{ block, attempts, max_retries });
-                    continue;
+            awaitAck(&socket, io, remote, block, backoffSeconds(settings.timeout, attempts)) catch |err| {
+                if (err == error.Timeout) {
+                    switch (retryAction(is_final_block, attempts, limit)) {
+                        .retransmit => {
+                            attempts += 1;
+                            log.warn("retransmit virtual config block {d} attempt {d}/{d}", .{ block, attempts, limit });
+                            continue;
+                        },
+                        .optimistic_complete => {
+                            log.info("virtual config final block ACK lost; assuming delivery per RFC 1350 §6", .{});
+                            offset += chunk.len;
+                            return offset;
+                        },
+                        .fail => return err,
+                    }
                 }
                 return err;
             };
@@ -526,27 +580,43 @@ fn transfer(
         // 等待本窗口中实际发送的最后一块的 ACK。
         // expected_ack 必须是 last_sent_block 而非 block（block 可能已递增）。
         const expected_ack = last_sent_block;
+        // 末尾块 ACK 乐观完成（RFC 1350 §6）+ 指数退避重传。
+        // 末尾块 ACK 丢失时数据几乎肯定已送达，按标准视为成功而非失败，
+        // 且不发 ERROR 包（tftpd-hpa exit(0) / dnsmasq LOG_INFO "sent"）。
+        // 非末尾块超时仍判失败：数据确实不完整（区别于 tftpd-hpa 的无差别
+        // exit(0)，与 dnsmasq「中途超时为错误、末尾超时为成功」一致）。
+        const is_final_block = last_read < settings.block_size;
+        const limit = retryLimit(is_final_block);
         var attempts: usize = 0;
         while (true) {
-            awaitAck(&socket, io, remote, expected_ack, settings.timeout) catch |err| {
-                if (err == error.Timeout and attempts < max_retries) {
-                    attempts += 1;
-                    log.warn("retransmit {s} block {d} attempt {d}/{d}", .{ request.filename, expected_ack, attempts, max_retries });
-                    // 客户端无法在 window 中较早的块丢失时 ACK window 末尾，
-                    // 因此按顺序重传整个未完成 window，而非仅重传最后一块。
-                    var resend_offset = window_start_offset;
-                    var resend_block = window_start_block;
-                    var resent: u16 = 0;
-                    while (resent < blocks_in_window) : (resent += 1) {
-                        const capacity = data[0..settings.block_size];
-                        const read = try file.readPositionalAll(io, capacity, resend_offset);
-                        var out: [max_block_size + 4]u8 = undefined;
-                        const datagram = try packet.encodeData(&out, resend_block, capacity[0..read]);
-                        try socket.send(io, remote, datagram);
-                        resend_offset += read;
-                        resend_block +%= 1;
+            awaitAck(&socket, io, remote, expected_ack, backoffSeconds(settings.timeout, attempts)) catch |err| {
+                if (err == error.Timeout) {
+                    switch (retryAction(is_final_block, attempts, limit)) {
+                        .retransmit => {
+                            attempts += 1;
+                            log.warn("retransmit {s} block {d} attempt {d}/{d}", .{ request.filename, expected_ack, attempts, limit });
+                            // 客户端无法在 window 中较早的块丢失时 ACK window 末尾，
+                            // 因此按顺序重传整个未完成 window，而非仅重传最后一块。
+                            var resend_offset = window_start_offset;
+                            var resend_block = window_start_block;
+                            var resent: u16 = 0;
+                            while (resent < blocks_in_window) : (resent += 1) {
+                                const capacity = data[0..settings.block_size];
+                                const read = try file.readPositionalAll(io, capacity, resend_offset);
+                                var out: [max_block_size + 4]u8 = undefined;
+                                const datagram = try packet.encodeData(&out, resend_block, capacity[0..read]);
+                                try socket.send(io, remote, datagram);
+                                resend_offset += read;
+                                resend_block +%= 1;
+                            }
+                            continue;
+                        },
+                        .optimistic_complete => {
+                            log.info("tftp: final block ACK lost for {s}; assuming delivery per RFC 1350 §6", .{request.filename});
+                            return offset;
+                        },
+                        .fail => return err,
                     }
-                    continue;
                 }
                 return err;
             };
@@ -990,4 +1060,54 @@ test "TFTP block number: expected_ack equals last sent block (window=2)" {
         try std.testing.expectEqual(last_sent_block, expected_ack);
         if (block_idx < file_blocks) block +%= 1; // 外层递增到下一个 window 的起始块
     }
+}
+
+// ── 末尾块 ACK 乐观完成 + 指数退避回归测试 ───────────────────────
+//
+// RFC 1350 §6：发送最后一块 DATA 后，若最终 ACK 丢失，发送方无法区分
+// 「接收方已收到数据但 ACK 丢失」与「数据未送达」。标准实现（tftpd-hpa
+// 的 exit(0)、dnsmasq 的 LOG_INFO "sent"）在有限重传后将末尾块 ACK 丢失
+// 视为传输成功。NodeForge 原实现把末尾块 ACK 丢失当作 error.Timeout 失败
+// 并发送 ERROR 包，与标准行为相反。
+//
+// 以下测试覆盖纯决策逻辑（不涉及 socket）：
+//   - retryAction：根据「是否末尾块 / 已重传次数 / 上限」决定 retransmit /
+//     optimistic_complete / fail
+//   - retryLimit：末尾块用更小的重传预算（≈7s）以尽快释放 worker
+//   - backoffSeconds：指数退避（每次翻倍，封顶 255）
+test "TFTP retry: retransmit while attempts below limit" {
+    try std.testing.expectEqual(RetryAction.retransmit, retryAction(false, 0, max_retries));
+    try std.testing.expectEqual(RetryAction.retransmit, retryAction(true, 0, final_block_retries));
+    try std.testing.expectEqual(RetryAction.retransmit, retryAction(false, max_retries - 1, max_retries));
+    try std.testing.expectEqual(RetryAction.retransmit, retryAction(true, final_block_retries - 1, final_block_retries));
+}
+
+test "TFTP retry: non-final block exhausted -> fail" {
+    try std.testing.expectEqual(RetryAction.fail, retryAction(false, max_retries, max_retries));
+    try std.testing.expectEqual(RetryAction.fail, retryAction(false, max_retries + 3, max_retries));
+}
+
+test "TFTP retry: final block exhausted -> optimistic complete (RFC 1350 §6)" {
+    try std.testing.expectEqual(RetryAction.optimistic_complete, retryAction(true, final_block_retries, final_block_retries));
+    try std.testing.expectEqual(RetryAction.optimistic_complete, retryAction(true, final_block_retries + 3, final_block_retries));
+}
+
+test "TFTP retry: retryLimit uses smaller budget for final block" {
+    try std.testing.expectEqual(@as(usize, max_retries), retryLimit(false));
+    try std.testing.expectEqual(@as(usize, final_block_retries), retryLimit(true));
+}
+
+test "TFTP backoff: doubles per attempt and caps at 255" {
+    // 1s 基线 + 指数退避：1, 2, 4, 8, 16, 32（6 次等待 = 63s，对齐 tftpd-hpa TRIES=6）
+    try std.testing.expectEqual(@as(u8, 1), backoffSeconds(1, 0));
+    try std.testing.expectEqual(@as(u8, 2), backoffSeconds(1, 1));
+    try std.testing.expectEqual(@as(u8, 4), backoffSeconds(1, 2));
+    try std.testing.expectEqual(@as(u8, 32), backoffSeconds(1, 5));
+    // 客户端协商 timeout=5 时基线放大
+    try std.testing.expectEqual(@as(u8, 5), backoffSeconds(5, 0));
+    try std.testing.expectEqual(@as(u8, 10), backoffSeconds(5, 1));
+    try std.testing.expectEqual(@as(u8, 160), backoffSeconds(5, 5));
+    // 封顶 255（awaitAck 的 seconds 是 u8）
+    try std.testing.expectEqual(@as(u8, 255), backoffSeconds(255, 1)); // 510 -> 255
+    try std.testing.expectEqual(@as(u8, 255), backoffSeconds(10, 8)); // 远超上限 -> 255
 }
