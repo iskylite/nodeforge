@@ -8,7 +8,7 @@
 //!   IP 地址，通过匹配活动 boot session 的 lease-IP 确认身份。适用于
 //!   Anaconda/Subiquity 在安装阶段拉取 answer 文件的场景。
 //! - `capability`：基于 bearer token + session header 认证。节点通过
-//!   `/api/v1/nodes/<id>/config` 获取 capability token 后，使用
+//!   `/api/v1/nodes/<id>/boot-config` 获取 capability token 后，使用
 //!   `Authorization: Bearer <token>` 和 `X-NodeForge-Session: <id>` header
 //!   访问受保护资源。适用于安装后事件上报和 rootfs 下载。
 

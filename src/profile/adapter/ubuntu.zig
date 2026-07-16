@@ -548,7 +548,7 @@ test "apt fallback is rendered from the install profile" {
 test "M4.1 autoinstall renders target defaults and static network" {
     const node: model.NodeConfig = .{ .id = "node-04", .mac = "00:11:22:33:44:99", .arch = .aarch64, .profile = "ubuntu", .ip = "192.168.50.27", .overrides = .{ .network = .{ .mode = .static, .interface = "ens160", .address = "192.168.50.27", .prefix_len = 24, .gateway = "192.168.50.1", .dns = &.{"192.168.50.1"}, .search_domains = &.{"nodeforge.local"} } } };
     const system: model.TargetSystemConfig = .{ .localization = .{ .locale = "zh_CN.UTF-8", .timezone = "Asia/Shanghai", .keyboard = "us" }, .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} }, .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }} };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/repos/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1");
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/artifacts/repositories/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1");
     // report_url="" 表示未配置 subiquity-report 端点（不渲染 reporting 块）
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "locale: 'zh_CN.UTF-8'") != null);

@@ -21,7 +21,7 @@ pub const Record = struct {
 };
 
 pub const File = struct {
-    schema_version: u32 = 2,
+    schema_version: u32 = 3,
     saved_at: i64,
     sessions: []const Record,
 };
@@ -72,7 +72,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 2) or parsed.value.sessions.len > boot_session.max_sessions or utc_now < parsed.value.saved_at) return error.InvalidBootSessionState;
+    if (parsed.value.schema_version != 3 or parsed.value.sessions.len > boot_session.max_sessions or utc_now < parsed.value.saved_at) return error.InvalidBootSessionState;
     var restored: usize = 0;
     for (parsed.value.sessions) |record| {
         if (!boot_session.validId(record.boot_session_id) or !validCapability(&record.capability) or utc_now < record.last_seen_at) continue;
@@ -108,7 +108,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
             if (record.plan_digest == null or !std.crypto.timing_safe.eql([32]u8, digest, record.plan_digest.?)) return error.InvalidBootSessionState;
             try validatePlanAssets(allocator, plan_json, catalog);
             try store.captureInstallPlan(allocator, record.boot_session_id, plan_json, record.model_revision);
-        } else if (parsed.value.schema_version >= 2) return error.InvalidBootSessionState;
+        } else if (parsed.value.schema_version >= 3) return error.InvalidBootSessionState;
         restored += 1;
     }
     return restored;

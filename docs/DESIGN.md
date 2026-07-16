@@ -370,14 +370,14 @@ const AppConfig = struct {
     http: HttpConfig,
     logging: LoggingConfig,
     events: EventsConfig,
-    nodes: []NodeConfig,
-    distros: []DistroConfig,
-    profiles: []ProfileConfig,
-    provisioning_bundles: []ProvisioningBundle,
     policy: PolicyConfig,
 };
 
 const Catalog = struct {
+    distros: []DistroConfig,
+    profiles: []ProfileConfig,
+    nodes: []NodeConfig,
+    provisioning_bundles: []ProvisioningBundle,
     assets: []AssetConfig,
     repositories: []RepositoryConfig,
     install_sources: []InstallSourceConfig,
@@ -385,9 +385,8 @@ const Catalog = struct {
     boot_bundles: []BootBundleConfig,
 };
 
-// nodes 暂时保留在 AppConfig，因为它表达管理员确认后的节点身份、
-// IP/profile 绑定和部署意图；asset/repository/install source/rootfs/
-// boot bundle 这类由扫描、导入、构建、发布得到的对象放入 Catalog。
+// M4.7 后 AppConfig 只保存启动/站点策略；所有可由管理 API 变更的
+// distro/profile/node/bundle/source/asset 由 Catalog manifest/entity store 拥有。
 
 const NodeConfig = struct {
     id: []const u8,
@@ -500,7 +499,7 @@ const ProfileConfig = struct {
     arch: Arch,
     boot: BootConfig,
     boot_source: BootSourceRef,
-    cmdline_template: []const u8,
+    kernel_args: ?[]const u8 = null,
     safety: ProfileSafetyConfig,
     system: TargetSystemConfig,
     install: ?InstallConfig,
@@ -590,7 +589,7 @@ Profile 描述“一类节点如何启动和部署”，node 描述“这一台�
 - `distro` / `version` / `arch`：发行版、版本、架构。
 - `boot`：不同架构对应 bootloader，例如 UEFI x86_64 使用 `grubx64.efi`。
 - `boot_source`：安装场景只引用 `install_source`，无盘场景只引用 `boot_bundle`。
-- `cmdline_template`：kernel cmdline 模板。
+- `kernel_args`：经过 token 级安全校验并 canonicalize 的追加参数；NodeForge 管理的 installer/config 参数不可覆盖。
 - `safety`：是否允许未知节点使用、是否破坏性、是否写持久状态。
 
 `system` 公共配置描述 locale/timezone/keyboard、离线连接策略、SSH/root、普通用户/password/sudo/key、
@@ -1279,13 +1278,16 @@ pxe_seen
 
 | 入口 | 用途 |
 | --- | --- |
-| `/opt/nodeforge/config/config.json` | 启动配置、站点默认值、安全策略和人工声明的部署策略 |
-| `/opt/nodeforge/catalog/catalog.json` 与 manifest | 由 `nodeforged` 根据 CLI/API 的导入、构建、校验、发布请求维护的资产和语义目录 |
+| `<install-root>/config/config.json` | M4.7 后只含启动配置、站点默认值和 policy；离线重配生效 |
+| `<install-root>/catalog/manifest.json` 与 entity files | daemon-owned distro/profile/node/bundle/source/asset 目录 |
 | `nodeforge` CLI | 常用操作、批量变更、资产导入/构建/发布、查询和排障 |
 
 `config.json` 是启动时加载的站点配置事实源。M0 中，server IP、端口、bind interface、资产根目录等修改后均需重启 `nodeforged` 生效；离线编辑或 `nodeforge config import` 都是正常工作流，但必须经过 `nodeforge config validate` 或 `nodeforged --check-config`。M1+ 才为 DHCP discovery 等运行期策略提供 CLI/API 在线切换与 daemon 原子写回。
 
-`catalog.json` 是 NodeForge 管理的资产和语义目录事实源，不鼓励手写。M0 只支持其读取、导出和跨文件校验；不提供 catalog 修改命令。M1+ 中它记录通过导入、构建、扫描和发布产生的 asset、repository、install source、rootfs、initrd、boot bundle；M4.3 后统一由 `assets import`、`assets rootfs-package`、`assets initrd-build`、`assets bundle-publish` 等 canonical 命令发起，而实际扫描、校验、原子写回和内存视图更新仍由 `nodeforged` 完成。logical id 使用统一的小写 ASCII path-safe grammar，展示标题单独保存。涉及 profile 引用的 install-source rename 必须通过 daemon 的 config/catalog/目录联合事务和 recovery journal，不能分别写两个 JSON。旧命令名仅用于解释历史记录，不再进入现行帮助或脚本。
+M4.7 后 catalog 是 `manifest.json` + 按实体拆分文件。manifest 固定 layout schema、catalog revision、transaction id
+和 entity digest；daemon 是唯一 writer，所有变更通过同一 journal/stage/fsync/rename/manifest-last 事务发布。旧
+`catalog.json` 与旧 config 中的实体只作为一次性 migration input；缺文件、digest mismatch 或无法裁决的 mixed layout
+fail closed。logical id 使用统一的小写 ASCII path-safe grammar，展示标题单独保存。
 
 管理接口复用唯一 HTTP listener，但 `/api/v1/management/` 仅接受 direct peer `127.0.0.1`；`nodeforge` CLI 的管理客户端也固定请求该地址，不读取配置中的管理地址，也不支持远程管理地址参数。远程管理需要未来明确的 TLS、认证和授权设计，不能借用 PXE listener 绕过。MVP 不再并列设计 Unix socket、独立 RPC、第二个 HTTP listener 或独立 `management_port`，减少协议、端口和客户端实现分叉。
 
@@ -1382,11 +1384,15 @@ sequenceDiagram
 
 ### 10.5 配置持久化与格式
 
-`config.json` 是启动配置和人工声明策略的事实源，schema 随阶段从 M0 的 server/http/logging、基础 distro/profile/node/policy 扩展到 DHCP/TFTP、安装和 provisioning；准确的当前可加载字段以代码与 `config.example.json` 为准，M4.1 目标字段在实现前不得提前当作可用配置。`catalog.json` 是 NodeForge 管理目录的事实源，M1+ 记录 asset、repository、install source、rootfs、initrd、boot bundle 等导入、构建、扫描、发布结果。二者都使用 JSON、都必须整体校验并原子写回；catalog 写入始终只允许由 `nodeforged` 执行。
+M4.7 后 `config.json` 是只读启动配置和人工站点 policy 的事实源；distro/profile/node/provisioning bundle 与所有
+导入/构建资源属于 Catalog。config 与 catalog 都使用 JSON，但 catalog 以 manifest/entity files 和可恢复多文件事务
+发布；完整有效性由 `validateConfigShape`、`validateCatalogShape`、`validateModel` 三层检查。config 在线 PATCH 禁止，
+重配置走 setup/config apply 的离线 candidate、重启健康检查和失败回滚。
 
 MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。M3.1 前的 `runtime.json` 属于运行态，M3.1 起其内容按恢复语义拆分为 `leases.json` 与 `node-status.json`，并保留旧文件作兼容迁移输入；`events.jsonl` 属于事件历史。M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。交互式启动默认写 stderr，systemd 显式选择受限权限的轮转文件 `/opt/nodeforge/logs/nodeforged.log`；`--log-output both` 才同时写入 stderr/journal。
 
-默认安装根为 `/opt/nodeforge`，代码中只在统一路径定义处声明一次，其他默认路径全部派生。完整的目录布局、系统集成点和仓库目录结构见第 14 章。
+默认安装根为 `/opt/nodeforge`；M4.7 启动时通过显式 root 或 executable+marker/layout 发现并初始化 runtime `Paths`，
+无法验证时 fail closed。其他路径全部从该实例派生，支持 `/srv/nf` 等自定义根。
 
 ### 10.6 日志分层
 
@@ -1531,7 +1537,7 @@ Install profile 示例：
   "boot_source": {
     "install_source": "ubuntu-22.04-x86_64-live-server"
   },
-  "cmdline_template": "nodeforge.mode=install nodeforge.node_id={{node_id}} nodeforge.config_url={{config_url}} nodeforge.event_url={{event_url}} autoinstall ds=nocloud-net;s={{answer_base_url}}/",
+  "kernel_args": "iommu=pt",
   "safety": {
     "safe_for_unknown": false,
     "destructive": true,
@@ -1627,7 +1633,7 @@ Diskless profile 示例：
   "boot_source": {
     "boot_bundle": "ubuntu-22.04-x86_64-5.15.0-xx-diskless-20260706"
   },
-  "cmdline_template": "nodeforge.mode=diskless nodeforge.node_id={{node_id}} nodeforge.config_url={{config_url}} nodeforge.event_url={{event_url}}",
+  "kernel_args": "iommu=pt",
   "safety": {
     "safe_for_unknown": true,
     "destructive": false,
@@ -1871,7 +1877,8 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
   `node_status` 独立同步保存至 `node-status.json`；两者不共享 I/O 锁，旧 `runtime.json` 只作迁移输入。每个协议
   事件仍经唯一 EventWriter 立即追加；有序停机要求 checkpoint worker flush-and-stop 后再写服务终态。不得在每个
   DHCP 报文上同步 `fsync` 整份 runtime 文件，以免阻塞 UDP 收包。
-- 随软件包提供 `packaging/systemd/nodeforged.service`；CLI 不重复封装 `systemctl`；M0 需要通过 Rocky 9.7 aarch64 systemd 验证。
+- M4.7 `nodeforge setup` 根据 install root 生成完整 hardening unit，并负责 daemon-reload/enable/start/health-check/
+  rollback；普通管理 CLI 不提供通用 `systemctl` wrapper。安装 bundle 必须同时含 `nodeforge` 与 `nodeforged`。
 - M3 的 `nodeforged --check` 同时验证 `mount`/`umount` 可用、私有挂载根可创建，且服务具有
   `CAP_SYS_ADMIN`；ISO 导入自动发布本地 HTTP yum/dnf/apt 基础源并绑定 repository。repo GPG 检查默认关闭，只有显式启用才校验 key。
 - rootfs HTTP 下载支持 Range/If-Range 断点续传和最终 SHA256 校验。
@@ -1919,11 +1926,14 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 
 ## 15. 目录布局
 
-默认安装根为 `/opt/nodeforge`。除 systemd unit 和 `/usr/bin` 软链接外，配置、运行态、日志、资产、部署产物和工作目录都放在该目录下。`/etc/systemd/system/nodeforged.service` 也是软链接，指向 `/opt/nodeforge/systemd/nodeforged.service`，避免卸载 `/opt/nodeforge` 后留下可用但失配的旧 service 文件。
+默认安装根为 `/opt/nodeforge`，也可由验证过的 executable+`.nodeforge-root` 布局或 `setup --install-root` 选择
+自定义根。除 systemd unit 和 `/usr/bin` 软链接外，配置、运行态、日志、资产、部署产物和工作目录都放在该根下。
 
-代码中只允许在统一路径定义处声明默认安装根，其他默认路径都从它派生。这样后续如果要把安装根从 `/opt/nodeforge` 调整到其他位置，只需要修改一处路径常量和对应打包配置，不需要在业务模块、校验逻辑和文档示例之间到处找硬编码。
+所有消费者使用进程启动时只初始化一次的 `Paths`；未初始化、重复初始化、marker/layout 不合法、symlink/权限不可信
+都显式报错，不允许 lazy `/opt` 回退。
 
-正常安装时 `nodeforged` 自动读取 `/opt/nodeforge/config/config.json` 和 `/opt/nodeforge/catalog/catalog.json`，systemd 不需要传 `--config` 和 `--catalog`。这两个参数仍保留为覆盖入口，主要用于开发测试、迁移验证或临时排障，不作为日常部署命令的一部分。
+正常安装时 `nodeforged` 从 runtime Paths 读取 `config/config.json` 与 `catalog/`，systemd 不传 `--config`/
+`--catalog`。覆盖参数只用于开发/迁移/排障，`--catalog` 指目录。
 
 ```text
 /opt/nodeforge/
@@ -1935,7 +1945,15 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
   config/
     config.json
   catalog/
-    catalog.json
+    manifest.json
+    distros.json
+    profiles.json
+    nodes.json
+    provisioning_bundles.json
+    repositories.json
+    assets.json
+    install_sources.json
+    boot_bundles.json
   state/
     leases.json             # M3.1 DHCP lease snapshot
     node-status.json        # M3.1 node-status snapshot

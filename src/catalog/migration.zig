@@ -230,7 +230,7 @@ test "legacy wrong distro produces stable migration plan and profile patch" {
         .{ .name = "rocky-old-installer-kernel", .kind = .kernel, .path = "install/rocky-old/vmlinuz" },
         .{ .name = "rocky-old-installer-initrd", .kind = .installer_initrd, .path = "install/rocky-old/initrd.img" },
     };
-    const source: model.InstallSourceConfig = .{ .name = "rocky-old", .source_label = "CentOS Linux 8.4 DVD", .distro = "rocky", .version = "8.4", .arch = .x86_64, .source_asset = "rocky-old-image", .installer_kernel = "rocky-old-installer-kernel", .installer_initrd = "rocky-old-installer-initrd", .media_tree_url = "http://192.0.2.1/repos/rocky-old" };
+    const source: model.InstallSourceConfig = .{ .name = "rocky-old", .source_label = "CentOS Linux 8.4 DVD", .distro = "rocky", .version = "8.4", .arch = .x86_64, .source_asset = "rocky-old-image", .installer_kernel = "rocky-old-installer-kernel", .installer_initrd = "rocky-old-installer-initrd", .media_tree_url = "http://192.0.2.1/artifacts/repositories/rocky-old" };
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1" }, .profiles = &.{.{ .name = "legacy", .mode = .install, .distro = "rocky", .version = "8.4", .arch = .x86_64, .install_source = "rocky-old" }} };
     const catalog: model.Catalog = .{ .assets = &assets, .install_sources = &.{source} };
     var first = try build(std.testing.allocator, &config, &catalog, 11, 4);
@@ -259,7 +259,7 @@ test "typed candidates update source assets and profile without text-wide replac
         .{ .name = "rocky-old-installer-kernel", .kind = .kernel, .path = "install/rocky-old/vmlinuz", .distro = "rocky", .version = "8.4", .arch = .x86_64, .sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
         .{ .name = "rocky-old-installer-initrd", .kind = .installer_initrd, .path = "install/rocky-old/initrd.img", .distro = "rocky", .version = "8.4", .arch = .x86_64, .sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
     };
-    const source: model.InstallSourceConfig = .{ .name = "rocky-old", .source_label = "CentOS Linux 8.4 DVD", .distro = "rocky", .version = "8.4", .arch = .x86_64, .source_asset = "rocky-old-image", .installer_kernel = "rocky-old-installer-kernel", .installer_initrd = "rocky-old-installer-initrd", .media_tree_url = "http://192.0.2.1/repos/rocky-old" };
+    const source: model.InstallSourceConfig = .{ .name = "rocky-old", .source_label = "CentOS Linux 8.4 DVD", .distro = "rocky", .version = "8.4", .arch = .x86_64, .source_asset = "rocky-old-image", .installer_kernel = "rocky-old-installer-kernel", .installer_initrd = "rocky-old-installer-initrd", .media_tree_url = "http://192.0.2.1/artifacts/repositories/rocky-old" };
     const versions = [_]model.DistroVersionConfig{.{ .version = "8.4", .archs = &.{.x86_64}, .install_adapter = .kickstart, .package_manager = .dnf }};
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .bind_interface = "eth0" }, .distros = &.{.{ .name = "centos", .family = .rhel, .versions = &versions }}, .profiles = &.{.{ .name = "legacy", .mode = .install, .distro = "rocky", .version = "8.4", .arch = .x86_64, .install_source = "rocky-old", .safety = .{ .destructive = true, .persistent_writes = true }, .install = .{} }} };
     const catalog: model.Catalog = .{ .assets = &assets, .install_sources = &.{source} };

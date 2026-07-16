@@ -37,7 +37,7 @@ pub fn findAsset(catalog: *const model.Catalog, name: []const u8) ?*const model.
     return null;
 }
 
-/// 按文件路径查找文件资产（用于 HTTP /boot/ 路由的 ETag 查找）。
+/// 按文件路径查找文件资产（用于 HTTP /artifacts/boot/ 路由的 ETag 查找）。
 pub fn findAssetByPath(catalog: *const model.Catalog, path: []const u8) ?*const model.AssetConfig {
     for (catalog.assets) |*item| if (equal(item.path, path)) return item;
     return null;

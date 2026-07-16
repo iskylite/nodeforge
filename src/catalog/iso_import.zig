@@ -33,9 +33,9 @@ pub const Request = struct {
 };
 
 /// 导入结果。包含所有需要发布到 catalog 的对象：
-/// - ISO asset（通过 HTTP /images/ 下载）
+/// - ISO asset（通过 HTTP /artifacts/images/ 下载）
 /// - installer kernel/initrd assets（通过 TFTP 提供）
-/// - 可选的 repository（通过 HTTP /repos/ 提供）
+/// - 可选的 repository（通过 HTTP /artifacts/repositories/ 提供）
 /// - install source（关联 ISO/kernel/initrd/repo 的 catalog 对象）
 /// 调用方负责将这些对象原子发布到 catalog 快照。
 pub const Result = struct {
@@ -157,7 +157,7 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     const distro_name = try allocator.dupe(u8, detected.distro);
     const distro_version = try allocator.dupe(u8, detected.version);
     const version_capability = lookup.findDistroVersion(config, detected.distro, detected.version, detected.arch) orelse return error.MediaTupleMismatch;
-    const media_tree_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}/repos/{s}", .{ config.server.server_ip, config.server.http_port, source_name });
+    const media_tree_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ config.server.server_ip, config.server.http_port, source_name });
     const result: Result = .{
         .source_name = source_name,
         .source_label = detected.source_label,

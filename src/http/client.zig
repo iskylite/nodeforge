@@ -7,7 +7,7 @@ const management = @import("management.zig");
 pub const Status = struct {
     /// TCP 连接是否成功建立；false 表示进程不可达或端口未监听。
     reachable: bool,
-    /// HTTP 响应是否为 200；false 包括连接成功但响应非 200。
+    /// HTTP 响应是否为 2xx（成功）；false 包括连接成功但响应非 2xx。
     healthy: bool,
 };
 
@@ -71,7 +71,7 @@ pub fn managementStatus(io: std.Io, port: u16) Status {
         io,
         management.client_ip,
         port,
-        "/api/v1/management/server/status",
+        "/api/v1/management/status",
         "GET",
     );
 }
@@ -82,7 +82,7 @@ pub fn validateActiveConfig(io: std.Io, port: u16) Status {
         io,
         management.client_ip,
         port,
-        "/api/v1/management/config/validate",
+        "/api/v1/management/config/validations",
         "POST",
     );
 }
@@ -91,19 +91,19 @@ pub fn validateActiveConfig(io: std.Io, port: u16) Status {
 pub fn installRetry(io: std.Io, port: u16, node_id: []const u8) Status {
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
-    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/install/retry", .{node_id}) catch return .{ .reachable = false, .healthy = false };
+    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/install-generations", .{node_id}) catch return .{ .reachable = false, .healthy = false };
     return probeAt(io, management.client_ip, port, value, "POST");
 }
 
-/// M4.2: 通知 daemon 重新加载 config.json（node add/set/remove 写回后调用）。
-/// daemon 验证新配置后退出，由 systemd 自动重启加载新配置。
+/// M4.4: config/reload 路由已删除。此函数现在探测 /management/status 作为替代。
+/// 调用方应迁移到 managementStatus。
 pub fn configReload(io: std.Io, port: u16) Status {
-    return probeAt(io, management.client_ip, port, "/api/v1/management/config/reload", "POST");
+    return managementStatus(io, port);
 }
 
 /// 探测 M1 TFTP 运行态路由。仅由本机 daemon 提供，不接受远程地址。
 pub fn tftpStatus(io: std.Io, port: u16) Status {
-    return probeAt(io, management.client_ip, port, "/api/v1/management/tftp/status", "GET");
+    return probeAt(io, management.client_ip, port, "/api/v1/management/runtime/tftp", "GET");
 }
 
 /// 读取 M1 TFTP 计数器响应并解析为 `TftpCounters`。
@@ -117,7 +117,7 @@ pub fn tftpCounters(io: std.Io, port: u16) TftpCounters {
     defer stream.close(io);
     var send_buffer: [512]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
-    writer.interface.print("GET /api/v1/management/tftp/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{}) catch return .{ .reachable = true };
+    writer.interface.print("GET /api/v1/management/runtime/tftp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{}) catch return .{ .reachable = true };
     writer.interface.flush() catch return .{ .reachable = true };
     var recv_buffer: [2048]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
@@ -137,14 +137,14 @@ pub fn tftpCounters(io: std.Io, port: u16) TftpCounters {
 /// 调用方负责格式化输出；本函数只负责固定路由的 HTTP GET 和响应体提取。
 /// 仅连接 `127.0.0.1`，不接受远程端点。
 pub fn tftpSessionsJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
-    return managementJson(io, port, "/api/v1/management/tftp/sessions", output);
+    return managementJson(io, port, "/api/v1/management/runtime/tftp/sessions", output);
 }
 
 /// 从本机管理路由获取 M2 DHCP lease 观测数据。
 /// `unknown_only` 为 true 时只返回未认领节点的 lease，false 返回全部。
 /// 仅连接 `127.0.0.1`，不接受远程端点。
 pub fn dhcpLeasesJson(io: std.Io, port: u16, unknown_only: bool, output: []u8) !?[]const u8 {
-    return managementJson(io, port, if (unknown_only) "/api/v1/management/dhcp/unknown" else "/api/v1/management/dhcp/leases", output);
+    return managementJson(io, port, if (unknown_only) "/api/v1/management/runtime/dhcp/leases?scope=unclaimed" else "/api/v1/management/runtime/dhcp/leases", output);
 }
 
 pub fn nodesJson(io: std.Io, port: u16, node_id: ?[]const u8, output: []u8) !?[]const u8 {
@@ -203,6 +203,11 @@ pub fn configSet(io: std.Io, port: u16, body: []const u8) Status {
     return managementMutation(io, port, "PATCH", "/api/v1/management/config", body, revision);
 }
 
+/// 执行带 If-Match revision 的管理变更请求（POST/PATCH/DELETE）。
+///
+/// 所有变更端点成功时返回 200 OK（非 201），因此这里只匹配 `" 200 "` 而非
+/// 使用 `is2xx`。`probeAt` 探测的创建类端点（如 config/validations、
+/// install-generations）返回 201 Created，需要 `is2xx` 才能正确判定。
 fn managementMutation(io: std.Io, port: u16, method: []const u8, path: []const u8, body: []const u8, revision: u64) Status {
     const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return .{ .reachable = false, .healthy = false };
     var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return .{ .reachable = false, .healthy = false };
@@ -276,7 +281,7 @@ fn managementPostJson(io: std.Io, port: u16, path: []const u8, body: []const u8,
 /// 请求 daemon 导入资产并写入 catalog。
 ///
 /// 所有字段在发送前经过 `querySafe` 检查，拒绝包含 `&=?#%\r\n` 的值，
-/// 防止 URL 注入。请求通过 `POST /api/v1/management/assets/import` 发送，
+/// 防止 URL 注入。请求通过 `POST /api/v1/management/assets` 发送，
 /// 参数放在 query string 中，Content-Length 为 0。
 /// daemon 负责计算 SHA-256、校验路径和原子写入 catalog。
 /// 返回 `true` 表示 daemon 接受了导入（HTTP 200），`false` 表示拒绝或连接失败。
@@ -290,7 +295,7 @@ pub fn importAsset(io: std.Io, port: u16, asset: AssetImport) !bool {
     defer stream.close(io);
     var send_buffer: [2048]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
-    try writer.interface.print("POST /api/v1/management/assets/import?name={s}&kind={s}&path={s}", .{ asset.name, asset.kind, asset.path });
+    try writer.interface.print("POST /api/v1/management/assets?name={s}&kind={s}&path={s}", .{ asset.name, asset.kind, asset.path });
     if (asset.distro) |value| try writer.interface.print("&distro={s}", .{value});
     if (asset.version) |value| try writer.interface.print("&version={s}", .{value});
     if (asset.arch) |value| try writer.interface.print("&arch={s}", .{value});
@@ -356,7 +361,8 @@ fn jsonCounter(body: []const u8, key: []const u8) u64 {
 ///
 /// 使用 `Connection: close` 保证能够以 EOF 作为响应结束，不实现通用 HTTP 客户端。
 /// 收发缓冲区在栈上分配，函数返回后自动释放。
-/// 返回的 `Status` 区分 TCP 连接可达性（`reachable`）和 HTTP 200 响应（`healthy`）。
+/// 返回的 `Status` 区分 TCP 连接可达性（`reachable`）和 HTTP 2xx 响应（`healthy`）。
+/// 接受所有 2xx 状态码：GET 探测通常返回 200，POST 创建类端点返回 201。
 fn probeAt(io: std.Io, ip: []const u8, port: u16, path: []const u8, method: []const u8) Status {
     const address = std.Io.net.IpAddress.parseIp4(ip, port) catch
         return .{ .reachable = false, .healthy = false };
@@ -378,12 +384,33 @@ fn probeAt(io: std.Io, ip: []const u8, port: u16, path: []const u8, method: []co
         return .{ .reachable = true, .healthy = false };
     return .{
         .reachable = true,
-        .healthy = std.mem.findPosLinear(u8, response, 0, " 200 ") != null,
+        .healthy = is2xx(response),
     };
+}
+
+/// 检查 HTTP 状态行中的状态码是否为 2xx（成功）。
+/// HTTP 状态行格式："HTTP/1.1 200 OK\r\n"，状态码为首个空格后的 3 位数字。
+fn is2xx(status_line: []const u8) bool {
+    const space = std.mem.indexOfScalar(u8, status_line, ' ') orelse return false;
+    if (space + 4 > status_line.len) return false;
+    return status_line[space + 1] == '2' and
+        std.ascii.isDigit(status_line[space + 2]) and
+        std.ascii.isDigit(status_line[space + 3]);
 }
 
 test "status distinguishes reachability and health" {
     const status: Status = .{ .reachable = true, .healthy = false };
     try std.testing.expect(status.reachable);
     try std.testing.expect(!status.healthy);
+}
+
+test "is2xx accepts 200, 201, 202 and rejects others" {
+    try std.testing.expect(is2xx("HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(is2xx("HTTP/1.1 201 Created\r\n"));
+    try std.testing.expect(is2xx("HTTP/1.1 202 Accepted\r\n"));
+    try std.testing.expect(is2xx("HTTP/1.1 204 No Content\r\n"));
+    try std.testing.expect(!is2xx("HTTP/1.1 301 Moved\r\n"));
+    try std.testing.expect(!is2xx("HTTP/1.1 404 Not Found\r\n"));
+    try std.testing.expect(!is2xx("HTTP/1.1 500 Error\r\n"));
+    try std.testing.expect(!is2xx("bad"));
 }

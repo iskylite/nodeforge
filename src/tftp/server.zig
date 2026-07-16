@@ -315,10 +315,10 @@ fn transferVirtualConfig(
         const node = lookup.findNode(config, identity.node_id) orelse return error.BootTargetUnavailable;
         // M4.2 F4：node.http_accel 是实验性功能（默认 false）。
         // 启用时，initrd 路径渲染为 GRUB HTTP URL
-        // `(http,server:port)/boot/<path>` 而非 TFTP `/<path>`。
+        // `(http,server:port)/artifacts/boot/<path>` 而非 TFTP `/<path>`。
         // GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，因此 TFTP 上的
         // 大文件传输受限于 ~2 MB/s。HTTP 使用 TCP 窗口控制达到接近线速。
-        // HTTP 服务器从 tftp.asset_root 提供 /boot/<path>
+        // HTTP 服务器从 tftp.asset_root 提供 /artifacts/boot/<path>
         //（参见 http/server.zig bootFile 路由）。
         // 需要编译了 `http` 模块的 GRUB。
         //
@@ -340,7 +340,7 @@ fn transferVirtualConfig(
         // kernel/initrd 始终通过 TFTP 传输。
         const kernel_path = std.fmt.bufPrint(&kernel_grub, "/{s}", .{target.kernel_path}) catch return error.BootTargetUnavailable;
         const initrd_path = if (node.http_accel)
-            std.fmt.bufPrint(&initrd_grub, "(http,{s}:{d})/boot/{s}", .{ config.server.server_ip, config.server.http_port, target.initrd_path }) catch return error.BootTargetUnavailable
+            std.fmt.bufPrint(&initrd_grub, "(http,{s}:{d})/artifacts/boot/{s}", .{ config.server.server_ip, config.server.http_port, target.initrd_path }) catch return error.BootTargetUnavailable
         else
             std.fmt.bufPrint(&initrd_grub, "/{s}", .{target.initrd_path}) catch return error.BootTargetUnavailable;
         break :blk grub.render(&config_buf, .{
@@ -420,7 +420,7 @@ fn transferFromMemory(
 /// 流程：
 /// 1. 校验 mode 和路径安全性（相对路径 + catalog 白名单）
 /// 2. 打开文件，计算 `stat().size` 用于 `tsize` option
-/// 3. 协商 `blksize`/`timeout`/`tsize`/`windowsize` options（含 §7.4 主动建议 blksize），
+/// 3. 协商 `blksize`/`timeout`/`tsize`/`windowsize` options（§9.12.5：不放大、不主动建议），
 ///    如有则发送 OACK 并等待 ACK
 /// 4. 按 `blksize` 分块读取文件，发送 DATA，等待 ACK，超时重传（最多 `max_retries` 次）
 /// 5. 最后一个 DATA 的负载小于 `blksize` 时传输完成
@@ -455,8 +455,7 @@ fn transfer(
     // GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，因此服务端回退到
     // windowsize=1（停止等待）。这是大多数 PXE 客户端的预期行为，
     // 解释了 TFTP 大文件传输 ~2 MB/s 的吞吐限制。
-    // §7.4：客户端发送了至少一个 option 但省略 blksize 时，服务端在
-    // OACK 中主动建议 blksize=1468（比 RFC 1350 默认 512 提升约 3 倍）。
+    // §9.12.5：客户端未请求 blksize 时不主动放入 OACK，不放大客户端请求值。
     log.debug("negotiated {s}: blksize={d} windowsize={d} timeout={d}s", .{ request.filename, settings.block_size, settings.windowsize, settings.timeout });
 
     const local = try std.Io.net.IpAddress.parseIp4("0.0.0.0", 0);
@@ -608,32 +607,26 @@ const Settings = struct {
 
 /// 解析客户端请求的 options 并生成协商结果。
 ///
-/// - `blksize`：接受 8 到 `max_block_size` 之间的值（RFC 2348）
-/// - `timeout`：接受 1-255 秒，0 被拒绝（RFC 2349）
+/// - `blksize`：接受 8 到 `max_block_size` 之间的值（RFC 2348），
+///   服务端返回 `min(requested, max_blksize)`，不放大客户端请求值
+/// - `timeout`：接受 1-255 秒，0 被拒绝（RFC 2349），原值回显
 /// - `tsize`：仅当客户端发送 `0` 时返回文件实际大小（RFC 2349）
 /// - `windowsize`：RFC 7440，clamp 到服务端 `max_windowsize`
 /// 未知 option 被安全忽略。
 ///
-/// **blksize 升级策略**：当客户端发送的 `blksize` 小于 `max_blksize`（默认 1468）时，
-/// 服务端在 OACK 中返回 `max_blksize` 作为实际块大小。RFC 2347 §1 规定客户端
-/// "SHOULD"接受服务端在 OACK 中返回的值；实测 GRUB 2.06 的 TFTP 客户端会接受
-/// 服务端回复的更大 blksize，从而将吞吐从 2.5 MB/s（blksize=1024）提升到
-/// 3.7 MB/s（blksize=1468），提升约 48%。若客户端拒绝服务端建议的值，TFTP 协议
-/// 不提供回退机制，传输将失败；但已知 GRUB 和大多数现代 TFTP 客户端均兼容此行为。
-///
-/// §7.4：客户端发送了至少一个已识别 option 但省略 `blksize` 时，服务端在 OACK 中
-/// 主动建议 `max_blksize`，将 RFC 1350 默认 512 字节/块升级。不对零 option 客户端
-/// 发送 OACK（避免向不期望 OACK 的客户端发送）。
-/// `windowsize` 不主动建议（RFC 7440 较新，未请求时下发可能破坏不支持的客户端）。
+/// **blksize 协商契约**（§9.12.5 / M4.3-05）：
+/// 客户端请求 blksize 时只允许 `min(requested, configured_max)`，
+/// 客户端未请求时不主动放入 OACK。不放大客户端请求值，不主动建议未请求的 option。
+/// 早期 M4.2 设计中的"主动建议未请求 blksize"和"放大客户端请求值"已被 M4.3
+/// 明确废弃——RFC 2347/2348 的 option 协商边界不允许服务端突破客户端的请求范围。
+/// `windowsize` 同理不主动建议（RFC 7440 较新，未请求时下发可能破坏不支持的客户端）。
 fn negotiate(options: []const packet.Option, file_size: u64, max_windowsize: u16, max_blksize: u16) !Settings {
     var settings: Settings = .{};
     for (options) |option| {
         if (std.ascii.eqlIgnoreCase(option.name, "blksize")) {
             const value = std.fmt.parseInt(u16, option.value, 10) catch return error.InvalidOption;
             if (value < 8 or value > max_block_size) return error.InvalidOption;
-            // blksize 升级：当客户端请求的 blksize 小于 max_blksize（默认 1468）时，
-            // 服务端在 OACK 中返回 max_blksize。RFC 2347 §1 规定客户端 SHOULD 接受
-            // 服务端返回的值。GRUB 2.06 兼容此行为，吞吐提升 ~48%（1024→1468）。
+            // blksize 协商：只允许 min(requested, max_blksize)，不放大客户端请求值（§9.12.5）。
             // 客户端请求更大块时 clamp 到 max_blksize 避免 UDP 分片。
             settings.block_size = @min(value, max_blksize);
             settings.use_blksize = true;

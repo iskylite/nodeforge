@@ -419,7 +419,7 @@ fn validateTargetNetwork(config: *const model.AppConfig, node: model.NodeConfig,
 
 fn managedRepositoryUrl(config: *const model.AppConfig, value: []const u8) bool {
     var prefix_buffer: [160]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&prefix_buffer, "http://{s}:{d}/repos/", .{ config.server.server_ip, config.server.http_port }) catch return false;
+    const prefix = std.fmt.bufPrint(&prefix_buffer, "http://{s}:{d}/artifacts/repositories/", .{ config.server.server_ip, config.server.http_port }) catch return false;
     if (!std.mem.startsWith(u8, value, prefix) or value.len == prefix.len) return false;
     const path = value[prefix.len..];
     if (std.mem.indexOfAny(u8, path, "?#%\\\r\n") != null) return false;
@@ -577,12 +577,12 @@ test "M4.1 repositories must use the managed local HTTP namespace" {
         .server_ip = "192.168.50.1",
         .http_port = 8080,
     } };
-    try std.testing.expect(managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/ubuntu-22.04"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "https://archive.ubuntu.com/ubuntu"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/local?mirror=external"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/../images/private"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/repos/%2e%2e/images/private"));
+try std.testing.expect(managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/ubuntu-22.04"));
+try std.testing.expect(!managedRepositoryUrl(&config, "https://archive.ubuntu.com/ubuntu"));
+try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/"));
+try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/local?mirror=external"));
+try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/../images/private"));
+try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/%2e%2e/images/private"));
 
     const catalog: model.Catalog = .{
         .repositories = &.{.{

@@ -9,6 +9,7 @@
 - [NodeForge 分阶段详细设计与实现计划](docs/DETAILED_DESIGN.md)
 - [M4.3 模型、运行态与可观测性专项设计](docs/superpowers/specs/2026-07-15-m4_3-model-runtime-observability-design.md)
 - [M4.4 HTTP API URL 契约专项设计](docs/superpowers/specs/2026-07-15-m4_4-http-api-url-contract-design.md)
+- [M4.6 自定义内核引导参数专项设计](docs/superpowers/specs/2026-07-16-kernel-args-custom-boot-params-design.md)
 - [M0–M4.1 实现审计](docs/M0_M4_AUDIT.md)
 - [Rocky Linux 8.10 aarch64 VMware PXE 验证](docs/ROCKY_8_10_VALIDATION.md)
 
@@ -30,29 +31,31 @@ M4.1 同时补齐自动安装生命周期：install profile 默认一次性 gene
 desired/applied drift。TFTP option、DHCP T1/T2、trace 时钟回拨、运行期 asset 和 ISO orphan/空间预检等
 M1-M3 横切修正仍写在各自章节，但作为 M4.1 验收前置回归。
 
-M4.3 是进入 M5 前的现行补全里程碑，当前状态为“设计完成，待实现”。它会修正真实 distro/family、repository
+M4.3 已落地；M4.4 的 canonical URL、三平面隔离与双发行版主链路也已验证可行。它们完成了真实 distro/family、repository
 可空与 SHA 幂等导入，补 install-source `catalog show/migrate`、完整 node 视图、typed daemon mutation、
 只读 `profile list/show`、ConfigRuntime、可恢复且自有身份数据的 BootSession、传输归属、Ubuntu webhook proof
 和构建溯源；logical id 使用统一 path-safe grammar，跨 config/catalog/目录的迁移通过可恢复联合事务发布，活动
 BootSession 使用自有 immutable install plan，inventory 以 generation/session 仲裁迟到写入。M4.3 只提前
 已实现 PXE 部署所需的运维闭环；rootfs/diskless、完整 profile/distro/repository CRUD、全配置 diff/apply 和
-provision/reconcile 仍按 M5–M7 实现。上述基础链路改造完成后，必须重新跑通 Rocky 9.7、Ubuntu 22.04 的完整
-PXE 安装和 Ubuntu 安装中 daemon restart-resume，历史成功记录不能直接作为 M4.3 验收。
+provision/reconcile 仍按 M5–M7 实现。后续里程碑仍须持续回归 Rocky 9.7、Ubuntu 22.04 完整 PXE 安装和
+Ubuntu 安装中的 daemon restart-resume。
 
-M4.4 紧随 M4.3、同样必须在 M5 前完成：节点交付 API 统一到 `/api/v1/nodes/:id/**`，本机管理 API 保持
+M4.4 已将节点交付 API 统一到 `/api/v1/nodes/:id/**`，本机管理 API 保持
 `/api/v1/management/**`，静态制品迁移到 `/artifacts/**`；删除重复 `/boot/config`，用显式 Kickstart/NoCloud
-install-config 路径，rootfs 绑定 node capability，并以集中 RouteSpec 消除前缀匹配顺序冲突。旧 URL 不依赖
+install-config 路径并把 rootfs 绑定 node capability；集中 RouteSpec/405 等工程化遗留统一转入 M4.5。旧 URL 不依赖
 redirect/alias，M4.4 直接替换并删除；切换前必须结束并清理 M4.3 session/checkpoint，残留旧 schema 拒绝启动且不
-自动 rearm。method/status/error、
-ETag/If-Match、idempotency、collection/operation envelope 和 golden DTO 是当前实现验收基线，不是历史兼容冻结。
+自动 rearm。M4.5–M4.7 是进入 M5 前的现行补全方案：M4.5 承接 RouteSpec/405、golden DTO、分页、目标 ETag、
+持久 Operation/Idempotency-Key 和健壮 HTTP client；M4.6 增加安全 canonical 的 `profile.kernel_args`；M4.7
+通过 runtime Paths、schema/manifest、多文件事务和 `nodeforge setup` 收口部署与 config/catalog ownership。
+它们不回改 M4.4 已验证 URL 和安装链路，但 M5–M7 必须消费完成后的统一模型。
 
 NodeForge 配置中所有语义为 `password` 的字段都允许填写明文，并以明文写入 JSON、导入和导出；
 包括系统用户、root、IPMI，以及未来新增的 repository/proxy/basic-auth 等密码字段。发行版安装器要求
 hash 时只在渲染/下发阶段临时转换，不能把 hash 回写成配置事实。token、session capability、SSH 私钥和
 已经生成的 password hash 不是 password 配置字段，仍按各自的短期或受限传递规则处理。
 
-[`config.example.json`](config.example.json) 只展示当前代码能够加载和校验的配置。已实现的 M4.1 schema、默认值
-以详细设计第 9.10 节为准；待实现的 M4.3 现行契约以第 9.12 节为准。相关变更必须同步更新代码、示例配置、
+[`config.example.json`](config.example.json) 只展示当前代码能够加载和校验的配置。已实现基线与待实现的
+M4.5–M4.7 契约分别以详细设计 §9.14–§9.16 为准。相关变更必须同步更新代码、示例配置、
 fixture 和验证记录，不能把设计完成误写成代码已完成。
 
 ## 开发
@@ -84,11 +87,11 @@ make arm64-debug    # 交叉编译 aarch64 Debug 二进制
 `make arm64` 使用 `aarch64-linux-gnu`；可通过 `ARM64_TARGET=<zig-target>` 覆盖目标三元组。
 交叉构建产物仍位于 `zig-out/bin/`，再次执行 `make build` 可恢复本机架构产物。
 
-正常安装默认使用 `/opt/nodeforge/config/config.json` 和
-`/opt/nodeforge/catalog/catalog.json`，无需传 `--config`/`--catalog`；这些参数主要用于
-开发、测试和临时排障覆盖路径。
+当前实现正常安装默认使用 `/opt/nodeforge/config/config.json` 和单文件 catalog。M4.7 后默认根仍为
+`/opt/nodeforge`，但 catalog 变为 `catalog/manifest.json` + entity files，自定义根由 runtime Paths/marker 发现；
+`--config`/`--catalog` 只用于开发、迁移和排障，后者届时指向目录。
 
-安装布局的唯一事实源是 `src/paths.zig` 中的 `install_root`。运行时默认路径全部由它派生：ISO、TFTP
+当前安装布局的事实源是 `src/paths.zig` 的默认根；M4.7 将其升级为启动时初始化一次的 runtime `Paths`。ISO、TFTP
 启动文件、仓库、密钥、rootfs、initrd 与 bundle 分别位于 `assets/iso`、`assets/boot`、`assets/repos`、
 `assets/keys`、`assets/rootfs`、`assets/initrd`、`assets/bundles`；运行态 provisioning 结果位于
 `state/provisioned`。升级旧安装前先停止服务并执行 `packaging/install-layout.sh`；它会迁移旧数据、更新

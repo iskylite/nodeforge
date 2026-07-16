@@ -1,7 +1,7 @@
 //! M4.2 F6: 节点资源的增删改（node add/set/remove）。
 //!
 //! 采用 CLI 直接操作 config.json 的方式（与 config import 一致），
-//! 写回后由 CLI 调用 `POST /management/config/reload` 通知 daemon 重新加载。
+//! 写回后由 CLI 通过 `PATCH /management/config` 通知 daemon 在线应用变更。
 //! 这样避免修改 RouteContext 的 const 语义和线程安全问题。
 //!
 //! 每个 mutation 函数：load config -> 修改 nodes 数组 -> validateConfig -> save。

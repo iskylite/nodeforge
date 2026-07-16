@@ -22,7 +22,7 @@ pub const assets_dir = install_root ++ "/assets";
 pub const iso_dir = assets_dir ++ "/iso";
 /// TFTP 启动小文件根目录。
 pub const boot_dir = assets_dir ++ "/boot";
-/// HTTP `/repos/` 发布的软件仓库根目录。
+/// HTTP `/artifacts/repositories/` 发布的软件仓库根目录。
 pub const repos_dir = assets_dir ++ "/repos";
 /// Bootstrap SSH key pair 和导入公钥目录。
 pub const keys_dir = assets_dir ++ "/keys";

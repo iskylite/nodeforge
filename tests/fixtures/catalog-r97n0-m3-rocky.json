@@ -7,7 +7,7 @@
       "version": "9.7",
       "arch": "aarch64",
       "manager": "dnf",
-      "base_url": "http://192.168.27.128:18080/repos/rocky-9.7-aarch64-iso/Minimal",
+      "base_url": "http://192.168.27.128:18080/artifacts/repositories/rocky-9.7-aarch64-iso/Minimal",
       "gpg_check": false,
       "gpg_key": null
     }

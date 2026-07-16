@@ -62,9 +62,9 @@ const RouteContext = struct {
     /// worker 的 lease 文件锁竞争。
     status_io_mutex: *std.atomic.Mutex,
     node_status_path: []const u8,
-    /// M4.2: config.json 路径，供 config/reload 端点重新加载。
+    /// M4.2: config.json 路径，供 PATCH /management/config 端点加载和保存。
     config_path: []const u8,
-    /// M4.2: config reload 请求标志。HTTP handler 设置后，serve() 返回后
+    /// M4.2: config mutation 请求标志。HTTP handler 设置后，serve() 返回后
     /// app.zig 检查并重启 daemon。
     reload_requested: *std.atomic.Value(bool),
 };
@@ -167,7 +167,7 @@ pub fn serve(
 
     // `workers > 1` 启用 facil.io cluster 模式并 fork listener。
     // Boot session 是刻意设计为进程本地的能力状态，与 DHCP/TFTP 线程共享，
-    // 因此 fork 出的 HTTP worker 会用过期副本认证，拒绝安装器的 `/answer` 请求。
+    // 因此 fork 出的 HTTP worker 会用过期副本认证，拒绝安装器的 `/install-config/kickstart` 请求。
     // 单 worker 保持所有协议状态在此进程内；事件循环对 sendfile 下载和
     // HTTP 回调保持非阻塞。
     zap.start(.{ .threads = 1, .workers = 1 });
@@ -181,20 +181,15 @@ fn getClientIp(request: zap.Request) []const u8 {
     return addr.data[0..addr.len];
 }
 
-/// 在 Zap 解析请求后分发管理路由。
-/// 路由表保持显式匹配，不引入动态路由框架；M3 将在同一 listener 增加
-/// PXE 数据路由（boot config、answer file、repo/rootfs 下载）。
+/// 在 Zap 解析请求后分发路由。
 ///
-/// 当前路由表：
-/// - `GET  /healthz`                              — 进程存活与 HTTP 可达性
-/// - `GET  /api/v1/management/config/status`      — 配置加载有效性
-/// - `POST /api/v1/management/config/validate`    — 重新校验已加载的 config/catalog 快照
-/// - `GET  /api/v1/management/server/status`      — 守护进程生命周期阶段
-/// - `GET  /api/v1/management/tftp/status`        — M1 TFTP 传输计数
-/// - `GET  /api/v1/management/tftp/sessions`      — M1 TFTP 会话列表
-/// - `GET  /api/v1/management/dhcp/leases`        — M2 DHCP lease 列表
-/// - `GET  /api/v1/management/dhcp/unknown`       — M2 未认领节点列表
-/// - `POST /api/v1/management/assets/import`      — M1 资产导入（daemon 写入 catalog）
+/// M4.4 路由平面分离：
+/// - 节点交付 API：`/api/v1/nodes/:id/**`
+/// - 本机管理 API：`/api/v1/management/**`（loopback only）
+/// - 静态制品：`/artifacts/**`
+/// - 进程健康探针：`/healthz`（无版本、无认证）
+///
+/// 旧 URL 不注册，直接返回 404；不实现 redirect、alias 或兼容路由。
 fn route(request: zap.Request) !void {
     const shared_context = active_context orelse return error.MissingRouteContext;
     const model_pair = shared_context.models.acquire();
@@ -221,42 +216,41 @@ fn route(request: zap.Request) !void {
 
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/healthz"))
         return json(request, .ok, "{\"ok\":true,\"service\":\"nodeforge\"}\n", meta);
+
+    // ── 节点交付 API ──────────────────────────────────────────
     if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD")) {
-        if (nodePath(path, "/boot/config/")) |node_id| return bootConfig(request, context, node_id, meta);
-        if (assetRoute(path, "/images/")) |name| return imageAsset(request, context, name, meta);
-        if (assetRoute(path, "/rootfs/")) |name| return rootfsAsset(request, context, name, meta);
-        if (bootFileRoute(path)) |relative| return bootFile(request, context, relative, meta);
-        if (repoRoute(path)) |repo| return repositoryAsset(request, context, repo.name, repo.tail, meta);
-        if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
-            if (std.mem.eql(u8, node_route.suffix, "/config")) return bootConfig(request, context, node_route.node_id, meta);
-            if (std.mem.eql(u8, node_route.suffix, "/answer")) return answerFixture(request, context, node_route.node_id, .kickstart, meta);
-            if (std.mem.eql(u8, node_route.suffix, "/answer/user-data")) return answerFixture(request, context, node_route.node_id, .user_data, meta);
-            if (std.mem.eql(u8, node_route.suffix, "/answer/meta-data")) return answerFixture(request, context, node_route.node_id, .meta_data, meta);
-            if (std.mem.eql(u8, node_route.suffix, "/answer/vendor-data")) return answerFixture(request, context, node_route.node_id, .vendor_data, meta);
+        if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
+            if (std.mem.eql(u8, node_route.suffix, "/boot-config")) return bootConfig(request, context, node_route.node_id, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/install-config/kickstart")) return installConfig(request, context, node_route.node_id, .kickstart, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/install-config/nocloud/user-data")) return installConfig(request, context, node_route.node_id, .user_data, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/install-config/nocloud/meta-data")) return installConfig(request, context, node_route.node_id, .meta_data, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/install-config/nocloud/vendor-data")) return installConfig(request, context, node_route.node_id, .vendor_data, meta);
         };
+        // ── 静态制品路由 ──────────────────────────────────────
+        if (assetRoute(path, "/artifacts/images/")) |name| return imageAsset(request, context, name, meta);
+        if (artifactRepoRoute(path)) |repo| return repositoryAsset(request, context, repo.name, repo.tail, meta);
+        if (artifactBootRoute(path)) |relative| return bootFile(request, context, relative, meta);
     }
     if (std.mem.eql(u8, method, "POST")) {
         if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/events")) return nodeEvent(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/logs")) return nodeLog(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/facts")) return nodeFacts(request, context, node_route.node_id, meta);
-            if (std.mem.eql(u8, node_route.suffix, "/subiquity-report")) return subiquityReport(request, context, node_route.node_id, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/installer-hooks/subiquity")) return subiquityReport(request, context, node_route.node_id, meta);
         };
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/config/status"))
-        return json(request, .ok, "{\"ok\":true,\"result\":{\"config\":\"valid\"}}\n", meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/validate")) {
+
+    // ── 本机管理 API ──────────────────────────────────────────
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/status")) {
+        return managementStatus(request, context, meta);
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/config")) {
+        return managementConfigGet(request, context, meta);
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/validations")) {
         const catalog_snapshot = context.catalog_snapshot;
         config_validate.validate(context.config, catalog_snapshot.value()) catch |err| return validationError(request, err, meta);
-        return json(request, .ok, "{\"ok\":true,\"result\":{}}\n", meta);
-    }
-    // M4.3: 兼容 CLI 的 reload 请求现在执行在线 snapshot publish，不退出 daemon。
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/config/reload")) {
-        applyConfigFromDisk(context) catch |err| {
-            observe_log.err("config reload failed: {t}", .{err});
-            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"config.reload_failed\",\"message\":\"cannot validate or publish config.json\"}}\n", meta);
-        };
-        return json(request, .ok, "{\"ok\":true,\"result\":{\"reload\":\"applied_online\"}}\n", meta);
+        return json(request, .created, "{\"ok\":true,\"result\":{}}\n", meta);
     }
     if (std.mem.eql(u8, method, "PATCH") and std.mem.eql(u8, path, "/api/v1/management/config")) return managementConfigSet(request, context, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/nodes")) return managementNodeAdd(request, context, meta);
@@ -264,15 +258,7 @@ fn route(request: zap.Request) !void {
         if (std.mem.eql(u8, method, "PATCH")) return managementNodeSet(request, context, node_id, meta);
         if (std.mem.eql(u8, method, "DELETE")) return managementNodeRemove(request, context, node_id, meta);
     }
-    if (std.mem.eql(u8, method, "POST")) if (installRetryPath(path)) |node_id| return installRetry(request, context, node_id, meta);
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/server/status")) {
-        const body = switch (context.runtime.service) {
-            .starting => "{\"ok\":true,\"result\":{\"service\":\"starting\"}}\n",
-            .running => "{\"ok\":true,\"result\":{\"service\":\"running\"}}\n",
-            .stopping => "{\"ok\":true,\"result\":{\"service\":\"stopping\"}}\n",
-        };
-        return json(request, .ok, body, meta);
-    }
+    if (std.mem.eql(u8, method, "POST")) if (installGenerationsPath(path)) |node_id| return installGenerations(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime")) {
         return runtimeSummary(request, context, meta);
     }
@@ -280,22 +266,20 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/nodes/")) |node_id| return managementNode(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfiles(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfile(request, context, name, meta);
-    if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/api/v1/management/nodes/")) if (managementNodePath(path)) |node_id| {
-        return managementNodeStatus(request, context, node_id, meta);
-    };
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/tftp/status")) {
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime/tftp")) {
         return tftpStatus(request, context.runtime, meta);
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/tftp/sessions")) {
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime/tftp/sessions")) {
         return tftpSessions(request, context.runtime, meta);
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/dhcp/leases")) {
-        return dhcpLeases(request, context.allocator, context.runtime, false, meta);
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime/dhcp/leases")) {
+        const scope_unclaimed = blk: {
+            if (request.getParamSlice("scope")) |scope| break :blk std.mem.eql(u8, scope, "unclaimed");
+            break :blk false;
+        };
+        return dhcpLeases(request, context.allocator, context.runtime, scope_unclaimed, meta);
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/dhcp/unknown")) {
-        return dhcpLeases(request, context.allocator, context.runtime, true, meta);
-    }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/assets/import")) {
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/assets")) {
         return importAsset(request, context, meta);
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/install-sources")) {
@@ -355,8 +339,10 @@ fn assetRoute(path: []const u8, prefix: []const u8) ?[]const u8 {
 }
 
 const RepoRoute = struct { name: []const u8, tail: []const u8 };
-fn repoRoute(path: []const u8) ?RepoRoute {
-    const prefix = "/repos/";
+
+/// M4.4: `/artifacts/repositories/:name/*` 路由。
+fn artifactRepoRoute(path: []const u8) ?RepoRoute {
+    const prefix = "/artifacts/repositories/";
     if (!std.mem.startsWith(u8, path, prefix)) return null;
     const rest = path[prefix.len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
@@ -367,10 +353,21 @@ fn repoRoute(path: []const u8) ?RepoRoute {
     return .{ .name = name, .tail = tail };
 }
 
+/// M4.4: `/artifacts/boot/*` 路由——通过 HTTP 从 `tftp.asset_root` 提供
+/// kernel/initrd 文件，启用 GRUB HTTP 加速。
+fn artifactBootRoute(path: []const u8) ?[]const u8 {
+    const prefix = "/artifacts/boot/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const relative = path[prefix.len..];
+    if (relative.len == 0) return null;
+    asset_validate.validateRelativePath(relative) catch return null;
+    return relative;
+}
+
 fn imageAsset(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
     const catalog_snapshot = context.catalog_snapshot;
     // Casper 仅在 kernel `url=` 值以 `.iso` 结尾时接受网络 ISO。Catalog 资产
-    // ID 是逻辑名，不一定有该后缀，因此 `/images/<asset>.iso` 是 ISO 资产的
+    // ID 是逻辑名，不一定有该后缀，因此 `/artifacts/images/<asset>.iso` 是 ISO 资产的
     // 只读别名。
     const asset = lookup.findAsset(catalog_snapshot.value(), name) orelse if (std.mem.endsWith(u8, name, ".iso") and name.len > ".iso".len)
         lookup.findAsset(catalog_snapshot.value(), name[0 .. name.len - ".iso".len])
@@ -384,45 +381,7 @@ fn imageAsset(request: zap.Request, context: *const RouteContext, name: []const 
     return staticFile(request, context, context.config.http.asset_root, path, checksum, meta);
 }
 
-fn rootfsAsset(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
-    const checked = auth.authenticateAsset(context.sessions, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
-    const asset_info = blk: {
-        const catalog_snapshot = context.catalog_snapshot;
-        const profile = lookup.findProfile(context.config, checked.profile) orelse return notFound(request, meta);
-        if (profile.mode != .diskless) return nodeAuthError(request, error.ProofMismatch, meta);
-        const bundle = lookup.findBootBundle(catalog_snapshot.value(), profile.boot_bundle orelse return notFound(request, meta)) orelse return notFound(request, meta);
-        if (!std.mem.eql(u8, bundle.rootfs, name)) return nodeAuthError(request, error.ProofMismatch, meta);
-        const asset = lookup.findAsset(catalog_snapshot.value(), name) orelse return notFound(request, meta);
-        if (asset.kind != .rootfs) return notFound(request, meta);
-        // Catalog 分配在 daemon 生命周期内是只追加的，因此这些 slice 在
-        // unlock 后仍然有效，可安全用于传输。
-        break :blk .{ .path = asset.path, .checksum = asset.sha256 };
-    };
-    return staticFile(request, context, context.config.http.asset_root, asset_info.path, asset_info.checksum, meta);
-}
 
-/// M4.2 F4：`/boot/<path>` 路由——通过 HTTP 从 `tftp.asset_root` 提供
-/// kernel/initrd 文件，启用 GRUB HTTP 加速。
-///
-/// GRUB 的 TFTP 客户端不支持 RFC 7440 windowsize，大文件（100+ MB initrd）
-/// 在 TFTP 模式下受 RTT 限制仅约 2 MB/s。HTTP 使用 TCP 窗口控制达到接近线速。
-///
-/// 路由优先级：`/boot/config/<node_id>` 在路由表中先于此条匹配，
-/// 因此不会误将 boot config 端点当作静态文件处理。
-///
-/// 安全：路径经 `validateRelativePath` 拒绝 `..`/绝对路径/反斜杠，
-/// 随后 `findAssetByPath` 做 catalog 白名单校验——只有 catalog 中注册的
-/// asset path 才能被提供。`staticFile` → `openRegularFile` 会再次
-/// `validateRelativePath`，形成双重校验。无需认证——GRUB 的 HTTP
-/// 请求无法携带 bearer token，与 TFTP 一致。
-fn bootFileRoute(path: []const u8) ?[]const u8 {
-    const prefix = "/boot/";
-    if (!std.mem.startsWith(u8, path, prefix)) return null;
-    const relative = path[prefix.len..];
-    if (relative.len == 0) return null;
-    asset_validate.validateRelativePath(relative) catch return null;
-    return relative;
-}
 
 /// M4.2 F4：从 `tftp.asset_root` 提供启动文件（kernel/initrd）。
 /// Catalog 白名单 + ETag checksum 支持条件请求和断点续传。
@@ -551,7 +510,7 @@ fn sendManagedFile(request: zap.Request, context: *const RouteContext, file: *st
     try request.setHeader("accept-ranges", "bytes");
     request.setContentTypeFromFilename(relative) catch try request.setHeader("content-type", "application/octet-stream");
     // M3.6 下载日志：info 记录每个 HTTP 下载请求的对象、范围、字节数和客户端 IP。
-    if (std.mem.startsWith(u8, request_path, "/repos/"))
+    if (std.mem.startsWith(u8, request_path, "/artifacts/repositories/"))
         log.debug("HTTP repository request GET {s} (range={d}+{d}/{d}, client={s})", .{ relative, range.offset, range.length, total_size, meta.client_ip })
     else
         log.info("HTTP download request GET {s} (range={d}+{d}/{d}, client={s})", .{ relative, range.offset, range.length, total_size, meta.client_ip });
@@ -587,7 +546,7 @@ fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const 
     const response_state = if (std.mem.eql(u8, method, "GET") and status >= 200 and status < 300) "queued" else "completed";
     const peer_ip = auth.parsePeerIpv4(meta.client_ip) catch 0;
     const identity = if (peer_ip != 0) context.sessions.resolveTftpBoot(peer_ip, boot_session.monotonicNow()) else null;
-    if (std.mem.startsWith(u8, path, "/repos/"))
+    if (std.mem.startsWith(u8, path, "/artifacts/repositories/"))
         log.debug("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, node={s}, asset={s}, object_bytes={d}, response_state={s})", .{ method, path, status, bytes_sent, duration_us, meta.client_ip, if (identity) |value| value.node_id else "-", relative, object_size, response_state })
     else
         log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, node={s}, asset={s}, object_bytes={d}, response_state={s})", .{ method, path, status, bytes_sent, duration_us, meta.client_ip, if (identity) |value| value.node_id else "-", relative, object_size, response_state });
@@ -597,14 +556,12 @@ fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const 
     var object_bytes_text: [20]u8 = undefined;
     var duration_text: [20]u8 = undefined;
     // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
-    // 使生产环境可按 traffic_class 查询和过滤不同类型的 HTTP 流量，
-    // 例如只看 repository 下载或 boot 文件传输。
-    //   repository -> /repos/**
-    //   image      -> /images/**
-    //   boot       -> /boot/**
-    //   rootfs     -> /rootfs/**
-    //   api        -> 管理端点、安装 answer、事件上报等控制面请求
-    const traffic_class: []const u8 = if (std.mem.startsWith(u8, path, "/repos/")) "repository" else if (std.mem.startsWith(u8, path, "/images/")) "image" else if (std.mem.startsWith(u8, path, "/boot/")) "boot" else if (std.mem.startsWith(u8, path, "/rootfs/")) "rootfs" else "api";
+    // M4.4: 静态制品路径从旧前缀切换到 /artifacts/** canonical URL。
+    //   repository -> /artifacts/repositories/**
+    //   image      -> /artifacts/images/**
+    //   boot       -> /artifacts/boot/**
+    //   api        -> 管理端点、安装 install-config、事件上报等控制面请求
+    const traffic_class: []const u8 = if (std.mem.startsWith(u8, path, "/artifacts/repositories/")) "repository" else if (std.mem.startsWith(u8, path, "/artifacts/images/")) "image" else if (std.mem.startsWith(u8, path, "/artifacts/boot/")) "boot" else "api";
     var fields: [11]events.Field = undefined;
     var count: usize = 0;
     inline for ([_]events.Field{
@@ -699,9 +656,10 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
 
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
+    // M4.4 canonical URL: boot-config replaces config.
     const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
     defer context.allocator.free(base);
-    const config_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/config", .{ base, node_id });
+    const config_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/boot-config", .{ base, node_id });
     defer context.allocator.free(config_url);
     const event_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/events", .{ base, node_id });
     defer context.allocator.free(event_url);
@@ -709,18 +667,35 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
         std.json.fmt(node_id, .{}),    std.json.fmt(session.boot_session_id[0..], .{}), std.json.fmt(session.profile, .{}), std.json.fmt(@tagName(session.mode), .{}),
         std.json.fmt(config_url, .{}), std.json.fmt(event_url, .{}),
     });
+    // M4.4 安全响应头：boot-config 和 install-config 响应可能包含 capability、
+    // password hash 或 SSH key，必须统一设置 no-store/nosniff/referrer policy。
+    try request.setHeader("cache-control", "no-store, private");
+    try request.setHeader("pragma", "no-cache");
+    try request.setHeader("x-content-type-options", "nosniff");
+    try request.setHeader("referrer-policy", "no-referrer");
     // 上方临时 URL 字符串在其生命周期结束前被有意复制到 writer 中；
     // 将 writer 作为一次响应分配释放。
     switch (session.mode) {
         .install => {
-            const answer_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/answer", .{ base, node_id });
-            defer context.allocator.free(answer_url);
-            try output.writer.print(",\"answer_url\":{f}", .{std.json.fmt(answer_url, .{})});
+            // M4.4: boot-config 返回按 profile adapter 明确生成的 install-config URL，
+            // 不再返回含糊的单一 answer_url。
             const plan_bytes = (try context.sessions.copyInstallPlan(context.allocator, session.boot_session_id[0..])) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_missing\",\"message\":\"boot session has no immutable install plan\"}}\n", meta);
             defer context.allocator.free(plan_bytes);
             const parsed_plan = std.json.parseFromSlice(InstallPlanEnvelope, context.allocator, plan_bytes, .{ .allocate = .alloc_always }) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"immutable install plan cannot be decoded\"}}\n", meta);
             defer parsed_plan.deinit();
             const source = &parsed_plan.value.install_source;
+            const distro = &parsed_plan.value.distro;
+            if (distro.family == .ubuntu) {
+                // Ubuntu 使用 NoCloud seed_url 指向 install-config/nocloud/。
+                const seed_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/install-config/nocloud/", .{ base, node_id });
+                defer context.allocator.free(seed_url);
+                try output.writer.print(",\"install_config\":{{\"kind\":\"no-cloud\",\"seed_url\":{f}}}", .{std.json.fmt(seed_url, .{})});
+            } else {
+                // RHEL 系使用 Kickstart URL。
+                const ks_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/install-config/kickstart", .{ base, node_id });
+                defer context.allocator.free(ks_url);
+                try output.writer.print(",\"install_config\":{{\"kind\":\"kickstart\",\"url\":{f}}}", .{std.json.fmt(ks_url, .{})});
+            }
             try output.writer.print(",\"installer\":{{\"source\":{f},\"kernel\":{f},\"initrd\":{f}}},\"repository_urls\":[", .{
                 std.json.fmt(source.name, .{}), std.json.fmt(source.installer_kernel, .{}), std.json.fmt(source.installer_initrd, .{}),
             });
@@ -757,7 +732,7 @@ const InstallPlanEnvelope = struct {
     provisioning_bundles: []const model.ProvisioningBundle,
     delivery: struct { server_ip: []const u8, http_port: u16 },
 };
-fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []const u8, format: AnswerFormat, meta: RequestMeta) !void {
+fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []const u8, format: AnswerFormat, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
     if (checked.proof == .bootstrap and checked.session.plan_digest == null) {
@@ -789,7 +764,7 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     // 始终为 Ubuntu 传入 report_url；webhook reporter 无认证，端点通过源 IP 校验。
     const distro = &plan.distro;
     const report_url: []const u8 = if (distro.family == .ubuntu) blk: {
-        const url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/subiquity-report", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
+        const url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/installer-hooks/subiquity", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
         break :blk url;
     } else "";
     defer if (report_url.len > 0) context.allocator.free(report_url);
@@ -821,14 +796,14 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     // APT 源 URL 解析：Ubuntu ISO 导入时始终创建 repository 条目
     //（即使 ISO 不含完整 APT metadata），因此 findRepository 应总能找到。
     // 保留 fallback 逻辑以兼容手动配置场景：当 repository 不存在时，
-    // 构造 /repos/<source_name>/ URL，使 apt 请求快速 404 而非 DNS 超时。
+    // 构造 /artifacts/repositories/<source_name>/ URL，使 apt 请求快速 404 而非 DNS 超时。
     const apt_primary_url = if (format == .user_data) blk: {
         const source = &plan.install_source;
         if (plan.distro.family == .ubuntu) {
             // Ubuntu: 优先使用 repository.base_url；若不存在则构造 fallback URL
             const repository = findRepositoryIn(plan.catalog_repositories, source.name);
             if (repository) |repo| if (repo.manager == .apt) break :blk repo.base_url;
-            break :blk try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/repos/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
+            break :blk try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
         }
         break :blk null;
     } else null;
@@ -838,7 +813,7 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
         .vendor_data => try context.allocator.dupe(u8, ""),
         .kickstart => blk: {
             const source = &plan.install_source;
-            const install_root = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/repos/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
+            const install_root = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
             defer context.allocator.free(install_root);
             break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, facts_url, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope);
         },
@@ -850,7 +825,7 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
     // `sendBody` 可能立即将响应交回 facil.io；在交接前记录借用的路由段，
     // 而非之后保留 request 拥有的 slice 用于诊断。
     log.info("GET installer answer -> 200 (node={s}, client={s})", .{ node_id, meta.client_ip });
-    // M4：记录 HTTP 请求事件用于可观测性。`answerFixture` 不使用 `json()`
+    // M4：记录 HTTP 请求事件用于可观测性。`installConfig` 不使用 `json()`
     // 助手（后者处理事件日志），因此必须显式追加事件。否则成功的
     // kickstart/autoinstall 获取在 events.jsonl 中不可见。
     {
@@ -860,8 +835,9 @@ fn answerFixture(request: zap.Request, context: *const RouteContext, node_id: []
         var duration_text: [20]u8 = undefined;
         const req_path = request.path orelse "<missing>";
         const req_method = request.method orelse "OTHER";
-        // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
-        const traffic_class: []const u8 = if (std.mem.startsWith(u8, req_path, "/repos/")) "repository" else if (std.mem.startsWith(u8, req_path, "/images/")) "image" else if (std.mem.startsWith(u8, req_path, "/boot/")) "boot" else if (std.mem.startsWith(u8, req_path, "/rootfs/")) "rootfs" else "api";
+    // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
+    // M4.4: 静态制品路径从旧前缀切换到 /artifacts/** canonical URL。
+    const traffic_class: []const u8 = if (std.mem.startsWith(u8, req_path, "/artifacts/repositories/")) "repository" else if (std.mem.startsWith(u8, req_path, "/artifacts/images/")) "image" else if (std.mem.startsWith(u8, req_path, "/artifacts/boot/")) "boot" else "api";
         const fields = [_]events.Field{
             .{ .key = "method", .value = req_method },
             .{ .key = "path", .value = req_path },
@@ -1591,22 +1567,20 @@ fn assetInputError(request: zap.Request, message: []const u8, meta: RequestMeta)
 }
 
 fn managementNodePath(path: []const u8) ?[]const u8 {
+    // M4.4: 旧 /management/nodes/:id/status 路由已删除，使用 /management/nodes/:id 聚合端点。
+    _ = path;
+    return null;
+}
+
+fn installGenerationsPath(path: []const u8) ?[]const u8 {
     const prefix = "/api/v1/management/nodes/";
-    const suffix = "/status";
+    const suffix = "/install-generations";
     if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
     const node_id = path[prefix.len .. path.len - suffix.len];
     return if (auth.nodeIdSafe(node_id)) node_id else null;
 }
 
-fn installRetryPath(path: []const u8) ?[]const u8 {
-    const prefix = "/api/v1/management/nodes/";
-    const suffix = "/install/retry";
-    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
-    const node_id = path[prefix.len .. path.len - suffix.len];
-    return if (auth.nodeIdSafe(node_id)) node_id else null;
-}
-
-fn installRetry(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+fn installGenerations(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const node = lookup.findNode(context.config, node_id) orelse return notFound(request, meta);
     const profile = lookup.findProfile(context.config, node.profile) orelse return notFound(request, meta);
     if (profile.mode != .install) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.not_profile\",\"message\":\"node does not have an install profile\"}}\n", meta);
@@ -1631,8 +1605,42 @@ fn installRetry(request: zap.Request, context: *const RouteContext, node_id: []c
         };
         context.event_writer.appendWithFields(context.io, context.allocator, paths.events_path, "install.retry.requested", "install generation rearmed", &fields) catch |err| observe_log.err("retry event append failed: {t}", .{err});
     }
+    // M4.4: install-generations 返回 201 + Location header。
+    var location: [256]u8 = undefined;
+    const location_value = try std.fmt.bufPrint(&location, "/api/v1/management/nodes/{s}/install-generations", .{node_id});
+    try request.setHeader("location", location_value);
     var body: [160]u8 = undefined;
-    return json(request, .ok, try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"generation\":{d},\"message\":\"rearmed; waiting for next PXE\"}}}}\n", .{ std.json.fmt(node_id, .{}), rearm.generation }), meta);
+    return json(request, .created, try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"generation\":{d},\"message\":\"rearmed; waiting for next PXE\"}}}}\n", .{ std.json.fmt(node_id, .{}), rearm.generation }), meta);
+}
+
+/// M4.4: `/management/status` — server/config/runtime 摘要，替代旧 /server/status 和 /config/status。
+fn managementStatus(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const service_text = switch (context.runtime.service) {
+        .starting => "starting",
+        .running => "running",
+        .stopping => "stopping",
+    };
+    const catalog_snapshot = context.catalog_snapshot;
+    const config_valid = blk: {
+        config_validate.validate(context.config, catalog_snapshot.value()) catch break :blk false;
+        break :blk true;
+    };
+    var body: [256]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"service\":\"{s}\",\"config_valid\":{s},\"config_revision\":{d},\"catalog_revision\":{d}}}}}\n", .{ service_text, if (config_valid) "true" else "false", context.config_revision, context.catalog_snapshot.revision });
+    return json(request, .ok, rendered, meta);
+}
+
+/// M4.4: `/management/config` GET — revision、valid、restart-required 摘要，不返回 secrets。
+/// 替代旧 /config/status。
+fn managementConfigGet(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const catalog_snapshot = context.catalog_snapshot;
+    const config_valid = blk: {
+        config_validate.validate(context.config, catalog_snapshot.value()) catch break :blk false;
+        break :blk true;
+    };
+    var body: [256]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"config\":\"{s}\",\"revision\":{d},\"catalog_revision\":{d}}}}}\n", .{ if (config_valid) "valid" else "invalid", context.config_revision, context.catalog_snapshot.revision });
+    return json(request, .ok, rendered, meta);
 }
 
 /// 暴露有界的 M3 状态投影，不读取事件流。
@@ -2067,7 +2075,7 @@ fn json(request: zap.Request, status: zap.http.StatusCode, body: []const u8, met
             var bytes_text: [20]u8 = undefined;
             var duration_text: [20]u8 = undefined;
             // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
-            const traffic_class: []const u8 = if (std.mem.startsWith(u8, path, "/repos/")) "repository" else if (std.mem.startsWith(u8, path, "/images/")) "image" else if (std.mem.startsWith(u8, path, "/boot/")) "boot" else if (std.mem.startsWith(u8, path, "/rootfs/")) "rootfs" else "api";
+            const traffic_class: []const u8 = if (std.mem.startsWith(u8, path, "/artifacts/repositories/")) "repository" else if (std.mem.startsWith(u8, path, "/artifacts/images/")) "image" else if (std.mem.startsWith(u8, path, "/artifacts/boot/")) "boot" else "api";
             const fields = [_]events.Field{
                 .{ .key = "method", .value = method },
                 .{ .key = "path", .value = path },

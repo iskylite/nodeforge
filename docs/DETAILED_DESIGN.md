@@ -40,9 +40,12 @@
 | M4.2 | 部署链路健壮性、密钥可维护性与传输性能加固 | M4.1 | 部署错误传回 nodeforged、节点级不部署开关、ISO 导入主流 OS+覆盖语义、TFTP windowsize/并发/配置项、免密公钥配置化+CLI 导入、CLI 命令体系校准 |
 | M4.3 | 安装源与节点模型收口、运行态热更新和可观测性完善 | M4.2 | family/distro 正确建模、ISO 幂等导入、catalog 查看/迁移、完整 node/profile 只读视图、daemon-owned ConfigRuntime、owned session resume、传输归属、webhook 认证和构建溯源 |
 | M4.4 | HTTP API URL 契约收口与路由平面分离 | M4.3 | 节点交付/本机管理/静态制品三平面，消除重复 URL，node-bound rootfs，canonical 路由和有界迁移 |
-| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2、M4.3、M4.4 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
-| M6 | 支持矩阵增强 | M4.1、M4.2、M4.3、M4.4、M5 | x86_64 生产验证、RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX |
-| M7 | 补充包和后处理增强 | M4.1、M4.2、M4.3、M4.4、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
+| M4.5 | HTTP 契约补全与客户端健壮性 | M4.4 | 承接 M4.4 遗留的 RouteSpec/405/golden/分页/ETag/幂等操作，统一状态/信封/请求和有界客户端解析 |
+| M4.6 | 自定义内核引导参数 | M4.5 | `profile.kernel_args` 字段，PXE cmdline 追加、Kickstart `--append`、Autoinstall `late-commands` GRUB drop-in、安全校验和缓冲区扩容 |
+| M4.7 | 路径自举、模型存储迁移与部署初始化 | M4.6 | runtime Paths；schema+manifest+多文件事务；config/catalog ownership；bundle setup/reconfigure/reset/rollback |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
+| M6 | 支持矩阵增强 | M4.1、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
+| M7 | 补充包和后处理增强 | M4.1、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
 
 ### 1.3 完成标准
 
@@ -58,7 +61,7 @@
 
 ### 1.4 阅读顺序与阶段依赖
 
-- M0-M7（含 M1.5、M2.5、M2.5.1、M4.1、M4.2、M4.3 和 M4.4）是可验收的产品阶段，按章节依赖阅读和交付。
+- M0-M7（含 M1.5、M2.5、M2.5.1、M4.1、M4.2、M4.3、M4.4、M4.5、M4.6 和 M4.7）是可验收的产品阶段，按章节依赖阅读和交付。
 - M1 先实现正式 TFTP 只读服务，并用标准 TFTP client 验证 RRQ/OACK、重传和路径安全。
 - M1.5 在 M2 前收敛 CLI 展示层；它不改变 daemon API、配置或协议语义，但 M2+ 新命令必须复用其 formatter。
 - M2 再实现 DHCP 地址、架构识别和 bootfile 决策，最后与 M1 联调完整 PXE 入口。
@@ -68,6 +71,14 @@
 - M4 先跑通安装主链路，M4.1 再收敛目标系统 locale/timezone、离线、SSH/root、包和静态网络配置；
   M5 复用 M4.1 的公共系统配置类型，但无盘包必须在 rootfs build 阶段落盘。M4/M5 交付基础
   provisioning runner；M7 只增强 archive、script、firstboot 和诊断，不是安装或无盘链路的前置阻塞。
+- M4.4 在 M4.3 后收口 HTTP URL 路由，M4.5 随后统一 HTTP 接口语义（状态码、响应信封、安全头、请求体和客户端判定）。
+  M4.5 不回改已验证 canonical URL/认证链路，但承接 RouteSpec、405、golden DTO、分页、ETag 和幂等操作等
+  M4.4 遗留工程化项；M5 消费 M4.5 统一后的接口。
+  M4.6 在 M4.5 后增加自定义内核引导参数（`profile.kernel_args`），不改变 HTTP/DHCP/TFTP 协议语义，
+  只在 PXE cmdline 末尾追加、Kickstart `bootloader --append` 和 Autoinstall `late-commands` GRUB drop-in
+  三条链路注入。M4.7 随后完成 Paths、schema/manifest/catalog transaction 和 setup，M5 只可在 M4.7a 后隔离
+  原型，正式合入与验收依赖 M4.7a-c 全部完成。M5 diskless initrd 从 `/proc/cmdline` 透传 kernel_args，M6
+  PXELINUX 在 APPEND 末尾追加。
 
 ## 2. 代码结构总览
 
@@ -79,8 +90,8 @@
 
 | 项目 | MVP 约束 | 允许扩展时机 |
 | --- | --- | --- |
-| 数据模型 | `AppConfig` 表达启动/策略配置，`Catalog` 表达导入/构建/发布得到的管理目录，`RuntimeState` 表达运行态 | 配置迁移或 Web API 需要稳定 schema 时再拆 schema 包 |
-| 存储 | M0 使用 `/opt/nodeforge/config/config.json` + `/opt/nodeforge/catalog/catalog.json`；站点配置修改后重启生效。M1+ 才支持 DHCP discovery 策略和 catalog 变更的运行期在线切换 | 并发写入、查询性能或多实例需求出现后再考虑数据库 |
+| 数据模型 | M4.7 后 `AppConfig` 只表达启动/站点策略，`Catalog` 拥有 distro/profile/node/bundle/source/asset，`RuntimeState` 表达运行态；统一 `ModelRevision`/desired digest | 配置迁移或 Web API 需要稳定 schema 时再拆 schema 包 |
+| 存储 | M4.7 前为 config+单 catalog；M4.7 后为 config + catalog manifest/entity files，通过 journal 多文件事务发布 | 单机 1000 节点与 crash recovery 验收后，再按证据考虑数据库 |
 | 管理接口 | 复用唯一 HTTP listener；M3.6 起管理路由仅接受 `127.0.0.1` direct peer；CLI 固定访问该地址，只管理同机服务；不单设 `management_port` | M0 不提供远程管理客户端 |
 | 发行版 adapter | `ubuntu.zig`、`kickstart.zig` 两个文件 | 版本差异明显增多后再拆能力表文件 |
 | 带外管理 | 只保存 IPMI 信息，不实现控制动作 | 明确要做电源控制/启动设备控制时再加执行模块 |
@@ -97,8 +108,8 @@
 ### 2.2 核心调用路径
 
 MVP 的目标业务路径如下。M0 历史上只交付 CLI 本地文件操作和 HTTP 管理路由；当前 M1-M3 的
-DHCP/TFTP/HTTP 数据路径已有实现与验证，M4/M4.1 已有实机记录，M4.2 作为当前实现基线；M4.3 为已完成设计、
-待实现并重新系统验收的补全阶段；M4.4 随后收口 HTTP URL，M5+ 按后续章节交付：
+DHCP/TFTP/HTTP 数据路径已有实现与验证，M0–M4.3 已落地，M4.4 URL 契约收口与路由平面已验证可行；M4.5
+承接契约工程化遗留，M4.6 增加自定义内核引导参数，M4.7 收口路径/模型存储/部署，M5+ 按后续章节交付：
 
 ```text
 M1+ CLI / 127.0.0.1 management HTTP
@@ -191,7 +202,7 @@ M0 目标是建立项目基础架构，实现可启动的守护进程和管理�
 - `catalog/store.zig` 模块级注释说明默认路径、文件大小限制和函数职责
 - `config/validate.zig` 详细说明校验顺序和限制
 - `http/server.zig` 函数文档包括 `serve`、`route`、`validationError`、`json` 等
-- `http/client.zig` 的 `Status` 结构和 `probeAt` 函数
+- `http/client.zig` 的 `Status` 结构、`probeAt` 函数和 `is2xx` 状态码判定辅助函数
 - `state/runtime.zig` 和 `state/events.zig` 的运行态模型
 - `observe/error.zig` 的错误信封结构和响应格式
 - `observe/log.zig` 的日志等级和输出约定
@@ -277,9 +288,8 @@ cli
 
 ## 4. 核心数据模型
 
-本章描述 M1-M7（含 M4.1）的目标模型，不等同于任一历史阶段的实际 schema。第 5 节记录 M0
-验收边界；当前代码已实现 M4.1 的 TargetSystemConfig、目标网络和安全默认值，但系统级验收尚未全部
-完成。判断能力是否可用必须同时查看代码、fixture 和验证记录，不能仅凭本章出现字段下结论。
+本章描述 M1-M7 的目标模型，不等同于任一历史阶段的实际 schema。M4.7 是目标 ownership/storage 的切换点；
+判断能力是否可用必须同时查看代码、fixture 和验证记录，不能仅凭本章出现字段下结论。
 
 ### 4.1 配置模型
 
@@ -287,11 +297,12 @@ MVP 不把所有对象都塞进单一手写配置文件，而是分为三类事�
 
 | 类型 | 文件 | 主要内容 | 修改入口 |
 | --- | --- | --- | --- |
-| 启动/策略配置 | `/opt/nodeforge/config/config.json` | M0 为 server/http/logging、发行版矩阵、profile/node/policy 的基础配置；M1+ 扩展 dhcp/tftp、hooks、网络 override、provisioning bundle | M0 手工编辑 + `config validate` 或离线 `config import`，重启生效；M1+ 增加 `config apply` 和 DHCP discovery 在线切换 |
-| 管理 catalog | `/opt/nodeforge/catalog/catalog.json` | asset、repository、install source、rootfs、initrd、boot bundle | M0 只读校验/导出；M1+ CLI/API 请求 `nodeforged` import/build/package/publish 并写入 |
-| 运行态 | M2/M3.0 使用或兼容读取 `/opt/nodeforge/state/runtime.json`；M3.1 起为 `/opt/nodeforge/state/leases.json`、`/opt/nodeforge/state/node-status.json` 与 `/opt/nodeforge/logs/events.jsonl`；M4.1 增加 `/opt/nodeforge/state/deployment-control.json` | lease、观察 status、install generation/applied revision、事件；活动 session/TFTP 传输仅在内存 | 服务运行时更新 |
+| 启动/策略配置 | `<install-root>/config/config.json` | M4.7 后为 server/http/logging/dhcp/tftp/events/policy，只读运行快照 | setup/config apply 离线 candidate + restart/rollback |
+| 管理 catalog | `<install-root>/catalog/manifest.json` + entity files | distro/profile/node/bundle/source/asset/repository/rootfs/initrd | CLI/API 请求 daemon，经可恢复多文件事务写入 |
+| 运行态 | `<install-root>/state/*.json` 与 `<install-root>/logs/events.jsonl` | lease/status/generation/inventory/session/operation/provisioned/event | state manager 更新，路径由 runtime Paths 派生 |
 
-MVP 不读取 YAML 配置文件；如果后续需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。catalog 是 `nodeforged` 的内部持久化文件，CLI 不直接写。配置和 catalog 明显变大后再评估拆分或引入数据库。
+MVP 不读取 YAML 事实源。catalog 是 `nodeforged` 的内部持久化目录，CLI 不直接写；M4.7 已选择按实体拆分与
+manifest/journal，是否引入数据库必须在 1000-node 与 crash-recovery 数据后另行评估。
 
 ```zig
 const AppConfig = struct {
@@ -429,7 +440,7 @@ const ProfileConfig = struct {
     arch: Arch,
     boot: BootConfig,
     boot_source: BootSourceRef,
-    cmdline_template: []const u8,
+    kernel_args: ?[]const u8 = null, // M4.6: 自定义内核引导参数，追加到 PXE cmdline 和目标系统 GRUB
     safety: ProfileSafetyConfig,
     system: TargetSystemConfig,
     install: ?InstallConfig,
@@ -2714,8 +2725,8 @@ object revision/ETag，新 publication 只影响后续请求。已发布对象�
   会导致 `events list` 空列表断言失败，残留日志会导致 `grep` 匹配到非本次运行的行。
 - 删除 `/opt/nodeforge/state/` 下的 `leases.json`、`node-status.json`、`runtime.json`（legacy）
   和 `*.tmp`——残留状态会影响 legacy 迁移和崩溃恢复测试的起始条件。
-- 如需干净 catalog 回归，额外删除 `/opt/nodeforge/catalog/catalog.json` 和
-  `/opt/nodeforge/work/iso-import-*` 工作目录。
+- M4.7 前的 legacy 回归可额外删除 `/opt/nodeforge/catalog/catalog.json`；M4.7 后使用临时 install root 或
+  `nodeforge setup --reset-state/--reset-all --yes`，不得手工删除 manifest/entity/journal 造成不可裁决 mixed layout。
 - `tests/http.sh` 和 `tests/cli.sh` 已各自使用独立临时目录（`$tmp`）和 `--events-path` 隔离，
   但手动验证仍需遵守上述清理步骤。`build.zig` 已强制 `http_tests` 和 `cli_tests` 串行执行
   以避免端口冲突。
@@ -3733,6 +3744,7 @@ normalized `TargetSystemConfig`，不得复制字段、另设默认值或把共�
 | 目标系统额外包 | `system.packages` | installer 原生 package 阶段 | rootfs build 阶段；启动时禁止 apt/dnf |
 | 目标持久网络 | `node.overrides.network` | Netplan/Kickstart/NetworkManager | overlay 中生成 Netplan/NetworkManager |
 | firewall/SELinux | `system.security` | answer + target finalizer | rootfs build + overlay；RHEL cmdline 同步 `selinux=0` |
+| 内核引导参数 | `profile.kernel_args` | PXE cmdline 追加 + Kickstart `bootloader --append` / Autoinstall `late-commands` GRUB drop-in | PXE cmdline 追加（initrd 透传） |
 
 自动安装专属配置只有 `install.apt.fallback`、install source、storage/partitions、bootloader、answer schema/
 renderer、installer hook/event 和安装完成后的磁盘重启流程。无盘专属配置只有 boot bundle/rootfs/initrd、
@@ -4507,6 +4519,13 @@ option 当前已经实现，客户端请求时原值回显，未请求时使用�
 `timeout_seconds` 公开配置。`max_blksize` 校验补齐 8..65464 上限。客户端请求 blksize 时只允许
 `min(requested, configured_max)`，客户端未请求时不主动放入 OACK。
 
+CLI 健康探测（`probeAt`）接受所有 2xx 状态码而非仅 200。`POST /api/v1/management/config/validations`
+返回 201 Created、`POST /api/v1/management/nodes/:id/install-generations` 返回 201 Created，早期的
+仅匹配 `" 200 "` 的硬编码导致 `nodeforge status`/`check` 误报 Config API FAIL。`is2xx` 辅助函数从
+状态行提取首个空格后的 3 位数字，检查首字符为 `'2'` 且后两位为数字，覆盖 200–209。`managementMutation`
+和 `importAsset` 等只调用返回 200 的端点，保留 `" 200 "` 硬编码；`managementPostJson` 已单独处理
+200/201/202 三种成功码。
+
 TFTP 事件当前已经存在，kernel/initrd 下载属于 `tftp.rrq/transfer.complete/transfer.error`。M4.3 将 node_id
 加入成功关联的 TFTP/HTTP 传输，无法唯一关联时写稳定 link state，使 `events list --node` 不再漏掉传输事件。
 
@@ -4693,6 +4712,11 @@ wildcard 吞路由、node auth、management loopback 和 sensitive cache policy�
 
 #### 9.13.5 验收门槛
 
+> **M4.4 验证结论与后续承接**：M4.4 的 canonical URL 切换、三平面隔离和现有端到端链路已经验证可行，
+> 本轮不回改 M4.4 实现。下列第 2、7、8、9 项中尚未完全工程化的 RouteSpec registry、405/Allow、golden DTO、
+> cursor/limit、ETag/If-Match、Idempotency-Key 和统一客户端解析，不视为推翻 M4.4 可行性，而作为 M4.5 的
+> **契约补全包**集中落地。M4.5 不恢复旧 URL、不增加 alias/redirect，也不改变已验证的节点安装链路。
+
 1. `/boot/config`、`/answer`、`/boot|images|repos` 和历史 management URL 从首次 M4.4 启动即 404；无 redirect/alias。
 2. Rocky/Ubuntu 只得到各自 canonical install-config；错误 leaf 404，method mismatch 405 + Allow。
 3. 敏感响应 no-store 且日志无 token/header/body；Subiquity 仍使用 M4.3 专用 bootstrap proof。
@@ -4704,6 +4728,915 @@ wildcard 吞路由、node auth、management loopback 和 sensitive cache policy�
 8. code/RouteSpec/generator/CLI/example/fixture/M5–M7 当前章节对旧 URL 和兼容路由元数据零引用。
 9. golden fixtures 和契约测试覆盖 collection/error/operation、201/202/204、Location、ETag/If-Match、cursor/limit、
    Idempotency-Key 与 status/error 映射；开发期变更必须同步更新设计、server、CLI 和 fixture。
+
+### 9.14 M4.5：HTTP 接口语义一致性与客户端健壮性
+
+#### 9.14.1 阶段定位
+
+M4.5 是 M4.4 后的 HTTP **契约补全与客户端可靠性里程碑**。M4.4 已完成并验证 canonical URL、三平面隔离和
+Rocky/Ubuntu 主链路；M4.5 不回改这些结论，而把 M4.4 设计中尚未完整工程化的 route/method、DTO、分页、并发控制、
+幂等操作与客户端协议解析收口为可执行契约。M4.5 完成后，M4.6/M4.7/M5–M7 只能消费这一套契约。
+
+M4.5 不恢复旧 URL、不改变节点交付认证升级模型，也不为内部历史增加 `/api/v2`。允许补充 canonical collection
+对应的 detail route（例如 `GET /management/assets/:name`）和 operations 查询，因为它们是 M4.4 资源语义的闭环，
+不是兼容路由。M4.5 的范围包括：
+- `json()` 助手和个别 handler 的状态码选择；
+- 变更类端点的 `result` 返回值；
+- `assets`/`install-sources` 导入从 query string 迁移到 JSON body；
+- `http/client.zig` 的完整 HTTP response reader、状态码和 endpoint-specific ETag 处理；
+- 集中 RouteSpec registry、method mismatch 的 405/Allow、请求校验和一致安全头；
+- collection 分页、golden DTO/error/operation fixture、Idempotency-Key 与废弃函数清理。
+
+#### 9.14.2 问题分析
+
+M4.4 完成后对 HTTP API 进行了系统审计，发现以下 14 类语义不匹配：
+
+**P0——影响正确性：**
+
+1. **HTTP 状态码不一致**：`POST /config/validations` 返回 201 但不创建资源；`POST /nodes` 返回 200 但创建了资源；
+   `POST /catalog/migration-plans` 返回 201 但只是 dry-run 预览。`managementMutation` 客户端硬编码只匹配
+   `" 200 "`，导致返回 201 的创建类端点被误判为失败。
+
+2. **客户端状态码匹配碎片化**：`managementMutation` 只匹配 200；`importAsset` 只匹配 200；`importInstallSource`
+   匹配 200+202；`managementPostJson` 匹配 200+201+202。四种策略应统一为 `is2xx`。
+
+3. **`assets`/`install-sources` 请求体格式不一致**：这两个导入端点使用 query string 传递 `name`/`path`/`sha256`
+   等参数（`Content-Length: 0`），而其他所有 POST 管理端点使用 JSON body。query string 方式存在 URL 长度限制、
+   参数未 URL 编码（仅 `querySafe` 拒绝非安全字符）和与其他端点模式不一致的问题。
+
+**P1——影响可用性和可观测性：**
+
+4. **响应信封不一致**：`POST /assets` 返回 `{"ok":true}` 缺少 `result` 字段；`POST /nodes` 的
+   `result` 仅返回 `{"mutation":"applied_online"}` 缺少新 revision 和资源 URL。客户端无法从响应中获取变更结果。
+
+5. **错误码命名不规范**：`stage_invalid`、`session_inactive`、`body_too_large` 三个错误码缺少命名空间前缀；
+   `request.idempotency_conflict` 应归入 `operation.` 命名空间。
+
+6. **安全响应头覆盖不完整**：`json()` 助手不设置 `Cache-Control` 和 `X-Content-Type-Options`；只有 `bootConfig`
+   和 `installConfig` 手动设置了部分头。管理 API 响应可能包含敏感配置信息，应统一设置 `no-store` + `nosniff`。
+
+7. **revision 获取语义不匹配**：客户端 `managementRevision` 通过 `GET /management/nodes` 解析
+   `view_revision.config` 获取 config revision，而不是从 `GET /management/config` 的 `revision` 字段获取。
+   这导致语义混淆，且依赖 128 KB 缓冲区读取全部 nodes 列表只为提取一个数字。
+
+**P2——影响健壮性：**
+
+8. **客户端缓冲区溢出静默失败**：`managementJson` 使用 12 KB 栈缓冲区，服务端部分端点使用 `Allocating` writer
+   无上限。数据量超限时客户端返回 `null`（被当作连接失败），而非显式错误。
+
+9. **`assets` 导入缺少幂等性**：重复导入同一资产会重复计算 SHA-256，没有基于 name+sha256 的幂等检查。
+
+10. **客户端 JSON 解析脆弱**：`jsonCounter` 使用字符串查找解析 JSON 数字字段，可能误匹配字符串值中的数字；
+    `managementJson` 的 body 提取只读取到第一个 `\n`，无法处理多行 JSON。
+
+**P3——技术债务：**
+
+11. **废弃函数残留**：`managementNodePath` 函数体已清空但仍存在；`configReload` 标记为废弃但仍可调用；
+    `installRetry` 函数名未更新为 `installGenerations`。
+
+12. **路由匹配逻辑分散**：路由匹配分散在 `nodePath`、`logicalPath`、`installGenerationsPath`、`assetRoute`、
+    `artifactRepoRoute`、`artifactBootRoute` 等多个函数中，通过链式 `if` 组合，增加维护风险。
+
+13. **`managementPostJson` 注释与代码不匹配**：`client.zig` line 318 注释提到
+    `POST /api/v1/management/install-sources/import`，但实际路径是 `/install-sources`。
+
+14. **`install-config` 响应缺少 `nosniff` 头**：`bootConfig` 设置了完整的安全头（`no-store, private`、`nosniff`、
+    `no-referrer`），但 `installConfig` 只设置了 `no-store`，缺少 `nosniff` 和 `no-referrer`。
+
+#### 9.14.3 设计目标
+
+| 类别 | 当前状态 | M4.5 目标 |
+| --- | --- | --- |
+| 状态码 | 混乱（创建返回 200，校验返回 201） | 统一策略：创建→201+Location，变更→200，校验/探测→200，异步→202 |
+| 响应信封 | `{"ok":true}` 与 `{"ok":true,"result":{...}}` 混用 | 所有成功响应统一 `{"ok":true,"result":{...}}`；fire-and-forget 保留 `{"ok":true}` |
+| 请求体 | assets/install-sources 用 query string | 迁移到 JSON body，与其他 POST 端点一致 |
+| 安全头 | 仅 boot-config/install-config 手动设置 | `json()` 助手统一设置 `Cache-Control: no-store, private` + `nosniff` |
+| 客户端状态码 | 4 种不同匹配策略 | 先解析 status line/headers/body，再按调用端点允许的 2xx 集合判断；异步 202 必须轮询 Operation |
+| revision 获取 | 通过 nodes body 字符串扫描 config revision | 从目标资源响应的 ETag/`view_revision` 获取；config 与 catalog/desired-model 不混用 |
+| 错误码命名 | 3 个缺少前缀 | 补全为 `node.stage_invalid`、`node.session_inactive`、`http.body_too_large` |
+| 幂等性 | assets 导入无幂等检查 | 同步资产按完整 canonical metadata+sha256 自然幂等；长任务使用 Idempotency-Key registry |
+| 废弃清理 | 3 个废弃函数残留 | 删除 `managementNodePath`、`configReload`，重命名 `installRetry`→`installGenerations` |
+| 路由 | 链式 `if` 与 helper 分散匹配 | RouteSpec registry 统一 method/template/plane/auth/cache/log/handler，冲突启动失败 |
+| collection | 全量 body，客户端固定小缓冲 | `limit=1..200`、opaque cursor、`next_cursor`、有界完整 body reader |
+
+#### 9.14.4 统一状态码策略
+
+```text
+GET    → 200 OK
+HEAD   → 200 OK
+POST   (创建资源)      → 201 Created + Location header
+POST   (变更/应用)     → 200 OK
+POST   (校验/探测)     → 200 OK
+POST   (fire-and-forget) → 200 OK
+POST   (长任务)        → 202 Accepted + Location header
+PATCH  → 200 OK
+DELETE → 200 OK（当前保留 result body；不改为 204 以避免破坏客户端）
+```
+
+具体端点调整：
+
+| 端点 | 当前 | M4.5 |
+| --- | --- | --- |
+| `POST /management/config/validations` | 201 | **200**（校验不创建资源） |
+| `POST /management/nodes` | 200 | **201** + Location: `/management/nodes/:id` |
+| `POST /management/assets`（新资源） | 200 | **201** + Location: `/management/assets/:name`；同时补齐该 detail GET |
+| `POST /management/assets`（完全相同资源） | 200 | **200** + 同一 resource envelope |
+| `POST /management/install-sources` | 202 | **202** + 固定 Operation envelope/Location |
+| `POST /management/catalog/migration-plans` | 201 | **200**（dry-run 不创建资源） |
+| `POST /management/catalog/migrations` | 202 | **202** + 固定 Operation envelope/Location |
+| `POST /management/nodes/:id/install-generations` | 201 | **201** + Location（已正确） |
+
+> **长任务信封不随执行快慢变化**：ISO/install-source import 和 catalog migration 即使在当前进程内很快完成，
+> 也始终返回 `202 Operation`；不能因为“同步完成/幂等复用”切换成 resource envelope。相同
+> Idempotency-Key+canonical request 在 queued/running/succeeded/failed 任一状态都返回同一 operation；同 key 不同请求
+> 返回 409。CLI 收到 202 后必须按 Location 轮询 terminal state，只有 `succeeded` 才算业务成功。
+
+#### 9.14.5 统一响应信封
+
+所有成功响应统一为 `{"ok":true,"result":{...}}`。变更类端点的 `result` 必须包含可操作的返回值：
+
+```json
+// POST /management/nodes（创建节点）
+{"ok":true,"result":{"node_id":"node-01","revision":42}}
+// + Location: /api/v1/management/nodes/node-01
+
+// POST /management/assets（注册资产）
+{"ok":true,"result":{"name":"rocky-kernel","kind":"kernel","sha256":"abc..."}}
+// + Location: /api/v1/management/assets/rocky-kernel
+
+// PATCH /management/config（在线变更）
+{"ok":true,"result":{"revision":43}}
+
+// POST /management/config/validations（校验）
+{"ok":true,"result":{}}
+
+// POST /management/nodes/:id/events（fire-and-forget）
+{"ok":true}
+```
+
+`POST /management/nodes/:id/events`、`/logs`、`/facts`、`/installer-hooks/subiquity` 保留 `{"ok":true}` 简化信封，
+因为这些是节点侧的 fire-and-forget 上报，安装器不解析响应体。
+
+#### 9.14.6 请求体 JSON 化
+
+`POST /management/assets` 和 `POST /management/install-sources` 从 query string 迁移到 JSON body：
+
+```json
+// POST /management/assets
+Content-Type: application/json
+{
+  "name": "rocky-kernel",
+  "kind": "kernel",
+  "path": "boot/rocky/9.7/aarch64/vmlinuz",
+  "distro": "rocky",
+  "version": "9.7",
+  "arch": "aarch64",
+  "kernel_release": null
+}
+
+// POST /management/install-sources
+Content-Type: application/json
+Idempotency-Key: <key>
+{
+  "filename": "staged-abc.iso",
+  "sha256": "0000...0000",
+  "name": "rocky-9.7-iso",
+  "distro": "rocky",
+  "version": "9.7",
+  "arch": "aarch64"
+}
+```
+
+服务端 `importAsset` 和 `importInstallSource` 从 `request.body` 解析 JSON，替代 `request.getParamSlice`。
+客户端 `importAsset` 和 `importInstallSource` 从 query string 拼接改为 JSON body 序列化。
+
+`install-sources` 仍保留 `Idempotency-Key` header（不放入 body），因为它是传输层语义而非业务参数。
+
+#### 9.14.7 客户端健壮性收敛
+
+**公共 response reader**：
+
+`managementJson`、`managementMutation`、`importAsset`、`importInstallSource` 和 `probeAt` 统一经过一个有界 HTTP
+response reader。它必须完整解析 status line、headers、`Content-Length` 和多行 body，不得只读取第一行，也不得用
+`jsonCounter` 字符串扫描字段。初始上限为 150 KiB，并按 endpoint 可配置；超过上限返回
+`error.ResponseTooLarge`，body 截断返回 `error.TruncatedResponse`，不支持的 `Transfer-Encoding` 返回明确协议错误。
+reader 区分 transport、HTTP protocol、非 2xx、error envelope 和 operation terminal failure，解析 204/empty body 时
+不伪造 JSON。服务端同时限制 collection page 和所有动态 JSON writer，客户端上限不是服务端无界输出的补丁。
+
+**状态与异步完成判定**：
+
+先可靠解析三位状态码，再按端点的成功集合判断；不能继续搜索 `" 200 "`，也不能把任意 `is2xx` 都当最终成功。
+201 要求合法 Location，202 要求 Operation envelope + Location 并轮询，204 要求空 body。4xx/5xx 解析统一
+`error {code,message,details?,request_id}` 后映射为 CLI 结构化错误；格式错误则报告 protocol error 并保留 request id。
+
+**revision/ETag 收敛**：
+
+移除全局 `managementRevision` 假设。config mutation 读取 `GET /management/config` 的 ETag，nodes/profiles/assets/
+install-sources/catalog mutation 读取目标 collection/detail 的 catalog/desired-model ETag，runtime endpoint 只使用自身
+`view_revision`。客户端把目标响应 ETag 原样放入 `If-Match`，不得从 nodes body 猜 config revision，也不得在 M4.7
+实体迁移后继续用 config revision 保护 catalog 写入。响应 body 可回显 revision 便于展示，但并发控制以 ETag 为准。
+
+#### 9.14.8 安全响应头统一
+
+`json()` 助手统一设置以下响应头，使所有 JSON 响应继承安全策略：
+
+```text
+Cache-Control: no-store, private
+X-Content-Type-Options: nosniff
+```
+
+`bootConfig` 和 `installConfig` 保留额外的 `Pragma: no-cache` 和 `Referrer-Policy: no-referrer`，
+因为这些响应包含 capability token、password hash 和 SSH key。
+
+静态制品端点（`/artifacts/**`）不经过 `json()` 助手，由 `sendManagedFile` 根据 immutable SHA/ETag 设置独立缓存
+策略；不得把 management 的 `no-store` 机械套到不可变制品，也不得让 tokenized 节点响应继承 public cache。
+
+请求侧同时收口：带 JSON body 的端点只接受 `application/json`（允许 `charset=utf-8`），错误媒体类型返回 415；
+超过端点上限返回 413；unknown 字段、重复字段、类型错误和 set/unset 冲突返回 400/422 且无副作用。
+
+#### 9.14.9 错误码命名补全
+
+| 当前错误码 | M4.5 错误码 | 影响端点 |
+| --- | --- | --- |
+| `stage_invalid` | `node.stage_invalid` | `POST /nodes/:id/events` |
+| `session_inactive` | `node.session_inactive` | 节点交付 API |
+| `body_too_large` | `http.body_too_large` | `POST /nodes/:id/events`、`/logs`、`/installer-hooks/subiquity` |
+| `request.idempotency_conflict` | `operation.idempotency_conflict` | `POST /install-sources`、`/catalog/migrations` |
+
+错误码变更不保留兼容映射——M4.4 已确立"旧 URL 直接 404"的先例，M4.5 对错误码同样不保留别名。
+CLI 是唯一消费者，同版本更新即可。
+
+#### 9.14.10 废弃函数清理
+
+| 函数 | 位置 | 处理方式 |
+| --- | --- | --- |
+| `managementNodePath` | `server.zig` | 删除（函数体已清空，返回 `null`） |
+| `configReload` | `client.zig` | 删除（M4.4 已删除 config/reload 路由） |
+| `installRetry` | `client.zig` | 重命名为 `installGenerations`，更新所有调用方 |
+
+#### 9.14.11 资产导入幂等性
+
+`POST /management/assets` 增加基于 canonical resource 的自然幂等检查：
+
+1. 如果 catalog 中已存在同名资产，且 kind/path/distro/version/arch/kernel_release/sha256 等全部 canonical metadata
+   完全相同，返回 `200 OK` + 同一 resource envelope（幂等复用）。
+2. 如果同名但任一 canonical 字段不同，返回 `409 Conflict` +
+   `{"ok":false,"error":{"code":"asset.name_conflict","message":"...","request_id":"..."}}`。
+3. 如果不存在，执行导入并返回 `201 Created`。
+
+这不引入 Idempotency-Key 机制——资产导入是同步快速操作（仅计算 SHA-256 + 写 catalog），不需要长任务幂等性。
+完整 canonical metadata 的自然幂等足以防止“相同内容、不同语义元数据”被错误复用。
+
+#### 9.14.11.1 M4.4 遗留契约补全
+
+1. 建立集中 `RouteSpec` registry，声明 method/template/plane/auth/cache/log/handler；启动时检测等价模板、wildcard
+   吞路由和重复 method，存在冲突即拒绝启动。已验证 canonical URL 不变，旧路由仍不注册。
+2. path 匹配但 method 不匹配统一返回 405 并按 RouteSpec 聚合 `Allow`；真正不存在的 path 才返回 404。
+3. `GET /management/{nodes,profiles,assets,install-sources,operations}` 统一支持 `limit=1..200` 和 opaque cursor，
+   返回 `items/next_cursor/view_revision`。cursor 绑定 collection、排序键、过滤条件和 snapshot revision；篡改、过期或
+   跨 collection 使用返回 400/409，不允许漏项或重复项。
+4. collection/resource、error、Operation、201/202/204、Location、ETag/If-Match、cursor 和 Idempotency-Key 建立
+   golden fixture。所有 RouteSpec 都必须有 method/auth/cache/log contract test，所有 CLI 写操作都有 HTTP integration。
+5. 变更资源缺少 `If-Match` 返回 428，过期返回 409；操作失败不产生部分写入。Operation registry 和 idempotency
+   request digest 持久化，daemon restart 后不能生成第二个逻辑操作。
+
+#### 9.14.12 验收门槛
+
+1. **状态码**：所有端点符合 §9.14.4；客户端解析 status/Location/envelope，202 轮询到 terminal，不能把任意 2xx 当最终成功。
+2. **响应信封**：所有管理 API 成功响应包含 `result` 字段（fire-and-forget 除外）；变更类端点返回新 revision。
+3. **请求体**：`assets`/`install-sources` 导入使用 JSON body；`querySafe` 不再用于这两个端点的参数传递。
+4. **安全头**：`json()` 助手统一设置 `no-store` + `nosniff`；`bootConfig`/`installConfig` 保留完整安全头。
+5. **客户端**：公共 reader 支持多行/empty/204/150 KiB 边界，拒绝 truncated/oversize/unsupported transfer；
+   ETag 从目标资源获取，不再使用 `jsonCounter` 或 config-only `managementRevision`。
+6. **错误码**：`stage_invalid`→`node.stage_invalid`、`session_inactive`→`node.session_inactive`、
+   `body_too_large`→`http.body_too_large`、`request.idempotency_conflict`→`operation.idempotency_conflict`。
+7. **幂等性**：asset 仅在全部 canonical metadata+SHA 相同才复用；import/migration 同 key 同请求返回同一持久 Operation。
+8. **废弃清理**：`managementNodePath`、`configReload` 已删除；`installRetry` 已重命名。
+9. **M4.4 遗留收口**：RouteSpec、405+Allow、分页/cursor、golden DTO/error/operation、ETag/If-Match 和
+   Idempotency-Key contract tests 全部落地；M4.4 已验证 URL 和 Rocky/Ubuntu 链路保持不变。
+10. **文档同步**：`client.zig` 注释与实际路径一致；`server.zig` 路由注释与 `RouteSpec` 一致。
+
+#### 9.14.13 不在 M4.5 范围内
+
+- 不改变 `DELETE /nodes/:id` 的 200 → 204（避免破坏客户端，留待未来 major 版本）。
+- 不做通用 content negotiation；v1 JSON 仍固定为 `application/json; charset=utf-8`，但请求 Content-Type 必须校验。
+- 不改变节点交付 API 的认证模型（bootstrap → capability 升级流程保留）。
+- 不改变 `subiquityReport` 的 form-urlencoded 请求体格式（curtin webhook 不支持 JSON）。
+
+### 9.15 M4.6：自定义内核引导参数
+
+#### 9.15.1 阶段定位
+
+M4.6 在 M4.5 后交付自定义内核引导参数（`profile.kernel_args`）能力。该能力横切 PXE 安装和无盘两条
+链路：PXE 引导时追加到 kernel cmdline 末尾；安装后在目标系统中通过 Kickstart `bootloader --append`
+或 Autoinstall `late-commands` GRUB drop-in 持久化；无盘启动时由 initrd 从 `/proc/cmdline` 透传到
+运行系统。M4.6 不改变 DHCP/TFTP/HTTP 协议语义，不引入新路由，不修改安装器 adapter 的 storage/bootloader
+plan 逻辑——只在现有渲染路径的末尾追加用户声明的参数。
+
+#### 9.15.2 配置模型
+
+`ProfileConfig` 新增 `kernel_args: ?[]const u8 = null` 字段（替代 M3 遗留的 `cmdline_template`）。该字段
+是 profile 级声明，node override 不支持覆盖——内核引导参数属于部署能力边界，单节点差异应通过不同
+profile 表达。输入层允许 `null` 或空字符串；空字符串在校验后立即 canonicalize 为 `null`，持久化、digest、
+ETag 和 install plan 中不得保留两种等价表示。
+
+`kernel_args` 的语义是"空格分隔的 `key=value` 或 `key` 参数列表"，NodeForge 不解析其内容，只做安全
+校验和字符串拼接。典型用例包括 `iommu=pt`、`intel_iommu=on`、`hugepagesz=1G hugepages=4`、
+`isolcpus=1,2,3,4`、`vfio_pci.ids=1000:0010` 等。
+
+#### 9.15.3 安全校验
+
+`kernel_args` 在 config/catalog 校验阶段通过以下规则（与 kernel-args spec §2.4/§5.1 对齐）：
+
+1. **允许字符集**：ASCII 字母数字、`=.-_,:` 和空格。`:` 用于 VFIO `vfio_pci.ids=1000:0010`，
+   `,` 用于 CPU 隔离 `isolcpus=1,2,3`。此白名单隐式拒绝控制字符（`< 0x20`、`0x7f`）、`()`、`{}`
+   等不在白名单内的字符。
+2. **禁止字符**（显式列出，与白名单互为补充）：控制字符、引号（`"`、`'`、`` ` ``）、分号（`;`）、
+   反斜杠（`\`）、`$`、`()`、`{}`。这些字符在 Shell/GRUB/Kickstart/YAML 上下文中存在注入或语法逃逸
+   风险：双引号截断 Kickstart `--append` 取值，单引号破坏 YAML `late-commands`，`$` 触发 shell 变量展开。
+3. **token 与 canonical 约束**：按 ASCII 空格切分；输入可以有前后/连续空格，但在写入前折叠为单空格，空结果转
+   `null`。每个 token 的参数名（第一个 `=` 前）不能为空、不得以 `-` 开头；同名参数默认拒绝，避免不同消费者
+   对重复键采取 first-wins/last-wins 产生歧义。
+4. **长度上限**：256 字节。实际内核参数组合极少超过此长度，256 字节在 PXE GRUB cmdline、
+   Kickstart `--append` 和 GRUB `GRUB_CMDLINE_LINUX` 所有目标平台的安全范围内，且与 §9.15.4
+   的 1024 字节缓冲区预留充足余量。
+5. **按 token 精确拒绝保留参数名**：不得使用 common `ip`、`root`、`initrd`、`BOOT_IMAGE`、
+   `nodeforge.config`；RHEL install 额外拒绝 `rd.neednet`、`inst.ks`、`inst.repo`、`inst.stage2`；Ubuntu install
+   额外拒绝 `boot`、`url`、`cloud-config-url`、`autoinstall`、`ds`、`ramdisk_size`；NodeForge 内部额外拒绝
+   `boot_session_id`、`token`、`capability`。只比较 `=` 前的完整参数名，不做任意子串匹配；列表按 mode/distro
+   选择，新增 NodeForge 管理参数时同一变更必须扩展该表和 fixture。
+6. 校验失败返回 `profile.kernel_args_invalid` 错误码，消息指明违规字符、长度或保留关键字。
+7. install profile 配置 `kernel_args` 时必须同时满足 `bootloader.install=true`；否则返回
+   `profile.kernel_args_requires_bootloader`，避免只影响安装器 PXE、却没有按契约持久化到目标系统。
+
+#### 9.15.4 PXE cmdline 追加
+
+`boot/target.zig` 的 `resolveInstall` 和 `resolveDiskless` 在生成 `BootTarget.cmdline` 时，于基础
+cmdline 末尾追加 `kernel_args`：
+
+```zig
+fn appendKernelArgs(buf: []u8, base: []const u8, kernel_args: ?[]const u8) ?[]const u8 {
+    const extra = kernel_args orelse return base;
+    if (extra.len == 0) return base;
+    if (base.len + 1 + extra.len > buf.len) return null;
+    buf[base.len] = ' ';
+    @memcpy(buf[base.len + 1 ..][0..extra.len], extra);
+    return buf[0 .. base.len + 1 + extra.len];
+}
+```
+
+- 基础 cmdline 由现有逻辑生成（install: `ip=dhcp rd.neednet=1 inst.repo=... inst.ks=...`；
+  diskless: `ip=dhcp nodeforge.config=...`），`kernel_args` 追加在其后。
+- `BootTarget.cmdline` 的缓冲区从 512 字节扩容至 1024 字节。容量测试不得依赖“典型约 300 字节”，而应使用
+  logical-id、URL、host/port 等模型允许的最大长度计算最坏 base。当前上界约 459 字节
+  （Rocky install：`ip=dhcp rd.neednet=1 inst.repo=<256> inst.ks=http://<ip>:<port>/api/v1/nodes/<96>/install-config/kickstart`），
+  加 `kernel_args`（最长 256）+ 分隔符约 716 字节，1024 留有充足余量。768 字节在典型 Ubuntu
+  cmdline（~300）+ 256 时即已不足，故不可用。
+- 缓冲区不足时 `appendKernelArgs` 返回 `null`，`resolveInstall`/`resolveDiskless` 据此返回 `null`。
+  此路径须在返回前 `log.warn` 记录 node_id 和 `kernel_args` 长度，避免静默"boot target unavailable"
+  无法定位根因。
+- `resolveInstall` 追加位置在 `inst.ks=`/`autoinstall ds=` 之后的末尾；`resolveDiskless` 追加位置在
+  `nodeforge.config=` 之后的末尾。`kernel_args` 不得出现在 `inst.ks=`/`autoinstall`/`nodeforge.config`/token 之前。
+
+#### 9.15.5 Kickstart `bootloader --append`
+
+Kickstart adapter（`profile/adapter/kickstart.zig`）在渲染 `bootloader` 指令时，若 `kernel_args` 非空，
+追加 `--append="<kernel_args>"`。RHEL 7/8/9/10 的 Kickstart 语法一致：
+
+```text
+bootloader --boot-drive=sda --append="iommu=pt hugepagesz=1G hugepages=4"
+```
+
+- `--append` 的值使用双引号包裹，`kernel_args` 中已禁止双引号字符（§9.15.3），不会产生转义问题。
+- `--append` 不替代 Anaconda 自身的默认参数（如 `crashkernel`、`rd.*`），GRUB 安装时 Anaconda 会将
+  `--append` 值追加到 `GRUB_CMDLINE_LINUX`，与默认参数共存。
+- Kickstart `bootloader --location` 和 `--boot-drive` 逻辑不受影响，M4.1 的 storage/bootloader 校验
+  仍然在 `--append` 之前执行。
+
+#### 9.15.6 Ubuntu Autoinstall `late-commands` GRUB drop-in
+
+Ubuntu 没有 Autoinstall 原生字段直接设置 GRUB 参数。M4.6 使用 `late-commands` 在目标系统中写入
+GRUB drop-in 文件并执行 `update-grub`：
+
+```yaml
+late-commands:
+  - 'mkdir -p /target/etc/default/grub.d && printf ''%s\n'' ''GRUB_CMDLINE_LINUX="${GRUB_CMDLINE_LINUX} iommu=pt"'' > /target/etc/default/grub.d/99-nodeforge.cfg && chmod 0644 /target/etc/default/grub.d/99-nodeforge.cfg'
+  - 'curtin in-target --target=/target -- update-grub'
+```
+
+- 使用 `/target/etc/default/grub.d/99-nodeforge.cfg` 而非直接修改 `/etc/default/grub`，避免与包升级
+  冲突（Ubuntu 推荐的 GRUB 配置扩展方式）。
+- drop-in 使用 `GRUB_CMDLINE_LINUX`，使普通和 recovery entry 都继承硬件必需参数，与 Kickstart 持久化语义一致。
+  `${GRUB_CMDLINE_LINUX}` 必须作为**字面量**写入目标文件，不能在 installer 环境提前展开；adapter 必须通过现有
+  YAML quote helper 生成上述单引号/转义并做 exact fixture，禁止用 `echo` 拼接 shell 变量。
+- `curtin in-target --target=/target -- update-grub` 是 Autoinstall 中在目标系统执行命令的标准方式，
+  确保 GRUB 配置写入目标盘的 ESP。
+- Ubuntu adapter 在渲染 `late-commands` 时，若 `kernel_args` 为空则不生成上述两行命令，不影响已有的
+  `late-commands` 内容。
+
+#### 9.15.7 无盘链路（M5 前瞻）
+
+无盘模式下 `kernel_args` 通过两条路径生效：
+
+1. **PXE 引导 cmdline**：`resolveDiskless` 在 `nodeforge.config=` 之后追加 `kernel_args`，内核引导时
+   即生效（如 `iommu=pt` 在内核初始化阶段生效）。
+2. **运行系统持久化**：无盘系统没有磁盘 GRUB，但 `kernel_args` 已在 `/proc/cmdline` 中。initrd 不需要
+   额外处理——`/proc/cmdline` 由内核自动生成，包含 PXE 引导时的完整 cmdline。`systemd` 和其他服务
+   可从 `/proc/cmdline` 读取参数。如果需要 GRUB 风格的持久化（无盘场景通常不需要），可由 rootfs build
+   阶段在 `/etc/default/grub.d/` 中预置 drop-in，但 M5 不强制实现此路径。
+
+无盘链路不引入 `bootloader --append` 等安装器语义。`kernel_args` 在无盘模式下的唯一入口是 PXE cmdline。
+
+#### 9.15.8 BIOS PXELINUX（M6 前瞻）
+
+M6 BIOS PXELINUX renderer（`boot/pxelinux.zig`）在 `APPEND` 指令末尾追加 `kernel_args`，与 GRUB
+UEFI 路径行为一致。详见 §11.4 更新。
+
+#### 9.15.9 代码任务
+
+| 模块 | 任务 |
+| --- | --- |
+| `model.zig` | `ProfileConfig` 新增 `kernel_args: ?[]const u8 = null`；移除 `cmdline_template` |
+| `config/validate.zig` | 新增 `kernel_args` 字符集/长度/边界校验，返回 `profile.kernel_args_invalid` |
+| `boot/target.zig` | `resolveInstall`/`resolveDiskless` 调用 `appendKernelArgs`，缓冲区扩容至 1024，溢出 `log.warn` |
+| `profile/adapter/kickstart.zig` | `bootloader` 指令追加 `--append` |
+| `profile/adapter/ubuntu.zig` | `late-commands` 追加 GRUB drop-in 写入和 `update-grub` |
+| `catalog.example.json` / `config.example.json` | 示例增加 `kernel_args` 字段 |
+| 测试 fixture | 双 adapter `kernel_args` fixture（空值/典型值/边界长度 256/保留关键字/注入字符拒绝） |
+
+install plan/session checkpoint 必须捕获 canonical `kernel_args` 和 plan digest；active session 期间相关 profile 变更按
+M4.3 drift 规则拒绝或留待下一 generation，daemon restart-resume 后 answer 必须逐字节稳定。
+
+#### 9.15.10 验收门槛
+
+1. **PXE install（Kickstart）**：配置 `kernel_args: "iommu=pt"` 的 profile，Rocky 安装后目标系统
+   `/proc/cmdline` 包含 `iommu=pt`，`/etc/default/grub` 中 `GRUB_CMDLINE_LINUX` 包含 `iommu=pt`。
+2. **PXE install（Autoinstall）**：配置 `kernel_args: "iommu=pt"` 的 profile，Ubuntu 安装后目标系统
+   `/proc/cmdline` 包含 `iommu=pt`，`/etc/default/grub.d/99-nodeforge.cfg` 存在且内容正确。
+3. **PXE 引导 cmdline**：GRUB 查看节点 PXE cmdline（或 `boot render` 预览）包含 `kernel_args`，
+   且位于 `inst.ks=`/`autoinstall`/`nodeforge.config=` 之后。
+4. **安全校验**：包含 `"`、`;`、`$`、`()` 或 token 参数名以 `-` 开头的输入被拒绝；完整参数名命中
+   mode/distro 保留表也被拒绝，但 `foo.inst.ks=1` 不因子串误判，返回
+   `profile.kernel_args_invalid`。
+5. **空值兼容**：`kernel_args` 为 `null` 或空字符串时，所有链路行为与 M4.5 完全一致。
+6. **长度边界**：256 字节的 `kernel_args` 正常通过校验和渲染，257 字节被拒绝。
+7. **adapter/schema**：RHEL 8/9 通过对应 pykickstart/ksvalidator；Ubuntu 22.04/24.04 通过 autoinstall schema，
+   exact fixture 证明 drop-in 中保留字面量 `${GRUB_CMDLINE_LINUX}`、mode 为 0644，并执行 in-target update-grub。
+8. **会话稳定性**：active plan 捕获 canonical 参数，profile 漂移不改变已签发 answer，同版本 restart-resume 稳定。
+9. **实机与回归**：Rocky/Ubuntu 普通和 recovery entry 验证持久参数；M4.5 全部门槛继续通过。
+
+#### 9.15.11 不在 M4.6 范围内
+
+- 不支持 node override 级别的 `kernel_args` 覆盖。单节点差异通过不同 profile 表达。
+- 不解析 `kernel_args` 语义（不验证 `iommu=pt` 是否合法，只做字符集校验）。
+- 不支持 Kickstart `%post` 或 Autoinstall `user-data` 中的 `runcmd` 注入内核参数——`kernel_args` 的
+  安装后持久化只通过 `bootloader --append`（Kickstart）和 GRUB drop-in（Autoinstall）实现。
+- 不修改 M5 无盘 initrd 的 `/proc/cmdline` 解析逻辑——initrd 已解析 `/proc/cmdline` 获取
+  `nodeforge.config_url`，`kernel_args` 由内核自动透传。
+- 不为无盘系统实现 GRUB drop-in 预置（无盘场景 `kernel_args` 通过 PXE cmdline 生效即可）。
+
+### 9.16 M4.7：路径自举、config/catalog 边界重构与部署初始化
+
+#### 9.16.1 目标
+
+解决三个相互关联的架构问题：
+
+1. **安装目录硬编码**：当前 `paths.zig` 中 32 个路径常量从编译期 `install_root = "/opt/nodeforge"` 派生，
+   无法支持自定义安装根（如 `/srv/nf`）。部署到非标准路径需要手动维护软链和多份二进制副本。
+2. **config/catalog 边界模糊**：`config.json` 同时包含启动配置（server/http/tftp/dhcp）和运行时管理数据
+   （profiles/nodes/distros）。`node add/set/remove` 在运行时修改 `config.json`，使"启动配置"既非只读也非稳定。
+3. **缺少部署初始化命令**：全新服务器部署需要手动创建目录树、手写 config.json、手动安装 systemd unit 和软链，
+   无统一的 init/reset 入口。
+
+M4.7 在 M4.6 的基础上完成这三项重构，为 M5 无盘启动和 M6 支持矩阵增强提供更健壮的部署基础。
+
+为控制破坏面，M4.7 仍是一个里程碑，但实现和验收分三道不可跳过的内部 gate：
+
+| Gate | 范围 | 进入下一 gate 的条件 |
+| --- | --- | --- |
+| M4.7a | runtime `Paths`、install-root/marker、全部路径消费者迁移 | 默认根和自定义根测试通过，业务代码无硬编码绝对路径 |
+| M4.7b | schema bump、config/catalog 所有权迁移、manifest、多文件事务、revision/digest | legacy 迁移和逐阶段 crash recovery 通过，无 mixed generation 可见 |
+| M4.7c | `setup --reconfigure/reset-*`、bundle 安装、systemd、回滚 | 新装/重配/重置/失败回滚和健康检查通过 |
+
+M5 可以在 M4.7a 后做隔离原型，但合入主线和里程碑验收必须等待 M4.7a–c 全部完成，避免继续建立在旧
+AppConfig ownership 或单文件 catalog 上。
+
+#### 9.16.2 路径自举
+
+**设计原则**：二进制启动时第一件事是自举发现安装根，一切路径从安装根派生；无法证明根目录合法时 fail closed，
+不得因为 `readlink`/权限/布局错误静默猜测 `/opt/nodeforge`。
+
+**自举流程**：
+
+```
+1. 若显式给出 --install-root：canonicalize 后校验 root marker/layout
+2. 否则 readlink("/proc/self/exe") → /srv/nf/bin/nodeforge，并要求父目录为 bin
+3. dirname(dirname(exe)) → /srv/nf，校验 /srv/nf/.nodeforge-root 和 bin 中成对二进制
+4. 仅对标准安装允许验证过的 /opt/nodeforge 作为 default candidate；验证失败即报错
+5. 从唯一根派生 config/catalog/state/logs/work/assets/systemd 等全部路径
+```
+
+`--config` 和 `--catalog` 是测试/迁移/排障的叶子覆盖，优先级高于 root 派生值；`--catalog` 在 M4.7 后指向
+catalog 目录而不是单个 JSON。daemon 常规 systemd 启动不使用这些覆盖。`--install-root` 只用于 setup、显式自定义
+部署与诊断，不能被普通请求改变。
+
+**`paths.zig` 改动**：
+
+新增运行时 `Paths` 结构体，包含全部路径字段。`Paths.discover()` 完成自举，`Paths.resolve()` 从显式
+安装根构建。进程启动时调用 `paths.init()` 设置全局路径，之后 `paths.current()` 返回只读指针。现有
+40 个 `pub const` 降级为 `discover()` 内部回退值，不再被业务代码直接引用。
+
+```zig
+pub const Paths = struct {
+    install_root: []const u8,
+    config_path: []const u8,
+    catalog_path: []const u8,
+    state_dir: []const u8,
+    logs_dir: []const u8,
+    events_path: []const u8,
+    // ... 全部路径字段
+
+    pub fn discover(io: std.Io, allocator: std.mem.Allocator) !Paths { ... }
+    pub fn resolve(allocator: std.mem.Allocator, root: []const u8) !Paths { ... }
+    pub fn deinit(self: *Paths, allocator: std.mem.Allocator) void { ... }
+};
+
+var global: ?Paths = null;
+
+pub fn init(p: Paths) error{AlreadyInitialized}!void { ... }
+pub fn current() error{PathsNotInitialized}!*const Paths { ... }
+```
+
+`Paths` 使用进程级 allocator/arena，生命周期覆盖 CLI parser、daemon 和所有 worker；初始化发生在 `buildCli()` 和
+配置加载之前且仅一次。测试显式 `Paths.resolve(temp_root)` 并通过 context/scoped injection 传入，被迫使用全局的测试
+串行运行；`current()` 不允许在未初始化时偷偷构造默认实例。
+
+**编译期引用的迁移**：
+
+全文 73 处引用分为两类：
+
+| 类别 | 数量 | 处理方式 |
+| --- | --- | --- |
+| 运行时引用（函数体内） | 59 | `paths.xxx` → `paths.current().xxx`，机械替换 |
+| 编译期引用（struct 默认值、help 文本 `++`、flag 默认值） | 14 | 逐个特殊处理 |
+
+编译期引用的特殊处理：
+
+- `model.zig` 中 `HttpConfig.asset_root`/`repository_root` 和 `TftpConfig.asset_root` 的默认值从
+  `paths.iso_dir`/`paths.repos_dir`/`paths.boot_dir` 改为空字符串 `""`，成为必填字段。`setup` 生成
+  config 时写入 `<install_root>/assets/iso` 等正确路径。校验器已有空字符串检查（`EmptyAssetRoot`）。
+- `nodeforged.zig` help 文本中 `"..." ++ nodeforge.paths.install_root ++ "..."` 改为运行时
+  `writer.print("...{s}...", .{paths.current().install_root})`。`service_log_path` 同理。
+- `config/load.zig` 和 `catalog/store.zig` 的 `pub const default_path` 改为
+  `pub fn defaultPath() []const u8`，返回 `paths.current().config_path`。
+- `main.zig` flag 默认值（`addConfigPathFlag`、`addCatalogPathFlag`、`events-path`）在
+  `paths.init()` 之后由 `buildCli()` 调用，直接使用 `paths.current().xxx`。
+- `server/admin_key.zig` 模块级 `const generated_dir = paths.keys_dir` 改为
+  `fn generatedDir() []const u8`。
+
+**改动文件汇总**：
+
+| 文件 | 引用数 | 改动类型 |
+| --- | --- | --- |
+| `paths.zig` | — | 新增 `Paths` 结构体、`discover`/`init`/`current` |
+| `app.zig` | 18 | 机械替换 |
+| `http/server.zig` | 26 | 机械替换 |
+| `main.zig` | 12 + 4 flag + 3 测试 | 替换 + flag 默认值改 |
+| `nodeforged.zig` | 1 + 2 help | 替换 + `++` 改 `print` |
+| `model.zig` | 3 | 默认值改空字符串 |
+| `config/load.zig` | 1 | `pub const` → `pub fn` |
+| `catalog/store.zig` | 1 | `pub const` → `pub fn` |
+| `dhcp/server.zig` | 1 | 机械替换 |
+| `tftp/server.zig` | 1 | 机械替换 |
+| `catalog/iso_import.zig` | 3 | 机械替换 |
+| `preflight.zig` | 1 | 机械替换 |
+| `state/model_transaction.zig` | 2 | 机械替换 |
+| `server/admin_key.zig` | 1 | `const` → `fn` |
+| **总计** | **73** | |
+
+单元测试不得依赖未初始化回退；所有路径测试使用临时根、marker 和显式 `Paths`，同时覆盖 symlink root、`..`、
+非 `bin/` 布局、readlink 失败、重复 init、default candidate 缺 marker 等 fail-closed 分支。
+
+#### 9.16.3 config/catalog 边界重构
+
+**问题**：当前 `config.json` 既包含启动配置（server/http/tftp/dhcp/logging/events/policy），又包含
+运行时管理数据（distros/profiles/nodes/provisioning_bundles）。`node add/set/remove` 在运行时修改
+`config.json`，导致启动配置不能只读，位置不能随意移动，人工编辑与 daemon 写回可能冲突。
+
+**重构后的边界**：
+
+```
+config.json（只读，人工维护，启动时读一次）
+├── server (bind_interface, server_ip, http_port)
+├── http (asset_root, repository_root, max_connections)
+├── tftp (asset_root, windowsize, max_blksize, max_concurrent_transfers)
+├── dhcp (subnet, pool, router, dns, lease_seconds)
+├── logging (level, file)
+├── events (max_size_mb, keep)
+└── policy (default_action, allow_unknown_diskless)
+
+catalog/（读写，仅 daemon，通过 CLI/API 管理）
+├── distros.json
+├── profiles.json
+├── nodes.json
+├── provisioning_bundles.json
+├── repositories.json
+├── assets.json
+├── install_sources.json
+└── boot_bundles.json (M5)
+```
+
+**config.json 变为纯启动配置**：只管"服务在哪、监听什么端口、网络怎么配"。人工写好后不再被运行时
+修改。`config apply`（M6）修改它时完整重载 daemon，不是运行时热改。
+
+**catalog 变为完整运行时模型**：profiles、nodes、distros 全部由 daemon 通过 CLI/API 管理
+（`node add/set/remove`、未来的 `profile add/update`）。daemon 是 catalog 的唯一 writer。
+
+**影响**：
+
+| 操作 | 之前 | 之后 |
+| --- | --- | --- |
+| `node add/set/remove` | 写回 config.json | 写回 catalog/nodes.json |
+| `node list` | 从 config.nodes 读取 | 从 catalog/nodes.json 读取 |
+| `config validate` | 校验 config + catalog 交叉引用 | `validateConfigShape` 只校验文件形状；完整命令再调用 `validateModel` |
+| `catalog validate` | 校验 catalog 对 config 的引用 | `validateCatalogShape` + `validateModel` 校验内部和 config policy 引用 |
+| daemon 启动 | 加载 config + catalog | 加载 config（只读）+ catalog（读写） |
+
+#### 9.16.4 catalog 按实体拆分
+
+**动机**：将 profiles/nodes/distros/provisioning_bundles 迁入 catalog 后，单文件 `catalog.json` 在
+成百上千节点场景下膨胀，且 `node add` 需要写回整个文件。
+
+**拆分方案**：按实体类型分文件，每个文件是独立的 JSON 数组：
+
+```
+catalog/
+├── manifest.json            # schema/layout/catalog revision/entity digests/transaction id
+├── nodes.json               # 高频写
+├── profiles.json            # 低频写
+├── distros.json             # 极低频
+├── provisioning_bundles.json
+├── assets.json              # 中频写
+├── repositories.json        # 低频
+├── install_sources.json     # 低频
+└── boot_bundles.json         # M5
+```
+
+**加载**：daemon 先读取 `manifest.json`，校验 layout schema、catalog revision、transaction id 和每个 entity digest，
+再读取声明的实体文件合并为内存 `Catalog`。manifest 声明的文件缺失、digest 不匹配、出现 unresolved journal 或 mixed
+transaction id 时一律 fail closed；只有 manifest 和 legacy 输入都不存在的 brand-new root 才能初始化空 catalog。
+
+**写入**：`node add` 的业务实体只改 `nodes.json`，但必须与新 `manifest.json` 作为同一事务提交；asset register 同理。
+ISO import 可同时修改 assets/repositories/install_sources，catalog migration 还可能修改 profiles 和目录布局，均走统一
+`CatalogTransactionCoordinator`，不得各自 rename 后再补 revision。
+
+**向后兼容**：M4.7 必须 bump `AppConfig.schema_version` 并引入独立 catalog layout schema。迁移输入同时包含旧
+`config.json`（distros/profiles/nodes/provisioning_bundles）和旧 `catalog.json`（repositories/assets/install_sources/
+boot_bundles），先在内存构造并完整校验新模型、检测 logical-id collision，再通过 migration journal 一次性发布新
+config + manifest/entity files；`profile.kernel_args` 等 M4.6 字段必须无损保留。原文件备份、migration marker 和 request
+digest 使崩溃重启可幂等完成或回滚；old/new 混合且无可证明 journal 时拒绝启动，不能猜测缺文件为空。
+
+**提交顺序**：锁定 model → 写 journal/prepared metadata → 在同文件系统 stage 所有 affected files → fsync file/dir →
+依次 rename entity/config → **最后 rename manifest** 作为可见 commit point → fsync catalog dir → 标记 journal committed
+并清理。恢复器在任何一步崩溃后依据 transaction id 和 digest roll-forward/rollback；测试在每个阶段注入崩溃。
+
+**不做的事**：不按节点分目录（`nodes/node-001.json`），1000 节点级别不需要。多环境靠多实例
+（不同安装根），不在单实例内分租户。
+
+#### 9.16.4.1 代码任务与影响面
+
+config/catalog 边界重构（§9.16.3）和按实体拆分（§9.16.4）是 M4.7 破坏性最大的部分，远超路径自举
+（§9.16.2，73 处）。以下为独立代码任务清单，§9.16.2 的改动文件汇总表不覆盖本节。
+
+**lookup 签名迁移**：`findProfile`/`findNode`/`findDistro`/`findDistroVersion` 当前接收 `*const AppConfig`，
+拆分后须改为接收 `*const Catalog`（distros/profiles/nodes/provisioning_bundles 迁入 catalog）。
+分布与计数（当前代码实测）：
+
+| 文件 | find* 调用数 | 改动说明 |
+| --- | --- | --- |
+| `http/server.zig` | 12 | `findProfile`/`findNode`/`findDistro` 改传 `catalog_snapshot.value()` |
+| `config/validate.zig` | 8 | 跨实体校验从 config 侧迁到 catalog 侧（见下） |
+| `catalog.zig` | 5 | 内部 lookup 改传 catalog |
+| `state/boot_session_store.zig` | 4 | session 校验改传 catalog |
+| `main.zig` | 3 | CLI 渲染改传 catalog |
+| `boot/target.zig` | 3 | `resolveInstall`/`resolveDiskless` 已接收 catalog，确认 profile/distro 查找改 catalog |
+| `tftp/server.zig` | 1 | 虚拟 GRUB 解析改传 catalog |
+| `catalog/iso_import.zig` | 1 | 改传 catalog |
+| **合计** | **37** | |
+
+**校验模型重构**：拆成三个显式层次，禁止把 shape valid 误报为可运行模型：
+
+| 校验函数 | 之前 | 之后 |
+| --- | --- | --- |
+| `validateConfigShape` | 校验 config + catalog 交叉引用 | 校验 server/http/tftp/dhcp/logging/events/policy 自身形状和局部约束 |
+| `validateCatalogShape` | 校验 catalog 对 config 的引用 | 校验各实体 schema、ID、digest 和 catalog 内部引用 |
+| `validateModel` | 隐含在旧 validate | 校验 config policy/default_profile → catalog，以及 nodes→profiles→distros→sources/assets 的完整可运行性 |
+| `validateDistros` | 在 config 侧 | 迁到 catalog 侧 |
+
+**node_mutation 改写目标**：`addNode`/`setNode`/`removeNode`（`config/node_mutation.zig`）当前
+`config_load.load` + `config_store.save` 操作 config.json，拆分后改为操作 `catalog/nodes.json`
+（原子 tmp+sync+rename 不变）。`config.json` 在 daemon 运行期间不再被 mutation 写入。
+
+**模型 revision 不退化**：定义 `ModelRevision { config, catalog, desired_digest }`。config revision 仅在离线重配置
+成功后变化，catalog revision 每次 manifest commit 变化；`desired_digest` 对 node、profile、effective system、source/
+asset digest、M4.6 `kernel_args` 等生成不可变部署计划所需字段做 canonical hash。M4.3 transaction coordinator 扩展为
+catalog multi-file coordinator，而不是删除联合恢复语义。BootSession checkpoint 保存 config/catalog revision、
+desired_digest 和 owned plan digest；drift/deployment generation 不得继续只调用 `revisionForConfig`。
+
+**`PATCH /management/config` 语义**：M4.7 起禁用在线 config 写入，返回稳定 409
+`config.offline_only`（并指向 `nodeforge setup --reconfigure`）；不得返回“202 staged”却既不持久化也无 Operation。
+M4.5 的 route 保留用于只读获取和明确错误，M6 `config apply` 复用 setup 的离线 candidate→validateModel→atomic save→
+restart→health-check→rollback 流程，不另建在线 store。
+
+**与 M5 的依赖关系**：M5 只允许在 M4.7a 后做隔离原型；任何读取 profile/node、写 boot bundle 或部署状态的
+代码都依赖 M4.7b 的 Catalog/ModelRevision/manifest，主线集成和验收还依赖 M4.7c 部署路径，不能与旧模型并行落地。
+
+#### 9.16.5 `nodeforge setup` 命令
+
+**设计原则**：合并 init 和 reset 为单一 `setup` 命令，默认交互式，通过自举发现安装根后尝试加载
+配置，根据加载结果自动决定是全新部署还是已有部署的重配置/重置。
+
+**命令结构**：
+
+```bash
+# 交互式（默认，自动检测一切）
+nodeforge setup
+
+# 非交互式 + 自动检测
+nodeforge setup --non-interactive
+
+# 非交互式 + 覆盖关键参数
+nodeforge setup --non-interactive \
+  --install-root /srv/nf \
+  --bind-interface enp26s0 \
+  --server-ip 192.168.27.128 \
+  --yes
+
+# 已有部署离线重配置（candidate 校验、重启、健康检查、失败回滚）
+nodeforge setup --reconfigure [--non-interactive --yes]
+
+# 只生成 systemd unit
+nodeforge setup --generate-systemd [--print | --install]
+
+# 只修复目录结构
+nodeforge setup --repair-dirs
+
+# 完全重置（清空运行态，重新生成配置）
+nodeforge setup --reset-all [--non-interactive --yes]
+
+# 连 catalog/assets/keys 一并清除的真正破坏性重置
+nodeforge setup --reset-all --purge-data --non-interactive --yes
+
+# 只清空运行态，保留配置
+nodeforge setup --reset-state [--non-interactive --yes]
+
+# dry-run 预览
+nodeforge setup --dry-run
+```
+
+**交互式流程**：
+
+```text
+$ nodeforge setup
+
+[1] 路径自举
+    二进制：/srv/nf/bin/nodeforge
+    安装根：/srv/nf
+
+[2] 加载配置
+    /srv/nf/config/config.json → 加载成功，schema_version=<current>
+    daemon: active
+
+    → 已有部署，选择操作：
+      [1] 重新配置（保留配置，可修改参数后重启）
+      [2] 清空运行态（保留配置，清空 leases/status/deployment-control）
+      [3] 完全重置（重新生成配置和运行态）
+      [4] 修复目录结构（补全缺失目录，不修改配置）
+    > 2
+
+[3] 确认
+    将清空以下运行态文件：
+      /srv/nf/state/leases.json
+      /srv/nf/state/node-status.json
+      /srv/nf/state/deployment-control.json
+      /srv/nf/state/boot-sessions.json
+    保留：
+      config.json、catalog/、events.jsonl
+    继续？[y/N]: y
+
+[4] 执行
+    ✓ 停止 daemon
+    ✓ 备份 state/ → backups/state-20260716-023001/
+    ✓ 清空 leases.json / node-status.json / deployment-control.json
+    ✓ 启动 daemon
+    ✓ 服务状态：active
+```
+
+只有配置路径返回 `FileNotFound` 且根目录布局允许初始化时才进入全新部署；PermissionDenied、JSON parse、schema、
+manifest、digest、owner/mode 或交叉校验失败全部 fail closed，不得被“配置加载失败”吞掉并覆盖现有部署。
+
+全新部署时，同一命令跳到初始化流程：
+
+```text
+[2] 加载配置
+    /srv/nf/config/config.json → FileNotFound
+
+    → 全新部署
+
+[3] 网络配置（交互式）
+    检测到网络接口：
+      [1] enp26s0  192.168.27.128/24  UP  ✓ 有默认路由
+    选择 PXE 网卡 [1]:
+    服务 IP [192.168.27.128]:
+    子网 [192.168.27.0/24]:
+    地址池 [192.168.27.200-192.168.27.254]:
+    ...
+
+[4] 创建目录结构
+    ✓ /srv/nf/config  /srv/nf/catalog  /srv/nf/state  /srv/nf/logs
+    ✓ /srv/nf/assets/{iso,boot,repos,keys}  /srv/nf/tftp  /srv/nf/work/import
+
+[5] 生成配置
+    ✓ /srv/nf/config/config.json
+
+[6] 生成 systemd unit
+    ✓ /srv/nf/systemd/nodeforged.service
+    ✓ ln -sf .../nodeforged.service /etc/systemd/system/
+
+[7] 启动服务
+    ✓ systemctl enable + start nodeforged
+```
+
+**安装 bundle 与权限**：当前构建产物是 `nodeforge` + `nodeforged` 两个二进制，因此“单个二进制完成部署”不成立。
+`setup` 从包含两者的同版本/同架构安装 bundle（或已安装目标的 sibling）校验 build provenance 后原子安装到
+`<root>/bin`；缺少 daemon binary 立即失败。执行安装、systemd、owner/capability 的动作要求 root。所有 root/父目录
+逐级拒绝不可信 symlink 和 group/world-writable 路径；config、含 secret 的 nodes/state 为 0600，目录 0700/0750，
+公开不可变制品按需 0644。执行前检查同文件系统 rename、磁盘空间和备份可写性。
+
+**systemd unit 动态生成**：`setup` 根据自举发现的路径生成完整 unit，`ExecStart` 不需要传 `--config`：
+
+```ini
+[Unit]
+Description=NodeForge provisioning daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/nf
+ExecStartPre=/srv/nf/bin/nodeforged --check --log-output file
+ExecStart=/srv/nf/bin/nodeforged --log-output file
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateMounts=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target
+```
+
+setup 写 unit 后执行 daemon-reload、enable、start，并以 `/healthz` + model load 双重检查；任一步失败恢复旧 unit/config、
+恢复服务原启停状态并保留诊断备份。普通 management CLI 仍不提供通用 `systemctl` wrapper；setup lifecycle 是唯一例外。
+
+**网卡检测**：交互式自动读取 `/sys/class/net/` 枚举接口，用 `ioctl(SIOCGIFADDR)` 获取 IP 和掩码，
+读取 `/proc/net/route` 找有默认路由的接口，基于 IP/掩码自动推导子网 CIDR 和地址池推荐范围。
+
+**重置时基于旧配置推荐**：读取已有 `config.json`，每个字段作为默认值显示在 `[方括号]` 中。如果环境
+未变（网卡仍存在、IP 仍可用），旧值就是推荐值；如果环境已变，自动检测新值并标注变化。
+
+**重置边界与恢复**：执行 reset 前先恢复/确认所有 catalog/model journal；存在无法裁决的事务时拒绝 reset，不能删掉
+证据。`--reset-state` 清理 leases、node-status、deployment-control、boot-sessions、node-inventory、operations、
+provisioned markers 和可安全归档的 completed journal，保留 config/catalog/assets/keys/events；legacy runtime 同步归档。
+`--reset-all` 重新生成 config 并清理上述 state，但默认仍保留 catalog/assets/keys；只有显式 `--purge-data --yes` 才删除
+这些事实源。所有 reset 先生成带 manifest/digest 的备份，使用原子替换，重启健康检查失败自动回滚；非交互破坏操作
+必须同时给 `--yes`，交互默认答案为 No，备份保留策略和磁盘上限可配置。
+
+#### 9.16.6 不在 M4.7 范围内
+
+- 不实现高可用集群部署或多实例同步。
+- 不实现 Web UI 或通用低代码配置系统。
+- 不实现远程部署工具（通过 Ansible/Terraform 等外部工具实现）。
+- 不实现 `--uninstall` 卸载命令（可后续补充）。
+- 不实现跨主机分布式事务；单实例内 config/catalog/entity/manifest 的迁移和恢复属于 M4.7 必做范围。
+
+#### 9.16.7 验收标准
+
+- `nodeforge setup` 从含 `nodeforge`/`nodeforged` 的同版本安装 bundle 完成初始化；缺文件/架构或 provenance 不匹配
+  时 fail closed，不能声称由一个 CLI 二进制生成 daemon。
+- 自定义安装根（如 `/srv/nf`）部署后，daemon 正常启动，所有 state/logs/work 路径自动正确。
+- `node add/set/remove` 修改 `catalog/nodes.json`，不修改 `config.json`。
+- `config.json` 在 daemon 运行期间不被修改（只读）。
+- 1000 节点 collection 通过 M4.5 cursor 分页读取；`node add` 只改 nodes 业务文件并在同一事务提交 manifest，不重写
+  无关实体文件，CLI 不受 12 KiB/单行 JSON 限制。
+- 旧 config+单文件 catalog 能一次性迁移，schema/manifest 升级、collision、备份、marker、幂等 restart 和每阶段
+  crash injection 全部通过；mixed old/new、missing entity、digest mismatch 一律 fail closed。
+- `Paths` 未 init、重复 init、custom root、marker 缺失、readlink 失败、symlink/`..` 和权限异常都有显式测试，
+  不存在编译期回退或 lazy default。
+- `nodeforge setup --generate-systemd` 输出的 unit 文件中路径与自举发现一致，`ExecStart` 不含 `--config`。
+- `setup --reconfigure/reset-state/reset-all/purge-data` 的确认、备份、事务恢复、systemd rollback、健康检查和权限测试通过；
+  config/catalog/model revision 与 active BootSession plan digest 在重启前后保持契约一致。
 
 ## 10. M5：内存无盘启动与基础后处理
 
@@ -4720,6 +5653,13 @@ PXE bootfile，见 §9.10.11/§9.11.2 F2）；`NodeConfig.http_accel` 对 diskle
 （§9.11.7 F6），M5 新增的 `diskless`/`rootfs`/`initrd`/`boot-bundle` 命令须遵循 resource-action 模型；
 boot-gate 事件状态转换去重（§9.11.7.1 F9），M5 diskless boot-gate 事件须复用同一 `BootGateSuppressor` 模式；
 HTTP 只生成 M4.4 `/artifacts/boot/**` 与 `/api/v1/nodes/:id/artifacts/rootfs/:name`，不实现任何旧 URL alias。
+M4.6 的 `profile.kernel_args`（§9.15）对 diskless 模式同样生效：`resolveDiskless` 在 PXE cmdline 末尾
+追加 `kernel_args`，initrd 从 `/proc/cmdline` 透传，无需额外处理。
+
+M5 以 M4.7 完整模型为实现基线：所有路径从注入的 `Paths` 获取；distro/profile/node/boot bundle 从 Catalog entity
+snapshot 获取；rootfs/boot bundle publish 通过 manifest transaction；BootConfig、drift 和 deployment generation 使用
+`ModelRevision.desired_digest`，不得读取 `config.nodes/profiles`、单文件 `catalog.json` 或 `revisionForConfig`。M4.5 的
+node/resource API 使用 cursor 和目标 ETag，M5 不新增无分页大 collection 或 config-only 并发控制。
 
 ### 10.2 代码任务
 
@@ -4777,6 +5717,11 @@ parse /proc/cmdline
   -> write /run/nodeforge/boot.json
   -> switch_root merged /sbin/init
 ```
+
+> **M4.6 kernel_args 透传**：`profile.kernel_args`（§9.15.7）在 `resolveDiskless` 阶段追加到 PXE cmdline
+> 末尾，内核引导时即写入 `/proc/cmdline`。initrd 不需要额外解析或处理 `kernel_args`——它已在
+> `/proc/cmdline` 中，内核初始化阶段生效（如 `iommu=pt`）。运行系统中的服务可从 `/proc/cmdline` 读取
+> 这些参数。无盘系统无磁盘 GRUB，`kernel_args` 的唯一入口是 PXE cmdline。
 
 rootfs 下载支持断点续传：
 
@@ -5026,10 +5971,14 @@ retry，只有 attempt 已终态失败后才需要操作员重新 arm。
 
 完善 MVP 周边兼容性和诊断能力。
 
-### 11.2 M4.1/M4.2/M4.3/M4.4 基线继承
+### 11.2 M4.1–M4.7 与 M5 基线继承
 
 M6 只扩展架构、发行版版本和 bootloader，不得为新 adapter 建立第二套目标系统默认值。新增的 x86_64、
 Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 的归一化 TargetSystemConfig，并满足：
+
+- profile/distro/node/repository CRUD 直接写 M4.7 Catalog entity files，并复用 manifest/journal/ModelRevision；不得恢复
+  AppConfig ownership、单 `catalog.json` 或另建 adapter store。config diff/apply 走 `setup --reconfigure` 的离线
+  candidate/重启/健康检查/回滚流程，`PATCH /management/config` 继续返回 `config.offline_only`。
 
 - 字段省略时仍默认 `en_US.UTF-8`、OpenSSH enabled、password authentication enabled、root login `yes`、
   root password `asdf1234`、主机防火墙 disabled；RHEL 系 SELinux 默认 disabled。
@@ -5040,6 +5989,9 @@ Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 �
 - BIOS PXELINUX 只改变 bootloader 和配置查找方式，不改变目标系统的账号、SSH、防火墙、SELinux、包或
   网络策略。PXELINUX 链路固定使用 `pxelinux.0`（只支持 TFTP），`http_accel` 对 BIOS 节点无效，
   kernel/initrd 始终通过 TFTP 传输。详见 §5.2.1。
+- M4.6 `profile.kernel_args`（§9.15.8）在 PXELINUX `APPEND` 末尾追加，行为与 GRUB UEFI 路径一致；
+  新发行版 adapter 的 Kickstart `bootloader --append` 和 Autoinstall `late-commands` GRUB drop-in
+  必须复用同一 `kernel_args` 安全校验（§9.15.3），不得绕过字符集/长度限制。
 - 新 adapter 必须直接消费 normalized `system.users` 和 `system.packages`：自动安装映射到发行版安装器，
   无盘映射到 rootfs build/capability 与 overlay；不得新建 adapter 私有 users/packages 字段。
 - 新 adapter 必须复用 SHA-512 crypt `$6$`、password 明文事实源、bootstrap admin public key 始终合并和
@@ -5066,8 +6018,8 @@ Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 �
 ### 11.3 任务
 
 - Rocky Linux 9.x 优先的 RHEL 系 kickstart 版本能力表。
-- x86_64 生产验证记录和 aarch64 真机/QEMU PXE 验证记录。
-- BIOS x86 + PXELINUX 链路。
+- ~~x86_64 生产验证记录和 aarch64 真机/QEMU PXE 验证记录。~~ **暂不实现**（无 x86_64 环境；aarch64 验证已在 M0–M4 完成）。
+- ~~BIOS x86 + PXELINUX 链路。~~ **暂不实现**（无 x86_64 环境；PXELINUX 设计见 §11.4，待 x86_64 环境就绪后实施）。
 - 安装错误分类。
 - ISO/repo/rootfs 资产更完整校验。
 - HTTP/TFTP 连接、fd、worker 与 per-client 限流的目标机压测；根据结果固化上限和 429/503 行为。
@@ -5076,7 +6028,13 @@ Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 �
 - Proxy DHCP spike。
 - Secure Boot 风险评估。
 
+> **x86_64 延迟说明**：当前无 x86_64 测试环境，M6 中所有 x86_64 相关任务（生产验证、BIOS PXELINUX）
+> 标记为**暂不实现**。aarch64 的全部链路验证已在 M0–M4 完成。待 x86_64 环境就绪后，这些任务
+> 可直接在 M6 框架内实施，不影响已完成阶段的交付。
+
 ### 11.4 BIOS PXELINUX
+
+> **暂不实现**：当前无 x86_64 测试环境。以下设计保留为实施方案，待 x86_64 环境就绪后交付。
 
 PXELINUX 只用于 BIOS x86。DHCP 返回 `pxelinux.0` 后，PXELINUX 从 TFTP 根目录下的 `pxelinux.cfg/` 查找配置。NodeForge 不使用 PXELINUX 私有 DHCP option 指定配置文件，遵循默认查找规则：
 
@@ -5104,8 +6062,12 @@ ONTIMEOUT nodeforge
 
 LABEL nodeforge
   KERNEL install/rocky/9.7/x86_64/vmlinuz
-  APPEND initrd=install/rocky/9.7/x86_64/initrd.img inst.ks=http://192.168.50.1:8080/api/v1/nodes/node-01/install-config/kickstart inst.repo=http://192.168.50.1:8080/artifacts/repositories/rocky-9.7-x86_64-dvd/
+  APPEND initrd=install/rocky/9.7/x86_64/initrd.img inst.ks=http://192.168.50.1:8080/api/v1/nodes/node-01/install-config/kickstart inst.repo=http://192.168.50.1:8080/artifacts/repositories/rocky-9.7-x86_64-dvd/ iommu=pt
 ```
+
+> **M4.6 kernel_args**：若 profile 配置了 `kernel_args`（§9.15.8），PXELINUX renderer 在 `APPEND` 指令
+> 末尾追加该参数，行为与 GRUB UEFI 路径一致。`kernel_args` 位于 `inst.ks=`/`inst.repo=` 或
+> `nodeforge.config=` 之后，`deploy=false` 节点不生成安装条目，因此也不追加 `kernel_args`。
 
 默认 `wait` 示例：
 
@@ -5168,23 +6130,23 @@ M6 不因某 reason 自动执行 install retry；M7 的自动策略仍受 §12.9
 
 把此前路线图中未落地的 `config diff/apply` 收敛到 M6 运维增强，而不新增无编号阶段：
 
-- `config diff` 对两个完整快照做纯只读、secret-aware 的结构 diff，并按 restart-required、runtime-applicable、
+- `config diff` 对两个完整 ModelSnapshot 做纯只读、secret-aware 的结构 diff，并按 restart-required、catalog-runtime、
   redeploy-required、M7-reconcile 四类展示影响；password 只显示 changed，不打印旧值/新值。M6 直接复用
-  M4.3 已交付的 `ConfigRuntime`、revision/ETag、snapshot pinning 和原子持久化协议：`NodeConfig.deploy`、node CRUD
-  和 discovery policy 已是 runtime-applicable，不得重新分类为“需有序重启”；server bootstrap SSH key 是否可
+  M4.7 的 `ModelRevision`、目标 ETag、snapshot pinning 和 catalog transaction：`NodeConfig.deploy`、node CRUD
+  和 catalog policy 是 runtime-applicable，不得重新分类为“需有序重启”；server bootstrap SSH key 是否可
   在线替换须在 M6 明确实现 runtime reconfigure，否则保持 restart-required。公钥 diff 只显示 fingerprint
   而非完整 key blob；`TftpConfig` 各字段属 restart-required；
   `HttpConfig.max_connections` 属 restart-required；`InstallSourceConfig.source_label` 属 catalog 导入产物
   不经 `config apply`。
-- `config apply` 是 M4.3 mutation 事务的全文件/复杂对象扩展：先构造 candidate、完整校验和引用检查，再按同一
-  revision 原子写盘/替换内存 snapshot 并写 `config.updated`，不得创建第二个 config store。server bind/subnet/
-  root path 等结构字段只有显式 `--accept-restart-required` 才可落盘并返回待重启字段；未显式接受时整个 apply
-  无副作用。DHCP discovery policy 和已明确支持的 catalog/runtime policy 在线切换。
+- `config apply` 只处理 M4.7 AppConfig 字段，并调用 `setup --reconfigure` 的离线 candidate→`validateModel`→atomic
+  save→restart→health-check→rollback 内核；不得在线替换 config snapshot或创建第二个 config store。server bind/
+  subnet/root path 等 restart-required 字段只有显式 `--accept-restart-required` 才可进入该流程；未接受时无副作用。
+  node/profile/distro 和 catalog policy 使用各自 CRUD + catalog ETag/transaction，不混入 config apply。
 - apply 不自动 arm install generation、不清除 failure、不重启节点。对 completed 节点调用 §9.10.12 的
   desired/applied drift 分类；需要重装的变更由操作员另行执行 `install retry`。
-- 多节点并发渲染只读取 immutable config/catalog snapshot；每个 request 的 node/session/hasher/plan 独立，
-  status store 使用节点粒度或短时 mutex，慢速下载/renderer 不持有全局写锁。压测覆盖 apply 与 100 个下载/
-  多节点 answer 并发，证明旧请求完成于旧 revision、新请求只见新 revision。
+- 多节点并发渲染只读取 immutable ModelSnapshot；每个 request 的 node/session/hasher/plan 独立，status store 使用
+  节点粒度或短时 mutex，慢速下载/renderer 不持有全局写锁。压测覆盖离线 reconfigure 前后和 100 个下载/answer
+  并发，证明已 pin 的 session 继续使用 owned plan，新请求只见健康重启后的新 ModelRevision。
 - 生产容量验收记录 events 保留上界、状态/lease 固定容量耗尽行为、work orphan 清理、asset filesystem
   low-watermark 和导入空间预检；容量不足返回稳定错误，不删除已发布/活动对象。
 
@@ -5194,7 +6156,7 @@ M6 不因某 reason 自动执行 install retry；M7 的自动策略仍受 §12.9
 
 M4/M5 已交付 repository、standard-packages、managed-file 和统一 runner。本阶段补齐 archive、script、firstboot、CLI plan/status 和三条链路的完整回归。这里的“配置可视化”是指 CLI 按阶段、步骤和执行结果清晰组织输出，不引入 Web UI 或通用低代码配置系统。
 
-M7 不获得绕过 M4.1/M4.2/M4.3/M4.4/M5 目标系统策略的权限。`profile.system` 与 `node.overrides.network` 是 locale、
+M7 不获得绕过 M4.1–M4.7/M5 目标系统策略和存储事务的权限。`profile.system` 与 `node.overrides.network` 是 locale、
 timezone、keyboard、连接策略、SSH/root、普通用户/password/sudo/key、目标系统额外包、防火墙、SELinux
 和目标网络的权威事实源；bundle 只能补充业务内容。M7 继承 M4.2 的以下约束：bootstrap admin key 多值
 合并去重规则（§9.10.6.2 / §9.11.6 F5）不变，finalizer 须对多 bootstrap key 重新断言归属；`NodeConfig.deploy`
@@ -5202,6 +6164,8 @@ timezone、keyboard、连接策略、SSH/root、普通用户/password/sudo/key�
 `install.subiquity_error`（§11.5）的 retryability 遵循错误分类表，M7 auto-retry allowlist 消费该分类。
 M7 的 agent/finalizer 还必须复用 M4.3 的真实 distro、ConfigRuntime revision、node inventory 聚合视图和
 BootSession resume 语义，不得创建第二套 node facts/session store。
+M7 的 profile/node/bundle 读取来自 Catalog snapshot，状态/备份/provisioned 路径来自 `Paths`，applied/desired 判断使用
+M4.7 desired digest；runner 只能通过既有 transaction/status writer 发布结果，不能直接编辑 config 或 entity JSON。
 
 ### 12.2 增强范围
 
@@ -5287,7 +6251,7 @@ diskless_boot
 4. 下载并校验 `tar.bz2`，解压并执行其安装脚本。
 5. 原子写入 `files`，用于 `/etc/hosts`、chrony/systemd-timesyncd、resolver 和业务配置。
 6. 按声明顺序执行自定义 scripts/patch。
-7. 写入 `/opt/nodeforge/state/provisioned/<bundle>-<version>.json` 并上报结果。
+7. 写入 `Paths.state_provisioned/<bundle>-<version>.json` 并上报结果。
 8. 执行 TargetSystem finalizer，校验并固化 profile 的账号、SSH、网络、连接和安全策略。
 
 同一个 bundle 可用于：
@@ -5414,7 +6378,10 @@ M4.2/M4.3/M4.4 累积回归项（后续阶段覆盖前序过渡契约）：
 | F6/M4.3-04 CLI 校准 | canonical 资源命令可用；deprecated alias 已从 help 和命令树删除并返回 unknown command；node typed `k=v`/`unset` 原子校验；M4.3 CLI 范围冻结；`buildCli` 拆分后的 `register*Commands` |
 | M4.3 profile 只读视图 | profile list/show 的引用数、validation、capability、install-source/repository/assets/effective system 和 secret 脱敏；无写 action |
 | M4.3-01/08/09 所有权与恢复 | config/catalog/目录 journal 逐状态 crash recovery；高频 ModelSnapshotPair replace + handler/worker/session 并发无 UAF/torn pair/旧 snapshot 泄漏；BootSession 自有 immutable plan；inventory stale-source 仲裁；受保护 mutation 拒绝；restart 后 capability resumed 与真实 gap 分流 |
-| M4.4 URL/router | 三平面 canonical route matrix、RouteSpec 冲突/auth/cache/log、旧 URL 全量 404、旧 session schema 拒绝、node-bound rootfs、无 redirect/alias；当前 DTO/error/operation/ETag/idempotency golden contract；Rocky/Ubuntu 全链路 |
+| M4.4 URL 可行性基线 | 三平面 canonical route、旧 URL 404、旧 session schema 拒绝、node-bound rootfs、无 redirect/alias；Rocky/Ubuntu 全链路保持已验证 |
+| M4.5 HTTP 契约补全 | RouteSpec 冲突/auth/cache/log、405+Allow、request validation、安全头、collection cursor、golden DTO/error/operation、目标 ETag/If-Match、持久 idempotency、完整有界 client reader 与 202 polling |
+| M4.6 kernel_args | token/canonical/reserved-key 校验、max-length cmdline、Kickstart 版本 fixture、Ubuntu 22.04/24.04 literal GRUB drop-in、normal/recovery boot、immutable session plan/restart |
+| M4.7 paths/model/setup | custom/default root/marker/symlink/权限；legacy config+catalog migration；manifest/entity digest；逐 commit phase crash recovery；1000-node pagination；setup/reconfigure/reset/systemd rollback |
 | M4.3 系统级回归 | Rocky 9.7、Ubuntu 22.04 在最终 M4.3 二进制上重新完成 PXE 安装至可登录；Ubuntu 安装中 daemon restart 后完成且不 rearm |
 
 测试目录：
@@ -5441,6 +6408,10 @@ tests/
   "schema_version": 1
 }
 ```
+
+上例是 M0–M4.6 legacy schema。M4.7 必须提升 config schema version，并在 `catalog/manifest.json` 使用独立
+`layout_schema_version`；具体目标数字在实现时由 migration fixture 固定，但不得继续以 1 写出迁移后的 config。
+loader 仅接受当前 schema 或明确列入迁移矩阵的旧 schema，未知新版本和无法裁决的 mixed layout 均 fail closed。
 
 MVP 只支持当前版本。后续升级时增加 migration。
 
@@ -5499,9 +6470,18 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
       node/profile 聚合与 typed mutation、inventory 仲裁、owned BootSession/install plan、认证恢复、日志和构建溯源；
       完成 crash/concurrency tests，并重新完成 Rocky/Ubuntu 全安装与 Ubuntu restart-resume 后，才进入 M4.4。
 10.8. 实现 M4.4 RouteSpec、三路由平面、canonical URL generator、node-bound rootfs 契约和当前 DTO/error/operation
-      golden contract；直接删除旧 route，要求 clean session state 且拒绝旧 schema，再次通过 HTTP contract与双发行版实机回归后进入 M5。
-11. 实现 dracut module、boot bundle/rootfs/initrd capability 校验、TargetSystem BootConfig 和断点续传。
-12. 跑通 diskless squashfs overlay、目标系统 overlay 与 `rootfs_build`/`diskless_boot`，完成 M5，再实施 M6/M7 增强。
+      URL cutover；直接删除旧 route，要求 clean session state 且拒绝旧 schema，确认 M4.4 主链路可行。
+10.9. 实现 M4.5 契约补全：RouteSpec/405+Allow、golden DTO/error/operation、分页/cursor、目标 ETag/If-Match、
+      持久 Idempotency-Key/Operation、JSON request validation 和有界完整 HTTP client reader；双发行版链路不回改。
+10.10. 实现 M4.6 自定义内核引导参数：`ProfileConfig.kernel_args` 字段、token 级安全校验、PXE cmdline 追加、
+      Kickstart `bootloader --append`、Autoinstall `late-commands` GRUB drop-in、缓冲区扩容；
+      双 adapter/version fixture 与 restart plan 稳定性覆盖，完成 M4.6。详见 §9.15。
+10.11. 依次通过 M4.7a Paths/marker，M4.7b schema+manifest+multi-file transaction/migration/revision，M4.7c
+      setup bundle/reconfigure/reset/systemd rollback；完成逐阶段 crash injection、自定义根和旧模型迁移后才进入 M5。
+11. 实现 dracut module、boot bundle/rootfs/initrd capability 校验、TargetSystem BootConfig 和断点续传，全部消费
+    M4.7 Catalog/Paths/ModelRevision。
+12. 跑通 diskless squashfs overlay、目标系统 overlay 与 `rootfs_build`/`diskless_boot`，完成 M5，再实施复用同一
+    entity transaction 和 offline config apply 的 M6/M7 增强。
 
 ## 16. MVP 最终交付清单
 
@@ -5512,32 +6492,31 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
 
 配置：
 
-- `/opt/nodeforge/config/config.json`
+- `<install-root>/config/config.json`（默认 install-root 为 `/opt/nodeforge`）
 
 管理目录：
 
-- `/opt/nodeforge/catalog/catalog.json`
+- `<install-root>/catalog/manifest.json`
+- `<install-root>/catalog/{distros,profiles,nodes,provisioning_bundles,repositories,assets,install_sources,boot_bundles}.json`
 
 运行态：
 
-- `/opt/nodeforge/state/leases.json`（M3 DHCP lease snapshot）
-- `/opt/nodeforge/state/node-status.json`（M3 node-status snapshot）
-- `/opt/nodeforge/state/deployment-control.json`（M4.1 install generation、consumed generation 与 applied revision）
-- `/opt/nodeforge/state/runtime.json`（M2/早期 M3 兼容迁移输入，不再写入）
-- `/opt/nodeforge/logs/events.jsonl`
+- `<install-root>/state/leases.json`（M3 DHCP lease snapshot）
+- `<install-root>/state/node-status.json`（M3 node-status snapshot）
+- `<install-root>/state/deployment-control.json`（install generation、consumed generation 与 applied revision）
+- `<install-root>/state/{boot-sessions,node-inventory,operations}.json`
+- `<install-root>/state/runtime.json`（M2/早期 M3 兼容迁移输入，只作归档输入）
+- `<install-root>/logs/events.jsonl`
 
 资产目录：
 
-- `/opt/nodeforge/assets/iso`
-- `/opt/nodeforge/assets/boot`
-- `/opt/nodeforge/assets/repos`
-- `/opt/nodeforge/assets/keys`
-- `/opt/nodeforge/assets/rootfs`
-- `/opt/nodeforge/assets/initrd`
-- `/opt/nodeforge/assets/bundles`
-- `/opt/nodeforge/state/provisioned`
+- `<install-root>/assets/{iso,boot,repos,keys,rootfs,initrd,bundles}`
+- `<install-root>/state/provisioned`
+- `<install-root>/state/transactions` 与 `<install-root>/backups`
 
-这些路径由代码中的统一默认路径模块派生；文档、示例配置和 systemd unit 必须与该定义保持一致。M0 默认安装根是 `/opt/nodeforge`，正常服务启动不再显式传 `--config`/`--catalog`，只在测试或临时排障时覆盖。
+这些路径由 M4.7 runtime `Paths` 从验证过的 install root 派生；文档、示例配置和 systemd unit 必须一致。默认根是
+`/opt/nodeforge`，自定义根由 marker/布局或 `--install-root` 明确选择；正常服务启动不传 `--config`/`--catalog`，
+测试/迁移覆盖中 `--catalog` 指目录。旧单文件 catalog 只作为一次性 migration input，不是最终交付物。
 
 必须可演示：
 
@@ -5620,6 +6599,24 @@ node inventory、传输 node 归属、webhook proof、BootSession resume 或 bui
 检查：§9.12 验收、M5 bundle tuple/下载事件、M6 adapter 能力表/config apply、M7 reconciliation/finalizer、
 catalog/config/state schema 迁移、CLI/HTTP 集成测试和 daemon restart-resume 实测。不得退回 `distro=rocky`
 伪归一、CLI 直写 config、进程重启应用 node 属性或明文 capability 落盘。
+
+M4.4 的路由平面、canonical URL、RouteSpec registry、三重绑定、session schema 版本或有界迁移规则任一变化，
+还必须同步检查：§9.13 验收、M5–M7 现行章节 URL 引用、`boot/target.zig` 命令行生成、`http/client.zig` 管理路径、
+`catalog.example.json` 及 `tests/fixtures/*.json` 的 `base_url`、golden JSON fixture 和 RouteSpec 契约测试。
+不得恢复旧路由、redirect/alias、deprecated warning 或兼容截止时间。
+
+M4.5 的 route/method、状态码、信封、安全头、请求校验、分页、ETag 或 Operation 逻辑任一变化，还必须同步检查：
+§9.14 验收、RouteSpec registry、`json()`/handler、HTTP client reader、目标资源 ETag/If-Match、cursor snapshot、
+Idempotency-Key registry、import JSON、golden fixture 和 CLI polling。不得恢复字符串状态码/JSON 扫描、config-only
+`managementRevision`、旧错误码 alias 或执行快慢决定的 resource/operation 双信封。
+
+M4.6 的字符表、canonical token、保留键、adapter 持久化或 cmdline 上限变化，还必须同步 §9.15、kernel-args
+专项设计、Catalog profile schema、desired digest、Kickstart/Ubuntu 版本 fixture、M5 diskless 和 M6 PXELINUX。
+Ubuntu drop-in 必须保留字面量 `${GRUB_CMDLINE_LINUX}`，不得在 installer 环境提前展开。
+
+M4.7 的 Paths、ownership、schema/manifest、transaction/revision 或 setup/reset 变化，还必须同步概要设计、README、
+M5–M7 lookup/write path、最终交付清单、legacy migration fixture、crash recovery、systemd unit 和安装 bundle。
+不得恢复 lazy `/opt` fallback、缺实体视为空、在线 config PATCH、单文件 catalog 或单二进制 setup 假设。
 
 不允许出现：
 

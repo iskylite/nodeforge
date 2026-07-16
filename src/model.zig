@@ -71,7 +71,7 @@ pub const ServerConfig = struct {
 pub const HttpConfig = struct {
     /// rootfs、ISO 和普通 HTTP 资产根目录。
     asset_root: []const u8 = paths.iso_dir,
-    /// 通过 `/repos/` 只读发布的仓库根目录。
+    /// 通过 `/artifacts/repositories/` 只读发布的仓库根目录。
     repository_root: []const u8 = paths.repos_dir,
     /// M4.2 F4: 最大并发 HTTP 连接数。0 = 不限制。
     /// M6 将在压力测试后设置生产默认值。

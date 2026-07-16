@@ -4,9 +4,11 @@
 //! 因此 human 输出绝不会改变 JSON 事实、状态或错误路径。
 
 const std = @import("std");
+const c = @cImport({
+    @cInclude("time.h");
+});
 const table = @import("table.zig");
 const model = @import("../model.zig");
-const audit_events = @import("../state/events.zig");
 
 pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const u8 };
 pub const TftpSessionRow = struct { id: []const u8, phase: []const u8, filename: []const u8 };
@@ -181,13 +183,17 @@ pub fn status(writer: *std.Io.Writer, process: bool, http: bool, management: boo
     try writer.print("{s}\n", .{if (config) "OK config valid" else "FAIL config unavailable"});
 }
 
-/// 将 epoch 秒格式化为 RFC 3339 UTC 可视化时间。CLI human 输出统一使用该函数，
-/// 不再直接打印裸 epoch 整数；0 或负值（未发生）返回 "-"。
-/// 复用 daemon 事件写入器已校验过的 `events.rfc3339FromUnix`，保证 CLI 与审计
-/// 事件的时间展示语义一致。
+/// 将 epoch 秒格式化为宿主机本地时间。CLI human 输出使用 24 小时制并遵循
+/// 系统时区；结构化 JSON/API 和 Event v2 仍保持 UTC 时间语义。
+/// 0 或负值（未发生）返回 "-"。
 pub fn formatTimestamp(buffer: *[20]u8, epoch: i64) []const u8 {
     if (epoch <= 0) return "-";
-    return audit_events.rfc3339FromUnix(buffer, epoch) catch "-";
+    var seconds: c.time_t = @intCast(epoch);
+    var local: c.struct_tm = undefined;
+    if (c.localtime_r(&seconds, &local) == null) return "-";
+    const length = c.strftime(buffer, buffer.len, "%Y-%m-%d %H:%M:%S", &local);
+    if (length != 19) return "-";
+    return buffer[0..length];
 }
 
 /// 所有详情/状态块的 label 统一缩进和对齐宽度。使用 display-width-aware 填充，
@@ -211,16 +217,22 @@ fn detailField(writer: *std.Io.Writer, label: []const u8, value: []const u8) !vo
     try writer.writeByte('\n');
 }
 
-test "formatTimestamp renders RFC 3339 visualization time" {
+test "formatTimestamp renders local 24-hour visualization time" {
     var buffer: [20]u8 = undefined;
-    try std.testing.expectEqualStrings("2026-07-11T08:30:00Z", formatTimestamp(&buffer, 1783758600));
+    const rendered = formatTimestamp(&buffer, 1783758600);
+    try std.testing.expectEqual(@as(usize, 19), rendered.len);
+    try std.testing.expectEqual(@as(u8, '-'), rendered[4]);
+    try std.testing.expectEqual(@as(u8, '-'), rendered[7]);
+    try std.testing.expectEqual(@as(u8, ' '), rendered[10]);
+    try std.testing.expectEqual(@as(u8, ':'), rendered[13]);
+    try std.testing.expectEqual(@as(u8, ':'), rendered[16]);
     try std.testing.expectEqualStrings("-", formatTimestamp(&buffer, 0));
     try std.testing.expectEqualStrings("-", formatTimestamp(&buffer, -1));
 }
 
 test "node list table shows deployment start and end columns" {
     const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "started_at", .title = "STARTED" }, .{ .key = "finished_at", .title = "FINISHED" } };
-    const cells = [_][]const u8{ "node-01", "2026-07-11T08:30:00Z", "2026-07-11T08:45:00Z" };
+    const cells = [_][]const u8{ "node-01", "2026-07-11 16:30:00", "2026-07-11 16:45:00" };
     const rows = [_]table.Row{.{ .cells = &cells }};
     var buffer: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
@@ -228,5 +240,5 @@ test "node list table shows deployment start and end columns" {
     const out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "STARTED") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FINISHED") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "2026-07-11T08:30:00Z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2026-07-11 16:30:00") != null);
 }

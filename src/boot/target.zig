@@ -8,7 +8,7 @@
 //! - install：profile.install_source → InstallSourceConfig → installer kernel/initrd
 //!   assets，并读取已发布 repository URL。M3 不追加 inst.ks=（M4 完成后追加）。
 //! - diskless：profile.boot_bundle → kernel/initrd assets。cmdline 包含
-//!   nodeforge.config=http://…/api/v1/nodes/<id>/config。
+//!   nodeforge.config=http://…/api/v1/nodes/<id>/boot-config。
 //! - discovery：不提供 kernel/initrd，返回 null。
 //!
 //! M3.6 安全要点：
@@ -145,7 +145,7 @@ fn resolveInstall(
         if (source_asset.kind != .iso) return null;
         break :blk std.fmt.bufPrint(
             cmdline_buf,
-            "boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=dhcp url=http://{s}:{d}/images/{s}.iso cloud-config-url=/dev/null autoinstall ds=nocloud-net\\;s=http://{s}:{d}/api/v1/nodes/{s}/answer/",
+            "boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=dhcp url=http://{s}:{d}/artifacts/images/{s}.iso cloud-config-url=/dev/null autoinstall ds=nocloud-net\\;s=http://{s}:{d}/api/v1/nodes/{s}/install-config/nocloud/",
             .{ config.server.server_ip, config.server.http_port, source.source_asset, server_ip, http_port, identity.node_id },
         ) catch return null;
     } else blk: {
@@ -155,12 +155,12 @@ fn resolveInstall(
         // - inst.repo=<url>：Anaconda 从此 DNF repository URL 下载安装树
         // M4 会追加 `inst.ks=<answer_url>` 以实现无人值守 Kickstart 安装。
         // `repository.base_url` is the DNF package root (for example
-        // `/repos/<source>/Minimal`).  Anaconda's `inst.repo` instead needs
+        // `/artifacts/repositories/<source>/Minimal`).  Anaconda's `inst.repo` instead needs
         // the media tree root so it can read `.treeinfo`, `images/install.img`
         // and follow the treeinfo repository pointer itself.
         var install_root_buf: [256]u8 = undefined;
-        const install_root = std.fmt.bufPrint(&install_root_buf, "http://{s}:{d}/repos/{s}", .{ server_ip, http_port, source.name }) catch return null;
-        break :blk std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s} inst.ks=http://{s}:{d}/api/v1/nodes/{s}/answer", .{ install_root, server_ip, http_port, identity.node_id }) catch return null;
+        const install_root = std.fmt.bufPrint(&install_root_buf, "http://{s}:{d}/artifacts/repositories/{s}", .{ server_ip, http_port, source.name }) catch return null;
+        break :blk std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s} inst.ks=http://{s}:{d}/api/v1/nodes/{s}/install-config/kickstart", .{ install_root, server_ip, http_port, identity.node_id }) catch return null;
     };
 
     return .{
@@ -201,7 +201,7 @@ fn resolveDiskless(
 
     // cmdline 包含 nodeforge.config URL，节点 initrd 通过该 URL 拉取 BootConfig。
     // BootConfig 包含 rootfs 下载地址、capability token 和事件上报 URL。
-    const cmdline = std.fmt.bufPrint(cmdline_buf, "ip=dhcp nodeforge.config=http://{s}:{d}/api/v1/nodes/{s}/config", .{
+    const cmdline = std.fmt.bufPrint(cmdline_buf, "ip=dhcp nodeforge.config=http://{s}:{d}/api/v1/nodes/{s}/boot-config", .{
         server_ip,
         http_port,
         identity.node_id,
@@ -270,7 +270,7 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
             .version = "9.7",
             .arch = .aarch64,
             .manager = .dnf,
-            .base_url = "http://192.168.27.128:18080/repos/rocky-9.7-iso",
+            .base_url = "http://192.168.27.128:18080/artifacts/repositories/rocky-9.7-iso",
         }},
     };
     const identity: TftpBootIdentity = .{
@@ -286,9 +286,10 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
     try std.testing.expectEqualStrings("install/rocky/vmlinuz", target.kernel_path);
     try std.testing.expectEqualStrings("install/rocky/initrd.img", target.initrd_path);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "ip=dhcp") != null);
-    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.repo=http://192.168.27.128:18080/repos/rocky-9.7-iso") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.repo=http://192.168.27.128:18080/artifacts/repositories/rocky-9.7-iso") != null);
     // M4 appends the authenticated node-specific Kickstart endpoint.
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.ks=http://") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "install-config/kickstart") != null);
 }
 
 test "resolve diskless target returns config url cmdline" {
@@ -332,7 +333,7 @@ test "resolve diskless target returns config url cmdline" {
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     try std.testing.expectEqualStrings("boot/vmlinuz", target.kernel_path);
     try std.testing.expectEqualStrings("boot/initrd.img", target.initrd_path);
-    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "nodeforge.config=http://192.168.27.128:18080/api/v1/nodes/node-02/config") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "nodeforge.config=http://192.168.27.128:18080/api/v1/nodes/node-02/boot-config") != null);
 }
 
 // M3.6 关键测试：验证 Ubuntu install 使用 `url=`（casper ISO 下载）而非
@@ -356,11 +357,11 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
     var cmdline_buf: [512]u8 = undefined;
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     // 必须包含 url= 参数指向已发布的 ISO HTTP URL。
-    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "url=http://192.168.27.128:18080/images/ubuntu-iso.iso") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "url=http://192.168.27.128:18080/artifacts/images/ubuntu-iso.iso") != null);
     // Ubuntu live initramfs must explicitly select casper; otherwise it can
     // fall back to scanning a missing local CD-ROM device.
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "boot=casper") != null);
-    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "ds=nocloud-net\\;s=http://192.168.27.128:18080/api/v1/nodes/node-ubuntu/answer/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "ds=nocloud-net\\;s=http://192.168.27.128:18080/api/v1/nodes/node-ubuntu/install-config/nocloud/") != null);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "cloud-config-url=/dev/null") != null);
     // 绝不能包含 inst.repo=，那是 Anaconda/RHEL 专用参数。
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.repo=") == null);

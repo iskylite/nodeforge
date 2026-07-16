@@ -1236,7 +1236,7 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
 }
 
 /// 离线 answer 预览有意使用明显的非密钥占位符。
-/// 真实凭据仅通过已认证的 `/answer` 路由下发。
+/// 真实凭据仅通过已认证的 `/install-config/kickstart` 路由下发。
 fn installRenderHandler(ctx: zli.CommandContext) !void {
     _ = outputJsonFromContext(ctx) orelse return;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
@@ -1284,7 +1284,7 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     const plan_digest = try nodeforge.profile_install.planDigest(ctx.allocator, node, profile, source);
     const preview_scope = try nodeforge.password_hash.randomSalt(ctx.io);
     std.debug.print("password_hash_scope=preview config_revision={d} plan_digest={d} package_availability=installer-media\n", .{ config_revision, plan_digest });
-    // APT 源 URL 解析：与 HTTP answerFixture 保持一致的 fallback 逻辑。
+    // APT 源 URL 解析：与 HTTP installConfig 保持一致的 fallback 逻辑。
     // Ubuntu ISO 导入时始终创建 repository，但手动配置场景可能缺失。
     const distro = nodeforge.catalog.findDistro(&config.value, source.distro) orelse {
         try ctx.writer.writeAll("error: install: distro unavailable\n");
@@ -1294,7 +1294,7 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     const apt_primary_url = if (distro.family == .ubuntu) blk: {
         const repository = nodeforge.catalog.findRepository(catalog.value(), source.name);
         if (repository) |repo| if (repo.manager == .apt) break :blk repo.base_url;
-        break :blk try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/repos/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
+        break :blk try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
     } else null;
     const event_url = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/api/v1/nodes/{s}/events", .{ config.value.server.server_ip, config.value.server.http_port, node.id });
     defer ctx.allocator.free(event_url);
@@ -1306,7 +1306,7 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     const answer = if (distro.family == .ubuntu)
         try nodeforge.ubuntu_autoinstall.renderUserDataM41(ctx.allocator, node, install, system, bootstrap_key, bundle, apt_primary_url, "<facts-url>", event_url, "<log-url>", preview_report_url, "<boot-session>", "<capability>", &preview_scope)
     else blk: {
-        const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/repos/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
+        const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
         defer ctx.allocator.free(install_root);
         break :blk try nodeforge.kickstart.renderAnswerM41(ctx.allocator, node, install, system, bootstrap_key, install_root, bundle, "<facts-url>", event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope);
     };

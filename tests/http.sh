@@ -54,19 +54,16 @@ done
 test "$ready" = true
 
 grep -Fqx '{"ok":true,"service":"nodeforge"}' "$tmp/health"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/config/status" >"$tmp/config-status"
-grep -Fqx '{"ok":true,"result":{"config":"valid"}}' "$tmp/config-status"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/server/status" >"$tmp/status"
-grep -Fqx '{"ok":true,"result":{"service":"running"}}' "$tmp/status"
-curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/validate" >"$tmp/validate"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/config" >"$tmp/config-status"
+grep -Fq '"config":"valid"' "$tmp/config-status"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/status" >"$tmp/status"
+grep -Fq '"service":"running"' "$tmp/status"
+grep -Fq '"config_valid":true' "$tmp/status"
+curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/validations" >"$tmp/validate"
 grep -Fqx '{"ok":true,"result":{}}' "$tmp/validate"
 
-# M4.3 reload publishes a new immutable config snapshot without restarting the daemon.
-sed 's/"level": "info"/"level": "debug"/' "$tmp/config.json" >"$tmp/config.next"
-mv "$tmp/config.next" "$tmp/config.json"
-curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/reload" >"$tmp/reload"
-grep -Fq '"reload":"applied_online"' "$tmp/reload"
-kill -0 "$pid"
+# M4.4: config/reload route deleted; config mutations now use PATCH /management/config
+# which publishes in-process. The CLI config set test below exercises this path.
 
 # M4.3 runtime-safe config set publishes in-process; listener fields are
 # classified restart-required and leave the file unchanged.
