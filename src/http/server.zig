@@ -1388,6 +1388,7 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     const distro = parsed.value.distro;
     const version = parsed.value.version;
     const arch = parsed.value.arch;
+    if (distro) |value| if (!config_validate.validLogicalId(value)) return assetInputError(request, "invalid distro override", meta);
     const arch_text = if (arch) |value| @tagName(value) else null;
     const idempotency_key = request.getHeader("idempotency-key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_key_required\",\"message\":\"Idempotency-Key header is required\"}}\n", meta);
     var digest_buf: [32]u8 = undefined;
@@ -1447,10 +1448,10 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     };
     context.models.lock();
     defer context.models.unlock();
-    context.catalog.publishInstallSource(context.io, context.config, imported) catch |err| {
+    context.catalog.publishInstallSource(context.io, context.configs, context.config, context.config_revision, imported) catch |err| {
         // importMedia 已经将不可变文件复制到受管根目录。
         // 被拒绝的候选不得积累不可访问的 public-root 孤儿文件
-        //（例如，当 media 三元组未在操作员配置的 distro 矩阵中声明时）。
+        //（例如，ISO 覆盖产生了与既有同名 distro 不一致的 family）。
         iso_import.cleanupPublishedOutputs(context.io, context.allocator, context.config, &imported);
         observe_log.err("ISO catalog publication failed: {t}", .{err});
         return assetInputError(request, @errorName(err), meta);

@@ -516,7 +516,7 @@ const DiscoveryAction = enum {
 | 对象 | 实现职责 |
 | --- | --- |
 | `AssetConfig` | 保存物理文件路径、类型、大小、SHA256、来源和可选 kernel_release |
-| `DistroConfig` | 保存发行版族、版本、架构、安装 adapter 和包管理器 |
+| `DistroConfig` | 保存 ISO 导入自动派生的真实产品、family、版本、架构、安装 adapter 和包管理器能力索引 |
 | `RepositoryConfig` | 保存 apt/yum/dnf 源、mirror、GPG key、suite/component/repo id 和用途 |
 | `InstallSourceConfig` | 绑定 ISO/安装树/image 与 installer kernel/initrd、可选 media tree、repo 列表 |
 | `RootfsConfig` | 记录 rootfs 构建输入、repo 列表、kernel_release 和发布物 |
@@ -2525,9 +2525,9 @@ CLI 的同步成功/失败语义，发起请求的一个 HTTP worker 等待该 w
 流程固定如下：
 
 1. CLI 打开并 `fstat` 任意用户输入 ISO，确认它是普通文件后原子 stage；daemon 再以受限 root 打开 staged ISO、
-   校验普通文件和 SHA256。RHEL 系从 `.treeinfo`（family 白名单见 §9.11.4）、Ubuntu/Debian 从 `.disk/info`
-   检测 distro/version/arch；三个 CLI flag 是可选**覆盖**（§9.11.4），指定时跳过自动检测直接采用，
-   仍校验文件存在性和支持矩阵。
+   校验普通文件和 SHA256。有效 `.treeinfo` + Anaconda kernel/initrd 确定 `rhel` family，有效
+   `.disk/info` + casper kernel/initrd/squashfs 确定 `ubuntu` family。代码内置产品标签映射负责识别真实
+   distro；CLI tuple 是元数据覆盖，不能覆盖 family。未知产品只有在布局仍有效时才允许覆盖，未知布局直接拒绝。
 2. 在 `/opt/nodeforge/work/iso-import-<random>/mnt` 创建权限收紧的随机私有挂载点，以
    `mount -t iso9660 -o ro,nosuid,nodev,noexec,loop` 挂载该 ISO；只有 ISO9660 挂载失败且明确检测到
    UDF 文件系统时才以同一组选项重试 `-t udf`。遍历挂载树时拒绝不安全路径、
@@ -2538,13 +2538,15 @@ CLI 的同步成功/失败语义，发起请求的一个 HTTP worker 等待该 w
 3. RHEL-family 先用 `.treeinfo`/installer layout 识别真实 distro/version/arch，再独立探测
    `repodata/repomd.xml`；缺少 repodata 不否定媒体身份。Ubuntu 校验 installer media，并单独检查
    `dists/`、`pool/` 与 APT metadata 是否完整。
-4. 构建 publication plan：ISO/installer kernel/initrd asset、一个 `InstallSourceConfig`、可选 media tree，
-   以及仅在对应包管理器 metadata 可消费时创建的零个或多个 `RepositoryConfig`。所有名字和 SHA 先按
+4. 构建 publication plan：自动创建或扩展的 `DistroConfig` tuple、ISO/installer kernel/initrd asset、
+   一个 `InstallSourceConfig`、可选 media tree，以及仅在对应包管理器 metadata 可消费时创建的零个或多个
+   `RepositoryConfig`。adapter/package-manager 由 family 唯一派生。所有名字和 SHA 先按
    M4.3 幂等状态机检查；同内容复用，同名异内容冲突，绝不覆盖已发布对象。
 5. 将完成的目录移动到受管 roots（repo tree 到 `assets/repos/<install-source>/`，TFTP 小启动文件到
    对应 `tftp.asset_root` 路径）。这些文件在 catalog 发布前不被 HTTP/TFTP resolver 暴露。
-6. 以一个 candidate 完整校验 catalog、原子写入 catalog 文件并替换内存 snapshot；只有这一步成功后资源才
-   对外可见。任一前置步骤失败不得发布 catalog；清理失败只留下不可访问的 work orphan，并记录服务 err。
+6. 以一个 candidate 完整校验 catalog，把 distro tuple 与 install source/assets/repository 原子写入 catalog
+   并替换内存 snapshot；只有这一步成功后资源才对外可见。首次导入不要求预建 distro。任一前置步骤失败不得
+   发布 catalog；清理失败只留下不可访问的 work orphan，并记录服务 err。
 
 导入可靠性补丁（M3 归属，列入 M4.1 验收前置）：
 
@@ -2672,10 +2674,11 @@ basename 交给本机 daemon；导入请求结束后删除临时 copy，绝不�
 
 `--distro`、`--version`、`--arch` 均为可选的**覆盖**（§9.12.2）：RHEL family 从 `.treeinfo` 识别
 CentOS/RHEL/AlmaLinux/Fedora 及国产化 openEuler/Kylin/AnolisOS/Sugon OS/BigCloud-Enterprise-Linux 等真实
-`distro/version/arch`，Ubuntu/Debian 从 `.disk/info` 检测 tuple；family 仅用于选择 installer/package-manager
-能力，不改写产品身份。指定 flag 时覆盖自动检测结果，仍校验文件存在性、媒体布局和支持矩阵。未识别 ISO 且未指定
-`--distro` 时返回友好错误提示 supported families 与 hint。`source_label` 只保存媒体显示标签，不承担真实 distro
-的替代字段。RPM 媒体的 `aarch64`/`x86_64` 与 Ubuntu 媒体的 `arm64`/`amd64` 在导入器中规范化到统一架构模型；
+`distro/version/arch`，Ubuntu 从 `.disk/info` 检测 tuple；family 由媒体布局确定并唯一选择
+installer/package-manager，不能被 flag 改写。已知标签自动识别；布局有效但产品标签未知时可用 `--distro`
+覆盖，元数据不足时还必须提供 version/arch。未识别布局或未知标签且没有必要覆盖时返回明确错误。
+`source_label` 只保存媒体显示标签，不承担真实 distro 的替代字段。RPM 媒体的 `aarch64`/`x86_64` 与
+Ubuntu 媒体的 `arm64`/`amd64` 在导入器中规范化到统一架构模型；
 Ubuntu `22.04.5` 规范化为 profile/catalog 使用的 `22.04`。
 
 `asset import --path` 仍刻意是相对于 `tftp.asset_root` 的 catalog 注册路径，而不是“导入任意文件”的 CLI；它不会复制
@@ -2861,7 +2864,7 @@ M3.6 收敛 M3.5 代码审计发现的六项契约问题：动态 GRUB 错误语
 | --- | --- |
 | 无 DHCP session 请求虚拟 `grub.cfg` | 这是 authorization/policy rejection，不是文件缺失；严格匹配的虚拟名字返回 TFTP ERROR code 2（access violation），无关静态路径才继续返回 code 1。MAC/IP 名称同时校验格式及大小写，允许 GRUB 常见的单个前导 `/`。 |
 | ISO CLI 强制 `/opt/nodeforge/work/import/` basename | CLI 现在接受任意本地普通 ISO 路径，临时 stage 到受管目录后向 daemon 仅传 opaque basename，完成后清除临时 copy。既改善 UX，又不把任意 host path 交给常驻特权服务。 |
-| 重复输入 distro/version/arch | 三个 flag 改为可选覆盖（M4.2 §9.11.4 F3 将断言升级为覆盖语义）；RHEL 系以 `.treeinfo` family 白名单，Ubuntu/Debian 以 `.disk/info` 检测并规范化 tuple。指定 flag 时跳过自动检测直接采用。 |
+| 重复输入 distro/version/arch | 三个 flag 改为可选覆盖；family 始终由 Anaconda `.treeinfo` 或 Ubuntu casper 布局确定。已知产品标签自动映射，布局有效但标签未知时才需要 tuple 覆盖；参数不能绕过布局校验。 |
 | Ubuntu install cmdline | `inst.repo` 只供 Anaconda/RHEL；Ubuntu live-server 由 casper 下载 ISO，使用 `root=/dev/ram0 ramdisk_size=1500000 ip=dhcp url=http://<server>:<port>/images/<iso-asset>`。不加入旧式 `boot=casper netboot=url`：Canonical 当前 UEFI netboot 文档（涵盖 20.04+）以 `url=` 作为 live ISO 定位参数；M4 再附加 autoinstall NoCloud 参数。M3 的 `cloud-config-url=/dev/null` 已移除，以免和 NoCloud-Net 同时声明输入；它不是“waiting for cloud-init”的充分证据，必须结合 NoCloud 请求和 cloud-init 日志区分网络、answer YAML 与 datasource 问题。 |
 | HTTP/TFTP 下载日志 | M3 最初把每个 HTTP 请求和 Range 记为 info；M4.3 将 `/repos/**` 成功 GET/HEAD/Range 服务日志覆盖为 debug，4xx/5xx 仍为 info/warn。TFTP info 记录 RRQ/完成/失败并关联 node，debug 可记录有界进度；重传仍为 warn。 |
 | 管理 API 的权限边界 | `/api/v1/management/` 能写 catalog、触发 loop mount，故虽与 PXE HTTP 共用 listener，仍只接受 direct peer `127.0.0.1`；远端请求 403，不能通过 `X-Forwarded-For` 伪造。CLI 也没有远程 endpoint。 |
@@ -2870,16 +2873,16 @@ M3.6 收敛 M3.5 代码审计发现的六项契约问题：动态 GRUB 错误语
 | Ubuntu live 介质完整性 | 除 `.disk/info`、`casper/vmlinuz` 与 `casper/initrd` 外，导入还必须存在 `casper/filesystem.squashfs`，避免发布一个能下载 kernel 却无法进入 live installer 的 ISO。 |
 | loop mount 隔离 | systemd unit 启用 `PrivateMounts=true`；结合 `CAP_SYS_ADMIN`、只读挂载和 worker cleanup，ISO mount 不进入 host mount namespace。 |
 
-ISO 导入从用户路径到发布的完整责任链是：`CLI fstat → atomic staging copy → daemon constrained open/hash → readonly loop mount → distro detection/optional assertion → kernel/initrd/repo staging → checksums → catalog candidate validation + atomic replacement → stage cleanup`。catalog 是对 HTTP/TFTP 可见性的唯一提交点；任何未发布文件都不能经 resolver 访问。导入不会实现后台 job：CLI 等待本地 daemon 的有界 worker 结果。
+ISO 导入从用户路径到发布的完整责任链是：`CLI fstat → atomic staging copy → daemon constrained open/hash → readonly loop mount → family/layout validation + tuple detection/optional override → kernel/initrd/repo staging → checksums → distro tuple + install source catalog candidate validation/atomic replacement → stage cleanup`。catalog 是对 HTTP/TFTP 可见性的唯一提交点；任何未发布文件都不能经 resolver 访问。导入不会实现后台 job：CLI 等待本地 daemon 的有界 worker 结果。
 
 #### 8.13.1 Rocky 9.7 / Ubuntu 22.04 的 M3.6 实际启用顺序
 
 1. 在 PXE 服务机安装 NodeForge，并让 `server.server_ip` 已配置在 `bind_interface` 上；systemd unit 以
    `CAP_NET_BIND_SERVICE`、`CAP_NET_RAW`、`CAP_SYS_ADMIN` 与 `PrivateMounts=true` 启动。先运行
    `nodeforged --check`，它会检查 HTTP/DHCP/TFTP bind、mount/umount 和 capability。
-2. 先使用**不引用 install source** 的基础 config 启动 daemon（例如只有 distro matrix、DHCP 和
-   `policy.default_action=wait`）。这是必要顺序：config/catalog 在 daemon 启动时整体校验，尚不存在的 source
-   不能被 profile 提前引用。
+2. 先使用**不引用 install source** 的基础 config 启动 daemon（catalog 的 distro 索引可以为空，
+   `policy.default_action=wait`）。首个 ISO 导入会自动创建 distro tuple；尚不存在的 source 仍不能被 profile
+   提前引用。
 3. 通过本机 CLI 导入媒体：
 
    ```bash
@@ -4022,7 +4025,9 @@ hostname 从未设置，导致安装后主机名为 `localhost`。
 
 > **M4.3 修订**：本小节记录 M4.2 当时的实现目标，其中“RHEL 系全部归一为 distro=rocky”、
 > “repository 是导入成功前置条件”和无内容级重复导入语义均已被实机验证否定。M4.3 §9.12.2
-> 以 `family` 选择 adapter、以真实 `distro` 标识产品，并允许 repository 为空；新实现以 M4.3 为准。
+> 以 `family` 选择 adapter、以真实 `distro` 标识产品，并允许 repository 为空；现行实现进一步规定
+> family 必须来自已验证媒体布局、已知产品标签自动映射、未知标签可用 tuple 覆盖，且导入事务自动创建
+> distro 能力索引。以下“归一为 rocky/ubuntu”和“校验预建支持矩阵”仅是历史记录，不是当前设计。
 
 RHEL 系 `.treeinfo` `family` 前缀白名单扩展为
 `Rocky|CentOS|CentOS Stream|RedHatEnterpriseServer|RedHatEnterpriseLinux|AlmaLinux|Fedora|OracleLinux|ScientificLinux|CloudLinux|EuroLinux`，
@@ -4239,7 +4244,7 @@ resource-action canonical form：
 - **M4.3** 提前只读 `profile list/show`、`catalog show <install-source>` 和可审计的
   `catalog migrate --dry-run/--apply`，用于发现当前 PXE 策略并检查/修复既有安装源；它不开放 profile/catalog 写 CRUD。
 - **M6** 在 M4.3 只读视图上新增 `profile add/update/remove/validate`、`config diff/apply`、
-  profile/distro/repository 写 CRUD、
+  profile/repository 写 CRUD 和 distro 派生索引只读诊断、
   `node render --format pxelinux`（BIOS PXELINUX 预览）。`deploy=false` 节点的 PXELINUX 配置不生成安装条目（§11.4）。
 - **M7** 新增 `provision bundle-list/show/create/validate/publish/plan`、`provision step-add/remove`、
   `provision run-show/status`。`provision plan --node` 对 `deploy=false` 节点标注 deploy-disabled（§12.9）。
@@ -4373,7 +4378,8 @@ tmp+fsync+rename 原子写回。写回后调用 localhost-only 的 `POST /api/v1
 热替换必须引入完整的快照所有权和回收协议，超出 M4.2 范围。默认 `RestartSec=2s`，因此 mutation 存在短暂
 服务窗口。若写盘成功而 reload 请求失败，CLI 返回非零并要求手工重启，磁盘配置不会回滚。
 
-`profile`/`distro`/`repository` 等 config 资源的 CRUD 管理 API 不在 M4.2 范围（留 M6）。
+`profile`/`repository` 等 config 资源的 CRUD 管理 API 不在 M4.2 范围（留 M6）。distro 不规划独立 CRUD；
+现行设计由 ISO 导入事务自动维护其能力索引。
 
 #### 9.11.11 M4.1 基线继承
 
@@ -4422,7 +4428,7 @@ M4.3 是总设计的现行契约，不是可与历史实现任选其一的方案
 | profile CLI 全部留到 M6 | M4.3 提前只读 `profile list/show` 发现和诊断当前 PXE 策略；M6 仅增加 add/update/remove/validate 和引用迁移 |
 | M4.2 CLI 直写配置并 reload、M6 才计划 snapshot apply | M4.3 交付唯一 `ConfigRuntime`；M6 在同一 revision/事务模型上扩展全配置 diff/apply，不得另建 snapshot 或退回重启式 node CRUD |
 | M4.2 per-field flags 与 deprecated alias | M4.3 完成兼容窗口并删除 alias，node 使用 typed `k=v`/`unset`；历史命令只用于读旧记录 |
-| M4.2 把 `catalog show` 留到 M6、迁移无明确入口 | M4.3 提前 install-source 只读 show 和带 plan digest 的迁移 plan/apply；M6 仍负责完整 profile/distro/repository CRUD |
+| M4.2 把 `catalog show` 留到 M6、迁移无明确入口 | M4.3 提前 install-source 只读 show 和带 plan digest 的迁移 plan/apply；M6 仍负责完整 profile/repository CRUD，distro 只随 ISO 导入维护 |
 | M2.5/M3 每个 HTTP 成功请求为 info | `/repos/**` 成功包流量改为 debug，错误仍为 info/warn；下载业务事件继续保留 |
 | M2.5.1/M3 规定 daemon 重启必使 token 失效 | M4.3 只恢复已签发 capability 的 active delivery session；不恢复 UDP transfer、早期 bootstrap 或 install arm |
 | M4.2 已完成资源目录迁移 | M4.3 只补边界测试和清理文档；M5–M7 不再实现或引用第二套路径 |
@@ -4436,10 +4442,28 @@ M4.3 是总设计的现行契约，不是可与历史实现任选其一的方案
 必须表达真实发行版。Kylin、CentOS、Rocky、RHEL、Alma 等可以共享 `.rhel` + kickstart/dnf，但不得共享
 `distro=rocky` 或 `rocky-*` 目录。
 
-ISO 检测先解析媒体布局和 family/distro/version/arch，再探测 repository。`.treeinfo` 没有 `repository`、
-且没有可直接发布的 `repodata/repomd.xml` 时，仍发布 ISO/kernel/initrd/install source，repositories 为空；
-安装 preflight 再判断该 source 是否满足执行条件。repository manager 来自匹配的
-`DistroVersionConfig.package_manager`，不能通过字符串比较推导。
+family 是媒体校验结果，不是用户配置：有效 `.treeinfo` 与 Anaconda kernel/initrd 确定 `.rhel`，有效
+Ubuntu `.disk/info`、casper kernel/initrd 和 squashfs 确定 `.ubuntu`。tuple 参数只覆盖产品 id、version、arch，
+不能把 RHEL-family 布局改成 Ubuntu 或反向改写。完全不符合已支持布局的 ISO 必须拒绝。
+
+代码内置媒体产品标签映射。RHEL-family 当前识别 Rocky、CentOS、AlmaLinux、RHEL、Fedora、Oracle Linux、
+Scientific Linux、CloudLinux、EuroLinux、Kylin、openEuler、TencentOS、AnolisOS、UnionTech/UOS、
+Sugon OS、BigCloud Enterprise Linux、TurboLinux 和 npserver；Ubuntu 标准标签映射为 `ubuntu`。
+已知标签自动导入。布局有效但标签未知或含糊时允许
+`--distro` 覆盖；若媒体元数据也无法给出 version/arch，则三个 tuple 值必须补齐，否则返回
+`MediaTupleMismatch`。覆盖不等于增加 adapter，adapter/package-manager 仍由 family 唯一派生。
+
+`DistroConfig` 是 ISO 导入维护的只读能力索引，不是要求操作员预先声明的放行白名单。setup 后空索引合法；
+首次导入在同一个 catalog candidate 中创建 distro/version/arch，后续导入扩展版本或架构。同一 distro id
+若试图跨 family 复用则 fail closed。distro tuple 与 ISO/kernel/initrd/install source/repository 通过同一个
+manifest-last 事务发布，不存在 catalog 已引用 tuple 但能力索引尚未更新的窗口；CLI/API 不提供独立
+`distro add/update/remove` 写路径。
+
+ISO 识别 tuple 后再探测 repository。`.treeinfo` 没有 `repository`、且没有可直接发布的
+`repodata/repomd.xml` 时，仍发布 ISO/kernel/initrd/install source，repositories 为空；Ubuntu 也只有
+`dists/pool/Release` 等 APT metadata 可消费时才创建 repository。安装 preflight 再判断 source 是否满足
+执行条件。repository manager 来自 family 派生后写入的 `DistroVersionConfig.package_manager`，不能通过
+产品字符串比较推导。
 
 这条规则必须覆盖 importer 之外的所有运行时分派：HTTP answer/render、profile preflight、repository manager、
 boot target 和 CLI 展示都从 `DistroConfig.family` 与 `DistroVersionConfig.install_adapter/package_manager` 取值。
@@ -4501,7 +4525,7 @@ CLI 不再为每个新属性增加一个专用 flag。
 M4.3 的 CLI 完成范围冻结为：完整 node list/show 和 daemon-owned mutation、只读 profile list/show、allowlist
 `config set`、带 logical name/SHA 结果的 assets import、install-source catalog show/migrate、补齐 node 归属的
 runtime tftp-sessions，以及两个二进制的版本溯源。rootfs/initrd/boot-bundle/diskless 留 M5；全量 config diff/apply、
-profile 写操作、distro/repository CRUD 和 PXELINUX 留 M6；provision/reconcile 留 M7。不得提前增加远程 TLS/agent
+profile/repository 写操作、distro 派生索引诊断和 PXELINUX 留 M6；provision/reconcile 留 M7。不得提前增加远程 TLS/agent
 或批量编排。
 
 #### 9.12.4 完整 node list/show 与 SN 事实
@@ -4579,7 +4603,8 @@ arch/IP 和 node 删除被拒绝；`deploy=false` 只阻止新 PXE，不杀死�
 M4.3 的 `config set <typed k=v...>` 只接受明确 allowlist 的 runtime-applicable path（首批为 discovery policy、
 logging level 和 events rotation），并复用同一 revision、全量校验、原子写盘和 snapshot publish 事务；结构字段
 直接返回 `config.restart_required`，不“先写盘再假装在线生效”。完整文件的 secret-aware `config diff/apply`、
-profile/distro/repository 影响分析仍归 M6，但必须扩展这一机制，不能实现第二条写路径。
+profile/repository 影响分析仍归 M6；distro 变化只作为 ISO 导入 plan 的派生影响展示。它们必须扩展这一机制，
+不能实现第二条写路径。
 
 #### 9.12.7 Ubuntu webhook 和 session resume
 
@@ -5412,8 +5437,9 @@ catalog/（读写，仅 daemon，通过 CLI/API 管理）
 拆签名的协议代码；`config_store.StartupConfig` 是唯一可序列化形状，schema 2 永不写出这些字段。这是有删除条件的
 兼容层，不是 ownership 回退。
 
-**catalog 变为完整运行时模型**：profiles、nodes、distros 全部由 daemon 通过 CLI/API 管理
-（`node add/set/remove`、未来的 `profile add/update`）。daemon 是 catalog 的唯一 writer。
+**catalog 变为完整运行时模型**：profiles、nodes 由 daemon 通过 CLI/API 管理
+（`node add/set/remove`、未来的 `profile add/update`）；distros 由 daemon 在 ISO 导入事务中自动派生和扩展，
+不提供独立写命令。daemon 是 catalog 的唯一 writer。
 
 **影响**：
 
@@ -6213,7 +6239,7 @@ retry，只有 attempt 已终态失败后才需要操作员重新 arm。
 M6 只扩展架构、发行版版本和 bootloader，不得为新 adapter 建立第二套目标系统默认值。新增的 x86_64、
 Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 的归一化 TargetSystemConfig，并满足：
 
-- profile/distro/node/repository CRUD 直接写 M4.7 Catalog entity files，并复用 manifest/journal/ModelRevision；不得恢复
+- profile/node/repository CRUD 与 ISO 导入派生的 distro 索引直接写 M4.7 Catalog entity files，并复用 manifest/journal/ModelRevision；不得恢复
   AppConfig ownership、单 `catalog.json` 或另建 adapter store。config diff/apply 走 `setup --reconfigure` 的离线
   candidate/重启/健康检查/回滚流程，`PATCH /management/config` 继续返回 `config.offline_only`。
 
@@ -6249,7 +6275,7 @@ Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 �
   kernel/initrd 始终走 TFTP。详见 §5.2.1。
 - M6 新增的 CLI 命令（如 `boot render --format pxelinux`）须遵循 M4.2 §9.11.7 F6 的 resource-action
   canonical form，并复用 M4.3 typed patch/ConfigRuntime；不得恢复已删除的 deprecated alias 或 CLI 直写文件。
-- M6 的 PXELINUX、后续 NoCloud 和 profile/distro/repository API 只使用 M4.4 三平面 canonical URL/RouteSpec；
+- M6 的 PXELINUX、后续 NoCloud、profile/repository API 和 distro 只读视图只使用 M4.4 三平面 canonical URL/RouteSpec；
   不得恢复 `/boot/config`、`/answer`、`/repos` 或用 redirect 维持旧生成器。
 
 ### 11.3 任务
@@ -6378,7 +6404,8 @@ M6 不因某 reason 自动执行 install retry；M7 的自动策略仍受 §12.9
 - `config apply` 只处理 M4.7 AppConfig 字段，并调用 `setup --reconfigure` 的离线 candidate→`validateModel`→atomic
   save→restart→health-check→rollback 内核；不得在线替换 config snapshot或创建第二个 config store。server bind/
   subnet/root path 等 restart-required 字段只有显式 `--accept-restart-required` 才可进入该流程；未接受时无副作用。
-  node/profile/distro 和 catalog policy 使用各自 CRUD + catalog ETag/transaction，不混入 config apply。
+  node/profile 和 catalog policy 使用各自 CRUD + catalog ETag/transaction，不混入 config apply；distro
+  仅由 ISO 导入事务派生，不属于 `config apply` 或通用 CRUD。
 - apply 不自动 arm install generation、不清除 failure、不重启节点。对 completed 节点调用 §9.10.12 的
   desired/applied drift 分类；需要重装的变更由操作员另行执行 `install retry`。
 - 多节点并发渲染只读取 immutable ModelSnapshot；每个 request 的 node/session/hasher/plan 独立，status store 使用

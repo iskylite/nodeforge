@@ -14,8 +14,9 @@
 > `node list/show` 改为聚合 desired/profile/status/deployment/inventory。资源目录迁移本身已经由 M4.2 实现，
 > M4.3 只做边界测试和现行文档清理，不重新开发第二套迁移。
 > M4.3 还将 install-source 的只读 `catalog show` 和带 plan digest 的 `catalog migrate --dry-run/--apply`
-> 提前作为旧数据修复入口，并提前只读 `profile list/show` 以发现当前 PXE 策略；M6 仍负责 profile 写操作、
-> distro/repository CRUD 和完整 config diff/apply。M4.3 必须修改
+> 提前作为旧数据修复入口，并提前只读 `profile list/show` 以发现当前 PXE 策略；M6 仍负责 profile/repository
+> 写操作和完整 config diff/apply。2026-07-17 的后续修订取消独立 distro CRUD：family 来自媒体布局，
+> 已知产品标签自动映射，未知但布局有效的产品允许 tuple 覆盖，ISO 导入事务自动维护 distro 索引。M4.3 必须修改
 > 现有实现与测试，并重新完成 Rocky/Ubuntu 全安装和 Ubuntu restart-resume，不能只更新设计文档。
 > M4.4 随后统一本文出现的历史 `/boot/config`、`/answer`、`/repos`、`/subiquity-report` 和 management 动词路径；
 > 本稿仅保留当时实现语义，现行 URL 以 M4.4 专项设计为准。
@@ -112,12 +113,12 @@ M5/M6/M7 继承 M4.2 的以下变更，不得假设旧行为：
 |-----------|------|-------------|
 | F2 `deploy` 开关 | `deploy=false` 对 diskless/PXELINUX 同样生效；`node retry`/`diskless-retry` 无法绕过；config diff 归类 runtime-applicable | M5 (diskless)、M6 (PXELINUX §11.4)、M6 (config diff §11.6)、M7 (reconciliation §12.9) |
 | F1 reason 码 | `install.anaconda_error`/`install.subiquity_error` 进入 §11.5 错误分类表；M7 auto-retry allowlist 消费其 retryability | M6 (§11.5)、M7 (§12.9) |
-| F3 family 白名单 + `source_label` | M6 版本能力表按 `source_label` 区分变体，归一 distro 不变 | M6 (§11.2/§11.3) |
+| F3 family/产品标签 + `source_label` | 后续修订改为媒体布局定 family、真实 distro 入索引；`source_label` 仅展示，M6 能力表按 family/distro/version 处理 | M6 (§11.2/§11.3) |
 | F4 TftpConfig 字段 | M6 压测固化使用 M4.2 已引入的字段名 | M6 (§11.3) |
 | F4 `node.http_accel` | M5 diskless 模式的 kernel/initrd 同样适用 HTTP 加速；仅对 GRUB UEFI 生效，M6 BIOS PXELINUX 固定使用 `pxelinux.0`（TFTP only），`http_accel` 无效 | M5 (§10.4)、M6 (§11.4) |
 | F5 多公钥 | M5 BootConfig `root_authorized_keys` 可含多个 bootstrap key；M7 finalizer 须断言多 key 归属 | M5 (§10.6)、M7 (§12.3) |
 | F6 CLI 8 资源模型 | 后续命令须遵循 resource-action 模型；M4.3 已提前 profile 只读顶层，M5 构建产物归入 `assets`，M6 增加 profile 写 action，M7 provision 独立顶层 | M4.3 (§9.12)、M5 (§10.7)、M6 (§11.4)、M7 (§12.8) |
-| F6 node 原子变更 + reload | M6 config diff/apply 须识别 node add/set/remove 的有序重启语义；M6 profile/distro/repo CRUD 复用同一原子写回模式 | M6 (§11.6) |
+| F6 node 原子变更 + reload | 此处 node reload 模型已被 M4.3 runtime 事务替代；M6 profile/repo CRUD 复用新事务，distro 仅由 ISO 导入派生 | M6 (§11.6) |
 | F6 安装目录资源化 | M5 构建产物路径（rootfs/initrd/boot-bundle）须使用新布局 `assets/rootfs/`/`assets/initrd/`/`assets/bundles/`；M7 provisioned 归 `state/provisioned/` | M5 (§10.2)、M7 (§12.2) |
 | F1 `log_url` 注入 | BootConfig 共同字段增加 `log_url`；M5 initrd 如需失败摘要可复用 `/logs` | M5 (§10.4) |
 | F9 boot-gate 去重 | M5 diskless boot-gate 事件（如 `boot.diskless_not_armed`）须复用同一 `BootGateSuppressor` 模式 | M5 (§10.5) |
@@ -395,8 +396,8 @@ CLI help 文案更新（`main.zig:294-298`）：
 error: install-source: could not auto-detect distro from media metadata.
   Detected .treeinfo family: <value> (not in supported list)
   Supported families: Rocky, CentOS, RHEL, AlmaLinux, Fedora, openEuler, Kylin, ...
-  Ubuntu/Debian: detected via .disk/info
-  Hint: specify --distro <rocky|ubuntu|debian> --version <X> --arch <Y> to override
+  Ubuntu Server: detected via .disk/info + casper layout
+  Hint: specify --distro <canonical-id> [--version <X> --arch <Y>] for a valid but unknown product label
 ```
 
 ## 7. F4：TFTP 性能优化
@@ -858,7 +859,8 @@ reload 前重新解析并校验磁盘配置，响应成功后执行完整有序 
 若写盘成功而 reload 请求失败，CLI 返回非零并明确提示配置已保存、需手工重启，不能谎报“即时生效”。
 `deploy` 仍通过 `node set <id> --deploy false` 管理，与 `--ip`/`--mac`/`--profile` 同级。
 
-`profile`/`distro`/`repository` 等 config 资源的 CRUD 管理 API 不在 M4.2 范围（留 M6）。
+`profile`/`repository` 等 config 资源的 CRUD 管理 API 不在 M4.2 范围（留 M6）。distro 由后续 ISO 导入
+事务自动维护，不提供独立 CRUD。
 
 ### 9.7 安装目录资源化布局
 
@@ -898,7 +900,7 @@ M4.2 校准为资源化布局：
 
 > **M4.3 覆盖**：下列内容是 M4.2 当时的规划。现行边界已把 install-source 的只读 `catalog show` 和旧 catalog
 > 的 digest-protected migrate plan/apply 和只读 profile list/show 提前到 M4.3；M6 仍保留 profile 写操作、
-> distro/repository CRUD、支持矩阵
+> repository CRUD、distro 派生索引诊断、支持矩阵
 > 和 config diff/apply，其余 M5/M7 命令归属不变。
 
 M4.2 只校准 M0-M4.1 已有的命令并新增 node CRUD 和 assets key 管理。后续里程碑新增命令必须遵循同一
@@ -906,7 +908,7 @@ resource-action canonical form：
 - **M5** 新增 `assets rootfs-package`/`initrd-build`/`boot-bundle-publish` 和 `node diskless-status`/`diskless-retry`/
   `diskless-overlay`。`diskless-retry` 受 `deploy=false` 限制（§4.5）。
 - **M6** 在 M4.3 `profile list/show` 上新增 `profile add/update/remove/validate`、`config diff/apply`、
-  profile/distro/repository 写 CRUD、
+  profile/repository 写 CRUD 和 distro 派生索引诊断、
   `node render --format pxelinux`（BIOS PXELINUX 预览）。
 - **M7** 新增 `provision bundle-list/show/create/validate/publish/plan`、`provision step-add/remove`、
   `provision run-show/status`。

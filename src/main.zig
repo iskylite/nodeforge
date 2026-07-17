@@ -541,14 +541,14 @@ fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
     const command = try zli.Command.init(init_options, .{
         .name = "import",
         .description = "Import an ISO and publish its install source",
-        .help = "Accepts an ISO at any local path. The CLI stages a temporary managed copy, then asks the local daemon to mount, validate and publish it. The original file is never moved or deleted; distro/version/arch are auto-detected unless overridden.",
+        .help = "Accepts an ISO at any local path. The daemon validates its Anaconda/.treeinfo or Subiquity/casper layout, derives family and distro capabilities, and atomically publishes the distro tuple with the install source. The original file is never moved or deleted. Use tuple overrides for a valid but previously unknown vendor label; unknown layouts are rejected.",
     }, installSourceImportHandler);
     try addConfigPathFlag(command);
     try addOutputFlag(command);
     try addDebugFlag(command);
     try command.addPositionalArg(.{ .name = "iso-path", .description = "Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso", .required = true });
     try command.addFlags(&.{
-        .{ .name = "distro", .description = "Override auto-detected distro; e.g. rocky, ubuntu, debian. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "distro", .description = "Override an unknown or ambiguous product id; e.g. rocky, kylin, ubuntu. Family still comes from ISO layout", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "name", .description = "Explicit canonical logical name; e.g. rocky-9.7-aarch64-dvd", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Override auto-detected version; e.g. 9.7, 22.04. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "arch", .description = "Override auto-detected arch; e.g. aarch64, x86_64. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
@@ -934,6 +934,11 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
     const name = ctx.flag("name", []const u8);
     const version = ctx.flag("version", []const u8);
     const arch = ctx.flag("arch", []const u8);
+    if (distro.len != 0 and !nodeforge.config_validate.validLogicalId(distro)) {
+        try ctx.writer.writeAll("error: install-source: invalid canonical --distro\n");
+        setExitCode(ctx, 2);
+        return;
+    }
     if (name.len != 0 and !nodeforge.config_validate.validLogicalId(name)) {
         try ctx.writer.writeAll("error: install-source: invalid canonical --name\n");
         setExitCode(ctx, 2);

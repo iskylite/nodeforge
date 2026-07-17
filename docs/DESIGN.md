@@ -362,7 +362,7 @@ NodeForge 的对象模型保持简单：配置对象描述“应该怎样”，�
 | `tftp` | TFTP asset root、传输参数、只读访问策略 |
 | `http` | HTTP asset root、Range、manifest、状态上报入口 |
 | `node` | 节点身份、MAC/client id、静态 IP、架构、profile、标签、模板变量、带外管理 |
-| `distro` | 操作系统族、版本、架构、安装 adapter、包管理器和支持矩阵 |
+| `distro` | ISO 导入自动维护的发行版能力索引：真实产品 id、family、版本、架构、安装 adapter 和包管理器 |
 | `repository` | apt/yum/dnf 源、mirror、GPG key、组件/仓库名，绑定到 distro/version/arch |
 | `install_source` | ISO、HTTP install tree、image 或 repo 安装入口，包含 installer kernel/initrd 关系 |
 | `profile` | 启动/安装/无盘策略，按 `mode` 区分 `discovery`、`install`、`diskless` |
@@ -662,7 +662,7 @@ safe/ephemeral profile 至少需要满足：`safety.safe_for_unknown = true`、`
 | 层级 | 负责内容 | 不负责内容 |
 | --- | --- | --- |
 | `asset` | 物理文件路径、大小、SHA256、类型、来源 | 不表达“这套系统如何启动” |
-| `distro` | 发行版支持矩阵、安装 adapter、包管理器 | 不保存具体文件路径 |
+| `distro` | 从已验证 ISO 派生的产品/family/version/arch 能力索引 | 不由用户预创建，不保存具体文件路径 |
 | `repository` | apt/yum/dnf 源、mirror、GPG key、组件/仓库名 | 不决定节点安装到哪里 |
 | `install_source` | 安装介质或安装树，以及 installer kernel/initrd | 不表达磁盘分区和用户配置 |
 | `rootfs` | 无盘 rootfs 构建规格和发布物 | 不单独决定启动 kernel |
@@ -676,6 +676,12 @@ ISO 导入规则保持简单且不做错误假设：
   失败或收到终止信号时均必须卸载并清理挂载点。
 - 挂载树先复制到 NodeForge 管理的 staging/version 目录，再提取 installer kernel/initrd 并通过 HTTP
   只读发布；不得让 HTTP/TFTP 直接指向仍挂载的介质。
+- family 由媒体布局确定：有效 `.treeinfo` + Anaconda kernel/initrd 属于 `rhel` family，有效
+  `.disk/info` + casper kernel/initrd/squashfs 属于 `ubuntu` family。CLI 参数不能把一种布局伪装成另一种 family。
+- 已知媒体产品标签由代码内置映射成真实 distro id；无法命中映射时，只有在 family 布局仍然有效的前提下，
+  才允许通过 `--distro`（以及元数据缺失时的 `--version`/`--arch`）覆盖。布局本身不受支持时直接报错。
+- 导入事务把新的 distro/version/arch tuple 与 asset、repository、install source 一起原子写入 catalog。
+  首次安装允许空 distro 索引，不要求先导入配置，也不提供独立的 `distro add/update/remove` 子命令。
 - Rocky/RHEL 系 DVD ISO 只有在 `.treeinfo` 和 `repodata/repomd.xml` 有效时才自动建立 yum/dnf repository。
 - Ubuntu Server ISO 始终可作为 installer media；ISO 导入时始终发布受管媒体树，但只有存在可消费的
   `dists/`、`pool/` 和 APT metadata 时才创建 `RepositoryConfig`。不完整媒体通过 install source 的
@@ -1054,6 +1060,13 @@ RHEL / CentOS 系支持优先级：
 | 兼容目标 | RHEL 9.x、AlmaLinux 9.x | 复用 Rocky Linux 9.x kickstart 模型，按差异补版本能力表 |
 | 后续增强 | Fedora Server | 仅作为后续兼容增强，不作为生产初期目标 |
 
+ISO 产品识别与“已经完成实机验收”是两个层级。代码内置的 RHEL-family 标签映射覆盖 Rocky、CentOS、
+AlmaLinux、RHEL、Fedora、Oracle Linux、Scientific Linux、CloudLinux、EuroLinux、Kylin、openEuler、
+TencentOS、AnolisOS、UnionTech/UOS、Sugon OS、BigCloud Enterprise Linux、TurboLinux 和 npserver；
+这些标签共享 Anaconda/kickstart + dnf family 能力，
+但 catalog 始终保存真实产品 id。映射存在只表示导入器能确定产品身份，不把尚未完成对应版本 fixture/实机
+验证的产品提升为 MVP 已验收发行版。
+
 架构支持策略：
 
 | 层级 | 架构 | 策略 |
@@ -1310,7 +1323,8 @@ fail closed。logical id 使用统一的小写 ASCII path-safe grammar，展示�
 | 类型 | 推荐入口 | 生效方式 | 示例 |
 | --- | --- | --- | --- |
 | 启动/站点配置 | `config.json` | M0 重启 `nodeforged` | server IP、bind interface、HTTP/管理共用端口、资产根目录、安全默认值 |
-| 内置/静态能力 | 代码内置 + 可选配置覆盖 | 重启 `nodeforged` | distro 支持矩阵、adapter 能力表、默认模板 |
+| 内置/静态能力 | 代码内置 | 随二进制版本生效 | family→adapter/package-manager、已知 ISO 产品标签映射、默认模板 |
+| ISO 派生能力索引 | `assets import` | 与 install source 同一 catalog 事务在线生效 | distro/family/version/arch；未知但布局有效的产品可用 tuple 参数覆盖 |
 | 启动与站点策略 | `config.json` 或未来 `config apply` | 离线校验后重启；运行中只读 | server/http/tftp/dhcp/logging/events/policy |
 | 管理 catalog（M1+） | CLI 发起请求，`nodeforged` 导入、构建、扫描、发布 | `nodeforged` 写入 catalog 并更新内存视图，运行期可见 | asset、repository、install source、rootfs、initrd、boot bundle |
 | 批量初始化（M1+） | CLI 导入清单，`nodeforged` 校验和落盘 | 管理实体写 catalog，运行事实写 runtime；不回写启动 config | 批量导入节点、profile、资产 manifest、repository/install source 清单 |
@@ -1372,7 +1386,7 @@ sequenceDiagram
 - node `oob.ipmi.address/netmask/gateway` 必须是 IPv4 地址；`oob.ipmi.username/password` 是可选明文字段。
 - 节点静态 IP 属于 PXE subnet，且不冲突。
 - DHCP range 不与 server IP、router IP、静态 IP 冲突。
-- distro/version/arch 必须存在于支持矩阵，profile、repo、install source、rootfs、boot bundle 引用的三元组必须一致。
+- distro/version/arch 必须存在于 ISO 导入维护的能力索引，profile、repo、install source、rootfs、boot bundle 引用的三元组必须一致。
 - repository 的包管理器必须匹配 distro 能力，例如 Ubuntu 使用 apt，Rocky/RHEL/Alma/Fedora 使用 dnf/yum 兼容模型。
 - install source 必须声明 installer kernel/initrd，并且它们必须存在于 asset manifest。
 - `dhcp.discovery.default_action` 必须是 `wait`、`discovery`、`diskless` 或 `deny`；不能配置为 `install`。
@@ -1699,7 +1713,7 @@ CLI 是 NodeForge MVP 的主要运维界面。M0 仅提供状态、健康检查�
 | 放在配置文件 | 放在 CLI/API |
 | --- | --- |
 | server IP、HTTP 端口、资产根目录 | status/check |
-| distro 支持矩阵、adapter 能力 | distro show/list/validate |
+| family adapter/产品标签映射（代码内置），ISO 派生 distro 索引（catalog） | 通过 `assets import` 创建或扩展；由 `catalog show/validate` 聚合查看，不提供独立 distro 子命令 |
 | profile、provisioning bundle、默认安全策略 | config validate/diff/apply，install/provision plan |
 | repository、install source | `assets import/list/show/validate`（由 catalog 聚合展示 repository/install source） |
 | rootfs、initrd、boot bundle | `assets rootfs-package/initrd-build/bundle-publish` 及 list/show/validate |

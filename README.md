@@ -38,7 +38,7 @@ M4.3 已落地；M4.4 的 canonical URL、三平面隔离与双发行版主链�
 `profile list/show`（M4.6 追加受限 `kernel_args` set/unset）、ConfigRuntime、可恢复且自有身份数据的 BootSession、传输归属、Ubuntu webhook proof
 和构建溯源；logical id 使用统一 path-safe grammar，跨 config/catalog/目录的迁移通过可恢复联合事务发布，活动
 BootSession 使用自有 immutable install plan，inventory 以 generation/session 仲裁迟到写入。M4.3 只提前
-已实现 PXE 部署所需的运维闭环；rootfs/diskless、完整 profile/distro/repository CRUD、全配置 diff/apply 和
+已实现 PXE 部署所需的运维闭环；rootfs/diskless、完整 profile/repository CRUD、全配置 diff/apply 和
 provision/reconcile 仍按 M5–M7 实现。后续里程碑仍须持续回归 Rocky 9.7、Ubuntu 22.04 完整 PXE 安装和
 Ubuntu 安装中的 daemon restart-resume。
 
@@ -65,6 +65,17 @@ M4.5 已实施 HTTP 契约补全：集中 RouteSpec（含启动冲突/wildcard �
 M4.5 契约已在 Rocky 9.7 aarch64 验证目标以 root 端到端回归（详见 §9.14.14）。
 M4.6–M4.8 契约分别以详细设计 §9.15–§9.17 为准（M4.8 实施早于 M4.6）。M4.6/M4.7 已落地并有自动验证；
 M4.7 的 systemd 激活/回滚仍必须在 Rocky 主机完成实机清单后才能形成部署环境验收结论。
+
+## ISO 与发行版
+
+首次 `nodeforge setup` 产生空的 distro 索引，这是正常状态。执行
+`nodeforge assets import <iso-path>` 时，daemon 会校验 ISO 的 Anaconda/`.treeinfo` 或
+Ubuntu/casper 布局，由布局确定 family，再识别产品、版本和架构，并把新的 distro tuple 与安装源原子写入
+catalog；不需要、也没有 `distro add` 子命令。
+
+已知产品标签会自动映射。对于布局有效但产品标签未知或含糊的定制 ISO，可使用 `--distro` 覆盖产品 id，
+必要时同时提供 `--version`、`--arch`；这些参数不能覆盖媒体布局确定的 family。无法识别为受支持布局的 ISO
+仍会拒绝导入。
 
 ## 开发
 

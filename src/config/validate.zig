@@ -267,7 +267,7 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
 /// 校验 catalog 的格式、对象唯一性和对 config 的引用关系。
 ///
 /// 需要 config 已经通过 `validateConfig`；catalog 中的 distro/version/arch
-/// 必须能在 config 的支持矩阵中找到，asset kind 必须与引用方期望一致。
+/// 必须能在 ISO 导入所维护的 distro 能力索引中找到，asset kind 必须与引用方期望一致。
 pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     if (catalog.schema_version != 1 and catalog.schema_version != 2) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.RepositoryConfig, catalog.repositories);
@@ -311,11 +311,8 @@ fn validateDistros(config: *const model.AppConfig) ValidationError!void {
         for (distro.versions) |version| {
             if (version.version.len == 0 or version.archs.len == 0)
                 return error.UnsupportedDistroTuple;
-            const expected = switch (distro.family) {
-                .rhel => .{ model.InstallAdapter.kickstart, model.PackageManager.dnf },
-                .ubuntu => .{ model.InstallAdapter.autoinstall, model.PackageManager.apt },
-            };
-            if (version.install_adapter != expected[0] or version.package_manager != expected[1])
+            if (version.install_adapter != model.installAdapterForFamily(distro.family) or
+                version.package_manager != model.packageManagerForFamily(distro.family))
                 return error.DistroAdapterMismatch;
         }
     }

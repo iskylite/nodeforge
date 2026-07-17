@@ -11,6 +11,10 @@
 > 日志等级和事件语义不变。M4.3 新增的 `/management/profiles[/name]`、nodes/catalog/config/install-sources/
 > operations collections 直接采用 M4.4 保留的稳定路径和 v1 DTO，避免刚新增就迁移。完整 URL 与 representation
 > 契约见 M4.4 专项设计 §5。
+>
+> **2026-07-17 ISO 派生索引修订**：`DistroConfig` 不再是 ISO 导入前必须由操作员预建的支持矩阵。
+> family 由媒体布局确定，已知产品标签由代码映射，未知但布局有效的产品允许 tuple 覆盖；导入事务自动创建或
+> 扩展 distro/version/arch 索引。CLI 不提供独立 distro CRUD。本文后续相关段落均按此修订解释。
 
 ## 1. 结论摘要
 
@@ -32,8 +36,8 @@
 M4.3 是基础契约修正，不是功能堆叠。M5 的 rootfs/initrd/boot bundle、M6 的支持矩阵和 M7 的
 reconciliation 都会消费这里的发行版身份、节点属性、配置快照和 session 语义，因此不得后移。CLI 只提前
 完成已交付 PXE 能力的运维闭环：完整 `node list/show`、只读 `profile list/show`、daemon-owned node mutation、
-安装源 `catalog show` 和旧 catalog 的显式迁移。M5–M7 的 rootfs/diskless、profile 写操作及完整
-distro/repository CRUD、全配置 diff/apply、
+安装源 `catalog show` 和旧 catalog 的显式迁移。M5–M7 的 rootfs/diskless、profile/repository 写操作、
+distro 派生索引诊断、全配置 diff/apply、
 PXELINUX 和 provision/reconcile 命令仍留在各自里程碑，不以“补全 CLI”为由提前扩大范围。
 
 ## 2. 当前代码事实与根因
@@ -185,7 +189,7 @@ const DetectedMedia = struct {
 其中：
 
 - `family` 决定安装器协议能力，不进入目录名称；
-- `distro` 是 config 中真实存在的 `DistroConfig.name`；
+- `distro` 是媒体识别出的真实产品 id，并会成为 catalog 中自动维护的 `DistroConfig.name`；
 - `source_label` 仅用于保留媒体的人类可读标签，不参与身份归一；
 - `media_tree` 表示可发布的安装媒体树；它可以存在而 `repositories` 为空，最终写入
   `InstallSourceConfig.media_tree_url`，不能被当作 package repository；
@@ -199,17 +203,26 @@ const DetectedMedia = struct {
 | CentOS | rhel | centos |
 | AlmaLinux | rhel | alma |
 | Red Hat Enterprise Linux | rhel | rhel |
+| Fedora | rhel | fedora |
+| Oracle Linux | rhel | oraclelinux |
+| Scientific Linux | rhel | scientificlinux |
+| CloudLinux | rhel | cloudlinux |
+| EuroLinux | rhel | eurolinux |
 | Kylin / Kylin Linux Advanced Server | rhel | kylin |
 | openEuler | rhel | openeuler |
 | TencentOS | rhel | tencentos |
 | AnolisOS | rhel | anolis |
 | UnionTech/UOS | rhel | uos |
 | Sugon OS | rhel | sugon |
+| BigCloud Enterprise Linux | rhel | bclinux |
+| TurboLinux | rhel | turbolinux |
+| npserver | rhel | npserver |
 | Ubuntu-Server | ubuntu | ubuntu |
 
-映射后的 distro 必须存在于 `AppConfig.distros`，且 tuple 支持当前 version/arch。未知 family 可以通过
-`--distro <name>` 指定，但指定项的 `DistroConfig.family/install_adapter` 必须与检测到的媒体布局兼容。
-`--distro` 只覆盖产品身份，不能把 Anaconda 媒体伪装成 Ubuntu/Subiquity 媒体。
+映射命中后直接使用该 distro；不要求它预先存在。导入 publication candidate 自动创建或扩展
+`DistroConfig` 的 version/arch，并由 family 唯一派生 adapter/package-manager。映射未命中时，只有媒体布局已经
+确定为支持的 family 才允许 `--distro <name>` 覆盖；元数据无法解析 version/arch 时还必须补齐对应参数。
+`--distro` 只覆盖产品身份，不能把 Anaconda 媒体伪装成 Ubuntu/Subiquity 媒体。完全未知布局仍然拒绝。
 
 ### 3.2 repository 可选
 
@@ -218,7 +231,8 @@ RHEL-family 检测先解析 family/version/arch 和 kernel/initrd，再独立探
 - 有 `.treeinfo repository` 时，安全验证该相对路径并探测 `repodata/repomd.xml`；
 - 无该字段时，可探测 ISO 根、BaseOS、AppStream 等已知位置；
 - 一个都没有时 `repositories=[]`，导入仍成功；
-- repository manager 从匹配的 `DistroVersionConfig.package_manager` 读取，不再比较 distro 字符串。
+- repository manager 从 family 派生并写入同一 candidate 的 `DistroVersionConfig.package_manager` 读取，
+  不再比较 distro 字符串。
 
 没有 repository 的 install source 在 catalog 中合法。profile 绑定或安装 preflight 必须给出明确诊断，例如
 `install_source.repository_missing`，而不是在导入阶段谎称“无法识别发行版”。
@@ -357,8 +371,9 @@ answer/preflight 必须使用这一对 snapshot，不能先后读取两个独立
 发布新的 pair。status/inventory 等独立 runtime store 返回自己的 revision，聚合 DTO 携带 revision vector，不伪称
 不同事实源具有同一个事务时刻。
 
-不得提供绕过歧义、活动 session、journal 或摘要检查的 `--force`。M6 仍负责 profile/distro/repository 的完整 CRUD
-和更丰富的 catalog 管理，但必须复用同一 coordinator、revision pair 和 journal，不实现第二套 writer。
+不得提供绕过歧义、活动 session、journal 或摘要检查的 `--force`。M6 仍负责 profile/repository 的完整 CRUD、
+distro 派生索引诊断和更丰富的 catalog 管理，但必须复用同一 coordinator、revision pair 和 journal，
+不实现第二套 writer。
 
 ## 4. M4.3-02：资源化安装目录现状验收与文档收口
 
@@ -547,7 +562,7 @@ M4.3 只实现当前 PXE OS 部署已经需要、但现有 CLI 无法完整观�
 | `profile` | 只读 `list/show`，展开 PXE 选择和引用关系 | M6 `add/update/remove/validate` 和复杂 mutation |
 | `config` | runtime-applicable allowlist `set` | M6 全配置 `diff/apply` 与复杂对象影响分析 |
 | `assets` | `import ... name=`、SHA 幂等和 reused/conflict 结果 | M5 rootfs/initrd/bundle 构建 |
-| `catalog` | install source `show`；旧 catalog `migrate --dry-run/--apply` | M6 profile/distro/repository CRUD 和支持矩阵扩展 |
+| `catalog` | install source `show`；旧 catalog `migrate --dry-run/--apply` | M6 profile/repository CRUD、distro 派生索引诊断和支持矩阵扩展 |
 | `runtime` | 现有 `tftp-sessions` 补 node/session/client/result | M5/M7 新运行类型和 agent 状态 |
 | version | 两个二进制的构建溯源 | 无新 `version` 子命令 |
 
@@ -860,7 +875,7 @@ M4.3 是对已实现链路的实机复核，不是与旧设计并列的另一种
 | profile CLI 与 M6 CRUD | 旧规划把 profile 的所有 CLI 都留到 M6，导致当前 PXE profile 无法通过 CLI 发现 | M4.3 提前只读 `profile list/show`；M6 保留 add/update/remove/validate | M4.3 API 只读同一 ConfigRuntime snapshot/catalog revision；不提前 profile mutation、drift apply 或引用迁移 |
 | node mutation 与 M6 config apply | M4.2 CLI 直写 + reload；M6 原计划才引入 snapshot apply | M4.3 先交付 ConfigRuntime、node CRUD 和 allowlist `config set` 在线 mutation | M6 继承同一 snapshot/revision，扩展全配置 diff/apply；不得再实现第二套 snapshot 或把 node CRUD退回重启 |
 | CLI flags 与兼容 alias | M4.2 每字段 flag，并承诺 alias 保留一个版本周期 | typed `k=v`/`unset`；M4.3 删除已完成兼容窗口的 aliases | M4.2 命令例只作历史；现行帮助、测试、M5–M7 全用 canonical form；脚本升级失败应显式暴露 unknown command |
-| catalog CLI 与 M6 边界 | M4.2 把 `catalog show` 全部留到 M6，且迁移器没有明确操作入口 | M4.3 提前只读 install-source `show` 和带 plan digest 的迁移 plan/apply | 这是修复既有 catalog 数据的必要运维闭环；M6 仍拥有 profile/distro/repository CRUD、完整支持矩阵和复杂 catalog 管理 |
+| catalog CLI 与 M6 边界 | M4.2 把 `catalog show` 全部留到 M6，且迁移器没有明确操作入口 | M4.3 提前只读 install-source `show` 和带 plan digest 的迁移 plan/apply | 这是修复既有 catalog 数据的必要运维闭环；M6 仍拥有 profile/repository CRUD、distro 派生索引诊断、完整支持矩阵和复杂 catalog 管理 |
 | TFTP 参数与 RFC | M4.2 用主动/放大 blksize 换吞吐；旧设计提到未实现的 timeout 配置 | 三个公开参数；timeout option 已实现；OACK 只回请求项且 blksize 不放大 | 删除伪 `timeout_seconds` 待办；修 RFC 行为和 65464 上限；性能优化转到客户端请求、windowsize 或受控 HTTP |
 | TFTP/HTTP 日志等级 | M2.5/M3 要求每个 HTTP 成功请求 info；TFTP 仅带 session | `/repos/**` 成功包请求 debug；关联成功的传输带 node_id | route-class 覆盖通用 access log 等级；错误仍为 info/warn。TFTP 唯一 lease/session 关联时反规范化 node_id，否则写 link failure |
 | Subiquity webhook proof | M4.2 文档写源 IP proof，handler 却复用 header 自动分流 | webhook 固定 direct peer + active install lease proof | 不信任 header 改变 proof；header 来源单独诊断。`/events`、`/logs` 继续使用 capability，不放宽 |
@@ -880,7 +895,7 @@ ConfigRuntime 不等于所有字段都热生效，bind/port/root/TFTP 参数仍�
 | 内容幂等导入 | rootfs/initrd/boot bundle 发布复用同一 SHA + logical name 冲突模型 |
 | node inventory/status 聚合 API | M5 diskless 状态和 M7 reconciliation 扩展同一 node view，不新增平行 show 命令 |
 | profile 只读聚合 API | M5/M6 扩展同一 profile DTO 的 bundle/capability 和 mutation 字段，不新建第二套 profile show |
-| typed k=v + daemon-owned CRUD | M6 profile/distro/repo CRUD 复用 patch/revision/ConfigRuntime，不得 CLI 直写文件 |
+| typed k=v + daemon-owned CRUD | M6 profile/repo CRUD 复用 patch/revision/ConfigRuntime；distro 继续只由 ISO 导入事务维护，不得 CLI 直写文件 |
 | ConfigSnapshot pinning | DHCP/TFTP/HTTP/M5 worker 都必须 acquire/release，不得借用 replace 后悬空 slice |
 | 长生命周期状态所有权 | BootSession/store/队列拥有身份字段，只记录 config revision/digest；M5–M7 不得以长时间 pin 整个 snapshot 代替深拷贝 |
 | session resume | M5 installer/diskless delivery 可复用 hash/TTL/checkpoint 基础设施；M7 agent/finalizer 必须使用独立 enrollment/credential namespace，只复用持久化模式，不复用 installer token |
@@ -919,7 +934,8 @@ ConfigRuntime 不等于所有字段都热生效，bind/port/root/TFTP 参数仍�
 
 ## 16. M4.3 总验收标准
 
-1. 无 `repository` 的 Kylin `.treeinfo` 仍能识别 `distro=kylin` 并导入 ISO/kernel/initrd；catalog repo 列表可空。
+1. setup 后空 distro 索引可直接导入首个 ISO；无 `repository` 的 Kylin `.treeinfo` 仍能识别
+   `distro=kylin`，并在同一事务创建 distro tuple、ISO/kernel/initrd/install source；catalog repo 列表可空。
 2. Rocky 8.4、CentOS 8.4 同时导入后拥有不同 logical name、目录和 catalog tuple，均不被归一成对方。
 3. 同一 SHA-256 ISO 重复导入返回幂等成功且不复制；同名不同 SHA 返回稳定 409；不同 name 可并存。
 4. 已有目录迁移通过成功/幂等回归，并新增双边有数据、非目录和 symlink 边界测试；现行 M5–M7 文档不再引用旧路径。

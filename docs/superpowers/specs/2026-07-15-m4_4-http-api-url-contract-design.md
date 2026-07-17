@@ -144,8 +144,9 @@ M4.4 不追求教条式 REST；耗时验证、迁移计划和 install generation
 | GET | `/api/v1/management/runtime/tftp/sessions` | TFTP sessions |
 | GET | `/api/v1/management/runtime/dhcp/leases` | lease；`scope=all|unclaimed` |
 
-M4.3 已取消 reload 式 node CRUD，因此 `/management/config/reload` 直接删除，不迁移为新 URL。M6 的 profile/distro/
-repository 写 API 和完整 config diff/apply 必须沿用上述 collection、revision 和 action-resource 规则。
+M4.3 已取消 reload 式 node CRUD，因此 `/management/config/reload` 直接删除，不迁移为新 URL。M6 的
+profile/repository 写 API、distro 派生索引只读视图和完整 config diff/apply 必须沿用上述 collection、revision
+和 action-resource 规则；不增加 distro 写 API。
 
 所有 management path 在 route match 之前继续执行 direct peer `127.0.0.1` 校验；不能因 path 重构信任
 `X-Forwarded-For` 或开放远程 endpoint。
@@ -337,7 +338,7 @@ cache policy、log class、handler。启动/测试时检查：
 | --- | --- |
 | M4.3 | profile list/show 和新增 nodes/catalog/config/install-source/operation API 直接采用 §5 canonical 路径；BootSession 保留 owned plan/model revision，但 M4.4 切换要求先清空 M4.3 session state |
 | M5 | rootfs 从首次交付起只实现 node-bound canonical URL；boot/rootfs bundle 生成器只输出 `/artifacts` 和 node API |
-| M6 | NoCloud 新版本仍使用显式 leaf；PXELINUX 只输出 canonical artifact/install-config URL；profile/distro/repository CRUD 继承管理 collection 规则 |
+| M6 | NoCloud 新版本仍使用显式 leaf；PXELINUX 只输出 canonical artifact/install-config URL；profile/repository CRUD 与 distro 派生索引只读视图继承管理 collection 规则 |
 | M7 | agent/finalizer 不复用 installer endpoint 或 capability；provision API 使用独立 management collections |
 
 M4.4 不改变 M4.3 的 authentication proof、generation、distro/family、catalog logical name 或 ModelRuntime 事务语义；

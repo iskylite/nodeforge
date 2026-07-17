@@ -6,7 +6,7 @@
 //!
 //! M3.6 完整责任链：
 //! `CLI fstat → atomic staging copy → daemon constrained open/hash →
-//! readonly loop mount → distro detection/optional assertion →
+//! readonly loop mount → family/layout validation + tuple detection/optional override →
 //! kernel/initrd/repo staging → checksums → catalog candidate validation +
 //! atomic replacement → stage cleanup`
 //!
@@ -15,13 +15,12 @@
 
 const std = @import("std");
 const model = @import("../model.zig");
-const lookup = @import("../catalog.zig");
 const paths = @import("../paths.zig");
 const assets = @import("../assets/validate.zig");
 
 /// 导入请求。filename 是 CLI 已暂存到 import_dir 的不透明文件名。
-/// distro/version/arch 是可选的操作员断言：导入器从可信媒体元数据检测三元组，
-/// 如果提供的断言值与检测结果不一致，导入被拒绝（error.MediaTupleMismatch）。
+/// distro/version/arch 是可选覆盖。family 始终由经过结构校验的 ISO 布局决定；
+/// 已知产品从媒体标签映射，未知产品只有提供 `distro` 时才继续。
 pub const Request = struct {
     filename: []const u8,
     name: ?[]const u8 = null,
@@ -40,6 +39,8 @@ pub const Request = struct {
 /// 调用方负责将这些对象原子发布到 catalog 快照。
 pub const Result = struct {
     source_name: []const u8,
+    /// family 由 ISO 的 Anaconda/.treeinfo 或 Subiquity/casper 布局确定。
+    family: model.DistroFamily,
     /// M4.2 F3: optional operator-friendly label for the install source.
     source_label: ?[]const u8 = null,
     iso_asset: model.AssetConfig,
@@ -49,14 +50,14 @@ pub const Result = struct {
     install_source: model.InstallSourceConfig,
 };
 
-/// 导入一个 Rocky/RHEL 或 Ubuntu DVD ISO。
+/// 导入一个已支持布局的 Anaconda/RHEL-family 或 Ubuntu Server ISO。
 ///
 /// 完整流程：
 /// 1. 校验 filename 安全性（无路径分隔符、无 `..`、无 null 字节）
 /// 2. 在受管 import_dir 内计算 ISO SHA-256（验证文件是普通非符号链接文件）
 /// 3. 创建随机 tag 的临时工作目录（mount point + staged repo）
 /// 4. 只读 loop mount ISO（先尝试 iso9660，失败再尝试 udf）
-/// 5. 从媒体元数据检测 distro/version/arch（Rocky .treeinfo 或 Ubuntu .disk/info）
+/// 5. 从媒体布局确定 family，并从元数据检测 distro/version/arch；未知产品标签可由请求覆盖
 /// 6. 将 mount 内容复制到 staged repo
 /// 7. 卸载 ISO
 /// 8. 将 kernel/initrd/ISO/repo 复制到各自的受管目标目录（NoClobber 防止覆盖）
@@ -104,7 +105,13 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     try unmountIso(io, allocator, mount_point);
     mounted = false;
 
-    const source_name = if (request.name) |name| try allocator.dupe(u8, name) else try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-iso", .{ detected.distro, detected.version, @tagName(detected.arch) });
+    const source_name = if (request.name) |name|
+        try allocator.dupe(u8, name)
+    else blk: {
+        const version_slug = try logicalComponent(allocator, detected.version);
+        defer allocator.free(version_slug);
+        break :blk try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-iso", .{ detected.distro, version_slug, @tagName(detected.arch) });
+    };
     const iso_rel = try allocator.dupe(u8, request.filename);
     const kernel_rel = try std.fmt.allocPrint(allocator, "install/{s}/vmlinuz", .{source_name});
     const initrd_rel = try std.fmt.allocPrint(allocator, "install/{s}/initrd.img", .{source_name});
@@ -156,15 +163,15 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     } else &.{};
     const distro_name = try allocator.dupe(u8, detected.distro);
     const distro_version = try allocator.dupe(u8, detected.version);
-    const version_capability = lookup.findDistroVersion(config, detected.distro, detected.version, detected.arch) orelse return error.MediaTupleMismatch;
     const media_tree_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ config.server.server_ip, config.server.http_port, source_name });
     const result: Result = .{
         .source_name = source_name,
+        .family = detected.family,
         .source_label = detected.source_label,
         .iso_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .kind = .iso, .path = iso_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &iso_hash) },
         .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
         .initrd_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .kind = .installer_initrd, .path = initrd_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &initrd_hash) },
-        .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = version_capability.package_manager, .base_url = if (base.len == 0) try allocator.dupe(u8, media_tree_url) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base }) } else null,
+        .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = model.packageManagerForFamily(detected.family), .base_url = if (base.len == 0) try allocator.dupe(u8, media_tree_url) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base }) } else null,
         .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names },
     };
     retain_outputs = true;
@@ -223,49 +230,36 @@ const DetectedMedia = struct {
     layout: MediaLayout,
 };
 
-/// 从挂载的 ISO 检测 distro/version/arch 和媒体布局。
+/// 从挂载的 ISO 检测 family/distro/version/arch 和媒体布局。
 ///
-/// 检测顺序：先尝试 Rocky .treeinfo（结构化元数据更强），
-/// 非 Rocky ISO 则回退到 Ubuntu live-server 标记文件 .disk/info。
-/// 如果操作员提供了断言值，检测结果必须与之匹配，否则拒绝导入。
+/// 检测顺序：先尝试 Anaconda `.treeinfo`（结构化元数据更强），
+/// 没有 `.treeinfo` 时回退到 Ubuntu live-server 的 `.disk/info`/casper 布局。
+/// CLI tuple 是元数据覆盖，不能覆盖由已验证媒体布局确定的 family。
 fn detectMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, requested: Request) !DetectedMedia {
-    // Rocky 的 `.treeinfo` 是明确的结构化元数据，比文件名有更强的认证保证。
-    // 先尝试它；非 Rocky ISO 会回退到 Ubuntu live-server 标记文件。
+    // Anaconda 的 `.treeinfo` 是明确的结构化元数据，比文件名有更强的识别保证。
+    // 只有不存在 `.treeinfo` 时才回退到 Ubuntu live-server 标记文件。
     var detected: DetectedMedia = undefined;
-    if (detectRockyMedia(io, allocator, mount_point)) |rocky| {
-        detected = rocky;
+    if (detectRhelMedia(io, allocator, mount_point, requested)) |rhel| {
+        detected = rhel;
     } else |err| switch (err) {
-        error.FileNotFound, error.MediaMetadataMissing, error.MediaTupleMismatch => {
-            detected = try detectUbuntuMedia(io, allocator, mount_point);
+        error.FileNotFound => {
+            detected = try detectUbuntuMedia(io, allocator, mount_point, requested);
         },
         else => return err,
     }
-    // M4.2 F3: operator assertions override detected values (not reject on mismatch).
-    applyRequestedTuple(requested, &detected);
     return detected;
 }
 
-/// M4.2 F3：将操作员提供的三元组作为覆盖应用到检测到的媒体信息上。
-/// 当操作员提供 distro/version/arch 时，覆盖检测值。这使得可以导入
-/// 元数据模糊或不完整的介质（例如自定义 RHEL 重建版使用非标准
-/// .treeinfo family 字符串）。
-/// 空字段保持检测值不变。
-fn applyRequestedTuple(requested: Request, detected: *DetectedMedia) void {
-    if (requested.distro) |value| detected.distro = value;
-    if (requested.version) |value| detected.version = value;
-    if (requested.arch) |value| detected.arch = value;
-}
-
-/// 从 Rocky/RHEL ISO 的 `.treeinfo` 检测媒体信息。
+/// 从 Anaconda/RHEL-family ISO 的 `.treeinfo` 检测媒体信息。
 ///
 /// `.treeinfo` 是 INI 格式文件，包含 arch/family/version/repository 等字段。
 /// 检测步骤：
 /// 1. 验证 `.treeinfo`、`images/pxeboot/vmlinuz`、`images/pxeboot/initrd.img` 存在
 /// 2. 读取 `.treeinfo` 并提取 repository/version/arch
 /// 3. 验证 repository 路径安全性和 repomd.xml 存在
-/// 4. 验证 family 前缀为 "Rocky"
-/// 5. 解析 arch 为 model.Arch 枚举
-fn detectRockyMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8) !DetectedMedia {
+/// 4. 将已知 family 标签映射为产品 id；未知标签仅在 `--distro` 覆盖时接受
+/// 5. 解析 arch 为 model.Arch 枚举；family 固定为 rhel
+fn detectRhelMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, requested: Request) !DetectedMedia {
     _ = try assets.verifyRegularFile(io, mount_point, ".treeinfo");
     _ = try assets.verifyRegularFile(io, mount_point, "images/pxeboot/vmlinuz");
     _ = try assets.verifyRegularFile(io, mount_point, "images/pxeboot/initrd.img");
@@ -282,21 +276,25 @@ fn detectRockyMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []con
     else
         try std.fmt.allocPrint(allocator, "{s}/repodata/repomd.xml", .{repository_path});
     defer allocator.free(repomd_path);
-    const family = rhelFamily(treeinfo) orelse return error.MediaTupleMismatch;
-    const distro = distroForRhelFamily(family) orelse return error.MediaTupleMismatch;
+    const product_label = valueFor(treeinfo, "family");
+    const distro = requested.distro orelse
+        (if (product_label) |label| distroForRhelFamily(label) else null) orelse
+        return error.MediaTupleMismatch;
     const has_repository = blk: {
         _ = assets.verifyRegularFile(io, mount_point, repomd_path) catch break :blk false;
         break :blk true;
     };
-    const version = valueFor(treeinfo, "version") orelse return error.MediaMetadataMissing;
-    const arch_text = valueFor(treeinfo, "arch") orelse return error.MediaMetadataMissing;
-    const arch = std.meta.stringToEnum(model.Arch, arch_text) orelse return error.UnsupportedImportArchitecture;
+    const version = requested.version orelse valueFor(treeinfo, "version") orelse return error.MediaTupleMismatch;
+    const arch = requested.arch orelse blk: {
+        const arch_text = valueFor(treeinfo, "arch") orelse return error.MediaTupleMismatch;
+        break :blk std.meta.stringToEnum(model.Arch, arch_text) orelse return error.UnsupportedImportArchitecture;
+    };
     return .{
         .family = .rhel,
         .distro = distro,
         .version = try allocator.dupe(u8, version),
         .arch = arch,
-        .source_label = try allocator.dupe(u8, family),
+        .source_label = if (product_label) |label| try allocator.dupe(u8, label) else null,
         .layout = .{ .kernel_path = "images/pxeboot/vmlinuz", .initrd_path = "images/pxeboot/initrd.img", .repository_base = if (has_repository) try allocator.dupe(u8, repository_path) else null },
     };
 }
@@ -316,17 +314,12 @@ fn detectRockyMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []con
 /// 1. 验证必需文件存在（含 casper squashfs）
 /// 2. 读取 `.disk/info` 并解析 distro/version/arch
 /// 3. 版本截取到 major.minor（如 `22.04`），去除 patch 组件
-/// 4. 始终发布 ISO 内容作为 APT repository（即使不完整）
+/// 4. 始终发布 ISO 媒体树；仅在 APT metadata 完整时创建 repository
 ///
 /// Ubuntu live-server ISO 通常包含 dists/ 和 pool/ 目录，但某些定制或
-/// minimal ISO 可能缺少完整的 APT metadata。即使如此，也必须发布 ISO
-/// 内容并创建 repository 条目：
-/// - autoinstall user-data 中的 apt.primary 需要一个 URL 来阻止
-///   Subiquity 回退到 archive.ubuntu.com（隔离网段会长时间超时）
-/// - 如果 ISO 确实有 apt metadata，apt 能正常工作
-/// - 如果没有，apt 请求会快速返回 404（而非 DNS 超时），安装器可
-///   在合理时间内继续或报告明确错误
-fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8) !DetectedMedia {
+/// minimal ISO 可能缺少完整的 APT metadata。此时媒体树仍供 casper 和
+/// Subiquity offline-install 使用，但不能登记成可消费的 apt repository。
+fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, requested: Request) !DetectedMedia {
     _ = try assets.verifyRegularFile(io, mount_point, ".disk/info");
     _ = try assets.verifyRegularFile(io, mount_point, "casper/vmlinuz");
     _ = try assets.verifyRegularFile(io, mount_point, "casper/initrd");
@@ -339,18 +332,20 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
     defer allocator.free(info_path);
     const info = try std.Io.Dir.cwd().readFileAlloc(io, info_path, allocator, .limited(64 * 1024));
     defer allocator.free(info);
-    const tuple = parseUbuntuDiskInfo(info) orelse return error.MediaTupleMismatch;
-    // ubuntuRepositoryComplete 检测 ISO 是否有完整 APT metadata（dists/pool/Release）。
-    // 检测结果保留用于诊断，但不再决定是否创建 repository——Ubuntu ISO 始终创建。
-    const has_repository = try ubuntuRepositoryComplete(io, allocator, mount_point, tuple.version, tuple.arch);
+    const detected_tuple = parseUbuntuDiskInfo(info);
+    const distro = requested.distro orelse if (detected_tuple != null) "ubuntu" else return error.MediaTupleMismatch;
+    const version = requested.version orelse if (detected_tuple) |tuple| tuple.version else return error.MediaTupleMismatch;
+    const arch = requested.arch orelse if (detected_tuple) |tuple| tuple.arch else return error.MediaTupleMismatch;
+    // 只有完整的 dists/pool/Release 才能发布 apt repository；媒体树本身
+    // 无论如何都会通过 install source 发布。
+    const has_repository = try ubuntuRepositoryComplete(io, allocator, mount_point, version, arch);
     return .{
         .family = .ubuntu,
-        .distro = "ubuntu",
-        .version = try allocator.dupe(u8, tuple.version),
-        .arch = tuple.arch,
-        // Ubuntu ISO 始终以根目录作为 repository_base（空字符串表示根）。
-        // 即使 ISO 没有 dists/pool，发布 ISO 内容仍能让 apt 快速失败
-        // 而非挂起在 DNS 超时上。
+        .distro = distro,
+        .version = try allocator.dupe(u8, version),
+        .arch = arch,
+        // 空字符串表示 ISO 根目录是完整 apt repository；null 表示仅发布
+        // installer media tree，不把不完整内容伪装成包仓库。
         .layout = .{ .kernel_path = "casper/vmlinuz", .initrd_path = "casper/initrd", .repository_base = if (has_repository) "" else null },
     };
 }
@@ -361,6 +356,15 @@ fn distroForRhelFamily(family: []const u8) ?[]const u8 {
         .{ .prefix = "CentOS", .distro = "centos" },
         .{ .prefix = "AlmaLinux", .distro = "alma" },
         .{ .prefix = "Red Hat Enterprise Linux", .distro = "rhel" },
+        .{ .prefix = "RedHatEnterpriseLinux", .distro = "rhel" },
+        .{ .prefix = "RedHatEnterpriseServer", .distro = "rhel" },
+        .{ .prefix = "Fedora", .distro = "fedora" },
+        .{ .prefix = "Oracle Linux", .distro = "oraclelinux" },
+        .{ .prefix = "OracleLinux", .distro = "oraclelinux" },
+        .{ .prefix = "Scientific Linux", .distro = "scientificlinux" },
+        .{ .prefix = "ScientificLinux", .distro = "scientificlinux" },
+        .{ .prefix = "CloudLinux", .distro = "cloudlinux" },
+        .{ .prefix = "EuroLinux", .distro = "eurolinux" },
         .{ .prefix = "Kylin Linux Advanced Server", .distro = "kylin" },
         .{ .prefix = "Kylin", .distro = "kylin" },
         .{ .prefix = "openEuler", .distro = "openeuler" },
@@ -370,6 +374,8 @@ fn distroForRhelFamily(family: []const u8) ?[]const u8 {
         .{ .prefix = "UOS", .distro = "uos" },
         .{ .prefix = "Sugon OS", .distro = "sugon" },
         .{ .prefix = "BigCloud-Enterprise-Linux", .distro = "bclinux" },
+        .{ .prefix = "TurboLinux", .distro = "turbolinux" },
+        .{ .prefix = "npserver", .distro = "npserver" },
     };
     for (mappings) |mapping| if (std.mem.startsWith(u8, family, mapping.prefix)) return mapping.distro;
     return null;
@@ -446,44 +452,6 @@ fn containsValue(text: []const u8, key: []const u8, expected: []const u8) bool {
     return std.mem.eql(u8, value, expected);
 }
 
-fn containsPrefixValue(text: []const u8, key: []const u8, expected_prefix: []const u8) bool {
-    const value = valueFor(text, key) orelse return false;
-    return std.mem.startsWith(u8, value, expected_prefix);
-}
-
-/// M4.2 F3：.treeinfo `family` 字段的 RHEL 系白名单。
-/// 接受 Rocky、CentOS、AlmaLinux 和 Red Hat Enterprise Linux 重建版。
-/// 这取代了硬编码的 `Rocky` 前缀检查，允许导入共享相同 .treeinfo
-/// 结构和 Anaconda 安装器布局的 CentOS/Alma/RHEL 介质。
-fn rhelFamily(treeinfo: []const u8) ?[]const u8 {
-    const family = valueFor(treeinfo, "family") orelse return null;
-    const whitelisted = [_][]const u8{
-        "Rocky",
-        "CentOS",
-        "AlmaLinux",
-        "Red Hat Enterprise Linux",
-        "Fedora",
-        "openEuler",
-        "Kylin",
-        "Kylin Linux Advanced Server",
-        "TencentOS",
-        "TencentOS-Server",
-        "AnolisOS",
-        "UnionTech OS Server",
-        "UOS Server",
-        "npserver",
-        "TurboLinux",
-        "Sugon OS",
-        "BigCloud-Enterprise-Linux",
-    };
-    for (whitelisted) |prefix| if (std.mem.startsWith(u8, family, prefix)) return family;
-    return null;
-}
-
-fn rhelFamilyWhitelisted(treeinfo: []const u8) bool {
-    return rhelFamily(treeinfo) != null;
-}
-
 fn valueFor(text: []const u8, key: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -492,6 +460,33 @@ fn valueFor(text: []const u8, key: []const u8) ?[]const u8 {
         return std.mem.trim(u8, line[equal + 1 ..], " \t\r");
     }
     return null;
+}
+
+/// 把媒体版本转换为可用于自动 logical id 的稳定小写分量。
+/// catalog 中仍保留 ISO 元数据的原始版本文本；这里只规范化自动名称。
+fn logicalComponent(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    if (value.len == 0) return error.MediaTupleMismatch;
+    const output = try allocator.alloc(u8, value.len);
+    errdefer allocator.free(output);
+    var written: usize = 0;
+    var separator = false;
+    for (value) |byte| {
+        const lowered = std.ascii.toLower(byte);
+        if (std.ascii.isAlphanumeric(lowered) or lowered == '.' or lowered == '_' or lowered == '-') {
+            if (separator and written != 0 and output[written - 1] != '-') {
+                output[written] = '-';
+                written += 1;
+            }
+            separator = false;
+            output[written] = lowered;
+            written += 1;
+        } else {
+            separator = true;
+        }
+    }
+    while (written != 0 and (output[written - 1] == '-' or output[written - 1] == '.' or output[written - 1] == '_')) written -= 1;
+    if (written == 0) return error.MediaTupleMismatch;
+    return output[0..written];
 }
 
 /// `.treeinfo` 使用 `key = value` 格式，而 Debian/Ubuntu Release 元数据使用
@@ -581,7 +576,7 @@ test "import metadata parser accepts Rocky Minimal repository layout" {
         \\repository = Minimal
         \\version = 9.7
     ;
-    try std.testing.expect(rhelFamilyWhitelisted(treeinfo));
+    try std.testing.expectEqualStrings("rocky", distroForRhelFamily(valueFor(treeinfo, "family").?).?);
     try std.testing.expect(containsValue(treeinfo, "version", "9.7"));
     try std.testing.expectEqualStrings("Minimal", valueFor(treeinfo, "repository").?);
     try std.testing.expect(safeFilename("Rocky-9.7-aarch64-minimal.iso"));
@@ -595,8 +590,40 @@ test "Kylin media family is normalized while preserving its source label" {
         \\family = Kylin Linux Advanced Server
         \\version = V10
     ;
-    try std.testing.expectEqualStrings("Kylin Linux Advanced Server", rhelFamily(treeinfo).?);
+    try std.testing.expectEqualStrings("kylin", distroForRhelFamily(valueFor(treeinfo, "family").?).?);
     try std.testing.expect(valueFor(treeinfo, "repository") == null);
+}
+
+test "known RHEL-family products map automatically and unknown products require override" {
+    const cases = [_]struct { label: []const u8, distro: []const u8 }{
+        .{ .label = "Rocky Linux", .distro = "rocky" },
+        .{ .label = "CentOS Stream", .distro = "centos" },
+        .{ .label = "AlmaLinux", .distro = "alma" },
+        .{ .label = "Red Hat Enterprise Linux", .distro = "rhel" },
+        .{ .label = "RedHatEnterpriseServer", .distro = "rhel" },
+        .{ .label = "Fedora Server", .distro = "fedora" },
+        .{ .label = "Oracle Linux Server", .distro = "oraclelinux" },
+        .{ .label = "ScientificLinux", .distro = "scientificlinux" },
+        .{ .label = "CloudLinux", .distro = "cloudlinux" },
+        .{ .label = "EuroLinux", .distro = "eurolinux" },
+        .{ .label = "Kylin Linux Advanced Server", .distro = "kylin" },
+        .{ .label = "openEuler", .distro = "openeuler" },
+        .{ .label = "TencentOS Server", .distro = "tencentos" },
+        .{ .label = "AnolisOS", .distro = "anolis" },
+        .{ .label = "UnionTech OS Server", .distro = "uos" },
+        .{ .label = "Sugon OS", .distro = "sugon" },
+        .{ .label = "BigCloud-Enterprise-Linux", .distro = "bclinux" },
+        .{ .label = "TurboLinux", .distro = "turbolinux" },
+        .{ .label = "npserver", .distro = "npserver" },
+    };
+    for (cases) |item| try std.testing.expectEqualStrings(item.distro, distroForRhelFamily(item.label).?);
+    try std.testing.expect(distroForRhelFamily("Example Enterprise Linux") == null);
+}
+
+test "automatic media name canonicalizes vendor version text" {
+    const value = try logicalComponent(std.testing.allocator, "V10 SP3");
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("v10-sp3", value);
 }
 
 test "Ubuntu media metadata uses ISO architecture spelling" {
@@ -615,10 +642,4 @@ test "Ubuntu disk metadata detects the profile tuple without CLI flags" {
     const tuple = parseUbuntuDiskInfo("Ubuntu-Server 22.04.5 LTS \"Jammy Jellyfish\" - Release arm64 (20230810)").?;
     try std.testing.expectEqualStrings("22.04", tuple.version);
     try std.testing.expectEqual(model.Arch.aarch64, tuple.arch);
-    var detected: DetectedMedia = .{ .family = .ubuntu, .distro = "ubuntu", .version = tuple.version, .arch = tuple.arch, .layout = undefined };
-    applyRequestedTuple(.{ .filename = "fixture.iso" }, &detected);
-    try std.testing.expectEqualStrings("ubuntu", detected.distro);
-    var overridden: DetectedMedia = .{ .family = .ubuntu, .distro = "ubuntu", .version = tuple.version, .arch = tuple.arch, .layout = undefined };
-    applyRequestedTuple(.{ .filename = "fixture.iso", .distro = "rocky" }, &overridden);
-    try std.testing.expectEqualStrings("rocky", overridden.distro);
 }

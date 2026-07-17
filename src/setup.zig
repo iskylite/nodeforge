@@ -65,6 +65,8 @@ pub fn installBundle(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
 
 pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths, network: Network) !void {
     const config = generatedConfig(p, network);
+    // 空 distro 索引是正常的首次安装状态；首个通过媒体布局校验的 ISO
+    // 会与 install source 一起原子创建对应 family/version/arch 能力记录。
     const catalog: model.Catalog = .{};
     try validate.validate(&config, &catalog);
     try installBundle(io, allocator, p);

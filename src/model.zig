@@ -203,6 +203,22 @@ pub const InstallAdapter = enum { kickstart, autoinstall };
 /// 基础源及额外标准包使用的包管理器。
 pub const PackageManager = enum { dnf, apt };
 
+/// family 是安装机制的唯一事实源；这些能力不是操作员输入。
+pub fn installAdapterForFamily(family: DistroFamily) InstallAdapter {
+    return switch (family) {
+        .rhel => .kickstart,
+        .ubuntu => .autoinstall,
+    };
+}
+
+/// family 是仓库类型的唯一事实源；ISO 导入据此生成 dnf/apt repository。
+pub fn packageManagerForFamily(family: DistroFamily) PackageManager {
+    return switch (family) {
+        .rhel => .dnf,
+        .ubuntu => .apt,
+    };
+}
+
 /// 资产类型用于阻止把 ISO、内核和 initrd 错接到其他位置。
 pub const AssetKind = enum { iso, bootloader, kernel, installer_initrd, nodeforge_initrd, rootfs, gpg_key };
 
@@ -212,7 +228,8 @@ pub const ProfileMode = enum { discovery, install, diskless };
 /// 未知节点没有显式绑定时的处理方式；永远不允许默认为 install。
 pub const DiscoveryAction = enum { wait, discovery, diskless, deny };
 
-/// 一个发行版名称下可以声明多个受支持版本。
+/// ISO 导入后自动形成的发行版能力索引。它不是要求操作员先创建的策略对象；
+/// 同一产品的新版本/架构由导入事务增量补齐。
 pub const DistroConfig = struct {
     /// 稳定短名称，例如 rocky、alma、rhel、fedora 或 ubuntu。
     name: []const u8,
@@ -222,7 +239,8 @@ pub const DistroConfig = struct {
     versions: []const DistroVersionConfig = &.{},
 };
 
-/// 发行版版本与架构能力矩阵。
+/// 发行版版本与架构能力矩阵。adapter/package manager 由 family 唯一派生，
+/// 保留在持久模型中用于自描述导出和旧 schema 兼容。
 pub const DistroVersionConfig = struct {
     /// 上游版本字符串，保留 9.7、22.04 这类原始表达。
     version: []const u8,

@@ -57,9 +57,14 @@ grep -Fq 'Architecture, used with --distro and --version; e.g. aarch64' "$tmp/as
 
 "$cli" assets import --help >"$tmp/assets-import-help"
 grep -Fq 'Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso' "$tmp/assets-import-help"
-grep -Fq 'Override auto-detected distro; e.g. rocky, ubuntu, debian' "$tmp/assets-import-help"
+grep -Fq 'Override an unknown or ambiguous product id; e.g. rocky, kylin, ubuntu. Family still comes from ISO layout' "$tmp/assets-import-help"
+grep -Fq 'atomically publishes the distro tuple with the install source' "$tmp/assets-import-help"
 if grep -Fq 'relative to /opt/nodeforge/work/import' "$tmp/assets-import-help"; then
     echo "assets import must accept an arbitrary ISO path" >&2
+    exit 1
+fi
+if "$cli" distro --help >"$tmp/distro-help" 2>&1; then
+    echo "distro must be derived by ISO import, not exposed as a standalone command" >&2
     exit 1
 fi
 
