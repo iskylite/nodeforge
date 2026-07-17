@@ -35,7 +35,7 @@ zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe
 
 测试必须确认：
 
-- 202/202 单元、CLI、setup 与 HTTP 合约通过；
+- 单元、CLI、setup 与 HTTP 合约通过（M4.7 当时基线 202/202；M4.8 与 ISO distro 自动派生后增至 224/224，以 `zig build test --summary all` 为准）；
 - host ReleaseSafe 与 aarch64-linux-gnu ReleaseSafe 构建通过；
 - `tests/setup.sh` 覆盖 custom root、成对 bundle、schema/manifest、systemd render、reset backup、partial bundle
   fail-closed、legacy migration 和 migration resume；

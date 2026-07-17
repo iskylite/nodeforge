@@ -213,11 +213,11 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
         if (decision.reserved_ip != null) return reply;
         // 正在续约自身活动 lease 的客户端会（正确地）回答该地址的 ICMP 探测。
         // 将此回复视为冲突会在 Anaconda 上线时放弃安装器的活动 lease。
-        if (runtime.dhcp.ownsActiveLease(request.mac(), reply.yiaddr, now())) return reply;
+        if (runtime.dhcp.ownsActiveLease(request.mac(), reply.yiaddr, boot_session.monotonicNow())) return reply;
         switch (probe.ping(io, reply.yiaddr, config.dhcp.ping_timeout_ms)) {
             .clear => return reply,
             .occupied => {
-                _ = runtime.dhcp.decline(request.mac(), now(), config.dhcp.abandon_seconds);
+                _ = runtime.dhcp.decline(request.mac(), boot_session.monotonicNow(), config.dhcp.abandon_seconds);
                 audit(io, persistence, config, "dhcp.abandoned", request.message_type orelse .inform, .decline, request.mac(), reply.yiaddr, request.xid, request.architecture, session_link);
             },
             .unavailable => {
@@ -333,7 +333,7 @@ fn processWithDeployment(config: *const model.AppConfig, runtime: *runtime_state
             return null;
         },
         .decline => {
-            _ = runtime.dhcp.decline(client, now(), config.dhcp.abandon_seconds);
+            _ = runtime.dhcp.decline(client, boot_session.monotonicNow(), config.dhcp.abandon_seconds);
             return null;
         },
         .discover, .request => {},
@@ -344,8 +344,8 @@ fn processWithDeployment(config: *const model.AppConfig, runtime: *runtime_state
     const selected = static_ip orelse chooseLease(config, runtime, client, requested, decision.known, typ);
     if (selected == 0) return if (typ == .request) base(.nak, 0, server_ip, mask, config, null) else null;
     if (typ == .request and request.server_identifier != null and request.server_identifier.? != server_ip) return null;
-    if (typ == .discover and static_ip != null and runtime.dhcp.offer(client, selected, true, now(), config.dhcp.offer_seconds) == 0) return null;
-    if (typ == .request and !runtime.dhcp.acknowledge(client, selected, decision.known or static_ip != null, static_ip != null, now(), config.dhcp.lease_seconds)) return base(.nak, 0, server_ip, mask, config, null);
+    if (typ == .discover and static_ip != null and runtime.dhcp.offer(client, selected, true, boot_session.monotonicNow(), config.dhcp.offer_seconds) == 0) return null;
+    if (typ == .request and !runtime.dhcp.acknowledge(client, selected, decision.known or static_ip != null, static_ip != null, boot_session.monotonicNow(), config.dhcp.lease_seconds)) return base(.nak, 0, server_ip, mask, config, null);
     return base(if (typ == .discover) .offer else .ack, selected, server_ip, mask, config, decision.bootfile);
 }
 /// 从配置构建 DHCP Reply 基础结构，包含子网掩码、网关、DNS 和租约时长。
@@ -371,16 +371,18 @@ fn chooseLease(config: *const model.AppConfig, runtime: *runtime_state.RuntimeSt
     const first = parseIp(config.dhcp.pool_start) orelse return 0;
     const last = parseIp(config.dhcp.pool_end) orelse return 0;
     if (typ == .request and requested != 0) return requested;
-    if (requested != 0 and poolContains(config, requested) and !reservedForOther(config, requested, mac)) return runtime.dhcp.offer(mac, requested, known, now(), config.dhcp.offer_seconds);
+    if (requested != 0 and poolContains(config, requested) and !reservedForOther(config, requested, mac)) return runtime.dhcp.offer(mac, requested, known, boot_session.monotonicNow(), config.dhcp.offer_seconds);
     var ip = first;
     while (ip <= last) : (ip += 1) {
         if (reservedForOther(config, ip, mac)) continue;
-        const allocated = runtime.dhcp.offer(mac, ip, known, now(), config.dhcp.offer_seconds);
+        const allocated = runtime.dhcp.offer(mac, ip, known, boot_session.monotonicNow(), config.dhcp.offer_seconds);
         if (allocated != 0) return allocated;
     }
     return 0;
 }
-/// 返回当前 Unix 时间戳（秒）。用于 lease 过期计算。
+/// 返回当前 Unix 时间戳（秒）。用于审计事件、session/lease 检查点的墙钟
+/// 时间。lease 过期判断改用 `boot_session.monotonicNow()`（MONOTONIC），避免
+/// 系统时钟回拨导致活动 lease 不过期或 abandoned 隔离期异常延长。
 fn now() i64 {
     var ts: std.posix.timespec = undefined;
     return if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) == .SUCCESS) @intCast(ts.sec) else 0;
@@ -680,4 +682,41 @@ test "DHCP request events retain the received message type" {
     try std.testing.expectEqualStrings("dhcp.request", requestEvent(.request));
     try std.testing.expectEqualStrings("dhcp.release", requestEvent(.release));
     try std.testing.expectEqualStrings("dhcp.decline", requestEvent(.decline));
+}
+
+test "DHCP decline via process quarantines the lease as abandoned" {
+    // A4-M4：端到端验证 DECLINE 经 process() 进入 decline 分支，把活动 lease
+    // 标记为 abandoned 并设置隔离期，而不是静默丢弃或重新分配。
+    const config: model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+        .dhcp = .{ .pool_start = "192.168.50.100", .pool_end = "192.168.50.110", .abandon_seconds = 300 },
+    };
+    var runtime: runtime_state.RuntimeState = .{};
+    const mac = [_]u8{ 2, 0, 0, 0, 0, 7 };
+    const chaddr = mac ++ [_]u8{0} ** 10;
+    const base_pkt: packet.Packet = .{ .op = 1, .xid = 1, .flags = 0, .ciaddr = 0, .yiaddr = 0, .siaddr = 0, .giaddr = 0, .chaddr = chaddr, .hlen = 6, .architecture = .aarch64 };
+
+    var discover = base_pkt;
+    discover.message_type = .discover;
+    const offer = process(&config, &runtime, &discover).?;
+
+    var request = base_pkt;
+    request.message_type = .request;
+    request.requested_ip = offer.yiaddr;
+    _ = process(&config, &runtime, &request).?;
+
+    var decline = base_pkt;
+    decline.message_type = .decline;
+    try std.testing.expect(process(&config, &runtime, &decline) == null);
+
+    var leases: [runtime_state.DhcpState.max_leases]runtime_state.DhcpLease = undefined;
+    runtime.dhcp.snapshot(&leases);
+    var found = false;
+    for (leases) |lease| {
+        if (lease.matches(&mac) and lease.ip == offer.yiaddr) {
+            try std.testing.expectEqual(runtime_state.LeasePhase.abandoned, lease.phase);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
 }

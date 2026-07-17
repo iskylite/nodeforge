@@ -193,6 +193,7 @@ pub fn reconcileMigrationRecovery(io: std.Io, allocator: std.mem.Allocator, dire
         defer parsed.deinit();
         if (parsed.value.schema_version != 1 or parsed.value.plan_digest.len != 64) return error.InvalidOperationsState;
         lock(&store.mutex);
+        defer store.mutex.unlock();
         var matched = false;
         for (&store.entries) |*entry| if (entry.used() and entry.kind == .catalog_migration and std.mem.eql(u8, entry.requestDigestSlice(), parsed.value.plan_digest)) {
             entry.state = if (parsed.value.outcome == .committed) .succeeded else .failed;
@@ -210,7 +211,6 @@ pub fn reconcileMigrationRecovery(io: std.Io, allocator: std.mem.Allocator, dire
             matched = true;
             break;
         };
-        store.mutex.unlock();
         if (!matched) return error.MigrationOperationNotFound;
         count += 1;
     }

@@ -648,6 +648,19 @@ pub const Store = struct {
         return count;
     }
 
+    /// 释放 Store 持有的所有 install plan 快照。用于测试清理和显式销毁；
+    /// daemon 正常停机应优先用 terminateAll 把终态写入事件日志后再清空。
+    pub fn deinit(self: *Store) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (session.install_plan) |plan| {
+                plan.release();
+                session.install_plan = null;
+            }
+        }
+    }
+
     pub fn snapshot(self: *Store, destination: *[max_sessions]Session) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();

@@ -35,20 +35,20 @@ pub const AssetImport = struct {
 
 /// M3.6 ISO 导入请求。CLI 先将管理员拥有的任意 ISO 原子复制到 daemon
 /// 管控的 staging 目录；只有生成的不透明文件名被发送到本机管理端点。
-/// distro/version/arch 三个字段是可选的一致性断言，因为 daemon 会从 ISO
-/// 元数据（.treeinfo 或 .disk/info）自动检测并规范化三元组。如果操作员
-/// 提供了断言值但与检测结果不一致，daemon 拒绝导入。
+/// distro/version/arch 三个字段是可选覆盖。family 始终由 ISO 布局决定；
+/// daemon 从 .treeinfo 或 .disk/info 检测三元组，提供的值直接采用而不
+/// 与检测结果比对，用于已知布局但产品标签未知或元数据不完整的介质。
 pub const InstallSourceImport = struct {
     /// 已暂存到 import_dir 的 ISO 文件名（不含路径前缀），由 CLI 生成。
     filename: []const u8,
     content_sha256: []const u8,
     idempotency_key: []const u8,
     name: ?[]const u8 = null,
-    /// 可选的发行版断言；daemon 从 ISO 元数据检测后与之比对。
+    /// 可选的产品覆盖；daemon 在元数据无法识别产品时采用此值。
     distro: ?[]const u8 = null,
-    /// 可选的版本断言；daemon 从 ISO 元数据检测后与之比对。
+    /// 可选的版本覆盖；daemon 在元数据缺失版本时采用此值。
     version: ?[]const u8 = null,
-    /// 可选的架构断言；daemon 从 ISO 元数据检测后与之比对。
+    /// 可选的架构覆盖；daemon 在元数据缺失架构时采用此值。
     arch: ?[]const u8 = null,
 };
 

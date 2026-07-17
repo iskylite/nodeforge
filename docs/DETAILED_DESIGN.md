@@ -5771,7 +5771,7 @@ owner/mode 和真实 `/healthz` rollback 仍须按 `docs/M4_7_VALIDATION.md` 在
   `deployment_control.max_entries`（`src/state/deployment_control.zig:10`）。会话/lease
   打满后协议仍应答，但 TFTP 无法解析启动身份（`access_violation`），节点无法完成 PXE。
 - **TFTP `max_concurrent_transfers` 为全局上限**（`src/tftp/server.zig:107` 的单一原子计数器，
-  非文档所述 per-client），默认 4，校验封顶 64（`src/config/validate.zig:116`）。GRUB 的
+  非文档所述 per-client），默认 4，校验封顶 64（`src/config/validate.zig`）。GRUB 的
   TFTP 客户端不协商 RFC 7440 windowsize，每传输 RTT 限约 2 MB/s；initrd（133 MB）单传
   需 ~66 s。
 - **DHCP OFFER 前串行 ICMP ping**（`src/dhcp/server.zig:217`，`ping_timeout_ms` 默认 500），
@@ -5821,7 +5821,7 @@ owner/mode 和真实 `/healthz` rollback 仍须按 `docs/M4_7_VALIDATION.md` 在
 - 默认 = `max(128, 2 × cpu_cores)`，config 可覆盖。
 - 字段类型 `u8` -> `u16`（2×核在 ≥128 核机器会溢出 u8）。
 - 计数器 `active_transfers`（`src/tftp/server.zig:107`）：`std.atomic.Value(u8)` -> `Value(u16)`。
-- 移除 `src/config/validate.zig:116` 的 `> 64` 校验上限（否则 128 直接被拒）。
+- 移除 `src/config/validate.zig` 的 `> 64` 校验上限（否则 128 直接被拒）。
 - 启动时 `std.Thread.getCpuCount()` 派生核数。
 - 文档对齐：全局（非 per-client）+ auto 派生语义。
 - 吞吐：每传输 RTT 限 ~2 MB/s，聚合随并发线性增长至打满线。千兆下 64 并行即 ~128 MB/s

@@ -15,6 +15,7 @@
 const std = @import("std");
 const boot_session = @import("../state/boot_session.zig");
 const contracts = @import("contracts.zig");
+const config_validate = @import("../config/validate.zig");
 
 /// 认证方式类型。
 pub const Proof = enum {
@@ -47,12 +48,12 @@ pub fn parsePeerIpv4(value: []const u8) !u32 {
     };
 }
 
-/// 校验 node ID 是否只包含安全字符（字母、数字、连字符、下划线）。
-/// 长度限制 96 字符，防止过长的 ID 消耗资源。
+/// 校验 node ID 是否为 canonical logical id。与 config_validate.validNodeId
+/// 保持一致：小写 ASCII `[a-z0-9._-]`、首尾字母数字、不超过 96 字符。统一
+/// 字符集保证配置校验通过的 node id 一定能在 HTTP 路由中使用，且长度与
+/// boot session/status/deployment 的固定缓冲容量一致。
 pub fn nodeIdSafe(value: []const u8) bool {
-    if (value.len == 0 or value.len > 96) return false;
-    for (value) |byte| if (!((byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9') or byte == '-' or byte == '_')) return false;
-    return true;
+    return config_validate.validNodeId(value);
 }
 
 /// 从 Authorization header 值中提取 bearer token。
@@ -109,4 +110,9 @@ test "bearer parsing never accepts a token in another shape" {
     try std.testing.expectEqualStrings(token, bearer("Bearer " ++ token).?);
     try std.testing.expect(bearer(token) == null);
     try std.testing.expect(bearer("Bearer short") == null);
+}
+
+test "node route identity uses the runtime 96-byte boundary" {
+    try std.testing.expect(nodeIdSafe("n" ** config_validate.node_id_max_len));
+    try std.testing.expect(!nodeIdSafe("n" ** (config_validate.node_id_max_len + 1)));
 }

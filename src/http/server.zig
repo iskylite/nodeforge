@@ -332,7 +332,13 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/operations/")) |operation_id| return managementOperation(request, context, operation_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/operations")) return managementOperations(request, context, meta);
     var allow_buffer: [128]u8 = undefined;
-    if (routes.allowed(path, &allow_buffer)) |allow| return methodNotAllowed(request, allow, meta);
+    if (routes.allowed(path, &allow_buffer)) |allow| {
+        // 路径匹配已知通配符路由，但具体子路径无 handler（如
+        // `/install-config/foo`）。若方法本身被允许，语义是 404 而非 405：
+        // 告诉客户端「GET 可用」但 GET 刚刚不被处理是自相矛盾的。
+        if (routes.methodAllowed(path, method)) return notFound(request, meta);
+        return methodNotAllowed(request, allow, meta);
+    }
     return notFound(request, meta);
 }
 
@@ -480,6 +486,10 @@ fn staticFile(request: zap.Request, context: *const RouteContext, root: []const 
         request.setContentTypeFromFilename(relative) catch try request.setHeader("content-type", "application/octet-stream");
         var length: [20]u8 = undefined;
         try request.setHeader("content-length", try std.fmt.bufPrint(&length, "{d}", .{size}));
+        if (checksum) |hash| {
+            var etag: [68]u8 = undefined;
+            try request.setHeader("etag", try std.fmt.bufPrint(&etag, "\"{s}\"", .{hash}));
+        }
         try request.sendBody("");
         file.close(context.io);
         recordStaticCompletion("HEAD", request_path, context, relative, 200, 0, size, meta);
@@ -2433,6 +2443,11 @@ fn tftpSessions(request: zap.Request, runtime: *const runtime_state.RuntimeState
 fn dhcpLeases(request: zap.Request, allocator: std.mem.Allocator, runtime: *const runtime_state.RuntimeState, unknown_only: bool, meta: RequestMeta) !void {
     var leases: [runtime_state.DhcpState.max_leases]runtime_state.DhcpLease = undefined;
     @constCast(&runtime.dhcp).snapshot(&leases);
+    // Runtime lease deadlines use MONOTONIC, but `expires_at` is a public Unix
+    // timestamp. Sample both clocks once so every row in this response shares
+    // the same conversion basis.
+    const realtime_now = unixNow();
+    const monotonic_now = boot_session.monotonicNow();
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try output.writer.writeAll("{\"ok\":true,\"result\":{\"leases\":[");
@@ -2454,11 +2469,20 @@ fn dhcpLeases(request: zap.Request, allocator: std.mem.Allocator, runtime: *cons
             lease.mac[3],
             lease.mac[4],
             lease.mac[5],
-            lease.expires_at,
+            monotonicExpiryToUnix(lease.expires_at, realtime_now, monotonic_now),
         });
     }
     try output.writer.writeAll("]}}\n");
     try json(request, .ok, output.written(), meta);
+}
+
+fn monotonicExpiryToUnix(expires_at: i64, realtime_now: i64, monotonic_now: i64) i64 {
+    return realtime_now + (expires_at - monotonic_now);
+}
+
+test "DHCP management expiry projects monotonic deadlines as Unix time" {
+    try std.testing.expectEqual(@as(i64, 2100), monotonicExpiryToUnix(1100, 2000, 1000));
+    try std.testing.expectEqual(@as(i64, 1990), monotonicExpiryToUnix(990, 2000, 1000));
 }
 
 /// 使用 NodeForge 的稳定错误信封渲染配置校验失败。

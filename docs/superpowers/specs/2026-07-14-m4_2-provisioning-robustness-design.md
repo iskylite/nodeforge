@@ -22,6 +22,18 @@
 > 本稿仅保留当时实现语义，现行 URL 以 M4.4 专项设计为准。
 > 新契约见 `2026-07-15-m4_3-model-runtime-observability-design.md`；与本稿冲突时以 M4.3 为准。
 
+> **后续修订（2026-07-17，M4.8 并发容量与 TFTP 配置收口）**：本稿以下过渡契约
+> 已被 M4.8 取代，现行实现以 `2026-07-17-concurrency-capacity-scaling-design.md`
+> 和 DETAILED_DESIGN.md §9.17 为准：
+> (1) §7.2「per-client 并发」实际为全局并发（`tftp/server.zig` 单一原子计数器）；
+> §7.3 的 `max_concurrent_transfers: u8 = 4` 已改为 `?u16 = null`（auto 派生
+> `max(128, 2×核)`，仅拒绝 0），`> 64` 上限已移除。
+> (2) §7.3 `http_accel: bool = true` 已纠正为 `false`（与 §7.3.1「默认禁用」一致）。
+> (3) §7.4「客户端省略 blksize 时的主动建议」已在 M4.3 删除：服务端不主动建议
+> 未请求的 option，不放大客户端请求值（见 DETAILED_DESIGN.md §9.12.5）。
+> (4) §6.2 的 Debian 检测已 descoped：代码未实现 Debian 介质识别，仅支持
+> Ubuntu-Server `.disk/info` + casper 布局；Debian 不在 M4 支持矩阵。
+
 > **后续修订（2026-07-17，F4 TFTP 传输与并发模型纠正）**：`e14b15f` 将 `awaitAck` 超时
 > 3s->5s、`max_retries` 3->5 的「加耐心」方向被证明治标不治本--对 139 MB initrd，
 > GRUB 收齐文件后转去加载（解压/EFI 分配）、不再回最终 ACK（dnsmasq 源码注释

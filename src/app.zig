@@ -61,7 +61,7 @@ pub fn run(
     const current_time: i64 = if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) == .SUCCESS) @intCast(clock.sec) else 0;
 
     // M3.1：优先从新文件加载；每个域独立回退到旧版 runtime.json 迁移。
-    loadLeases(io, allocator, &runtime.dhcp, current_time);
+    loadLeases(io, allocator, &runtime.dhcp, current_time, boot_session.monotonicNow());
     loadStatuses(io, allocator, &statuses);
 
     var event_writer: events.Writer = .{};
@@ -289,11 +289,11 @@ fn forProfile(config: *const model.AppConfig, name: []const u8) ?*const model.Pr
 
 /// M3.1：从 `leases.json` 加载 DHCP lease。如果新文件不存在，
 /// 尝试从旧版 `runtime.json` 迁移。
-fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.DhcpState, now_val: i64) void {
-    dhcp_store.load(io, allocator, paths.require().leases_path, dhcp, now_val) catch |err| switch (err) {
+fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.DhcpState, now_val: i64, mono_now: i64) void {
+    dhcp_store.load(io, allocator, paths.require().leases_path, dhcp, now_val, mono_now) catch |err| switch (err) {
         error.FileNotFound => {
             // 新文件缺失：尝试从旧版 runtime.json 迁移 lease。
-            dhcp_store.migrateLegacy(io, allocator, paths.require().runtime_path, dhcp, now_val) catch |legacy_err| switch (legacy_err) {
+            dhcp_store.migrateLegacy(io, allocator, paths.require().runtime_path, dhcp, now_val, mono_now) catch |legacy_err| switch (legacy_err) {
                 error.FileNotFound => {},
                 else => observe_log.err("dhcp: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),
             };
@@ -349,7 +349,7 @@ fn runCheckpoint(
             // faking success or blocking the orderly shutdown indefinitely.
             const gen = dhcp.snapshotWithGeneration(&leases);
             if (gen > saved_generation) {
-                dhcp_store.save(io, allocator, leases_path, &leases, now()) catch |err| {
+                dhcp_store.save(io, allocator, leases_path, &leases, now(), boot_session.monotonicNow()) catch |err| {
                     observe_log.err("dhcp: checkpoint final flush failed: {t}", .{err});
                 };
             }
@@ -359,7 +359,7 @@ fn runCheckpoint(
         // Normal checkpoint: save only if the generation advanced.
         const gen = dhcp.snapshotWithGeneration(&leases);
         if (gen > saved_generation) {
-            dhcp_store.save(io, allocator, leases_path, &leases, now()) catch |err| {
+            dhcp_store.save(io, allocator, leases_path, &leases, now(), boot_session.monotonicNow()) catch |err| {
                 observe_log.err("dhcp: checkpoint save failed: {t}", .{err});
                 // Do not update saved_generation on failure; the unsaved
                 // changes remain pending for the next iteration.

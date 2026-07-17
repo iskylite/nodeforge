@@ -41,7 +41,7 @@
   计数器**，`reserveTransferSlot`（server.zig:132）直接比 limit；**无任何按源 IP/MAC 的 per-client
   计数**。故 `max_concurrent_transfers=4` 是系统级，非文档/per-client 措辞所述。
 - 超限直接回 `ERROR "server busy, retry later"`（server.zig:134）**拒绝不排队**。
-- 字段 `max_concurrent_transfers: u8`（`src/model.zig`），校验 `> 64` 拒绝（`src/config/validate.zig:116`）。
+- 字段 `max_concurrent_transfers: u8`（`src/model.zig`），校验 `> 64` 拒绝（`src/config/validate.zig`）。
 - GRUB 的 TFTP 客户端不协商 RFC 7440 windowsize，服务端回退 `windowsize=1`（停等），
   每传输 RTT 限约 **2 MB/s**；initrd（133 MB）单传需 ~66 s。
 
@@ -102,7 +102,7 @@
 - 默认 = `max(128, 2 × cpu_cores)`，config 可覆盖。
 - 字段 `u8` -> `u16`（2×核在 ≥128 核机器溢出 u8）。
 - 计数器 `active_transfers`（server.zig:107）：`Value(u8)` -> `Value(u16)`。
-- 移除 `validate.zig:116` 的 `> 64` 校验上限。
+- 移除 `validate.zig` 的 `> 64` 校验上限。
 - 启动时 `std.Thread.getCpuCount()` 派生。
 - 文档对齐：全局（非 per-client）+ auto 派生；修正 `model.zig:99-102` docstring 与
   `2026-07-14-m4_2-provisioning-robustness-design.md` §7.2 的 per-client 措辞。
@@ -146,7 +146,7 @@ nodeforged: capacity derived
    - `src/state/runtime.zig`（leases）、`boot_session.zig`、`node_status.zig`、`node_inventory.zig`、
      `deployment_control.zig`；新增启动时派生 `usable_hosts(subnet)` 与受管节点数。
 2. **TFTP**：`max_concurrent_transfers` 字段 `u8`->`u16`、`active_transfers` `Value(u8)`->`Value(u16)`、
-   去 `validate.zig:116` 的 64 上限、启动 `getCpuCount()` 派生 `max(128, 2×核)`。
+   去 `validate.zig` 的 64 上限、启动 `getCpuCount()` 派生 `max(128, 2×核)`。
 3. **DHCP**：`ping_timeout_ms` 默认 `500`->`100`（`src/model.zig` DhcpConfig）。
 4. **HTTP**：`max_connections` 死字段处理（接上 or 标注）。
 5. **启动日志**：打印派生容量生效值。

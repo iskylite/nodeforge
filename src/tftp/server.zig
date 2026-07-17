@@ -144,13 +144,17 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
                 const datagram = allocator.dupe(u8, incoming.data) catch |err| {
                     pair.release();
                     _ = active_transfers.fetchSub(1, .acq_rel);
-                    return err;
+                    observe_log.err("tftp: unable to stage datagram: {t}", .{err});
+                    try sendError(&socket, io, &incoming.from, .undefined, "server busy, retry later");
+                    continue;
                 };
                 const context = allocator.create(TransferWorker) catch |err| {
                     pair.release();
                     allocator.free(datagram);
                     _ = active_transfers.fetchSub(1, .acq_rel);
-                    return err;
+                    observe_log.err("tftp: unable to allocate transfer context: {t}", .{err});
+                    try sendError(&socket, io, &incoming.from, .undefined, "server busy, retry later");
+                    continue;
                 };
                 context.* = .{ .io = io, .allocator = allocator, .datagram = datagram, .remote = incoming.from, .pair = pair, .runtime = runtime, .event_writer = event_writer, .sessions = sessions, .active = &active_transfers };
                 const thread = std.Thread.spawn(.{}, runTransferWorker, .{context}) catch |err| {
@@ -192,7 +196,10 @@ const TransferWorker = struct {
 
 fn runTransferWorker(context: *TransferWorker) void {
     // active 最后递减；dispatcher 看到 0 时，worker 已释放所有借用资源。
-    defer _ = context.active.fetchSub(1, .acq_rel);
+    // 必须先复制指针：后续 defer 会销毁 context，不能在最后一次 defer 中
+    // 再通过已释放的 context 取 active。
+    const active = context.active;
+    defer _ = active.fetchSub(1, .acq_rel);
     defer context.allocator.destroy(context);
     defer context.allocator.free(context.datagram);
     defer context.pair.release();
@@ -1160,6 +1167,83 @@ test "TFTP OACK loss retransmits from the established transfer TID" {
     thread.join();
     joined = true;
     try std.testing.expect(context.result == null);
+}
+
+test "TFTP worker retries a lost final ACK and releases its global slot" {
+    // 文件小于 blksize -> 整个传输只有一个末尾块。客户端收到末尾 DATA 后
+    // 不回 ACK，验证 worker 完成 final_block_retries 次重传、耗尽约 7s 的
+    // 乐观预算，并释放 M4.8 全局并发槽。
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const filename = "small.bin";
+    const file_content = [_]u8{ 0xab, 0xcd, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 };
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = filename, .data = &file_content });
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const asset_root = root_buf[0..root_len];
+
+    const initial: model.Catalog = .{ .assets = &.{.{ .name = "small", .kind = .iso, .path = filename }} };
+    var catalog = try catalog_runtime.CatalogRuntime.init(std.testing.allocator, "test-catalog.json", &initial);
+    defer catalog.deinit();
+    const config_value: model.AppConfig = .{
+        .server = .{ .server_ip = "127.0.0.1" },
+        .tftp = .{ .asset_root = asset_root },
+    };
+    var configs = try config_runtime.ConfigRuntime.init(std.testing.allocator, &config_value, 1);
+    defer configs.deinit();
+    var models = model_runtime.ModelRuntime.init(&configs, &catalog);
+
+    const loopback = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var client = try loopback.bind(std.testing.io, .{ .mode = .dgram, .protocol = .udp });
+    defer client.close(std.testing.io);
+
+    const rrq = "\x00\x01small.bin\x00octet\x00";
+    const datagram = try std.testing.allocator.dupe(u8, rrq);
+    const context = try std.testing.allocator.create(TransferWorker);
+    var active = std.atomic.Value(u16).init(1);
+    var runtime: runtime_state.RuntimeState = .{};
+    context.* = .{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .datagram = datagram,
+        .remote = client.address,
+        .pair = models.acquire(),
+        .runtime = &runtime,
+        .event_writer = null,
+        .sessions = null,
+        .active = &active,
+    };
+    const started_at = boot_session.monotonicNow();
+    const thread = std.Thread.spawn(.{}, runTransferWorker, .{context}) catch |err| {
+        context.pair.release();
+        std.testing.allocator.free(datagram);
+        std.testing.allocator.destroy(context);
+        return err;
+    };
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    // 收首次 DATA 和两次重传；三者必须来自同一 transfer TID，且块号/内容一致。
+    var buf: [600]u8 = undefined;
+    var transfer_tid: ?std.Io.net.IpAddress = null;
+    for (0..final_block_retries + 1) |_| {
+        const data = try client.receiveTimeout(std.testing.io, &buf, .{ .duration = .{ .raw = .fromSeconds(4), .clock = .awake } });
+        if (transfer_tid) |tid| try std.testing.expect(data.from.eql(&tid)) else transfer_tid = data.from;
+        try std.testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, data.data[0..2], .big));
+        try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, data.data[2..4], .big));
+        try std.testing.expectEqualSlices(u8, &file_content, data.data[4..]);
+    }
+
+    // 最后一次重传后仍等待 4s，累计预算约 7s，随后乐观完成并释放 worker slot。
+    thread.join();
+    joined = true;
+    try std.testing.expect(boot_session.monotonicNow() - started_at >= 6);
+    try std.testing.expectEqual(@as(u16, 0), active.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), runtime.tftp.started.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), runtime.tftp.completed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), runtime.tftp.failed.load(.monotonic));
+    try std.testing.expect(reserveTransferSlot(&active, 1));
+    _ = active.fetchSub(1, .acq_rel);
 }
 
 test "TFTP retry: retryLimit uses smaller budget for final block" {

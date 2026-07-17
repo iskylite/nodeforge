@@ -17,6 +17,7 @@ const std = @import("std");
 const model = @import("../model.zig");
 const paths = @import("../paths.zig");
 const assets = @import("../assets/validate.zig");
+const observe_log = @import("../observe/log.zig");
 
 /// 导入请求。filename 是 CLI 已暂存到 import_dir 的不透明文件名。
 /// distro/version/arch 是可选覆盖。family 始终由经过结构校验的 ISO 布局决定；
@@ -24,8 +25,8 @@ const assets = @import("../assets/validate.zig");
 pub const Request = struct {
     filename: []const u8,
     name: ?[]const u8 = null,
-    /// 可选的操作员断言。导入器从可信媒体元数据检测三元组，
-    /// 并拒绝与提供值不一致的断言。
+    /// 可选的产品覆盖。family 始终由 ISO 布局决定；提供的值直接采用，
+    /// 不与媒体元数据比对，用于已知布局但标签未知或元数据不完整的介质。
     distro: ?[]const u8 = null,
     version: ?[]const u8 = null,
     arch: ?model.Arch = null,
@@ -97,7 +98,8 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     // 永远不执行介质内容（只读取文件系统元数据和文件数据）。
     mountIso(io, allocator, input, mount_point, "iso9660") catch try mountIso(io, allocator, input, mount_point, "udf");
     var mounted = true;
-    defer if (mounted) unmountIso(io, allocator, mount_point) catch {};
+    defer if (mounted) unmountIso(io, allocator, mount_point) catch |err|
+        observe_log.warn("iso import: cleanup unmount failed for {s}: {t}", .{ mount_point, err });
 
     const detected = try detectMedia(io, allocator, mount_point, request);
     const media = detected.layout;
@@ -582,6 +584,23 @@ test "import metadata parser accepts Rocky Minimal repository layout" {
     try std.testing.expect(safeFilename("Rocky-9.7-aarch64-minimal.iso"));
     try std.testing.expect(!safeFilename("../escape.iso"));
     try std.testing.expect(!safeFilename("nested/escape.iso"));
+}
+
+test "safeFilename rejects every path-traversal variant" {
+    // 合法文件名：非空、无路径分隔符、无 null 字节、不等于 `.`/`..`。
+    try std.testing.expect(safeFilename("Rocky-9.7-aarch64-minimal.iso"));
+    try std.testing.expect(safeFilename("a"));
+    // 空、`.`、`..` 是 ISO 导入路径穿越的常见向量。
+    try std.testing.expect(!safeFilename(""));
+    try std.testing.expect(!safeFilename("."));
+    try std.testing.expect(!safeFilename(".."));
+    // 路径分隔符（POSIX 与 Windows）必须拒绝，防止 basename 逃逸。
+    try std.testing.expect(!safeFilename("../escape.iso"));
+    try std.testing.expect(!safeFilename("nested/escape.iso"));
+    try std.testing.expect(!safeFilename("windows\\escape.iso"));
+    // null 字节会破坏下游 `{s}/{s}` 字符串拼接假设。
+    try std.testing.expect(!safeFilename("null\x00byte.iso"));
+    try std.testing.expect(!safeFilename("\x00"));
 }
 
 test "Kylin media family is normalized while preserving its source label" {

@@ -273,10 +273,10 @@ POST config/validations:   { candidate?: object, patch?: TypedPatch }  # 二选�
 POST migration-plans:      { source_names?: [string] }                 # 省略表示全部旧对象
 POST catalog/migrations:   { plan_digest: string }
 POST assets:               { path: string, name?: LogicalId, kind: string }
-POST install-sources:      { iso_path: string, name?: LogicalId, distro_override?: string }
+POST install-sources:      { filename: string, sha256: string, name?: LogicalId, distro?: string, version?: string, arch?: string }
 ```
 
-`path/iso_path` 只允许 daemon 本机可读路径，并继续执行受管 staging、symlink 和文件类型检查；它们不得回显到普通
+`path`/`filename` 只允许 daemon 本机可读路径（`filename` 是 CLI 已 stage 到 import_dir 的不透明 basename），并继续执行受管 staging、symlink 和文件类型检查；它们不得回显到普通
 operation/result 或服务日志。body 未声明字段返回 `400 request.unknown_field`。最大 JSON body、string、array 长度由
 RouteSpec/DTO schema 显式给出并在读完整 body 前执行总大小限制。
 

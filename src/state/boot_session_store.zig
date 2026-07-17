@@ -163,21 +163,25 @@ test "delivery checkpoint restores capability and remaining TTL" {
     defer std.testing.allocator.free(path);
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.27.128" },
-        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
-        .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
     };
     var before: boot_session.Store = .{};
+    defer before.deinit();
     const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "install", .mode = .install, .model_revision = 42 }, 100, 1000);
     before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 101, 1001);
     const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
-    const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
+    const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
     try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42);
     try save(std.testing.io, std.testing.allocator, path, &before, 1002);
     var after: boot_session.Store = .{};
-    const catalog: model.Catalog = .{ .assets = &.{
-        .{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "aa" },
-        .{ .name = "initrd", .kind = .initrd, .path = "install/initrd", .sha256 = "bb" },
-    } };
+    defer after.deinit();
+    const catalog: model.Catalog = .{
+        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
+        .assets = &.{
+            .{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "aa" },
+            .{ .name = "initrd", .kind = .installer_initrd, .path = "install/initrd", .sha256 = "bb" },
+        },
+    };
     try std.testing.expectEqual(@as(usize, 1), try load(std.testing.io, std.testing.allocator, path, &config, &catalog, &after, 1012, 500));
     const restored = try after.authenticateCapability("n1", issued.boot_session_id[0..], issued.capability[0..], 501);
     try std.testing.expectEqual(@as(u64, 42), restored.model_revision);
@@ -186,10 +190,10 @@ test "delivery checkpoint restores capability and remaining TTL" {
 }
 
 test "resume fails closed when a pinned asset digest changes or disappears" {
-    const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
+    const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
     const changed: model.Catalog = .{ .assets = &.{
         .{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "changed" },
-        .{ .name = "initrd", .kind = .initrd, .path = "install/initrd", .sha256 = "bb" },
+        .{ .name = "initrd", .kind = .installer_initrd, .path = "install/initrd", .sha256 = "bb" },
     } };
     try std.testing.expectError(error.BootSessionAssetMismatch, validatePlanAssets(std.testing.allocator, plan, &changed));
     const missing: model.Catalog = .{ .assets = &.{.{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "aa" }} };

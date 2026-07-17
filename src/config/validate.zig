@@ -10,6 +10,10 @@ const asset_validate = @import("../assets/validate.zig");
 const profile_install = @import("../profile/install.zig");
 const capacity = @import("../state/capacity.zig");
 
+/// Node IDs are copied into several fixed-size runtime projections
+/// (`boot_session`, `deployment_control`, and `node_status`).
+pub const node_id_max_len = 96;
+
 /// 配置校验错误码。
 /// 所有错误均为编译期已知集合，不包含动态字符串——
 /// 具体对象名和字段通过 `@errorName` 在 `observe/error.zig` 中渲染为 message。
@@ -117,7 +121,8 @@ pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void 
     try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
     try uniqueNamed(model.BootBundleConfig, catalog.boot_bundles);
     for (catalog.nodes, 0..) |node, index| {
-        if (node.id.len == 0 or !validMac(node.mac)) return error.InvalidNodeMac;
+        if (!validNodeId(node.id)) return error.InvalidLogicalId;
+        if (!validMac(node.mac)) return error.InvalidNodeMac;
         for (catalog.nodes[index + 1 ..]) |other| {
             if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
             if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
@@ -298,12 +303,71 @@ pub fn validLogicalId(value: []const u8) bool {
     return !std.mem.eql(u8, value, ".") and !std.mem.eql(u8, value, "..");
 }
 
+/// Node IDs use the canonical logical-ID alphabet but have a smaller bound
+/// because they are retained in fixed-size hot-path and persisted state.
+pub fn validNodeId(value: []const u8) bool {
+    return value.len <= node_id_max_len and validLogicalId(value);
+}
+
 test "M4.3 logical ids are canonical path-safe lowercase ASCII" {
     try std.testing.expect(validLogicalId("kylin-v10-aarch64-dvd"));
     try std.testing.expect(validLogicalId("rocky_9.7-aarch64"));
     try std.testing.expect(!validLogicalId("Rocky-9"));
     try std.testing.expect(!validLogicalId("../rocky"));
     try std.testing.expect(!validLogicalId("岩石-9"));
+}
+
+test "node id must be a canonical logical id" {
+    // Node ID 使用 logical-id 字符集，但运行态固定投影上限为 96 字节。
+    // 校验在 catalog shape 与 config nodes 两处都生效。
+    const upper: model.Catalog = .{
+        .nodes = &.{.{ .id = "NodeA", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
+    };
+    try std.testing.expectError(error.InvalidLogicalId, validateCatalogShape(&upper));
+
+    const max_length: model.Catalog = .{
+        .nodes = &.{.{ .id = "n" ** node_id_max_len, .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
+    };
+    try validateCatalogShape(&max_length);
+
+    const too_long: model.Catalog = .{
+        .nodes = &.{.{ .id = "n" ** (node_id_max_len + 1), .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
+    };
+    try std.testing.expectError(error.InvalidLogicalId, validateCatalogShape(&too_long));
+}
+
+test "node mac must be a valid hardware address" {
+    const cat: model.Catalog = .{
+        .nodes = &.{.{ .id = "n1", .mac = "not-a-mac", .arch = .aarch64, .profile = "install" }},
+    };
+    try std.testing.expectError(error.InvalidNodeMac, validateCatalogShape(&cat));
+}
+
+test "duplicate node mac is rejected case-insensitively" {
+    const cat: model.Catalog = .{
+        .nodes = &.{
+            .{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" },
+            .{ .id = "n2", .mac = "02:AA:BB:CC:DD:EE", .arch = .aarch64, .profile = "install" },
+        },
+    };
+    try std.testing.expectError(error.DuplicateNodeMac, validateCatalogShape(&cat));
+}
+
+test "unsafe asset path is rejected" {
+    const cat: model.Catalog = .{
+        .assets = &.{.{ .name = "escape", .kind = .iso, .path = "../escape.iso" }},
+    };
+    try std.testing.expectError(error.UnsafeAssetPath, validateCatalogShape(&cat));
+}
+
+test "dhcp subnet prefix beyond /30 is rejected" {
+    const config: model.AppConfig = .{
+        .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" },
+        .http = test_http,
+        .tftp = test_tftp,
+        .dhcp = .{ .subnet = "192.168.50.0/31" },
+    };
+    try std.testing.expectError(error.InvalidDhcpSubnet, validateConfig(&config));
 }
 
 fn validateDistros(config: *const model.AppConfig) ValidationError!void {
@@ -493,7 +557,7 @@ fn sameTuple(distro: []const u8, version: []const u8, arch: model.Arch, other_di
 
 fn validateNodes(config: *const model.AppConfig) ValidationError!void {
     for (config.nodes, 0..) |node, i| {
-        if (node.id.len == 0) return error.EmptyObjectName;
+        if (!validNodeId(node.id)) return error.InvalidLogicalId;
         if (!validMac(node.mac)) return error.InvalidNodeMac;
         const profile = lookup.findProfile(config, node.profile) orelse return error.MissingProfile;
         if (profile.arch != node.arch) return error.InvalidProfileSource;

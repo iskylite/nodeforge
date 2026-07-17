@@ -64,8 +64,11 @@ done
 test "$ready" = true
 
 grep -Fqx '{"ok":true,"service":"nodeforge"}' "$tmp/health"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/config" >"$tmp/config-status"
+curl --silent --fail -D "$tmp/config-headers" "http://127.0.0.1:$port/api/v1/management/config" >"$tmp/config-status"
 grep -Fq '"config":"valid"' "$tmp/config-status"
+config_revision=$(sed -n 's/.*"revision":\([0-9][0-9]*\).*/\1/p' "$tmp/config-status")
+test -n "$config_revision"
+grep -Eqi "^etag:[[:space:]]*\"$config_revision\"" "$tmp/config-headers"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/status" >"$tmp/status"
 grep -Fq '"service":"running"' "$tmp/status"
 grep -Fq '"config_valid":true' "$tmp/status"
@@ -219,8 +222,8 @@ mt_status=$(curl --silent -o "$tmp/mt" -w '%{http_code}' -X POST -H 'Content-Typ
 test "$mt_status" = 415
 grep -Fq '"code":"http.unsupported_media_type"' "$tmp/mt"
 precond_status=$(curl --silent -o "$tmp/precond" -w '%{http_code}' -X PATCH -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/config")
-test "$precond_status" = 428
-grep -Fq '"code":"http.precondition_required"' "$tmp/precond"
+test "$precond_status" = 409
+grep -Fq '"code":"config.offline_only"' "$tmp/precond"
 curl --silent -D "$tmp/sec-headers" -o /dev/null "http://127.0.0.1:$port/api/v1/management/config"
 grep -Eqi '^cache-control:[[:space:]]*no-store,[[:space:]]*private' "$tmp/sec-headers"
 grep -Eqi '^x-content-type-options:[[:space:]]*nosniff' "$tmp/sec-headers"

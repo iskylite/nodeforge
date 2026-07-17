@@ -33,7 +33,9 @@ pub const DhcpLease = struct {
     ip: u32 = 0,
     /// 客户端 MAC 地址。
     mac: [6]u8 = [_]u8{0} ** 6,
-    /// Unix 时间戳（秒）。`abandoned` 阶段用作隔离截止时间。
+    /// 单调时钟秒（MONOTONIC）。运行期 lease 过期判断的基准；`abandoned`
+    /// 阶段用作隔离截止时间。持久化时由 `dhcp_store` 在 monotonic 与 Unix
+    /// 绝对时间戳之间转换，保证跨重启即使单调时钟归零仍可与墙钟比较。
     expires_at: i64 = 0,
     /// lease 是否被使用（非 empty）。
     pub fn used(self: *const DhcpLease) bool {
@@ -285,7 +287,8 @@ pub const BootGateSuppressor = struct {
     const State = enum { normal, not_armed, deploy_disabled };
 
     const Entry = struct {
-        node_id: [96]u8 = [_]u8{0} ** 96,
+        const node_id_capacity = 96;
+        node_id: [node_id_capacity]u8 = [_]u8{0} ** node_id_capacity,
         node_id_len: u8 = 0,
         last_state: State = .normal,
 
@@ -311,6 +314,9 @@ pub const BootGateSuppressor = struct {
     ///
     /// 内部自动维护 per-node 状态机，调用方无需关心状态管理细节。
     pub fn shouldEmit(self: *BootGateSuppressor, node_id: []const u8, not_armed: bool, deploy_disabled: bool) bool {
+        // 配置校验将 node ID 限制为 96 字节；这里独立 fail closed，避免未来
+        // 未校验的调用方写出固定缓冲区，也不能复用其他节点的去重状态。
+        if (node_id.len == 0 or node_id.len > Entry.node_id_capacity) return false;
         const new_state: State = if (not_armed) .not_armed else if (deploy_disabled) .deploy_disabled else .normal;
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -541,4 +547,12 @@ test "boot-gate suppressor tracks multiple nodes independently" {
     try std.testing.expect(!suppressor.shouldEmit("node-a", true, false));
     // node-b still not armed → suppress
     try std.testing.expect(!suppressor.shouldEmit("node-b", true, false));
+}
+
+test "boot-gate suppressor fails closed for an oversized node id" {
+    var suppressor: BootGateSuppressor = .{};
+    try std.testing.expect(!suppressor.shouldEmit("n" ** 97, true, false));
+    // Invalid input must not consume or mutate the first real node's slot.
+    try std.testing.expect(suppressor.shouldEmit("node-a", true, false));
+    try std.testing.expect(!suppressor.shouldEmit("node-a", true, false));
 }

@@ -93,6 +93,15 @@ pub fn allowed(path: []const u8, output: []u8) ?[]const u8 {
     return if (first) null else writer.buffered();
 }
 
+/// 精确判断某个 method 是否注册于该路径。不能在 `Allow` 文本中做子串
+/// 搜索，否则 `ET` 会被误认为匹配 `GET`。
+pub fn methodAllowed(path: []const u8, method: []const u8) bool {
+    for (specs) |spec| {
+        if (std.mem.eql(u8, spec.method, method) and pathMatches(spec.template, path)) return true;
+    }
+    return false;
+}
+
 /// 启动时检测等价模板、重复 method 和 wildcard 吞路由冲突。存在任一冲突
 /// 即拒绝启动（§9.14.11.1#1）。`detectConflicts` 接受任意 spec 列表，便于单测。
 pub fn validate() !void {
@@ -189,6 +198,10 @@ test "Allow aggregation reflects registered methods for detail and collection pa
     var buffer: [64]u8 = undefined;
     // /management/config 注册了 GET 和 PATCH，但没有 POST/DELETE。
     try std.testing.expectEqualStrings("GET, PATCH", allowed("/api/v1/management/config", &buffer).?);
+    try std.testing.expect(methodAllowed("/api/v1/management/config", "GET"));
+    try std.testing.expect(methodAllowed("/api/v1/management/config", "PATCH"));
+    try std.testing.expect(!methodAllowed("/api/v1/management/config", "ET"));
+    try std.testing.expect(!methodAllowed("/api/v1/management/config", "POST"));
     // 资产 detail 只注册了 GET，PUT/DELETE 应得到 405 + Allow: GET。
     try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/assets/rocky-kernel", &buffer).?);
     // M4.6 profile detail 既可查看，也只允许 PATCH kernel_args。
