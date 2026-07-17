@@ -53,7 +53,7 @@ zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe
 /srv/nodeforge/bin/nodeforge setup --generate-systemd --install --non-interactive --yes
 systemctl is-enabled nodeforged.service
 systemctl is-active nodeforged.service
-curl --fail http://127.0.0.1:8080/healthz
+curl --fail http://127.0.0.1:18080/healthz
 ```
 
 随后注入一次坏 unit 或健康检查失败，确认旧 unit、enabled/active 状态恢复且诊断备份保留；再检查

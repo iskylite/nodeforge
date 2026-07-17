@@ -75,7 +75,7 @@ test "load parses a minimal config" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("192.168.50.1", parsed.value.server.server_ip);
-    try std.testing.expectEqual(@as(u16, 8080), parsed.value.server.http_port);
+    try std.testing.expectEqual(@as(u16, 18080), parsed.value.server.http_port);
 }
 
 test "parsed strings do not borrow the input buffer" {

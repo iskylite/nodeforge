@@ -77,7 +77,8 @@ pub const ServerConfig = struct {
     /// HTTP M0 仍绑定 0.0.0.0，不把该字段作为 bind 地址。
     server_ip: []const u8,
     /// 唯一 HTTP 监听端口；同时承载 PXE 数据路由和管理路由。CLI 固定使用 loopback 访问。
-    http_port: u16 = 8080,
+    /// 默认 18080，避免与常见 Web 服务（8080）冲突。配置文件可显式覆盖。
+    http_port: u16 = 18080,
     /// NodeForge 管理端在目标机上使用的 bootstrap SSH 公钥；私钥绝不进入配置。
     ssh_authorized_public_key: ?[]const u8 = null,
     /// M4.2 F5: 额外的 SSH 公钥列表，注入到所有目标节点的 authorized_keys。

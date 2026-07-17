@@ -113,9 +113,9 @@ rm -f /opt/nodeforge/catalog/catalog.json
 - **网口适配**：`tests/http.sh` 默认使用 `config.example.json` 中的 `enp1s0` 网口，`r97n0`
   上不存在该接口。脚本已将 `bind_interface` 动态替换为 `lo` 以适配本机回环测试。
 
-M0 默认 HTTP/管理共用端口为 `8080`。管理 API 没有独立端口；CLI 固定通过
-`127.0.0.1:8080` 访问且不支持远程 endpoint，因此只能管理同机 `nodeforged`。服务端 listener
-绑定 `0.0.0.0:8080`，M3.6 起管理路由仅接受本机 `127.0.0.1` direct peer；从宿主机访问应返回
+M0 默认 HTTP/管理共用端口为 `18080`（可在配置文件 `server.http_port` 中覆盖）。管理 API 没有独立端口；CLI 固定通过
+`127.0.0.1:18080` 访问且不支持远程 endpoint，因此只能管理同机 `nodeforged`。服务端 listener
+绑定 `0.0.0.0:18080`，M3.6 起管理路由仅接受本机 `127.0.0.1` direct peer；从宿主机访问应返回
 403。M0 尚无管理鉴权和 TLS，验证环境必须使用受信任网络。
 
 ## M1 TFTP 待验证

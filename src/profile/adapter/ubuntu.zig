@@ -584,7 +584,7 @@ test "M4.1 autoinstall renders target defaults and static network" {
 test "M4.2 webhook reporting rendered when report_url is non-empty" {
     // 非空 report_url 渲染 reporting 块（webhook reporter 在 22.04 和 24.04 均可用）
     const node: model.NodeConfig = .{ .id = "node-rpt", .mac = "00:11:22:33:44:aa", .arch = .aarch64, .profile = "ubuntu", .hostname = "noderpt" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "http://192.168.50.1:8080/report", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "http://192.168.50.1:18080/report", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     // reporting 块应渲染，type 必须是 webhook（不是 http）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "reporting:") != null);

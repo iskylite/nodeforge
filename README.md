@@ -140,7 +140,7 @@ M4.6 内核参数通过 profile 管理：`nodeforge profile show <name>` 查看�
 `nodeforge profile unset <name> kernel_args` 清除。修改会拒绝引用该 profile 的活动 boot session；
 install profile 还需对目标节点执行 `nodeforge node retry <node>`，显式武装包含新参数的 generation。
 
-NodeForge 只有一个 HTTP listener，默认端口 `8080`，健康检查、管理 API 和 M3+ PXE 数据路由
+NodeForge 只有一个 HTTP listener，默认端口 `18080`（可在配置文件 `server.http_port` 中覆盖），健康检查、管理 API 和 M3+ PXE 数据路由
 复用该端口。listener 绑定 `0.0.0.0:<http_port>`；管理路由在入口检查 direct peer，只接受
 `127.0.0.1`，且不信任 `X-Forwarded-For`。`nodeforge` CLI 固定通过
 `127.0.0.1:<http_port>` 调用管理接口，不提供远程 endpoint 参数，因此 CLI 只支持管理同机

@@ -19,6 +19,9 @@ const atomicWrite = @import("state/dhcp_store.zig").atomicWrite;
 pub const Network = struct {
     bind_interface: []const u8 = "eth0",
     server_ip: []const u8 = "192.168.50.1",
+    /// HTTP/管理共用监听端口。默认 18080，避免与常见 Web 服务 8080 冲突；
+    /// `nodeforge setup --http-port <n>` 可覆盖。
+    http_port: u16 = 18080,
     subnet: []const u8 = "192.168.50.0/24",
     pool_start: []const u8 = "192.168.50.100",
     pool_end: []const u8 = "192.168.50.200",
@@ -27,7 +30,7 @@ pub const Network = struct {
 pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppConfig {
     return .{
         .schema_version = 2,
-        .server = .{ .bind_interface = network.bind_interface, .server_ip = network.server_ip },
+        .server = .{ .bind_interface = network.bind_interface, .server_ip = network.server_ip, .http_port = network.http_port },
         .http = .{ .asset_root = p.iso_dir, .repository_root = p.repos_dir },
         .tftp = .{ .asset_root = p.boot_dir },
         .dhcp = .{ .subnet = network.subnet, .pool_start = network.pool_start, .pool_end = network.pool_end },
@@ -265,6 +268,8 @@ test "generated config and systemd use custom runtime root" {
     defer p.deinit(std.testing.allocator);
     const config = generatedConfig(&p, .{});
     try std.testing.expectEqualStrings(p.iso_dir, config.http.asset_root);
+    // setup 生成的配置必须显式声明 http_port=18080，而非隐式依赖 model 默认值。
+    try std.testing.expectEqual(@as(u16, 18080), config.server.http_port);
     const unit = try renderSystemd(std.testing.allocator, &p);
     defer std.testing.allocator.free(unit);
     try std.testing.expect(std.mem.indexOf(u8, unit, p.nodeforged_path) != null);

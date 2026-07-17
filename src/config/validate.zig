@@ -751,14 +751,14 @@ test "M4.1 repositories must use the managed local HTTP namespace" {
     const config: model.AppConfig = .{ .server = .{
         .bind_interface = "pxe0",
         .server_ip = "192.168.50.1",
-        .http_port = 8080,
+        .http_port = 18080,
     } };
-    try std.testing.expect(managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/ubuntu-22.04"));
+    try std.testing.expect(managedRepositoryUrl(&config, "http://192.168.50.1:18080/artifacts/repositories/ubuntu-22.04"));
     try std.testing.expect(!managedRepositoryUrl(&config, "https://archive.ubuntu.com/ubuntu"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/local?mirror=external"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/../images/private"));
-    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:8080/artifacts/repositories/%2e%2e/images/private"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:18080/artifacts/repositories/"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:18080/artifacts/repositories/local?mirror=external"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:18080/artifacts/repositories/../images/private"));
+    try std.testing.expect(!managedRepositoryUrl(&config, "http://192.168.50.1:18080/artifacts/repositories/%2e%2e/images/private"));
 
     const catalog: model.Catalog = .{
         .repositories = &.{.{

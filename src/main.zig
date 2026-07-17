@@ -372,6 +372,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .{ .name = "dry-run", .description = "Describe the selected operation without writing", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "bind-interface", .description = "PXE bind interface for generated config", .type = .String, .default_value = .{ .String = "eth0" } },
         .{ .name = "server-ip", .description = "PXE server IPv4 address", .type = .String, .default_value = .{ .String = "192.168.50.1" } },
+        .{ .name = "http-port", .description = "HTTP/management listen port for generated config", .type = .Int, .default_value = .{ .Int = 18080 } },
         .{ .name = "subnet", .description = "DHCP subnet CIDR", .type = .String, .default_value = .{ .String = "192.168.50.0/24" } },
         .{ .name = "pool-start", .description = "First DHCP pool address", .type = .String, .default_value = .{ .String = "192.168.50.100" } },
         .{ .name = "pool-end", .description = "Last DHCP pool address", .type = .String, .default_value = .{ .String = "192.168.50.200" } },
@@ -408,6 +409,7 @@ fn setupHandler(ctx: zli.CommandContext) !void {
     const network: nodeforge.setup.Network = .{
         .bind_interface = ctx.flag("bind-interface", []const u8),
         .server_ip = ctx.flag("server-ip", []const u8),
+        .http_port = ctx.flag("http-port", u16),
         .subnet = ctx.flag("subnet", []const u8),
         .pool_start = ctx.flag("pool-start", []const u8),
         .pool_end = ctx.flag("pool-end", []const u8),

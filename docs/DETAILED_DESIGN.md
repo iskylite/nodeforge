@@ -774,7 +774,7 @@ MVP 不实现第二套 RPC，也不再拆成 management listener 与 PXE listene
 - HTTP listener 固定绑定 `0.0.0.0:http.port`。M0 只提供 `/healthz` 和管理 API；M3 将在同一 listener 提供 boot config、answer、repo/rootfs 下载和节点事件。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 M0 HTTP bind 地址。
 - `server.bind_interface` 是 DHCPv4 Linux 服务的必填 PXE 网卡字段，用于约束 DHCP 广播收发；示例的 `enp1s0` 只是占位值，部署前必须替换为承载 `server.server_ip` 的实际接口。静态校验拒绝空值；实际 bind 继续验证接口存在且可用。
 - `nodeforge` CLI 管理客户端固定连接 `127.0.0.1:http.port`，不提供远程管理地址配置项。
-- MVP 不配置独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `8080`；端口冲突时修改 `config.json` 并重启。
+- MVP 不配置独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `18080`（避免与常见 Web 服务 8080 冲突，可在 `config.json` 中覆盖）；端口冲突时修改 `config.json` 并重启。
 - 管理路由与未来 PXE 数据路由逻辑分区；M3.6 在 route 入口仅允许 direct peer `127.0.0.1` 调用 `/api/v1/management/`，不信任 `X-Forwarded-For`。
 - `nodeforge` CLI 固定连接 `127.0.0.1`，不提供远程 endpoint，只支持管理同机 `nodeforged`。MVP 不提供管理鉴权和 TLS；将 HTTP 路由作为正式远程管理接口前，必须另行设计 TLS、鉴权和审计。
 
@@ -900,7 +900,7 @@ TFTP 探针、DHCP resolver、repository 和 state 检查在对应阶段实现�
 - `ExecStart=/opt/nodeforge/bin/nodeforged --log-output file`
 - `ExecStartPre=/opt/nodeforge/bin/nodeforged --check --log-output file`
 - `Restart=on-failure`、`RestartSec=2s`
-- M0 HTTP 默认使用 8080，不申请 DHCP/TFTP 阶段才需要的 Linux capability。
+- M0 HTTP 默认使用 18080，不申请 DHCP/TFTP 阶段才需要的 Linux capability。
 - systemd unit 本体放在 `/opt/nodeforge/systemd/nodeforged.service`；`/etc/systemd/system/nodeforged.service` 只是软链接。二进制主体安装在 `/opt/nodeforge/bin/`；`/usr/bin/nodeforge` 和 `/usr/bin/nodeforged` 也只是软链接。
 - 不在 NodeForge CLI 中重复封装 `systemctl`。
 - M0 需要在 Rocky 9.7 aarch64 上执行 systemd 启动、快速重启、CLI 管理接口和外部 HTTP 管理路由验证；PXE HTTP 数据路由验证属于 M3。
@@ -1344,6 +1344,12 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 - **`giaddr` 处理（RFC 2131 标准行为）**：当收到的 DHCP 报文 `giaddr` 非零时，表示报文经由外部 relay agent（路由器 IP Helper 或 `dhcrelay`）转发。服务器基于 `giaddr` 或 option 82 中的 RFC 3527 Link Selection 子选项定位目标 subnet，而非使用接收接口的 subnet。回复报文按 RFC 2131 Section 4.1 发送到 `giaddr:67`（relay agent 的 UDP 67 端口），而非广播或直接发给客户端。这是任何 RFC 2131 合规 DHCP 服务器的基本行为，不是独立功能特性。NodeForge 自身不实现 relay agent。参考 ISC DHCP `locate_network()`（`server/dhcp.c`）和 `bootp()`（`server/bootp.c`）的实现。
 - **服务器端地址冲突检测（Ping Probe）**：在发送 DHCPOFFER 前，对候选 IP 发送 ICMP Echo Request。在配置的超时内（默认 500ms）未收到与该请求匹配的 Echo Reply 才发送 OFFER；Linux raw socket 收到自身发出的 Echo Request 或其他无关 ICMP 报文时，必须继续等待同一个绝对 deadline，不能提前判定地址空闲。收到匹配回复则调用 `abandon_lease()` 标记该 IP 为 abandoned 状态（保持 `abandon_lease_time`，默认 1 小时），并尝试下一个候选 IP。raw socket 打开、发送或接收失败时必须取消该 pending OFFER 并不回复，绝不能把 `unavailable` 当成 `clear`。Linux 服务单元需要 `CAP_NET_RAW` 和 `CAP_NET_BIND_SERVICE`。参考 ISC DHCP `do_ping_check()`/`lease_pinged()`/`abandon_lease()` 实现。
 - 未识别 option 必须安全跳过并保留报文边界；编码顺序稳定，必须正确写 end option 255。
+- **`Reply` 结构值语义约束**：`packet.Reply` 是值类型并跨函数传递（`base()` 构造 → `encodeReply` 编码），
+  其中所有可变长度字段必须由 Reply 自身拥有，不得借用构造函数的栈局部变量。历史上 `Reply.dns` 曾为
+  `[]const u32` 切片，`base()` 将局部 `[8]u32` 数组切片赋值后返回，导致 `Reply.dns` 指向已释放栈帧，
+  `encodeReply` 读到的 `len`/`ptr` 为栈垃圾，OFFER/ACK 中 option 6（DNS）随机丢失。修复后 `Reply.dns`
+  为 `[8]u32` 固定数组 + `dns_len: u4` 计数，`base()` 按值拷贝返回；option 3（Router）是 `?u32` 值类型，
+  本身不受影响。新增可变长度 option 字段时必须遵循同一约束：使用固定数组 + 计数，禁止返回局部切片。
 - `vendor/dhcp/` 保存去标识化的真实 DHCPv4 fixture、来源说明和期望解析结果。基于 ISC DHCP 源码重构实现，不直接链接 C 代码。
 - 只实现 DHCPv4；不监听 UDP 546/547，不解析 DHCPv6，也不输出 IPv6 地址。
 
@@ -2585,16 +2591,16 @@ diskless boot config 示例：
   "boot_session_id": "0123456789abcdef0123456789abcdef",
   "mode": "diskless",
   "profile": "rocky-9.7-aarch64-diskless",
-  "config_url": "http://192.168.50.1:8080/api/v1/nodes/node-02/config",
-  "rootfs_url": "http://192.168.50.1:8080/rootfs/rocky-9.7-aarch64-<kernel-release>.squashfs",
+"config_url": "http://192.168.50.1:18080/api/v1/nodes/node-02/config",
+"rootfs_url": "http://192.168.50.1:18080/rootfs/rocky-9.7-aarch64-<kernel-release>.squashfs",
   "rootfs_sha256": "...",
   "rootfs_mode": "squashfs_overlay",
   "overlay": {
     "tmpfs_size": "50%",
     "tmpfs_mode": "0755"
   },
-  "event_url": "http://192.168.50.1:8080/api/v1/nodes/node-02/events",
-  "log_url": "http://192.168.50.1:8080/api/v1/nodes/node-02/logs",
+"event_url": "http://192.168.50.1:18080/api/v1/nodes/node-02/events",
+"log_url": "http://192.168.50.1:18080/api/v1/nodes/node-02/logs",
   "access": {
     "session_header": "X-NodeForge-Session",
     "session_id": "0123456789abcdef0123456789abcdef",
@@ -6325,7 +6331,7 @@ ONTIMEOUT nodeforge
 
 LABEL nodeforge
   KERNEL install/rocky/9.7/x86_64/vmlinuz
-  APPEND initrd=install/rocky/9.7/x86_64/initrd.img inst.ks=http://192.168.50.1:8080/api/v1/nodes/node-01/install-config/kickstart inst.repo=http://192.168.50.1:8080/artifacts/repositories/rocky-9.7-x86_64-dvd/ iommu=pt
+  APPEND initrd=install/rocky/9.7/x86_64/initrd.img inst.ks=http://192.168.50.1:18080/api/v1/nodes/node-01/install-config/kickstart inst.repo=http://192.168.50.1:18080/artifacts/repositories/rocky-9.7-x86_64-dvd/ iommu=pt
 ```
 
 > **M4.6 kernel_args**：若 profile 配置了 `kernel_args`（§9.15.8），PXELINUX renderer 在 `APPEND` 指令

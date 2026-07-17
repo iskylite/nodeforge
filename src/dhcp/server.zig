@@ -19,6 +19,7 @@ const boot_session = @import("../state/boot_session.zig");
 const events = @import("../state/events.zig");
 const deployment_control = @import("../state/deployment_control.zig");
 const config_runtime = @import("../state/config_runtime.zig");
+const model_runtime = @import("../state/model_runtime.zig");
 const observe_log = @import("../observe/log.zig");
 const paths = @import("../paths.zig");
 const log = std.log.scoped(.dhcp);
@@ -62,9 +63,27 @@ pub const Persistence = struct {
     /// 只能在此精确 revision 上启动。
     config_revision: u64 = 0,
     configs: ?*config_runtime.ConfigRuntime = null,
+    /// config+catalog 一致快照边界。`persistenceRevision` 在其 gate 下取一致
+    /// 快照重算 desired（config+catalog）model revision，与部署武装使用的
+    /// revision 对齐；仅 config 的 revision 会使已武装节点被误判为 not armed。
+    models: ?*model_runtime.ModelRuntime = null,
 };
 
 fn persistenceRevision(value: *const Persistence) u64 {
+    // 部署 generation 武装在 desired（config+catalog）model revision 上
+    // （`deployment_control.revisionForModel` 与 HTTP `desiredRevision` 一致）。
+    // DHCP 的武装判定必须用同一把 desired revision：若退化为仅 config 的
+    // `configs.currentRevision()`（revisionForConfig），已武装节点会被恒判为
+    // install_not_armed，OFFER 不带 PXE bootfile，PXE 客户端不发 REQUEST，
+    // 最终无法获取 DHCP 分配的 IP。在 model gate 下取一致的 config+catalog
+    // 快照重算当前 desired revision，使武装后的 config/catalog 变更也能正确
+    // 使旧 generation 失效。
+    if (value.models) |models| {
+        const pair = models.acquire();
+        defer pair.release();
+        const revision = deployment_control.revisionForModel(value.allocator, pair.config.value(), pair.catalog.value()) catch return value.config_revision;
+        return revision.desiredRevision();
+    }
     return if (value.configs) |configs| configs.currentRevision() else value.config_revision;
 }
 
@@ -349,15 +368,23 @@ fn processWithDeployment(config: *const model.AppConfig, runtime: *runtime_state
     return base(if (typ == .discover) .offer else .ack, selected, server_ip, mask, config, decision.bootfile);
 }
 /// 从配置构建 DHCP Reply 基础结构，包含子网掩码、网关、DNS 和租约时长。
+///
+/// BUG 历史：此函数曾将局部 `var dns: [8]u32` 数组切片 `dns[0..count]`
+/// 赋给 `Reply.dns: []const u32` 后返回。`base()` 栈帧释放后 `Reply.dns`
+/// 成为悬挂指针，`encodeReply` 读到的 `len`/`ptr` 是栈垃圾，导致 OFFER/ACK
+/// 中 option 6（DNS）随机丢失。实测抓包确认 OFFER 只有 Message/Subnet-Mask/
+/// Lease-Time/Server-ID，无 DNS。option 3（Router）是 `?u32` 值类型不受影响，
+/// 但若配置未设 `dhcp.router` 也会缺失。修复：`Reply.dns` 改为 `[8]u32` 固定
+/// 数组 + `dns_len` 计数，`base()` 按值拷贝返回，消除悬挂指针。
 fn base(kind: packet.MessageType, yiaddr: u32, server_ip: u32, mask: u32, config: *const model.AppConfig, bootfile: ?[]const u8) packet.Reply {
-    var dns: [8]u32 = undefined;
-    var count: usize = 0;
+    var dns: [8]u32 = [_]u32{0} ** 8;
+    var dns_len: u4 = 0;
     for (config.dhcp.dns) |value| {
-        if (count == dns.len) break;
-        dns[count] = parseIp(value) orelse continue;
-        count += 1;
+        if (dns_len == dns.len) break;
+        dns[dns_len] = parseIp(value) orelse continue;
+        dns_len += 1;
     }
-    return .{ .kind = kind, .yiaddr = yiaddr, .server_ip = server_ip, .subnet_mask = mask, .router = if (config.dhcp.router) |router| parseIp(router) else null, .dns = dns[0..count], .lease_seconds = config.dhcp.lease_seconds, .bootfile = bootfile };
+    return .{ .kind = kind, .yiaddr = yiaddr, .server_ip = server_ip, .subnet_mask = mask, .router = if (config.dhcp.router) |router| parseIp(router) else null, .dns = dns, .dns_len = dns_len, .lease_seconds = config.dhcp.lease_seconds, .bootfile = bootfile };
 }
 /// 从地址池中选择一个可用地址。
 ///

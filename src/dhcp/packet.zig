@@ -193,7 +193,15 @@ pub const Reply = struct {
     /// 默认网关（option 3）；null 表示不下发。
     router: ?u32 = null,
     /// DNS 服务器列表（option 6）；最多 8 个。
-    dns: []const u32 = &.{},
+    ///
+    /// BUG 历史：此字段曾为 `[]const u32` 切片，`base()` 将局部 `[8]u32`
+    /// 数组切片赋值后返回，导致 `Reply.dns` 指向已释放的栈帧。
+    /// `encodeReply` 读到的 `len`/`ptr` 是栈垃圾，option 6 随机丢失，
+    /// PXE 客户端拿到的 OFFER 缺 DNS。改为固定数组 + 计数的值语义，
+    /// 消除悬挂指针。
+    dns: [8]u32 = [_]u32{0} ** 8,
+    /// `dns` 中有效条目数（0..8）。
+    dns_len: u4 = 0,
     /// 租约时长（option 51），秒。
     lease_seconds: u32,
     /// PXE bootfile 路径（option 67/sname）；null 表示不下发。
@@ -238,11 +246,11 @@ pub fn encodeReply(buffer: []u8, request: *const Packet, reply: Reply) ![]const 
         try put(&i, buffer, 3, &ip);
     }
     // option 6: DNS Servers (可选，最多 8 个)
-    if (reply.dns.len != 0) {
-        if (reply.dns.len > 8) return error.BufferTooSmall;
+    if (reply.dns_len != 0) {
         var values: [32]u8 = undefined;
-        for (reply.dns, 0..) |dns, n| writeIp(values[n * 4 ..][0..4], dns);
-        try put(&i, buffer, 6, values[0 .. reply.dns.len * 4]);
+        const dns_slice = reply.dns[0..reply.dns_len];
+        for (dns_slice, 0..) |dns, n| writeIp(values[n * 4 ..][0..4], dns);
+        try put(&i, buffer, 6, values[0 .. @as(usize, reply.dns_len) * 4]);
     }
     // option 51: IP Address Lease Time
     var seconds: [4]u8 = undefined;
@@ -342,4 +350,59 @@ test "parses client identity and RFC 3527 link selection options" {
     try std.testing.expectEqual(Architecture.x86_64, parsed.architecture);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0xaa, 0xbb, 0xcc }, parsed.client_uuid.?);
     try std.testing.expectEqual(@as(?u32, 0xc0a83200), parsed.link_selection);
+}
+
+// 测试：验证 OFFER/ACK 中 Router(3) 和 DNS(6) option 正确编码。
+// 回归：Reply.dns 曾为 `[]const u32` 切片，base() 返回局部数组切片后
+// 成为悬挂指针，encodeReply 读到栈垃圾导致 option 6 随机丢失。
+// 改为固定数组 + dns_len 值语义后，option 3/6 必须稳定出现在报文中。
+test "encodeReply includes Router and DNS options" {
+    var in: [300]u8 = [_]u8{0} ** 300;
+    in[0] = 1;
+    in[1] = 1;
+    in[2] = 6;
+    @memcpy(in[236..240], &magic_cookie);
+    in[240] = 53;
+    in[241] = 1;
+    in[242] = 1;
+    in[243] = 255;
+    const p = try parse(in[0..244]);
+
+    var dns: [8]u32 = [_]u32{0} ** 8;
+    dns[0] = 0xc0a83201; // 192.168.50.1
+    dns[1] = 0x08080808; // 8.8.8.8
+    var out: [512]u8 = undefined;
+    const encoded = try encodeReply(&out, &p, .{
+        .kind = .offer,
+        .yiaddr = 0xc0a83264,
+        .server_ip = 0xc0a83201,
+        .subnet_mask = 0xffffff00,
+        .router = 0xc0a83201,
+        .dns = dns,
+        .dns_len = 2,
+        .lease_seconds = 1800,
+        .bootfile = "grubaa64.efi",
+    });
+
+    // 在编码后的报文中搜索 option 3 (Router) 和 option 6 (DNS)。
+    // option 区域从 offset 240 开始，格式为 code(1) + len(1) + value。
+    var saw_router = false;
+    var saw_dns = false;
+    var i: usize = 240;
+    while (i < encoded.len and encoded[i] != 255) {
+        const code = encoded[i];
+        const len = encoded[i + 1];
+        if (code == 3 and len == 4) {
+            try std.testing.expectEqual(@as(u32, 0xc0a83201), readIp(encoded[i + 2 .. i + 6]));
+            saw_router = true;
+        }
+        if (code == 6 and len == 8) {
+            try std.testing.expectEqual(@as(u32, 0xc0a83201), readIp(encoded[i + 2 .. i + 6]));
+            try std.testing.expectEqual(@as(u32, 0x08080808), readIp(encoded[i + 6 .. i + 10]));
+            saw_dns = true;
+        }
+        i += 2 + len;
+    }
+    try std.testing.expect(saw_router);
+    try std.testing.expect(saw_dns);
 }

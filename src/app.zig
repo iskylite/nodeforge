@@ -116,6 +116,12 @@ pub fn run(
     const desired_revision = model_revision.desiredRevision();
     var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);
     defer live_config.deinit();
+    // live_catalog/live_models 必须在 Persistence 构造前就绪：DHCP 的武装判定
+    // 经 persistenceRevision 在 model gate 下取 config+catalog 快照重算 desired
+    // revision，需要引用 CatalogRuntime/ModelRuntime。
+    var live_catalog = try catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
+    defer live_catalog.deinit();
+    var live_models = model_runtime.ModelRuntime.init(&live_config, &live_catalog);
     deployment_control.load(io, allocator, paths.require().deployment_control_path, &deployments) catch |err| switch (err) {
         error.FileNotFound => {},
         else => {
@@ -170,10 +176,8 @@ pub fn run(
         .deployments = &deployments,
         .config_revision = desired_revision,
         .configs = &live_config,
+        .models = &live_models,
     };
-    var live_catalog = try catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
-    defer live_catalog.deinit();
-    var live_models = model_runtime.ModelRuntime.init(&live_config, &live_catalog);
     // DHCP 需要 wildcard 接收 socket 以处理客户端广播。DHCP 服务器将配置的
     // PXE NIC 作为 Linux socket 级别的边界；TFTP 保持绑定在广告的 unicast 地址。
     const dhcp_socket = try dhcp_server.bind(io, config.server.server_ip, config.server.bind_interface);

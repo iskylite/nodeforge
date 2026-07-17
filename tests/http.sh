@@ -43,7 +43,7 @@ sed \
     -e 's/192.168.50.0\/24/127.0.0.0\/24/' \
     -e 's/192.168.50.100/127.0.0.100/' \
     -e 's/192.168.50.200/127.0.0.200/' \
-    -e "s/\"http_port\": 8080/\"http_port\": $port/" \
+    -e "s/\"http_port\": 18080/\"http_port\": $port/" \
     -e 's/"bind_interface": "enp1s0"/"bind_interface": "lo"/' \
     "$root/config.example.json" > "$tmp/config.json"
 sed '/"policy": {/i\

@@ -103,7 +103,7 @@ test "timeout is 5 seconds for boot menu visibility" {
 // kernel 始终走 TFTP（GRUB EFI 内存限制，详见 tftp/server.zig 注释）。
 test "renders HTTP URL initrd path with TFTP kernel for http_accel mode" {
     var buffer: [512]u8 = undefined;
-    const value = try render(&buffer, .{ .node_id = "node-a", .hostname = "node-a", .lease_ip = 0xC0A81BC8, .profile = "install", .kernel_path = "/install/ubuntu-22.04-aarch64-iso/vmlinuz", .initrd_path = "(http,192.168.50.1:8080)/boot/install/ubuntu-22.04-aarch64-iso/initrd.img", .cmdline = "ip=dhcp", .arch = .aarch64 });
+    const value = try render(&buffer, .{ .node_id = "node-a", .hostname = "node-a", .lease_ip = 0xC0A81BC8, .profile = "install", .kernel_path = "/install/ubuntu-22.04-aarch64-iso/vmlinuz", .initrd_path = "(http,192.168.50.1:18080)/boot/install/ubuntu-22.04-aarch64-iso/initrd.img", .cmdline = "ip=dhcp", .arch = .aarch64 });
     try std.testing.expect(std.mem.indexOf(u8, value, "linux /install/ubuntu-22.04-aarch64-iso/vmlinuz ip=dhcp") != null);
-    try std.testing.expect(std.mem.indexOf(u8, value, "initrd (http,192.168.50.1:8080)/boot/install/ubuntu-22.04-aarch64-iso/initrd.img") != null);
+    try std.testing.expect(std.mem.indexOf(u8, value, "initrd (http,192.168.50.1:18080)/boot/install/ubuntu-22.04-aarch64-iso/initrd.img") != null);
 }

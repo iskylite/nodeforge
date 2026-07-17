@@ -7,7 +7,7 @@
       "version": "9.7",
       "arch": "aarch64",
       "manager": "dnf",
-      "base_url": "http://192.168.50.1:8080/artifacts/repositories/rocky/9.7/aarch64/dvd",
+      "base_url": "http://192.168.50.1:18080/artifacts/repositories/rocky/9.7/aarch64/dvd",
       "gpg_check": false
     }
   ],
