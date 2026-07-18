@@ -1,5 +1,8 @@
 # M4.4：HTTP API URL 契约收口与路由平面分离
 
+> 历史设计说明：本文保留 M4.4 对 M4.3 `config set` 的兼容要求；M4.9 已删除该命令和 management
+> config PATCH。现行路由契约见 `DETAILED_DESIGN.md` §9.18。
+
 - 日期：2026-07-15
 - 状态：设计完成，待实现
 - 前置：M4.3

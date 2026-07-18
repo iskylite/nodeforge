@@ -4,7 +4,8 @@
 > 其中“重复 ISO 导入被拒绝是正确行为”已被 SHA-256 + logical name 幂等语义覆盖；`tftp/`、`repos/`、
 > `provisioned/` 等旧顶层路径已由 M4.2 迁移到 `assets/*`、`state/provisioned/`；旧 `tftp`、`dhcp`、`trace`、
 > `install-source` CLI 仅用于还原历史验证步骤，M4.3 后应使用 canonical 资源命令。判断当前设计和新验收时以
-> 模型/CLI 以 `DETAILED_DESIGN.md` §9.12 与 M4.3 专项设计为准，HTTP URL 以 §9.13 与 M4.4 专项设计为准；
+> 模型/CLI 以 `DETAILED_DESIGN.md` §9.12 与 M4.3 专项设计为历史基线，M4.9 覆盖内容以 §9.18 与
+> M4.9 专项补丁为准；HTTP URL 以 §9.13 与 M4.4 专项设计为准；
 > 不能据本文旧成功条件恢复过渡行为。
 
 M0 已在 Rocky Linux 9.7 aarch64 实机完成 systemd、HTTP、CLI、端口独占和 debug 验证；结果以
@@ -14,6 +15,88 @@ M4/M4.1 的 Rocky 9.7 与 Ubuntu 22.04 正向安装、登录和生命周期链�
 异常/负向条目继续保持未勾选。Rocky 8.10 aarch64 因 VMware/Apple-Silicon 的 64 KiB page-granule
 不兼容单独暂缓，详见 `ROCKY_8_10_VALIDATION.md`；M5+ 尚未实现。任何新能力仍必须在实际目标机验证后
 才可勾选，不能把设计、renderer fixture 或较早阶段成功当成系统级通过。
+
+## M4.9（2026-07-18）：r97n0 全量重建与 r97n1 VMware 回归
+
+本轮按用户授权删除 r97n1 快照/数据，不保留旧节点状态；r97n0 上清空 NodeForge 二进制、配置、catalog、state
+及其他受管数据后，用当前分支重新 aarch64 交叉编译并通过 `setup` 初始化、导入 Rocky 9.7 ISO、添加 r97n1，
+随后从 VMware UEFI PXE 启动。最终完成安装、重启并从虚拟磁盘正常进入 Rocky 9.7。
+
+故障链与修复：
+
+| 现象/证据 | 根因 | 修复与验证 |
+| --- | --- | --- |
+| r97n0 明确记录 `PXE withheld ... install_not_armed`；`armed_generation=1`，但 requested/desired revision 不同 | deployment arm 使用 config+catalog 联合指纹，DHCP 却曾读取 ConfigRuntime 的 config-only 指纹 | DHCP 在 ModelRuntime gate 下重算联合 desired；失败使用 0 sentinel 关闭。回归断言 config-only 与联合指纹不同且 DHCP 使用后者 |
+| HTTP 路径在联合 revision 计算失败时回退 config-only | arm、immutable plan、drift/status 投影可能与 DHCP 使用不同 revision | HTTP 改为返回 `503 model.revision_unavailable`，每个请求只计算一次并复用，不再回退 |
+| fresh setup + ISO import 后缺少 `efi/grubaa64.efi` catalog/文件 | importer 只发布 ISO/kernel/initrd/repository，隐含依赖旧环境残留 bootloader | ISO import 从媒体提取架构对应 UEFI GRUB，发布 canonical bootloader asset；同架构重复导入安全复用 |
+| `setup` 执行 systemd enable/start 后偶发立即判 health 失败 | `Type=simple` 的 `systemctl start` 早于 HTTP listener ready 返回 | setup 使用 5 秒有界 readiness retry；真实错误仍回滚 |
+| 独立清理 boot-session 或 deployment-control 后可能恢复不一致 capability/generation | 两个文件各自原子但没有跨文件事务，旧 loader 未校验 join | 启动先加载 deployment-control，再按 node/generation/model revision 校验 install session；不一致拒绝启动 |
+
+最近提交关联分析：最近两个 HEAD 提交中，`c86b324` 保留了 DHCP 读取 config-only revision 的既有实现；
+`3ca9259` 已尝试接入 ModelRuntime，但计算失败仍错误回退到启动 revision，因此只修了一半。更早的
+`6d282d2` 首次引入该 config-only 读取，`46d935f` 的 M4.7 config/catalog 拆分使两类 revision 的差异成为
+稳定现象；`0ed4395` 的 ISO/catalog 收口则暴露了 fresh environment 对 bootloader 自举的依赖。因此最近
+两次提交与复现直接相关，但不是单一提交造成全部故障。修复原则是统一事实源与失败关闭，不撤销 M4.7 拆分。
+
+本轮本地门槛：`zig build test` 通过；`make arm64` 通过。实机门槛：r97n0 fresh setup/import/node add
+通过，r97n1 获得 PXE lease/bootfile，拉取 GRUB/kernel/initrd，完成 Anaconda 安装，重启后本地盘启动成功。
+
+本轮属于 M4.9a 已实现范围。完整 node-scoped 256-bit digest 的 deployment/session/status schema 迁移属于
+M4.9b，尚未实现，不能由本次 u64 联合 revision 修复或实机成功代替。
+
+## M4.10（2026-07-19）：fresh CLI 闭环
+
+r97n0 使用当前 ARM64 ReleaseSafe 二进制再次执行无历史 fresh reset，全程未编辑 JSON：
+
+```bash
+printf 'yes\n' | nodeforge setup --reset-all --purge-all --reconfigure \
+  --server-ip 192.168.27.128 --bind-interface enp26s0 \
+  --subnet 192.168.27.0/24 --pool-start 192.168.27.200 --pool-end 192.168.27.254
+systemctl daemon-reload
+systemctl restart nodeforged
+nodeforge assets import /root/nodeforge-stage/media/Rocky-9.7-aarch64-minimal.iso
+nodeforge node add r97n1 mac=00:50:56:2A:23:DB arch=aarch64 \
+  profile=rocky-9.7-aarch64-iso ip=192.168.27.210
+```
+
+结果：
+
+- 组合操作只给出一次完整范围的交互确认；输出 reset 和 reconfigure 两个阶段，backup、日志文件和
+  migration backup 均无残留。
+- reconfigure 重新发布 canonical unit；命令完成后 `nodeforged` 仍为 inactive，证明服务生命周期只由
+  随后的显式 systemctl 控制。
+- ISO import 返回 `install_source=rocky-9.7-aarch64-iso`，并在同一 catalog revision 自动创建同名默认 profile。
+- node add 后无需重启/retry，立即显示 `install_intent=initial-armed`、`pxe_ready=true`、
+  `armed_generation=1`，requested/desired revision 相等。
+- `profile create rocky-9.7-alt rocky-9.7-aarch64-iso` 可补充第二个 profile。
+- 当前 M4.9a 全局 digest 会因补充无关 profile 使既有 arm 进入 `rearm-required`；执行一次
+  `node retry r97n1` 后恢复 `retry-armed/pxe_ready=true`。该扰动由 M4.9b node-scoped digest 消除。
+- missing source、missing profile 分别返回 `profile.install_source_not_found`、
+  `node.profile_not_found` 和 request id。
+- `setup --reconfigure --install` 返回退出码 2，并说明 reconfigure 已发布 unit、`--install`
+  只属于 standalone `--generate-systemd` 操作。
+
+### M4.10 VMware 安装复验
+
+通过 Computer Use 启动 r97n1 后，第一轮 PXE 已完成 DHCP、GRUB、kernel/initrd 和 kickstart 获取，但
+Anaconda 报 `Disk "sda" given in clearpart command does not exist`。根因是 ISO 自动 profile 无法从介质
+tuple 推导目标机磁盘，默认 `/dev/sda` 与 VMware NVMe `/dev/nvme0n1` 不匹配。
+
+补齐 CLI 后未编辑 JSON，执行：
+
+```bash
+nodeforge profile set rocky-9.7-aarch64-iso boot_disk=/dev/nvme0n1
+nodeforge node retry r97n1 --force   # 仅在已确认失败目标机停止后
+```
+
+重新启动后验证：
+
+- kickstart 为 `clearpart --drives=nvme0n1`、`bootloader --boot-drive=nvme0n1`；
+- DHCP ACK、节点专属 GRUB、13,232,984-byte kernel、139,507,444-byte initrd 均成功；
+- Anaconda 完成 336 个软件包安装并上报 `install.completed`；
+- generation 3 的 requested/applied/desired revision 全部为 `11613377721464308635`；
+- `terminal_generation=3`、`successful_generation=3`、`drifted=false`、`pxe_ready=false`；
+- PXE-first 固件随后只获得无 bootfile lease，最终从本地 NVMe 启动到 Rocky Linux 9.7 login。
 
 ## M4.3 系统级重新验收（待实现后执行）
 
@@ -628,7 +711,7 @@ M0 默认 HTTP/管理共用端口为 `18080`（可在配置文件 `server.http_p
   不回退公网。
 - [x] 静态目标网络要求 `address == node.ip`，安装过程中本地 HTTP/session
   不断链，重启后 Ubuntu Netplan 或 Rocky NetworkManager 仍使用该静态地址。
-- [ ] config import/export 对用户、root、IPMI 及所有其他 password 字段均保留原始明文；schema 不要求
+- [ ] `setup --import-config` / `config export` 对用户、root、IPMI 及所有其他 password 字段均保留原始明文；schema 不要求
   SecretRef 或预哈希值。日志、事件、BootConfig 和 status/plan 默认输出不泄露明文密码。
 
 ### M5 继承验收

@@ -268,6 +268,21 @@ pub const Store = struct {
         return false;
     }
 
+    /// 操作员确认目标机已停止后，强制 retry 可终止无法回报 terminal event
+    /// 的坏 installer session（例如 kickstart 在 capability 下发后解析失败）。
+    pub fn supersedeNode(self: *Store, node_id: []const u8, mono_now: i64, utc_now: i64) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var changed = false;
+        for (&self.sessions) |*session| {
+            if (!session.active() or session.nodeId() == null or !std.mem.eql(u8, session.nodeId().?, node_id)) continue;
+            _ = terminateLocked(session, .superseded, mono_now, utc_now);
+            session.* = .{};
+            changed = true;
+        }
+        return changed;
+    }
+
     pub fn hasActiveInstallSource(self: *Store, source: []const u8, mono_now: i64) bool {
         var needle_buffer: [256]u8 = undefined;
         const needle = std.fmt.bufPrint(&needle_buffer, "\"name\":\"{s}\"", .{source}) catch return true;

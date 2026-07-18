@@ -109,9 +109,9 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     const config = try zli.Command.init(init_options, .{
         .name = "config",
-        .description = "Validate or manage startup configuration",
+        .description = "Validate or export startup configuration",
         .usage = "nodeforge config <command> [options]",
-        .help = "Manage startup configuration files. Changes are offline operations; restart nodeforged to load them.",
+        .help = "Inspect startup configuration files. Import and reconfiguration are owned by nodeforge setup.",
     }, showCurrentHelp);
     const config_validate = try zli.Command.init(init_options, .{
         .name = "validate",
@@ -129,16 +129,9 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     }, configExportHandler);
     try addConfigPathFlag(config_export);
     try addDebugFlag(config_export);
-    const config_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Apply runtime-safe configuration properties" }, configSetHandler);
-    try config_set.addPositionalArg(.{ .name = "properties", .description = "Typed runtime properties as key=value", .required = true, .variadic = true });
-    try addConfigPathFlag(config_set);
-    try addOutputFlag(config_set);
-    try addDebugFlag(config_set);
     try config.addCommands(&.{
         config_validate,
         config_export,
-        config_set,
-        try configImportCommand(init_options),
     });
 
     const catalog = try zli.Command.init(init_options, .{
@@ -241,6 +234,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     const node_retry = try zli.Command.init(init_options, .{ .name = "retry", .description = "Rearm the next PXE install generation" }, installRetryHandler);
     try node_retry.addPositionalArg(.{ .name = "node_id", .description = "Registered install node", .required = true });
+    try node_retry.addFlag(.{ .name = "force", .description = "Supersede a stuck active session before rearming", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(node_retry);
     try addOutputFlag(node_retry);
     try addDebugFlag(node_retry);
@@ -260,7 +254,18 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_render, node_retry, node_trace });
 
-    const profile = try zli.Command.init(init_options, .{ .name = "profile", .description = "Inspect PXE profiles and manage kernel arguments" }, showCurrentHelp);
+    const profile = try zli.Command.init(init_options, .{ .name = "profile", .description = "Create and inspect PXE profiles" }, showCurrentHelp);
+    const profile_create = try zli.Command.init(init_options, .{
+        .name = "create",
+        .description = "Create an install profile from an imported install source",
+        .usage = "nodeforge profile create <name> <install-source> [options]",
+        .help = "Derives distro, version, and architecture from the imported source. The profile is destructive, persistent, and explicit-retry by construction.",
+    }, profileCreateHandler);
+    try profile_create.addPositionalArg(.{ .name = "name", .description = "Canonical profile name", .required = true });
+    try profile_create.addPositionalArg(.{ .name = "install-source", .description = "Imported install source name", .required = true });
+    try addConfigPathFlag(profile_create);
+    try addOutputFlag(profile_create);
+    try addDebugFlag(profile_create);
     const profile_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List PXE profiles" }, profileListHandler);
     try addConfigPathFlag(profile_list);
     try addOutputFlag(profile_list);
@@ -270,9 +275,9 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_show);
     try addOutputFlag(profile_show);
     try addDebugFlag(profile_show);
-    const profile_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Set profile kernel arguments" }, profileSetHandler);
+    const profile_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Set profile installer properties" }, profileSetHandler);
     try profile_set.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
-    try profile_set.addPositionalArg(.{ .name = "property", .description = "kernel_args=<space-separated arguments>", .required = true });
+    try profile_set.addPositionalArg(.{ .name = "property", .description = "kernel_args=<arguments> or boot_disk=/dev/<device>", .required = true });
     try addConfigPathFlag(profile_set);
     try addOutputFlag(profile_set);
     try addDebugFlag(profile_set);
@@ -282,7 +287,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_unset);
     try addOutputFlag(profile_unset);
     try addDebugFlag(profile_unset);
-    try profile.addCommands(&.{ profile_list, profile_show, profile_set, profile_unset });
+    try profile.addCommands(&.{ profile_create, profile_list, profile_show, profile_set, profile_unset });
 
     // ── assets 资源（ISO/资产导入管理）──────────────────────────────────
     const assets = try zli.Command.init(init_options, .{
@@ -355,20 +360,22 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .name = "setup",
         .description = "Initialize, reconfigure, repair, or reset a NodeForge deployment",
         .usage = "nodeforge setup [--install-root PATH] [options]",
-        .help = "All filesystem effects are bounded by the bootstrapped install root. Destructive non-interactive operations require --yes.",
+        .help = "All filesystem effects are bounded by the bootstrapped install root. Destructive non-interactive operations require --yes. --reset-all may compose with --reconfigure.",
     }, setupHandler);
     try setup.addFlags(&.{
         .{ .name = "install-root", .description = "New or existing absolute install root", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "non-interactive", .description = "Do not prompt for input", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "yes", .description = "Confirm a destructive or service lifecycle action", .type = .Bool, .default_value = .{ .Bool = false } },
-        .{ .name = "reconfigure", .description = "Validate and republish an existing deployment", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "reconfigure", .description = "Validate config and republish systemd unit; may follow --reset-all", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "import-config", .description = "Import a complete startup config JSON during initialization or reconfiguration", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "generate-systemd", .description = "Generate only the systemd unit", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "print", .description = "Print generated systemd unit instead of writing it", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "install", .description = "Install/enable/start the generated systemd unit", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "repair-dirs", .description = "Repair the canonical directory tree only", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "reset-state", .description = "Back up and clear runtime state", .type = .Bool, .default_value = .{ .Bool = false } },
-        .{ .name = "reset-all", .description = "Reset startup config and runtime state", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "reset-all", .description = "Reset startup config and runtime state; may precede --reconfigure", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "purge-data", .description = "With --reset-all, also purge catalog and assets", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "purge-all", .description = "With --reset-all, purge catalog, assets, logs, backups, and migration backups", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "dry-run", .description = "Describe the selected operation without writing", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "bind-interface", .description = "PXE bind interface for generated config", .type = .String, .default_value = .{ .String = "eth0" } },
         .{ .name = "server-ip", .description = "PXE server IPv4 address", .type = .String, .default_value = .{ .String = "192.168.50.1" } },
@@ -396,13 +403,27 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 fn setupHandler(ctx: zli.CommandContext) !void {
     const p = nodeforge.paths.require();
     const dry_run = ctx.flag("dry-run", bool);
+    const import_config_path = ctx.flag("import-config", []const u8);
     const operation_count = @as(u8, @intFromBool(ctx.flag("generate-systemd", bool))) + @as(u8, @intFromBool(ctx.flag("repair-dirs", bool))) + @as(u8, @intFromBool(ctx.flag("reset-state", bool))) + @as(u8, @intFromBool(ctx.flag("reset-all", bool))) + @as(u8, @intFromBool(ctx.flag("reconfigure", bool)));
-    if (operation_count > 1 or (ctx.flag("print", bool) and ctx.flag("install", bool)) or ((ctx.flag("print", bool) or ctx.flag("install", bool)) and !ctx.flag("generate-systemd", bool))) return error.InvalidFlagValue;
-    const destructive = ctx.flag("reset-state", bool) or ctx.flag("reset-all", bool) or ctx.flag("purge-data", bool) or ctx.flag("install", bool);
-    if (ctx.flag("purge-data", bool) and !ctx.flag("reset-all", bool)) return error.InvalidFlagValue;
+    const reset_then_reconfigure = ctx.flag("reset-all", bool) and ctx.flag("reconfigure", bool);
+    if (operation_count > 1 and !(operation_count == 2 and reset_then_reconfigure))
+        return setupFlagError(ctx, "select one setup operation; only --reset-all may compose with --reconfigure");
+    if (ctx.flag("print", bool) and ctx.flag("install", bool)) return setupFlagError(ctx, "--print and --install are mutually exclusive");
+    if (ctx.flag("install", bool) and !ctx.flag("generate-systemd", bool)) return setupFlagError(ctx, "--install belongs to the standalone --generate-systemd operation; --reconfigure already republishes the unit and service activation remains an explicit systemctl action");
+    if (ctx.flag("print", bool) and !ctx.flag("generate-systemd", bool)) return setupFlagError(ctx, "--print requires --generate-systemd");
+    if (import_config_path.len != 0 and (ctx.flag("generate-systemd", bool) or ctx.flag("repair-dirs", bool) or ctx.flag("reset-state", bool) or ctx.flag("reset-all", bool))) return error.InvalidFlagValue;
+    const purge_all = ctx.flag("purge-all", bool);
+    const destructive = ctx.flag("reset-state", bool) or ctx.flag("reset-all", bool) or ctx.flag("purge-data", bool) or purge_all or ctx.flag("install", bool);
+    if ((ctx.flag("purge-data", bool) or purge_all) and !ctx.flag("reset-all", bool)) return setupFlagError(ctx, "--purge-data and --purge-all require --reset-all");
+    if (ctx.flag("purge-data", bool) and purge_all) return setupFlagError(ctx, "--purge-data and --purge-all are mutually exclusive");
     if (destructive and !ctx.flag("yes", bool)) {
         if (ctx.flag("non-interactive", bool)) return error.ConfirmationRequired;
-        try ctx.writer.print("This will modify {s}. Continue? [y/N]: ", .{p.install_root});
+        if (purge_all)
+            try ctx.writer.print("This will permanently purge NodeForge state, catalog, assets, logs, backups, and migration history under {s}, then regenerate the deployment. Continue? [y/N]: ", .{p.install_root})
+        else if (ctx.flag("reset-all", bool))
+            try ctx.writer.print("This will back up and reset NodeForge startup configuration and runtime state under {s}. Continue? [y/N]: ", .{p.install_root})
+        else
+            try ctx.writer.print("This will modify {s}. Continue? [y/N]: ", .{p.install_root});
         const answer = ctx.reader.takeDelimiter('\n') catch null;
         if (answer == null or !(std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r"), "y") or std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r"), "yes"))) return error.ConfirmationRequired;
     }
@@ -414,8 +435,22 @@ fn setupHandler(ctx: zli.CommandContext) !void {
         .pool_start = ctx.flag("pool-start", []const u8),
         .pool_end = ctx.flag("pool-end", []const u8),
     };
+    var imported_config: ?std.json.Parsed(nodeforge.model.AppConfig) = null;
+    if (import_config_path.len != 0) {
+        imported_config = loadConfig(ctx.io, ctx.allocator, import_config_path, ctx.writer, false) orelse {
+            setExitCode(ctx, 1);
+            return;
+        };
+        if (imported_config.?.value.schema_version != 2 or imported_config.?.value.distros.len != 0 or imported_config.?.value.profiles.len != 0 or imported_config.?.value.nodes.len != 0 or imported_config.?.value.provisioning_bundles.len != 0) {
+            try ctx.writer.writeAll("error: config: imported startup config must use schema 2 and must not embed catalog entities\n");
+            imported_config.?.deinit();
+            setExitCode(ctx, 1);
+            return;
+        }
+    }
+    defer if (imported_config) |*candidate| candidate.deinit();
     if (dry_run) {
-        try views.success(ctx.writer, "setup dry-run", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config", .value = p.config_path }, .{ .label = "Catalog", .value = p.catalog_dir } });
+        try views.success(ctx.writer, "setup dry-run", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config", .value = p.config_path }, .{ .label = "Config source", .value = if (import_config_path.len == 0) "generated/existing" else import_config_path }, .{ .label = "Catalog", .value = p.catalog_dir } });
         return;
     }
     if (ctx.flag("generate-systemd", bool)) {
@@ -450,15 +485,19 @@ fn setupHandler(ctx: zli.CommandContext) !void {
             const config = nodeforge.setup.generatedConfig(p, network);
             try nodeforge.config_validate.validate(&config, &nodeforge.model.Catalog{});
             try nodeforge.config_store.save(ctx.io, ctx.allocator, p.config_path, &config);
-            if (ctx.flag("purge-data", bool)) {
+            if (ctx.flag("purge-data", bool) or purge_all) {
                 std.Io.Dir.cwd().deleteTree(ctx.io, p.catalog_dir) catch {};
                 std.Io.Dir.cwd().deleteTree(ctx.io, p.assets_dir) catch {};
                 try nodeforge.setup.repairDirectories(ctx.io, ctx.allocator, p);
                 try nodeforge.catalog_store.initializeEmpty(ctx.io, ctx.allocator, p.catalog_dir);
             }
         }
-        try views.success(ctx.writer, "deployment state reset", &.{ .{ .label = "Backup", .value = backup }, .{ .label = "Install root", .value = p.install_root } });
-        return;
+        if (purge_all) try purgeSetupHistory(ctx, p);
+        try views.success(ctx.writer, "deployment state reset", &.{ .{ .label = "Backup", .value = if (purge_all) "purged by --purge-all" else backup }, .{ .label = "Install root", .value = p.install_root } });
+        // M4.10：reset-all + reconfigure 是一个有序组合，不是两个相互竞争的
+        // operation。reset 先生成新配置/空 catalog；随后复用唯一的 reconfigure
+        // 校验与 unit 发布路径。这里不得调用 systemctl，服务生命周期仍由操作员控制。
+        if (!reset_then_reconfigure) return;
     }
 
     const config_exists = blk: {
@@ -466,21 +505,48 @@ fn setupHandler(ctx: zli.CommandContext) !void {
         break :blk true;
     };
     if (!config_exists) {
-        try nodeforge.setup.initialize(ctx.io, ctx.allocator, p, network);
+        try nodeforge.setup.initialize(ctx.io, ctx.allocator, p, network, if (imported_config) |*candidate| &candidate.value else null);
         try views.success(ctx.writer, "NodeForge initialized", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config", .value = p.config_path }, .{ .label = "Catalog", .value = p.catalog_dir } });
         return;
     }
     const migrated = try nodeforge.setup.migrateLegacy(ctx.io, ctx.allocator, p);
-    var config = try nodeforge.config.load(ctx.io, ctx.allocator, p.config_path);
-    defer config.deinit();
     var catalog = try nodeforge.catalog_store.load(ctx.io, ctx.allocator, p.catalog_dir);
     defer catalog.deinit();
-    const effective = nodeforge.model.projectCatalog(config.value, &catalog.value);
+    var installed_config: ?std.json.Parsed(nodeforge.model.AppConfig) = null;
+    if (imported_config == null) installed_config = try nodeforge.config.load(ctx.io, ctx.allocator, p.config_path);
+    defer if (installed_config) |*current| current.deinit();
+    const startup_config = if (imported_config) |*candidate| &candidate.value else &installed_config.?.value;
+    const effective = nodeforge.model.projectCatalog(startup_config.*, &catalog.value);
     try nodeforge.config_validate.validate(&effective, &catalog.value);
     const unit = try nodeforge.setup.renderSystemd(ctx.allocator, p);
     defer ctx.allocator.free(unit);
+    // M4.9：setup 是 startup config 的唯一写入口。发布前必须把 candidate
+    // 与当前 catalog 联合校验；requested/applied provenance 是历史事实，
+    // 配置导入不得改写。运行中的 daemon 只在重启后加载新 pair。
+    if (imported_config != null) try nodeforge.config_store.save(ctx.io, ctx.allocator, p.config_path, startup_config);
     try nodeforge.dhcp_store.atomicWrite(ctx.io, p.service_path, unit);
-    try views.success(ctx.writer, if (migrated) "legacy deployment migrated" else "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config schema", .value = "2" }, .{ .label = "Catalog layout", .value = "1" } });
+    if (imported_config != null)
+        try views.success(ctx.writer, "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config source", .value = import_config_path }, .{ .label = "Config schema", .value = "2" }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } })
+    else
+        try views.success(ctx.writer, if (migrated) "legacy deployment migrated" else "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config schema", .value = "2" }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } });
+}
+
+fn setupFlagError(ctx: zli.CommandContext, message: []const u8) void {
+    ctx.writer.print("error: setup: {s}\n", .{message}) catch {};
+    setExitCode(ctx, 2);
+}
+
+fn purgeSetupHistory(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !void {
+    const backups_dir = try std.fmt.allocPrint(ctx.allocator, "{s}/backups", .{p.install_root});
+    defer ctx.allocator.free(backups_dir);
+    std.Io.Dir.cwd().deleteTree(ctx.io, backups_dir) catch {};
+    std.Io.Dir.cwd().deleteTree(ctx.io, p.logs_dir) catch {};
+    for ([_][]const u8{ p.config_path, p.legacy_catalog_path }) |path| {
+        const migration_backup = try std.fmt.allocPrint(ctx.allocator, "{s}.m4.7.bak", .{path});
+        defer ctx.allocator.free(migration_backup);
+        std.Io.Dir.cwd().deleteFile(ctx.io, migration_backup) catch {};
+    }
+    try nodeforge.setup.repairDirectories(ctx.io, ctx.allocator, p);
 }
 
 /// Publish and activate the unit as one recoverable lifecycle operation. The
@@ -507,8 +573,20 @@ fn installSystemd(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !voi
     defer catalog.deinit();
     const effective = nodeforge.model.projectCatalog(config.value, &catalog.value);
     try nodeforge.config_validate.validate(&effective, &catalog.value);
-    if (!nodeforge.management_client.health(ctx.io, config.value.server.http_port).healthy) return error.SystemdHealthCheckFailed;
+    // M4.9：Type=simple 的 `systemctl start` 在 exec 成功后即可返回，此时 daemon 的
+    // HTTP worker 可能尚未完成 listener 初始化。单次立即探测会把正常启动
+    // 误判为失败并回滚刚安装的 unit；给启动路径一个有界的 5 秒就绪窗口。
+    if (!waitForSystemdHealth(ctx.io, config.value.server.http_port)) return error.SystemdHealthCheckFailed;
     if (existed) std.Io.Dir.cwd().deleteFile(ctx.io, backup) catch {};
+}
+
+fn waitForSystemdHealth(io: std.Io, port: u16) bool {
+    const attempts = 50;
+    for (0..attempts) |attempt| {
+        if (nodeforge.management_client.health(io, port).healthy) return true;
+        if (attempt + 1 < attempts) std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+    }
+    return false;
 }
 
 fn rollbackSystemd(ctx: zli.CommandContext, link: []const u8, backup: []const u8, existed: bool, was_enabled: bool, was_active: bool) void {
@@ -554,24 +632,6 @@ fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
         .{ .name = "name", .description = "Explicit canonical logical name; e.g. rocky-9.7-aarch64-dvd", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Override auto-detected version; e.g. 9.7, 22.04. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "arch", .description = "Override auto-detected arch; e.g. aarch64, x86_64. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
-    });
-    return command;
-}
-
-/// 构建带必填 `source` 位置参数的 `config import` 命令。
-fn configImportCommand(init_options: zli.InitOptions) !*zli.Command {
-    const command = try zli.Command.init(init_options, .{
-        .name = "import",
-        .description = "Validate and install a startup config",
-        .help = "Validate and atomically replace a config file; restart nodeforged to load the change.",
-    }, configImportHandler);
-    try addConfigPathFlag(command);
-    try addOutputFlag(command);
-    try addDebugFlag(command);
-    try command.addPositionalArg(.{
-        .name = "source",
-        .description = "Source config JSON path",
-        .required = true,
     });
     return command;
 }
@@ -716,34 +776,6 @@ fn configExportHandler(ctx: zli.CommandContext) !void {
     const bytes = try nodeforge.config_store.render(ctx.allocator, &parsed_config.value);
     defer ctx.allocator.free(bytes);
     try ctx.writer.writeAll(bytes);
-}
-
-/// 校验源配置后原子写入 `--config` 指定的目标路径。
-fn configImportHandler(ctx: zli.CommandContext) !void {
-    const output_json = outputJsonFromContext(ctx) orelse return;
-    const debug = ctx.flag("debug", bool);
-    const config_path = ctx.flag("config", []const u8);
-    const source = ctx.getArg("source") orelse unreachable;
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, source, ctx.writer, debug) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer parsed_config.deinit();
-    if (parsed_config.value.schema_version != 2 or parsed_config.value.distros.len != 0 or parsed_config.value.profiles.len != 0 or parsed_config.value.nodes.len != 0 or parsed_config.value.provisioning_bundles.len != 0) {
-        try ctx.writer.writeAll("error: config: schema-1/model migration requires nodeforge setup --reconfigure\n");
-        setExitCode(ctx, 1);
-        return;
-    }
-    nodeforge.config_validate.validateConfig(&parsed_config.value) catch |err| {
-        try printValidationError(ctx.writer, "config", source, err, debug);
-        setExitCode(ctx, 1);
-        return;
-    };
-    try nodeforge.config_store.save(ctx.io, ctx.allocator, config_path, &parsed_config.value);
-    if (output_json)
-        try ctx.writer.print("{{\"ok\":true,\"source\":\"{s}\",\"destination\":\"{s}\"}}\n", .{ source, config_path })
-    else
-        try views.success(ctx.writer, "config imported", &.{ .{ .label = "Source", .value = source }, .{ .label = "Destination", .value = config_path } });
 }
 
 /// 加载配置和 catalog 并校验 catalog 对象及跨文件关系。
@@ -978,12 +1010,16 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
         setExitCode(ctx, 1);
         return;
     };
-    if (!imported) {
+    if (imported == null) {
         try ctx.writer.writeAll("error: install-source: daemon rejected import\n");
         setExitCode(ctx, 1);
         return;
     }
-    if (output_json) try ctx.writer.print("{{\"ok\":true,\"path\":{f}}}\n", .{std.json.fmt(iso_path, .{})}) else try views.success(ctx.writer, "install source imported", &.{.{ .label = "ISO", .value = iso_path }});
+    const source_name = imported.?.name();
+    if (output_json)
+        try ctx.writer.print("{{\"ok\":true,\"path\":{f},\"install_source\":{f},\"profile\":{f},\"next\":{{\"node_add\":\"nodeforge node add <node-id> mac=<mac> arch=<arch> profile={s}\"}}}}\n", .{ std.json.fmt(iso_path, .{}), std.json.fmt(source_name, .{}), std.json.fmt(source_name, .{}), source_name })
+    else
+        try views.success(ctx.writer, "install source and default profile imported", &.{ .{ .label = "ISO", .value = iso_path }, .{ .label = "Install source", .value = source_name }, .{ .label = "Default profile", .value = source_name }, .{ .label = "Next", .value = "nodeforge node add <node-id> mac=<mac> arch=<arch> profile=<default-profile>" } });
 }
 
 /// 暂存 ISO 的结果：daemon 受管目录中的不透明文件名、完整路径和文件大小。
@@ -1395,7 +1431,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     var cursor_buf: [256]u8 = undefined;
     var cursor: ?[]const u8 = null;
     var truncated = false;
-    const NodeItem = struct { id: []const u8, mac: []const u8, ip: ?[]const u8, profile: []const u8, status: ?[]const u8, start_at: ?i64, install_at: ?i64, finished_at: ?i64, serial_number: ?[]const u8 };
+    const NodeItem = struct { id: []const u8, mac: []const u8, ip: ?[]const u8, profile: []const u8, deploy: bool, install_intent: []const u8, pxe_ready: bool, retry_pending: bool, armed_generation: ?u64, status: ?[]const u8, start_at: ?i64, install_at: ?i64, finished_at: ?i64, serial_number: ?[]const u8 };
     const Response = struct { ok: bool, result: struct { items: []const NodeItem, next_cursor: ?[]const u8 } };
     while (true) {
         const parsed = std.json.parseFromSlice(Response, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
@@ -1416,6 +1452,8 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
                 .mac = try a.dupe(u8, item.mac),
                 .ip = try a.dupe(u8, item.ip orelse "-"),
                 .profile = try a.dupe(u8, item.profile),
+                .deploy = try a.dupe(u8, if (item.deploy) "yes" else "no"),
+                .install_intent = try a.dupe(u8, item.install_intent),
                 .status = try a.dupe(u8, item.status orelse "-"),
                 .start_at = try a.dupe(u8, views.formatTimestamp(&start_buf, item.start_at orelse 0)),
                 .install_at = try a.dupe(u8, views.formatTimestamp(&install_buf, item.install_at orelse 0)),
@@ -1531,6 +1569,7 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
             arch: []const u8,
             boot_bundle: ?[]const u8,
             kernel_args: ?[]const u8,
+            install: ?model.InstallConfig,
             safety: model.ProfileSafetyConfig,
             validation: struct { valid: bool },
             capability: struct { family: []const u8, install_adapter: []const u8, package_manager: []const u8 },
@@ -1556,6 +1595,7 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     const result = parsed.value.result;
     try ctx.writer.print("Profile {s}\n", .{result.name});
     try ctx.writer.print("  Mode          {s}\n  Platform      {s} {s} ({s})\n  Family        {s}\n  Adapter       {s}\n  Packages      {s}\n  Boot bundle   {s}\n  Kernel args   {s}\n  Valid         {s}\n", .{ result.mode, result.distro, result.version, result.arch, result.capability.family, result.capability.install_adapter, result.capability.package_manager, result.boot_bundle orelse "-", result.kernel_args orelse "-", if (result.validation.valid) "yes" else "no" });
+    if (result.install) |install| try ctx.writer.print("  Boot disk     {s}\n  Wipe          {s}\n", .{ install.storage.boot_disk, if (install.storage.wipe) "yes" else "no" });
     try ctx.writer.print("\nSafety\n  Unknown safe  {s}\n  Destructive   {s}\n  Persistent    {s}\n  Reinstall     {s}\n", .{ if (result.safety.safe_for_unknown) "yes" else "no", if (result.safety.destructive) "yes" else "no", if (result.safety.persistent_writes) "yes" else "no", @tagName(result.safety.reinstall_policy) });
     try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Firewall      {s}\n  SELinux       {s}\n  Users         {d}\n  Packages      {d}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, result.effective_system.connectivity.mode, if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.security.firewall, result.effective_system.security.selinux, result.effective_system.users.len, result.effective_system.packages.len });
     if (result.install_source) |source| {
@@ -1571,13 +1611,43 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     try ctx.writer.print("\nModel revision\n  Config        {d}\n  Catalog       {d}\n", .{ result.model_revision.config, result.model_revision.catalog });
 }
 
+fn profileCreateHandler(ctx: zli.CommandContext) !void {
+    const output_json = outputJsonFromContext(ctx) orelse return;
+    const name = ctx.getArg("name") orelse return;
+    const install_source = ctx.getArg("install-source") orelse return;
+    if (!nodeforge.config_validate.validLogicalId(name) or !nodeforge.config_validate.validLogicalId(install_source)) {
+        try ctx.writer.writeAll("error: profile create: name and install-source must be canonical logical identifiers\n");
+        setExitCode(ctx, 2);
+        return;
+    }
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.profileCreate(ctx.io, config.value.server.http_port, name, install_source, &reason);
+    if (!result.healthy) {
+        try reportMutationFailure(ctx, result, "profile create failed: daemon unreachable");
+        return;
+    }
+    if (output_json)
+        try ctx.writer.print("{{\"ok\":true,\"profile\":{f},\"mode\":\"install\",\"install_source\":{f}}}\n", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}) })
+    else
+        try views.success(ctx.writer, "install profile created", &.{ .{ .label = "Profile", .value = name }, .{ .label = "Install source", .value = install_source }, .{ .label = "Safety", .value = "destructive, persistent, explicit retry" } });
+}
+
 fn profileSetHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const name = ctx.getArg("name") orelse return;
     const property = ctx.getArg("property") orelse return;
-    const prefix = "kernel_args=";
-    if (!std.mem.startsWith(u8, property, prefix) or property.len == prefix.len) return profilePropertyError(ctx, error.InvalidKernelArgsProperty);
-    try mutateProfileKernelArgs(ctx, name, property[prefix.len..], output_json, "profile kernel args updated");
+    const kernel_prefix = "kernel_args=";
+    const disk_prefix = "boot_disk=";
+    if (std.mem.startsWith(u8, property, kernel_prefix) and property.len > kernel_prefix.len)
+        return mutateProfileKernelArgs(ctx, name, property[kernel_prefix.len..], output_json, "profile kernel args updated");
+    if (std.mem.startsWith(u8, property, disk_prefix) and property.len > disk_prefix.len)
+        return mutateProfileBootDisk(ctx, name, property[disk_prefix.len..], output_json);
+    return profilePropertyError(ctx, error.InvalidProfileProperty);
 }
 
 fn profileUnsetHandler(ctx: zli.CommandContext) !void {
@@ -1606,8 +1676,26 @@ fn mutateProfileKernelArgs(ctx: zli.CommandContext, name: []const u8, kernel_arg
         try views.success(ctx.writer, summary, &.{ .{ .label = "Profile", .value = name }, .{ .label = "Kernel args", .value = kernel_args orelse "-" }, .{ .label = "Install nodes", .value = "run node retry before the next install" } });
 }
 
+fn mutateProfileBootDisk(ctx: zli.CommandContext, name: []const u8, boot_disk: []const u8, output_json: bool) !void {
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.profileSetBootDisk(ctx.io, config.value.server.http_port, name, boot_disk, &reason);
+    if (!result.healthy) {
+        try reportMutationFailure(ctx, result, "profile boot disk update failed: daemon unreachable");
+        return;
+    }
+    if (output_json)
+        try ctx.writer.print("{{\"ok\":true,\"profile\":{f},\"boot_disk\":{f}}}\n", .{ std.json.fmt(name, .{}), std.json.fmt(boot_disk, .{}) })
+    else
+        try views.success(ctx.writer, "profile boot disk updated", &.{ .{ .label = "Profile", .value = name }, .{ .label = "Boot disk", .value = boot_disk }, .{ .label = "Install nodes", .value = "run node retry before the next install" } });
+}
+
 fn profilePropertyError(ctx: zli.CommandContext, err: anyerror) void {
-    ctx.writer.print("error: profile attributes: {s}; expected kernel_args=<value> or unset kernel_args\n", .{@errorName(err)}) catch {};
+    ctx.writer.print("error: profile attributes: {s}; expected kernel_args=<value>, boot_disk=/dev/<device>, or unset kernel_args\n", .{@errorName(err)}) catch {};
     setExitCode(ctx, 2);
 }
 
@@ -1698,6 +1786,16 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
+    if (ctx.flag("force", bool)) {
+        var reason: [256]u8 = undefined;
+        const result = nodeforge.management_client.installGenerationsForce(ctx.io, config.value.server.http_port, node_id, &reason);
+        if (!result.healthy) return reportMutationFailure(ctx, result, "forced install retry failed: daemon unreachable");
+        if (output_json)
+            try ctx.writer.print("{{\"ok\":true,\"node_id\":{f},\"superseded_active_session\":true}}\n", .{std.json.fmt(node_id, .{})})
+        else
+            try ctx.writer.print("active install session superseded; generation rearmed for {s}; waiting for next PXE\n", .{node_id});
+        return;
+    }
     const status = nodeforge.management_client.installGenerations(ctx.io, config.value.server.http_port, node_id);
     if (output_json) try ctx.writer.print("{{\"ok\":{s},\"node_id\":{f}}}\n", .{ if (status.healthy) "true" else "false", std.json.fmt(node_id, .{}) }) else if (status.healthy) try ctx.writer.print("install generation rearmed for {s}; waiting for next PXE\n", .{node_id}) else try ctx.writer.print("error: install retry failed for {s}\n", .{node_id});
     if (!status.healthy) setExitCode(ctx, 1);
@@ -1714,55 +1812,6 @@ fn reportMutationFailure(ctx: zli.CommandContext, result: nodeforge.management_c
     else
         try ctx.writer.print("error: {s}\n", .{fallback});
     setExitCode(ctx, 1);
-}
-
-fn configSetHandler(ctx: zli.CommandContext) !void {
-    const output_json = outputJsonFromContext(ctx) orelse return;
-    const Patch = struct {
-        logging_level: ?model.LogLevel = null,
-        events_max_size_mb: ?u16 = null,
-        events_keep: ?u8 = null,
-        policy_default_action: ?model.DiscoveryAction = null,
-        policy_default_profile: ?[]const u8 = null,
-        policy_allow_unknown_diskless: ?bool = null,
-        server_http_port: ?u16 = null,
-        tftp_max_blksize: ?u16 = null,
-    };
-    var patch: Patch = .{};
-    var seen: u8 = 0;
-    for (ctx.positional_args) |item| {
-        const equal = std.mem.indexOfScalar(u8, item, '=') orelse return nodePropertyError(ctx, error.InvalidAttribute);
-        const key = item[0..equal];
-        const value = item[equal + 1 ..];
-        const bit: u8 = if (std.mem.eql(u8, key, "logging.level")) 1 else if (std.mem.eql(u8, key, "events.max_size_mb")) 2 else if (std.mem.eql(u8, key, "events.keep")) 4 else if (std.mem.eql(u8, key, "policy.default_action")) 8 else if (std.mem.eql(u8, key, "policy.default_profile")) 16 else if (std.mem.eql(u8, key, "policy.allow_unknown_diskless")) 32 else if (std.mem.eql(u8, key, "server.http_port")) 64 else if (std.mem.eql(u8, key, "tftp.max_blksize")) 128 else return nodePropertyError(ctx, error.UnknownAttribute);
-        if (seen & bit != 0) return nodePropertyError(ctx, error.DuplicateAttribute);
-        seen |= bit;
-        switch (bit) {
-            1 => patch.logging_level = std.meta.stringToEnum(model.LogLevel, value) orelse return nodePropertyError(ctx, error.InvalidAttribute),
-            2 => patch.events_max_size_mb = std.fmt.parseInt(u16, value, 10) catch return nodePropertyError(ctx, error.InvalidAttribute),
-            4 => patch.events_keep = std.fmt.parseInt(u8, value, 10) catch return nodePropertyError(ctx, error.InvalidAttribute),
-            8 => patch.policy_default_action = std.meta.stringToEnum(model.DiscoveryAction, value) orelse return nodePropertyError(ctx, error.InvalidAttribute),
-            16 => patch.policy_default_profile = value,
-            32 => patch.policy_allow_unknown_diskless = parseStrictBool(value) orelse return nodePropertyError(ctx, error.InvalidAttribute),
-            64 => patch.server_http_port = std.fmt.parseInt(u16, value, 10) catch return nodePropertyError(ctx, error.InvalidAttribute),
-            128 => patch.tftp_max_blksize = std.fmt.parseInt(u16, value, 10) catch return nodePropertyError(ctx, error.InvalidAttribute),
-            else => unreachable,
-        }
-    }
-    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer config.deinit();
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, patch, .{ .emit_null_optional_fields = false });
-    defer ctx.allocator.free(body);
-    var reason: [256]u8 = undefined;
-    const config_result = nodeforge.management_client.configSet(ctx.io, config.value.server.http_port, body, &reason);
-    if (!config_result.healthy) {
-        try reportMutationFailure(ctx, config_result, "config set failed: daemon unreachable");
-        return;
-    }
-    if (output_json) try ctx.writer.writeAll("{\"ok\":true}\n") else try views.success(ctx.writer, "configuration applied online", &.{});
 }
 
 fn nodeAddHandler(ctx: zli.CommandContext) !void {
@@ -1952,7 +2001,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
                 packages: []const []const u8,
             },
             status: ?struct { phase: []const u8, boot_session_id: []const u8, model_revision: u64, deployment_generation: u64, last_event_at: i64, last_error: bool, reason: []const u8, session_active: bool },
-            deployment: ?struct { current_generation: ?u64, armed_generation: ?u64, consumed_generation: ?u64, terminal_generation: ?u64, requested_revision: u64, applied_revision: u64, desired_revision: u64, drifted: bool, requested_by: []const u8, start_at: i64, install_at: i64, finished_at: i64, successful_generation: u64, deployed_at: i64 },
+            deployment: ?struct { install_intent: []const u8, pxe_ready: bool, retry_pending: bool, current_generation: ?u64, armed_generation: ?u64, consumed_generation: ?u64, terminal_generation: ?u64, requested_revision: u64, applied_revision: u64, desired_revision: u64, drifted: bool, requested_by: []const u8, start_at: i64, install_at: i64, finished_at: i64, successful_generation: u64, deployed_at: i64 },
             inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, reported_at: i64, deployment_generation: u64 = 0, session_created_at: i64, boot_session_id: []const u8 },
         },
     };
@@ -1984,7 +2033,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     var source_session_buf: [20]u8 = undefined;
     try ctx.writer.writeAll("\nDeployment\n");
     if (result.deployment) |deployment| {
-        try ctx.writer.print("  Current gen   {f}\n  Armed gen     {f}\n  Consumed gen  {f}\n  Terminal gen  {f}\n  Requested rev {d}\n  Applied rev   {d}\n  Desired rev   {d}\n  Drifted       {s}\n  Requested by  {s}\n  Start         {s}\n  Install       {s}\n  Finished      {s}\n  Success gen   {d}\n  Deployed      {s}\n", .{ std.json.fmt(deployment.current_generation, .{}), std.json.fmt(deployment.armed_generation, .{}), std.json.fmt(deployment.consumed_generation, .{}), std.json.fmt(deployment.terminal_generation, .{}), deployment.requested_revision, deployment.applied_revision, deployment.desired_revision, if (deployment.drifted) "yes" else "no", deployment.requested_by, views.formatTimestamp(&start_buf, deployment.start_at), views.formatTimestamp(&install_buf, deployment.install_at), views.formatTimestamp(&finished_buf, deployment.finished_at), deployment.successful_generation, views.formatTimestamp(&deployed_buf, deployment.deployed_at) });
+        try ctx.writer.print("  Intent        {s}\n  PXE ready     {s}\n  Retry pending {s}\n  Current gen   {f}\n  Armed gen     {f}\n  Consumed gen  {f}\n  Terminal gen  {f}\n  Requested rev {d}\n  Applied rev   {d}\n  Desired rev   {d}\n  Drifted       {s}\n  Requested by  {s}\n  Start         {s}\n  Install       {s}\n  Finished      {s}\n  Success gen   {d}\n  Deployed      {s}\n", .{ deployment.install_intent, if (deployment.pxe_ready) "yes" else "no", if (deployment.retry_pending) "yes" else "no", std.json.fmt(deployment.current_generation, .{}), std.json.fmt(deployment.armed_generation, .{}), std.json.fmt(deployment.consumed_generation, .{}), std.json.fmt(deployment.terminal_generation, .{}), deployment.requested_revision, deployment.applied_revision, deployment.desired_revision, if (deployment.drifted) "yes" else "no", deployment.requested_by, views.formatTimestamp(&start_buf, deployment.start_at), views.formatTimestamp(&install_buf, deployment.install_at), views.formatTimestamp(&finished_buf, deployment.finished_at), deployment.successful_generation, views.formatTimestamp(&deployed_buf, deployment.deployed_at) });
     } else try ctx.writer.writeAll("  Generation   -\n");
     try ctx.writer.writeAll("\nRuntime\n");
     if (result.status) |status| try ctx.writer.print("  Phase         {s}\n  Active        {s}\n  Last error    {s}\n  Last event    {s}\n  Reason        {s}\n  Session       {s}\n  Model rev     {d}\n  Generation    {d}\n", .{ status.phase, if (status.session_active) "yes" else "no", if (status.last_error) "yes" else "no", views.formatTimestamp(&last_event_buf, status.last_event_at), if (status.reason.len == 0) "-" else status.reason, status.boot_session_id, status.model_revision, status.deployment_generation }) else try ctx.writer.writeAll("  Phase         -\n");

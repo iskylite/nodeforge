@@ -72,14 +72,7 @@ pub fn run(
     try boot_session.generateId(io, &daemon_instance_id);
     try event_writer.setDaemonInstanceId(daemon_instance_id);
     var sessions: boot_session.Store = .{};
-    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, &sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
-        error.FileNotFound => 0,
-        else => {
-            observe_log.err("boot-session: refusing invalid checkpoint: {t}", .{err});
-            return err;
-        },
-    };
-    if (restored_sessions != 0) observe_log.info("boot-session: resumed {d} delivery session(s)", .{restored_sessions});
+    defer sessions.deinit();
     var deployments: deployment_control.Store = .{};
     var inventories = node_inventory.Store.init(allocator);
     defer inventories.deinit();
@@ -129,6 +122,17 @@ pub fn run(
             return err;
         },
     };
+    // M4.9：必须先加载 deployment-control，再恢复 capability。两个 checkpoint
+    // 分别原子写但不构成跨文件事务，因此恢复破坏性安装 session 前必须验证它
+    // 仍对应当时固定的 generation/revision，不能把旧 token 接到新 generation。
+    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, &deployments, &sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
+        error.FileNotFound => 0,
+        else => {
+            observe_log.err("boot-session: refusing invalid checkpoint: {t}", .{err});
+            return err;
+        },
+    };
+    if (restored_sessions != 0) observe_log.info("boot-session: resumed {d} delivery session(s)", .{restored_sessions});
     // inventory/deployment 恢复可能把 effective 下限抬高；必须在加载后报告实际值，
     // 不能把 clamp 前派生值或加载前默认值误报为生效容量。
     observe_log.info("capacity: subnet={s} derived={d}, lease/session effective={d}/{d} (ceiling {d}); managed nodes={d}, status={d} inventory={d} deployment={d} (ceiling {d}); tftp concurrency={d}; ping_timeout_ms={d}", .{ config.dhcp.subnet, lease_cap, runtime.dhcp.effective, sessions.effective, runtime_state.DhcpState.max_leases, config.nodes.len, statuses.effective, inventories.capacity, deployments.effective, node_status.max_statuses, tftp_conc, config.dhcp.ping_timeout_ms });
@@ -149,10 +153,6 @@ pub fn run(
     // node-status.json。两者互不争用。
     var status_io_mutex: std.atomic.Mutex = .unlocked;
     var checkpoint_flush_stop = std.atomic.Value(bool).init(false);
-    // 保留的有序退出信号，仅供需要完整重启的生命周期操作使用。M4.7 的
-    // node/profile 变更发布 catalog 快照，不再改写 config 或触发 reload。
-    var reload_requested = std.atomic.Value(bool).init(false);
-
     event_writer.appendWithFields(io, allocator, paths.require().events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
         observe_log.err("events: unable to record configuration load: {t}", .{err});
     for (config.nodes) |node| if (deployments.view(node.id)) |deployment| {
@@ -174,8 +174,6 @@ pub fn run(
         .writer = &event_writer,
         .sessions = &sessions,
         .deployments = &deployments,
-        .config_revision = desired_revision,
-        .configs = &live_config,
         .models = &live_models,
     };
     // DHCP 需要 wildcard 接收 socket 以处理客户端广播。DHCP 服务器将配置的
@@ -221,17 +219,9 @@ pub fn run(
         &status_io_mutex,
         paths.require().node_status_path,
         config_path,
-        &reload_requested,
     ) catch |err| {
         serve_error = err;
     };
-
-    // 若未来的离线 config apply 请求了有序退出，在这里进入统一关闭序列；
-    // catalog mutation 不会设置此标志。
-    if (reload_requested.load(.acquire)) {
-        observe_log.info("config: reload requested, exiting for systemd restart", .{});
-        // 进入正常关闭流程，然后 systemd 自动重启。
-    }
 
     // ── 关闭序列（M3.1）───────────────────────────────────────────────────
     // 1. 标记服务为 stopping，使管理 API 能报告该状态。

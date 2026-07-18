@@ -12,6 +12,8 @@
 - [M4.6 自定义内核引导参数专项设计](docs/superpowers/specs/2026-07-16-kernel-args-custom-boot-params-design.md)
 - [M4.7 路径、模型存储与 setup 验证记录](docs/M4_7_VALIDATION.md)
 - [M4.8 并发容量扩展与启动时动态派生专项设计](docs/superpowers/specs/2026-07-17-concurrency-capacity-scaling-design.md)
+- [M4.9 部署溯源、PXE 门禁与配置入口收口补丁](docs/superpowers/specs/2026-07-18-m4_9-deployment-provenance-and-config-ownership-patch.md)
+- [M4.10 CLI fresh-deployment 闭环补全](docs/superpowers/specs/2026-07-19-m4_10-cli-fresh-deployment-completion.md)
 - [M0–M4.1 实现审计](docs/M0_M4_AUDIT.md)
 - [Rocky Linux 8.10 aarch64 VMware PXE 验证](docs/ROCKY_8_10_VALIDATION.md)
 
@@ -46,9 +48,9 @@ M4.4 已将节点交付 API 统一到 `/api/v1/nodes/:id/**`，本机管理 API 
 `/api/v1/management/**`，静态制品迁移到 `/artifacts/**`；删除重复 `/boot/config`，用显式 Kickstart/NoCloud
 install-config 路径并把 rootfs 绑定 node capability；集中 RouteSpec/405 等工程化遗留统一转入 M4.5。旧 URL 不依赖
 redirect/alias，M4.4 直接替换并删除；切换前必须结束并清理 M4.3 session/checkpoint，残留旧 schema 拒绝启动且不
-自动 rearm。M4.5–M4.8 是进入 M5 前的现行补全方案（M4.8 编号在 M4.7 之后、实施早于 M4.6）：M4.5 承接 RouteSpec/405、golden DTO、分页、目标 ETag、
+自动 rearm。M4.5–M4.9 是进入 M5 前的现行补全方案（M4.8 编号在 M4.7 之后、实施早于 M4.6）：M4.5 承接 RouteSpec/405、golden DTO、分页、目标 ETag、
 持久 Operation/Idempotency-Key 和健壮 HTTP client；M4.6 增加安全 canonical 的 `profile.kernel_args`；M4.7 已通过
-runtime Paths、schema 2、manifest/entity 事务和 `nodeforge setup` 收口部署与 config/catalog ownership；M4.8 将 5 处定长 256 上限升级为“2048 安全天花板 + 启动时 effective 派生”，加入紧凑状态持久化、TFTP 并发 `auto=max(128,2×核)` 与 DHCP `ping_timeout` 优化，使运维在安全天花板内仅靠配置即可把批量部署规模调到 512/1024（详见 §9.17）。
+runtime Paths、schema 2、manifest/entity 事务和 `nodeforge setup` 收口部署与 config/catalog ownership；M4.8 将 5 处定长 256 上限升级为“2048 安全天花板 + 启动时 effective 派生”，加入紧凑状态持久化、TFTP 并发 `auto=max(128,2×核)` 与 DHCP `ping_timeout` 优化，使运维在安全天花板内仅靠配置即可把批量部署规模调到 512/1024（详见 §9.17）。M4.9 统一 DHCP/HTTP 的联合 desired revision，收紧 BootSession 恢复，补 fresh ISO bootloader 和 retry 可见性，并删除重复的 `config import`/死 `config set`，startup config 统一由 setup 导入（详见 §9.18）。
 它们不回改 M4.4 已验证 URL 和安装链路，但 M5–M7 必须消费完成后的统一模型。
 
 NodeForge 配置中所有语义为 `password` 的字段都允许填写明文，并以明文写入 JSON、导入和导出；
@@ -63,8 +65,13 @@ M4.5 已实施 HTTP 契约补全：集中 RouteSpec（含启动冲突/wildcard �
 有界 cursor 分页（CLI `node list`/`profile list` 跟随 `next_cursor`）、持久 Operation 幂等语义、客户端 202 轮询
 以及完整有界 response reader（含 204/空 body/非 2xx body）。install-config 与 boot-config 同样设置完整安全头。
 M4.5 契约已在 Rocky 9.7 aarch64 验证目标以 root 端到端回归（详见 §9.14.14）。
-M4.6–M4.8 契约分别以详细设计 §9.15–§9.17 为准（M4.8 实施早于 M4.6）。M4.6/M4.7 已落地并有自动验证；
+M4.6–M4.9 契约分别以详细设计 §9.15–§9.18 为准（M4.8 实施早于 M4.6）。M4.6/M4.7/M4.9a 已落地并有自动验证；
 M4.7 的 systemd 激活/回滚仍必须在 Rocky 主机完成实机清单后才能形成部署环境验收结论。
+M4.9b 的完整 node-scoped SHA-256 持久化仍是明确的 schema 后续项，当前兼容运行时仍使用联合摘要的 u64 投影。
+M4.10 已补齐 fresh CLI 闭环：ISO import 原子创建同名安全 install profile，显式 `profile create`
+用于补充 profile，在线 node add 立即持久化 initial generation；`setup --reconfigure` 始终发布 systemd
+unit 但不控制服务生命周期；真正无历史重置可组合为
+`--reset-all --purge-all --reconfigure`，之后由操作员显式执行 systemctl。
 
 ## ISO 与发行版
 
@@ -149,9 +156,9 @@ NodeForge 只有一个 HTTP listener，默认端口 `18080`（可在配置文件
 
 `nodeforge` 只把 `-v/--version` 放在顶层；`-h/--help` 由 zli 在每一级命令提供。
 `--config`、`--catalog`、`--output` 是业务命令自己的参数，必须写在对应命令之后，且只在该
-命令实际读取时出现。M0 的 `config import` 是只校验 source config 自身的离线文件操作，
-不读取 catalog；完成后必须重启 `nodeforged`。跨文件关系由 `config validate`、
-`catalog validate` 和 daemon 启动校验。
+命令实际读取时出现。启动配置导入统一使用
+`nodeforge setup --reconfigure --import-config <path>`；setup 在覆盖正式配置前联合校验候选
+config 与当前 catalog，完成后必须重启 `nodeforged`。
 
 服务默认输出 `info` 日志到 stderr/systemd journal。`config.json` 的 `logging.level` 可设置为
 `info` 或 `debug`；临时排障使用 `nodeforged -d` 强制本次启动输出 debug 服务日志，或在

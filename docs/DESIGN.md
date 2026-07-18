@@ -91,16 +91,16 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 - **协议通用，策略特化**：DHCP/TFTP 的 packet、option、状态机按通用协议设计；是否响应、返回什么 bootfile、允许读哪些文件由 NodeForge PXE 策略决定。
 - **大文件走 HTTP**：TFTP 只发启动小文件；rootfs、ISO、repo、安装源和大镜像统一走 HTTP。
 - **配置结构化**：不直接编辑 DHCP/TFTP 专用配置文件。NodeForge 把启动配置、策略配置、资产目录和运行态分开管理：`config.json` 表达站点级启动配置和少量策略默认值；导入、构建、发布得到的 repository、install source、rootfs、initrd、boot bundle 等进入 NodeForge 管理的 catalog；运行态进入 runtime/events。`nodeforged` 是 catalog 的唯一 writer。
-- **启动加载与在线更新分层**：M0 中，`nodeforged` 启动时读取并校验 `config.json`，形成内存配置快照；站点结构性配置修改后重启生效，`config import` 只是离线原子写入。M1+ 才引入 DHCP discovery 策略和 catalog 变更的在线 API，由 `nodeforged` 原子更新内存快照并持久化。
+- **启动加载与在线更新分层**：M0 中，`nodeforged` 启动时读取并校验 `config.json`，形成内存配置快照；站点结构性配置修改统一由 `setup --import-config` 联合校验并原子写入，重启生效。M1+ 才引入 DHCP discovery 策略和 catalog 变更的在线 API，由 `nodeforged` 原子更新内存快照并持久化。
 - **端口固定**：DHCP 固定监听 `UDP 67`，TFTP 固定监听 `UDP 69`。这两个端口是源码常量，不提供配置项、CLI 参数或运行时覆盖参数。
 - **发现安全**：未知节点身份可以从租约池获得临时 IP，并按 `dhcp.discovery.default_action` 进入等待、discovery 或显式允许的临时无盘；未知节点不能执行自动安装。MVP 以 MAC 为主要身份，保留 DHCP client id 和 SN 作为辅助信息。
 - **HTTP 单监听简化**：MVP 只启动一个 HTTP listener，固定绑定 `0.0.0.0:<http.port>`。健康检查、管理 API 和 M3+ PXE 数据 API 复用同一 HTTP 实现、连接循环和路由入口。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 HTTP bind 地址。DHCPv4 Linux 部署必须设置 `server.bind_interface`，用于以 `SO_BINDTODEVICE` 约束 DHCP 广播；CLI 管理客户端写死访问 `127.0.0.1:<http.port>`，不做远程管理发现和多管理端点配置。
 - **管理端口约定**：MVP 不引入独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `18080`（避免与常见 Web 服务 8080 冲突，可在 `config.json` 中覆盖）；listener 绑定所有 IPv4 接口，但 `/api/v1/management/` 仅接受 direct peer `127.0.0.1`，远端请求稳定返回 403。`nodeforge` CLI 固定连接 `127.0.0.1:<http.port>` 且不提供远程 endpoint，只支持管理同机 `nodeforged`。端口冲突时修改 `config.json` 后重启服务。
-- **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 只做 status/check、config/catalog 校验与导出、离线 config import。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
+- **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 做 status/check、config/catalog 校验与导出，启动配置导入归 setup。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
 - **CLI 使用成熟库**：命令解析、帮助信息、参数类型、默认值和错误提示使用固定版本的开源 CLI 库。MVP 固定使用支持 Zig 0.16.0 的 `zli v5.1.2`；命令、子命令、flag、位置参数和说明只在命令树中声明一次，解析与分级帮助从同一份声明生成。zli 只承载 CLI 语法和展示，不承载复杂业务配置模型。
 - **CLI 帮助可达**：顶层、每个资源命令和每个子命令都必须支持 `-h/--help`，显示用途、参数和默认值；长示例保留在 README 和运维文档，不塞进帮助页。
 - **日志与排障**：M0–M2 的 stderr/journal 行为在 M2.5 统一迁移为带时间、等级、scope 的标准库日志后端；`nodeforged --log-output auto|terminal|file|both` 控制本次输出目标，systemd 默认写入 `/opt/nodeforge/logs/nodeforged.log`，配置支持 `debug/info/warn/err` 和文件轮转，`nodeforged -d/--debug` 仅覆盖本次启动。M2.5 的 Event v2 是本地可查询审计契约，所有后续协议、installer、initrd 与 runner 复用同一注册表和 writer。服务日志、业务事件和 CLI 错误分别输出，且任何等级都不得记录密码、token、完整请求体或节点上传的大日志。
-- **密码配置统一为明文事实**：NodeForge config 中所有声明为 password 的字段都接受普通明文字符串，并在 JSON 存储、`config import` 和 `config export` 中原样保留；不限于用户、root 和 IPMI，未来 repository/proxy/basic-auth 等密码字段也遵循同一规则。需要 crypt/hash 的 adapter 只在渲染或受控下发阶段转换，不得回写配置。token、session capability、SSH private key 和派生 password hash 不属于 password 配置字段。
+- **密码配置统一为明文事实**：NodeForge config 中所有声明为 password 的字段都接受普通明文字符串，并在 JSON 存储、setup 配置导入和 `config export` 中原样保留；不限于用户、root 和 IPMI，未来 repository/proxy/basic-auth 等密码字段也遵循同一规则。需要 crypt/hash 的 adapter 只在渲染或受控下发阶段转换，不得回写配置。token、session capability、SSH private key 和派生 password hash 不属于 password 配置字段。
 - **输出可读优先**：面向人的默认输出必须分组、对齐、标注状态和时间；机器消费使用显式 `--output json`。
 
 ## 3. M0 实现状态
@@ -139,11 +139,10 @@ M0 项目骨架阶段已完成，并在 Rocky 9.7 aarch64 环境完成实机验�
 
 ### 3.5 M0 CLI 边界
 
-M0 只交付以下可执行命令：`status`、`check`、`config validate/export/import`、
-`catalog validate/export`。其中 `status` 和 `check` 固定调用本机管理 API；config/catalog
-命令直接操作本地 JSON 文件：`config import` 只校验 source config 自身后原子覆盖目标文件；
-`config validate` 与 `catalog validate` 才校验 config/catalog 关系。import 不会热加载，必须重启
-`nodeforged`。M0 不实现 DHCP/TFTP/资产/节点/rootfs/initrd/provision 的 CLI，也不实现
+M0 最初交付 `status`、`check`、`config validate/export`、`catalog validate/export`，后续将启动配置
+导入收敛到 `setup --import-config`。其中 `status` 和 `check` 固定调用本机管理 API；config/catalog
+命令只读本地 JSON 文件，setup 在原子覆盖目标配置前校验 source config 与当前 catalog 的完整关系。
+导入不会热加载，必须重启 `nodeforged`。M0 不实现 DHCP/TFTP/资产/节点/rootfs/initrd/provision 的 CLI，也不实现
 catalog 写入或运行期配置更新 API；这些能力按 M1+ 对应阶段设计和实现。
 
 M0 参数规则是命令局部而非 persistent/global：`nodeforge` 根命令只有 `-v/--version`，
@@ -165,7 +164,7 @@ Apple-Silicon 环境不支持介质内核的 64 KiB page granule 而单独暂缓
 | 能力 | 配置对象 | 运行态对象 | 主要命令 | MVP 验收点 |
 | --- | --- | --- | --- | --- |
 | TFTP 启动资产 | `tftp`、`asset` | `tftp_session` | `runtime tftp-counters/tftp-sessions`、`assets list/show` | 节点能拉取 bootloader、虚拟 `grub.cfg`、kernel、initrd（M3.5 已在 r97n0 完成实机验证） |
-| DHCP 地址分配 | `dhcp`、`node`、`policy` | `lease`、`unknown_client` | `config set policy.*=...`、`runtime dhcp-leases/dhcp-unknown` | 未知节点可获临时 lease，已登记节点拿正确 IP |
+| DHCP 地址分配 | `dhcp`、`node`、`policy` | `lease`、`unknown_client` | `setup --import-config`、`runtime dhcp-leases/dhcp-unknown` | 未知节点可获临时 lease，已登记节点拿正确 IP |
 | PXE 启动入口 | `node`、`profile`、`asset` | `node_status`、`event` | `node show`、`assets list` | DHCP 返回正确 `next-server` 和 `bootfile` |
 | HTTP 配置和资产 | `http`、`asset`、`profile` | `event` | `assets import`、`events list/follow` | initrd/installer 能获取配置并上报事件 |
 | 基础数据关系 | `distro`、`repository`、`install_source`、`asset`、`rootfs`、`boot_bundle` | `event` | `catalog show/validate`、`assets show/validate` | 能展开 OS 版本、repo、kernel、initrd、rootfs 的引用关系 |
@@ -175,7 +174,7 @@ Apple-Silicon 环境不支持介质内核的 64 KiB page granule 而单独暂缓
 | 无盘启动 | `profile.diskless`、`boot_bundle` | `node_status`、`event` | `node diskless-status/diskless-overlay` | 小 initrd 下载 rootfs 并切换到目标 rootfs |
 | boot bundle 校验 | `asset`、`rootfs`、`profile` | `event` | `assets rootfs-validate/initrd-validate` | kernel/initrd/rootfs 的版本、架构、kernel ABI 一致 |
 | 补充包和后处理 | `provisioning_bundle` | `node_status`、`event` | `provision bundle show/plan`、`provision status` | Kickstart、autoinstall、rootfs build、diskless 共用强类型步骤和清晰输出 |
-| 配置与目录持久化 | `config.json`、`catalog.json` | M3.1 起为 `leases.json`、`node-status.json`、`events.jsonl`，M4.1 增加 `deployment-control.json`；`runtime.json` 仅兼容迁移 | `config validate/export/set/apply`、`assets import/*-build/*-publish` | 启动配置可重启加载；install generation 和导入/发布状态可审计恢复 |
+| 配置与目录持久化 | `config.json`、`catalog.json` | M3.1 起为 `leases.json`、`node-status.json`、`events.jsonl`，M4.1 增加 `deployment-control.json`；`runtime.json` 仅兼容迁移 | `config validate/export`、`setup --import-config`、`assets import/*-build/*-publish` | 启动配置可重启加载；install generation 和导入/发布状态可审计恢复 |
 | 观测输出 | `logging`、`events` | `node_status`、`event` | `node list/show/trace`、`events list/follow/types` | 输出分组、表格化，错误有摘要和下一步建议 |
 
 ## 5. 总体架构与数据流
@@ -932,7 +931,7 @@ PXE 启动
 
 NodeForge 配置中所有语义为 password 的字段均直接以明文配置和存储，例如 `111111` 或 `asdf1234`。
 当前包括系统用户、root 与 IPMI；未来若增加 repository、proxy、HTTP basic-auth 或其他 password 字段，
-也必须默认接受明文并由 config import/export 原样往返。发行版 adapter 在渲染 answer file 时按安装器要求
+也必须默认接受明文并由 setup 配置导入/`config export` 原样往返。发行版 adapter 在渲染 answer file 时按安装器要求
 临时生成 hash；MVP 不设计额外密码状态、SecretRef、加密封装或轮换流程。
 
 未显式认领的节点默认不能使用会擦盘的 install profile。必须先由管理员把发现到的节点身份认领为 node，并绑定 IP/profile。这个身份 MVP 以 MAC 为主，可用 DHCP client id 和 SN 辅助确认。这样做的原因是 PXE 管理网段里可能临时接入未知服务器、虚拟机或误插设备，默认自动擦盘安装风险太高。
@@ -987,7 +986,7 @@ password/sudo/逐账号 key、目标系统额外包和 security；节点专属�
 `node.overrides.network`。兼容默认值为 `locale=en_US.UTF-8`、`timezone=UTC`、`keyboard=us`、
 `connectivity.mode=local-only`、OpenSSH/password authentication enabled、root login `yes`、root password
 `asdf1234`、firewall disabled、Rocky SELinux disabled 和目标系统 DHCP。root password 允许在 profile 中
-明文修改；配置文件和 config import/export 都保留明文，adapter 仅在安装器要求时临时转换为目标 hash。
+明文修改；配置文件、setup 配置导入和 `config export` 都保留明文，adapter 仅在安装器要求时临时转换为目标 hash。
 locale/timezone 可自定义；Ubuntu 的 GeoIP 始终关闭，不能通过修改 timezone 间接恢复公网探测。
 
 M4.1 将 M0-M4 审计发现的 answer 正确性缺口一并作为补丁交付：Ubuntu/Rocky 普通用户和 root 的明文
@@ -1019,10 +1018,25 @@ NetworkManager 配置，不依赖不稳定的 `ens*`/`enp*` 名称。
 不倒退历史 node status、不调用 BMC。只有 profile 明确配置高风险 `reinstall_policy=always` 时才允许每次 PXE
 重装；不提供持久的 node force-reinstall override。
 
+M4.9 将安装授权收敛为四层门禁，职责不能混为一谈：注册 MAC/arch/profile 阻止未知或不完整节点安装，`deploy` 是已知节点的长期 PXE
+硬开关，generation 防止已安装节点因 PXE-first 再次安装，plan digest 则只防止 retry 确认后、PXE 开始前该节点
+的实际安装计划被替换。最终 digest 必须是 node-scoped 的完整 SHA-256；全局 config+catalog 摘要会被无关 ISO/
+node 导入扰动，只作为当前兼容实现，不作为最终安全模型。
+
 安装完成时记录 applied config/target-system/install-plan digest。之后修改 network、用户、密码、包或安全策略
 只形成 desired/applied drift，不自动重装；storage/bootloader/source 变化必须显式新 generation，目标系统在线
 reconciliation 留给 M7。离线 `config validate` 不读取 runtime，只有 diff/apply/show 能结合 applied revision
 提示影响。
+
+`drifted=false` 是运行时派生值：`applied_revision` 非零且等于当前 config+catalog 联合内容指纹时表示无漂移；
+尚无成功安装基线（`applied_revision=0`）时也为 false，此时应结合 pending/running phase 理解，不能解读为“已验证一致”。
+`destructive=true` 是 install profile 对不可逆持久写入的安全声明，`wipe=true` 是该 profile 的
+`install.storage` 具体擦盘策略，两者可与 `drifted=false` 同时出现，含义并不冲突。它们不是 node 属性：
+`node set` 当前只支持 `mac/arch/profile/ip/hostname/deploy/http_accel`；可通过切换 `profile` 间接改变 desired plan，
+但不能直接写 `drifted/destructive/wipe`。当前在线 profile PATCH 只支持 `kernel_args`，storage/safety 变更必须走
+受校验的 profile/catalog 变更流程，并在之后显式 `install retry`，不得把高风险字段塞入 node override。
+`node list/show` 同时显示 `install_intent`、`pxe_ready` 和 `retry_pending`：`retry-armed` 表示已手动 retry 且当前
+plan 仍匹配，`rearm-required` 表示 retry 后计划发生了实际变化，`not-armed` 表示没有待消费安装意图。
 
 `local-only` 保证 NodeForge 生成的 answer 不包含未声明公网源：Ubuntu 禁止 installer refresh、APT GeoIP、
 update/upgrade 和默认 NTP，Rocky 不生成 mirrorlist/metalink/vendor NTP，两者只使用 NodeForge 本地 repo 和
@@ -1040,8 +1054,9 @@ Ubuntu Server 自动安装策略：
 - Ubuntu profile 通过 `install.apt.fallback` 选择 mirror 失败策略：默认 `offline-install`；
   要求本地 HTTP APT 必须成功的验收 profile 使用 `abort`；`continue-anyway` 仅作为 Subiquity
   schema 的完整透传值，不推荐生产使用。
-- MVP 通过离线事实源工作流配置该字段：修改 JSON 后执行 `nodeforge config import <path>`、
-  `nodeforge config validate` 并重启 daemon。当前不提供在线 `profile update` 命令。
+- MVP 通过启动配置工作流配置该字段：修改 JSON 后执行
+  `nodeforge setup --reconfigure --import-config <path>` 并重启 daemon。setup 已联合校验当前 catalog；
+  当前不提供在线 `profile update` 命令。
 - NodeForge 只支持 Ubuntu Server 22.04 LTS 及之后版本；不为 20.04 或更早版本做兼容。
 
 NodeForge Ubuntu 版本支持分层：
@@ -1307,7 +1322,7 @@ pxe_seen
 | `<install-root>/catalog/manifest.json` 与 entity files | daemon-owned distro/profile/node/bundle/source/asset 目录 |
 | `nodeforge` CLI | 常用操作、批量变更、资产导入/构建/发布、查询和排障 |
 
-`config.json` 是启动时加载的站点配置事实源。M0 中，server IP、端口、bind interface、资产根目录等修改后均需重启 `nodeforged` 生效；离线编辑或 `nodeforge config import` 都是正常工作流，但必须经过 `nodeforge config validate` 或 `nodeforged --check-config`。M1+ 才为 DHCP discovery 等运行期策略提供 CLI/API 在线切换与 daemon 原子写回。
+`config.json` 是启动时加载的站点配置事实源。M4.9 后，server IP、端口、bind interface、资产根目录等修改均需重启 `nodeforged` 生效；正式写入口统一为 `nodeforge setup --reconfigure --import-config <path>`，setup 在覆盖前完成 config+catalog 联合校验。`config validate` 和 `nodeforged --check-config` 保留为只读预检。catalog-owned node/profile/asset 仍通过 daemon 管理 API 在线发布。
 
 M4.7 后 catalog 是 `manifest.json` + 按实体拆分文件。manifest 固定 layout schema、catalog revision、transaction id
 和 entity digest；daemon 是唯一 writer，所有变更通过同一 journal/stage/fsync/rename/manifest-last 事务发布。旧
@@ -1334,7 +1349,7 @@ fail closed。logical id 使用统一的小写 ASCII path-safe grammar，展示�
 CLI 不应为每个配置字段都设计一个长参数。对于复杂对象，优先支持：
 
 - `nodeforge config validate`
-- M0: `nodeforge config export`、`nodeforge config import <path>`、`nodeforge catalog export`
+- M0: `nodeforge config export`、`nodeforge setup --reconfigure --import-config <path>`、`nodeforge catalog export`
 - M1+: `nodeforge config diff`、`nodeforge config apply <file-or-patch>`、`nodeforge node import <file>`、`nodeforge assets import <file-or-dir>`、`nodeforge assets rootfs-package <workdir>`、`nodeforge assets initrd-build ...`、`nodeforge assets boot-bundle-publish ...`
 
 这类命令以文件、清单或 patch 为输入，由核心校验器负责语义检查。
@@ -1415,7 +1430,7 @@ M4.7 后 `config.json` 是只读启动配置和人工站点 policy 的事实源�
 发布；完整有效性由 `validateConfigShape`、`validateCatalogShape`、`validateModel` 三层检查。config 在线 PATCH 禁止，
 重配置走 setup/config apply 的离线 candidate、重启健康检查和失败回滚。
 
-MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 `config import/export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。M3.1 前的 `runtime.json` 属于运行态，M3.1 起其内容按恢复语义拆分为 `leases.json` 与 `node-status.json`，并保留旧文件作兼容迁移输入；`events.jsonl` 属于事件历史。M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。交互式启动默认写 stderr，systemd 显式选择受限权限的轮转文件 `/opt/nodeforge/logs/nodeforged.log`；`--log-output both` 才同时写入 stderr/journal。
+MVP 只读取和写出 JSON，不把 YAML 作为事实源；后续如果需要 YAML，只作为 setup 配置导入、`config export` 或 catalog 清单导入导出的人机格式，导入后仍转换为 JSON 事实源。M3.1 前的 `runtime.json` 属于运行态，M3.1 起其内容按恢复语义拆分为 `leases.json` 与 `node-status.json`，并保留旧文件作兼容迁移输入；`events.jsonl` 属于事件历史。M2.5 在不改变 schema_version 的前提下以默认值增加 `events` 和可选 `logging.file`，因此旧配置继续有效。交互式启动默认写 stderr，systemd 显式选择受限权限的轮转文件 `/opt/nodeforge/logs/nodeforged.log`；`--log-output both` 才同时写入 stderr/journal。
 
 默认安装根为 `/opt/nodeforge`；M4.7 启动时通过显式 root 或 executable+marker/layout 发现并初始化 runtime `Paths`，
 无法验证时 fail closed。其他路径全部从该实例派生，支持 `/srv/nf` 等自定义根。
@@ -1765,7 +1780,7 @@ M0 的实际命令面以 2.5 “M0 CLI 边界”为准。下表仅前两行是 M
 | `nodeforge catalog ...` | `catalog validate/export/show/migrate`；M4.3 的 show/migrate 仅面向 install source | 查看发行版、repository、install source 和 bundle 关系；安全规划/执行旧 catalog 迁移 |
 | `nodeforge runtime ...` | `runtime status/dhcp-leases/dhcp-unknown/tftp-counters/tftp-sessions` | 查看 DHCP/TFTP/服务运行态 |
 | `nodeforge events ...` | `events list/follow/types` | 本机读取 Event v1/v2 历史、实时跟踪并发现注册事件类型 |
-| `nodeforge profile ...` | M4.3: `profile list/show`；M6: `add/update/remove/validate` | M4.3 先发现/诊断当前 PXE profile，M6 再开放写管理 |
+| `nodeforge profile ...` | M4.3: `profile list/show`；M4.10: ISO 自动默认 profile + 显式 `create` 补充安装 profile；M6: 完整 update/remove/validate | M4.10 只从已导入 source 派生固定安全 install profile，复杂 mutation 仍留 M6 |
 | `nodeforge provision ...` | `provision bundle-*/step-*/run-*`（M7） | 管理补充包、文件和后处理步骤 |
 
 M4.3 起 `dhcp`、`tftp`、`install-source`、`asset`、`install`、`trace` 等旧顶层路径不再是可选入口；它们的
@@ -1776,8 +1791,8 @@ M4.3 起 `dhcp`、`tftp`、`install-source`、`asset`、`install`、`trace` 等�
 
 ```bash
 nodeforge status
-nodeforge config set policy.default_action=wait
-nodeforge config set policy.default_action=diskless policy.allow_unknown_diskless=true
+nodeforge config export > candidate.json
+nodeforge setup --reconfigure --import-config candidate.json
 nodeforge runtime dhcp-unknown
 nodeforge assets import /srv/iso/ubuntu-22.04.5-live-server-arm64.iso
 nodeforge catalog show ubuntu-22.04-aarch64-iso
@@ -2086,7 +2101,8 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 
 - PXE 管理网段内未知 UEFI x86_64/aarch64 裸机能从 DHCP 租约池拿到临时 IP，并默认进入等待认领状态。
 - 管理员显式配置后，未知节点可以进入非破坏性 discovery profile 或 safe/ephemeral diskless profile。
-- 管理员能通过 `nodeforge config set policy.default_action=diskless policy.allow_unknown_diskless=true` 显式开启未知节点安全无盘，并能用同一 typed patch 收回。
+- 管理员能在候选 startup config 中显式设置 unknown-node policy，并通过
+  `nodeforge setup --reconfigure --import-config <path>` 联合校验、导入后重启生效；不得从在线 PATCH 绕过。
 - M4.3 的 `nodeforge catalog show <install-source>` 能展开 distro/repository/install source/kernel/initrd，
   `nodeforge profile list/show` 能发现当前 PXE 策略并展开 capability/source/effective system；M5/M6 在同一 DTO
   上增加 rootfs/boot bundle 和 profile 写管理，不只显示裸路径。

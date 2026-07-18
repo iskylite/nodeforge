@@ -101,14 +101,30 @@ pub const CatalogRuntime = struct {
         // 版本/架构 tuple；后续导入只扩展缺少的版本或架构。family 冲突 fail closed。
         var distro_expansion = try expandDistroTuple(self.allocator, value, imported);
         defer distro_expansion.deinit(self.allocator);
-        const additions = [_]model.AssetConfig{ imported.iso_asset, imported.kernel_asset, imported.initrd_asset };
-        for (additions) |asset| for (value.assets) |existing| if (std.mem.eql(u8, existing.name, asset.name)) return error.DuplicateObjectName;
+        const required_additions = [_]model.AssetConfig{ imported.iso_asset, imported.kernel_asset, imported.initrd_asset };
+        for (required_additions) |asset| for (value.assets) |existing| if (std.mem.eql(u8, existing.name, asset.name)) return error.DuplicateObjectName;
+        var bootloader_addition: ?model.AssetConfig = imported.bootloader_asset;
+        if (bootloader_addition) |bootloader| {
+            for (value.assets) |existing| {
+                if (!std.mem.eql(u8, existing.path, bootloader.path)) continue;
+                if (existing.kind != .bootloader) return error.AssetPathConflict;
+                bootloader_addition = null;
+                break;
+            }
+            if (bootloader_addition != null)
+                for (value.assets) |existing|
+                    if (std.mem.eql(u8, existing.name, bootloader.name)) return error.DuplicateObjectName;
+        }
         if (imported.repository) |repository| for (value.repositories) |existing| if (std.mem.eql(u8, existing.name, repository.name)) return error.DuplicateObjectName;
         for (value.install_sources) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
-        const assets = try self.allocator.alloc(model.AssetConfig, value.assets.len + additions.len);
+        for (value.profiles) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
+        const addition_count = required_additions.len + @as(usize, if (bootloader_addition != null) 1 else 0);
+        const assets = try self.allocator.alloc(model.AssetConfig, value.assets.len + addition_count);
         defer self.allocator.free(assets);
         @memcpy(assets[0..value.assets.len], value.assets);
-        @memcpy(assets[value.assets.len..], &additions);
+        @memcpy(assets[value.assets.len .. value.assets.len + required_additions.len], &required_additions);
+        if (bootloader_addition) |bootloader|
+            assets[value.assets.len + required_additions.len] = bootloader;
         const repo_count: usize = if (imported.repository == null) 0 else 1;
         const repositories = try self.allocator.alloc(model.RepositoryConfig, value.repositories.len + repo_count);
         defer self.allocator.free(repositories);
@@ -118,12 +134,29 @@ pub const CatalogRuntime = struct {
         defer self.allocator.free(sources);
         @memcpy(sources[0..value.install_sources.len], value.install_sources);
         sources[value.install_sources.len] = imported.install_source;
+        // M4.10 fresh-deployment 主路径：ISO publication 已拥有完整 tuple，
+        // 因而在同一 manifest-last transaction 中创建同名默认 install
+        // profile。显式 `profile create` 只用于从该 source 补充其他 profile。
+        const profiles = try self.allocator.alloc(model.ProfileConfig, value.profiles.len + 1);
+        defer self.allocator.free(profiles);
+        @memcpy(profiles[0..value.profiles.len], value.profiles);
+        profiles[value.profiles.len] = .{
+            .name = imported.install_source.name,
+            .mode = .install,
+            .distro = imported.install_source.distro,
+            .version = imported.install_source.version,
+            .arch = imported.install_source.arch,
+            .install_source = imported.install_source.name,
+            .safety = .{ .destructive = true, .persistent_writes = true, .reinstall_policy = .explicit },
+            .install = .{},
+        };
         var candidate = value.*;
         candidate.revision = old.revision + 1;
         candidate.distros = distro_expansion.values;
         candidate.assets = assets;
         candidate.repositories = repositories;
         candidate.install_sources = sources;
+        candidate.profiles = profiles;
         try validate.validateModel(config, &candidate);
         // 在持久提交前准备 catalog 与兼容 AppConfig 投影，保证 model gate
         // 释放后读者只会看到完整的新 pair，不会出现 catalog 已有 distro、
@@ -334,18 +367,29 @@ test "first install source publication persists and projects its derived distro"
     var catalog = try CatalogRuntime.init(std.testing.allocator, root, &.{});
     defer catalog.deinit();
 
+    var imported = importedFixture("rocky", "9.7", .aarch64, .rhel);
+    imported.bootloader_asset = .{
+        .name = "grub-uefi-aarch64",
+        .kind = .bootloader,
+        .path = "efi/grubaa64.efi",
+    };
     try catalog.publishInstallSource(
         std.testing.io,
         &configs,
         &config,
         1,
-        importedFixture("rocky", "9.7", .aarch64, .rhel),
+        imported,
     );
 
     const live_catalog = catalog.acquire();
     defer live_catalog.release();
     try std.testing.expectEqual(@as(usize, 1), live_catalog.value().distros.len);
     try std.testing.expectEqual(@as(usize, 1), live_catalog.value().install_sources.len);
+    try std.testing.expectEqual(@as(usize, 1), live_catalog.value().profiles.len);
+    try std.testing.expectEqualStrings("fixture-source", live_catalog.value().profiles[0].name);
+    try std.testing.expect(live_catalog.value().profiles[0].safety.destructive);
+    try std.testing.expectEqual(@as(usize, 4), live_catalog.value().assets.len);
+    try std.testing.expectEqualStrings("efi/grubaa64.efi", live_catalog.value().assets[3].path);
     try std.testing.expectEqualStrings("rocky", live_catalog.value().distros[0].name);
 
     const projected_config = configs.acquire();

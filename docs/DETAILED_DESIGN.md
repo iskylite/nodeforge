@@ -20,7 +20,7 @@
 - 网络协议明确只支持 IPv4；配置、监听地址、DHCP option 和 initrd 网络逻辑均不接受 IPv6。
 - NodeForge config 中所有语义为 password 的字段都直接接受并存储明文；当前包括系统用户
   `users.password`、root `ssh.root_password` 和 IPMI `oob.ipmi.password`，未来新增的 repository、proxy、
-  HTTP basic-auth 等 password 字段默认继承。JSON、`config import`、`config export` 原样保留明文，不引入
+  HTTP basic-auth 等 password 字段默认继承。JSON、setup `--import-config`、`config export` 原样保留明文，不引入
   SecretRef、外部 secret store、加密封装、临时密码状态或轮换流程。adapter 仅在目标格式要求时临时派生
   hash，不得把 hash 回写配置。token、session capability、SSH private key 和派生 password hash 不适用本规则。
 
@@ -44,9 +44,11 @@
 | M4.6 | 自定义内核引导参数 | M4.5 | `profile.kernel_args` 字段，PXE cmdline 追加、Kickstart `--append`、Autoinstall `late-commands` GRUB drop-in、安全校验和缓冲区扩容 |
 | M4.7 | 路径自举、模型存储迁移与部署初始化 | M4.6 | runtime Paths；schema+manifest+多文件事务；config/catalog ownership；bundle setup/reconfigure/reset/rollback |
 | M4.8 | 并发容量扩展与启动时动态派生 | M4.5 | 5 处定长上限改启动时按网段/CPU/节点数动态派生（config 可覆盖）；TFTP 并发 `auto=max(128,2×核)`、`u8→u16`、去 64 校验上限；DHCP `ping_timeout 500→100`；HTTP `max_connections` 死字段处理；启动日志打印生效容量。编号在 M4.7 之后，实施早于 M4.6（横向容量优化，与 M4.6/M4.7 内容正交） |
-| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
-| M6 | 支持矩阵增强 | M4.1、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
-| M7 | 补充包和后处理增强 | M4.1、M4.2、M4.3、M4.4、M4.5、M4.6、M4.7、M4.8、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
+| M4.9 | 部署溯源、PXE 门禁与配置入口收口补丁 | M4.7、M4.8 | 统一 config+catalog desired revision；session/deployment provenance join；fresh ISO bootloader；retry 可见性；startup config writer 收敛到 setup；完整 node-scoped SHA-256 作为后续 schema 子阶段 |
+| M4.10 | CLI fresh-deployment 闭环补全 | M4.9 | reconfigure/systemd 边界；purge-all；ISO import 结果；最小 install profile create；node mutation 错误透传 |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2–M4.10 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
+| M6 | 支持矩阵增强 | M4.1–M4.10、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
+| M7 | 补充包和后处理增强 | M4.1–M4.10、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
 
 ### 1.3 完成标准
 
@@ -62,7 +64,7 @@
 
 ### 1.4 阅读顺序与阶段依赖
 
-- M0-M7（含 M1.5、M2.5、M2.5.1、M4.1、M4.2、M4.3、M4.4、M4.5、M4.6 和 M4.7）是可验收的产品阶段，按章节依赖阅读和交付。
+- M0-M7（含 M1.5、M2.5、M2.5.1、M4.1–M4.9）是可验收的产品阶段，按章节依赖阅读和交付。
 - M1 先实现正式 TFTP 只读服务，并用标准 TFTP client 验证 RRQ/OACK、重传和路径安全。
 - M1.5 在 M2 前收敛 CLI 展示层；它不改变 daemon API、配置或协议语义，但 M2+ 新命令必须复用其 formatter。
 - M2 再实现 DHCP 地址、架构识别和 bootfile 决策，最后与 M1 联调完整 PXE 入口。
@@ -78,8 +80,9 @@
   M4.6 在 M4.5 后增加自定义内核引导参数（`profile.kernel_args`），不改变 HTTP/DHCP/TFTP 协议语义，
   只在 PXE cmdline 末尾追加、Kickstart `bootloader --append` 和 Autoinstall `late-commands` GRUB drop-in
   三条链路注入。M4.7 随后完成 Paths、schema/manifest/catalog transaction 和 setup，M5 只可在 M4.7a 后隔离
-  原型，正式合入与验收依赖 M4.7a-c 全部完成。M5 diskless initrd 从 `/proc/cmdline` 透传 kernel_args，M6
-  PXELINUX 在 APPEND 末尾追加。
+  原型，正式合入与验收依赖 M4.7a-c 全部完成。M4.9 在 M5 前覆盖 M4.1/M4.3/M4.7 的 revision、session
+  provenance 和 startup-config 写入口冲突；历史章节保留原文，现行行为以 §9.18 为准。M5 diskless initrd
+  从 `/proc/cmdline` 透传 kernel_args，M6 PXELINUX 在 APPEND 末尾追加。
 
 ## 2. 代码结构总览
 
@@ -5907,6 +5910,127 @@ nodeforged: capacity derived
   新 armed generation，不能继续显示旧 consumed generation。started/finished 属于当前尝试，最近成功的
   deployed generation/time 跨 retry 和失败保留；inventory 明示其来源 generation。
 
+### 9.18 M4.9：部署溯源、PXE 门禁与配置入口收口补丁
+
+> 专项设计：
+> `docs/superpowers/specs/2026-07-18-m4_9-deployment-provenance-and-config-ownership-patch.md`。
+> 本节覆盖 M4.1–M4.8 中与 revision、BootSession 恢复、fresh ISO 自举和 startup-config writer 冲突的条款；
+> 历史章节继续记录当时设计，不按 M4.9 结果静默改写。
+
+#### 9.18.1 状态与阶段拆分
+
+- **M4.9a 已实现**：统一联合 desired revision、禁止 config-only fallback、BootSession/deployment provenance
+  join、fresh ISO bootloader 自举、systemd readiness retry、retry/PXE 可见性，以及 startup-config 写入口收口。
+- **M4.9b 尚未实现**：deployment/session/status/install-plan 持久化完整 node-scoped SHA-256，并迁移旧 u64
+  schema。当前代码仍以联合 SHA-256 前 64 bit 兼容现有 deployment-control。
+
+设计、代码和验收不能把 M4.9b 的目标描述成当前能力。
+
+#### 9.18.2 r97n1 故障与 revision 语义
+
+r97n0 日志中 `requested_revision=2632895608528107461` 与
+`desired_revision=11733222931490568455` 是两份 canonical 内容指纹的截断值，不是递增版本。数值只允许做
+相等/不等判断，不允许按大小解释新旧。
+
+arm/retry 使用 config+catalog 联合指纹，而旧 DHCP 分支读取 config-only 指纹，导致同一进程内 gate 分叉。
+M4.9a 统一为：
+
+- HTTP/DHCP 从同一 pinned model pair 计算联合 desired。
+- HTTP 失败返回 `503 model.revision_unavailable`。
+- DHCP 失败使用 0 sentinel 并 fail closed withholding PXE。
+- DHCP persistence 在类型上要求 ModelRuntime；删除旧 config-only/startup revision fallback 字段。
+- `reinstall_policy=always` 遇到 revision unavailable 不得用 0 自动武装 generation。
+
+#### 9.18.3 门禁职责
+
+| 层次 | 职责 |
+| --- | --- |
+| node identity | MAC/arch/profile 完整且唯一；未知节点不 install |
+| `node.deploy` | 已知节点是否允许 PXE 的长期硬开关 |
+| install generation | 防止 PXE-first 节点在一次安装消费后自动重复擦盘 |
+| plan digest/revision | 防止 retry 确认后、PXE 消费前计划被替换 |
+
+`node list/show` 显式输出 `install_intent`、`pxe_ready`、`retry_pending` 和 `armed_generation`。
+`rearm-required` 表示已有 arm，但当前兼容 revision 已不匹配；`retry-armed` 表示 operator retry 仍可消费。
+
+#### 9.18.4 session、状态与重启
+
+启动先加载 deployment-control，再恢复 BootSession。install session 必须以 node/profile/MAC、generation、
+model revision、immutable asset 和 owned plan 与 control 对齐；任一不一致 fail closed，不恢复 capability，
+也不重新 arm。status 快照恢复后强制 `session_active=false`，只能由合法新事件重新激活。
+
+两个 checkpoint 各自原子但非跨文件事务，因此“只清一个文件”不属于合法恢复路径；loader 必须通过 join
+发现并拒绝孤立状态。
+
+#### 9.18.5 fresh deployment 修复
+
+- ISO import 从媒体提取并发布架构对应 UEFI GRUB，不依赖旧环境残留。
+- bootloader、kernel、initrd、source/catalog publication 保持内容校验与幂等复用。
+- setup 激活 `Type=simple` systemd unit 后使用 5 秒有界 readiness retry；真实失败仍回滚。
+
+#### 9.18.6 startup config ownership
+
+独立 `config import` 与 `config set` 删除，management config PATCH 不注册。当前唯一写入口：
+
+```bash
+nodeforge config export > candidate.json
+nodeforge setup --reconfigure --import-config candidate.json
+systemctl restart nodeforged
+```
+
+setup 先校验 schema-2 startup-only candidate，再与当前 catalog 联合校验，最后原子发布 canonical config。
+导入不能更新 requested/applied provenance；daemon 重启后才加载新 model 并重新计算 desired。
+
+#### 9.18.7 M4.9b 完整摘要迁移
+
+最终 deployment schema 保存 `requested_plan_digest`、`consumed_plan_digest`、`applied_plan_digest` 三个完整
+SHA-256；BootSession、node-status 和 install-plan envelope 使用同一个 node-scoped `plan_digest`。旧 u64 pending
+arm 升级后必须 `rearm-required`，旧 applied 基线显示 drift `unknown`，直到下一次成功安装建立完整摘要。
+
+node-scoped 输入只含实际影响该节点的 node/profile/system/storage/source/referenced asset identity/digest。
+导入无关 ISO、增加其他节点或修改无关 profile 不得使 pending retry 失效。
+
+#### 9.18.8 覆盖矩阵
+
+| 历史设计 | M4.9 现行行为 |
+| --- | --- |
+| M0 独立 `config import` | 删除；由 setup `--import-config` 联合校验 |
+| M4.3 allowlist `config set` | 删除 CLI/client |
+| M4.7 config PATCH 固定返回 409 | PATCH 未注册，按 RouteSpec 返回 405 |
+| DHCP 使用 config-only revision | 使用 config+catalog 联合 desired |
+| revision 失败回退 startup revision | 禁止 fallback，失败关闭 |
+| session 仅凭 TTL/node 恢复 | 与 deployment generation/revision 和 immutable plan join |
+| ISO import 假设 bootloader 已存在 | fresh media 自举 bootloader |
+
+#### 9.18.9 验证
+
+- 自动测试 240/240 通过，CLI/setup/HTTP 契约覆盖删除的命令、setup candidate 和 config PATCH 405。
+- `git diff --check` 与 aarch64-linux-gnu ReleaseSafe 交叉编译通过。
+- r97n0 清空全部 NodeForge 受管数据后 fresh setup/import/node add 成功。
+- r97n1 在 VMware UEFI 拉取 GRUB/kernel/initrd，完成 Rocky 9.7 Anaconda 安装并从本地盘重启成功。
+- M4.9b 在 schema、迁移测试和系统回归完成前保持未实现。
+
+### 9.19 M4.10：CLI fresh-deployment 闭环补全
+
+专项设计见
+`docs/superpowers/specs/2026-07-19-m4_10-cli-fresh-deployment-completion.md`。
+
+M4.10 覆盖旧章节中“profile create 全部留到 M6”的边界：ISO import 在同一事务中自动创建与 source
+同名的安全默认 install profile，并提前交付从已导入 source 补充额外 profile 的窄入口。
+`setup --reconfigure` 必须重新生成 unit，但不控制服务生命周期；
+`--generate-systemd --install` 仍是独立 unit 安装/激活操作。真正无历史 fresh reset 使用
+`setup --reset-all --purge-all --reconfigure --yes`，其中 reset/purge、配置与空 catalog 生成、联合校验和
+unit 发布按固定顺序执行，仍不隐式调用 systemctl。交互调用对整个组合只确认一次，默认 No 且拒绝时
+不得产生写入；非交互破坏操作必须显式 `--yes`。当前交互能力只承担安全确认，网络参数仍使用 flags
+或文档化默认值，不提供自动猜测网卡的菜单向导。ISO import 必须返回 canonical source，node/profile mutation
+必须透传可操作的结构化错误。完整命令、固定安全默认值、清理范围和验收矩阵以专项设计为准。
+
+M4.10 实机补丁同时增加受约束的 `profile set <name> boot_disk=/dev/<device>`：目标盘属于共享安装
+计划而不是 node identity，mutation 必须同步更新 `boot_disk/install_disks`、通过联合校验，并要求引用
+节点重新 retry。`profile show` 显示 boot disk/wipe。若 installer 在取得 capability 后、回报终态前失败，
+操作员必须先停止目标机，随后才可用 `node retry <node> --force` supersede 卡死 session；普通 retry
+继续拒绝活动 session，禁止以手删 checkpoint 作为恢复流程。
+
 ## 10. M5：内存无盘启动与基础后处理
 
 ### 10.1 目标
@@ -6247,7 +6371,7 @@ Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 �
 
 - profile/node/repository CRUD 与 ISO 导入派生的 distro 索引直接写 M4.7 Catalog entity files，并复用 manifest/journal/ModelRevision；不得恢复
   AppConfig ownership、单 `catalog.json` 或另建 adapter store。config diff/apply 走 `setup --reconfigure` 的离线
-  candidate/重启/健康检查/回滚流程，`PATCH /management/config` 继续返回 `config.offline_only`。
+  candidate/重启/健康检查/回滚流程，`PATCH /management/config` 保持未注册。
 
 - 字段省略时仍默认 `en_US.UTF-8`、OpenSSH enabled、password authentication enabled、root login `yes`、
   root password `asdf1234`、主机防火墙 disabled；RHEL 系 SELinux 默认 disabled。

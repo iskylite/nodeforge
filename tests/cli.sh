@@ -36,19 +36,29 @@ fi
 "$cli" config --help >"$tmp/config-help"
 grep -q "validate" "$tmp/config-help"
 grep -q "export" "$tmp/config-help"
-grep -q "import" "$tmp/config-help"
+if grep -Eq '^  set[[:space:]]' "$tmp/config-help"; then
+    echo "startup config mutation must be owned by setup" >&2
+    exit 1
+fi
+if grep -Eq '^  import[[:space:]]' "$tmp/config-help"; then
+    echo "startup config import must be owned by setup" >&2
+    exit 1
+fi
 if grep -q "Examples:" "$tmp/config-help"; then
     echo "help must not embed examples" >&2
     exit 1
 fi
 
-"$cli" config import --help >"$tmp/import-help"
-grep -q "Source config JSON path" "$tmp/import-help"
-grep -q "required" "$tmp/import-help"
-if grep -Eq '^   .*--catalog' "$tmp/import-help"; then
-    echo "config import must not expose catalog validation" >&2
-    exit 1
-fi
+"$cli" setup --help >"$tmp/setup-help"
+grep -q -- "--import-config" "$tmp/setup-help"
+grep -q -- "--purge-all" "$tmp/setup-help"
+"$cli" profile create --help >"$tmp/profile-create-help"
+grep -Fq 'Create an install profile from an imported install source' "$tmp/profile-create-help"
+grep -Fq 'Derives distro, version, and architecture' "$tmp/profile-create-help"
+"$cli" profile set --help >"$tmp/profile-set-help"
+grep -Fq 'boot_disk=/dev/<device>' "$tmp/profile-set-help"
+"$cli" node retry --help >"$tmp/node-retry-help"
+grep -Fq 'Supersede a stuck active session' "$tmp/node-retry-help"
 
 "$cli" assets register --help >"$tmp/asset-register-help"
 grep -Fq 'Distro name, used with --version and --arch; e.g. rocky' "$tmp/asset-register-help"
@@ -192,34 +202,6 @@ else
     test "$?" -eq 2
 fi
 grep -q "Unknown command: 'unknown'" "$tmp/unknown"
-
-if "$cli" config import >"$tmp/missing" 2>&1; then
-    echo "missing positional argument unexpectedly succeeded" >&2
-    exit 1
-else
-    test "$?" -eq 2
-fi
-grep -q "Missing 1 positional argument" "$tmp/missing"
-
-# Import is deliberately a single-file operation. A missing catalog must not
-# prevent staging a valid startup config for the next daemon restart.
-"$cli" config import -c "$tmp/imported.json" "$root/config.example.json" >"$tmp/imported"
-grep -Fqx 'OK config imported' "$tmp/imported"
-grep -q '^  Source' "$tmp/imported"
-grep -q '^  Destination' "$tmp/imported"
-test -s "$tmp/imported.json"
-
-# A source that fails semantic validation must not replace a previously valid
-# destination. This guards the offline import's validate-before-atomic-save rule.
-checksum_before=$(cksum "$tmp/imported.json")
-printf '%s\n' '{"schema_version":1,"server":{"server_ip":"::1"}}' >"$tmp/invalid-source.json"
-if "$cli" config import -c "$tmp/imported.json" "$tmp/invalid-source.json" >"$tmp/invalid-import" 2>&1; then
-    echo "invalid config import unexpectedly succeeded" >&2
-    exit 1
-else
-    test "$?" -eq 1
-fi
-test "$checksum_before" = "$(cksum "$tmp/imported.json")"
 
 "$daemon" --help >"$tmp/daemon-help"
 grep -q "NodeForge daemon" "$tmp/daemon-help"

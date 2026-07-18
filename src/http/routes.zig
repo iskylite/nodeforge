@@ -36,7 +36,6 @@ pub const specs = [_]RouteSpec{
     .{ .method = "HEAD", .template = "/artifacts/boot/*", .plane = .artifact, .auth = .none, .cache = .immutable, .log = .artifact },
     .{ .method = "GET", .template = "/api/v1/management/status", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/config", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
-    .{ .method = "PATCH", .template = "/api/v1/management/config", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/config/validations", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/nodes", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/nodes", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
@@ -45,6 +44,7 @@ pub const specs = [_]RouteSpec{
     .{ .method = "DELETE", .template = "/api/v1/management/nodes/:id", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/nodes/:id/install-generations", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/profiles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "PATCH", .template = "/api/v1/management/profiles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/assets", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
@@ -196,10 +196,10 @@ test "every RouteSpec declares known method, absolute template and plane-consist
 
 test "Allow aggregation reflects registered methods for detail and collection paths" {
     var buffer: [64]u8 = undefined;
-    // /management/config 注册了 GET 和 PATCH，但没有 POST/DELETE。
-    try std.testing.expectEqualStrings("GET, PATCH", allowed("/api/v1/management/config", &buffer).?);
+    // M4.9：startup config 只提供只读摘要；正式写入口属于 setup。
+    try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/config", &buffer).?);
     try std.testing.expect(methodAllowed("/api/v1/management/config", "GET"));
-    try std.testing.expect(methodAllowed("/api/v1/management/config", "PATCH"));
+    try std.testing.expect(!methodAllowed("/api/v1/management/config", "PATCH"));
     try std.testing.expect(!methodAllowed("/api/v1/management/config", "ET"));
     try std.testing.expect(!methodAllowed("/api/v1/management/config", "POST"));
     // 资产 detail 只注册了 GET，PUT/DELETE 应得到 405 + Allow: GET。

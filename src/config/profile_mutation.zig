@@ -5,6 +5,36 @@ const catalog_store = @import("../catalog/store.zig");
 const config_load = @import("load.zig");
 const validate = @import("validate.zig");
 
+pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, install_source: []const u8) !void {
+    var parsed = try catalog_store.load(io, allocator, catalog_path);
+    defer parsed.deinit();
+    for (parsed.value.profiles) |profile| if (std.mem.eql(u8, profile.name, name)) return error.ProfileAlreadyExists;
+    var source: ?model.InstallSourceConfig = null;
+    for (parsed.value.install_sources) |candidate| if (std.mem.eql(u8, candidate.name, install_source)) {
+        source = candidate;
+        break;
+    };
+    const selected = source orelse return error.InstallSourceNotFound;
+    const profiles = try allocator.alloc(model.ProfileConfig, parsed.value.profiles.len + 1);
+    defer allocator.free(profiles);
+    @memcpy(profiles[0..parsed.value.profiles.len], parsed.value.profiles);
+    profiles[parsed.value.profiles.len] = .{
+        .name = name,
+        .mode = .install,
+        .distro = selected.distro,
+        .version = selected.version,
+        .arch = selected.arch,
+        .install_source = selected.name,
+        .safety = .{ .destructive = true, .persistent_writes = true, .reinstall_policy = .explicit },
+        .install = .{},
+    };
+    var candidate = parsed.value;
+    candidate.profiles = profiles;
+    const projected = model.projectCatalog(config.*, &candidate);
+    try validate.validate(&projected, &candidate);
+    try catalog_store.save(io, allocator, catalog_path, &candidate);
+}
+
 pub fn setKernelArgs(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, profile_name: []const u8, kernel_args: ?[]const u8) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();
@@ -22,6 +52,30 @@ pub fn setKernelArgs(io: std.Io, allocator: std.mem.Allocator, config: *const mo
     var projected = model.projectCatalog(config.*, &candidate);
     config_load.canonicalizeKernelArgs(&projected);
     candidate.profiles = projected.profiles;
+    try validate.validate(&projected, &candidate);
+    try catalog_store.save(io, allocator, catalog_path, &candidate);
+}
+
+/// 修改 profile 级安装目标盘。磁盘是安装计划的一部分而不是节点发现
+/// 属性；同时更新 boot_disk/install_disks，避免产生自相矛盾的存储模型。
+pub fn setBootDisk(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, profile_name: []const u8, boot_disk: []const u8) !void {
+    var parsed = try catalog_store.load(io, allocator, catalog_path);
+    defer parsed.deinit();
+    const profiles = try allocator.dupe(model.ProfileConfig, parsed.value.profiles);
+    defer allocator.free(profiles);
+    var install_disks = [_][]const u8{boot_disk};
+    var found = false;
+    for (profiles) |*profile| if (std.mem.eql(u8, profile.name, profile_name)) {
+        if (profile.mode != .install or profile.install == null) return error.NotInstallProfile;
+        profile.install.?.storage.boot_disk = boot_disk;
+        profile.install.?.storage.install_disks = &install_disks;
+        found = true;
+        break;
+    };
+    if (!found) return error.ProfileNotFound;
+    var candidate = parsed.value;
+    candidate.profiles = profiles;
+    const projected = model.projectCatalog(config.*, &candidate);
     try validate.validate(&projected, &candidate);
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }

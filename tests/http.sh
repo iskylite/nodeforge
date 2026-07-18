@@ -75,29 +75,26 @@ grep -Fq '"config_valid":true' "$tmp/status"
 curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/validations" >"$tmp/validate"
 grep -Fqx '{"ok":true,"result":{}}' "$tmp/validate"
 
-# M4.7 makes startup config offline-only. The compatibility PATCH route returns
-# a stable actionable conflict and must never rewrite config.json.
-before_offline_only=$(sha256sum "$tmp/config.json" | awk '{print $1}')
-if "$cli" config set logging.level=info events.keep=4 -c "$tmp/config.json" >"$tmp/config-set" 2>&1; then
-    echo "online startup config mutation unexpectedly succeeded" >&2
-    exit 1
-fi
-kill -0 "$pid"
-grep -Fq 'config.offline_only' "$tmp/config-set"
-test "$before_offline_only" = "$(sha256sum "$tmp/config.json" | awk '{print $1}')"
-if "$cli" config set server.http_port=29999 -c "$tmp/config.json" >"$tmp/config-restart" 2>&1; then
-    echo "online listener config mutation unexpectedly succeeded" >&2
-    exit 1
-fi
-# M4.5：CLI 把 4xx/5xx 错误信封映射为结构化输出（code + request_id）。
-grep -Fq 'config.offline_only' "$tmp/config-restart"
-grep -Fq 'request_id=' "$tmp/config-restart"
-test "$before_offline_only" = "$(sha256sum "$tmp/config.json" | awk '{print $1}')"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-view"
 grep -Fq '"items":[]' "$tmp/nodes-view"
 grep -Eq '"view_revision":\{"config":[0-9]+,"catalog":[0-9]+,"node_status":[0-9]+,"deployment":[0-9]+,"inventory":[0-9]+\}' "$tmp/nodes-view"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles" >"$tmp/profiles-view"
 grep -Fq '"name":"discovery"' "$tmp/profiles-view"
+"$cli" profile create rocky-fresh rocky-9.7-aarch64-dvd -c "$tmp/config.json" >"$tmp/profile-create"
+grep -Fq 'install profile created' "$tmp/profile-create"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles/rocky-fresh" >"$tmp/profile-created"
+grep -Fq '"install_source":"rocky-9.7-aarch64-dvd"' "$tmp/profile-created"
+grep -Fq '"destructive":true' "$tmp/profile-created"
+"$cli" profile set rocky-fresh boot_disk=/dev/nvme0n1 -c "$tmp/config.json" >"$tmp/profile-disk"
+grep -Fq 'profile boot disk updated' "$tmp/profile-disk"
+"$cli" profile show rocky-fresh -c "$tmp/config.json" >"$tmp/profile-disk-show"
+grep -Fq 'Boot disk     /dev/nvme0n1' "$tmp/profile-disk-show"
+grep -Fq 'Wipe          yes' "$tmp/profile-disk-show"
+if "$cli" profile create missing-source does-not-exist -c "$tmp/config.json" >"$tmp/profile-create-missing" 2>&1; then
+    echo "profile create unexpectedly accepted a missing install source" >&2
+    exit 1
+fi
+grep -Fq 'profile.install_source_not_found' "$tmp/profile-create-missing"
 "$cli" profile show discovery -c "$tmp/config.json" >"$tmp/profile-show"
 grep -Fq 'Kernel args   -' "$tmp/profile-show"
 # M4.6 的窄 profile mutation：null/unset 可幂等应用；discovery 非空参数必须
@@ -145,6 +142,15 @@ fi
 kill -0 "$daemon_pid"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-after-remove"
 grep -Fq '"items":[]' "$tmp/nodes-after-remove"
+if "$cli" node add missing-profile mac=02:00:00:00:00:12 arch=aarch64 profile=does-not-exist -c "$tmp/config.json" >"$tmp/node-missing-profile" 2>&1; then
+    echo "node add unexpectedly accepted a missing profile" >&2
+    exit 1
+fi
+grep -Fq 'node.profile_not_found' "$tmp/node-missing-profile"
+"$cli" node add install-node mac=02:00:00:00:00:13 arch=aarch64 profile=rocky-fresh -c "$tmp/config.json" >"$tmp/install-node-add"
+"$cli" node show install-node -c "$tmp/config.json" >"$tmp/install-node-show"
+grep -Fq 'Intent        initial-armed' "$tmp/install-node-show"
+grep -Fq 'PXE ready     yes' "$tmp/install-node-show"
 
 # M2 read-only DHCP/runtime commands consume the validated local config and
 # daemon management routes. The empty pool is still a useful contract check.
@@ -215,15 +221,15 @@ test "$digest_1" = "$digest_after_noop"
 # M4.5：HTTP 契约补全--405+Allow、415、428、统一安全头和错误信封 request_id。
 allow_status=$(curl --silent -o "$tmp/mna" -D "$tmp/mna-headers" -w '%{http_code}' -X PUT "http://127.0.0.1:$port/api/v1/management/config")
 test "$allow_status" = 405
-grep -Eqi '^allow:[[:space:]]*get,[[:space:]]*patch' "$tmp/mna-headers"
+grep -Eqi '^allow:[[:space:]]*get' "$tmp/mna-headers"
 grep -Fq '"code":"http.method_not_allowed"' "$tmp/mna"
 grep -Fq '"request_id"' "$tmp/mna"
 mt_status=$(curl --silent -o "$tmp/mt" -w '%{http_code}' -X POST -H 'Content-Type: text/plain' --data 'x' "http://127.0.0.1:$port/api/v1/management/assets")
 test "$mt_status" = 415
 grep -Fq '"code":"http.unsupported_media_type"' "$tmp/mt"
-precond_status=$(curl --silent -o "$tmp/precond" -w '%{http_code}' -X PATCH -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/config")
-test "$precond_status" = 409
-grep -Fq '"code":"config.offline_only"' "$tmp/precond"
+patch_status=$(curl --silent -o "$tmp/config-patch" -w '%{http_code}' -X PATCH -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/config")
+test "$patch_status" = 405
+grep -Fq '"code":"http.method_not_allowed"' "$tmp/config-patch"
 curl --silent -D "$tmp/sec-headers" -o /dev/null "http://127.0.0.1:$port/api/v1/management/config"
 grep -Eqi '^cache-control:[[:space:]]*no-store,[[:space:]]*private' "$tmp/sec-headers"
 grep -Eqi '^x-content-type-options:[[:space:]]*nosniff' "$tmp/sec-headers"

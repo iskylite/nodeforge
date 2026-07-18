@@ -2,6 +2,7 @@ const std = @import("std");
 const model = @import("../model.zig");
 const boot_session = @import("boot_session.zig");
 const dhcp_store = @import("dhcp_store.zig");
+const deployment_control = @import("deployment_control.zig");
 
 pub const Record = struct {
     boot_session_id: []const u8,
@@ -67,7 +68,7 @@ fn chmod(io: std.Io, allocator: std.mem.Allocator, mode: []const u8, path: []con
     }
 }
 
-pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: *const model.AppConfig, catalog: *const model.Catalog, store: *boot_session.Store, utc_now: i64, mono_now: i64) !usize {
+pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: *const model.AppConfig, catalog: *const model.Catalog, deployments: *deployment_control.Store, store: *boot_session.Store, utc_now: i64, mono_now: i64) !usize {
     _ = config; // retained in the public signature for checkpoint schema compatibility
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(bytes);
@@ -77,6 +78,9 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
     var restored: usize = 0;
     for (parsed.value.sessions) |record| {
         if (!boot_session.validId(record.boot_session_id) or !validCapability(&record.capability) or utc_now < record.last_seen_at) continue;
+        // M4.9：0 是“revision unavailable / 无 provenance”哨兵。
+        // 没有固定 model 的 capability 不得跨重启恢复。
+        if (record.model_revision == 0) return error.InvalidBootSessionState;
         const elapsed = utc_now - record.last_seen_at;
         if (elapsed >= boot_session.delivery_ttl_seconds) continue;
         const node = findNode(catalog, record.node_id) orelse continue;
@@ -84,6 +88,18 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
         if (!std.mem.eql(u8, node.profile, record.profile) or !std.mem.eql(u8, &record.mac, &node_mac)) continue;
         const profile = findProfile(catalog, record.profile) orelse continue;
         if (profile.mode != record.mode) continue;
+        if (record.mode == .install) {
+            // M4.9：boot-sessions.json 与 deployment-control.json 分别原子写。
+            // 恢复破坏性 delivery 前必须校验 join，避免只清理/回滚一个文件后
+            // 把旧 capability/plan 接到新 generation。
+            if (record.deployment_generation == 0) return error.InvalidBootSessionState;
+            const deployment = deployments.view(record.node_id) orelse return error.BootSessionDeploymentMismatch;
+            if (deployment.currentGeneration() != record.deployment_generation or deployment.requested_revision != record.model_revision)
+                return error.BootSessionDeploymentMismatch;
+            // 若 deployment 已记录成功而 terminal checkpoint 尚未来得及删除
+            // token，也不得复活 capability。
+            if (deployment.deployed_generation == record.deployment_generation) continue;
+        }
         var id: [boot_session.id_len]u8 = undefined;
         @memcpy(&id, record.boot_session_id);
         var restored_session: boot_session.Session = .{
@@ -104,12 +120,13 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
         try boot_session.copyIdentity(&restored_session, record.node_id, record.profile);
         try store.restore(restored_session);
         if (record.install_plan_json) |plan_json| {
+            if (record.mode != .install) return error.InvalidBootSessionState;
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(plan_json, &digest, .{});
             if (record.plan_digest == null or !std.crypto.timing_safe.eql([32]u8, digest, record.plan_digest.?)) return error.InvalidBootSessionState;
             try validatePlanAssets(allocator, plan_json, catalog);
             try store.captureInstallPlan(allocator, record.boot_session_id, plan_json, record.model_revision);
-        } else if (parsed.value.schema_version >= 3) return error.InvalidBootSessionState;
+        } else if (record.mode == .install) return error.InvalidBootSessionState;
         restored += 1;
     }
     return restored;
@@ -168,12 +185,15 @@ test "delivery checkpoint restores capability and remaining TTL" {
     defer before.deinit();
     const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "install", .mode = .install, .model_revision = 42 }, 100, 1000);
     before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 101, 1001);
+    try before.setDeploymentGeneration(acquired.link.id().?, 1);
     const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
     const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
     try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42);
     try save(std.testing.io, std.testing.allocator, path, &before, 1002);
     var after: boot_session.Store = .{};
     defer after.deinit();
+    var deployments: deployment_control.Store = .{};
+    try deployments.ensureInitial("n1", 42, 999);
     const catalog: model.Catalog = .{
         .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
         .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
@@ -182,11 +202,66 @@ test "delivery checkpoint restores capability and remaining TTL" {
             .{ .name = "initrd", .kind = .installer_initrd, .path = "install/initrd", .sha256 = "bb" },
         },
     };
-    try std.testing.expectEqual(@as(usize, 1), try load(std.testing.io, std.testing.allocator, path, &config, &catalog, &after, 1012, 500));
+    try std.testing.expectEqual(@as(usize, 1), try load(std.testing.io, std.testing.allocator, path, &config, &catalog, &deployments, &after, 1012, 500));
     const restored = try after.authenticateCapability("n1", issued.boot_session_id[0..], issued.capability[0..], 501);
     try std.testing.expectEqual(@as(u64, 42), restored.model_revision);
     before.finishDelivery(issued.boot_session_id[0..], .completed, 103, 1003);
     after.finishDelivery(issued.boot_session_id[0..], .completed, 502, 1013);
+}
+
+test "resume rejects install session whose deployment provenance was reset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/boot-sessions.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.27.128" } };
+    const catalog: model.Catalog = .{
+        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
+        .assets = &.{
+            .{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "aa" },
+            .{ .name = "initrd", .kind = .installer_initrd, .path = "install/initrd", .sha256 = "bb" },
+        },
+    };
+    var before: boot_session.Store = .{};
+    defer before.deinit();
+    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "install", .mode = .install, .model_revision = 42 }, 100, 1000);
+    before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 101, 1001);
+    try before.setDeploymentGeneration(acquired.link.id().?, 3);
+    const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
+    const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
+    try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42);
+    try save(std.testing.io, std.testing.allocator, path, &before, 1002);
+
+    var reset_deployments: deployment_control.Store = .{};
+    try reset_deployments.ensureInitial("n1", 99, 1003);
+    var after: boot_session.Store = .{};
+    defer after.deinit();
+    try std.testing.expectError(error.BootSessionDeploymentMismatch, load(std.testing.io, std.testing.allocator, path, &config, &catalog, &reset_deployments, &after, 1012, 500));
+}
+
+test "resume accepts diskless capability without an install plan" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/boot-sessions.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.27.128" } };
+    const catalog: model.Catalog = .{
+        .profiles = &.{.{ .name = "diskless", .mode = .diskless, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "diskless" }},
+    };
+    var before: boot_session.Store = .{};
+    defer before.deinit();
+    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "diskless", .mode = .diskless, .model_revision = 7 }, 100, 1000);
+    before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 101, 1001);
+    const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
+    try save(std.testing.io, std.testing.allocator, path, &before, 1002);
+
+    var deployments: deployment_control.Store = .{};
+    var after: boot_session.Store = .{};
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try load(std.testing.io, std.testing.allocator, path, &config, &catalog, &deployments, &after, 1012, 500));
+    _ = try after.authenticateCapability("n1", issued.boot_session_id[0..], issued.capability[0..], 501);
 }
 
 test "resume fails closed when a pinned asset digest changes or disappears" {

@@ -95,6 +95,14 @@ pub fn installGenerations(io: std.Io, port: u16, node_id: []const u8) Status {
     return probeAt(io, management.client_ip, port, value, "POST");
 }
 
+pub fn installGenerationsForce(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
+    var path: [256]u8 = undefined;
+    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/install-generations", .{node_id}) catch return .{ .reachable = false, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", value, "{\"force\":true}", revision, reason_buf);
+}
+
 /// 探测 M1 TFTP 运行态路由。仅由本机 daemon 提供，不接受远程地址。
 pub fn tftpStatus(io: std.Io, port: u16) Status {
     return probeAt(io, management.client_ip, port, "/api/v1/management/runtime/tftp", "GET");
@@ -186,6 +194,15 @@ pub const Mutation = struct {
     reason: []const u8 = "",
 };
 
+pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name) or !querySafe(install_source)) return .{ .reachable = false, .healthy = false };
+    var body: [512]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&body, "{{\"name\":{f},\"install_source\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}) }) catch
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.invalid", "profile request is too large") };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", "/api/v1/management/profiles", rendered, revision, reason_buf);
+}
+
 pub fn nodeAdd(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutation {
     const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "POST", "/api/v1/management/nodes", body, revision, reason_buf);
@@ -210,21 +227,24 @@ pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) 
 /// 只允许修改 profile 的 `kernel_args` 字段；使用 catalog ETag 防止覆盖
 /// 其他 profile/node mutation 已发布的新 generation。
 pub fn profileSetKernelArgs(io: std.Io, port: u16, name: []const u8, kernel_args: ?[]const u8, reason_buf: []u8) Mutation {
+    return profileSetProperty(io, port, name, "kernel_args", kernel_args, reason_buf);
+}
+
+pub fn profileSetBootDisk(io: std.Io, port: u16, name: []const u8, boot_disk: []const u8, reason_buf: []u8) Mutation {
+    return profileSetProperty(io, port, name, "boot_disk", boot_disk, reason_buf);
+}
+
+fn profileSetProperty(io: std.Io, port: u16, name: []const u8, field: []const u8, value_to_set: ?[]const u8, reason_buf: []u8) Mutation {
     if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
     const value = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}", .{name}) catch return .{ .reachable = false, .healthy = false };
     var body: [512]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&body);
-    writer.writeAll("{\"kernel_args\":") catch return .{ .reachable = true, .healthy = false };
-    std.json.Stringify.value(kernel_args, .{}, &writer) catch return .{ .reachable = true, .healthy = false };
+    writer.print("{{\"{s}\":", .{field}) catch return .{ .reachable = true, .healthy = false };
+    std.json.Stringify.value(value_to_set, .{}, &writer) catch return .{ .reachable = true, .healthy = false };
     writer.writeByte('}') catch return .{ .reachable = true, .healthy = false };
     const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "PATCH", value, writer.buffered(), revision, reason_buf);
-}
-
-pub fn configSet(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutation {
-    const revision = configRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current config revision");
-    return managementMutation(io, port, "PATCH", "/api/v1/management/config", body, revision, reason_buf);
 }
 
 fn mutationUnreachable(reason_buf: []u8, message: []const u8) Mutation {
@@ -277,16 +297,6 @@ fn formatTransportError(out: []u8, err: anyerror) []const u8 {
 
 fn formatHttpStatus(out: []u8, status: u16) []const u8 {
     return std.fmt.bufPrint(out, "http: {d} response with no body", .{status}) catch "http: non-2xx response";
-}
-
-fn configRevision(io: std.Io, port: u16) ?u64 {
-    var buffer: [4096]u8 = undefined;
-    const maybe_body = managementJson(io, port, "/api/v1/management/config", &buffer) catch return null;
-    const body = maybe_body orelse return null;
-    const Response = struct { result: struct { revision: u64 } };
-    const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
-    defer parsed.deinit();
-    return parsed.value.result.revision;
 }
 
 fn catalogRevision(io: std.Io, port: u16) ?u64 {
@@ -372,7 +382,16 @@ pub fn importAsset(io: std.Io, port: u16, asset: AssetImport) !bool {
 /// M4.5 使用 application/json body 和独立 Idempotency-Key header；202 只表示
 /// HTTP 接受。客户端按 Location 轮询 Operation 直到 terminal，只有 succeeded
 /// 才算业务成功（§9.14.4：长任务信封不随执行快慢变化）。
-pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) !bool {
+pub const InstallSourceImportResult = struct {
+    source_name: [128]u8 = undefined,
+    source_name_len: usize = 0,
+
+    pub fn name(self: *const InstallSourceImportResult) []const u8 {
+        return self.source_name[0..self.source_name_len];
+    }
+};
+
+pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) !?InstallSourceImportResult {
     if (!querySafe(request.filename) or request.content_sha256.len != 64 or request.idempotency_key.len == 0 or request.idempotency_key.len > 128 or !querySafe(request.idempotency_key)) return error.InvalidInstallSourceField;
     inline for ([_]?[]const u8{ request.name, request.distro, request.version, request.arch }) |optional|
         if (optional) |value|
@@ -388,17 +407,29 @@ pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) 
     // daemon 改为异步（返回 queued/running）时才按 Location 轮询 terminal 状态。
     var attempts: usize = 0;
     while (attempts < 1200) : (attempts += 1) {
-        const body = reply.body orelse return false;
-        switch (operationState(body) orelse return false) {
-            .succeeded => return true,
-            .failed => return false,
+        const body = reply.body orelse return null;
+        switch (operationState(body) orelse return null) {
+            .succeeded => return operationImportResult(body),
+            .failed => return null,
             .pending => {},
         }
-        const next = reply.location orelse return false;
+        const next = reply.location orelse return null;
         std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
         reply = try getReply(io, port, next, &response, &location);
     }
-    return false;
+    return null;
+}
+
+fn operationImportResult(body: []const u8) ?InstallSourceImportResult {
+    const Envelope = struct { result: struct { result: []const u8 } };
+    const parsed = std.json.parseFromSlice(Envelope, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const name = parsed.value.result.result;
+    if (name.len == 0 or name.len > 128) return null;
+    var result: InstallSourceImportResult = .{};
+    @memcpy(result.source_name[0..name.len], name);
+    result.source_name_len = name.len;
+    return result;
 }
 
 /// 从 Operation 信封 `{"ok":true,"result":{"state":...}}` 提取终态判定。
@@ -489,6 +520,8 @@ test "operationState parses terminal and pending states" {
     try std.testing.expectEqual(OperationState.failed, operationState("{\"ok\":true,\"result\":{\"state\":\"failed\"}}").?);
     try std.testing.expectEqual(OperationState.pending, operationState("{\"ok\":true,\"result\":{\"state\":\"running\"}}").?);
     try std.testing.expect(operationState("not json") == null);
+    const imported = operationImportResult("{\"ok\":true,\"result\":{\"state\":\"succeeded\",\"result\":\"rocky-9.7-aarch64-iso\"}}").?;
+    try std.testing.expectEqualStrings("rocky-9.7-aarch64-iso", imported.name());
 }
 
 /// 向指定 IPv4:port 发送轻量探针并严格解析三位状态码。

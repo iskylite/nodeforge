@@ -42,6 +42,33 @@ fi
 grep -Fq "WorkingDirectory=$install_real" "$tmp/unit"
 "$install/bin/nodeforge" setup --reconfigure --non-interactive --yes >"$tmp/reconfigure"
 grep -Fq 'deployment reconfigured' "$tmp/reconfigure"
+# Reconfigure always republishes the unit, but never activates the service.
+printf '%s\n' stale-unit >"$install/systemd/nodeforged.service"
+"$install/bin/nodeforge" setup --reconfigure --non-interactive --yes >"$tmp/reconfigure-unit"
+grep -Fq "ExecStart=$install_real/bin/nodeforged --log-output file" "$install/systemd/nodeforged.service"
+if "$install/bin/nodeforge" setup --reconfigure --install --non-interactive --yes >"$tmp/reconfigure-install" 2>&1; then
+    echo "reconfigure unexpectedly accepted standalone systemd --install" >&2
+    exit 1
+fi
+grep -Fq -- '--install belongs to the standalone --generate-systemd operation' "$tmp/reconfigure-install"
+
+# Startup config replacement is part of setup so the candidate is validated
+# against the current catalog before the canonical config is atomically saved.
+jq '.logging.level = "debug"' "$install/config/config.json" >"$tmp/candidate.json"
+"$install/bin/nodeforge" setup --reconfigure --import-config "$tmp/candidate.json" --non-interactive --yes >"$tmp/import-config"
+grep -Fq 'deployment reconfigured' "$tmp/import-config"
+grep -Fq "$tmp/candidate.json" "$tmp/import-config"
+grep -Fq 'restart nodeforged' "$tmp/import-config"
+test "$(jq -r .logging.level "$install/config/config.json")" = debug
+
+# Invalid input must fail before replacing the installed startup config.
+checksum_before=$(cksum "$install/config/config.json")
+printf '%s\n' '{"schema_version":1,"server":{"server_ip":"::1"}}' >"$tmp/invalid-source.json"
+if "$install/bin/nodeforge" setup --reconfigure --import-config "$tmp/invalid-source.json" --non-interactive --yes >"$tmp/invalid-import" 2>&1; then
+    echo "invalid setup config import unexpectedly succeeded" >&2
+    exit 1
+fi
+test "$checksum_before" = "$(cksum "$install/config/config.json")"
 
 printf '%s\n' '{"schema_version":1}' >"$install/state/leases.json"
 "$install/bin/nodeforge" setup --reset-state --non-interactive --yes >"$tmp/reset"
@@ -51,6 +78,31 @@ test -n "$backup"
 test -f "$backup/leases.json"
 test "$(jq -r '.files[0].file' "$backup/manifest.json")" = leases.json
 test "$(jq -r '.files[0].sha256 | length' "$backup/manifest.json")" = 64
+
+# --purge-all may compose with --reconfigure. The interactive composite has one
+# confirmation boundary; rejection must happen before any destructive write.
+mkdir -p "$install/backups/old"
+printf old >"$install/backups/old/manifest.json"
+printf old >"$install/logs/events.jsonl"
+printf old >"$install/config/config.json.m4.7.bak"
+printf stale-unit >"$install/systemd/nodeforged.service"
+if printf 'n\n' | "$install/bin/nodeforge" setup --reset-all --purge-all --reconfigure >"$tmp/purge-denied" 2>&1; then
+    echo "rejected interactive purge unexpectedly succeeded" >&2
+    exit 1
+fi
+test -f "$install/backups/old/manifest.json"
+grep -Fq 'permanently purge NodeForge state' "$tmp/purge-denied"
+printf 'yes\n' | "$install/bin/nodeforge" setup --reset-all --purge-all --reconfigure >"$tmp/purge-all"
+grep -Fq 'purged by --purge-all' "$tmp/purge-all"
+grep -Fq 'deployment reconfigured' "$tmp/purge-all"
+grep -Fq 'Service' "$tmp/purge-all"
+grep -Fq 'unchanged; run systemctl daemon-reload/restart nodeforged' "$tmp/purge-all"
+test ! -e "$install/backups"
+test ! -e "$install/logs/events.jsonl"
+test ! -e "$install/config/config.json.m4.7.bak"
+test -f "$install/config/config.json"
+test -f "$install/catalog/manifest.json"
+grep -Fq "ExecStart=$install_real/bin/nodeforged --log-output file" "$install/systemd/nodeforged.service"
 
 # A partial bundle cannot produce a valid marker or claim initialization.
 partial="$tmp/partial"

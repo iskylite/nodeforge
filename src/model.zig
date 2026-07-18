@@ -342,7 +342,8 @@ pub const BootBundleConfig = struct {
 pub const ProfileSafetyConfig = struct {
     /// 是否允许未知节点使用此 profile；safe/ephemeral profile 必须为 true。
     safe_for_unknown: bool = false,
-    /// 是否包含擦盘、格式化等不可逆操作；install profile 必须为 true。
+    /// 是否授权该 profile 包含擦盘、格式化等不可逆操作；这是 profile 级
+    /// 安全声明，不是一次安装的 arm 状态。install profile 必须为 true。
     destructive: bool = false,
     /// 是否写入持久状态；safe/ephemeral profile 必须为 false。
     persistent_writes: bool = false,
@@ -476,7 +477,7 @@ pub const InstallConfig = struct {
 /// Subiquity 在所有候选 APT mirror 均不可用时的处理策略。
 ///
 /// 枚举标签刻意与 autoinstall schema 和 JSON 配置中的连字符值完全一致，
-/// 因此 `config import/export` 不需要额外字符串映射。
+/// 因此 setup 配置导入和 `config export` 不需要额外字符串映射。
 pub const AptFallback = enum {
     /// 立即终止安装；用于要求 HTTP APT mirror 必须可用的严格验收。
     abort,
@@ -496,7 +497,9 @@ pub const AptInstallConfig = struct {
 /// 磁盘存储布局配置。M4 渲染器根据此配置生成 Kickstart `part` 指令或
 /// Autoinstall `storage` 段。当 `partitions` 为空时使用安全默认值。
 pub const StorageConfig = struct {
-    /// 是否在分区前擦除磁盘所有分区表。MVP 默认为 true，确保安装环境干净。
+    /// 是否在分区前清除目标盘既有分区/签名。它是 install.storage 的具体
+    /// 渲染策略，只有 profile 已通过 destructive/persistent 安全校验且
+    /// generation 已显式武装时才可能执行。
     wipe: bool = true,
     /// 主启动磁盘设备路径；Kickstart 的 `clearpart --drives` 和 `bootloader --boot-drive` 使用此值。
     /// 值格式为 Linux 设备路径（如 `/dev/sda`），渲染时去掉 `/dev/` 前缀。
@@ -623,7 +626,7 @@ pub const NodeConfig = struct {
     overrides: NodeOverrideConfig = .{},
     /// M4.2 F2: 节点是否参与 PXE 部署。`false` 时即使 MAC/IP/profile 匹配，
     /// resolve() 也不下发 PXE bootfile，仍发诊断 DHCP lease。适用于 install/diskless/discovery 全模式。
-    /// 通过 `node set <id> --deploy false` 管理。与 generation gate 互补不冗余。
+    /// 通过 `node set <id> deploy=false` 管理。与 generation gate 互补不冗余。
     deploy: bool = true,
     /// M4.2 F4: 节点是否使用 HTTP 加速下载 initrd。
     /// **默认 `false`**。`true` 时 GRUB 配置中的 initrd 路径渲染为
@@ -643,7 +646,7 @@ pub const NodeConfig = struct {
     /// 在 TFTP 模式下受 RTT 限制仅约 2 MB/s。
     /// 仅对 GRUB UEFI 链路生效；M6 BIOS PXELINUX 固定使用 `pxelinux.0`
     /// （只支持 TFTP），此字段对 BIOS 节点无效。
-    /// 通过 `node set <id> --http-accel true` 启用。
+    /// 通过 `node set <id> http_accel=true` 启用。
     http_accel: bool = false,
 };
 

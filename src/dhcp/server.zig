@@ -19,6 +19,7 @@ const boot_session = @import("../state/boot_session.zig");
 const events = @import("../state/events.zig");
 const deployment_control = @import("../state/deployment_control.zig");
 const config_runtime = @import("../state/config_runtime.zig");
+const catalog_runtime = @import("../state/catalog_runtime.zig");
 const model_runtime = @import("../state/model_runtime.zig");
 const observe_log = @import("../observe/log.zig");
 const paths = @import("../paths.zig");
@@ -59,18 +60,14 @@ pub const Persistence = struct {
     /// boot session 存储，用于创建和更新 PXE 启动关联。
     sessions: *boot_session.Store,
     deployments: ?*deployment_control.Store = null,
-    /// daemon 已校验配置快照的稳定摘要。待执行的破坏性 generation
-    /// 只能在此精确 revision 上启动。
-    config_revision: u64 = 0,
-    configs: ?*config_runtime.ConfigRuntime = null,
     /// config+catalog 一致快照边界。`persistenceRevision` 在其 gate 下取一致
     /// 快照重算 desired（config+catalog）model revision，与部署武装使用的
     /// revision 对齐；仅 config 的 revision 会使已武装节点被误判为 not armed。
-    models: ?*model_runtime.ModelRuntime = null,
+    models: *model_runtime.ModelRuntime,
 };
 
 fn persistenceRevision(value: *const Persistence) u64 {
-    // 部署 generation 武装在 desired（config+catalog）model revision 上
+    // M4.9：部署 generation 武装在 desired（config+catalog）model revision 上
     // （`deployment_control.revisionForModel` 与 HTTP `desiredRevision` 一致）。
     // DHCP 的武装判定必须用同一把 desired revision：若退化为仅 config 的
     // `configs.currentRevision()`（revisionForConfig），已武装节点会被恒判为
@@ -78,13 +75,12 @@ fn persistenceRevision(value: *const Persistence) u64 {
     // 最终无法获取 DHCP 分配的 IP。在 model gate 下取一致的 config+catalog
     // 快照重算当前 desired revision，使武装后的 config/catalog 变更也能正确
     // 使旧 generation 失效。
-    if (value.models) |models| {
-        const pair = models.acquire();
-        defer pair.release();
-        const revision = deployment_control.revisionForModel(value.allocator, pair.config.value(), pair.catalog.value()) catch return value.config_revision;
-        return revision.desiredRevision();
-    }
-    return if (value.configs) |configs| configs.currentRevision() else value.config_revision;
+    const pair = value.models.acquire();
+    defer pair.release();
+    // M4.9：revision 重算失败必须 fail closed。回退到 daemon 启动时的 revision
+    // 可能在运行期 model mutation 后错误放行已过期的破坏性安装 generation。
+    const revision = deployment_control.revisionForModel(value.allocator, pair.config.value(), pair.catalog.value()) catch return 0;
+    return revision.desiredRevision();
 }
 
 /// 在同一 UDP worker 中处理 DHCP 和 session 生命周期。
@@ -176,6 +172,8 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
     if (!always or !deployments.canAutoRearm(node_id)) return;
     const requested_at = now();
     const revision = persistenceRevision(p);
+    // 无法取得联合 revision 时不能把 0 武装为一个可消费 generation。
+    if (revision == 0) return;
     const rearm = deployments.rearm(node_id, revision, requested_at, .policy_always) catch |err| {
         observe_log.err("dhcp: automatic install generation unavailable: {t}", .{err});
         return;
@@ -192,6 +190,8 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
     const fields = [_]events.Field{
         .{ .key = "node_id", .value = node_id },
         .{ .key = "generation", .value = std.fmt.bufPrint(&generation_text, "{d}", .{rearm.generation}) catch "0" },
+        // 历史事件字段名保持兼容；M4.9 后其值是联合 desired model revision，
+        // 不是 config-only revision。新状态接口使用 requested/desired_revision。
         .{ .key = "config_revision", .value = std.fmt.bufPrint(&revision_text, "{d}", .{revision}) catch "0" },
         .{ .key = "requested_at", .value = std.fmt.bufPrint(&requested_at_text, "{d}", .{requested_at}) catch "0" },
         .{ .key = "requested_by", .value = "policy_always" },
@@ -292,9 +292,9 @@ fn emitInstallNotArmed(io: std.Io, persistence: ?*const Persistence, node_id: []
     // 使操作员能区分“从未 arm”与“已 arm 但已 terminal”两种状态。
     const armed_gen_text = std.fmt.bufPrint(&armed_gen_buf, "{d}", .{view.armed_generation orelse 0}) catch "0";
     const terminal_gen_text = std.fmt.bufPrint(&terminal_gen_buf, "{d}", .{view.terminal_generation orelse 0}) catch "0";
-    // requested_revision 是已武装 generation 锁定的 config revision；
-    // desired_revision 是当前请求使用的 revision。两者不等说明
-    // 配置在 arm 后发生了变更，需要重新 arm 才能匹配新计划。
+    // requested_revision 是已武装 generation 锁定的联合 model revision；
+    // desired_revision 是当前请求使用的联合 revision。两者不等说明
+    // config/catalog 模型在 arm 后发生了变更，需要重新 arm 才能匹配新计划。
     const req_rev_text = std.fmt.bufPrint(&req_rev_buf, "{d}", .{view.requested_revision}) catch "0";
     const desired_rev_text = std.fmt.bufPrint(&desired_rev_buf, "{d}", .{desired_revision}) catch "0";
     const next_action = "nodeforge node retry <node_id>";
@@ -709,6 +709,37 @@ test "DHCP request events retain the received message type" {
     try std.testing.expectEqualStrings("dhcp.request", requestEvent(.request));
     try std.testing.expectEqualStrings("dhcp.release", requestEvent(.release));
     try std.testing.expectEqualStrings("dhcp.decline", requestEvent(.decline));
+}
+
+test "DHCP deployment gate uses the config and catalog model revision" {
+    const config: model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+    };
+    const catalog: model.Catalog = .{ .revision = 7 };
+    const config_revision = try deployment_control.revisionForConfig(std.testing.allocator, &config);
+    const expected = (try deployment_control.revisionForModel(std.testing.allocator, &config, &catalog)).desiredRevision();
+    // M4.9 实机回归的必要前提：ConfigRuntime 保存的 config-only revision
+    // 与 install generation 锁定的 config+catalog desired revision 不相同。
+    try std.testing.expect(config_revision != expected);
+
+    var configs = try config_runtime.ConfigRuntime.init(std.testing.allocator, &config, config_revision);
+    defer configs.deinit();
+    var catalogs = try catalog_runtime.CatalogRuntime.init(std.testing.allocator, "/tmp/nodeforge-test-catalog", &catalog);
+    defer catalogs.deinit();
+    var models = model_runtime.ModelRuntime.init(&configs, &catalogs);
+    var writer: events.Writer = .{};
+    var sessions: boot_session.Store = .{};
+    defer sessions.deinit();
+    const persistence: Persistence = .{
+        .allocator = std.testing.allocator,
+        .events_path = "/tmp/nodeforge-test-events.jsonl",
+        .writer = &writer,
+        .sessions = &sessions,
+        .models = &models,
+    };
+
+    try std.testing.expectEqual(expected, persistenceRevision(&persistence));
+    try std.testing.expect(persistenceRevision(&persistence) != configs.currentRevision());
 }
 
 test "DHCP decline via process quarantines the lease as abandoned" {

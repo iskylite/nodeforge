@@ -9,6 +9,12 @@ const model = @import("../model.zig");
 const config_store = @import("../config/store.zig");
 const catalog_store = @import("../catalog/store.zig");
 
+/// M4.9：一个 effective config/catalog model 的内容指纹。
+///
+/// 它不是计数器、Git revision、时间戳或可排序版本。`config` 是 config-only
+/// 指纹，`catalog` 是 manifest generation，`desiredRevision()` 是联合 SHA-256
+/// 的紧凑投影；调用方只能比较相等/不等。M4.9b 才迁移为持久化完整 node-scoped
+/// plan digest，当前 u64 仅为 schema 兼容实现。
 pub const ModelRevision = struct {
     config: u64,
     catalog: u64,
@@ -34,7 +40,7 @@ pub const Entry = struct {
     armed_generation: ?u64 = null,
     consumed_generation: ?u64 = null,
     terminal_generation: ?u64 = null,
-    /// 当前已武装 generation 被请求时捕获的不可变 config revision。
+    /// 当前已武装 generation 被请求时捕获的不可变 desired model revision。
     /// 更改的期望计划必须显式重新武装。
     requested_revision: u64 = 0,
     /// 进入破坏性安装器阶段的 revision。
@@ -343,6 +349,9 @@ pub const Store = struct {
         };
     }
 
+    /// M4.9：只有成功 revision 基线存在后才能判断 drift。
+    /// `applied_revision == 0` 表示“无 applied 基线”，不是“已确认同步”；
+    /// 调用方通过 deployment phase 暴露 pending/unknown 状态。
     pub fn isDrifted(self: *Store, node_id: []const u8, revision: u64) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -475,9 +484,10 @@ fn validNodeId(value: []const u8) bool {
     return true;
 }
 
-/// 为已校验的配置快照计算稳定的、非密钥的 revision 值。
-/// 仅以不透明 u64 存储；此辅助函数不会将密码、密钥或序列化配置
-/// 写入日志/事件/状态文件。
+/// 为已校验的配置快照计算稳定的、非密钥内容指纹。
+/// 结果是 SHA-256 前 64 bit 的不透明投影（0 保留为 unavailable sentinel）；
+/// 没有递增或大小顺序语义。此辅助函数不会将密码、密钥或序列化配置写入
+/// 日志/事件/状态文件。
 pub fn revisionForConfig(allocator: std.mem.Allocator, config: *const model.AppConfig) !u64 {
     const json = try config_store.render(allocator, config);
     defer allocator.free(json);
@@ -489,8 +499,10 @@ pub fn revisionForConfig(allocator: std.mem.Allocator, config: *const model.AppC
     return if (value == 0) 1 else value;
 }
 
-/// config/catalog 两条 revision 与不可变期望模型 digest 的统一投影。catalog
-/// mutation 不再伪装成 config revision；部署控制使用 digest 折叠值判断 drift。
+/// M4.9a config/catalog 两条 revision 与不可变期望模型 digest 的统一投影。catalog
+/// mutation 不再伪装成 config revision；部署控制使用 digest 前 64 bit 的折叠值
+/// 做相等性门禁和 drift 判断。M4.9b 才把 node-scoped 完整 digest 持久化到
+/// deployment/session/status；不得把本函数的全局 u64 兼容值描述成最终模型。
 pub fn revisionForModel(allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *const model.Catalog) !ModelRevision {
     const config_json = try config_store.render(allocator, config);
     defer allocator.free(config_json);
