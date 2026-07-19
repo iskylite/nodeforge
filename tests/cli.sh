@@ -24,6 +24,15 @@ grep -q "NodeForge administration CLI" "$tmp/root-help"
 grep -q "Available commands:" "$tmp/root-help"
 grep -q "catalog" "$tmp/root-help"
 grep -q -- "--version" "$tmp/root-help"
+grep -Fq 'Verify that nodeforged is operational' "$tmp/root-help"
+if grep -Fq 'Run health checks and set the exit code' "$tmp/root-help"; then
+    echo "check must not remain beside canonical status" >&2
+    exit 1
+fi
+if "$cli" check --help >"$tmp/check-help" 2>&1; then
+    echo "check unexpectedly remains as a command" >&2
+    exit 1
+fi
 if grep -Eq '^   .*--config' "$tmp/root-help"; then
     echo "root help must not expose command-specific flags" >&2
     exit 1
@@ -57,8 +66,26 @@ grep -Fq 'Create an install profile from an imported install source' "$tmp/profi
 grep -Fq 'Derives distro, version, and architecture' "$tmp/profile-create-help"
 "$cli" profile set --help >"$tmp/profile-set-help"
 grep -Fq 'boot_disk=/dev/<device>' "$tmp/profile-set-help"
+grep -Fq 'kernel_args, boot_disk' "$tmp/profile-set-help"
+grep -Fq "nodeforge profile set rocky 'kernel_args=iommu=pt hugepages=4'" "$tmp/profile-set-help"
+"$cli" node set --help >"$tmp/node-set-help"
+grep -Fq 'mac, arch, profile, ip, hostname, deploy, http_accel' "$tmp/node-set-help"
+grep -Fq 'nodeforge node set r97n1 hostname=r97n1 deploy=true' "$tmp/node-set-help"
+"$cli" node unset --help >"$tmp/node-unset-help"
+grep -Fq 'nodeforge node unset r97n1 ip hostname' "$tmp/node-unset-help"
 "$cli" node retry --help >"$tmp/node-retry-help"
 grep -Fq 'Supersede a stuck active session' "$tmp/node-retry-help"
+"$cli" status --help >"$tmp/status-help"
+grep -Fq 'advertised HTTP, catalog, DHCP, and TFTP' "$tmp/status-help"
+"$cli" runtime --help >"$tmp/runtime-help"
+if grep -Fq 'Show runtime status overview' "$tmp/runtime-help"; then
+    echo "runtime status must not remain beside canonical top-level status" >&2
+    exit 1
+fi
+if "$cli" runtime status --help >"$tmp/runtime-status-help" 2>&1; then
+    echo "runtime status unexpectedly remains as a command" >&2
+    exit 1
+fi
 
 "$cli" assets register --help >"$tmp/asset-register-help"
 grep -Fq 'Distro name, used with --version and --arch; e.g. rocky' "$tmp/asset-register-help"
@@ -87,7 +114,6 @@ grep -Fq 'Local OpenSSH public key path' "$tmp/assets-key-import-help"
 
 for command in \
     "status" \
-    "check" \
     "config validate" \
     "config export" \
     "catalog" \
@@ -125,9 +151,9 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-"$cli" --version | grep -Eq '^nodeforge 0\.1\.1 \(commit [0-9a-f]{12}|unknown'
+"$cli" --version | grep -Eq '^nodeforge 0\.1\.2 \(commit [0-9a-f]{12}|unknown'
 "$cli" -v | grep -Fq 'built '
-"$daemon" --version | grep -Eq '^nodeforged 0\.1\.1 \(commit [0-9a-f]{12}|unknown'
+"$daemon" --version | grep -Eq '^nodeforged 0\.1\.2 \(commit [0-9a-f]{12}|unknown'
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then

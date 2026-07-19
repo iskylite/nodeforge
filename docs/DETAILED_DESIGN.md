@@ -45,10 +45,11 @@
 | M4.7 | 路径自举、模型存储迁移与部署初始化 | M4.6 | runtime Paths；schema+manifest+多文件事务；config/catalog ownership；bundle setup/reconfigure/reset/rollback |
 | M4.8 | 并发容量扩展与启动时动态派生 | M4.5 | 5 处定长上限改启动时按网段/CPU/节点数动态派生（config 可覆盖）；TFTP 并发 `auto=max(128,2×核)`、`u8→u16`、去 64 校验上限；DHCP `ping_timeout 500→100`；HTTP `max_connections` 死字段处理；启动日志打印生效容量。编号在 M4.7 之后，实施早于 M4.6（横向容量优化，与 M4.6/M4.7 内容正交） |
 | M4.9 | 部署溯源、PXE 门禁与配置入口收口补丁 | M4.7、M4.8 | 统一 model provenance；完整 node-scoped SHA-256 授权/持久化/迁移；fresh ISO bootloader；retry 可见性；startup config writer 收敛到 setup |
-| M4.10 | CLI fresh-deployment 闭环补全 | M4.9 | reconfigure/systemd 边界；purge-all；ISO import 结果；最小 install profile create；node mutation 错误透传 |
-| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2–M4.10 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
-| M6 | 支持矩阵增强 | M4.1–M4.10、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
-| M7 | 补充包和后处理增强 | M4.1–M4.10、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
+| M4.10 | CLI fresh-deployment 闭环补全 | M4.9 | reconfigure/systemd 边界；purge-all（含 work 临时数据）；ISO import 结果；最小 install profile create；node mutation 错误透传 |
+| M4.11 | CLI 状态入口与 mutation key 收口 | M4.10 | 唯一 `nodeforge status`；advertised HTTP/catalog/DHCP/TFTP 端到端检查；node/profile show 与 set key 完全一致 |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2–M4.11 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
+| M6 | 支持矩阵增强 | M4.1–M4.11、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
+| M7 | 补充包和后处理增强 | M4.1–M4.11、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
 
 ### 1.3 完成标准
 
@@ -64,7 +65,8 @@
 
 ### 1.4 阅读顺序与阶段依赖
 
-- M0-M7（含 M1.5、M2.5、M2.5.1、M4.1–M4.9）是可验收的产品阶段，按章节依赖阅读和交付。
+- M0–M4.11（含 M1.5、M2.5、M2.5.1、M4.1–M4.11）是当前已实现/已验收范围；M5–M7 是设计冻结和后续交付目标，
+  不得把设计章节、预留模型或 resolver 单测当作端到端验收证据。
 - M1 先实现正式 TFTP 只读服务，并用标准 TFTP client 验证 RRQ/OACK、重传和路径安全。
 - M1.5 在 M2 前收敛 CLI 展示层；它不改变 daemon API、配置或协议语义，但 M2+ 新命令必须复用其 formatter。
 - M2 再实现 DHCP 地址、架构识别和 bootfile 决策，最后与 M1 联调完整 PXE 入口。
@@ -72,8 +74,8 @@
   引入 Event v2 结构化字段，补全 TFTP/HTTP 日志，并新增 CLI 事件查询命令。它不改变
   daemon API 或协议语义，但为 M3+ 的 HTTP 事件接口和运行态审计提供基础。
 - M4 先跑通安装主链路，M4.1 再收敛目标系统 locale/timezone、离线、SSH/root、包和静态网络配置；
-  M5 复用 M4.1 的公共系统配置类型，但无盘包必须在 rootfs build 阶段落盘。M4/M5 交付基础
-  provisioning runner；M7 只增强 archive、script、firstboot 和诊断，不是安装或无盘链路的前置阻塞。
+  M5 将复用这些公共类型，但当前尚未交付 rootfs build、无盘 initrd 或 diskless runner。现有
+  `provision/runner.zig` 是 M4 的 install_post 基础 runner；M7 的 archive、script、firstboot 和诊断仍待实现。
 - M4.4 在 M4.3 后收口 HTTP URL 路由，M4.5 随后统一 HTTP 接口语义（状态码、响应信封、安全头、请求体和客户端判定）。
   M4.5 不回改已验证 canonical URL/认证链路，但承接 RouteSpec、405、golden DTO、分页、ETag 和幂等操作等
   M4.4 遗留工程化项；M5 消费 M4.5 统一后的接口。
@@ -99,7 +101,7 @@
 | 管理接口 | 复用唯一 HTTP listener；M3.6 起管理路由仅接受 `127.0.0.1` direct peer；CLI 固定访问该地址，只管理同机服务；不单设 `management_port` | M0 不提供远程管理客户端 |
 | 发行版 adapter | `ubuntu.zig`、`kickstart.zig` 两个文件 | 版本差异明显增多后再拆能力表文件 |
 | 带外管理 | 只保存 IPMI 信息，不实现控制动作 | 明确要做电源控制/启动设备控制时再加执行模块 |
-| 补充包和后处理 | M4/M5 实现强类型步骤和最小 runner；M7 补齐高级步骤与诊断 | 明确需要常驻任务后再考虑 agent |
+| 补充包和后处理 | M4 已实现三种 install_post 步骤；M5 runner/M7 高级步骤与诊断待交付 | 明确需要常驻任务后再考虑 agent |
 | 插件系统 | 不做 | 第三方扩展成为明确目标后再设计 |
 
 拆模块的判断标准：
@@ -6029,13 +6031,41 @@ unit 发布按固定顺序执行，仍不隐式调用 systemctl。交互调用�
 或文档化默认值，不提供自动猜测网卡的菜单向导。ISO import 必须返回 canonical source，node/profile mutation
 必须透传可操作的结构化错误。完整命令、固定安全默认值、清理范围和验收矩阵以专项设计为准。
 
+`purge-all` 的无历史边界包括受管 `work/`：CLI ISO 暂存副本、中断导入的 `iso-import-*` 解包树及其他
+临时副本都必须删除，再由目录修复逻辑重建空的 `work/import/`。二进制、root marker、新 startup config、
+空 catalog 和 canonical unit 继续保留。ISO 文件树可能携带只读目录权限，删除实现可在已验证 install root
+派生出的 `work/` 内恢复 owner 权限后重试；任何最终清理失败都必须向上传播，禁止输出成功结果并遗留历史。
+自动测试同时覆盖确认前零写入、拒绝时 work 哨兵保留、确认后只读工作树消失及 canonical 空目录重建。
+
 M4.10 实机补丁同时增加受约束的 `profile set <name> boot_disk=/dev/<device>`：目标盘属于共享安装
 计划而不是 node identity，mutation 必须同步更新 `boot_disk/install_disks`、通过联合校验，并要求引用
 节点重新 retry。`profile show` 显示 boot disk/wipe。若 installer 在取得 capability 后、回报终态前失败，
 操作员必须先停止目标机，随后才可用 `node retry <node> --force` supersede 卡死 session；普通 retry
 继续拒绝活动 session，禁止以手删 checkpoint 作为恢复流程。
 
-## 10. M5：内存无盘启动与基础后处理
+### 9.20 M4.11：CLI 状态入口与 mutation key 收口
+
+专项设计见
+`docs/superpowers/specs/2026-07-19-m4_11-cli-status-and-mutation-keys.md`。
+
+M4.11 删除语义重叠但检查集合不一致的 `nodeforge check` 与 `nodeforge runtime status`，只保留
+`nodeforge status`。canonical status 除 loopback health/management/config validation 外，还必须探测配置中
+对 PXE 节点公布的 HTTP 地址、node/profile catalog API、DHCP leases API 和 TFTP runtime API；所有必需平面
+成功才可输出 Overall OK 和退出码 0。JSON 以稳定 snake_case key 返回逐项结果，供自动化消费。
+
+`node/profile list` 只承担摘要与 settable allowlist 导航；`show` 增加独立 Settable properties 分组，并以
+parser 接受的准确 `key=value` 输出当前可修改事实。optional 空值必须指向 `unset`，不能输出不可执行的
+`key=-`。展开的 profile/effective system、deployment、runtime、inventory、revision 等继续明确归入只读
+详情。没有 set 命令的资源，其 list/show 不声明 mutation key。未来新增可修改字段必须同步 parser、help、
+list/show、JSON DTO 和测试。
+
+跨资源及非赋值事实由 Owner/action 分组说明：例如 node view 中的 `profile.kernel_args` 指向
+`profile set`，deployment 状态指向 `node retry [--force]`，runtime/inventory/revision 分别标明
+daemon、node-reported 和 model-store owner 并保持只读。直接存储但没有安全 mutation 命令的字段同样必须
+诚实标为 `read-only (no mutation command)`，不能为了表面一致虚构 set。`set/unset --help` 列出完整
+allowlist、类型/引号约束和可复制示例，并与 parser、show 测试绑定。
+
+## 10. M5：内存无盘启动与基础后处理（设计冻结，未完成）
 
 ### 10.1 目标
 
@@ -6059,6 +6089,10 @@ snapshot 获取；rootfs/boot bundle publish 通过 manifest transaction；BootC
 node/resource API 使用 cursor 和目标 ETag，M5 不新增无分页大 collection 或 config-only 并发控制。
 
 ### 10.2 代码任务
+
+实现审计状态（2026-07-19）：当前仅有模型字段、UEFI target resolver scaffold 和 M4 事件 stage 预留；下表
+列出的 `profile/diskless.zig`、rootfs/initrd/boot-bundle 校验器、dracut module、overlay 执行器和 diskless
+CLI/HTTP payload 均尚未落地。具体缺口和证据见 `docs/M5_M7_ALIGNMENT_AUDIT.md`。
 
 | 模块 | 任务 |
 | --- | --- |
@@ -6323,6 +6357,8 @@ SELinux disabled 时，boot resolver 必须追加 `selinux=0`，同时 overlay �
 
 ### 10.7 CLI 命令
 
+以下命令是 M5 设计目标，当前版本尚未注册，不能直接执行：
+
 ```bash
 nodeforge rootfs package rocky-9.7-aarch64 --format squashfs --version 20260706
 nodeforge rootfs validate rocky-9.7-aarch64-<kernel-release>-diskless-20260706.squashfs
@@ -6350,7 +6386,7 @@ retry，只有 attempt 已终态失败后才需要操作员重新 arm。
 - `deploy=false` 的 diskless 节点收到 DHCP lease 但无 PXE bootfile，事件 `boot.deploy_disabled`；
   `diskless retry` 在 `deploy=false` 时不生效（M4.2 §9.11.2 F2）。
 
-### 10.9 阶段验收
+### 10.9 阶段验收（待完成）
 
 - 节点能 PXE 进入小 initrd。
 - 小 initrd 能拉取 boot config。
@@ -6362,13 +6398,13 @@ retry，只有 attempt 已终态失败后才需要操作员重新 arm。
   设回 `deploy=true` 后 `diskless retry` 可恢复（M4.2 §9.11.2 F2 / §9.10.11）。
 - 无盘启动阶段不创建账号、不安装包、不访问未声明公网端点；rootfs 的 `system.users/packages` 由 build manifest 可追溯。
 
-## 11. M6：支持矩阵增强
+## 11. M6：支持矩阵增强（M5 完成后，未开始验收）
 
 ### 11.1 目标
 
 完善 MVP 周边兼容性和诊断能力。
 
-### 11.2 M4.1–M4.8 与 M5 基线继承
+### 11.2 M4.1–M4.11 与 M5 基线继承（设计目标，待 M5 前置能力完成）
 
 M6 只扩展架构、发行版版本和 bootloader，不得为新 adapter 建立第二套目标系统默认值。新增的 x86_64、
 Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 的归一化 TargetSystemConfig，并满足：
@@ -6548,11 +6584,13 @@ M6 不因某 reason 自动执行 install retry；M7 的自动策略仍受 §12.9
 - 生产容量验收记录 events 保留上界、状态/lease 固定容量耗尽行为、work orphan 清理、asset filesystem
   low-watermark 和导入空间预检；容量不足返回稳定错误，不删除已发布/活动对象。
 
-## 12. M7：补充包和后处理增强
+## 12. M7：补充包和后处理增强（设计目标，未完成）
 
 ### 12.1 目标
 
-M4/M5 已交付 repository、standard-packages、managed-file 和统一 runner。本阶段补齐 archive、script、firstboot、CLI plan/status 和三条链路的完整回归。这里的“配置可视化”是指 CLI 按阶段、步骤和执行结果清晰组织输出，不引入 Web UI 或通用低代码配置系统。
+M4 已交付 repository、standard-packages、managed-file 和基础 runner；M5 无盘 runner 尚未交付。本阶段目标是
+在前置能力完成后补齐 archive、script、firstboot、CLI plan/status 和三条链路的完整回归。这里的“配置可视化”
+是指 CLI 按阶段、步骤和执行结果清晰组织输出，不引入 Web UI 或通用低代码配置系统。
 
 M7 不获得绕过 M4.1–M4.7/M5 目标系统策略和存储事务的权限。`profile.system` 与 `node.overrides.network` 是 locale、
 timezone、keyboard、连接策略、SSH/root、普通用户/password/sudo/key、目标系统额外包、防火墙、SELinux
@@ -6938,7 +6976,7 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
 - `nodeforge node status` 展示安装/无盘阶段。
 - `nodeforge events list/follow/types` 展示历史、实时事件流和注册表。
 - `nodeforge config validate` 校验配置。
-- `nodeforge check` 验证服务可用性。
+- `nodeforge status` 验证服务可用性；M5 diskless status/retry 与 M7 provision status 尚未实现。
 - `nodeforge provision bundle plan` 和 `provision status` 展示后处理计划与结果。
 
 ## 17. 风险和前置 spike

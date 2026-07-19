@@ -96,7 +96,7 @@ NodeForge 第一阶段是 PXE Boot Provisioning appliance，而不是完整集�
 - **发现安全**：未知节点身份可以从租约池获得临时 IP，并按 `dhcp.discovery.default_action` 进入等待、discovery 或显式允许的临时无盘；未知节点不能执行自动安装。MVP 以 MAC 为主要身份，保留 DHCP client id 和 SN 作为辅助信息。
 - **HTTP 单监听简化**：MVP 只启动一个 HTTP listener，固定绑定 `0.0.0.0:<http.port>`。健康检查、管理 API 和 M3+ PXE 数据 API 复用同一 HTTP 实现、连接循环和路由入口。`server.server_ip` 表示 PXE 服务网对外地址，用于生成裸机可访问 URL、DHCP next-server、TFTP/HTTP 广告地址；它不作为 HTTP bind 地址。DHCPv4 Linux 部署必须设置 `server.bind_interface`，用于以 `SO_BINDTODEVICE` 约束 DHCP 广播；CLI 管理客户端写死访问 `127.0.0.1:<http.port>`，不做远程管理发现和多管理端点配置。
 - **管理端口约定**：MVP 不引入独立 `management_port`。管理路由和 PXE HTTP 数据路由共用 `server.http_port`，默认 `18080`（避免与常见 Web 服务 8080 冲突，可在 `config.json` 中覆盖）；listener 绑定所有 IPv4 接口，但 `/api/v1/management/` 仅接受 direct peer `127.0.0.1`，远端请求稳定返回 403。`nodeforge` CLI 固定连接 `127.0.0.1:<http.port>` 且不提供远程 endpoint，只支持管理同机 `nodeforged`。端口冲突时修改 `config.json` 后重启服务。
-- **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 做 status/check、config/catalog 校验与导出，启动配置导入归 setup。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
+- **配置与 CLI 分工**：M0 不把所有配置字段拆成参数：server IP、端口、资产根目录等启动配置走 `config.json`；CLI 做 status、config/catalog 校验与导出，启动配置导入归 setup。M1+ 再为 ISO/repo/rootfs/initrd/boot bundle 提供由 daemon 写入 catalog 的导入/构建/发布命令，并为节点认领、批量导入、运行期策略、事件和日志加入 CLI/API。
 - **CLI 使用成熟库**：命令解析、帮助信息、参数类型、默认值和错误提示使用固定版本的开源 CLI 库。MVP 固定使用支持 Zig 0.16.0 的 `zli v5.1.2`；命令、子命令、flag、位置参数和说明只在命令树中声明一次，解析与分级帮助从同一份声明生成。zli 只承载 CLI 语法和展示，不承载复杂业务配置模型。
 - **CLI 帮助可达**：顶层、每个资源命令和每个子命令都必须支持 `-h/--help`，显示用途、参数和默认值；长示例保留在 README 和运维文档，不塞进帮助页。
 - **日志与排障**：M0–M2 的 stderr/journal 行为在 M2.5 统一迁移为带时间、等级、scope 的标准库日志后端；`nodeforged --log-output auto|terminal|file|both` 控制本次输出目标，systemd 默认写入 `/opt/nodeforge/logs/nodeforged.log`，配置支持 `debug/info/warn/err` 和文件轮转，`nodeforged -d/--debug` 仅覆盖本次启动。M2.5 的 Event v2 是本地可查询审计契约，所有后续协议、installer、initrd 与 runner 复用同一注册表和 writer。服务日志、业务事件和 CLI 错误分别输出，且任何等级都不得记录密码、token、完整请求体或节点上传的大日志。
@@ -130,9 +130,8 @@ M0 项目骨架阶段已完成，并在 Rocky 9.7 aarch64 环境完成实机验�
 
 ### 3.4 已验证能力
 - `nodeforged --check-config` 配置校验通过
-- `nodeforge status` 状态查询功能正常
 - `nodeforge config validate` 配置验证功能正常
-- `nodeforge check` 服务健康检查功能正常
+- `nodeforge status` 提供统一的服务可用性检查与自动化退出码
 - Rocky Linux 9.7 aarch64 远程环境部署验证通过
 - systemd 服务启动、停止、重启功能正常
 - HTTP 管理接口和 API 路由响应正常
@@ -140,7 +139,7 @@ M0 项目骨架阶段已完成，并在 Rocky 9.7 aarch64 环境完成实机验�
 ### 3.5 M0 CLI 边界
 
 M0 最初交付 `status`、`check`、`config validate/export`、`catalog validate/export`，后续将启动配置
-导入收敛到 `setup --import-config`。其中 `status` 和 `check` 固定调用本机管理 API；config/catalog
+导入收敛到 `setup --import-config`。M4.11 已将 `check` 融入唯一的 `status` 并扩展端到端探针；config/catalog
 命令只读本地 JSON 文件，setup 在原子覆盖目标配置前校验 source config 与当前 catalog 的完整关系。
 导入不会热加载，必须重启 `nodeforged`。M0 不实现 DHCP/TFTP/资产/节点/rootfs/initrd/provision 的 CLI，也不实现
 catalog 写入或运行期配置更新 API；这些能力按 M1+ 对应阶段设计和实现。
@@ -1728,7 +1727,7 @@ CLI 是 NodeForge MVP 的主要运维界面。M0 仅提供状态、健康检查�
 
 | 放在配置文件 | 放在 CLI/API |
 | --- | --- |
-| server IP、HTTP 端口、资产根目录 | status/check |
+| server IP、HTTP 端口、资产根目录 | canonical `status` |
 | family adapter/产品标签映射（代码内置），ISO 派生 distro 索引（catalog） | 通过 `assets import` 创建或扩展；由 `catalog show/validate` 聚合查看，不提供独立 distro 子命令 |
 | profile、provisioning bundle、默认安全策略 | config validate/diff/apply，install/provision plan |
 | repository、install source | `assets import/list/show/validate`（由 catalog 聚合展示 repository/install source） |
@@ -1746,7 +1745,7 @@ CLI 是 NodeForge MVP 的主要运维界面。M0 仅提供状态、健康检查�
 - 对常见运维习惯可以提供有明确删除版本的迁移别名或融合入口；M4.3 已结束旧 `dhcp/tftp/install/trace` 路径的兼容窗口，`status` 仍可聚合 server/node/runtime 常用摘要。
 - 同类资源使用同一组动作名，不混用 `delete/remove`、`check/validate`、`get/show`。
 - 默认输出面向人；机器消费必须显式使用 `--output json`。其他输出格式等有真实需求后再加。
-- 命令局部参数只放在所属动作之后，例如 `nodeforge check --output json`、`nodeforge config validate --config ./config.json --catalog ./catalog.json`；根命令只接受 `-v/--version`。
+- 命令局部参数只放在所属动作之后，例如 `nodeforge status --output json`、`nodeforge config validate --config ./config.json --catalog ./catalog.json`；根命令只接受 `-v/--version`。
 
 ### 11.3 命令格式规范
 
@@ -1760,7 +1759,6 @@ nodeforge <resource> [subresource] <action> [object] [options]
 
 ```text
 nodeforge status
-nodeforge check
 nodeforge apply <file>   # M1+，尚未实现
 ```
 
@@ -1773,13 +1771,13 @@ M0 的实际命令面以 2.5 “M0 CLI 边界”为准。下表仅前两行是 M
 
 | 命令组 | 示例 | 用途 |
 | --- | --- | --- |
-| `nodeforge status/check`（M0） | `status`、`check` | 查看服务状态；执行健康检查并提供自动化退出码 |
+| `nodeforge status`（M4.11 canonical） | `status`、`status --output json` | 验证 advertised HTTP、管理、配置、catalog、DHCP、TFTP，并提供自动化退出码 |
 | `nodeforge config ...`（M0 + M1+ 扩展） | M0: `config validate/export/import`；M1+: `config diff/apply` | 配置校验、导出、离线导入；后续再增加差异与配置片段应用 |
 | `nodeforge node ...` | `node list/show/add/set/unset/remove/render/retry/trace` | 管理节点声明、聚合状态和部署生命周期；mutation 使用 typed `k=v` |
 | `nodeforge assets ...` | `assets import/list/show/validate/key-*`，M5 增加 rootfs/initrd/bundle actions | 导入和管理 ISO、启动文件、构建产物与 bootstrap keys |
 | `nodeforge config ...` | `config validate/export/import/set`，M6 增加完整 `diff/apply` | 配置校验、全量导入和 M4.3 allowlist 在线字段更新 |
 | `nodeforge catalog ...` | `catalog validate/export/show/migrate`；M4.3 的 show/migrate 仅面向 install source | 查看发行版、repository、install source 和 bundle 关系；安全规划/执行旧 catalog 迁移 |
-| `nodeforge runtime ...` | `runtime status/dhcp-leases/dhcp-unknown/tftp-counters/tftp-sessions` | 查看 DHCP/TFTP/服务运行态 |
+| `nodeforge runtime ...` | `runtime dhcp-leases/dhcp-unknown/tftp-counters/tftp-sessions` | 查看 DHCP/TFTP 明细；整体可用性统一由顶层 status 判断 |
 | `nodeforge events ...` | `events list/follow/types` | 本机读取 Event v1/v2 历史、实时跟踪并发现注册事件类型 |
 | `nodeforge profile ...` | M4.3: `profile list/show`；M4.10: ISO 自动默认 profile + 显式 `create` 补充安装 profile；M6: 完整 update/remove/validate | M4.10 只从已导入 source 派生固定安全 install profile，复杂 mutation 仍留 M6 |
 | `nodeforge provision ...` | `provision bundle-*/step-*/run-*`（M7） | 管理补充包、文件和后处理步骤 |
@@ -2137,7 +2135,8 @@ MVP 不以功能数量为标准，而以 PXE provisioning 闭环为标准。
 - `nodeforge events list/follow/types` 能查看最近事件、安装/无盘错误摘要和注册事件类型；服务日志通过 journal 或可选本地文件查看。
 - 配置文件校验通过后能被 `nodeforged` 启动加载；通过 CLI/API 应用的运行期变更需要写回 JSON 时保持原子性，重启后保持一致。
 - discovery profile 默认不执行破坏性安装。
-- `nodeforge check` 能验证唯一 HTTP listener、管理路由、TFTP、DHCP 配置、repository 和状态存储。
+- `nodeforge status` 能验证 advertised HTTP listener、管理路由、active config、catalog、DHCP 与 TFTP
+  运行 API；任一必需平面失败时返回非零。
 - `nodeforge provision bundle plan` 与 `provision status` 能按阶段展示后处理计划和结果。
 
 ## 18. 技术不确定点与详细设计待确认

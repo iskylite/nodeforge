@@ -14,6 +14,7 @@
 - [M4.8 并发容量扩展与启动时动态派生专项设计](docs/superpowers/specs/2026-07-17-concurrency-capacity-scaling-design.md)
 - [M4.9 部署溯源、PXE 门禁与配置入口收口补丁](docs/superpowers/specs/2026-07-18-m4_9-deployment-provenance-and-config-ownership-patch.md)
 - [M4.10 CLI fresh-deployment 闭环补全](docs/superpowers/specs/2026-07-19-m4_10-cli-fresh-deployment-completion.md)
+- [M4.11 CLI 状态入口与 mutation key 收口](docs/superpowers/specs/2026-07-19-m4_11-cli-status-and-mutation-keys.md)
 - [M4.9b/M4.10 Ubuntu 22.04.5 r97n0/VMware 验证](docs/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md)
 - [M0–M4.1 实现审计](docs/M0_M4_AUDIT.md)
 - [Rocky Linux 8.10 aarch64 VMware PXE 验证](docs/ROCKY_8_10_VALIDATION.md)
@@ -35,6 +36,10 @@ M4.1 同时补齐自动安装生命周期：install profile 默认一次性 gene
 自动重装，`install retry` 只显式 rearm 下一次 PXE，不倒退历史状态或调用 BMC；目标配置变更只形成
 desired/applied drift。TFTP option、DHCP T1/T2、trace 时钟回拨、运行期 asset 和 ISO orphan/空间预检等
 M1-M3 横切修正仍写在各自章节，但作为 M4.1 验收前置回归。
+
+M4.11 已完成统一 status、端到端运行面检查和 show/set owner-action 对齐。M5–M7 目前仍处于设计冻结与
+前置模型/预留代码阶段；无盘 initrd/rootfs、PXELINUX、完整 provision CRUD/执行和后续里程碑验收尚未完成，
+以 [M5–M7 对齐审计](docs/M5_M7_ALIGNMENT_AUDIT.md) 为准，不能把设计命令当作当前可执行命令。
 
 M4.3 已落地；M4.4 的 canonical URL、三平面隔离与双发行版主链路也已验证可行。它们完成了真实 distro/family、repository
 可空与 SHA 幂等导入，补 install-source `catalog show/migrate`、完整 node 视图、typed daemon mutation、
@@ -74,8 +79,13 @@ M4.9b 已将完整 node-scoped SHA-256 持久化到 deployment/session/status/in
 generation 2 活动 session 拒绝及 generation 3 force-retry 重装回归。
 M4.10 已补齐 fresh CLI 闭环：ISO import 原子创建同名安全 install profile，显式 `profile create`
 用于补充 profile，在线 node add 立即持久化 initial generation；`setup --reconfigure` 始终发布 systemd
-unit 但不控制服务生命周期；真正无历史重置可组合为
+unit 但不控制服务生命周期；真正无历史重置（包括 `work/` 导入暂存及中断工作树）可组合为
 `--reset-all --purge-all --reconfigure`，之后由操作员显式执行 systemctl。
+
+M4.11 将运行检查收口为唯一的 `nodeforge status`：同时验证 loopback/advertised HTTP、management、
+active config、catalog、DHCP 与 TFTP 管理面，并用退出码表达整体可用性。`node/profile show` 的
+Settable properties 使用与相应 `set` 完全一致的 snake_case key；跨资源和 lifecycle 字段显示
+owner/action，计算、运行态、上报和 revision 明确为只读事实。`set/unset --help` 同步列出 key、约束和示例。
 
 ## ISO 与发行版
 

@@ -81,16 +81,23 @@ test "$(jq -r '.files[0].sha256 | length' "$backup/manifest.json")" = 64
 
 # --purge-all may compose with --reconfigure. The interactive composite has one
 # confirmation boundary; rejection must happen before any destructive write.
+# A confirmed purge also removes managed work/import history, including
+# read-only trees left by interrupted ISO imports, then recreates empty work dirs.
 mkdir -p "$install/backups/old"
+mkdir -p "$install/work/import" "$install/work/iso-import-stale/repo/readonly"
 printf old >"$install/backups/old/manifest.json"
 printf old >"$install/logs/events.jsonl"
 printf old >"$install/config/config.json.m4.7.bak"
+printf old >"$install/work/import/stale.iso"
+printf old >"$install/work/iso-import-stale/repo/readonly/treeinfo"
+chmod 500 "$install/work/iso-import-stale/repo/readonly"
 printf stale-unit >"$install/systemd/nodeforged.service"
 if printf 'n\n' | "$install/bin/nodeforge" setup --reset-all --purge-all --reconfigure >"$tmp/purge-denied" 2>&1; then
     echo "rejected interactive purge unexpectedly succeeded" >&2
     exit 1
 fi
 test -f "$install/backups/old/manifest.json"
+test -f "$install/work/import/stale.iso"
 grep -Fq 'permanently purge NodeForge state' "$tmp/purge-denied"
 printf 'yes\n' | "$install/bin/nodeforge" setup --reset-all --purge-all --reconfigure >"$tmp/purge-all"
 grep -Fq 'purged by --purge-all' "$tmp/purge-all"
@@ -100,6 +107,9 @@ grep -Fq 'unchanged; run systemctl daemon-reload/restart nodeforged' "$tmp/purge
 test ! -e "$install/backups"
 test ! -e "$install/logs/events.jsonl"
 test ! -e "$install/config/config.json.m4.7.bak"
+test ! -e "$install/work/import/stale.iso"
+test ! -e "$install/work/iso-import-stale"
+test -d "$install/work/import"
 test -f "$install/config/config.json"
 test -f "$install/catalog/manifest.json"
 grep -Fq "ExecStart=$install_real/bin/nodeforged --log-output file" "$install/systemd/nodeforged.service"

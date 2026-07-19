@@ -7,8 +7,9 @@
 //! 渲染规则：
 //! - install：profile.install_source → InstallSourceConfig → installer kernel/initrd
 //!   assets，并读取已发布 repository URL。M3 不追加 inst.ks=（M4 完成后追加）。
-//! - diskless：profile.boot_bundle → kernel/initrd assets。cmdline 包含
-//!   nodeforge.config=http://…/api/v1/nodes/<id>/boot-config。
+//! - diskless：profile.boot_bundle → kernel/initrd assets。当前只实现 M5 设计的
+//!   PXE target scaffold；完整 initrd、rootfs 下载和 diskless BootConfig payload
+//!   仍待 M5 落地。cmdline 包含 nodeforge.config=http://…/api/v1/nodes/<id>/boot-config。
 //! - discovery：不提供 kernel/initrd，返回 null。
 //!
 //! M3.6 安全要点：
@@ -51,9 +52,9 @@ pub const BootTarget = struct {
 ///   initrd 下载 ISO 并 loop mount 为 live 文件系统。M4 会追加
 ///   `autoinstall ds=nocloud-net;...`。
 ///
-/// diskless mode：从 boot bundle 取 kernel/initrd asset 路径，
-/// cmdline 包含 `ip=dhcp nodeforge.config=<config_url>`，节点 initrd 通过
-/// 该 URL 拉取 BootConfig 文档并随后下载 rootfs。
+/// diskless mode：从 boot bundle 取 kernel/initrd asset 路径并生成 M5 预留的
+/// config URL cmdline。此函数不构建 initrd、不提供 rootfs 下载，也不代表
+/// diskless 端到端链路已经完成。
 ///
 /// discovery mode：返回 null（不提供 kernel/initrd），节点只做网络诊断。
 ///
@@ -208,8 +209,8 @@ fn resolveDiskless(
     const kernel_path = toGrubPath(kernel_asset.path) orelse return null;
     const initrd_path = toGrubPath(initrd_asset.path) orelse return null;
 
-    // cmdline 包含 nodeforge.config URL，节点 initrd 通过该 URL 拉取 BootConfig。
-    // BootConfig 包含 rootfs 下载地址、capability token 和事件上报 URL。
+    // cmdline 只声明 M5 预留的 config URL；当前 HTTP diskless 分支尚未生成
+    // rootfs/capability payload，真正 initrd 消费链路由 M5 实现。
     const base = std.fmt.bufPrint(cmdline_buf, "ip=dhcp nodeforge.config=http://{s}:{d}/api/v1/nodes/{s}/boot-config", .{
         server_ip,
         http_port,

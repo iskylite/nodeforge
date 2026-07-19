@@ -60,6 +60,12 @@ nodeforge node add r97n1 mac=00:50:56:2A:23:DB arch=aarch64 \
   profile=rocky-9.7-aarch64-iso ip=192.168.27.210
 ```
 
+后续清理审计发现，当时的 `--purge-all` 没有覆盖 `work/`，因此 reset 前的 ISO 暂存/解包目录仍可能保留；
+这不影响下述 CLI 闭环结果，但不满足“无历史”磁盘语义。实现现已把受管 `work/` 纳入 purge 范围：
+清除 `work/import/` 和 `work/iso-import-*`（包括只读树），再重建空的 canonical `work/import/`；本地
+setup 回归覆盖拒绝确认时保留与确认后清除。此条是对原实机记录的勘误，不把后续代码修复表述为已在
+r97n0 重新执行。
+
 结果：
 
 - 组合操作只给出一次完整范围的交互确认；输出 reset 和 reconfigure 两个阶段，backup、日志文件和

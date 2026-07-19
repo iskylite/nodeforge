@@ -41,13 +41,18 @@ nodeforge node add r97n1 mac=... arch=aarch64 profile=rocky-9.7-aarch64-iso ip=.
 
 新增 `--purge-all`，只能与 `--reset-all --yes` 组合，清理：
 
-- runtime state、catalog 和全部受管 assets；
+- runtime state、catalog、全部受管 assets 和 `work/` 临时数据；
 - reset backups；
 - service/event logs；
 - M4.7 config/catalog migration `.bak`。
 
 它保留二进制、marker、新生成的 startup config、空 catalog 和 canonical systemd unit。
 输出必须明确 backup 已被 purge，不能返回一个已经不存在的路径。
+
+`work/` 是受管临时空间，不属于需要跨 reset 保留的部署事实。清理必须覆盖 `work/import/` 中的 CLI
+ISO 暂存副本以及中断操作留下的 `work/iso-import-*` 工作树，并在完成后重建权限正确的空
+`work/`、`work/import/`。安装介质复制出的目录可能是只读的；实现可以在已校验 install root 派生出的
+`work/` 边界内恢复 owner 权限后重试删除，但最终删除失败必须令操作失败，不能报告 purge 成功。
 
 ### 3.1 交互与非交互
 
@@ -111,7 +116,8 @@ M4.9b 已以 node-scoped 完整 digest 武装 generation；节点 arm 后补充�
 
 - setup help 和冲突 flag 诊断测试。
 - reset-all/purge-all + reconfigure 覆盖 stale unit，但不调用 systemctl；交互拒绝时无写入。
-- purge-all 后不存在 backups、日志文件和 migration backup。
+- purge-all 后不存在 backups、日志文件、migration backup 或旧 work/import 数据；空 `work/import/`
+  已按 canonical 权限重建。测试必须覆盖交互拒绝保留 work 哨兵，以及确认后清理只读 ISO 工作树。
 - profile create 正向、重复、missing source 测试。
 - node add missing profile 错误透传测试。
 - ISO import 输出 install source。

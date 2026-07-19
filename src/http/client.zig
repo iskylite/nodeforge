@@ -119,7 +119,7 @@ pub fn tftpCounters(io: std.Io, port: u16) TftpCounters {
     const maybe_body = managementJson(io, port, "/api/v1/management/runtime/tftp", &buffer) catch return .{ .reachable = true };
     const body = maybe_body orelse return .{ .reachable = true };
     const Response = struct { result: struct { started: u64, completed: u64, failed: u64 } };
-    const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, body, .{}) catch return .{ .reachable = true };
+    const parsed = std.json.parseFromSlice(Response, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return .{ .reachable = true };
     defer parsed.deinit();
     return .{ .reachable = true, .healthy = true, .started = parsed.value.result.started, .completed = parsed.value.result.completed, .failed = parsed.value.result.failed };
 }

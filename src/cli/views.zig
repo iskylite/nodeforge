@@ -135,16 +135,19 @@ pub fn success(writer: *std.Io.Writer, summary: []const u8, fields: []const Fiel
 
 pub const Field = struct { label: []const u8, value: []const u8 };
 
-/// M4.2: 渲染单个节点的详情块（分组键值）。
+/// M4.11: render mutable node facts as the exact `node set` key=value
+/// vocabulary. Optional absent values are described as unset instead of
+/// emitting an invalid assignment such as `ip=-`.
 pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
     try writer.print("Node {s}\n", .{node.id});
-    try detailField(writer, "MAC", node.mac);
-    try detailField(writer, "Arch", @tagName(node.arch));
-    try detailField(writer, "Profile", node.profile);
-    try detailField(writer, "IP", node.ip orelse "-");
-    try detailField(writer, "Hostname", node.hostname orelse "-");
-    try detailField(writer, "Deploy", if (node.deploy) "true" else "false");
-    try detailField(writer, "HTTP accel", if (node.http_accel) "true" else "false");
+    try writer.writeAll("\nSettable properties (nodeforge node set ");
+    try table.writeEscaped(writer, node.id);
+    try writer.writeAll(" key=value)\n");
+    try writer.print("  mac={s}\n  arch={s}\n  profile={s}\n", .{ node.mac, @tagName(node.arch), node.profile });
+    if (node.ip) |ip| try writer.print("  ip={s}\n", .{ip}) else try writer.print("  # ip is unset; action: nodeforge node unset {s} ip\n", .{node.id});
+    if (node.hostname) |hostname| try writer.print("  hostname={s}\n", .{hostname}) else try writer.print("  # hostname is unset; action: nodeforge node unset {s} hostname\n", .{node.id});
+    try writer.print("  deploy={s}\n  http_accel={s}\n", .{ if (node.deploy) "true" else "false", if (node.http_accel) "true" else "false" });
+    try writer.writeAll("\nRead-only detail\n");
     if (node.overrides.network) |network| {
         try writer.writeAll("  Network override\n");
         try detailField(writer, "Mode", @tagName(network.mode));
@@ -171,15 +174,6 @@ fn writeStringList(writer: *std.Io.Writer, label: []const u8, values: []const []
     try writer.writeByte('\n');
 }
 
-/// check 失败时仍使用人类可读的状态块；它与 `status` 共享字段对齐而不改变退出码。
-pub fn checkFailure(writer: *std.Io.Writer, process: bool, http: bool, management: bool, config: bool) !void {
-    try writer.writeAll("FAIL nodeforge checks failed\n");
-    try detailField(writer, "Process", if (process) "OK" else "FAIL");
-    try detailField(writer, "HTTP", if (http) "OK" else "FAIL");
-    try detailField(writer, "Management", if (management) "OK" else "FAIL");
-    try detailField(writer, "Config API", if (config) "OK" else "FAIL");
-}
-
 /// 渲染 TFTP 会话列表表格。`rows` 使用借用 slice；超过 32 行返回 `error.TooManyRows`。
 pub fn tftpSessions(writer: *std.Io.Writer, rows: []const TftpSessionRow) !void {
     const columns = [_]table.Column{ .{ .key = "id", .title = "ID", .alignment = .right }, .{ .key = "phase", .title = "PHASE" }, .{ .key = "filename", .title = "FILENAME" } };
@@ -193,18 +187,42 @@ pub fn tftpSessions(writer: *std.Io.Writer, rows: []const TftpSessionRow) !void 
     try table.render(writer, &columns, table_rows[0..rows.len], "No TFTP sessions recorded.", .{});
 }
 
-pub fn status(writer: *std.Io.Writer, process: bool, http: bool, management: bool, config: bool, server_ip: []const u8, port: u16) !void {
+pub const StatusView = struct {
+    ok: bool,
+    process: bool,
+    loopback_http: bool,
+    advertised_http: bool,
+    management_api: bool,
+    active_config: bool,
+    catalog_api: bool,
+    dhcp_api: bool,
+    tftp_api: bool,
+    server_ip: []const u8,
+    port: u16,
+    tftp_started: u64,
+    tftp_completed: u64,
+    tftp_failed: u64,
+};
+
+/// Render the single M4.11 operational-readiness view. Every required plane is
+/// explicit so a green summary means nodeforged can actually serve provisioning
+/// traffic, not merely that one HTTP route answered.
+pub fn status(writer: *std.Io.Writer, value: StatusView) !void {
     try writer.writeAll("NodeForge status\n");
-    try writeLabel(writer, "Process");
-    try writer.print("{s}\n", .{if (process) "OK reachable" else "FAIL unreachable"});
-    try writeLabel(writer, "HTTP");
-    try writer.print("{s} http://", .{if (http) "OK healthy" else "FAIL unhealthy"});
-    try table.writeEscaped(writer, server_ip);
-    try writer.print(":{d}\n", .{port});
-    try writeLabel(writer, "Management");
-    try writer.print("{s} http://127.0.0.1:{d}\n", .{ if (management) "OK route" else "FAIL route", port });
-    try writeLabel(writer, "Config API");
-    try writer.print("{s}\n", .{if (config) "OK config valid" else "FAIL config unavailable"});
+    try statusField(writer, "Overall", if (value.ok) "OK nodeforged operational" else "FAIL nodeforged unavailable");
+    try statusField(writer, "Process", if (value.process) "OK reachable" else "FAIL unreachable");
+    try statusField(writer, "Loopback HTTP", if (value.loopback_http) "OK /healthz" else "FAIL /healthz");
+    try writeStatusLabel(writer, "Advertised HTTP");
+    try writer.print("{s} http://", .{if (value.advertised_http) "OK /healthz" else "FAIL /healthz"});
+    try table.writeEscaped(writer, value.server_ip);
+    try writer.print(":{d}\n", .{value.port});
+    try statusField(writer, "Management API", if (value.management_api) "OK status route" else "FAIL status route");
+    try statusField(writer, "Active config", if (value.active_config) "OK daemon validation" else "FAIL daemon validation");
+    try statusField(writer, "Catalog API", if (value.catalog_api) "OK nodes + profiles" else "FAIL nodes/profiles");
+    try statusField(writer, "DHCP API", if (value.dhcp_api) "OK leases route" else "FAIL leases route");
+    try statusField(writer, "TFTP API", if (value.tftp_api) "OK runtime route" else "FAIL runtime route");
+    try writeStatusLabel(writer, "TFTP transfers");
+    try writer.print("started={d} completed={d} failed={d}\n", .{ value.tftp_started, value.tftp_completed, value.tftp_failed });
 }
 
 /// 将 epoch 秒格式化为宿主机本地时间。CLI human 输出使用 24 小时制并遵循
@@ -222,7 +240,10 @@ pub fn formatTimestamp(buffer: *[20]u8, epoch: i64) []const u8 {
 
 /// 所有详情/状态块的 label 统一缩进和对齐宽度。使用 display-width-aware 填充，
 /// 确保包含 CJK 字符的 label 也能正确对齐。
-const label_width: usize = 12;
+// 16 columns covers the longest human-readable detail labels (for example
+// "Network override" and "Prefix length") while keeping every key/value
+// block aligned across commands.
+const label_width: usize = 16;
 
 /// 写入 label 并用空格填充到 `label_width`，末尾留一个分隔空格。
 fn writeLabel(writer: *std.Io.Writer, label: []const u8) !void {
@@ -237,6 +258,23 @@ fn writeLabel(writer: *std.Io.Writer, label: []const u8) !void {
 
 fn detailField(writer: *std.Io.Writer, label: []const u8, value: []const u8) !void {
     try writeLabel(writer, label);
+    try table.writeEscaped(writer, value);
+    try writer.writeByte('\n');
+}
+
+const status_label_width: usize = label_width;
+
+fn writeStatusLabel(writer: *std.Io.Writer, label: []const u8) !void {
+    try writer.writeAll("  ");
+    try writer.writeAll(label);
+    const visible = table.displayWidth(label);
+    if (status_label_width > visible) {
+        for (0..status_label_width - visible) |_| try writer.writeByte(' ');
+    }
+}
+
+fn statusField(writer: *std.Io.Writer, label: []const u8, value: []const u8) !void {
+    try writeStatusLabel(writer, label);
     try table.writeEscaped(writer, value);
     try writer.writeByte('\n');
 }
@@ -266,4 +304,46 @@ test "node list table shows task start install and finish columns" {
     try std.testing.expect(std.mem.indexOf(u8, out, "INSTALL") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FINISHED") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "2026-07-11 16:30:00") != null);
+}
+
+test "status renders every M4.11 readiness plane" {
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try status(&writer, .{
+        .ok = true,
+        .process = true,
+        .loopback_http = true,
+        .advertised_http = true,
+        .management_api = true,
+        .active_config = true,
+        .catalog_api = true,
+        .dhcp_api = true,
+        .tftp_api = true,
+        .server_ip = "192.168.27.128",
+        .port = 18080,
+        .tftp_started = 3,
+        .tftp_completed = 2,
+        .tftp_failed = 1,
+    });
+    const out = writer.buffered();
+    inline for (.{ "Overall", "Loopback HTTP", "Advertised HTTP", "Management API", "Active config", "Catalog API", "DHCP API", "TFTP API", "started=3 completed=2 failed=1" }) |needle|
+        try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
+}
+
+test "node detail uses exact set parser keys" {
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try nodeDetail(&writer, .{
+        .id = "r97n1",
+        .mac = "00:50:56:2A:23:DB",
+        .arch = .aarch64,
+        .profile = "rocky",
+        .ip = "192.168.27.210",
+        .hostname = "r97n1",
+        .deploy = true,
+        .http_accel = false,
+    });
+    const out = writer.buffered();
+    inline for (.{ "mac=00:50:56:2A:23:DB", "arch=aarch64", "profile=rocky", "ip=192.168.27.210", "hostname=r97n1", "deploy=true", "http_accel=false" }) |needle|
+        try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
 }

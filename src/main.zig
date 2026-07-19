@@ -92,20 +92,12 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     const status = try zli.Command.init(init_options, .{
         .name = "status",
-        .description = "Show daemon status",
-        .help = "Show detailed checks for the local daemon and configured HTTP service address.",
+        .description = "Verify that nodeforged is operational",
+        .help = "Run the canonical end-to-end daemon readiness checks: loopback management, active config, advertised HTTP, catalog, DHCP, and TFTP.",
     }, statusHandler);
     try addConfigPathFlag(status);
     try addOutputFlag(status);
     try addDebugFlag(status);
-    const check = try zli.Command.init(init_options, .{
-        .name = "check",
-        .description = "Run health checks and set the exit code",
-        .help = "Print a concise health result and return a machine-readable exit code.",
-    }, checkHandler);
-    try addConfigPathFlag(check);
-    try addOutputFlag(check);
-    try addDebugFlag(check);
 
     const config = try zli.Command.init(init_options, .{
         .name = "config",
@@ -205,14 +197,24 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(node_add);
     try addDebugFlag(node_add);
 
-    const node_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Modify node attributes" }, nodeSetHandler);
+    const node_set = try zli.Command.init(init_options, .{
+        .name = "set",
+        .description = "Modify stored node properties",
+        .usage = "nodeforge node set <node_id> <key=value>... [options]",
+        .help = "Keys: mac, arch, profile, ip, hostname, deploy, http_accel. Booleans use true|false. Example: nodeforge node set r97n1 hostname=r97n1 deploy=true",
+    }, nodeSetHandler);
     try node_set.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
     try node_set.addPositionalArg(.{ .name = "properties", .description = "Typed properties as key=value", .required = true, .variadic = true });
     try addConfigPathFlag(node_set);
     try addOutputFlag(node_set);
     try addDebugFlag(node_set);
 
-    const node_unset = try zli.Command.init(init_options, .{ .name = "unset", .description = "Clear optional node attributes" }, nodeUnsetHandler);
+    const node_unset = try zli.Command.init(init_options, .{
+        .name = "unset",
+        .description = "Clear optional stored node properties",
+        .usage = "nodeforge node unset <node_id> <key>... [options]",
+        .help = "Keys: ip, hostname. Example: nodeforge node unset r97n1 ip hostname",
+    }, nodeUnsetHandler);
     try node_unset.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
     try node_unset.addPositionalArg(.{ .name = "keys", .description = "Optional property names to clear", .required = true, .variadic = true });
     try addConfigPathFlag(node_unset);
@@ -275,13 +277,23 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_show);
     try addOutputFlag(profile_show);
     try addDebugFlag(profile_show);
-    const profile_set = try zli.Command.init(init_options, .{ .name = "set", .description = "Set profile installer properties" }, profileSetHandler);
+    const profile_set = try zli.Command.init(init_options, .{
+        .name = "set",
+        .description = "Modify stored profile properties",
+        .usage = "nodeforge profile set <name> <key=value> [options]",
+        .help = "Keys: kernel_args, boot_disk. Quote kernel_args when it contains spaces. Examples: nodeforge profile set rocky boot_disk=/dev/nvme0n1; nodeforge profile set rocky 'kernel_args=iommu=pt hugepages=4'",
+    }, profileSetHandler);
     try profile_set.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
     try profile_set.addPositionalArg(.{ .name = "property", .description = "kernel_args=<arguments> or boot_disk=/dev/<device>", .required = true });
     try addConfigPathFlag(profile_set);
     try addOutputFlag(profile_set);
     try addDebugFlag(profile_set);
-    const profile_unset = try zli.Command.init(init_options, .{ .name = "unset", .description = "Clear profile kernel arguments" }, profileUnsetHandler);
+    const profile_unset = try zli.Command.init(init_options, .{
+        .name = "unset",
+        .description = "Clear an optional stored profile property",
+        .usage = "nodeforge profile unset <name> kernel_args [options]",
+        .help = "Key: kernel_args. boot_disk is required for install profiles and cannot be unset. Example: nodeforge profile unset rocky kernel_args",
+    }, profileUnsetHandler);
     try profile_unset.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
     try profile_unset.addPositionalArg(.{ .name = "property", .description = "Must be kernel_args", .required = true });
     try addConfigPathFlag(profile_unset);
@@ -339,7 +351,6 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         rt_dhcp_unknown,
         rt_tftp_counters,
         rt_tftp_sessions,
-        try runtimeStatusCommand(init_options),
     });
 
     const events = try zli.Command.init(init_options, .{
@@ -375,7 +386,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .{ .name = "reset-state", .description = "Back up and clear runtime state", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "reset-all", .description = "Reset startup config and runtime state; may precede --reconfigure", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "purge-data", .description = "With --reset-all, also purge catalog and assets", .type = .Bool, .default_value = .{ .Bool = false } },
-        .{ .name = "purge-all", .description = "With --reset-all, purge catalog, assets, logs, backups, and migration backups", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "purge-all", .description = "With --reset-all, purge catalog, assets, work files, logs, backups, and migration backups", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "dry-run", .description = "Describe the selected operation without writing", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "bind-interface", .description = "PXE bind interface for generated config", .type = .String, .default_value = .{ .String = "eth0" } },
         .{ .name = "server-ip", .description = "PXE server IPv4 address", .type = .String, .default_value = .{ .String = "192.168.50.1" } },
@@ -387,7 +398,6 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     try root.addCommands(&.{
         status,
-        check,
         config,
         catalog,
         node,
@@ -419,7 +429,7 @@ fn setupHandler(ctx: zli.CommandContext) !void {
     if (destructive and !ctx.flag("yes", bool)) {
         if (ctx.flag("non-interactive", bool)) return error.ConfirmationRequired;
         if (purge_all)
-            try ctx.writer.print("This will permanently purge NodeForge state, catalog, assets, logs, backups, and migration history under {s}, then regenerate the deployment. Continue? [y/N]: ", .{p.install_root})
+            try ctx.writer.print("This will permanently purge NodeForge state, catalog, assets, work files, logs, backups, and migration history under {s}, then regenerate the deployment. Continue? [y/N]: ", .{p.install_root})
         else if (ctx.flag("reset-all", bool))
             try ctx.writer.print("This will back up and reset NodeForge startup configuration and runtime state under {s}. Continue? [y/N]: ", .{p.install_root})
         else
@@ -495,8 +505,9 @@ fn setupHandler(ctx: zli.CommandContext) !void {
         if (purge_all) try purgeSetupHistory(ctx, p);
         try views.success(ctx.writer, "deployment state reset", &.{ .{ .label = "Backup", .value = if (purge_all) "purged by --purge-all" else backup }, .{ .label = "Install root", .value = p.install_root } });
         // M4.10：reset-all + reconfigure 是一个有序组合，不是两个相互竞争的
-        // operation。reset 先生成新配置/空 catalog；随后复用唯一的 reconfigure
-        // 校验与 unit 发布路径。这里不得调用 systemctl，服务生命周期仍由操作员控制。
+        // operation。reset/purge 先清空所选范围（purge-all 也包含 work 临时
+        // 数据）、生成新配置/空 catalog；随后复用唯一的 reconfigure 校验与
+        // unit 发布路径。这里不得调用 systemctl，服务生命周期仍由操作员控制。
         if (!reset_then_reconfigure) return;
     }
 
@@ -536,11 +547,25 @@ fn setupFlagError(ctx: zli.CommandContext, message: []const u8) void {
     setExitCode(ctx, 2);
 }
 
+/// Remove every history-bearing path covered by `--purge-all`.
+///
+/// Binary/marker/config/unit survive. Managed work files do not: imports are
+/// temporary, may be several GiB, and must not cross a fresh-reset boundary.
+/// `repairDirectories` recreates the empty canonical work/import layout.
 fn purgeSetupHistory(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !void {
     const backups_dir = try std.fmt.allocPrint(ctx.allocator, "{s}/backups", .{p.install_root});
     defer ctx.allocator.free(backups_dir);
     std.Io.Dir.cwd().deleteTree(ctx.io, backups_dir) catch {};
     std.Io.Dir.cwd().deleteTree(ctx.io, p.logs_dir) catch {};
+    // Interrupted ISO imports can contain read-only directory trees copied from
+    // installation media. Native deletion is preferred. If traversal is denied,
+    // restore owner permissions only under the validated, derived work path and
+    // retry with a bounded argv; command failure propagates instead of reporting
+    // a successful purge with stale data left behind.
+    std.Io.Dir.cwd().deleteTree(ctx.io, p.work_dir) catch {
+        try runRequired(ctx, &.{ "chmod", "-R", "u+rwx", p.work_dir });
+        try runRequired(ctx, &.{ "rm", "-rf", "--", p.work_dir });
+    };
     for ([_][]const u8{ p.config_path, p.legacy_catalog_path }) |path| {
         const migration_backup = try std.fmt.allocPrint(ctx.allocator, "{s}.m4.7.bak", .{path});
         defer ctx.allocator.free(migration_backup);
@@ -721,18 +746,11 @@ fn showCurrentHelp(ctx: zli.CommandContext) !void {
     try ctx.command.printHelp();
 }
 
-/// 执行详细状态查询，并把探测结果保存为进程退出码。
+/// 执行 canonical 端到端状态查询，并把探测结果保存为进程退出码。
 fn statusHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const debug = ctx.flag("debug", bool);
-    setExitCode(ctx, try statusCommand(ctx.io, ctx.allocator, ctx.flag("config", []const u8), output_json, debug, "status", ctx.writer));
-}
-
-/// 执行简洁健康检查，并把结果保存为适合自动化判断的退出码。
-fn checkHandler(ctx: zli.CommandContext) !void {
-    const output_json = outputJsonFromContext(ctx) orelse return;
-    const debug = ctx.flag("debug", bool);
-    setExitCode(ctx, try statusCommand(ctx.io, ctx.allocator, ctx.flag("config", []const u8), output_json, debug, "check", ctx.writer));
+    setExitCode(ctx, try statusCommand(ctx.io, ctx.allocator, ctx.flag("config", []const u8), output_json, debug, ctx.writer));
 }
 
 /// 加载并联合校验启动配置与 catalog，不修改任何文件。
@@ -1473,6 +1491,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
         page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", cursor, &response) catch null) orelse break;
     }
     try views.nodes(ctx.writer, rows.items);
+    try ctx.writer.writeAll("Settable keys: mac, arch, profile, ip, hostname, deploy, http_accel (see: nodeforge node show <id>)\n");
     if (truncated) try ctx.writer.writeAll("note: output truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
 
@@ -1539,6 +1558,7 @@ fn profileListHandler(ctx: zli.CommandContext) !void {
         page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", cursor, &response) catch null) orelse break;
     }
     try views.profiles(ctx.writer, rows.items);
+    try ctx.writer.writeAll("Settable keys: kernel_args, boot_disk (see: nodeforge profile show <name>)\n");
     if (truncated) try ctx.writer.writeAll("note: output truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
 
@@ -1596,8 +1616,14 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     defer parsed.deinit();
     const result = parsed.value.result;
     try ctx.writer.print("Profile {s}\n", .{result.name});
-    try ctx.writer.print("  Mode          {s}\n  Platform      {s} {s} ({s})\n  Family        {s}\n  Adapter       {s}\n  Packages      {s}\n  Boot bundle   {s}\n  Kernel args   {s}\n  Valid         {s}\n", .{ result.mode, result.distro, result.version, result.arch, result.capability.family, result.capability.install_adapter, result.capability.package_manager, result.boot_bundle orelse "-", result.kernel_args orelse "-", if (result.validation.valid) "yes" else "no" });
-    if (result.install) |install| try ctx.writer.print("  Boot disk     {s}\n  Wipe          {s}\n", .{ install.storage.boot_disk, if (install.storage.wipe) "yes" else "no" });
+    try ctx.writer.writeAll("\nSettable properties (nodeforge profile set ");
+    try ctx.writer.writeAll(result.name);
+    try ctx.writer.writeAll(" key=value)\n");
+    if (result.kernel_args) |kernel_args| try ctx.writer.print("  kernel_args={s}\n", .{kernel_args}) else try ctx.writer.print("  # kernel_args is unset; action: nodeforge profile unset {s} kernel_args\n", .{result.name});
+    if (result.install) |install| try ctx.writer.print("  boot_disk={s}\n", .{install.storage.boot_disk});
+    try ctx.writer.print("\nRead-only detail\n  mode          {s}\n  platform      {s} {s} ({s})\n  family        {s}\n  adapter       {s}\n  package_manager {s}\n  boot_bundle   {s}\n  valid         {s}\n", .{ result.mode, result.distro, result.version, result.arch, result.capability.family, result.capability.install_adapter, result.capability.package_manager, result.boot_bundle orelse "-", if (result.validation.valid) "yes" else "no" });
+    if (result.install) |install| try ctx.writer.print("  wipe          {s}\n", .{if (install.storage.wipe) "yes" else "no"});
+    try ctx.writer.print("\nOwner / action\n  kernel_args\n    owner         profile:{s}\n    action        nodeforge profile set {s} 'kernel_args=<arguments>'\n  boot_disk\n    owner         profile:{s}\n    action        nodeforge profile set {s} boot_disk=/dev/<device>\n  mode/distro/version/arch/boot_bundle/safety\n    owner         profile:{s}\n    action        read-only (no mutation command)\n  effective_system.*\n    owner         projected startup/profile model\n    action        read-only projection\n  install_source.* / assets.*\n    owner         imported catalog assets\n    action        nodeforge assets list/show/import\n  model_revision.*\n    owner         nodeforged model store\n    action        read-only\n", .{ result.name, result.name, result.name, result.name, result.name });
     try ctx.writer.print("\nSafety\n  Unknown safe  {s}\n  Destructive   {s}\n  Persistent    {s}\n  Reinstall     {s}\n", .{ if (result.safety.safe_for_unknown) "yes" else "no", if (result.safety.destructive) "yes" else "no", if (result.safety.persistent_writes) "yes" else "no", @tagName(result.safety.reinstall_policy) });
     try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Firewall      {s}\n  SELinux       {s}\n  Users         {d}\n  Packages      {d}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, result.effective_system.connectivity.mode, if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.security.firewall, result.effective_system.security.selinux, result.effective_system.users.len, result.effective_system.packages.len });
     if (result.install_source) |source| {
@@ -2042,6 +2068,11 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     const result = parsed.value.result;
     try views.nodeDetail(ctx.writer, result.node);
     try ctx.writer.print("\nProfile\n  Name          {s}\n  Mode          {s}\n  Platform      {s} {s} ({s})\n  Install src   {s}\n  Boot bundle   {s}\n  Kernel args   {s}\n  Unknown safe  {s}\n  Destructive   {s}\n  Persistent    {s}\n  Reinstall     {s}\n  More          nodeforge profile show {s}\n", .{ result.profile.name, result.profile.mode, result.profile.distro, result.profile.version, result.profile.arch, result.profile.install_source orelse "-", result.profile.boot_bundle orelse "-", result.profile.kernel_args orelse "-", if (result.profile.safety.safe_for_unknown) "yes" else "no", if (result.profile.safety.destructive) "yes" else "no", if (result.profile.safety.persistent_writes) "yes" else "no", @tagName(result.profile.safety.reinstall_policy), result.profile.name });
+    // M4.11 ownership map: cross-resource stored facts keep their real model
+    // key, but point at the owning command instead of pretending `node set`
+    // can mutate them. Derived/runtime/audit projections are explicitly marked
+    // read-only below.
+    try ctx.writer.print("\nOwner / action\n  profile.kernel_args\n    owner         profile:{s}\n    action        nodeforge profile set {s} 'kernel_args=<arguments>'\n  profile.*\n    owner         profile:{s}\n    action        nodeforge profile show {s}\n  deployment.*\n    owner         nodeforged lifecycle\n    action        nodeforge node retry {s} [--force]\n  runtime.*\n    owner         nodeforged runtime\n    action        read-only\n  inventory.*\n    owner         node-reported inventory\n    action        read-only\n  view_revision.*\n    owner         nodeforged model store\n    action        read-only\n", .{ result.profile.name, result.profile.name, result.profile.name, result.profile.name, result.node.id });
     try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Root keys     {d}\n  Firewall      {s}\n  SELinux       {s}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, @tagName(result.effective_system.connectivity.mode), if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.ssh.root_authorized_key_count, @tagName(result.effective_system.security.firewall), @tagName(result.effective_system.security.selinux) });
     try ctx.writer.print("  NTP servers   {d}\n", .{result.effective_system.connectivity.ntp_servers.len});
     for (result.effective_system.connectivity.ntp_servers) |server| try ctx.writer.print("    - {s}\n", .{server});
@@ -2532,40 +2563,76 @@ fn addDebugFlag(command: *zli.Command) !void {
     });
 }
 
-/// 执行 `status` 或 `check`。二者使用同一组探针，通过输出详细度区分用途。
-/// 所有 M0 探针固定连接本机 127.0.0.1；`server_ip` 只用于显示对 PXE 节点广告的地址。
+/// M4.11 canonical readiness probe. A healthy `/healthz` alone is insufficient:
+/// operators need proof that the configured advertised listener and each
+/// management plane needed for provisioning are usable in the running daemon.
 fn statusCommand(
     io: std.Io,
     allocator: std.mem.Allocator,
     config_path: []const u8,
     output_json: bool,
     debug: bool,
-    action: []const u8,
     out: *std.Io.Writer,
 ) !u8 {
     var parsed_config = loadConfig(io, allocator, config_path, out, debug) orelse return 1;
     defer parsed_config.deinit();
-    const status = nodeforge.management_client.managementStatus(io, parsed_config.value.server.http_port);
+    const port = parsed_config.value.server.http_port;
+    const server_ip = parsed_config.value.server.server_ip;
+    const status = nodeforge.management_client.managementStatus(io, port);
+    const loopback_health = nodeforge.management_client.health(io, port);
+    const advertised_health = nodeforge.management_client.healthAt(io, server_ip, port);
     const active_config = nodeforge.management_client.validateActiveConfig(io, parsed_config.value.server.http_port);
-    const health = nodeforge.management_client.health(io, parsed_config.value.server.http_port);
-    const ok = status.healthy and active_config.healthy and health.healthy;
+    const tftp = nodeforge.management_client.tftpCounters(io, port);
+
+    var nodes_buffer: [128 * 1024]u8 = undefined;
+    const nodes_api = (nodeforge.management_client.nodesJson(io, port, null, &nodes_buffer) catch null) != null;
+    var profiles_buffer: [128 * 1024]u8 = undefined;
+    const profiles_api = (nodeforge.management_client.profilesJson(io, port, null, &profiles_buffer) catch null) != null;
+    const catalog_api = nodes_api and profiles_api;
+    var dhcp_buffer: [128 * 1024]u8 = undefined;
+    const dhcp_api = (nodeforge.management_client.dhcpLeasesJson(io, port, false, &dhcp_buffer) catch null) != null;
+
+    const ok = status.healthy and loopback_health.healthy and advertised_health.healthy and active_config.healthy and catalog_api and dhcp_api and tftp.healthy;
     if (output_json) {
+        const advertised_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ server_ip, port });
+        defer allocator.free(advertised_url);
         try out.print(
-            "{{\"process\":{s},\"http\":{s},\"management\":{s},\"config\":{s}}}\n",
-            .{ jsonBool(status.reachable), jsonBool(health.healthy), jsonBool(status.healthy), jsonBool(active_config.healthy) },
+            "{{\"ok\":{s},\"checks\":{{\"process\":{s},\"loopback_http\":{s},\"advertised_http\":{s},\"management_api\":{s},\"active_config\":{s},\"catalog_api\":{s},\"dhcp_api\":{s},\"tftp_api\":{s}}},\"advertised_url\":{f},\"tftp_transfers\":{{\"started\":{d},\"completed\":{d},\"failed\":{d}}}}}\n",
+            .{
+                jsonBool(ok),
+                jsonBool(status.reachable),
+                jsonBool(loopback_health.healthy),
+                jsonBool(advertised_health.healthy),
+                jsonBool(status.healthy),
+                jsonBool(active_config.healthy),
+                jsonBool(catalog_api),
+                jsonBool(dhcp_api),
+                jsonBool(tftp.healthy),
+                std.json.fmt(advertised_url, .{}),
+                tftp.started,
+                tftp.completed,
+                tftp.failed,
+            },
         );
         return if (ok) 0 else 1;
     }
-    if (std.mem.eql(u8, action, "check")) {
-        if (ok) {
-            try views.success(out, "nodeforge checks passed", &.{});
-        } else {
-            try views.checkFailure(out, status.reachable, health.healthy, status.healthy, active_config.healthy);
-        }
-        return if (ok) 0 else 1;
-    }
 
-    try views.status(out, status.reachable, health.healthy, status.healthy, active_config.healthy, parsed_config.value.server.server_ip, parsed_config.value.server.http_port);
+    try views.status(out, .{
+        .ok = ok,
+        .process = status.reachable,
+        .loopback_http = loopback_health.healthy,
+        .advertised_http = advertised_health.healthy,
+        .management_api = status.healthy,
+        .active_config = active_config.healthy,
+        .catalog_api = catalog_api,
+        .dhcp_api = dhcp_api,
+        .tftp_api = tftp.healthy,
+        .server_ip = server_ip,
+        .port = port,
+        .tftp_started = tftp.started,
+        .tftp_completed = tftp.completed,
+        .tftp_failed = tftp.failed,
+    });
     return if (ok) 0 else 1;
 }
 
@@ -2673,45 +2740,4 @@ fn printVersion(out: *std.Io.Writer) !void {
         nodeforge.version.build_time,
         if (nodeforge.version.git_dirty) "dirty" else "clean",
     });
-}
-
-// ── M4.2 F6：runtime status + 废弃别名 ─────────────────────
-
-/// `runtime status` 子命令：展示服务运行态概要（DHCP/TFTP/管理 API）。
-fn runtimeStatusCommand(init_options: zli.InitOptions) !*zli.Command {
-    const cmd = try zli.Command.init(init_options, .{
-        .name = "status",
-        .description = "Show runtime status overview (DHCP, TFTP, service)",
-        .help = "Contact the local daemon management API and summarize active runtime state.",
-    }, runtimeStatusHandler);
-    try addConfigPathFlag(cmd);
-    try addOutputFlag(cmd);
-    try addDebugFlag(cmd);
-    return cmd;
-}
-
-fn runtimeStatusHandler(ctx: zli.CommandContext) !void {
-    const output_json = outputJsonFromContext(ctx) orelse return;
-    const debug = ctx.flag("debug", bool);
-    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, debug) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer config.deinit();
-    const port = config.value.server.http_port;
-    const mgmt = nodeforge.management_client.managementStatus(ctx.io, port);
-    const health = nodeforge.management_client.health(ctx.io, port);
-    const tftp = nodeforge.management_client.tftpCounters(ctx.io, port);
-    if (output_json) {
-        try ctx.writer.print(
-            "{{\"management\":{s},\"http\":{s},\"tftp\":{{\"started\":{d},\"completed\":{d},\"failed\":{d}}}}}\n",
-            .{ jsonBool(mgmt.healthy), jsonBool(health.healthy), tftp.started, tftp.completed, tftp.failed },
-        );
-    } else {
-        try ctx.writer.print("Runtime Status\n", .{});
-        try ctx.writer.print("  Management API   {s}\n", .{if (mgmt.healthy) "available" else "unavailable"});
-        try ctx.writer.print("  HTTP             {s}\n", .{if (health.healthy) "healthy" else "unhealthy"});
-        try ctx.writer.print("  TFTP Transfers   started={d} completed={d} failed={d}\n", .{ tftp.started, tftp.completed, tftp.failed });
-    }
-    if (!mgmt.healthy) setExitCode(ctx, 1);
 }

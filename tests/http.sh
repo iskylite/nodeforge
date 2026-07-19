@@ -93,15 +93,22 @@ grep -Fq 'profile.already_exists' "$tmp/profile-create-duplicate"
 "$cli" profile set rocky-fresh boot_disk=/dev/nvme0n1 -c "$tmp/config.json" >"$tmp/profile-disk"
 grep -Fq 'profile boot disk updated' "$tmp/profile-disk"
 "$cli" profile show rocky-fresh -c "$tmp/config.json" >"$tmp/profile-disk-show"
-grep -Fq 'Boot disk     /dev/nvme0n1' "$tmp/profile-disk-show"
-grep -Fq 'Wipe          yes' "$tmp/profile-disk-show"
+grep -Fq 'Settable properties (nodeforge profile set rocky-fresh key=value)' "$tmp/profile-disk-show"
+grep -Fq 'boot_disk=/dev/nvme0n1' "$tmp/profile-disk-show"
+grep -Fq 'wipe          yes' "$tmp/profile-disk-show"
+grep -Fq 'Owner / action' "$tmp/profile-disk-show"
+grep -Fq 'nodeforge profile set rocky-fresh boot_disk=/dev/<device>' "$tmp/profile-disk-show"
+"$cli" profile set rocky-fresh 'kernel_args=iommu=pt' -c "$tmp/config.json" >"$tmp/profile-kernel-set"
+"$cli" profile show rocky-fresh -c "$tmp/config.json" >"$tmp/profile-kernel-show"
+grep -Fq 'kernel_args=iommu=pt' "$tmp/profile-kernel-show"
+"$cli" profile unset rocky-fresh kernel_args -c "$tmp/config.json" >"$tmp/profile-kernel-unset"
 if "$cli" profile create missing-source does-not-exist -c "$tmp/config.json" >"$tmp/profile-create-missing" 2>&1; then
     echo "profile create unexpectedly accepted a missing install source" >&2
     exit 1
 fi
 grep -Fq 'profile.install_source_not_found' "$tmp/profile-create-missing"
 "$cli" profile show discovery -c "$tmp/config.json" >"$tmp/profile-show"
-grep -Fq 'Kernel args   -' "$tmp/profile-show"
+grep -Fq '# kernel_args is unset' "$tmp/profile-show"
 # M4.6 的窄 profile mutation：null/unset 可幂等应用；discovery 非空参数必须
 # 由稳定校验错误拒绝，并且不能改变配置文件。
 "$cli" profile unset discovery kernel_args -c "$tmp/config.json" >"$tmp/profile-unset"
@@ -134,10 +141,20 @@ grep -Fq '"id":"test-node"' "$tmp/node-after-add"
 for section in 'Node test-node' 'Profile' 'Effective system' 'Deployment' 'Runtime' 'Inventory' 'View revisions'; do
     grep -Fq "$section" "$tmp/node-show"
 done
-"$cli" node set test-node hostname=worker-11 -c "$tmp/config.json" >"$tmp/node-set"
+grep -Fq 'Owner / action' "$tmp/node-show"
+grep -Fq 'nodeforge profile set discovery' "$tmp/node-show"
+grep -Fq 'nodeforge node retry test-node [--force]' "$tmp/node-show"
+for property in 'mac=02:00:00:00:00:11' 'arch=aarch64' 'profile=discovery' 'deploy=true' 'http_accel=false'; do
+    grep -Fq "$property" "$tmp/node-show"
+done
+"$cli" node set test-node mac=02:00:00:00:00:11 arch=aarch64 profile=discovery ip=127.0.0.111 hostname=worker-11 deploy=true http_accel=false -c "$tmp/config.json" >"$tmp/node-set"
 kill -0 "$daemon_pid"
 grep -Fq '"hostname": "worker-11"' "$tmp/config.json"
-"$cli" node unset test-node hostname -c "$tmp/config.json" >"$tmp/node-unset"
+"$cli" node show test-node -c "$tmp/config.json" >"$tmp/node-show-after-set"
+for property in 'ip=127.0.0.111' 'hostname=worker-11'; do
+    grep -Fq "$property" "$tmp/node-show-after-set"
+done
+"$cli" node unset test-node ip hostname -c "$tmp/config.json" >"$tmp/node-unset"
 kill -0 "$daemon_pid"
 if grep -Fq '"hostname": "worker-11"' "$tmp/config.json"; then
     echo "node unset did not clear hostname" >&2
@@ -176,8 +193,13 @@ grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No unknown cli
 "$cli" node list -c "$tmp/config.json" >"$tmp/node-list"
 grep -Fqx 'No nodes registered.' "$tmp/node-list"
 
-"$cli" check -c "$tmp/config.json" >"$tmp/check"
-grep -Fqx 'OK nodeforge checks passed' "$tmp/check"
+"$cli" status -c "$tmp/config.json" >"$tmp/status-command"
+for check in 'Overall' 'Process' 'Loopback HTTP' 'Advertised HTTP' 'Management API' 'Active config' 'Catalog API' 'DHCP API' 'TFTP API' 'TFTP transfers'; do
+    grep -Fq "$check" "$tmp/status-command"
+done
+grep -Fq 'OK nodeforged operational' "$tmp/status-command"
+"$cli" status -o json -c "$tmp/config.json" >"$tmp/status-command.json"
+jq -e '.ok and .checks.process and .checks.loopback_http and .checks.advertised_http and .checks.management_api and .checks.active_config and .checks.catalog_api and .checks.dhcp_api and .checks.tftp_api' "$tmp/status-command.json" >/dev/null
 
 if "$daemon" --check -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/preflight" 2>&1; then
     echo "preflight unexpectedly accepted an active HTTP listener" >&2

@@ -765,6 +765,10 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
             }
             try output.writer.writeByte(']');
         },
+        // M5 design placeholder: diskless BootConfig must add target_system,
+        // required_features, rootfs URL and capability. Keep the response
+        // intentionally empty until the authenticated rootfs artifact and
+        // initrd contract land; do not imply a working diskless payload.
         .diskless => {},
         .discovery => {},
     }
