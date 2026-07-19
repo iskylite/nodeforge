@@ -6065,6 +6065,20 @@ daemon、node-reported 和 model-store owner 并保持只读。直接存储但�
 诚实标为 `read-only (no mutation command)`，不能为了表面一致虚构 set。`set/unset --help` 列出完整
 allowlist、类型/引号约束和可复制示例，并与 parser、show 测试绑定。
 
+### 9.21 M4.12：Node/Profile 属性归属与存储覆盖设计
+
+M4.12 冻结节点属性、节点 override、profile 默认值、profile 部署策略和派生字段的归属边界，解决 `boot_disk` 等 storage 字段同时具有“共享安装计划”和“单节点物理设备”语义的问题。完整设计、影响清单、迁移和验收要求见 `docs/superpowers/specs/2026-07-19-m4_12-node-profile-ownership-design.md`。
+
+本设计的强制原则如下：
+
+1. 单节点硬件事实或物理设备差异不得通过修改共享 profile 表达；profile 只能提供默认值或共享安装策略。
+2. effective 值按 node override、profile default、schema default 的顺序合并；所有 adapter、校验、digest、retry 和审计必须消费合并结果。
+3. `show`、`set`、`unset`、HTTP API、JSON 和帮助文本必须使用同一组直接存储 key；派生/聚合字段必须显式标为只读。
+4. 旧配置和无 override 节点的 M4.11 行为保持兼容；profile 默认值修改的影响范围必须可见，不能静默触发无关节点重部署。
+5. M5–M7 的未实现能力不得因本设计提前注册命令或改变状态机；未来 adapter、diskless、PXELINUX 和 reconciliation 只能依赖 effective storage 抽象。
+
+M4.12 本阶段只完善设计和兼容契约，不改变已实现主体功能；实现前必须完成模型、validate、Kickstart/Ubuntu、management API、CLI views/help、digest、fixture 和回归测试的逐项审查。
+
 ## 10. M5：内存无盘启动与基础后处理（设计冻结，未完成）
 
 ### 10.1 目标
