@@ -44,7 +44,7 @@
 | M4.6 | 自定义内核引导参数 | M4.5 | `profile.kernel_args` 字段，PXE cmdline 追加、Kickstart `--append`、Autoinstall `late-commands` GRUB drop-in、安全校验和缓冲区扩容 |
 | M4.7 | 路径自举、模型存储迁移与部署初始化 | M4.6 | runtime Paths；schema+manifest+多文件事务；config/catalog ownership；bundle setup/reconfigure/reset/rollback |
 | M4.8 | 并发容量扩展与启动时动态派生 | M4.5 | 5 处定长上限改启动时按网段/CPU/节点数动态派生（config 可覆盖）；TFTP 并发 `auto=max(128,2×核)`、`u8→u16`、去 64 校验上限；DHCP `ping_timeout 500→100`；HTTP `max_connections` 死字段处理；启动日志打印生效容量。编号在 M4.7 之后，实施早于 M4.6（横向容量优化，与 M4.6/M4.7 内容正交） |
-| M4.9 | 部署溯源、PXE 门禁与配置入口收口补丁 | M4.7、M4.8 | 统一 config+catalog desired revision；session/deployment provenance join；fresh ISO bootloader；retry 可见性；startup config writer 收敛到 setup；完整 node-scoped SHA-256 作为后续 schema 子阶段 |
+| M4.9 | 部署溯源、PXE 门禁与配置入口收口补丁 | M4.7、M4.8 | 统一 model provenance；完整 node-scoped SHA-256 授权/持久化/迁移；fresh ISO bootloader；retry 可见性；startup config writer 收敛到 setup |
 | M4.10 | CLI fresh-deployment 闭环补全 | M4.9 | reconfigure/systemd 边界；purge-all；ISO import 结果；最小 install profile create；node mutation 错误透传 |
 | M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2–M4.10 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
 | M6 | 支持矩阵增强 | M4.1–M4.10、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
@@ -5921,10 +5921,11 @@ nodeforged: capacity derived
 
 - **M4.9a 已实现**：统一联合 desired revision、禁止 config-only fallback、BootSession/deployment provenance
   join、fresh ISO bootloader 自举、systemd readiness retry、retry/PXE 可见性，以及 startup-config 写入口收口。
-- **M4.9b 尚未实现**：deployment/session/status/install-plan 持久化完整 node-scoped SHA-256，并迁移旧 u64
-  schema。当前代码仍以联合 SHA-256 前 64 bit 兼容现有 deployment-control。
+- **M4.9b 已实现并完成系统验收**：deployment/session/status/install-plan 持久化完整 node-scoped
+  SHA-256；旧 u64 仅用于读取兼容，不再授权安装或判断 drift。r97n0/Ubuntu 证据见专项验证记录。
 
-设计、代码和验收不能把 M4.9b 的目标描述成当前能力。
+设计、代码和验收仍须区分自动与系统证据；本轮同时保留两类证据，未用旧 Rocky 正向成功替代
+M4.9b 迁移与门禁验证。
 
 #### 9.18.2 r97n1 故障与 revision 语义
 
@@ -5983,11 +5984,13 @@ setup 先校验 schema-2 startup-only candidate，再与当前 catalog 联合校
 
 #### 9.18.7 M4.9b 完整摘要迁移
 
-最终 deployment schema 保存 `requested_plan_digest`、`consumed_plan_digest`、`applied_plan_digest` 三个完整
+deployment schema 3 保存 `requested_plan_digest`、`consumed_plan_digest`、`applied_plan_digest` 三个完整
 SHA-256；BootSession、node-status 和 install-plan envelope 使用同一个 node-scoped `plan_digest`。旧 u64 pending
 arm 升级后必须 `rearm-required`，旧 applied 基线显示 drift `unknown`，直到下一次成功安装建立完整摘要。
 
-node-scoped 输入只含实际影响该节点的 node/profile/system/storage/source/referenced asset identity/digest。
+node-scoped 输入只含实际影响该节点的 node/profile/system/storage/source/referenced asset identity/digest，以及
+answer 实际注入的 bootstrap/additional SSH keys。受管 ISO repository 的内容身份继承被引用 source ISO 的完整
+SHA-256；外部 mirror 只绑定声明 URL，NodeForge 不声称冻结远端内容。
 导入无关 ISO、增加其他节点或修改无关 profile 不得使 pending retry 失效。
 
 #### 9.18.8 覆盖矩阵
@@ -6004,11 +6007,12 @@ node-scoped 输入只含实际影响该节点的 node/profile/system/storage/sou
 
 #### 9.18.9 验证
 
-- 自动测试 240/240 通过，CLI/setup/HTTP 契约覆盖删除的命令、setup candidate 和 config PATCH 405。
-- `git diff --check` 与 aarch64-linux-gnu ReleaseSafe 交叉编译通过。
+- 自动测试当前基线 244/244 通过；新增 digest schema/迁移、无关实体隔离和 bootloader 内容冲突覆盖。
+- `git diff --check` 与 aarch64-linux-gnu ReleaseSafe 交叉编译须在本轮最终代码上重新执行。
 - r97n0 清空全部 NodeForge 受管数据后 fresh setup/import/node add 成功。
 - r97n1 在 VMware UEFI 拉取 GRUB/kernel/initrd，完成 Rocky 9.7 Anaconda 安装并从本地盘重启成功。
-- M4.9b 在 schema、迁移测试和系统回归完成前保持未实现。
+- 上述 Rocky 证据属于 M4.9a 历史基线；M4.9b 的 r97n0/Ubuntu PXE、force-retry 和 systemd rollback
+  证据见 `docs/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。
 
 ### 9.19 M4.10：CLI fresh-deployment 闭环补全
 

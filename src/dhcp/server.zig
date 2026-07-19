@@ -64,6 +64,8 @@ pub const Persistence = struct {
     /// 快照重算 desired（config+catalog）model revision，与部署武装使用的
     /// revision 对齐；仅 config 的 revision 会使已武装节点被误判为 not armed。
     models: *model_runtime.ModelRuntime,
+    bootstrap_key: []const u8 = "",
+    additional_keys: []const []const u8 = &.{},
 };
 
 fn persistenceRevision(value: *const Persistence) u64 {
@@ -81,6 +83,15 @@ fn persistenceRevision(value: *const Persistence) u64 {
     // 可能在运行期 model mutation 后错误放行已过期的破坏性安装 generation。
     const revision = deployment_control.revisionForModel(value.allocator, pair.config.value(), pair.catalog.value()) catch return 0;
     return revision.desiredRevision();
+}
+
+fn persistencePlanDigest(value: *const Persistence, node_id: []const u8) deployment_control.Digest {
+    const pair = value.models.acquire();
+    defer pair.release();
+    return @import("../state/plan_digest.zig").forNode(value.allocator, pair.config.value(), pair.catalog.value(), .{
+        .bootstrap_key = value.bootstrap_key,
+        .additional_keys = value.additional_keys,
+    }, node_id) catch deployment_control.empty_digest;
 }
 
 /// 在同一 UDP worker 中处理 DHCP 和 session 生命周期。
@@ -171,10 +182,9 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
     };
     if (!always or !deployments.canAutoRearm(node_id)) return;
     const requested_at = now();
-    const revision = persistenceRevision(p);
-    // 无法取得联合 revision 时不能把 0 武装为一个可消费 generation。
-    if (revision == 0) return;
-    const rearm = deployments.rearm(node_id, revision, requested_at, .policy_always) catch |err| {
+    const digest = persistencePlanDigest(p, node_id);
+    if (!deployment_control.digestSet(digest)) return;
+    const rearm = deployments.rearm(node_id, digest, requested_at, .policy_always) catch |err| {
         observe_log.err("dhcp: automatic install generation unavailable: {t}", .{err});
         return;
     };
@@ -192,7 +202,7 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
         .{ .key = "generation", .value = std.fmt.bufPrint(&generation_text, "{d}", .{rearm.generation}) catch "0" },
         // 历史事件字段名保持兼容；M4.9 后其值是联合 desired model revision，
         // 不是 config-only revision。新状态接口使用 requested/desired_revision。
-        .{ .key = "config_revision", .value = std.fmt.bufPrint(&revision_text, "{d}", .{revision}) catch "0" },
+        .{ .key = "config_revision", .value = std.fmt.bufPrint(&revision_text, "{d}", .{persistenceRevision(p)}) catch "0" },
         .{ .key = "requested_at", .value = std.fmt.bufPrint(&requested_at_text, "{d}", .{requested_at}) catch "0" },
         .{ .key = "requested_by", .value = "policy_always" },
     };
@@ -206,8 +216,10 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
 fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, persistence: ?*const Persistence, session_link: ?*const boot_session.Link) ?packet.Reply {
     var attempts: usize = 0;
     while (attempts < runtime_state.DhcpState.max_leases) : (attempts += 1) {
+        const preliminary = resolver.resolve(config, request.mac(), request.architecture);
+        const digest = if (persistence) |p| if (preliminary.node_id) |node_id| persistencePlanDigest(p, node_id) else deployment_control.empty_digest else deployment_control.empty_digest;
         const revision = if (persistence) |p| persistenceRevision(p) else 0;
-        const decision = resolver.resolveWithDeployment(config, if (persistence) |p| p.deployments else null, revision, request.mac(), request.architecture);
+        const decision = resolver.resolveWithDeployment(config, if (persistence) |p| p.deployments else null, digest, request.mac(), request.architecture);
         // M4.2 F9: boot-gate 事件状态转换去重。
         //
         // DHCP 客户端一次启动周期产生 4-8+ 个包（PXE 固件 DISCOVER→OFFER→
@@ -224,7 +236,7 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
                 if (decision.deploy_disabled) emitDeployDisabled(io, persistence, node_id);
             }
         }
-        const reply = processWithDeployment(config, runtime, request, if (persistence) |p| p.deployments else null, revision) orelse return null;
+        const reply = processWithDeployment(config, runtime, request, if (persistence) |p| p.deployments else null, digest) orelse return null;
         if (reply.kind != .offer) return reply;
         // 已注册节点的显式保留地址对其 MAC 是独占的。
         // 不要因为旧客户端网络栈在固件重新获取 DHCP 时仍回答 ICMP 而让
@@ -334,10 +346,10 @@ fn emitDeployDisabled(io: std.Io, persistence: ?*const Persistence, node_id: []c
 ///
 /// 此函数不执行 ICMP 探测；探测由 `offerAfterProbe` 在返回 OFFER 前执行。
 pub fn process(config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet) ?packet.Reply {
-    return processWithDeployment(config, runtime, request, null, 0);
+    return processWithDeployment(config, runtime, request, null, deployment_control.empty_digest);
 }
 
-fn processWithDeployment(config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, deployments: ?*deployment_control.Store, revision: u64) ?packet.Reply {
+fn processWithDeployment(config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, deployments: ?*deployment_control.Store, digest: deployment_control.Digest) ?packet.Reply {
     const typ = request.message_type orelse return null;
     const server_ip = parseIp(config.server.server_ip) orelse return null;
     const net = network(config.dhcp.subnet) orelse return null;
@@ -345,7 +357,7 @@ fn processWithDeployment(config: *const model.AppConfig, runtime: *runtime_state
     if (relay_link != 0 and !inNetwork(relay_link, config.dhcp.subnet, net.prefix)) return null;
     const mask = prefixMask(net.prefix);
     const client = request.mac();
-    const decision = resolver.resolveWithDeployment(config, deployments, revision, client, request.architecture);
+    const decision = resolver.resolveWithDeployment(config, deployments, digest, client, request.architecture);
     switch (typ) {
         .release => {
             _ = runtime.dhcp.release(client);
@@ -467,7 +479,9 @@ fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const m
     // 被暂停的破坏性 profile 仍需获得诊断 DHCP lease，
     // 但不能获取携带 capability 的 boot session。这样的 session
     // 会使安全的 `install retry` 操作返回 409，即使从未服务过安装器。
-    const decision = resolver.resolveWithDeployment(config, p.deployments, persistenceRevision(p), request.mac(), request.architecture);
+    const preliminary = resolver.resolve(config, request.mac(), request.architecture);
+    const digest = if (preliminary.node_id) |node_id| persistencePlanDigest(p, node_id) else deployment_control.empty_digest;
+    const decision = resolver.resolveWithDeployment(config, p.deployments, digest, request.mac(), request.architecture);
     if (decision.install_not_armed) return null;
     const result = p.sessions.acquireDhcp(io, .{
         .mac = request.mac(),
@@ -476,6 +490,7 @@ fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const m
         .profile = decision.profile,
         .mode = decision.mode,
         .model_revision = persistenceRevision(p),
+        .model_plan_digest = if (decision.node_id) |node_id| persistencePlanDigest(p, node_id) else deployment_control.empty_digest,
     }, boot_session.monotonicNow(), now()) catch |err| {
         observe_log.warn("dhcp: boot session allocation unavailable: {t}", .{err});
         return .capacity_exhausted;

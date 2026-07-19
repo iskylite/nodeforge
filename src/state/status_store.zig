@@ -10,6 +10,7 @@ const node_status = @import("node_status.zig");
 const runtime = @import("runtime.zig");
 const dhcp_store = @import("dhcp_store.zig");
 const boot_session = @import("boot_session.zig");
+const deployment_control = @import("deployment_control.zig");
 
 /// M4.8 紧凑磁盘记录。运行时仍使用固定缓冲区以避免锁内分配，磁盘格式只写
 /// 实际字符串，避免把 2048 个空槽和每条记录的 NUL padding 序列化。
@@ -18,6 +19,7 @@ pub const DiskStatus = struct {
     boot_session_id: []const u8,
     daemon_instance_id: []const u8,
     model_revision: u64 = 0,
+    plan_digest: ?[]const u8 = null,
     deployment_generation: u64 = 0,
     phase: node_status.Phase,
     last_event_at: i64,
@@ -26,9 +28,9 @@ pub const DiskStatus = struct {
     session_active: bool = false,
 };
 
-/// M4.8 `node-status.json` schema 4。
+/// M4.9b `node-status.json` schema 5。
 pub const StatusFile = struct {
-    schema_version: u32 = 4,
+    schema_version: u32 = 5,
     revision: u64 = 0,
     saved_at: i64,
     statuses: []const DiskStatus,
@@ -67,6 +69,7 @@ fn compactStatuses(statuses: *const [node_status.max_statuses]node_status.Status
             .boot_session_id = &status.boot_session_id,
             .daemon_instance_id = &status.daemon_instance_id,
             .model_revision = status.model_revision,
+            .plan_digest = if (deployment_control.digestSet(status.model_plan_digest)) &status.model_plan_digest else null,
             .deployment_generation = status.deployment_generation,
             .phase = status.phase,
             .last_event_at = status.last_event_at,
@@ -106,7 +109,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
             }
             store.restoreInactive(&snapshot, parsed.value.revision);
         },
-        4 => {
+        4, 5 => {
             const parsed = try std.json.parseFromSlice(StatusFile, allocator, bytes, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             if (parsed.value.statuses.len > node_status.max_statuses) return error.InvalidStatusState;
@@ -116,6 +119,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
                 var status: node_status.Status = .{
                     .phase = disk.phase,
                     .model_revision = disk.model_revision,
+                    .model_plan_digest = if (disk.plan_digest) |digest| try parseDigest(digest) else deployment_control.empty_digest,
                     .deployment_generation = disk.deployment_generation,
                     .last_event_at = disk.last_event_at,
                     .last_error = disk.last_error,
@@ -134,6 +138,16 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         },
         else => return error.InvalidStatusState,
     }
+}
+
+fn parseDigest(value: []const u8) !deployment_control.Digest {
+    if (value.len != 64) return error.InvalidStatusState;
+    var result: deployment_control.Digest = undefined;
+    for (value, 0..) |byte, index| {
+        if (!std.ascii.isHex(byte) or std.ascii.toLower(byte) != byte) return error.InvalidStatusState;
+        result[index] = byte;
+    }
+    return result;
 }
 
 fn validDiskStatus(status: DiskStatus) bool {
@@ -185,7 +199,7 @@ test "schema 4 status snapshot serializes only used compact records" {
     defer output.deinit();
     try std.json.Stringify.value(StatusFile{ .saved_at = 1, .statuses = used }, .{}, &output.writer);
     try std.testing.expect(output.written().len < 1024);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"schema_version\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"schema_version\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"node_id\":\"n1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"model_revision\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"deployment_generation\":5") != null);

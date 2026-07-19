@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const git_commit = b.option([]const u8, "git-commit", "Git commit recorded in version output") orelse commandOutput(b, &.{ "git", "rev-parse", "HEAD" }) orelse "unknown";
     const build_time = b.option([]const u8, "build-time", "UTC build time recorded in version output") orelse commandOutput(b, &.{ "sh", "-c", "if [ -n \"${SOURCE_DATE_EPOCH:-}\" ]; then date -u -r \"$SOURCE_DATE_EPOCH\" '+%Y-%m-%dT%H:%M:%SZ'; else date -u '+%Y-%m-%dT%H:%M:%SZ'; fi" }) orelse "unknown";
     const git_dirty = if (commandOutput(b, &.{ "git", "status", "--porcelain", "--untracked-files=no" })) |status| status.len != 0 else false;
-    build_options.addOption([]const u8, "version", "0.1.0");
+    build_options.addOption([]const u8, "version", "0.1.1");
     build_options.addOption([]const u8, "git_commit", git_commit);
     build_options.addOption(bool, "git_dirty", git_dirty);
     build_options.addOption([]const u8, "build_time", build_time);

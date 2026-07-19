@@ -8,13 +8,24 @@ const dhcp_store = @import("dhcp_store.zig");
 const model = @import("../model.zig");
 const config_store = @import("../config/store.zig");
 const catalog_store = @import("../catalog/store.zig");
+const plan_digest = @import("plan_digest.zig");
+pub const Digest = plan_digest.Digest;
+pub const empty_digest: Digest = [_]u8{0} ** 64;
+
+pub fn digestSet(value: Digest) bool {
+    return !std.mem.allEqual(u8, &value, 0);
+}
+
+pub fn digestEqual(a: Digest, b: Digest) bool {
+    return std.crypto.timing_safe.eql(Digest, a, b);
+}
 
 /// M4.9：一个 effective config/catalog model 的内容指纹。
 ///
 /// 它不是计数器、Git revision、时间戳或可排序版本。`config` 是 config-only
 /// 指纹，`catalog` 是 manifest generation，`desiredRevision()` 是联合 SHA-256
-/// 的紧凑投影；调用方只能比较相等/不等。M4.9b 才迁移为持久化完整 node-scoped
-/// plan digest，当前 u64 仅为 schema 兼容实现。
+/// 的紧凑投影；调用方只能比较相等/不等。M4.9b 的授权、恢复和 drift 已使用
+/// 完整 node-scoped plan digest；该 u64 只为旧 schema/CLI 读取兼容保留。
 pub const ModelRevision = struct {
     config: u64,
     catalog: u64,
@@ -47,6 +58,9 @@ pub const Entry = struct {
     consumed_revision: u64 = 0,
     /// 安装器完成时报告为成功安装的 revision。
     applied_revision: u64 = 0,
+    requested_plan_digest: Digest = empty_digest,
+    consumed_plan_digest: Digest = empty_digest,
+    applied_plan_digest: Digest = empty_digest,
     /// 当前 generation 被武装的时间；CLI/API 将其显示为整个部署任务的 Start。
     requested_at: i64 = 0,
     /// 安装器报告 `install.started`、generation 被消费的时间；CLI/API 显示为 Install。
@@ -79,6 +93,9 @@ pub const DiskEntry = struct {
     requested_revision: u64 = 0,
     consumed_revision: u64 = 0,
     applied_revision: u64 = 0,
+    requested_plan_digest: ?[]const u8 = null,
+    consumed_plan_digest: ?[]const u8 = null,
+    applied_plan_digest: ?[]const u8 = null,
     requested_at: i64 = 0,
     started_at: i64 = 0,
     finished_at: i64 = 0,
@@ -87,7 +104,7 @@ pub const DiskEntry = struct {
     requested_by: RequestSource = .initial,
 };
 
-pub const File = struct { schema_version: u32 = 2, revision: u64 = 0, entries: []const DiskEntry = &.{} };
+pub const File = struct { schema_version: u32 = 3, revision: u64 = 0, entries: []const DiskEntry = &.{} };
 
 pub const RearmResult = struct {
     generation: u64,
@@ -96,6 +113,7 @@ pub const RearmResult = struct {
     previous_armed_generation: ?u64 = null,
     previous_next_generation: u64 = 1,
     previous_requested_revision: u64 = 0,
+    previous_requested_plan_digest: Digest = empty_digest,
     previous_requested_at: i64 = 0,
     previous_requested_by: RequestSource = .initial,
     /// rearm 前该条目记录的 per-generation 生命周期时间戳。rearm 会为新
@@ -110,12 +128,14 @@ pub const ConsumeResult = struct {
     generation: u64,
     previous_consumed_generation: ?u64,
     previous_consumed_revision: u64,
+    previous_consumed_plan_digest: Digest,
 };
 
 pub const TerminalResult = struct {
     generation: u64,
     previous_terminal_generation: ?u64,
     previous_applied_revision: u64,
+    previous_applied_plan_digest: Digest,
     previous_deployed_generation: u64,
     previous_deployed_at: i64,
 };
@@ -127,6 +147,8 @@ pub const View = struct {
     terminal_generation: ?u64,
     requested_revision: u64,
     applied_revision: u64,
+    requested_plan_digest: Digest = empty_digest,
+    applied_plan_digest: Digest = empty_digest,
     requested_at: i64,
     started_at: i64,
     finished_at: i64,
@@ -158,16 +180,24 @@ pub const Store = struct {
         self.effective = @max(used, @max(@as(usize, 1), @min(derived, max_entries)));
     }
 
+    /// 在线 node add 只能扩大启动时派生容量，不能意外缩小显式 override。
+    pub fn growEffective(self: *Store, minimum: usize) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        self.effective = @max(self.effective, @min(minimum, max_entries));
+    }
+
     /// 首次观测武装 generation 1。已有条目永远不会
     /// 被 config 重载自动重新武装。
-    pub fn ensureInitial(self: *Store, node_id: []const u8, revision: u64, requested_at: i64) !void {
+    pub fn ensureInitial(self: *Store, node_id: []const u8, digest: Digest, requested_at: i64) !void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         const entry = try self.findOrCreateLocked(node_id);
         if (entry.armed_generation == null and entry.consumed_generation == null) {
             entry.armed_generation = entry.next_generation;
             entry.next_generation += 1;
-            entry.requested_revision = revision;
+            entry.requested_revision = 0;
+            entry.requested_plan_digest = digest;
             entry.requested_at = requested_at;
             entry.requested_by = .initial;
         }
@@ -182,11 +212,11 @@ pub const Store = struct {
 
     /// 待执行 generation 必须仍指向操作员已确认的精确快照。这防止
     /// 配置重载在 `install retry` 与 PXE 之间静默改变破坏性部署计划。
-    pub fn isArmedForRevision(self: *Store, node_id: []const u8, revision: u64) bool {
+    pub fn isArmedForDigest(self: *Store, node_id: []const u8, digest: Digest) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
         for (&self.entries) |entry| if (entry.used() and std.mem.eql(u8, entry.node(), node_id))
-            return entry.armed_generation != null and entry.requested_revision == revision;
+            return entry.armed_generation != null and digestSet(entry.requested_plan_digest) and digestEqual(entry.requested_plan_digest, digest);
         return false;
     }
 
@@ -204,9 +234,11 @@ pub const Store = struct {
             .generation = generation,
             .previous_consumed_generation = entry.consumed_generation,
             .previous_consumed_revision = entry.consumed_revision,
+            .previous_consumed_plan_digest = entry.consumed_plan_digest,
         };
         entry.consumed_generation = generation;
         entry.consumed_revision = entry.requested_revision;
+        entry.consumed_plan_digest = entry.requested_plan_digest;
         if (entry.started_at == 0 and timestamp != 0) entry.started_at = timestamp;
         entry.finished_at = 0;
         entry.armed_generation = null;
@@ -221,12 +253,12 @@ pub const Store = struct {
     /// 否则新 generation 尚未开始时会错误地抹掉上一次成功部署记录。
     /// consumed/terminal generation 作为历史不在此处清零，由后续 consume/
     /// markTerminal 为新 generation 覆盖。
-    pub fn rearm(self: *Store, node_id: []const u8, revision: u64, requested_at: i64, requested_by: RequestSource) !RearmResult {
+    pub fn rearm(self: *Store, node_id: []const u8, digest: Digest, requested_at: i64, requested_by: RequestSource) !RearmResult {
         lock(&self.mutex);
         defer self.mutex.unlock();
         const entry = try self.findOrCreateLocked(node_id);
         if (entry.armed_generation) |generation| {
-            if (entry.requested_revision == revision) return .{ .generation = generation, .changed = false };
+            if (digestSet(entry.requested_plan_digest) and digestEqual(entry.requested_plan_digest, digest)) return .{ .generation = generation, .changed = false };
             const previous = RearmResult{
                 .generation = entry.next_generation,
                 .changed = true,
@@ -234,6 +266,7 @@ pub const Store = struct {
                 .previous_armed_generation = generation,
                 .previous_next_generation = entry.next_generation,
                 .previous_requested_revision = entry.requested_revision,
+                .previous_requested_plan_digest = entry.requested_plan_digest,
                 .previous_requested_at = entry.requested_at,
                 .previous_requested_by = entry.requested_by,
                 .previous_started_at = entry.started_at,
@@ -242,7 +275,8 @@ pub const Store = struct {
             };
             entry.armed_generation = entry.next_generation;
             entry.next_generation += 1;
-            entry.requested_revision = revision;
+            entry.requested_revision = 0;
+            entry.requested_plan_digest = digest;
             entry.requested_at = requested_at;
             entry.requested_by = requested_by;
             entry.started_at = 0;
@@ -256,12 +290,13 @@ pub const Store = struct {
         const previous_deployed = entry.deployed_at;
         entry.next_generation += 1;
         entry.armed_generation = generation;
-        entry.requested_revision = revision;
+        entry.requested_revision = 0;
+        entry.requested_plan_digest = digest;
         entry.requested_at = requested_at;
         entry.requested_by = requested_by;
         entry.started_at = 0;
         entry.finished_at = 0;
-        return .{ .generation = generation, .changed = true, .previous_next_generation = previous_next, .previous_requested_revision = entry.consumed_revision, .previous_started_at = previous_started, .previous_finished_at = previous_finished, .previous_deployed_at = previous_deployed };
+        return .{ .generation = generation, .changed = true, .previous_next_generation = previous_next, .previous_requested_revision = entry.consumed_revision, .previous_requested_plan_digest = entry.consumed_plan_digest, .previous_started_at = previous_started, .previous_finished_at = previous_finished, .previous_deployed_at = previous_deployed };
     }
 
     pub fn rollbackConsume(self: *Store, node_id: []const u8, result: ConsumeResult) void {
@@ -270,6 +305,7 @@ pub const Store = struct {
         for (&self.entries) |*entry| if (entry.used() and std.mem.eql(u8, entry.node(), node_id) and entry.consumed_generation != null and entry.consumed_generation.? == result.generation and entry.armed_generation == null) {
             entry.consumed_generation = result.previous_consumed_generation;
             entry.consumed_revision = result.previous_consumed_revision;
+            entry.consumed_plan_digest = result.previous_consumed_plan_digest;
             entry.armed_generation = result.generation;
             return;
         };
@@ -286,6 +322,7 @@ pub const Store = struct {
             entry.armed_generation = result.previous_armed_generation;
             entry.next_generation = result.previous_next_generation;
             entry.requested_revision = result.previous_requested_revision;
+            entry.requested_plan_digest = result.previous_requested_plan_digest;
             entry.requested_at = result.previous_requested_at;
             entry.requested_by = result.previous_requested_by;
             entry.started_at = result.previous_started_at;
@@ -318,6 +355,7 @@ pub const Store = struct {
                     .generation = generation,
                     .previous_terminal_generation = entry.terminal_generation,
                     .previous_applied_revision = entry.applied_revision,
+                    .previous_applied_plan_digest = entry.applied_plan_digest,
                     .previous_deployed_generation = entry.deployed_generation,
                     .previous_deployed_at = entry.deployed_at,
                 };
@@ -325,6 +363,7 @@ pub const Store = struct {
                 if (entry.finished_at == 0 and timestamp != 0) entry.finished_at = timestamp;
                 if (applied) {
                     entry.applied_revision = entry.consumed_revision;
+                    entry.applied_plan_digest = entry.consumed_plan_digest;
                     if (entry.deployed_generation != generation and timestamp != 0) {
                         entry.deployed_generation = generation;
                         entry.deployed_at = timestamp;
@@ -343,21 +382,21 @@ pub const Store = struct {
         for (&self.entries) |*entry| if (entry.used() and std.mem.eql(u8, entry.node(), node_id) and entry.terminal_generation != null and entry.terminal_generation.? == result.generation) {
             entry.terminal_generation = result.previous_terminal_generation;
             entry.applied_revision = result.previous_applied_revision;
+            entry.applied_plan_digest = result.previous_applied_plan_digest;
             entry.deployed_generation = result.previous_deployed_generation;
             entry.deployed_at = result.previous_deployed_at;
             return;
         };
     }
 
-    /// M4.9：只有成功 revision 基线存在后才能判断 drift。
-    /// `applied_revision == 0` 表示“无 applied 基线”，不是“已确认同步”；
-    /// 调用方通过 deployment phase 暴露 pending/unknown 状态。
-    pub fn isDrifted(self: *Store, node_id: []const u8, revision: u64) bool {
+    /// M4.9b：只有完整 applied plan digest 基线存在后才能判断 drift。
+    /// 只有旧 u64 applied revision 的迁移记录仍为 unknown。
+    pub fn drift(self: *Store, node_id: []const u8, digest: Digest) enum { unknown, clean, drifted } {
         lock(&self.mutex);
         defer self.mutex.unlock();
         for (&self.entries) |entry| if (entry.used() and std.mem.eql(u8, entry.node(), node_id))
-            return entry.applied_revision != 0 and entry.applied_revision != revision;
-        return false;
+            return if (!digestSet(entry.applied_plan_digest)) .unknown else if (digestEqual(entry.applied_plan_digest, digest)) .clean else .drifted;
+        return .unknown;
     }
 
     pub fn view(self: *Store, node_id: []const u8) ?View {
@@ -370,6 +409,8 @@ pub const Store = struct {
             .terminal_generation = entry.terminal_generation,
             .requested_revision = entry.requested_revision,
             .applied_revision = entry.applied_revision,
+            .requested_plan_digest = entry.requested_plan_digest,
+            .applied_plan_digest = entry.applied_plan_digest,
             .requested_at = entry.requested_at,
             .started_at = entry.started_at,
             .finished_at = entry.finished_at,
@@ -423,7 +464,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 2) or parsed.value.entries.len > max_entries) return error.InvalidDeploymentControl;
+    if ((parsed.value.schema_version < 1 or parsed.value.schema_version > 3) or parsed.value.entries.len > max_entries) return error.InvalidDeploymentControl;
     lock(&store.mutex);
     defer store.mutex.unlock();
     store.entries = [_]Entry{.{}} ** max_entries;
@@ -448,6 +489,11 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         entry.requested_revision = disk_entry.requested_revision;
         entry.consumed_revision = disk_entry.consumed_revision;
         entry.applied_revision = disk_entry.applied_revision;
+        if (parsed.value.schema_version == 3) {
+            entry.requested_plan_digest = try parseDigest(disk_entry.requested_plan_digest);
+            entry.consumed_plan_digest = try parseDigest(disk_entry.consumed_plan_digest);
+            entry.applied_plan_digest = try parseDigest(disk_entry.applied_plan_digest);
+        }
         entry.requested_at = disk_entry.requested_at;
         entry.started_at = disk_entry.started_at;
         entry.finished_at = disk_entry.finished_at;
@@ -460,6 +506,17 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         count += 1;
     }
     store.effective = @max(store.effective, count);
+}
+
+fn parseDigest(value: ?[]const u8) !Digest {
+    if (value == null) return empty_digest;
+    if (value.?.len != 64) return error.InvalidDeploymentControl;
+    var result: Digest = undefined;
+    for (value.?, 0..) |byte, index| {
+        if (!std.ascii.isHex(byte) or std.ascii.toLower(byte) != byte) return error.InvalidDeploymentControl;
+        result[index] = byte;
+    }
+    return result;
 }
 
 fn validGenerations(entry: DiskEntry) bool {
@@ -499,10 +556,9 @@ pub fn revisionForConfig(allocator: std.mem.Allocator, config: *const model.AppC
     return if (value == 0) 1 else value;
 }
 
-/// M4.9a config/catalog 两条 revision 与不可变期望模型 digest 的统一投影。catalog
-/// mutation 不再伪装成 config revision；部署控制使用 digest 前 64 bit 的折叠值
-/// 做相等性门禁和 drift 判断。M4.9b 才把 node-scoped 完整 digest 持久化到
-/// deployment/session/status；不得把本函数的全局 u64 兼容值描述成最终模型。
+/// M4.9a config/catalog 两条 revision 与不可变期望模型 digest 的统一投影。
+/// M4.9b 后部署授权改用 `plan_digest.forNode`；本函数继续服务 view revision、
+/// ETag 和旧 schema/CLI 兼容，不得再用于安装授权、session join 或 drift。
 pub fn revisionForModel(allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *const model.Catalog) !ModelRevision {
     const config_json = try config_store.render(allocator, config);
     defer allocator.free(config_json);
@@ -558,6 +614,9 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
             .requested_revision = entry.requested_revision,
             .consumed_revision = entry.consumed_revision,
             .applied_revision = entry.applied_revision,
+            .requested_plan_digest = if (digestSet(entry.requested_plan_digest)) &entry.requested_plan_digest else null,
+            .consumed_plan_digest = if (digestSet(entry.consumed_plan_digest)) &entry.consumed_plan_digest else null,
+            .applied_plan_digest = if (digestSet(entry.applied_plan_digest)) &entry.applied_plan_digest else null,
             .requested_at = entry.requested_at,
             .started_at = entry.started_at,
             .finished_at = entry.finished_at,
@@ -579,17 +638,21 @@ fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }
 
+const test_digest_1: Digest = [_]u8{'1'} ** 64;
+const test_digest_2: Digest = [_]u8{'2'} ** 64;
+const test_digest_11: Digest = [_]u8{'b'} ** 64;
+
 test "generation consumes once and retry is idempotent" {
     var store: Store = .{};
-    try store.ensureInitial("node-01", 1, 10);
+    try store.ensureInitial("node-01", test_digest_1, 10);
     try std.testing.expect(store.isArmed("node-01"));
     const consumed = (try store.consume("node-01")).?;
     try std.testing.expectEqual(@as(u64, 1), consumed.generation);
     try std.testing.expect(!store.isArmed("node-01"));
-    const first_retry = try store.rearm("node-01", 2, 20, .operator);
+    const first_retry = try store.rearm("node-01", test_digest_2, 20, .operator);
     try std.testing.expectEqual(@as(u64, 2), first_retry.generation);
     try std.testing.expect(first_retry.changed);
-    const repeated_retry = try store.rearm("node-01", 2, 21, .operator);
+    const repeated_retry = try store.rearm("node-01", test_digest_2, 21, .operator);
     try std.testing.expectEqual(@as(u64, 2), repeated_retry.generation);
     try std.testing.expect(!repeated_retry.changed);
 }
@@ -618,31 +681,31 @@ test "current generation prefers armed work over the previous consumed generatio
 
 test "retry replaces stale pending revision" {
     var store: Store = .{};
-    try store.ensureInitial("node-01", 1, 10);
-    const result = try store.rearm("node-01", 2, 20, .operator);
+    try store.ensureInitial("node-01", test_digest_1, 10);
+    const result = try store.rearm("node-01", test_digest_2, 20, .operator);
     try std.testing.expect(result.changed);
     try std.testing.expect(result.replaced);
     try std.testing.expectEqual(@as(u64, 2), result.generation);
-    try std.testing.expect(store.isArmedForRevision("node-01", 2));
+    try std.testing.expect(store.isArmedForDigest("node-01", test_digest_2));
 }
 
 test "failed persistence rollback restores stale pending generation" {
     var store: Store = .{};
-    try store.ensureInitial("node-01", 1, 10);
-    const result = try store.rearm("node-01", 2, 20, .operator);
+    try store.ensureInitial("node-01", test_digest_1, 10);
+    const result = try store.rearm("node-01", test_digest_2, 20, .operator);
     store.rollbackRearm("node-01", result);
-    try std.testing.expect(store.isArmedForRevision("node-01", 1));
-    try std.testing.expect(!store.isArmedForRevision("node-01", 2));
+    try std.testing.expect(store.isArmedForDigest("node-01", test_digest_1));
+    try std.testing.expect(!store.isArmedForDigest("node-01", test_digest_2));
 }
 
 test "always policy can rearm only after a terminal consumed generation" {
     var store: Store = .{};
-    try store.ensureInitial("node-01", 1, 10);
+    try store.ensureInitial("node-01", test_digest_1, 10);
     _ = try store.consume("node-01");
     try std.testing.expect(!store.canAutoRearm("node-01"));
     _ = store.markTerminal("node-01", false);
     try std.testing.expect(store.canAutoRearm("node-01"));
-    _ = try store.rearm("node-01", 1, 20, .policy_always);
+    _ = try store.rearm("node-01", test_digest_1, 20, .policy_always);
     try std.testing.expect(!store.canAutoRearm("node-01"));
 }
 
@@ -653,19 +716,20 @@ test "deployment state rejects impossible generation ordering" {
 
 test "completion records applied revision without arming another install" {
     var store: Store = .{};
-    try store.ensureInitial("node-01", 11, 10);
+    try store.ensureInitial("node-01", test_digest_11, 10);
     _ = try store.consume("node-01");
     _ = store.markTerminal("node-01", true);
     try std.testing.expect(!store.isArmed("node-01"));
-    try std.testing.expect(!store.isDrifted("node-01", 11));
-    try std.testing.expect(store.isDrifted("node-01", 12));
+    try std.testing.expectEqual(.clean, store.drift("node-01", test_digest_11));
+    const changed_digest: Digest = [_]u8{'c'} ** 64;
+    try std.testing.expectEqual(.drifted, store.drift("node-01", changed_digest));
 }
 
 test "retry resets current attempt timestamps but preserves last successful deployment" {
     // rearm 清零当前尝试的 install/finished，但最近成功 deployed 必须保留，
     // 直到新 generation 真正完成后再原子替换。
     var store: Store = .{};
-    try store.ensureInitial("node-01", 1, 10);
+    try store.ensureInitial("node-01", test_digest_1, 10);
     _ = (try store.consumeAt("node-01", 100)).?;
     _ = store.markTerminalAt("node-01", true, 200);
     const first = store.view("node-01").?;
@@ -674,7 +738,7 @@ test "retry resets current attempt timestamps but preserves last successful depl
     try std.testing.expectEqual(@as(u64, 1), first.deployed_generation);
     try std.testing.expectEqual(@as(i64, 200), first.deployed_at);
 
-    _ = try store.rearm("node-01", 1, 300, .operator);
+    _ = try store.rearm("node-01", test_digest_1, 300, .operator);
     const rearmed = store.view("node-01").?;
     try std.testing.expectEqual(@as(i64, 0), rearmed.started_at);
     try std.testing.expectEqual(@as(i64, 0), rearmed.finished_at);
@@ -693,10 +757,10 @@ test "retry resets current attempt timestamps but preserves last successful depl
 
 test "rearm rollback restores per-generation deployment timestamps" {
     var store: Store = .{};
-    try store.ensureInitial("node-01", 1, 10);
+    try store.ensureInitial("node-01", test_digest_1, 10);
     _ = (try store.consumeAt("node-01", 100)).?;
     _ = store.markTerminalAt("node-01", true, 200);
-    const result = try store.rearm("node-01", 2, 300, .operator);
+    const result = try store.rearm("node-01", test_digest_2, 300, .operator);
     store.rollbackRearm("node-01", result);
     const restored = store.view("node-01").?;
     try std.testing.expectEqual(@as(i64, 100), restored.started_at);
@@ -722,7 +786,34 @@ test "effective deployment capacity searches restored entries outside the prefix
     @memcpy(store.entries[1].node_id[0..7], "node-01");
     store.entries[1].node_id_len = 7;
     store.setEffective(1);
-    try store.ensureInitial("node-01", 1, 1);
+    try store.ensureInitial("node-01", test_digest_1, 1);
     try std.testing.expect(!store.entries[0].used());
-    try std.testing.expectError(error.DeploymentControlCapacity, store.ensureInitial("node-02", 1, 1));
+    try std.testing.expectError(error.DeploymentControlCapacity, store.ensureInitial("node-02", test_digest_1, 1));
+}
+
+test "schema 2 pending arm is readable but cannot authorize a digest" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/deployment-control.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    try dhcp_store.atomicWrite(std.testing.io, path, "{\"schema_version\":2,\"entries\":[{\"node_id\":\"node-01\",\"node_id_len\":7,\"next_generation\":2,\"armed_generation\":1,\"requested_revision\":42}]}");
+    var store: Store = .{};
+    try load(std.testing.io, std.testing.allocator, path, &store);
+    try std.testing.expect(store.isArmed("node-01"));
+    try std.testing.expect(!store.isArmedForDigest("node-01", test_digest_1));
+    try std.testing.expect(!digestSet(store.view("node-01").?.requested_plan_digest));
+}
+
+test "schema 3 persists and restores full plan digests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/deployment-control.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    var before: Store = .{};
+    try before.ensureInitial("node-01", test_digest_1, 10);
+    try save(std.testing.io, std.testing.allocator, path, &before);
+    var after: Store = .{};
+    try load(std.testing.io, std.testing.allocator, path, &after);
+    try std.testing.expect(after.isArmedForDigest("node-01", test_digest_1));
+    try std.testing.expectEqualSlices(u8, &test_digest_1, &after.view("node-01").?.requested_plan_digest);
 }

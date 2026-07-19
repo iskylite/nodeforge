@@ -4,6 +4,7 @@
 const std = @import("std");
 const boot_session = @import("boot_session.zig");
 const capacity = @import("capacity.zig");
+const deployment_control = @import("deployment_control.zig");
 
 /// M4.8: 投影表内存天花板；生效容量由 `Store.effective` 在启动时按
 /// `max(受管节点数, config)` 派生（`min(派生, max_statuses)`）。
@@ -36,6 +37,7 @@ pub const Status = struct {
     daemon_instance_id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
     /// 该投影所属的不可变 config/model revision；0 仅表示旧格式未知。
     model_revision: u64 = 0,
+    model_plan_digest: deployment_control.Digest = deployment_control.empty_digest,
     /// install generation；diskless/discovery 或旧格式可为 0。
     deployment_generation: u64 = 0,
     phase: Phase = .boot_config_fetched,
@@ -74,13 +76,19 @@ pub const Store = struct {
         self.effective = @max(used, @max(@as(usize, 1), @min(derived, max_statuses)));
     }
 
+    pub fn growEffective(self: *Store, minimum: usize) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        self.effective = @max(self.effective, @min(minimum, max_statuses));
+    }
+
     pub fn update(self: *Store, node_id: []const u8, session_id: []const u8, daemon_id: []const u8, phase: Phase, reason: ?[]const u8, timestamp: i64, active: bool) !void {
-        return self.updateForDeployment(node_id, session_id, daemon_id, 0, 0, phase, reason, timestamp, active);
+        return self.updateForDeployment(node_id, session_id, daemon_id, 0, deployment_control.empty_digest, 0, phase, reason, timestamp, active);
     }
 
     /// 更新带来源归属的当前状态。管理聚合必须同时匹配 model revision 与
     /// deployment generation，不能把旧 profile/session 的 completed 拼到新 desired config。
-    pub fn updateForDeployment(self: *Store, node_id: []const u8, session_id: []const u8, daemon_id: []const u8, model_revision: u64, deployment_generation: u64, phase: Phase, reason: ?[]const u8, timestamp: i64, active: bool) !void {
+    pub fn updateForDeployment(self: *Store, node_id: []const u8, session_id: []const u8, daemon_id: []const u8, model_revision: u64, model_plan_digest: deployment_control.Digest, deployment_generation: u64, phase: Phase, reason: ?[]const u8, timestamp: i64, active: bool) !void {
         if (node_id.len == 0 or node_id.len > 96 or !boot_session.validId(session_id) or !boot_session.validId(daemon_id)) return error.InvalidNodeStatus;
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -104,7 +112,7 @@ pub const Store = struct {
             if (used >= self.effective) return error.NodeStatusCapacityExhausted;
             break :blk free orelse return error.NodeStatusCapacityExhausted;
         };
-        entry.* = .{ .model_revision = model_revision, .deployment_generation = deployment_generation, .phase = phase, .last_event_at = timestamp, .last_error = phase == .failed, .session_active = active };
+        entry.* = .{ .model_revision = model_revision, .model_plan_digest = model_plan_digest, .deployment_generation = deployment_generation, .phase = phase, .last_event_at = timestamp, .last_error = phase == .failed, .session_active = active };
         @memcpy(entry.node_id[0..node_id.len], node_id);
         entry.node_id_len = @intCast(node_id.len);
         @memcpy(&entry.boot_session_id, session_id);
@@ -205,7 +213,7 @@ test "node status replaces only the current projection" {
 test "node status records model revision and deployment generation provenance" {
     var store: Store = .{};
     const id = "0123456789abcdef0123456789abcdef";
-    try store.updateForDeployment("n1", id, id, 42, 5, .install_started, null, 10, true);
+    try store.updateForDeployment("n1", id, id, 42, [_]u8{'4'} ** 64, 5, .install_started, null, 10, true);
     const status = store.get("n1").?;
     try std.testing.expectEqual(@as(u64, 42), status.model_revision);
     try std.testing.expectEqual(@as(u64, 5), status.deployment_generation);

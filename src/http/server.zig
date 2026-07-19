@@ -99,6 +99,13 @@ fn desiredRevision(context: *const RouteContext) !u64 {
     return revision.desiredRevision();
 }
 
+fn desiredPlanDigest(context: *const RouteContext, node_id: []const u8) !deployment_control.Digest {
+    return @import("../state/plan_digest.zig").forNode(context.allocator, context.config, context.catalog_snapshot.value(), .{
+        .bootstrap_key = context.bootstrap_key,
+        .additional_keys = context.additional_keys,
+    }, node_id);
+}
+
 /// 用 32 位零填充十六进制写入请求标识（序号足够区分本机 daemon 的请求）。
 fn nextRequestId(out: *[32]u8) void {
     const seq = request_counter.fetchAdd(1, .monotonic);
@@ -678,7 +685,9 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
     ) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode == .install and checked.proof == .bootstrap and checked.session.plan_digest == null) {
         const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
-        const plan_json = buildInstallPlan(context, node_id, checked.session.profile, desired_revision) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
+        const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
+        if (!deployment_control.digestEqual(checked.session.model_plan_digest, desired_digest)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"node plan changed after PXE authorization; retry is required\"}}\n", meta);
+        const plan_json = buildInstallPlan(context, node_id, checked.session.profile, desired_revision, desired_digest) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
         defer context.allocator.free(plan_json);
         context.sessions.captureInstallPlan(context.allocator, checked.session.boot_session_id[0..], plan_json, desired_revision) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"boot session plan is already pinned to different inputs\"}}\n", meta);
     }
@@ -691,7 +700,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
     };
     if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist delivery session\"}}\n", meta);
 
-    context.statuses.updateForDeployment(node_id, session.boot_session_id[0..], context.daemon_instance_id, session.model_revision, session.deployment_generation, .boot_config_fetched, null, unixNow(), true) catch |err|
+    context.statuses.updateForDeployment(node_id, session.boot_session_id[0..], context.daemon_instance_id, session.model_revision, session.model_plan_digest, session.deployment_generation, .boot_config_fetched, null, unixNow(), true) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     const fields = [_]events.Field{
@@ -772,6 +781,7 @@ const AnswerFormat = enum { kickstart, user_data, meta_data, vendor_data };
 const InstallPlanEnvelope = struct {
     schema_version: u32,
     model_revision: u64,
+    plan_digest: deployment_control.Digest,
     node: model.NodeConfig,
     profile: model.ProfileConfig,
     distro: model.DistroConfig,
@@ -787,7 +797,9 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
     if (checked.proof == .bootstrap and checked.session.plan_digest == null) {
         const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
-        const plan_json = buildInstallPlan(context, node_id, checked.session.profile, desired_revision) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
+        const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
+        if (!deployment_control.digestEqual(checked.session.model_plan_digest, desired_digest)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"node plan changed after PXE authorization; retry is required\"}}\n", meta);
+        const plan_json = buildInstallPlan(context, node_id, checked.session.profile, desired_revision, desired_digest) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
         defer context.allocator.free(plan_json);
         context.sessions.captureInstallPlan(context.allocator, checked.session.boot_session_id[0..], plan_json, desired_revision) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"boot session plan is already pinned to different inputs\"}}\n", meta);
     }
@@ -910,7 +922,7 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     try request.sendBody(body);
 }
 
-fn buildInstallPlan(context: *const RouteContext, node_id: []const u8, profile_name: []const u8, desired_revision: u64) ![]u8 {
+fn buildInstallPlan(context: *const RouteContext, node_id: []const u8, profile_name: []const u8, desired_revision: u64, desired_digest: deployment_control.Digest) ![]u8 {
     const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return error.MissingNode;
     const profile = lookup.findProfile(context.catalog_snapshot.value(), profile_name) orelse return error.MissingProfile;
     const distro = lookup.findDistro(context.catalog_snapshot.value(), profile.distro) orelse return error.MissingDistro;
@@ -918,17 +930,33 @@ fn buildInstallPlan(context: *const RouteContext, node_id: []const u8, profile_n
     const source = lookup.findInstallSource(catalog_snapshot.value(), profile.install_source orelse return error.MissingInstallSource) orelse return error.MissingInstallSource;
     const kernel = lookup.findAsset(catalog_snapshot.value(), source.installer_kernel) orelse return error.MissingAsset;
     const initrd = lookup.findAsset(catalog_snapshot.value(), source.installer_initrd) orelse return error.MissingAsset;
+    const repositories = try context.allocator.alloc(model.RepositoryConfig, source.repositories.len);
+    defer context.allocator.free(repositories);
+    for (source.repositories, 0..) |name, index|
+        repositories[index] = (lookup.findRepository(catalog_snapshot.value(), name) orelse return error.MissingRepository).*;
+    const bundle_count: usize = if (profile.install != null and profile.install.?.bundle != null) 1 else 0;
+    const bundles = try context.allocator.alloc(model.ProvisioningBundle, bundle_count);
+    defer context.allocator.free(bundles);
+    if (profile.install) |install| if (install.bundle) |name| {
+        var found: ?model.ProvisioningBundle = null;
+        for (catalog_snapshot.value().provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) {
+            found = bundle;
+            break;
+        };
+        bundles[0] = found orelse return error.MissingProvisioningBundle;
+    };
     return std.json.Stringify.valueAlloc(context.allocator, .{
         .schema_version = @as(u32, 1),
         .model_revision = desired_revision,
+        .plan_digest = desired_digest,
         .node = node.*,
         .profile = profile.*,
         .distro = distro.*,
         .install_source = source.*,
         .kernel = kernel.*,
         .initrd = initrd.*,
-        .catalog_repositories = catalog_snapshot.value().repositories,
-        .provisioning_bundles = context.catalog_snapshot.value().provisioning_bundles,
+        .catalog_repositories = repositories,
+        .provisioning_bundles = bundles,
         .delivery = .{ .server_ip = context.config.server.server_ip, .http_port = context.config.server.http_port },
     }, .{});
 }
@@ -976,7 +1004,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
         };
     }
-    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.deployment_generation, mapped.phase, event.value.reason, unixNow(), !terminal) catch |err|
+    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, mapped.phase, event.value.reason, unixNow(), !terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [4]events.Field = .{
@@ -1015,7 +1043,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
         .diskless => "diskless.failed",
         .discovery => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.stage_invalid\",\"message\":\"logs unavailable for discovery\"}}\n", meta),
     };
-    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.deployment_generation, .failed, summary.value.reason, unixNow(), false) catch |err|
+    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, .failed, summary.value.reason, unixNow(), false) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     const fields = [_]events.Field{ .{ .key = "node_id", .value = node_id }, .{ .key = "boot_session_id", .value = checked.session.boot_session_id[0..] }, .{ .key = "reason", .value = summary.value.reason } };
@@ -1132,7 +1160,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
         };
     }
-    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.deployment_generation, mapped.phase, null, unixNow(), !delivery_terminal) catch |err|
+    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, mapped.phase, null, unixNow(), !delivery_terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [3]events.Field = .{
@@ -1812,9 +1840,9 @@ fn installGenerations(request: zap.Request, context: *const RouteContext, node_i
         @import("../state/boot_session_store.zig").save(context.io, context.allocator, paths.require().boot_sessions_path, context.sessions, unixNow()) catch
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced session termination\"}}\n", meta);
     }
-    const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
+    const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
     const requested_at = unixNow();
-    const rearm = context.deployments.rearm(node_id, desired_revision, requested_at, .operator) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot rearm install generation\"}}\n", meta);
+    const rearm = context.deployments.rearm(node_id, desired_digest, requested_at, .operator) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot rearm install generation\"}}\n", meta);
     if (rearm.changed) {
         deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch {
             context.deployments.rollbackRearm(node_id, rearm);
@@ -2042,16 +2070,23 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
         else => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.mutation_failed\",\"message\":\"node could not be added\"}}\n", meta),
     };
     applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"node persisted but snapshot publish failed\"}}\n", meta);
+    const current = context.catalog.acquire();
+    defer current.release();
+    // M4.8 的启动派生容量不能阻止 M4.10 的在线 node add。只按新受管
+    // 节点数扩大各投影表，保留更大的 config override，不超过安全天花板。
+    context.deployments.growEffective(current.value().nodes.len);
+    context.statuses.growEffective(current.value().nodes.len);
+    context.inventories.growCapacity(current.value().nodes.len);
     // M4.10：在线添加 install 节点必须与 daemon 启动恢复具有相同的首次
     // generation 语义。否则 fresh CLI 流程会在 node add 成功后仍显示
     // deployment=null，必须额外重启或 retry 才能获得 PXE。
     if (value.deploy) {
-        const current = context.catalog.acquire();
-        defer current.release();
         if (lookup.findProfile(current.value(), value.profile)) |profile| if (profile.mode == .install) {
-            const revision = deployment_control.revisionForModel(context.allocator, context.config, current.value()) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"node persisted but initial install generation could not be computed\"}}\n", meta);
-            const desired_revision = revision.desiredRevision();
-            context.deployments.ensureInitial(value.id, desired_revision, unixNow()) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.capacity_exceeded\",\"message\":\"node persisted but initial install generation could not be allocated\"}}\n", meta);
+            const desired_digest = @import("../state/plan_digest.zig").forNode(context.allocator, context.config, current.value(), .{
+                .bootstrap_key = context.bootstrap_key,
+                .additional_keys = context.additional_keys,
+            }, value.id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"node persisted but initial install plan digest could not be computed\"}}\n", meta);
+            context.deployments.ensureInitial(value.id, desired_digest, unixNow()) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.capacity_exceeded\",\"message\":\"node persisted but initial install generation could not be allocated\"}}\n", meta);
             deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"node persisted but initial install generation could not be persisted\"}}\n", meta);
         };
     }
@@ -2131,23 +2166,23 @@ fn revisionConflict(request: zap.Request, meta: RequestMeta) !void {
 fn managementNodes(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     const page = pageRequest(request, "nodes", context.catalog_snapshot.revision) catch |err| return pageError(request, err, meta);
     if (page.offset > context.catalog_snapshot.value().nodes.len) return pageError(request, error.InvalidCursor, meta);
-    const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
     const end = @min(page.offset + page.limit, context.catalog_snapshot.value().nodes.len);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"items\":[", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision() });
     for (context.catalog_snapshot.value().nodes[page.offset..end], 0..) |node, index| {
         if (index != 0) try output.writer.writeByte(',');
+        const desired_digest = desiredPlanDigest(context, node.id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
         const deployment = context.deployments.view(node.id);
-        const status = currentProjectedStatus(context, node.id, deployment, desired_revision);
+        const status = currentProjectedStatus(context, node.id, deployment, desired_digest);
         const inventory = context.inventories.get(node.id);
         try output.writer.print("{{\"id\":{f},\"mac\":{f},\"ip\":", .{ std.json.fmt(node.id, .{}), std.json.fmt(node.mac, .{}) });
         if (node.ip) |ip| try output.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try output.writer.writeAll("null");
         try output.writer.print(",\"profile\":{f},\"deploy\":{s},\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"armed_generation\":{f},\"status\":", .{
             std.json.fmt(node.profile, .{}),
             if (node.deploy) "true" else "false",
-            std.json.fmt(installIntent(node.deploy, deployment, desired_revision), .{}),
-            if (installPxeReady(node.deploy, deployment, desired_revision)) "true" else "false",
+            std.json.fmt(installIntent(node.deploy, deployment, desired_digest), .{}),
+            if (installPxeReady(node.deploy, deployment, desired_digest)) "true" else "false",
             if (retryPending(deployment)) "true" else "false",
             std.json.fmt(if (deployment) |value| value.armed_generation else null, .{}),
         });
@@ -2171,7 +2206,8 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
             if (times.finished_at != 0) try output.writer.print("{d}", .{times.finished_at}) else try output.writer.writeAll("null");
             try output.writer.writeAll(",\"deployed_at\":");
             if (value.deployed_at != 0) try output.writer.print("{d}", .{value.deployed_at}) else try output.writer.writeAll("null");
-            try output.writer.print(",\"drifted\":{s}", .{if (value.applied_revision != 0 and value.applied_revision != desired_revision) "true" else "false"});
+            const drift = context.deployments.drift(node.id, desired_digest);
+            try output.writer.print(",\"drifted\":{s},\"drift_state\":{f}", .{ if (drift == .drifted) "true" else "false", std.json.fmt(@tagName(drift), .{}) });
         } else try output.writer.writeAll(",\"start_at\":null,\"install_at\":null,\"finished_at\":null,\"deployed_at\":null,\"drifted\":false");
         try output.writer.writeAll(",\"serial_number\":");
         if (inventory) |value| if (value.serial_number) |serial| try output.writer.print("{f}", .{std.json.fmt(serial, .{})}) else try output.writer.writeAll("null") else try output.writer.writeAll("null");
@@ -2188,8 +2224,9 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return notFound(request, meta);
     const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile) orelse return notFound(request, meta);
     const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
+    const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
     const deployment = context.deployments.view(node_id);
-    const status = currentProjectedStatus(context, node_id, deployment, desired_revision);
+    const status = currentProjectedStatus(context, node_id, deployment, desired_digest);
     const inventory = context.inventories.get(node_id);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
@@ -2209,9 +2246,10 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     try output.writer.writeAll(",\"deployment\":");
     if (deployment) |value| {
         const times = deploymentTimes(value);
-        try output.writer.print("{{\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"current_generation\":{f},\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"drifted\":{s},\"requested_by\":{f},\"start_at\":{d},\"install_at\":{d},\"finished_at\":{d},\"successful_generation\":{d},\"deployed_at\":{d}}}", .{
-            std.json.fmt(installIntent(node.deploy, value, desired_revision), .{}),
-            if (installPxeReady(node.deploy, value, desired_revision)) "true" else "false",
+        const drift = context.deployments.drift(node_id, desired_digest);
+        try output.writer.print("{{\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"current_generation\":{f},\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"requested_plan_digest\":{f},\"applied_plan_digest\":{f},\"desired_plan_digest\":{f},\"drifted\":{s},\"drift_state\":{f},\"requested_by\":{f},\"start_at\":{d},\"install_at\":{d},\"finished_at\":{d},\"successful_generation\":{d},\"deployed_at\":{d}}}", .{
+            std.json.fmt(installIntent(node.deploy, value, desired_digest), .{}),
+            if (installPxeReady(node.deploy, value, desired_digest)) "true" else "false",
             if (retryPending(value)) "true" else "false",
             std.json.fmt(value.currentGeneration(), .{}),
             std.json.fmt(value.armed_generation, .{}),
@@ -2220,7 +2258,11 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
             value.requested_revision,
             value.applied_revision,
             desired_revision,
-            if (value.applied_revision != 0 and value.applied_revision != desired_revision) "true" else "false",
+            std.json.fmt(if (deployment_control.digestSet(value.requested_plan_digest)) value.requested_plan_digest[0..] else null, .{}),
+            std.json.fmt(if (deployment_control.digestSet(value.applied_plan_digest)) value.applied_plan_digest[0..] else null, .{}),
+            std.json.fmt(desired_digest[0..], .{}),
+            if (drift == .drifted) "true" else "false",
+            std.json.fmt(@tagName(drift), .{}),
             std.json.fmt(@tagName(value.requested_by), .{}),
             times.start_at,
             times.install_at,
@@ -2238,16 +2280,16 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
 
 /// 返回与当前 desired model 和当前 deployment generation 同源的状态。
 /// node list/show 是一致投影，不能把历史 session 的 phase 与新 profile/retry 拼接。
-fn currentProjectedStatus(context: *const RouteContext, node_id: []const u8, deployment: ?deployment_control.View, desired_revision: u64) ?node_status.Status {
+fn currentProjectedStatus(context: *const RouteContext, node_id: []const u8, deployment: ?deployment_control.View, desired_digest: deployment_control.Digest) ?node_status.Status {
     var status = context.statuses.get(node_id) orelse return null;
     // schema 4 首版尚无 provenance。只在 deployment state 能以“同一 terminal
     // generation + 同一 finished timestamp”严格佐证时补全；不能仅凭 node_id
     // 接受旧 completed，否则 profile 修改后又会把旧结果拼到新 desired config。
-    if (status.model_revision == 0 and status.deployment_generation == 0) {
+    if (!deployment_control.digestSet(status.model_plan_digest)) {
         const view = deployment orelse return null;
         status = corroborateLegacyStatus(status, view) orelse return null;
     }
-    if (status.model_revision == 0 or status.model_revision != desired_revision) return null;
+    if (!deployment_control.digestSet(status.model_plan_digest) or !deployment_control.digestEqual(status.model_plan_digest, desired_digest)) return null;
     if (status.deployment_generation != 0) {
         const view = deployment orelse return null;
         const current_generation = view.currentGeneration() orelse return null;
@@ -2267,6 +2309,7 @@ fn corroborateLegacyStatus(raw: node_status.Status, view: deployment_control.Vie
     if (!terminal_matches) return null;
     var status = raw;
     status.model_revision = view.requested_revision;
+    status.model_plan_digest = view.requested_plan_digest;
     status.deployment_generation = current_generation;
     return status;
 }
@@ -2284,11 +2327,11 @@ fn deploymentPhaseFallback(view: deployment_control.View) ?[]const u8 {
 
 /// M4.9 破坏性安装意图投影：node identity 与 `deploy` 决定节点是否参与，
 /// generation/revision 决定某一次具体安装是否仍获授权。
-fn installIntent(deploy: bool, view: ?deployment_control.View, desired_revision: u64) []const u8 {
+fn installIntent(deploy: bool, view: ?deployment_control.View, desired_digest: deployment_control.Digest) []const u8 {
     if (!deploy) return "disabled";
     const value = view orelse return "not-applicable";
     if (value.armed_generation != null) {
-        if (value.requested_revision != desired_revision) return "rearm-required";
+        if (!deployment_control.digestSet(value.requested_plan_digest) or !deployment_control.digestEqual(value.requested_plan_digest, desired_digest)) return "rearm-required";
         return switch (value.requested_by) {
             .initial => "initial-armed",
             .operator => "retry-armed",
@@ -2301,9 +2344,9 @@ fn installIntent(deploy: bool, view: ?deployment_control.View, desired_revision:
     return "not-armed";
 }
 
-fn installPxeReady(deploy: bool, view: ?deployment_control.View, desired_revision: u64) bool {
+fn installPxeReady(deploy: bool, view: ?deployment_control.View, desired_digest: deployment_control.Digest) bool {
     const value = view orelse return false;
-    return deploy and value.armed_generation != null and value.requested_revision == desired_revision;
+    return deploy and value.armed_generation != null and deployment_control.digestSet(value.requested_plan_digest) and deployment_control.digestEqual(value.requested_plan_digest, desired_digest);
 }
 
 fn retryPending(view: ?deployment_control.View) bool {
@@ -2312,12 +2355,15 @@ fn retryPending(view: ?deployment_control.View) bool {
 }
 
 test "install intent distinguishes initial retry stale and consumed states" {
+    const digest_42: deployment_control.Digest = [_]u8{'4'} ** 64;
+    const digest_43: deployment_control.Digest = [_]u8{'5'} ** 64;
     var view: deployment_control.View = .{
         .next_generation = 2,
         .armed_generation = 1,
         .consumed_generation = null,
         .terminal_generation = null,
         .requested_revision = 42,
+        .requested_plan_digest = digest_42,
         .applied_revision = 0,
         .requested_at = 1,
         .started_at = 0,
@@ -2325,19 +2371,19 @@ test "install intent distinguishes initial retry stale and consumed states" {
         .deployed_at = 0,
         .requested_by = .initial,
     };
-    try std.testing.expectEqualStrings("disabled", installIntent(false, view, 42));
-    try std.testing.expectEqualStrings("initial-armed", installIntent(true, view, 42));
-    try std.testing.expect(installPxeReady(true, view, 42));
+    try std.testing.expectEqualStrings("disabled", installIntent(false, view, digest_42));
+    try std.testing.expectEqualStrings("initial-armed", installIntent(true, view, digest_42));
+    try std.testing.expect(installPxeReady(true, view, digest_42));
     view.requested_by = .operator;
-    try std.testing.expectEqualStrings("retry-armed", installIntent(true, view, 42));
+    try std.testing.expectEqualStrings("retry-armed", installIntent(true, view, digest_42));
     try std.testing.expect(retryPending(view));
-    try std.testing.expectEqualStrings("rearm-required", installIntent(true, view, 43));
-    try std.testing.expect(!installPxeReady(true, view, 43));
+    try std.testing.expectEqualStrings("rearm-required", installIntent(true, view, digest_43));
+    try std.testing.expect(!installPxeReady(true, view, digest_43));
     view.armed_generation = null;
     view.consumed_generation = 1;
-    try std.testing.expectEqualStrings("installing", installIntent(true, view, 42));
+    try std.testing.expectEqualStrings("installing", installIntent(true, view, digest_42));
     view.terminal_generation = 1;
-    try std.testing.expectEqualStrings("not-armed", installIntent(true, view, 42));
+    try std.testing.expectEqualStrings("not-armed", installIntent(true, view, digest_42));
 }
 
 const DeploymentTimes = struct { start_at: i64, install_at: i64, finished_at: i64 };
@@ -2501,8 +2547,9 @@ fn managementProfile(request: zap.Request, context: *const RouteContext, name: [
 
 fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
+    const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
     const deployment = context.deployments.view(node_id);
-    const status = currentProjectedStatus(context, node_id, deployment, desired_revision) orelse return notFound(request, meta);
+    const status = currentProjectedStatus(context, node_id, deployment, desired_digest) orelse return notFound(request, meta);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     try output.writer.print("{{\"ok\":true,\"result\":{{\"id\":{f},\"boot_session_id\":{f},\"model_revision\":{d},\"deployment_generation\":{d},\"phase\":{f},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}", .{
@@ -2510,14 +2557,17 @@ fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node
         if (status.last_error) "true" else "false", std.json.fmt(status.reasonSlice(), .{}),        if (status.session_active) "true" else "false",
     });
     if (deployment) |value| {
-        try output.writer.print(",\"deployment\":{{\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"drifted\":{s},\"requested_at\":{d},\"requested_by\":{f}}}", .{
+        const drift = context.deployments.drift(node_id, desired_digest);
+        try output.writer.print(",\"deployment\":{{\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"desired_plan_digest\":{f},\"drifted\":{s},\"drift_state\":{f},\"requested_at\":{d},\"requested_by\":{f}}}", .{
             std.json.fmt(value.armed_generation, .{}),
             std.json.fmt(value.consumed_generation, .{}),
             std.json.fmt(value.terminal_generation, .{}),
             value.requested_revision,
             value.applied_revision,
             desired_revision,
-            if (value.applied_revision != 0 and value.applied_revision != desired_revision) "true" else "false",
+            std.json.fmt(desired_digest[0..], .{}),
+            if (drift == .drifted) "true" else "false",
+            std.json.fmt(@tagName(drift), .{}),
             value.requested_at,
             std.json.fmt(@tagName(value.requested_by), .{}),
         });

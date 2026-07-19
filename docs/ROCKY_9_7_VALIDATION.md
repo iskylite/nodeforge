@@ -41,8 +41,9 @@ M4/M4.1 的 Rocky 9.7 与 Ubuntu 22.04 正向安装、登录和生命周期链�
 本轮本地门槛：`zig build test` 通过；`make arm64` 通过。实机门槛：r97n0 fresh setup/import/node add
 通过，r97n1 获得 PXE lease/bootfile，拉取 GRUB/kernel/initrd，完成 Anaconda 安装，重启后本地盘启动成功。
 
-本轮属于 M4.9a 已实现范围。完整 node-scoped 256-bit digest 的 deployment/session/status schema 迁移属于
-M4.9b，尚未实现，不能由本次 u64 联合 revision 修复或实机成功代替。
+本轮当时只属于 M4.9a 范围，不能作为 M4.9b 证据。M4.9b 后续已实现并在
+[`UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`](UBUNTU_22_04_M4_9_M4_10_VALIDATION.md)
+完成 schema 迁移、完整 digest 和 Ubuntu PXE 独立验收；本段保留的是 2026-07-18 的历史边界。
 
 ## M4.10（2026-07-19）：fresh CLI 闭环
 
@@ -69,8 +70,8 @@ nodeforge node add r97n1 mac=00:50:56:2A:23:DB arch=aarch64 \
 - node add 后无需重启/retry，立即显示 `install_intent=initial-armed`、`pxe_ready=true`、
   `armed_generation=1`，requested/desired revision 相等。
 - `profile create rocky-9.7-alt rocky-9.7-aarch64-iso` 可补充第二个 profile。
-- 当前 M4.9a 全局 digest 会因补充无关 profile 使既有 arm 进入 `rearm-required`；执行一次
-  `node retry r97n1` 后恢复 `retry-armed/pxe_ready=true`。该扰动由 M4.9b node-scoped digest 消除。
+- 当时 M4.9a 的全局 digest 会因补充无关 profile 使既有 arm 进入 `rearm-required`；该历史扰动已由
+  M4.9b node-scoped digest 消除，新验证中无关 Ubuntu source/profile 导入没有改变 r97n1 desired plan。
 - missing source、missing profile 分别返回 `profile.install_source_not_found`、
   `node.profile_not_found` 和 request id。
 - `setup --reconfigure --install` 返回退出码 2，并说明 reconfigure 已发布 unit、`--install`

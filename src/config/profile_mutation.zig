@@ -1,4 +1,11 @@
-//! M4.7 profile `kernel_args` catalog mutation。
+//! PXE profile 的受约束 catalog mutation。
+//!
+//! 本模块只提供已进入现行 CLI/HTTP 契约的窄写入口：
+//! - 从已有 install source 创建安全默认 install profile；
+//! - 规范化修改 `kernel_args`；
+//! - 同步修改 install profile 的 `boot_disk`/`install_disks`。
+//! 每次写入都先投影完整 config+catalog 模型并校验，再由 catalog store
+//! 原子发布；这里不实现 M6 规划中的通用 profile CRUD。
 const std = @import("std");
 const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
@@ -18,6 +25,8 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
     const profiles = try allocator.alloc(model.ProfileConfig, parsed.value.profiles.len + 1);
     defer allocator.free(profiles);
     @memcpy(profiles[0..parsed.value.profiles.len], parsed.value.profiles);
+    // 与 ISO import 自动创建的默认 profile 使用同一安全基线。CLI 不接收
+    // 任意 safety/storage JSON，避免形成绕过模型校验的第二套创建语义。
     profiles[parsed.value.profiles.len] = .{
         .name = name,
         .mode = .install,

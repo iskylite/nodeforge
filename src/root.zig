@@ -72,6 +72,8 @@ pub const dhcp_store = @import("state/dhcp_store.zig");
 /// 节点状态持久化存储：磁盘上的节点状态和终态记录。
 pub const status_store = @import("state/status_store.zig");
 pub const deployment_control = @import("state/deployment_control.zig");
+/// M4.9b：仅包含节点实际引用事实的完整 SHA-256 部署计划摘要。
+pub const plan_digest = @import("state/plan_digest.zig");
 /// CLI 管理客户端：通过本机 HTTP 管理 API 与 daemon 通信。
 pub const management_client = @import("http/client.zig");
 pub const http_routes = @import("http/routes.zig");
@@ -157,6 +159,7 @@ test {
     _ = dhcp_store;
     _ = status_store;
     _ = deployment_control;
+    _ = plan_digest;
     _ = management_client;
     _ = http_routes;
     _ = management;

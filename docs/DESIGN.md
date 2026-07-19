@@ -1020,16 +1020,17 @@ NetworkManager 配置，不依赖不稳定的 `ens*`/`enp*` 名称。
 
 M4.9 将安装授权收敛为四层门禁，职责不能混为一谈：注册 MAC/arch/profile 阻止未知或不完整节点安装，`deploy` 是已知节点的长期 PXE
 硬开关，generation 防止已安装节点因 PXE-first 再次安装，plan digest 则只防止 retry 确认后、PXE 开始前该节点
-的实际安装计划被替换。最终 digest 必须是 node-scoped 的完整 SHA-256；全局 config+catalog 摘要会被无关 ISO/
-node 导入扰动，只作为当前兼容实现，不作为最终安全模型。
+的实际安装计划被替换。现行授权 digest 是 node-scoped 的完整 SHA-256；全局 config+catalog 摘要会被无关 ISO/
+node 导入扰动，仅保留为 view revision 和旧 schema/CLI 读取兼容，不参与授权、恢复 join 或 drift。
 
 安装完成时记录 applied config/target-system/install-plan digest。之后修改 network、用户、密码、包或安全策略
 只形成 desired/applied drift，不自动重装；storage/bootloader/source 变化必须显式新 generation，目标系统在线
 reconciliation 留给 M7。离线 `config validate` 不读取 runtime，只有 diff/apply/show 能结合 applied revision
 提示影响。
 
-`drifted=false` 是运行时派生值：`applied_revision` 非零且等于当前 config+catalog 联合内容指纹时表示无漂移；
-尚无成功安装基线（`applied_revision=0`）时也为 false，此时应结合 pending/running phase 理解，不能解读为“已验证一致”。
+drift 使用三态：存在完整 `applied_plan_digest` 且等于 desired 时为 `clean`，不等时为 `drifted`；只有旧
+u64 applied provenance 或尚无成功安装基线时为 `unknown`。兼容布尔 `drifted=false` 不能单独解读为
+“已验证一致”，CLI/API 应优先展示 `drift_state`。
 `destructive=true` 是 install profile 对不可逆持久写入的安全声明，`wipe=true` 是该 profile 的
 `install.storage` 具体擦盘策略，两者可与 `drifted=false` 同时出现，含义并不冲突。它们不是 node 属性：
 `node set` 当前只支持 `mac/arch/profile/ip/hostname/deploy/http_accel`；可通过切换 `profile` 间接改变 desired plan，

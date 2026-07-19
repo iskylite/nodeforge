@@ -106,7 +106,6 @@ pub fn run(
     try operations.clearMigrationRecoveryRecords(io, allocator, transaction_dir);
     const model_revision = try deployment_control.revisionForModel(allocator, config, catalog);
     const config_revision = model_revision.config;
-    const desired_revision = model_revision.desiredRevision();
     var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);
     defer live_config.deinit();
     // live_catalog/live_models 必须在 Persistence 构造前就绪：DHCP 的武装判定
@@ -133,13 +132,18 @@ pub fn run(
         },
     };
     if (restored_sessions != 0) observe_log.info("boot-session: resumed {d} delivery session(s)", .{restored_sessions});
+    // deployment/session/status 是同一个 M4.9b schema 窗口。旧 checkpoint
+    // 读取成功后立即重写，而不是等待下一次 DHCP/HTTP 事件或有序关机；这样
+    // 升级中途崩溃也不会长期留下混合 schema。旧 capability 已在 load 中丢弃。
+    try boot_session_store.save(io, allocator, paths.require().boot_sessions_path, &sessions, current_time);
+    var migrated_status_snapshot: [node_status.max_statuses]node_status.Status = undefined;
+    statuses.snapshot(&migrated_status_snapshot);
+    try status_store.save(io, allocator, paths.require().node_status_path, &migrated_status_snapshot, statuses.currentRevision(), current_time);
     // inventory/deployment 恢复可能把 effective 下限抬高；必须在加载后报告实际值，
     // 不能把 clamp 前派生值或加载前默认值误报为生效容量。
     observe_log.info("capacity: subnet={s} derived={d}, lease/session effective={d}/{d} (ceiling {d}); managed nodes={d}, status={d} inventory={d} deployment={d} (ceiling {d}); tftp concurrency={d}; ping_timeout_ms={d}", .{ config.dhcp.subnet, lease_cap, runtime.dhcp.effective, sessions.effective, runtime_state.DhcpState.max_leases, config.nodes.len, statuses.effective, inventories.capacity, deployments.effective, node_status.max_statuses, tftp_conc, config.dhcp.ping_timeout_ms });
-    for (config.nodes) |node| if (forProfile(config, node.profile)) |profile| if (profile.mode == .install) {
-        deployments.ensureInitial(node.id, desired_revision, current_time) catch |err| return err;
-    };
-    try deployment_control.save(io, allocator, paths.require().deployment_control_path, &deployments);
+    // 先解析实际会写入 answer 的密钥，再计算/武装 plan digest。配置为空时
+    // 密钥可能来自受管文件或自动生成 key，仅摘要 ServerConfig 会漏掉真实输入。
     const bootstrap_key = try @import("server/admin_key.zig").resolve(io, allocator, config.server);
     defer allocator.free(bootstrap_key);
     const additional_keys = try @import("server/admin_key.zig").resolveAdditional(io, allocator, config.server);
@@ -147,6 +151,15 @@ pub fn run(
         for (additional_keys) |key| allocator.free(key);
         allocator.free(additional_keys);
     }
+    const delivery: @import("state/plan_digest.zig").Delivery = .{
+        .bootstrap_key = bootstrap_key,
+        .additional_keys = additional_keys,
+    };
+    for (config.nodes) |node| if (forProfile(config, node.profile)) |profile| if (profile.mode == .install) {
+        const digest = try @import("state/plan_digest.zig").forNode(allocator, config, catalog, delivery, node.id);
+        deployments.ensureInitial(node.id, digest, current_time) catch |err| return err;
+    };
+    try deployment_control.save(io, allocator, paths.require().deployment_control_path, &deployments);
 
     // M3.1：leases.json 和 node-status.json 使用独立的 I/O 锁。
     // DHCP checkpoint worker 持有 leases.json；HTTP handler 持有
@@ -156,13 +169,12 @@ pub fn run(
     event_writer.appendWithFields(io, allocator, paths.require().events_path, "config.loaded", "validated configuration loaded", &.{}) catch |err|
         observe_log.err("events: unable to record configuration load: {t}", .{err});
     for (config.nodes) |node| if (deployments.view(node.id)) |deployment| {
-        if (deployment.applied_revision != 0 and deployment.applied_revision != desired_revision) {
-            var applied_text: [24]u8 = undefined;
-            var desired_text: [24]u8 = undefined;
+        const digest = @import("state/plan_digest.zig").forNode(allocator, config, catalog, delivery, node.id) catch continue;
+        if (deployments.drift(node.id, digest) == .drifted) {
             const fields = [_]events.Field{
                 .{ .key = "node_id", .value = node.id },
-                .{ .key = "applied_revision", .value = std.fmt.bufPrint(&applied_text, "{d}", .{deployment.applied_revision}) catch "0" },
-                .{ .key = "desired_revision", .value = std.fmt.bufPrint(&desired_text, "{d}", .{desired_revision}) catch "0" },
+                .{ .key = "applied_plan_digest", .value = deployment.applied_plan_digest[0..] },
+                .{ .key = "desired_plan_digest", .value = digest[0..] },
             };
             event_writer.appendWithFields(io, allocator, paths.require().events_path, "install.configuration_drifted", "installed node configuration differs from current desired state", &fields) catch |err|
                 observe_log.err("events: unable to record install drift: {t}", .{err});
@@ -175,6 +187,8 @@ pub fn run(
         .sessions = &sessions,
         .deployments = &deployments,
         .models = &live_models,
+        .bootstrap_key = bootstrap_key,
+        .additional_keys = additional_keys,
     };
     // DHCP 需要 wildcard 接收 socket 以处理客户端广播。DHCP 服务器将配置的
     // PXE NIC 作为 Linux socket 级别的边界；TFTP 保持绑定在广告的 unicast 地址。

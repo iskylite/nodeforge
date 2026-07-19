@@ -93,9 +93,8 @@ nodeforge node retry <node>
 操作员确认目标机已停止后，可使用 `node retry <node> --force` 显式 supersede 卡死 session 并重新武装；
 不得要求手工删除 session checkpoint。
 
-当前 M4.9a 仍以全局 config+catalog u64 投影武装 generation，因此在节点已 arm 后补充一个无关
-profile 也会暂时显示 `rearm-required`；操作员需执行 `node retry`。消除无关实体扰动属于已经定义的
-M4.9b node-scoped 完整 digest，不在 M4.10 伪造第二套比较规则。
+M4.9b 已以 node-scoped 完整 digest 武装 generation；节点 arm 后补充一个无关 profile 不再导致
+`rearm-required`。只有实际影响该节点的 profile/source/asset、目标系统字段或有效交付 key 变化才要求 retry。
 
 ## 5. 输出和错误契约
 
@@ -103,7 +102,10 @@ M4.9b node-scoped 完整 digest，不在 M4.10 伪造第二套比较规则。
 - profile create 返回 profile/source/mode。
 - node add 至少区分 `node.profile_not_found`、`node.already_exists`、`node.duplicate_mac`。
 - 在线添加 `deploy=true` 的 install 节点立即持久化 initial generation；不得依赖 daemon 重启或额外 retry。
+- 在线 node add 按新受管节点数只增不减地扩大 deployment/status/inventory effective capacity；启动时按旧
+  节点数派生的容量不得使第二个节点“已落 catalog、未能 initial arm”。
 - 所有失败继续携带 request id；CLI 不把结构化服务端错误重新折叠成通用消息。
+- human `profile show` 必须接受 ISO 自动 profile 的 nullable `source_label`，为空时回退 source name。
 
 ## 6. 验收
 
@@ -115,6 +117,19 @@ M4.9b node-scoped 完整 digest，不在 M4.10 伪造第二套比较规则。
 - ISO import 输出 install source。
 - 本地完整测试、ARM64 交叉编译通过。
 - r97n0 从 purge-all 开始，仅用 CLI 完成 ISO import（自动 profile）和 node add；另验显式补充 profile create。
-- node add 后立即为 `initial-armed/pxe_ready=true`；补充 profile 后按当前全局 digest 语义显式 retry 恢复 ready。
+- node add 后立即为 `initial-armed/pxe_ready=true`；补充无关 profile 后仍保持 ready。
 - r97n1 NVMe 实机使用 profile set 修正目标盘后完成 Anaconda 安装；卡死 session 通过显式
   `node retry --force` 恢复，不修改 JSON/checkpoint。
+
+## 7. 设计—实现映射
+
+| 现行契约 | 实现事实源 | 自动/实机证据 |
+| --- | --- | --- |
+| reset/purge → reconfigure，且不隐式控制服务 | `src/main.zig` `setupHandler`、`purgeSetupHistory` | `tests/setup.sh`；r97n0 fresh CLI 回归 |
+| standalone systemd 安装带 readiness/rollback | `src/main.zig` `installSystemd`、`waitForSystemdHealth` | setup 合约测试；Rocky 激活验证，负向回滚清单继续保留 |
+| ISO import 原子发布 source + 同名默认 profile | `src/catalog/iso_import.zig`、`src/state/catalog_runtime.zig` | catalog 单测、`tests/http.sh`、r97n0 ISO 导入 |
+| 窄 profile create / boot disk mutation | `src/config/profile_mutation.zig`、`src/http/server.zig` | `tests/http.sh`；r97n1 NVMe 安装 |
+| node add 立即 initial arm；容量在线扩大；retry 可强制替代卡死 session | `src/http/server.zig`、`src/state/deployment_control.zig`、`src/state/boot_session_store.zig` | 244 个 Zig 测试、HTTP/CLI 合约、r97n2 Ubuntu generation 3 |
+
+本表只映射 M4.10 范围。M4.9b 的 node-scoped 完整 SHA-256 已实现，但其系统验收必须引用独立的
+schema/迁移负向证据和本轮 r97n0/Ubuntu PXE 记录，不能只引用旧 PXE 正向成功。

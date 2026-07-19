@@ -581,7 +581,9 @@ fn installSystemd(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !voi
 }
 
 fn waitForSystemdHealth(io: std.Io, port: u16) bool {
-    const attempts = 50;
+    // 每次 probe 自带 250ms receive 上限，15 次加 100ms 间隔使整个
+    // readiness transaction 保持约 5 秒，而非只限制 sleep 总和。
+    const attempts = 15;
     for (0..attempts) |attempt| {
         if (nodeforge.management_client.health(io, port).healthy) return true;
         if (attempt + 1 < attempts) std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
@@ -879,14 +881,12 @@ fn catalogMigrateHandler(ctx: zli.CommandContext) !void {
     try ctx.writer.print("Plan digest: {s}\nRenames: {d}\nBlockers: {d}\nApplicable: {s}\n", .{ parsed.value.result.plan_digest, parsed.value.result.plan.renames.len, parsed.value.result.plan.blockers.len, if (parsed.value.result.applicable) "yes" else "no" });
 }
 
-/// 导入一个已存在的 root 受管文件，计算其 SHA-256 摘要，校验候选 catalog
-/// 后原子发布新 manifest。
+/// 通过本机 daemon 注册一个已经位于受管根目录中的资产。
 ///
-/// 这是一个离线路径：不通过 daemon 的管理 API，而是直接操作 catalog 文件。
-/// 适用于 daemon 尚未启动时的初始部署场景。导入过程：
-/// 1. 解析 --type/--name/--path/--distro/--version/--arch/--kernel-release 参数
-/// 2. 通过管理 API 请求 daemon 执行实际导入（计算摘要、校验、发布）
-/// 3. daemon 拒绝时返回退出码 1，CLI 参数错误返回退出码 2
+/// CLI 只解析并校验资产类型、逻辑名称、受管相对路径和可选 distro tuple；
+/// 文件打开、SHA-256 计算、候选模型校验及 catalog 原子发布均由 daemon
+/// 管理 API 完成。因此本命令要求 daemon 可达，不是 fresh setup 的离线写入口。
+/// daemon 拒绝或不可达时返回退出码 1，CLI 参数错误返回退出码 2。
 fn assetImportHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const debug = ctx.flag("debug", bool);
@@ -943,7 +943,7 @@ fn assetImportHandler(ctx: zli.CommandContext) !void {
     if (output_json) try ctx.writer.print("{{\"ok\":true,\"name\":\"{s}\"}}\n", .{name}) else try views.success(ctx.writer, "asset imported", &.{.{ .label = "Name", .value = name }});
 }
 
-/// M3.6 `install-source import` 命令处理器。
+/// `assets import` 的 ISO 安装源导入处理器。
 ///
 /// 完整流程：
 /// 1. 加载启动配置获取 daemon HTTP 端口
@@ -951,6 +951,8 @@ fn assetImportHandler(ctx: zli.CommandContext) !void {
 /// 3. 调用 `stageInstallIso` 将 ISO 原子复制到 daemon 受管的暂存目录
 /// 4. 通过管理 API 请求 daemon 执行 loop mount、介质检测和 catalog 发布
 /// 5. daemon 返回后，defer 清理暂存文件
+/// 6. M4.10：成功响应同时返回 canonical install source；daemon 在同一
+///    catalog publication 中创建同名默认 install profile
 ///
 /// 安全设计：CLI 永远不将任意宿主路径发送给 daemon，只发送暂存目录中的
 /// 不透明 basename。daemon 只在受管目录内操作，杜绝路径穿越攻击。
@@ -1581,7 +1583,7 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
                 users: []const std.json.Value,
                 packages: []const []const u8,
             },
-            install_source: ?struct { name: []const u8, source_label: []const u8, media_tree_url: ?[]const u8, repositories: []const []const u8 },
+            install_source: ?struct { name: []const u8, source_label: ?[]const u8, media_tree_url: ?[]const u8, repositories: []const []const u8 },
             assets: []const struct { name: []const u8, kind: []const u8, path: []const u8, sha256: ?[]const u8 },
             nodes: []const []const u8,
         },
@@ -1599,7 +1601,7 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     try ctx.writer.print("\nSafety\n  Unknown safe  {s}\n  Destructive   {s}\n  Persistent    {s}\n  Reinstall     {s}\n", .{ if (result.safety.safe_for_unknown) "yes" else "no", if (result.safety.destructive) "yes" else "no", if (result.safety.persistent_writes) "yes" else "no", @tagName(result.safety.reinstall_policy) });
     try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Firewall      {s}\n  SELinux       {s}\n  Users         {d}\n  Packages      {d}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, result.effective_system.connectivity.mode, if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.security.firewall, result.effective_system.security.selinux, result.effective_system.users.len, result.effective_system.packages.len });
     if (result.install_source) |source| {
-        try ctx.writer.print("\nInstall source\n  Name          {s}\n  Label         {s}\n  Media tree    {s}\n  Repositories  {d}\n", .{ source.name, source.source_label, source.media_tree_url orelse "-", source.repositories.len });
+        try ctx.writer.print("\nInstall source\n  Name          {s}\n  Label         {s}\n  Media tree    {s}\n  Repositories  {d}\n", .{ source.name, source.source_label orelse source.name, source.media_tree_url orelse "-", source.repositories.len });
     } else try ctx.writer.writeAll("\nInstall source  -\n");
     try ctx.writer.print("\nAssets ({d})\n", .{result.assets.len});
     for (result.assets) |asset| try ctx.writer.print("  {s}\n    Kind        {s}\n    Path        {s}\n    SHA-256     {s}\n", .{ asset.name, asset.kind, asset.path, asset.sha256 orelse "-" });
@@ -1796,9 +1798,13 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
             try ctx.writer.print("active install session superseded; generation rearmed for {s}; waiting for next PXE\n", .{node_id});
         return;
     }
-    const status = nodeforge.management_client.installGenerations(ctx.io, config.value.server.http_port, node_id);
-    if (output_json) try ctx.writer.print("{{\"ok\":{s},\"node_id\":{f}}}\n", .{ if (status.healthy) "true" else "false", std.json.fmt(node_id, .{}) }) else if (status.healthy) try ctx.writer.print("install generation rearmed for {s}; waiting for next PXE\n", .{node_id}) else try ctx.writer.print("error: install retry failed for {s}\n", .{node_id});
-    if (!status.healthy) setExitCode(ctx, 1);
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.installGenerations(ctx.io, config.value.server.http_port, node_id, &reason);
+    if (!result.healthy) return reportMutationFailure(ctx, result, "install retry failed: daemon unreachable");
+    if (output_json)
+        try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})})
+    else
+        try ctx.writer.print("install generation rearmed for {s}; waiting for next PXE\n", .{node_id});
 }
 
 // ── M4.2 node CRUD handlers ───────────────────────────────────────
@@ -2001,7 +2007,29 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
                 packages: []const []const u8,
             },
             status: ?struct { phase: []const u8, boot_session_id: []const u8, model_revision: u64, deployment_generation: u64, last_event_at: i64, last_error: bool, reason: []const u8, session_active: bool },
-            deployment: ?struct { install_intent: []const u8, pxe_ready: bool, retry_pending: bool, current_generation: ?u64, armed_generation: ?u64, consumed_generation: ?u64, terminal_generation: ?u64, requested_revision: u64, applied_revision: u64, desired_revision: u64, drifted: bool, requested_by: []const u8, start_at: i64, install_at: i64, finished_at: i64, successful_generation: u64, deployed_at: i64 },
+            deployment: ?struct {
+                install_intent: []const u8,
+                pxe_ready: bool,
+                retry_pending: bool,
+                current_generation: ?u64,
+                armed_generation: ?u64,
+                consumed_generation: ?u64,
+                terminal_generation: ?u64,
+                requested_revision: u64,
+                applied_revision: u64,
+                desired_revision: u64,
+                requested_plan_digest: ?[]const u8,
+                applied_plan_digest: ?[]const u8,
+                desired_plan_digest: []const u8,
+                drifted: bool,
+                drift_state: []const u8,
+                requested_by: []const u8,
+                start_at: i64,
+                install_at: i64,
+                finished_at: i64,
+                successful_generation: u64,
+                deployed_at: i64,
+            },
             inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, reported_at: i64, deployment_generation: u64 = 0, session_created_at: i64, boot_session_id: []const u8 },
         },
     };
@@ -2033,13 +2061,18 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     var source_session_buf: [20]u8 = undefined;
     try ctx.writer.writeAll("\nDeployment\n");
     if (result.deployment) |deployment| {
-        try ctx.writer.print("  Intent        {s}\n  PXE ready     {s}\n  Retry pending {s}\n  Current gen   {f}\n  Armed gen     {f}\n  Consumed gen  {f}\n  Terminal gen  {f}\n  Requested rev {d}\n  Applied rev   {d}\n  Desired rev   {d}\n  Drifted       {s}\n  Requested by  {s}\n  Start         {s}\n  Install       {s}\n  Finished      {s}\n  Success gen   {d}\n  Deployed      {s}\n", .{ deployment.install_intent, if (deployment.pxe_ready) "yes" else "no", if (deployment.retry_pending) "yes" else "no", std.json.fmt(deployment.current_generation, .{}), std.json.fmt(deployment.armed_generation, .{}), std.json.fmt(deployment.consumed_generation, .{}), std.json.fmt(deployment.terminal_generation, .{}), deployment.requested_revision, deployment.applied_revision, deployment.desired_revision, if (deployment.drifted) "yes" else "no", deployment.requested_by, views.formatTimestamp(&start_buf, deployment.start_at), views.formatTimestamp(&install_buf, deployment.install_at), views.formatTimestamp(&finished_buf, deployment.finished_at), deployment.successful_generation, views.formatTimestamp(&deployed_buf, deployment.deployed_at) });
+        try ctx.writer.print("  Intent        {s}\n  PXE ready     {s}\n  Retry pending {s}\n  Current gen   {f}\n  Armed gen     {f}\n  Consumed gen  {f}\n  Terminal gen  {f}\n  Requested plan {s}\n  Applied plan  {s}\n  Desired plan  {s}\n  Drift state   {s}\n  Legacy req rev {d}\n  Legacy app rev {d}\n  Legacy des rev {d}\n  Requested by  {s}\n  Start         {s}\n  Install       {s}\n  Finished      {s}\n  Success gen   {d}\n  Deployed      {s}\n", .{ deployment.install_intent, if (deployment.pxe_ready) "yes" else "no", if (deployment.retry_pending) "yes" else "no", std.json.fmt(deployment.current_generation, .{}), std.json.fmt(deployment.armed_generation, .{}), std.json.fmt(deployment.consumed_generation, .{}), std.json.fmt(deployment.terminal_generation, .{}), digestPrefix(deployment.requested_plan_digest), digestPrefix(deployment.applied_plan_digest), digestPrefix(deployment.desired_plan_digest), deployment.drift_state, deployment.requested_revision, deployment.applied_revision, deployment.desired_revision, deployment.requested_by, views.formatTimestamp(&start_buf, deployment.start_at), views.formatTimestamp(&install_buf, deployment.install_at), views.formatTimestamp(&finished_buf, deployment.finished_at), deployment.successful_generation, views.formatTimestamp(&deployed_buf, deployment.deployed_at) });
     } else try ctx.writer.writeAll("  Generation   -\n");
     try ctx.writer.writeAll("\nRuntime\n");
     if (result.status) |status| try ctx.writer.print("  Phase         {s}\n  Active        {s}\n  Last error    {s}\n  Last event    {s}\n  Reason        {s}\n  Session       {s}\n  Model rev     {d}\n  Generation    {d}\n", .{ status.phase, if (status.session_active) "yes" else "no", if (status.last_error) "yes" else "no", views.formatTimestamp(&last_event_buf, status.last_event_at), if (status.reason.len == 0) "-" else status.reason, status.boot_session_id, status.model_revision, status.deployment_generation }) else try ctx.writer.writeAll("  Phase         -\n");
     try ctx.writer.writeAll("\nInventory\n");
     if (result.inventory) |inventory| try ctx.writer.print("  SN            {s}\n  UUID          {s}\n  Vendor        {s}\n  Model         {s}\n  Generation    {d}\n  Session       {s}\n  Session start {s}\n  Reported      {s}\n", .{ inventory.serial_number orelse "-", inventory.product_uuid orelse "-", inventory.vendor orelse "-", inventory.model orelse "-", inventory.deployment_generation, inventory.boot_session_id, views.formatTimestamp(&source_session_buf, inventory.session_created_at), views.formatTimestamp(&reported_buf, inventory.reported_at) }) else try ctx.writer.writeAll("  SN            -\n");
     try ctx.writer.print("\nView revisions\n  Config        {d}\n  Catalog       {d}\n  Node status   {d}\n  Deployment    {d}\n  Inventory     {d}\n", .{ result.view_revision.config, result.view_revision.catalog, result.view_revision.node_status, result.view_revision.deployment, result.view_revision.inventory });
+}
+
+fn digestPrefix(value: ?[]const u8) []const u8 {
+    const digest = value orelse return "-";
+    return digest[0..@min(digest.len, 12)];
 }
 
 fn printMutationError(ctx: zli.CommandContext, err: anyerror, action: []const u8, node_id: []const u8) !void {

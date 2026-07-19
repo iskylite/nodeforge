@@ -1,10 +1,10 @@
-//! M3 Linux 安装介质导入器。
+//! Linux 安装介质导入器（M3 基线，M4.9 fresh bootloader 自举）。
 //!
 //! 导入器有意使用内核的只读 loop mount 而非 ISO 解析器或第三方提取工具。
 //! 它从不暴露 mount：所有发布的文件在 catalog 快照被原子替换之前都已复制到
 //! NodeForge 管控的目录中。
 //!
-//! M3.6 完整责任链：
+//! 现行完整责任链：
 //! `CLI fstat → atomic staging copy → daemon constrained open/hash →
 //! readonly loop mount → family/layout validation + tuple detection/optional override →
 //! bootloader/kernel/initrd/repo staging → checksums → catalog candidate validation +
@@ -18,6 +18,7 @@ const model = @import("../model.zig");
 const paths = @import("../paths.zig");
 const assets = @import("../assets/validate.zig");
 const observe_log = @import("../observe/log.zig");
+const dhcp_store = @import("../state/dhcp_store.zig");
 
 /// 导入请求。filename 是 CLI 已暂存到 import_dir 的不透明文件名。
 /// distro/version/arch 是可选覆盖。family 始终由经过结构校验的 ISO 布局决定；
@@ -43,7 +44,7 @@ pub const Result = struct {
     source_name: []const u8,
     /// family 由 ISO 的 Anaconda/.treeinfo 或 Subiquity/casper 布局确定。
     family: model.DistroFamily,
-    /// M4.2 F3: optional operator-friendly label for the install source.
+    /// M4.2 F3：面向操作员的可选 install source 标签。
     source_label: ?[]const u8 = null,
     iso_asset: model.AssetConfig,
     bootloader_asset: ?model.AssetConfig = null,
@@ -587,18 +588,45 @@ fn copyFileNoClobber(io: std.Io, allocator: std.mem.Allocator, source: []const u
 }
 
 /// M4.9 fresh-deployment 修复：UEFI bootloader 是每个架构共享的 canonical
-/// TFTP 对象。后续导入同架构
-/// ISO 时复用已发布文件，避免不同安装源互相覆盖正在使用的启动链。
+/// TFTP 对象。后续导入同架构 ISO 时只复用内容完全相同的已发布文件；
+/// 同一路径内容不同说明新介质试图替换正在使用的共享启动链，必须 fail
+/// closed，不能静默沿用旧文件或覆盖它。
 fn copyFileIfMissing(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8, created: *bool) !void {
     const parent = std.fs.path.dirname(destination) orelse return error.InvalidImportDestination;
     try std.Io.Dir.cwd().createDirPath(io, parent);
     if (std.Io.Dir.cwd().openFile(io, destination, .{})) |file| {
         var opened = file;
         opened.close(io);
+        var source_digest: [32]u8 = undefined;
+        var destination_digest: [32]u8 = undefined;
+        try sha256Path(io, source, &source_digest);
+        try sha256Path(io, destination, &destination_digest);
+        if (!std.crypto.timing_safe.eql([32]u8, source_digest, destination_digest))
+            return error.BootloaderContentConflict;
         return;
     } else |err| if (err != error.FileNotFound) return err;
     created.* = true;
     try run(io, allocator, &.{ "cp", "--no-dereference", "--no-clobber", source, destination });
+}
+
+/// 对 importer 已约束出的普通文件路径计算原始 SHA-256。source 来自只读
+/// mount 的已验证 EFI 路径，destination 位于受管 TFTP root；调用方不得将
+/// 未验证的 HTTP/CLI 路径传入本函数。
+fn sha256Path(io: std.Io, path: []const u8, out: *[32]u8) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false });
+    defer file.close(io);
+    if ((try file.stat(io)).kind != .file) return error.NotRegularFile;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var offset: u64 = 0;
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const count = try file.readPositionalAll(io, &buffer, offset);
+        if (count == 0) break;
+        hash.update(buffer[0..count]);
+        offset += count;
+        if (count < buffer.len) break;
+    }
+    hash.final(out);
 }
 
 fn canonicalBootloaderPath(arch: model.Arch) []const u8 {
@@ -635,6 +663,25 @@ test "canonical UEFI bootloader paths match DHCP option 67" {
     try std.testing.expectEqualStrings("efi/grubaa64.efi", canonicalBootloaderPath(.aarch64));
     try std.testing.expectEqualStrings("efi/grubx64.efi", canonicalBootloaderPath(.x86_64));
     try std.testing.expectEqualStrings("grub-uefi-aarch64", canonicalBootloaderName(.aarch64));
+}
+
+test "shared UEFI bootloader reuse requires identical content" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "{s}/source.efi", .{root});
+    defer std.testing.allocator.free(source);
+    const destination = try std.fmt.allocPrint(std.testing.allocator, "{s}/efi/grubaa64.efi", .{root});
+    defer std.testing.allocator.free(destination);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, std.fs.path.dirname(destination).?);
+    try dhcp_store.atomicWrite(std.testing.io, source, "same bootloader");
+    try dhcp_store.atomicWrite(std.testing.io, destination, "same bootloader");
+    var created = false;
+    try copyFileIfMissing(std.testing.io, std.testing.allocator, source, destination, &created);
+    try std.testing.expect(!created);
+    try dhcp_store.atomicWrite(std.testing.io, source, "different bootloader");
+    try std.testing.expectError(error.BootloaderContentConflict, copyFileIfMissing(std.testing.io, std.testing.allocator, source, destination, &created));
 }
 
 fn runAt(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.process.Child.Cwd) !void {

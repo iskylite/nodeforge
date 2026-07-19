@@ -88,9 +88,9 @@ pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Arc
 
 /// M4.1 破坏性安装 gate。DHCP 仍可提供诊断 lease，
 /// 但未武装 generation 的安装 profile 不会收到 PXE bootfile。
-pub fn resolveWithDeployment(config: *const model.AppConfig, deployments: ?*deployment_control.Store, revision: u64, mac: []const u8, arch: packet.Architecture) Decision {
+pub fn resolveWithDeployment(config: *const model.AppConfig, deployments: ?*deployment_control.Store, digest: deployment_control.Digest, mac: []const u8, arch: packet.Architecture) Decision {
     var decision = resolve(config, mac, arch);
-    if (decision.mode == .install and decision.node_id != null and deployments != null and !deployments.?.isArmedForRevision(decision.node_id.?, revision)) {
+    if (decision.mode == .install and decision.node_id != null and deployments != null and !deployments.?.isArmedForDigest(decision.node_id.?, digest)) {
         decision.bootfile = null;
         decision.install_not_armed = true;
     }
@@ -99,10 +99,11 @@ pub fn resolveWithDeployment(config: *const model.AppConfig, deployments: ?*depl
 
 test "consumed install generation suppresses PXE bootfile" {
     var deployments: deployment_control.Store = .{};
-    try deployments.ensureInitial("node-01", 1, 1);
+    const digest: deployment_control.Digest = [_]u8{'1'} ** 64;
+    try deployments.ensureInitial("node-01", digest, 1);
     _ = try deployments.consume("node-01");
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }} };
-    const decision = resolveWithDeployment(&config, &deployments, 1, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
+    const decision = resolveWithDeployment(&config, &deployments, digest, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
     try @import("std").testing.expect(decision.bootfile == null);
 }
 
@@ -133,10 +134,11 @@ test "deploy=true (default) still gets bootfile" {
 
 test "always reinstall policy still requires an armed generation" {
     var deployments: deployment_control.Store = .{};
-    try deployments.ensureInitial("node-01", 1, 1);
+    const digest: deployment_control.Digest = [_]u8{'1'} ** 64;
+    try deployments.ensureInitial("node-01", digest, 1);
     _ = try deployments.consume("node-01");
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .safety = .{ .destructive = true, .persistent_writes = true, .reinstall_policy = .always } }} };
-    const decision = resolveWithDeployment(&config, &deployments, 1, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
+    const decision = resolveWithDeployment(&config, &deployments, digest, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
     try @import("std").testing.expect(decision.bootfile == null);
     try @import("std").testing.expect(decision.install_not_armed);
 }

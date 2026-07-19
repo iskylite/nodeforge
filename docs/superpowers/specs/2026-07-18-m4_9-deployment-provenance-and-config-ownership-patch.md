@@ -1,7 +1,8 @@
 # M4.9 部署溯源、PXE 门禁与配置入口收口补丁
 
 > 状态：M4.9a 已实现并完成 Rocky 9.7 aarch64 fresh-deployment 回归；M4.9b 的完整
-> node-scoped SHA-256 持久化为后续 schema 升级要求，当前运行时尚未实现。
+> node-scoped SHA-256、schema 迁移和授权门禁已实现；自动测试、r97n0/Ubuntu
+> PXE、force-retry 和 systemd readiness rollback 系统验收均已完成。
 >
 > 本文是 M4.1–M4.8 之后的覆盖性补丁。旧章节保留当时设计和验证事实；发生冲突时，以本文和
 > `DETAILED_DESIGN.md` §9.18 为准。
@@ -48,8 +49,8 @@ desired_revision=11733222931490568455
 - `reinstall_policy=always` 在 revision unavailable 时不得把 0 武装为可消费 generation。
 - 每个 HTTP request 在 route entry pin 同一 model pair；一个请求不能跨 snapshot 拼接 config/catalog。
 
-当前运行时为了兼容 deployment-control schema，仍使用联合 SHA-256 的前 64 bit。它是兼容实现，不是最终
-安全粒度。
+联合 SHA-256 的前 64 bit 只保留为 view revision 和旧 schema/CLI 读取兼容。安装授权、恢复 join 和 drift
+均使用完整 node-scoped digest。
 
 ### 3.2 四层安装门禁
 
@@ -136,11 +137,11 @@ setup 不改写 deployment 的 requested/applied provenance。前者会替操作
 
 ## 4. M4.9b：完整 256-bit node-scoped digest
 
-该部分是已确认的长期 schema 目标，尚未在当前代码中实现。
+该部分是当前实现契约。自动门槛与系统验收状态分别记录。
 
 ### 4.1 持久化模型
 
-deployment-control 下一 schema 保存三个 64 字符小写 SHA-256：
+deployment-control schema 3 保存三个 64 字符小写 SHA-256：
 
 - `requested_plan_digest`
 - `consumed_plan_digest`
@@ -156,8 +157,11 @@ digest 只包含实际影响目标节点的：
 - node identity、hostname、network overrides
 - profile mode、system、storage、bootloader、kernel args
 - referenced distro/source/repository/bundle/assets 的 logical identity 和完整内容 digest
+- answer 实际采用的 bootstrap key 和 additional keys（包括配置外解析出的受管/自动生成 key）
 
 导入未被该节点引用的 ISO、增加另一节点或修改无关 profile，不得使 pending retry 失效。
+受管 ISO repository 的字节身份由同一被引用 source ISO 的 SHA-256 约束；外部 mirror 只能绑定声明 URL，
+NodeForge 不把远端可变内容伪装成 immutable asset。
 
 ### 4.3 迁移
 
@@ -183,7 +187,7 @@ digest 只包含实际影响目标节点的：
 
 自动门槛：
 
-- `zig build test --summary all`：240/240。
+- `zig build test --summary all`：244/244（最终代码上重跑）。
 - CLI 契约：`config import`、`config set` 不出现在 help，setup 暴露 `--import-config`。
 - HTTP 契约：management config PATCH 返回 405，GET/validation 保持只读。
 - setup：合法 candidate 联合校验后落盘；非法 candidate 不改变 canonical config。
@@ -196,5 +200,7 @@ digest 只包含实际影响目标节点的：
 - 添加 r97n1，VMware UEFI 获得 lease 和 bootfile。
 - r97n1 拉取 GRUB/kernel/initrd，完成 Anaconda 安装。
 - 重启后从本地虚拟磁盘正常进入 Rocky 9.7。
+- r97n2 使用 Ubuntu 22.04.5 完成 UEFI PXE、NVMe 安装、本地盘启动和 force-retry generation 3。
+- active daemon 不响应时 readiness 在 6 秒内失败，unit link、enabled/active 状态和健康服务全部恢复。
 
-M4.9b 完整 digest 在 schema、迁移和系统回归完成前不得标记为已实现。
+完整证据见 `docs/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。

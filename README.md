@@ -14,6 +14,7 @@
 - [M4.8 并发容量扩展与启动时动态派生专项设计](docs/superpowers/specs/2026-07-17-concurrency-capacity-scaling-design.md)
 - [M4.9 部署溯源、PXE 门禁与配置入口收口补丁](docs/superpowers/specs/2026-07-18-m4_9-deployment-provenance-and-config-ownership-patch.md)
 - [M4.10 CLI fresh-deployment 闭环补全](docs/superpowers/specs/2026-07-19-m4_10-cli-fresh-deployment-completion.md)
+- [M4.9b/M4.10 Ubuntu 22.04.5 r97n0/VMware 验证](docs/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md)
 - [M0–M4.1 实现审计](docs/M0_M4_AUDIT.md)
 - [Rocky Linux 8.10 aarch64 VMware PXE 验证](docs/ROCKY_8_10_VALIDATION.md)
 
@@ -65,9 +66,12 @@ M4.5 已实施 HTTP 契约补全：集中 RouteSpec（含启动冲突/wildcard �
 有界 cursor 分页（CLI `node list`/`profile list` 跟随 `next_cursor`）、持久 Operation 幂等语义、客户端 202 轮询
 以及完整有界 response reader（含 204/空 body/非 2xx body）。install-config 与 boot-config 同样设置完整安全头。
 M4.5 契约已在 Rocky 9.7 aarch64 验证目标以 root 端到端回归（详见 §9.14.14）。
-M4.6–M4.9 契约分别以详细设计 §9.15–§9.18 为准（M4.8 实施早于 M4.6）。M4.6/M4.7/M4.9a 已落地并有自动验证；
-M4.7 的 systemd 激活/回滚仍必须在 Rocky 主机完成实机清单后才能形成部署环境验收结论。
-M4.9b 的完整 node-scoped SHA-256 持久化仍是明确的 schema 后续项，当前兼容运行时仍使用联合摘要的 u64 投影。
+M4.6–M4.9 契约分别以详细设计 §9.15–§9.18 为准（M4.8 实施早于 M4.6）。M4.6/M4.7/M4.9 已落地；
+Rocky 主机已完成 systemd 激活、fresh reconfigure 及不响应 daemon 的 readiness/rollback 故障注入。
+M4.9b 已将完整 node-scoped SHA-256 持久化到 deployment/session/status/install-plan，并以其执行安装授权、
+恢复 join 和 drift；旧联合摘要 u64 仅保留一个读取兼容窗口。自动测试已覆盖无关实体不扰动、旧 pending
+不授权和旧 applied drift `unknown`；r97n0/VMware Ubuntu 22.04.5 已完成 generation 1 正向安装、
+generation 2 活动 session 拒绝及 generation 3 force-retry 重装回归。
 M4.10 已补齐 fresh CLI 闭环：ISO import 原子创建同名安全 install profile，显式 `profile create`
 用于补充 profile，在线 node add 立即持久化 initial generation；`setup --reconfigure` 始终发布 systemd
 unit 但不控制服务生命周期；真正无历史重置可组合为
@@ -178,8 +182,9 @@ Rocky Linux 9.7 aarch64 的 `192.168.27.0/24` 已完成 DHCP 生命周期、冲�
 每次 DHCP `DISCOVER`/`REQUEST` 会创建或复用一个不可预测的
 32 字符小写十六进制 `boot_session_id`（128-bit）。同一启动尝试的 DHCP 与经唯一 lease-IP 安全关联的
 TFTP 事件都会记录该 id；每条 daemon Event v2 同时带有 `daemon_instance_id`，用于识别
-服务重启边界。现有实现的 session 仍仅存在于当前进程；M4.3 将其修订为：仅对已经签发 capability 的 active
-delivery session 在 mode 0600 checkpoint 中持久化自有身份、immutable install plan/digest、route contract 和 token，重启后恢复合法
+服务重启边界。早期实现的 session 仅存在于进程内；现行 M4.3/M4.9 实现仅对已经签发 capability 的 active
+delivery session 在 mode 0600 checkpoint 中持久化自有身份、immutable install plan/digest、route contract 和 token，并与
+deployment generation/revision 及 immutable plan 做恢复 join；重启后只恢复合法
 安装器回调及同一 answer 语义，但不恢复 UDP transfer 或 install arm。
 超时、被新 session 取代或不可恢复时才追加明确的终止/失效 reason。
 

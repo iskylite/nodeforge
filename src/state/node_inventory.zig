@@ -30,6 +30,12 @@ pub const Store = struct {
         self.capacity = @max(self.entries.items.len, @max(@as(usize, 1), @min(derived, max_entries)));
     }
 
+    pub fn growCapacity(self: *Store, minimum: usize) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        self.capacity = @max(self.capacity, @min(minimum, max_entries));
+    }
+
     pub fn put(self: *Store, node_id: []const u8, session_id: []const u8, generation: u64, session_created_at: i64, facts: Facts, reported_at: i64) !bool {
         try validateFacts(facts);
         const digest = digestFacts(facts);

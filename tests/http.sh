@@ -85,6 +85,11 @@ grep -Fq 'install profile created' "$tmp/profile-create"
 curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles/rocky-fresh" >"$tmp/profile-created"
 grep -Fq '"install_source":"rocky-9.7-aarch64-dvd"' "$tmp/profile-created"
 grep -Fq '"destructive":true' "$tmp/profile-created"
+if "$cli" profile create rocky-fresh rocky-9.7-aarch64-dvd -c "$tmp/config.json" >"$tmp/profile-create-duplicate" 2>&1; then
+    echo "profile create unexpectedly accepted a duplicate name" >&2
+    exit 1
+fi
+grep -Fq 'profile.already_exists' "$tmp/profile-create-duplicate"
 "$cli" profile set rocky-fresh boot_disk=/dev/nvme0n1 -c "$tmp/config.json" >"$tmp/profile-disk"
 grep -Fq 'profile boot disk updated' "$tmp/profile-disk"
 "$cli" profile show rocky-fresh -c "$tmp/config.json" >"$tmp/profile-disk-show"
@@ -148,6 +153,16 @@ if "$cli" node add missing-profile mac=02:00:00:00:00:12 arch=aarch64 profile=do
 fi
 grep -Fq 'node.profile_not_found' "$tmp/node-missing-profile"
 "$cli" node add install-node mac=02:00:00:00:00:13 arch=aarch64 profile=rocky-fresh -c "$tmp/config.json" >"$tmp/install-node-add"
+if "$cli" node add install-node mac=02:00:00:00:00:14 arch=aarch64 profile=rocky-fresh -c "$tmp/config.json" >"$tmp/node-duplicate-id" 2>&1; then
+    echo "node add unexpectedly accepted a duplicate identifier" >&2
+    exit 1
+fi
+grep -Fq 'node.already_exists' "$tmp/node-duplicate-id"
+if "$cli" node add duplicate-mac mac=02:00:00:00:00:13 arch=aarch64 profile=rocky-fresh -c "$tmp/config.json" >"$tmp/node-duplicate-mac" 2>&1; then
+    echo "node add unexpectedly accepted a duplicate MAC" >&2
+    exit 1
+fi
+grep -Fq 'node.duplicate_mac' "$tmp/node-duplicate-mac"
 "$cli" node show install-node -c "$tmp/config.json" >"$tmp/install-node-show"
 grep -Fq 'Intent        initial-armed' "$tmp/install-node-show"
 grep -Fq 'PXE ready     yes' "$tmp/install-node-show"

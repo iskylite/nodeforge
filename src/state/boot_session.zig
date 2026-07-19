@@ -87,6 +87,7 @@ pub const Session = struct {
     profile_len: u8 = 0,
     mode: ?model.ProfileMode = null,
     model_revision: u64 = 0,
+    model_plan_digest: @import("deployment_control.zig").Digest = @import("deployment_control.zig").empty_digest,
     deployment_generation: u64 = 0,
     install_plan: ?*InstallPlanSnapshot = null,
     created_at: i64 = 0,
@@ -127,6 +128,7 @@ pub const Authenticated = struct {
     capability: [capability_len]u8,
     capability_issued: bool,
     model_revision: u64,
+    model_plan_digest: @import("deployment_control.zig").Digest,
     deployment_generation: u64,
     session_created_at: i64,
     plan_digest: ?[32]u8,
@@ -179,6 +181,7 @@ pub const DhcpIdentity = struct {
     profile: ?[]const u8,
     mode: ?model.ProfileMode,
     model_revision: u64 = 0,
+    model_plan_digest: @import("deployment_control.zig").Digest = @import("deployment_control.zig").empty_digest,
 };
 
 /// `acquireDhcp` 的附带结果；被替换的 session 必须由调用者写出终态事件。
@@ -764,6 +767,7 @@ fn newSession(io: std.Io, identity: DhcpIdentity, mono_now: i64, utc_now: i64, e
         .dhcp_xid = identity.xid,
         .mode = identity.mode,
         .model_revision = identity.model_revision,
+        .model_plan_digest = identity.model_plan_digest,
         .created_at = utc_now,
         .last_seen_at = utc_now,
         .created_mono = mono_now,
@@ -812,6 +816,7 @@ fn authenticated(session: *const Session) Authenticated {
         .capability = session.capability,
         .capability_issued = session.capability_issued,
         .model_revision = session.model_revision,
+        .model_plan_digest = session.model_plan_digest,
         .deployment_generation = session.deployment_generation,
         .session_created_at = session.created_at,
         .plan_digest = if (session.install_plan) |plan| plan.digest else null,

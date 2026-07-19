@@ -16,13 +16,14 @@ pub const Record = struct {
     last_seen_at: i64,
     capability: [boot_session.capability_len]u8,
     model_revision: u64 = 0,
+    plan_digest: ?[]const u8 = null,
     deployment_generation: u64 = 0,
     install_plan_json: ?[]const u8 = null,
-    plan_digest: ?[32]u8 = null,
+    install_plan_digest: ?[32]u8 = null,
 };
 
 pub const File = struct {
-    schema_version: u32 = 3,
+    schema_version: u32 = 4,
     saved_at: i64,
     sessions: []const Record,
 };
@@ -45,9 +46,10 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         .last_seen_at = session.last_seen_at,
         .capability = session.capability,
         .model_revision = session.model_revision,
+        .plan_digest = if (deployment_control.digestSet(session.model_plan_digest)) &session.model_plan_digest else null,
         .deployment_generation = session.deployment_generation,
         .install_plan_json = if (session.install_plan) |plan| plan.json else null,
-        .plan_digest = if (session.install_plan) |plan| plan.digest else null,
+        .install_plan_digest = if (session.install_plan) |plan| plan.digest else null,
     };
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -72,15 +74,22 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
     _ = config; // retained in the public signature for checkpoint schema compatibility
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(bytes);
+    const Header = struct { schema_version: u32 };
+    const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    // schema 3 只有全局 u64 provenance，升级后不得恢复任何 capability。
+    // 接受文件仅用于不中断 daemon 升级；下一次 checkpoint 会写 schema 4。
+    if (header.value.schema_version == 3) return 0;
+    if (header.value.schema_version != 4) return error.InvalidBootSessionState;
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    if (parsed.value.schema_version != 3 or parsed.value.sessions.len > boot_session.max_sessions or utc_now < parsed.value.saved_at) return error.InvalidBootSessionState;
+    if (parsed.value.sessions.len > boot_session.max_sessions or utc_now < parsed.value.saved_at) return error.InvalidBootSessionState;
     var restored: usize = 0;
     for (parsed.value.sessions) |record| {
         if (!boot_session.validId(record.boot_session_id) or !validCapability(&record.capability) or utc_now < record.last_seen_at) continue;
-        // M4.9：0 是“revision unavailable / 无 provenance”哨兵。
-        // 没有固定 model 的 capability 不得跨重启恢复。
-        if (record.model_revision == 0) return error.InvalidBootSessionState;
+        // schema 4 的完整 plan digest 才是恢复授权事实；u64 revision 仅保留
+        // 为读取兼容和诊断，不能继续作为 capability 的授权门槛。
+        const record_digest = try parsePlanDigest(record.plan_digest);
         const elapsed = utc_now - record.last_seen_at;
         if (elapsed >= boot_session.delivery_ttl_seconds) continue;
         const node = findNode(catalog, record.node_id) orelse continue;
@@ -94,7 +103,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
             // 把旧 capability/plan 接到新 generation。
             if (record.deployment_generation == 0) return error.InvalidBootSessionState;
             const deployment = deployments.view(record.node_id) orelse return error.BootSessionDeploymentMismatch;
-            if (deployment.currentGeneration() != record.deployment_generation or deployment.requested_revision != record.model_revision)
+            if (deployment.currentGeneration() != record.deployment_generation or !deployment_control.digestEqual(deployment.requested_plan_digest, record_digest))
                 return error.BootSessionDeploymentMismatch;
             // 若 deployment 已记录成功而 terminal checkpoint 尚未来得及删除
             // token，也不得复活 capability。
@@ -115,6 +124,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
             .capability_issued = true,
             .capability = record.capability,
             .model_revision = record.model_revision,
+            .model_plan_digest = record_digest,
             .deployment_generation = record.deployment_generation,
         };
         try boot_session.copyIdentity(&restored_session, record.node_id, record.profile);
@@ -123,8 +133,8 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
             if (record.mode != .install) return error.InvalidBootSessionState;
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(plan_json, &digest, .{});
-            if (record.plan_digest == null or !std.crypto.timing_safe.eql([32]u8, digest, record.plan_digest.?)) return error.InvalidBootSessionState;
-            try validatePlanAssets(allocator, plan_json, catalog);
+            if (record.install_plan_digest == null or !std.crypto.timing_safe.eql([32]u8, digest, record.install_plan_digest.?)) return error.InvalidBootSessionState;
+            try validatePlanAssets(allocator, plan_json, catalog, record_digest);
             try store.captureInstallPlan(allocator, record.boot_session_id, plan_json, record.model_revision);
         } else if (record.mode == .install) return error.InvalidBootSessionState;
         restored += 1;
@@ -132,10 +142,11 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
     return restored;
 }
 
-fn validatePlanAssets(allocator: std.mem.Allocator, bytes: []const u8, catalog: *const model.Catalog) !void {
-    const Envelope = struct { kernel: model.AssetConfig, initrd: model.AssetConfig };
+fn validatePlanAssets(allocator: std.mem.Allocator, bytes: []const u8, catalog: *const model.Catalog, expected_digest: deployment_control.Digest) !void {
+    const Envelope = struct { plan_digest: deployment_control.Digest, kernel: model.AssetConfig, initrd: model.AssetConfig };
     const parsed = std.json.parseFromSlice(Envelope, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch return error.InvalidBootSessionState;
     defer parsed.deinit();
+    if (!deployment_control.digestEqual(parsed.value.plan_digest, expected_digest)) return error.BootSessionDeploymentMismatch;
     inline for (.{ parsed.value.kernel, parsed.value.initrd }) |expected| {
         var matched = false;
         for (catalog.assets) |actual| if (std.mem.eql(u8, actual.name, expected.name)) {
@@ -173,6 +184,16 @@ fn validCapability(value: []const u8) bool {
     return true;
 }
 
+fn parsePlanDigest(value: ?[]const u8) !deployment_control.Digest {
+    if (value == null or value.?.len != 64) return error.InvalidBootSessionState;
+    var result: deployment_control.Digest = undefined;
+    for (value.?, 0..) |byte, index| {
+        if (!std.ascii.isHex(byte) or std.ascii.toLower(byte) != byte) return error.InvalidBootSessionState;
+        result[index] = byte;
+    }
+    return result;
+}
+
 test "delivery checkpoint restores capability and remaining TTL" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -183,17 +204,17 @@ test "delivery checkpoint restores capability and remaining TTL" {
     };
     var before: boot_session.Store = .{};
     defer before.deinit();
-    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "install", .mode = .install, .model_revision = 42 }, 100, 1000);
+    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "install", .mode = .install, .model_revision = 42, .model_plan_digest = [_]u8{'4'} ** 64 }, 100, 1000);
     before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 101, 1001);
     try before.setDeploymentGeneration(acquired.link.id().?, 1);
     const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
-    const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
+    const plan = "{\"plan_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
     try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42);
     try save(std.testing.io, std.testing.allocator, path, &before, 1002);
     var after: boot_session.Store = .{};
     defer after.deinit();
     var deployments: deployment_control.Store = .{};
-    try deployments.ensureInitial("n1", 42, 999);
+    try deployments.ensureInitial("n1", [_]u8{'4'} ** 64, 999);
     const catalog: model.Catalog = .{
         .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
         .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
@@ -225,16 +246,16 @@ test "resume rejects install session whose deployment provenance was reset" {
     };
     var before: boot_session.Store = .{};
     defer before.deinit();
-    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "install", .mode = .install, .model_revision = 42 }, 100, 1000);
+    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "install", .mode = .install, .model_revision = 42, .model_plan_digest = [_]u8{'4'} ** 64 }, 100, 1000);
     before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 101, 1001);
     try before.setDeploymentGeneration(acquired.link.id().?, 3);
     const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
-    const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
+    const plan = "{\"plan_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
     try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42);
     try save(std.testing.io, std.testing.allocator, path, &before, 1002);
 
     var reset_deployments: deployment_control.Store = .{};
-    try reset_deployments.ensureInitial("n1", 99, 1003);
+    try reset_deployments.ensureInitial("n1", [_]u8{'9'} ** 64, 1003);
     var after: boot_session.Store = .{};
     defer after.deinit();
     try std.testing.expectError(error.BootSessionDeploymentMismatch, load(std.testing.io, std.testing.allocator, path, &config, &catalog, &reset_deployments, &after, 1012, 500));
@@ -252,7 +273,7 @@ test "resume accepts diskless capability without an install plan" {
     };
     var before: boot_session.Store = .{};
     defer before.deinit();
-    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "diskless", .mode = .diskless, .model_revision = 7 }, 100, 1000);
+    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "diskless", .mode = .diskless, .model_revision = 7, .model_plan_digest = [_]u8{'7'} ** 64 }, 100, 1000);
     before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 101, 1001);
     const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
     try save(std.testing.io, std.testing.allocator, path, &before, 1002);
@@ -265,12 +286,12 @@ test "resume accepts diskless capability without an install plan" {
 }
 
 test "resume fails closed when a pinned asset digest changes or disappears" {
-    const plan = "{\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
+    const plan = "{\"plan_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
     const changed: model.Catalog = .{ .assets = &.{
         .{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "changed" },
         .{ .name = "initrd", .kind = .installer_initrd, .path = "install/initrd", .sha256 = "bb" },
     } };
-    try std.testing.expectError(error.BootSessionAssetMismatch, validatePlanAssets(std.testing.allocator, plan, &changed));
+    try std.testing.expectError(error.BootSessionAssetMismatch, validatePlanAssets(std.testing.allocator, plan, &changed, [_]u8{'4'} ** 64));
     const missing: model.Catalog = .{ .assets = &.{.{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "aa" }} };
-    try std.testing.expectError(error.BootSessionAssetMismatch, validatePlanAssets(std.testing.allocator, plan, &missing));
+    try std.testing.expectError(error.BootSessionAssetMismatch, validatePlanAssets(std.testing.allocator, plan, &missing, [_]u8{'4'} ** 64));
 }

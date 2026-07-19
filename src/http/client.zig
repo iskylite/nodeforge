@@ -88,11 +88,12 @@ pub fn validateActiveConfig(io: std.Io, port: u16) Status {
 }
 
 /// 通过仅限本机的 API 显式武装一个 install generation。
-pub fn installGenerations(io: std.Io, port: u16, node_id: []const u8) Status {
+pub fn installGenerations(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) Mutation {
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
     const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/install-generations", .{node_id}) catch return .{ .reachable = false, .healthy = false };
-    return probeAt(io, management.client_ip, port, value, "POST");
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", value, "{}", revision, reason_buf);
 }
 
 pub fn installGenerationsForce(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) Mutation {
@@ -545,12 +546,15 @@ fn probeAt(io: std.Io, ip: []const u8, port: u16, path: []const u8, method: []co
     writer.interface.flush() catch return .{ .reachable = true, .healthy = false };
 
     var recv_buffer: [2048]u8 = undefined;
-    var reader = stream.reader(io, &recv_buffer);
-    const response = reader.interface.takeDelimiterInclusive('\n') catch
+    // 管理探针必须有真实 I/O 上限。只在两次尝试之间 sleep 不能约束
+    // 已建立但不响应的 TCP peer；systemd readiness 曾因此远超声明的 5 秒。
+    const incoming = stream.socket.receiveTimeout(io, &recv_buffer, .{
+        .duration = .{ .raw = .fromMilliseconds(250), .clock = .awake },
+    }) catch
         return .{ .reachable = true, .healthy = false };
     return .{
         .reachable = true,
-        .healthy = is2xx(response),
+        .healthy = is2xx(incoming.data),
     };
 }
 
