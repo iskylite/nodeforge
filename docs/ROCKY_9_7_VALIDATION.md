@@ -85,6 +85,9 @@ r97n0 重新执行。
 
 ### M4.10 VMware 安装复验
 
+> 以下 `profile set ... boot_disk` 是 M4.10 历史验证命令。v0.1 目标接口改为
+> `node set <id> storage.boot_disk=/dev/...`，不再由 Profile 持有物理磁盘。
+
 通过 Computer Use 启动 r97n1 后，第一轮 PXE 已完成 DHCP、GRUB、kernel/initrd 和 kickstart 获取，但
 Anaconda 报 `Disk "sda" given in clearpart command does not exist`。根因是 ISO 自动 profile 无法从介质
 tuple 推导目标机磁盘，默认 `/dev/sda` 与 VMware NVMe `/dev/nvme0n1` 不匹配。

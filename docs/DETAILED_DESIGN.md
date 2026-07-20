@@ -1,5 +1,13 @@
 # NodeForge 分阶段详细设计与实现计划
 
+> 历史合并文档：本文保留 M0-M7 的实现细节、验收记录和未实现设计，便于追溯。
+> 当前权威版本边界已经拆分为 `V0_1_DESIGN.md` 和 `V0_2_DESIGN.md`。M4.12 的 fallback
+> 所有权方案只代表当前代码历史，目标模型以 v0.1 的 M4.13 修复要求为准。尤其是本文中的 discovery Profile、
+> Profile `boot_disk/install_disks`、`match_mac`、稳定磁盘 selector、nullable install/diskless source、
+> `standard_packages`、单盘限制和普通 `--help` 长示例均不是目标接口。v0.1 使用独立 discovery observation、
+> Node direct `storage.boot_disk/additional_disks`、可 override 的原生 storage mode/partition policy、唯一
+> `software.*` selection、直接 item CLI 和统一 `--help-full`；v0.2 才以 tagged Profile kind 增加 diskless。
+
 本文基于 `DESIGN.md` 的收敛版概要设计，作为后续代码实现的执行蓝图。它把 NodeForge 第一阶段拆成可落地的实现阶段，明确每个阶段要写哪些模块、形成哪些数据结构、暴露哪些接口和 CLI、需要哪些测试，以及达到什么标准才能进入下一阶段。
 
 本文不替代概要设计。概要设计回答“做什么、边界是什么、核心取舍是什么”；本文回答“按什么顺序实现、每一步交付什么代码、如何验证”。
@@ -47,9 +55,10 @@
 | M4.9 | 部署溯源、PXE 门禁与配置入口收口补丁 | M4.7、M4.8 | 统一 model provenance；完整 node-scoped SHA-256 授权/持久化/迁移；fresh ISO bootloader；retry 可见性；startup config writer 收敛到 setup |
 | M4.10 | CLI fresh-deployment 闭环补全 | M4.9 | reconfigure/systemd 边界；purge-all（含 work 临时数据）；ISO import 结果；最小 install profile create；node mutation 错误透传 |
 | M4.11 | CLI 状态入口与 mutation key 收口 | M4.10 | 唯一 `nodeforge status`；advertised HTTP/catalog/DHCP/TFTP 端到端检查；node/profile show 与 set key 完全一致 |
-| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2–M4.11 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
-| M6 | 支持矩阵增强 | M4.1–M4.11、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
-| M7 | 补充包和后处理增强 | M4.1–M4.11、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
+| M4.12 | Node/Profile 属性归属与存储覆盖 | M4.11 | node storage override；effective plan 统一消费；profile fallback、API/CLI/digest/renderer ownership 对齐 |
+| M5 | 内存无盘启动与基础后处理 | M1-M3、M4.1 公共系统配置、基础 runner、M4.2–M4.12 | 小 initrd 进入 `squashfs_overlay`，`rootfs_build`/`diskless_boot` 跑通 |
+| M6 | 支持矩阵增强 | M4.1–M4.12、M5 | RHEL 系差异、Ubuntu 后续 LTS、BIOS PXELINUX（x86_64 暂不实现，无 x86 环境） |
+| M7 | 补充包和后处理增强 | M4.1–M4.12、M5 | 完善 tar.bz2、自定义脚本、CLI plan/status 和跨链路回归 |
 
 ### 1.3 完成标准
 
@@ -65,7 +74,7 @@
 
 ### 1.4 阅读顺序与阶段依赖
 
-- M0–M4.11（含 M1.5、M2.5、M2.5.1、M4.1–M4.11）是当前已实现/已验收范围；M5–M7 是设计冻结和后续交付目标，
+- M0–M4.12（含 M1.5、M2.5、M2.5.1、M4.1–M4.12）是当前代码已实现范围；M0–M4.11 的实机/验收记录仍按各章节保存，M4.12 本轮仅新增自动化证据，未新增实机记录。M5–M7 是设计冻结和后续交付目标，
   不得把设计章节、预留模型或 resolver 单测当作端到端验收证据。
 - M1 先实现正式 TFTP 只读服务，并用标准 TFTP client 验证 RRQ/OACK、重传和路径安全。
 - M1.5 在 M2 前收敛 CLI 展示层；它不改变 daemon API、配置或协议语义，但 M2+ 新命令必须复用其 formatter。
@@ -4303,7 +4312,7 @@ resource-action canonical form：
 4. openEuler/Kylin/CentOS/RHEL/Sugon OS ISO -> `assets import` 成功，catalog distro=rocky，source_label 记原始 family。
 5. `assets import --distro rocky --version 9.7 --arch aarch64` -> 跳过自动检测。
 6. TFTP windowsize=4 -> QEMU PXE 吞吐显著优于 windowsize=1（但 GRUB 不协商 windowsize，仍为 stop-and-wait）。
-6a. `node.http_accel=true`（默认）-> GRUB 配置含 `(http,server:port)/boot/<path>` URL；
+6a. `node.http_accel=true`（实验性，默认 `false`）-> GRUB 配置含 `(http,server:port)/boot/<path>` URL；
     `GET /boot/<path>` 返回 200 + catalog asset 的 SHA-256 ETag；
     `node set <id> http_accel=false` -> GRUB 配置回退为 TFTP `/<path>`。
 6b. 106 MB initrd via HTTP < 5s（千兆网），via TFTP ~52s（stop-and-wait）。
@@ -6065,9 +6074,12 @@ daemon、node-reported 和 model-store owner 并保持只读。直接存储但�
 诚实标为 `read-only (no mutation command)`，不能为了表面一致虚构 set。`set/unset --help` 列出完整
 allowlist、类型/引号约束和可复制示例，并与 parser、show 测试绑定。
 
-### 9.21 M4.12：Node/Profile 属性归属与存储覆盖设计
+### 9.21 M4.12：Node/Profile 属性归属与存储覆盖
 
-M4.12 冻结节点属性、节点 override、profile 默认值、profile 部署策略和派生字段的归属边界，解决 `boot_disk` 等 storage 字段同时具有“共享安装计划”和“单节点物理设备”语义的问题。完整设计、影响清单、迁移和验收要求见 `docs/superpowers/specs/2026-07-19-m4_12-node-profile-ownership-design.md`。
+> 历史实现说明：本节记录当前代码中的 Profile storage fallback，不再是目标模型。后续修复不得继续
+> 扩展该 fallback；现行所有权、完整 override 和 schema v3 迁移要求见 `V0_1_DESIGN.md`。
+
+M4.12 冻结并实现节点属性、节点 override、profile 默认值、profile 部署策略和派生字段的归属边界，解决 `boot_disk` 等 storage 字段同时具有“共享安装计划”和“单节点物理设备”语义的问题。完整设计、影响清单和迁移要求见 `docs/superpowers/specs/2026-07-19-m4_12-node-profile-ownership-design.md`；系统证据矩阵见 `docs/M0_M4_12_SYSTEM_AUDIT.md`。
 
 本设计的强制原则如下：
 
@@ -6077,7 +6089,7 @@ M4.12 冻结节点属性、节点 override、profile 默认值、profile 部署�
 4. 旧配置和无 override 节点的 M4.11 行为保持兼容；profile 默认值修改的影响范围必须可见，不能静默触发无关节点重部署。
 5. M5–M7 的未实现能力不得因本设计提前注册命令或改变状态机；未来 adapter、diskless、PXELINUX 和 reconciliation 只能依赖 effective storage 抽象。
 
-M4.12 本阶段只完善设计和兼容契约，不改变已实现主体功能；实现前必须完成模型、validate、Kickstart/Ubuntu、management API、CLI views/help、digest、fixture 和回归测试的逐项审查。
+当前实现已完成模型、validate、Kickstart/Autoinstall 消费入口、management API、CLI views/help、digest 和回归测试审查：node override 优先于 profile storage default，profile default 变化不会漂移有 override 的节点，清除 override 后才回退并要求重新武装。`zig build test --summary all` 当前为 254/254；M4.12 尚无单独 Rocky/Ubuntu 实机记录。
 
 ## 10. M5：内存无盘启动与基础后处理（设计冻结，未完成）
 
@@ -6104,7 +6116,7 @@ node/resource API 使用 cursor 和目标 ETag，M5 不新增无分页大 collec
 
 ### 10.2 代码任务
 
-实现审计状态（2026-07-19）：当前仅有模型字段、UEFI target resolver scaffold 和 M4 事件 stage 预留；下表
+实现审计状态（2026-07-20）：当前仅有模型字段、UEFI target resolver scaffold、M4 事件 stage 预留和 M4.12 effective storage 抽象；下表
 列出的 `profile/diskless.zig`、rootfs/initrd/boot-bundle 校验器、dracut module、overlay 执行器和 diskless
 CLI/HTTP payload 均尚未落地。具体缺口和证据见 `docs/M5_M7_ALIGNMENT_AUDIT.md`。
 
@@ -6418,7 +6430,7 @@ retry，只有 attempt 已终态失败后才需要操作员重新 arm。
 
 完善 MVP 周边兼容性和诊断能力。
 
-### 11.2 M4.1–M4.11 与 M5 基线继承（设计目标，待 M5 前置能力完成）
+### 11.2 M4.1–M4.12 与 M5 基线继承（设计目标，待 M5 前置能力完成）
 
 M6 只扩展架构、发行版版本和 bootloader，不得为新 adapter 建立第二套目标系统默认值。新增的 x86_64、
 Ubuntu 后续 LTS、RHEL 系变体和 BIOS PXELINUX 路径均必须复用 M4.1 的归一化 TargetSystemConfig，并满足：

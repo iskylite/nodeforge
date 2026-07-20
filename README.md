@@ -1,12 +1,16 @@
 # NodeForge
-一个基于 Zig 实现的轻量级 OS Provisioning 平台，面向小型 Linux 集群，内置 DHCP/TFTP/HTTP 服务，提供 PXE 引导、多 Linux 发行版无人值守安装、内存无盘启动、系统镜像/安装源分发和未来的软件包管理能力。
+一个基于 Zig 实现的轻量级 OS Provisioning 平台，面向小型 Linux 集群，内置 DHCP/TFTP/HTTP 服务。当前代码提供
+IPv4 PXE 引导、多 Linux 发行版无人值守安装和安装源分发；软件能力索引与完整属性面正在 v0.1 M4.13 补齐，
+内存无盘启动属于尚未开始的 v0.2。
 
-基于 Zig 0.16 · 内置 DHCP/TFTP/HTTP · PXE 引导 · 多系统无人值守安装 · 内存无盘启动 · 软件包管理预留
+基于 Zig 0.16 · 内置 DHCP/TFTP/HTTP · IPv4 PXE · Rocky/Ubuntu 无人值守安装
 
 ## 设计文档
 
-- [NodeForge PXE 特化版概要设计](docs/DESIGN.md)
-- [NodeForge 分阶段详细设计与实现计划](docs/DETAILED_DESIGN.md)
+- [NodeForge v0.1 设计与修复计划](docs/V0_1_DESIGN.md)：M0-M4 及进入 v0.2 前必须完成的所有权、属性和软件能力修复，现行权威设计
+- [NodeForge v0.2 设计范围](docs/V0_2_DESIGN.md)：尚未实现的 M5-M7，v0.1 完成前不得启动正式实现
+- [历史合并概要设计](docs/DESIGN.md)：保留早期 M0-M7 全景和决策记录，不再作为版本边界事实源
+- [历史分阶段详细设计与实现计划](docs/DETAILED_DESIGN.md)：保留里程碑实现、验收和专项细节
 - [M4.3 模型、运行态与可观测性专项设计](docs/superpowers/specs/2026-07-15-m4_3-model-runtime-observability-design.md)
 - [M4.4 HTTP API URL 契约专项设计](docs/superpowers/specs/2026-07-15-m4_4-http-api-url-contract-design.md)
 - [M4.6 自定义内核引导参数专项设计](docs/superpowers/specs/2026-07-16-kernel-args-custom-boot-params-design.md)
@@ -15,6 +19,8 @@
 - [M4.9 部署溯源、PXE 门禁与配置入口收口补丁](docs/superpowers/specs/2026-07-18-m4_9-deployment-provenance-and-config-ownership-patch.md)
 - [M4.10 CLI fresh-deployment 闭环补全](docs/superpowers/specs/2026-07-19-m4_10-cli-fresh-deployment-completion.md)
 - [M4.11 CLI 状态入口与 mutation key 收口](docs/superpowers/specs/2026-07-19-m4_11-cli-status-and-mutation-keys.md)
+- [M4.12 Node/Profile 属性归属与存储覆盖（历史方案，已被 v0.1 取代）](docs/superpowers/specs/2026-07-19-m4_12-node-profile-ownership-design.md)
+- [M0-M4.12 系统实现审计](docs/M0_M4_12_SYSTEM_AUDIT.md)
 - [M4.9b/M4.10 Ubuntu 22.04.5 r97n0/VMware 验证](docs/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md)
 - [M0–M4.1 实现审计](docs/M0_M4_AUDIT.md)
 - [Rocky Linux 8.10 aarch64 VMware PXE 验证](docs/ROCKY_8_10_VALIDATION.md)
@@ -37,9 +43,18 @@ M4.1 同时补齐自动安装生命周期：install profile 默认一次性 gene
 desired/applied drift。TFTP option、DHCP T1/T2、trace 时钟回拨、运行期 asset 和 ISO orphan/空间预检等
 M1-M3 横切修正仍写在各自章节，但作为 M4.1 验收前置回归。
 
-M4.11 已完成统一 status、端到端运行面检查和 show/set owner-action 对齐。M5–M7 目前仍处于设计冻结与
-前置模型/预留代码阶段；无盘 initrd/rootfs、PXELINUX、完整 provision CRUD/执行和后续里程碑验收尚未完成，
-以 [M5–M7 对齐审计](docs/M5_M7_ALIGNMENT_AUDIT.md) 为准，不能把设计命令当作当前可执行命令。
+M4.11 已完成统一 status、端到端运行面检查和 show/set owner-action 对齐。M4.12 的节点存储 fallback、有效计划合并、
+digest/API/CLI/renderer 和 JSON 契约已有代码与 254/254 自动化证据，但其 Profile/Node 所有权结论已被否决，
+不能作为 v0.1 完成依据。当前阶段是 [v0.1 M4.13 修复](docs/V0_1_DESIGN.md)：物理安装盘改为 Node direct
+`storage.boot_disk`（默认 `/dev/sda`）和 `storage.additional_disks`，删除语义重复且未被 adapter 消费的
+`install_disks`；Profile 定义共享 mode/wipe/partition/bootloader 策略，Node 可完整 override，并支持双安装器
+原生的 single/LVM/RAID0/1/5/6/10 及 RAID 上 LVM。默认自动布局为单主 1 GiB ESP、2 GiB ext4 `/boot`、
+剩余 ext4 `/`，默认无 swap；分区既可用直接 item CLI 增删改查，也可从文件原子替换。`http_accel` 作为默认
+false 的 UEFI 实验验证属性保留。目标系统未配置时继续使用普通用户
+`nodeforge/asdf1234` 和 root 密码 `asdf1234`，两者均支持明文 CLI/Profile/Node override。同步补齐 unknown DHCP client 记录/认领、
+typed property/collection/item contract、统一 `--help-full`、全资源无 Shell 内嵌 JSON mutation 和软件能力查询配置。Discovery 不再
+作为 Profile mode；IPv6 和稳定磁盘选择器是永久非目标。
+完成 schema v3、迁移和双发行版回归后才进入 v0.2。M5–M7 仍是未实现范围，不能把设计命令当作当前可执行命令。
 
 M4.3 已落地；M4.4 的 canonical URL、三平面隔离与双发行版主链路也已验证可行。它们完成了真实 distro/family、repository
 可空与 SHA 幂等导入，补 install-source `catalog show/migrate`、完整 node 视图、typed daemon mutation、
@@ -85,7 +100,8 @@ unit 但不控制服务生命周期；真正无历史重置（包括 `work/` 导
 M4.11 将运行检查收口为唯一的 `nodeforge status`：同时验证 loopback/advertised HTTP、management、
 active config、catalog、DHCP 与 TFTP 管理面，并用退出码表达整体可用性。`node/profile show` 的
 Settable properties 使用与相应 `set` 完全一致的 snake_case key；跨资源和 lifecycle 字段显示
-owner/action，计算、运行态、上报和 revision 明确为只读事实。`set/unset --help` 同步列出 key、约束和示例。
+owner/action，计算、运行态、上报和 revision 明确为只读事实。v0.1 目标由紧凑 `--help` 指向统一
+`--help-full`，后者从 typed spec 同步生成 canonical key、约束和示例。
 
 ## ISO 与发行版
 

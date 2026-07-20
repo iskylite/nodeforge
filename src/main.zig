@@ -7,6 +7,7 @@ const zli = @import("zli");
 const nodeforge = @import("nodeforge");
 const views = @import("nodeforge").cli_views;
 const cli_output = @import("nodeforge").cli_output;
+const cli_properties = @import("nodeforge").cli_properties;
 const cli_events = @import("nodeforge").cli_events;
 const model = @import("nodeforge").model;
 const node_mutation = @import("nodeforge").node_mutation;
@@ -201,7 +202,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .name = "set",
         .description = "Modify stored node properties",
         .usage = "nodeforge node set <node_id> <key=value>... [options]",
-        .help = "Keys: mac, arch, profile, ip, hostname, deploy, http_accel. Booleans use true|false. Example: nodeforge node set r97n1 hostname=r97n1 deploy=true",
+        .help = "Keys: " ++ cli_properties.node_set_keys ++ ". Booleans use true|false; install_disks is a comma-separated device list. Example: nodeforge node set r97n1 boot_disk=/dev/nvme0n1",
     }, nodeSetHandler);
     try node_set.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
     try node_set.addPositionalArg(.{ .name = "properties", .description = "Typed properties as key=value", .required = true, .variadic = true });
@@ -213,7 +214,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .name = "unset",
         .description = "Clear optional stored node properties",
         .usage = "nodeforge node unset <node_id> <key>... [options]",
-        .help = "Keys: ip, hostname. Example: nodeforge node unset r97n1 ip hostname",
+        .help = "Keys: " ++ cli_properties.node_unset_keys ++ ". Storage keys fall back to the profile default. Example: nodeforge node unset r97n1 boot_disk install_disks",
     }, nodeUnsetHandler);
     try node_unset.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
     try node_unset.addPositionalArg(.{ .name = "keys", .description = "Optional property names to clear", .required = true, .variadic = true });
@@ -231,7 +232,6 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try node_render.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
     try addConfigPathFlag(node_render);
     try addCatalogPathFlag(node_render);
-    try addOutputFlag(node_render);
     try addDebugFlag(node_render);
 
     const node_retry = try zli.Command.init(init_options, .{ .name = "retry", .description = "Rearm the next PXE install generation" }, installRetryHandler);
@@ -281,7 +281,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .name = "set",
         .description = "Modify stored profile properties",
         .usage = "nodeforge profile set <name> <key=value> [options]",
-        .help = "Keys: kernel_args, boot_disk. Quote kernel_args when it contains spaces. Examples: nodeforge profile set rocky boot_disk=/dev/nvme0n1; nodeforge profile set rocky 'kernel_args=iommu=pt hugepages=4'",
+        .help = "Keys: " ++ cli_properties.profile_set_keys ++ ". boot_disk changes the shared fallback only; set a single machine with node set <id> boot_disk=.... Quote kernel_args when it contains spaces. Examples: nodeforge profile set rocky boot_disk=/dev/sda; nodeforge profile set rocky 'kernel_args=iommu=pt hugepages=4'",
     }, profileSetHandler);
     try profile_set.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
     try profile_set.addPositionalArg(.{ .name = "property", .description = "kernel_args=<arguments> or boot_disk=/dev/<device>", .required = true });
@@ -292,7 +292,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .name = "unset",
         .description = "Clear an optional stored profile property",
         .usage = "nodeforge profile unset <name> kernel_args [options]",
-        .help = "Key: kernel_args. boot_disk is required for install profiles and cannot be unset. Example: nodeforge profile unset rocky kernel_args",
+        .help = "Keys: " ++ cli_properties.profile_unset_keys ++ ". boot_disk is a required profile default and cannot be unset. Example: nodeforge profile unset rocky kernel_args",
     }, profileUnsetHandler);
     try profile_unset.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
     try profile_unset.addPositionalArg(.{ .name = "property", .description = "Must be kernel_args", .required = true });
@@ -1419,146 +1419,209 @@ fn runtimeLeaseList(ctx: zli.CommandContext, unknown_only: bool) !void {
     try views.dhcpLeases(ctx.writer, rows[0..parsed.value.result.leases.len], unknown_only);
 }
 
+const NodeListViewRevision = struct { config: u64, catalog: u64, node_status: u64, deployment: u64, inventory: u64 };
+const NodeListItem = struct {
+    id: []const u8,
+    mac: []const u8,
+    ip: ?[]const u8,
+    profile: []const u8,
+    deploy: bool,
+    install_intent: []const u8,
+    pxe_ready: bool,
+    retry_pending: bool,
+    armed_generation: ?u64,
+    status: ?[]const u8,
+    start_at: ?i64,
+    install_at: ?i64,
+    finished_at: ?i64,
+    deployed_at: ?i64,
+    drifted: bool,
+    drift_state: ?[]const u8 = null,
+    serial_number: ?[]const u8,
+};
+const NodeListPage = struct { ok: bool, result: struct { view_revision: NodeListViewRevision, items: []const NodeListItem, next_cursor: ?[]const u8 } };
+
 fn nodeListHandler(ctx: zli.CommandContext) !void {
-    const output_json = outputJsonFromContext(ctx) orelse return;
+    const output = outputFromContext(ctx) orelse return;
+    const output_json = output.mode == .json;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
-    // M4.5：按 `next_cursor` 翻页直到取完或达到表格渲染上限（256）。字段借用
-    // 每页响应缓冲，故用 arena 复制到稳定存储后再渲染。`--output json` 只回显
-    // 首页信封，JSON 消费者自行跟随游标。
+    // Both output modes own pagination. JSON is one complete collection
+    // envelope; human rendering keeps its documented 256-row display bound.
     var response: [128 * 1024]u8 = undefined;
     const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", null, &response) catch {
-        try ctx.writer.writeAll("error: node: local daemon management API unavailable\n");
+        try cli_output.writeError(ctx.writer, output, "node.unavailable", "local daemon management API unavailable");
         setExitCode(ctx, 1);
         return;
     };
     var page_body = first orelse {
-        try ctx.writer.writeAll("error: node: local daemon management API unavailable\n");
+        try cli_output.writeError(ctx.writer, output, "node.unavailable", "local daemon management API unavailable");
         setExitCode(ctx, 1);
         return;
     };
-    if (output_json) {
-        try ctx.writer.writeAll(page_body);
-        return;
-    }
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var rows: std.ArrayList(views.NodeRow) = .empty;
+    var items: std.ArrayList(NodeListItem) = .empty;
     var cursor_buf: [256]u8 = undefined;
     var cursor: ?[]const u8 = null;
     var truncated = false;
-    const NodeItem = struct { id: []const u8, mac: []const u8, ip: ?[]const u8, profile: []const u8, deploy: bool, install_intent: []const u8, pxe_ready: bool, retry_pending: bool, armed_generation: ?u64, status: ?[]const u8, start_at: ?i64, install_at: ?i64, finished_at: ?i64, serial_number: ?[]const u8 };
-    const Response = struct { ok: bool, result: struct { items: []const NodeItem, next_cursor: ?[]const u8 } };
+    var view_revision: ?NodeListViewRevision = null;
     while (true) {
-        const parsed = std.json.parseFromSlice(Response, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-            try ctx.writer.writeAll("error: node: malformed daemon response\n");
+        const parsed = std.json.parseFromSlice(NodeListPage, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+            try cli_output.writeError(ctx.writer, output, "node.invalid_response", "malformed daemon response");
             setExitCode(ctx, 1);
             return;
         };
+        if (view_revision) |expected| {
+            if (!std.meta.eql(expected, parsed.value.result.view_revision)) {
+                try cli_output.writeError(ctx.writer, output, "node.view_changed", "node view changed while following pagination; retry the command");
+                setExitCode(ctx, 1);
+                return;
+            }
+        } else view_revision = parsed.value.result.view_revision;
         for (parsed.value.result.items) |item| {
-            if (rows.items.len >= 256) {
+            if (!output_json and items.items.len >= 256) {
                 truncated = true;
                 break;
             }
-            var start_buf: [20]u8 = undefined;
-            var install_buf: [20]u8 = undefined;
-            var finished_buf: [20]u8 = undefined;
-            try rows.append(a, .{
-                .id = try a.dupe(u8, item.id),
-                .mac = try a.dupe(u8, item.mac),
-                .ip = try a.dupe(u8, item.ip orelse "-"),
-                .profile = try a.dupe(u8, item.profile),
-                .deploy = try a.dupe(u8, if (item.deploy) "yes" else "no"),
-                .install_intent = try a.dupe(u8, item.install_intent),
-                .status = try a.dupe(u8, item.status orelse "-"),
-                .start_at = try a.dupe(u8, views.formatTimestamp(&start_buf, item.start_at orelse 0)),
-                .install_at = try a.dupe(u8, views.formatTimestamp(&install_buf, item.install_at orelse 0)),
-                .finished_at = try a.dupe(u8, views.formatTimestamp(&finished_buf, item.finished_at orelse 0)),
-                .serial_number = try a.dupe(u8, item.serial_number orelse "-"),
-            });
+            try items.append(a, item);
         }
         if (truncated) break;
         if (parsed.value.result.next_cursor) |nc| {
             if (nc.len <= cursor_buf.len) {
                 @memcpy(cursor_buf[0..nc.len], nc);
                 cursor = cursor_buf[0..nc.len];
-            } else break;
+            } else {
+                try cli_output.writeError(ctx.writer, output, "node.invalid_cursor", "daemon returned an oversized pagination cursor");
+                setExitCode(ctx, 1);
+                return;
+            }
         } else break;
-        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", cursor, &response) catch null) orelse break;
+        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", cursor, &response) catch null) orelse {
+            try cli_output.writeError(ctx.writer, output, "node.pagination_failed", "daemon became unavailable while following pagination");
+            setExitCode(ctx, 1);
+            return;
+        };
+    }
+    if (output_json) {
+        const Result = struct { view_revision: NodeListViewRevision, items: []const NodeListItem, next_cursor: ?[]const u8 = null };
+        return cli_output.writeResult(ctx.writer, Result{ .view_revision = view_revision.?, .items = items.items });
+    }
+    var rows: std.ArrayList(views.NodeRow) = .empty;
+    for (items.items) |item| {
+        var start_buf: [20]u8 = undefined;
+        var install_buf: [20]u8 = undefined;
+        var finished_buf: [20]u8 = undefined;
+        try rows.append(a, .{
+            .id = item.id,
+            .mac = item.mac,
+            .ip = item.ip orelse "-",
+            .profile = item.profile,
+            .deploy = if (item.deploy) "yes" else "no",
+            .install_intent = item.install_intent,
+            .status = item.status orelse "-",
+            .start_at = try a.dupe(u8, views.formatTimestamp(&start_buf, item.start_at orelse 0)),
+            .install_at = try a.dupe(u8, views.formatTimestamp(&install_buf, item.install_at orelse 0)),
+            .finished_at = try a.dupe(u8, views.formatTimestamp(&finished_buf, item.finished_at orelse 0)),
+            .serial_number = item.serial_number orelse "-",
+        });
     }
     try views.nodes(ctx.writer, rows.items);
-    try ctx.writer.writeAll("Settable keys: mac, arch, profile, ip, hostname, deploy, http_accel (see: nodeforge node show <id>)\n");
+    try ctx.writer.print("Settable keys: {s} (see: nodeforge node show <id>)\n", .{cli_properties.node_set_keys});
     if (truncated) try ctx.writer.writeAll("note: output truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
 
+const ProfileListItem = struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: ?[]const u8, nodes: usize, valid: bool };
+const ProfileListPage = struct { ok: bool, result: struct { items: []const ProfileListItem, next_cursor: ?[]const u8, view_revision: u64 } };
+
 fn profileListHandler(ctx: zli.CommandContext) !void {
-    const output_json = outputJsonFromContext(ctx) orelse return;
+    const output = outputFromContext(ctx) orelse return;
+    const output_json = output.mode == .json;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
-    // M4.5：按 `next_cursor` 翻页取全部 profile（上限 256 行）。`--output json`
-    // 只回显首页信封，JSON 消费者自行跟随游标。
     var response: [128 * 1024]u8 = undefined;
     const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", null, &response) catch {
-        try ctx.writer.writeAll("error: profile: local daemon management API unavailable\n");
+        try cli_output.writeError(ctx.writer, output, "profile.unavailable", "local daemon management API unavailable");
         setExitCode(ctx, 1);
         return;
     };
     var page_body = first orelse {
-        try ctx.writer.writeAll("error: profile: local daemon management API unavailable\n");
+        try cli_output.writeError(ctx.writer, output, "profile.unavailable", "local daemon management API unavailable");
         setExitCode(ctx, 1);
         return;
     };
-    if (output_json) return ctx.writer.writeAll(page_body);
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var rows: std.ArrayList(views.ProfileRow) = .empty;
+    var items: std.ArrayList(ProfileListItem) = .empty;
     var cursor_buf: [256]u8 = undefined;
     var cursor: ?[]const u8 = null;
     var truncated = false;
-    const ProfileItem = struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: ?[]const u8, nodes: usize, valid: bool };
-    const Response = struct { ok: bool, result: struct { items: []const ProfileItem, next_cursor: ?[]const u8 } };
+    var view_revision: ?u64 = null;
     while (true) {
-        const parsed = std.json.parseFromSlice(Response, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-            try ctx.writer.writeAll("error: profile: malformed daemon response\n");
+        const parsed = std.json.parseFromSlice(ProfileListPage, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+            try cli_output.writeError(ctx.writer, output, "profile.invalid_response", "malformed daemon response");
             setExitCode(ctx, 1);
             return;
         };
+        if (view_revision) |expected| {
+            if (expected != parsed.value.result.view_revision) {
+                try cli_output.writeError(ctx.writer, output, "profile.view_changed", "profile view changed while following pagination; retry the command");
+                setExitCode(ctx, 1);
+                return;
+            }
+        } else view_revision = parsed.value.result.view_revision;
         for (parsed.value.result.items) |profile| {
-            if (rows.items.len >= 256) {
+            if (!output_json and items.items.len >= 256) {
                 truncated = true;
                 break;
             }
-            var count_buf: [24]u8 = undefined;
-            try rows.append(a, .{
-                .name = try a.dupe(u8, profile.name),
-                .mode = try a.dupe(u8, profile.mode),
-                .distro = try a.dupe(u8, profile.distro),
-                .version = try a.dupe(u8, profile.version),
-                .arch = try a.dupe(u8, profile.arch),
-                .install_source = try a.dupe(u8, profile.install_source orelse "-"),
-                .nodes = try a.dupe(u8, try std.fmt.bufPrint(&count_buf, "{d}", .{profile.nodes})),
-                .valid = try a.dupe(u8, if (profile.valid) "yes" else "no"),
-            });
+            try items.append(a, profile);
         }
         if (truncated) break;
         if (parsed.value.result.next_cursor) |nc| {
             if (nc.len <= cursor_buf.len) {
                 @memcpy(cursor_buf[0..nc.len], nc);
                 cursor = cursor_buf[0..nc.len];
-            } else break;
+            } else {
+                try cli_output.writeError(ctx.writer, output, "profile.invalid_cursor", "daemon returned an oversized pagination cursor");
+                setExitCode(ctx, 1);
+                return;
+            }
         } else break;
-        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", cursor, &response) catch null) orelse break;
+        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", cursor, &response) catch null) orelse {
+            try cli_output.writeError(ctx.writer, output, "profile.pagination_failed", "daemon became unavailable while following pagination");
+            setExitCode(ctx, 1);
+            return;
+        };
+    }
+    if (output_json) {
+        const Result = struct { items: []const ProfileListItem, next_cursor: ?[]const u8 = null, view_revision: u64 };
+        return cli_output.writeResult(ctx.writer, Result{ .items = items.items, .view_revision = view_revision.? });
+    }
+    var rows: std.ArrayList(views.ProfileRow) = .empty;
+    for (items.items) |profile| {
+        var count_buf: [24]u8 = undefined;
+        try rows.append(a, .{
+            .name = profile.name,
+            .mode = profile.mode,
+            .distro = profile.distro,
+            .version = profile.version,
+            .arch = profile.arch,
+            .install_source = profile.install_source orelse "-",
+            .nodes = try a.dupe(u8, try std.fmt.bufPrint(&count_buf, "{d}", .{profile.nodes})),
+            .valid = if (profile.valid) "yes" else "no",
+        });
     }
     try views.profiles(ctx.writer, rows.items);
-    try ctx.writer.writeAll("Settable keys: kernel_args, boot_disk (see: nodeforge profile show <name>)\n");
+    try ctx.writer.print("Settable keys: {s} (boot_disk is a shared default; see: nodeforge profile show <name>)\n", .{cli_properties.profile_set_keys});
     if (truncated) try ctx.writer.writeAll("note: output truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
 
@@ -1616,14 +1679,14 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     defer parsed.deinit();
     const result = parsed.value.result;
     try ctx.writer.print("Profile {s}\n", .{result.name});
-    try ctx.writer.writeAll("\nSettable properties (nodeforge profile set ");
+    try ctx.writer.writeAll("\nSettable profile properties/defaults (nodeforge profile set ");
     try ctx.writer.writeAll(result.name);
     try ctx.writer.writeAll(" key=value)\n");
     if (result.kernel_args) |kernel_args| try ctx.writer.print("  kernel_args={s}\n", .{kernel_args}) else try ctx.writer.print("  # kernel_args is unset; action: nodeforge profile unset {s} kernel_args\n", .{result.name});
-    if (result.install) |install| try ctx.writer.print("  boot_disk={s}\n", .{install.storage.boot_disk});
+    if (result.install) |install| try ctx.writer.print("  boot_disk={s}  # shared fallback for nodes without an override\n", .{install.storage.boot_disk});
     try ctx.writer.print("\nRead-only detail\n  mode          {s}\n  platform      {s} {s} ({s})\n  family        {s}\n  adapter       {s}\n  package_manager {s}\n  boot_bundle   {s}\n  valid         {s}\n", .{ result.mode, result.distro, result.version, result.arch, result.capability.family, result.capability.install_adapter, result.capability.package_manager, result.boot_bundle orelse "-", if (result.validation.valid) "yes" else "no" });
     if (result.install) |install| try ctx.writer.print("  wipe          {s}\n", .{if (install.storage.wipe) "yes" else "no"});
-    try ctx.writer.print("\nOwner / action\n  kernel_args\n    owner         profile:{s}\n    action        nodeforge profile set {s} 'kernel_args=<arguments>'\n  boot_disk\n    owner         profile:{s}\n    action        nodeforge profile set {s} boot_disk=/dev/<device>\n  mode/distro/version/arch/boot_bundle/safety\n    owner         profile:{s}\n    action        read-only (no mutation command)\n  effective_system.*\n    owner         projected startup/profile model\n    action        read-only projection\n  install_source.* / assets.*\n    owner         imported catalog assets\n    action        nodeforge assets list/show/import\n  model_revision.*\n    owner         nodeforged model store\n    action        read-only\n", .{ result.name, result.name, result.name, result.name, result.name });
+    try ctx.writer.print("\nOwner / action\n  kernel_args\n    owner         profile:{s}\n    action        nodeforge profile set {s} 'kernel_args=<arguments>'\n  boot_disk\n    owner         profile:{s} default\n    action        nodeforge profile set {s} boot_disk=/dev/<device>\n    node override nodeforge node set <id> boot_disk=/dev/<device>\n  mode/distro/version/arch/boot_bundle/safety\n    owner         profile:{s}\n    action        read-only (no mutation command)\n  effective_system.*\n    owner         projected startup/profile model\n    action        read-only projection\n  install_source.* / assets.*\n    owner         imported catalog assets\n    action        nodeforge assets list/show/import\n  model_revision.*\n    owner         nodeforged model store\n    action        read-only\n", .{ result.name, result.name, result.name, result.name, result.name });
     try ctx.writer.print("\nSafety\n  Unknown safe  {s}\n  Destructive   {s}\n  Persistent    {s}\n  Reinstall     {s}\n", .{ if (result.safety.safe_for_unknown) "yes" else "no", if (result.safety.destructive) "yes" else "no", if (result.safety.persistent_writes) "yes" else "no", @tagName(result.safety.reinstall_policy) });
     try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Firewall      {s}\n  SELinux       {s}\n  Users         {d}\n  Packages      {d}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, result.effective_system.connectivity.mode, if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.security.firewall, result.effective_system.security.selinux, result.effective_system.users.len, result.effective_system.packages.len });
     if (result.install_source) |source| {
@@ -1644,7 +1707,8 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
     const name = ctx.getArg("name") orelse return;
     const install_source = ctx.getArg("install-source") orelse return;
     if (!nodeforge.config_validate.validLogicalId(name) or !nodeforge.config_validate.validLogicalId(install_source)) {
-        try ctx.writer.writeAll("error: profile create: name and install-source must be canonical logical identifiers\n");
+        const output = outputFromContext(ctx) orelse return;
+        try cli_output.writeError(ctx.writer, output, "profile.invalid", "profile create: name and install-source must be canonical logical identifiers");
         setExitCode(ctx, 2);
         return;
     }
@@ -1660,7 +1724,7 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
         return;
     }
     if (output_json)
-        try ctx.writer.print("{{\"ok\":true,\"profile\":{f},\"mode\":\"install\",\"install_source\":{f}}}\n", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}) })
+        try cli_output.writeResult(ctx.writer, .{ .profile = name, .mode = "install", .install_source = install_source })
     else
         try views.success(ctx.writer, "install profile created", &.{ .{ .label = "Profile", .value = name }, .{ .label = "Install source", .value = install_source }, .{ .label = "Safety", .value = "destructive, persistent, explicit retry" } });
 }
@@ -1699,7 +1763,7 @@ fn mutateProfileKernelArgs(ctx: zli.CommandContext, name: []const u8, kernel_arg
         return;
     }
     if (output_json)
-        try ctx.writer.print("{{\"ok\":true,\"profile\":{f},\"kernel_args\":{f}}}\n", .{ std.json.fmt(name, .{}), std.json.fmt(kernel_args, .{}) })
+        try cli_output.writeResult(ctx.writer, .{ .profile = name, .kernel_args = kernel_args })
     else
         try views.success(ctx.writer, summary, &.{ .{ .label = "Profile", .value = name }, .{ .label = "Kernel args", .value = kernel_args orelse "-" }, .{ .label = "Install nodes", .value = "run node retry before the next install" } });
 }
@@ -1717,20 +1781,22 @@ fn mutateProfileBootDisk(ctx: zli.CommandContext, name: []const u8, boot_disk: [
         return;
     }
     if (output_json)
-        try ctx.writer.print("{{\"ok\":true,\"profile\":{f},\"boot_disk\":{f}}}\n", .{ std.json.fmt(name, .{}), std.json.fmt(boot_disk, .{}) })
+        try cli_output.writeResult(ctx.writer, .{ .profile = name, .boot_disk = boot_disk })
     else
-        try views.success(ctx.writer, "profile boot disk updated", &.{ .{ .label = "Profile", .value = name }, .{ .label = "Boot disk", .value = boot_disk }, .{ .label = "Install nodes", .value = "run node retry before the next install" } });
+        try views.success(ctx.writer, "profile boot disk default updated", &.{ .{ .label = "Profile", .value = name }, .{ .label = "Default disk", .value = boot_disk }, .{ .label = "Affected nodes", .value = "nodes without a boot_disk override; run node retry before install" } });
 }
 
 fn profilePropertyError(ctx: zli.CommandContext, err: anyerror) void {
-    ctx.writer.print("error: profile attributes: {s}; expected kernel_args=<value>, boot_disk=/dev/<device>, or unset kernel_args\n", .{@errorName(err)}) catch {};
+    var message: [256]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&message, "profile attributes: {s}; expected kernel_args=<value>, boot_disk=/dev/<device>, or unset kernel_args", .{@errorName(err)}) catch "invalid profile property";
+    const output = outputFromContext(ctx) orelse return;
+    cli_output.writeError(ctx.writer, output, "profile.invalid_property", rendered) catch {};
     setExitCode(ctx, 2);
 }
 
 /// 离线 answer 预览有意使用明显的非密钥占位符。
 /// 真实凭据仅通过已认证的 `/install-config/kickstart` 路由下发。
 fn installRenderHandler(ctx: zli.CommandContext) !void {
-    _ = outputJsonFromContext(ctx) orelse return;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), ctx.writer, ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
@@ -1762,7 +1828,8 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
         setExitCode(ctx, 1);
         return;
     };
-    const install = profile.install orelse {
+    var effective_disk: [1][]const u8 = undefined;
+    const install = nodeforge.profile_install.effectiveInstall(node, profile, &effective_disk) catch {
         try ctx.writer.writeAll("error: install: profile has no install plan\n");
         setExitCode(ctx, 1);
         return;
@@ -1819,7 +1886,7 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
         const result = nodeforge.management_client.installGenerationsForce(ctx.io, config.value.server.http_port, node_id, &reason);
         if (!result.healthy) return reportMutationFailure(ctx, result, "forced install retry failed: daemon unreachable");
         if (output_json)
-            try ctx.writer.print("{{\"ok\":true,\"node_id\":{f},\"superseded_active_session\":true}}\n", .{std.json.fmt(node_id, .{})})
+            try cli_output.writeResult(ctx.writer, .{ .node_id = node_id, .superseded_active_session = true })
         else
             try ctx.writer.print("active install session superseded; generation rearmed for {s}; waiting for next PXE\n", .{node_id});
         return;
@@ -1828,7 +1895,7 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     const result = nodeforge.management_client.installGenerations(ctx.io, config.value.server.http_port, node_id, &reason);
     if (!result.healthy) return reportMutationFailure(ctx, result, "install retry failed: daemon unreachable");
     if (output_json)
-        try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})})
+        try cli_output.writeResult(ctx.writer, .{ .node_id = node_id })
     else
         try ctx.writer.print("install generation rearmed for {s}; waiting for next PXE\n", .{node_id});
 }
@@ -1839,10 +1906,8 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
 /// 直接输出服务端错误信封（code/message/request_id），否则（连接失败）输出
 /// `fallback`。始终置非零退出码。
 fn reportMutationFailure(ctx: zli.CommandContext, result: nodeforge.management_client.Mutation, fallback: []const u8) !void {
-    if (result.reason.len > 0)
-        try ctx.writer.print("error: {s}\n", .{result.reason})
-    else
-        try ctx.writer.print("error: {s}\n", .{fallback});
+    const output = outputFromContext(ctx) orelse return;
+    try cli_output.writeError(ctx.writer, output, "mutation.failed", if (result.reason.len > 0) result.reason else fallback);
     setExitCode(ctx, 1);
 }
 
@@ -1850,7 +1915,7 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const config_path = ctx.flag("config", []const u8);
     const node_id = ctx.getArg("node_id") orelse return;
-    const patch = parseNodeProperties(ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
+    const patch = parseNodeProperties(ctx.allocator, ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
     const mac = patch.mac orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
     const arch = patch.arch orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
     const profile = patch.profile orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
@@ -1860,7 +1925,7 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .id = node_id, .mac = mac, .arch = arch, .profile = profile, .ip = patch.ip, .hostname = patch.hostname, .deploy = patch.deploy orelse true, .http_accel = patch.http_accel orelse false }, .{});
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .id = node_id, .mac = mac, .arch = arch, .profile = profile, .ip = patch.ip, .hostname = patch.hostname, .deploy = patch.deploy orelse true, .http_accel = patch.http_accel orelse false, .boot_disk = patch.boot_disk, .install_disks = patch.install_disks }, .{ .emit_null_optional_fields = false });
     defer ctx.allocator.free(body);
     var reason: [256]u8 = undefined;
     const node_result = nodeforge.management_client.nodeAdd(ctx.io, config.value.server.http_port, body, &reason);
@@ -1868,14 +1933,14 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
         try reportMutationFailure(ctx, node_result, "node add failed: daemon unreachable");
         return;
     }
-    if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node added", &.{ .{ .label = "Node", .value = node_id }, .{ .label = "MAC", .value = mac }, .{ .label = "Profile", .value = profile } });
+    if (output_json) try cli_output.writeResult(ctx.writer, .{ .node_id = node_id }) else try views.success(ctx.writer, "node added", &.{ .{ .label = "Node", .value = node_id }, .{ .label = "MAC", .value = mac }, .{ .label = "Profile", .value = profile } });
 }
 
 fn nodeSetHandler(ctx: zli.CommandContext) !void {
     const output_json = outputJsonFromContext(ctx) orelse return;
     const config_path = ctx.flag("config", []const u8);
     const node_id = ctx.getArg("node_id") orelse return;
-    const patch = parseNodeProperties(ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
+    const patch = parseNodeProperties(ctx.allocator, ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
     var params: node_mutation.SetParams = .{ .mac = patch.mac, .arch = patch.arch, .profile = patch.profile, .deploy = patch.deploy, .http_accel = patch.http_accel };
     if (patch.ip) |value| {
         params.ip_set = true;
@@ -1885,13 +1950,21 @@ fn nodeSetHandler(ctx: zli.CommandContext) !void {
         params.hostname_set = true;
         params.hostname = value;
     }
+    if (patch.boot_disk) |value| {
+        params.boot_disk_set = true;
+        params.boot_disk = value;
+    }
+    if (patch.install_disks) |value| {
+        params.install_disks_set = true;
+        params.install_disks = value;
+    }
 
     var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .mac = params.mac, .arch = params.arch, .profile = params.profile, .ip = if (params.ip_set) params.ip else null, .hostname = if (params.hostname_set) params.hostname else null, .deploy = params.deploy, .http_accel = params.http_accel }, .{ .emit_null_optional_fields = false });
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .mac = params.mac, .arch = params.arch, .profile = params.profile, .ip = if (params.ip_set) params.ip else null, .hostname = if (params.hostname_set) params.hostname else null, .deploy = params.deploy, .http_accel = params.http_accel, .boot_disk = if (params.boot_disk_set) params.boot_disk else null, .install_disks = if (params.install_disks_set) params.install_disks else null }, .{ .emit_null_optional_fields = false });
     defer ctx.allocator.free(body);
     var reason: [256]u8 = undefined;
     const node_result = nodeforge.management_client.nodeSet(ctx.io, config.value.server.http_port, node_id, body, &reason);
@@ -1899,7 +1972,7 @@ fn nodeSetHandler(ctx: zli.CommandContext) !void {
         try reportMutationFailure(ctx, node_result, "node set failed: daemon unreachable");
         return;
     }
-    if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node updated", &.{.{ .label = "Node", .value = node_id }});
+    if (output_json) try cli_output.writeResult(ctx.writer, .{ .node_id = node_id }) else try views.success(ctx.writer, "node updated", &.{.{ .label = "Node", .value = node_id }});
 }
 
 fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
@@ -1916,6 +1989,14 @@ fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
             if (params.hostname_set) return nodePropertyError(ctx, error.DuplicateAttribute);
             params.hostname_set = true;
             params.hostname = null;
+        } else if (std.mem.eql(u8, key, "boot_disk")) {
+            if (params.boot_disk_set) return nodePropertyError(ctx, error.DuplicateAttribute);
+            params.boot_disk_set = true;
+            params.boot_disk = null;
+        } else if (std.mem.eql(u8, key, "install_disks")) {
+            if (params.install_disks_set) return nodePropertyError(ctx, error.DuplicateAttribute);
+            params.install_disks_set = true;
+            params.install_disks = null;
         } else return nodePropertyError(ctx, error.AttributeNotOptional);
     }
     var config = loadConfig(ctx.io, ctx.allocator, config_path, ctx.writer, ctx.flag("debug", bool)) orelse {
@@ -1923,7 +2004,7 @@ fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    var unset: [2][]const u8 = undefined;
+    var unset: [4][]const u8 = undefined;
     var unset_len: usize = 0;
     if (params.ip_set) {
         unset[unset_len] = "ip";
@@ -1931,6 +2012,14 @@ fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
     }
     if (params.hostname_set) {
         unset[unset_len] = "hostname";
+        unset_len += 1;
+    }
+    if (params.boot_disk_set) {
+        unset[unset_len] = "boot_disk";
+        unset_len += 1;
+    }
+    if (params.install_disks_set) {
+        unset[unset_len] = "install_disks";
         unset_len += 1;
     }
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .unset = unset[0..unset_len] }, .{});
@@ -1941,33 +2030,50 @@ fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
         try reportMutationFailure(ctx, node_result, "node unset failed: daemon unreachable");
         return;
     }
-    if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node attributes cleared", &.{.{ .label = "Node", .value = node_id }});
+    if (output_json) try cli_output.writeResult(ctx.writer, .{ .node_id = node_id }) else try views.success(ctx.writer, "node attributes cleared", &.{.{ .label = "Node", .value = node_id }});
 }
 
-const NodeProperties = struct { mac: ?[]const u8 = null, arch: ?model.Arch = null, profile: ?[]const u8 = null, ip: ?[]const u8 = null, hostname: ?[]const u8 = null, deploy: ?bool = null, http_accel: ?bool = null };
-fn parseNodeProperties(values: []const []const u8) !NodeProperties {
+const NodeProperties = struct { mac: ?[]const u8 = null, arch: ?model.Arch = null, profile: ?[]const u8 = null, ip: ?[]const u8 = null, hostname: ?[]const u8 = null, deploy: ?bool = null, http_accel: ?bool = null, boot_disk: ?[]const u8 = null, install_disks: ?[]const []const u8 = null };
+fn parseNodeProperties(allocator: std.mem.Allocator, values: []const []const u8) !NodeProperties {
     var result: NodeProperties = .{};
-    var seen: u8 = 0;
+    var seen: u16 = 0;
     for (values) |item| {
         const equal = std.mem.indexOfScalar(u8, item, '=') orelse return error.InvalidAttribute;
         const key = item[0..equal];
         const value = item[equal + 1 ..];
         if (key.len == 0 or value.len == 0) return error.InvalidAttribute;
-        const bit: u8 = if (std.mem.eql(u8, key, "mac")) 1 else if (std.mem.eql(u8, key, "arch")) 2 else if (std.mem.eql(u8, key, "profile")) 4 else if (std.mem.eql(u8, key, "ip")) 8 else if (std.mem.eql(u8, key, "hostname")) 16 else if (std.mem.eql(u8, key, "deploy")) 32 else if (std.mem.eql(u8, key, "http_accel")) 64 else return error.UnknownAttribute;
+        const property = cli_properties.NodeKey.parse(key) orelse return error.UnknownAttribute;
+        const bit = property.mask();
         if (seen & bit != 0) return error.DuplicateAttribute;
         seen |= bit;
-        switch (bit) {
-            1 => result.mac = value,
-            2 => result.arch = std.meta.stringToEnum(model.Arch, value) orelse return error.InvalidAttribute,
-            4 => result.profile = value,
-            8 => result.ip = value,
-            16 => result.hostname = value,
-            32 => result.deploy = parseStrictBool(value) orelse return error.InvalidAttribute,
-            64 => result.http_accel = parseStrictBool(value) orelse return error.InvalidAttribute,
-            else => unreachable,
+        switch (property) {
+            .mac => result.mac = value,
+            .arch => result.arch = std.meta.stringToEnum(model.Arch, value) orelse return error.InvalidAttribute,
+            .profile => result.profile = value,
+            .ip => result.ip = value,
+            .hostname => result.hostname = value,
+            .deploy => result.deploy = parseStrictBool(value) orelse return error.InvalidAttribute,
+            .http_accel => result.http_accel = parseStrictBool(value) orelse return error.InvalidAttribute,
+            .boot_disk => result.boot_disk = value,
+            .install_disks => result.install_disks = try parseDeviceList(allocator, value),
         }
     }
     return result;
+}
+fn parseDeviceList(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    var count: usize = 1;
+    for (value) |byte| if (byte == ',') {
+        count += 1;
+    };
+    const disks = try allocator.alloc([]const u8, count);
+    var split = std.mem.splitScalar(u8, value, ',');
+    var index: usize = 0;
+    while (split.next()) |disk| {
+        if (disk.len == 0) return error.InvalidAttribute;
+        disks[index] = disk;
+        index += 1;
+    }
+    return disks;
 }
 fn parseStrictBool(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "true")) return true;
@@ -1975,7 +2081,10 @@ fn parseStrictBool(value: []const u8) ?bool {
     return null;
 }
 fn nodePropertyError(ctx: zli.CommandContext, err: anyerror) void {
-    ctx.writer.print("error: node attributes: {s}\n", .{@errorName(err)}) catch {};
+    var message: [128]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&message, "node attributes: {s}", .{@errorName(err)}) catch "invalid node property";
+    const output = outputFromContext(ctx) orelse return;
+    cli_output.writeError(ctx.writer, output, "node.invalid_property", rendered) catch {};
     setExitCode(ctx, 2);
 }
 
@@ -1995,7 +2104,7 @@ fn nodeRemoveHandler(ctx: zli.CommandContext) !void {
         try reportMutationFailure(ctx, node_result, "node remove failed: daemon unreachable");
         return;
     }
-    if (output_json) try ctx.writer.print("{{\"ok\":true,\"node_id\":{f}}}\n", .{std.json.fmt(node_id, .{})}) else try views.success(ctx.writer, "node removed", &.{.{ .label = "Node", .value = node_id }});
+    if (output_json) try cli_output.writeResult(ctx.writer, .{ .node_id = node_id }) else try views.success(ctx.writer, "node removed", &.{.{ .label = "Node", .value = node_id }});
 }
 
 fn nodeShowHandler(ctx: zli.CommandContext) !void {
@@ -2032,6 +2141,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
                 users: []const struct { name: []const u8, sudo: bool, password_configured: bool, authorized_key_count: usize },
                 packages: []const []const u8,
             },
+            storage: ?struct { profile_default: model.StorageConfig, override: ?model.NodeStorageOverrideConfig, effective: model.StorageConfig },
             status: ?struct { phase: []const u8, boot_session_id: []const u8, model_revision: u64, deployment_generation: u64, last_event_at: i64, last_error: bool, reason: []const u8, session_active: bool },
             deployment: ?struct {
                 install_intent: []const u8,
@@ -2073,6 +2183,15 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     // can mutate them. Derived/runtime/audit projections are explicitly marked
     // read-only below.
     try ctx.writer.print("\nOwner / action\n  profile.kernel_args\n    owner         profile:{s}\n    action        nodeforge profile set {s} 'kernel_args=<arguments>'\n  profile.*\n    owner         profile:{s}\n    action        nodeforge profile show {s}\n  deployment.*\n    owner         nodeforged lifecycle\n    action        nodeforge node retry {s} [--force]\n  runtime.*\n    owner         nodeforged runtime\n    action        read-only\n  inventory.*\n    owner         node-reported inventory\n    action        read-only\n  view_revision.*\n    owner         nodeforged model store\n    action        read-only\n", .{ result.profile.name, result.profile.name, result.profile.name, result.profile.name, result.node.id });
+    if (result.storage) |storage| {
+        try ctx.writer.writeAll("\nEffective storage (read-only projection)\n");
+        try ctx.writer.print("  Boot disk      {s}\n  Source         {s}\n  Profile default {s}\n  Install disks  ", .{ storage.effective.boot_disk, if (storage.override != null and storage.override.?.boot_disk != null) "node override" else "profile default", storage.profile_default.boot_disk });
+        for (storage.effective.install_disks, 0..) |disk, index| {
+            if (index != 0) try ctx.writer.writeAll(", ");
+            try ctx.writer.writeAll(disk);
+        }
+        try ctx.writer.writeByte('\n');
+    }
     try ctx.writer.print("\nEffective system\n  Locale        {s}\n  Timezone      {s}\n  Keyboard      {s}\n  Connectivity  {s}\n  Time sync     {s}\n  SSH           {s}\n  Password auth {s}\n  Root login    {s}\n  Root password {s}\n  Root keys     {d}\n  Firewall      {s}\n  SELinux       {s}\n", .{ result.effective_system.localization.locale, result.effective_system.localization.timezone, result.effective_system.localization.keyboard, @tagName(result.effective_system.connectivity.mode), if (result.effective_system.connectivity.time_sync) "enabled" else "disabled", if (result.effective_system.ssh.enabled) "enabled" else "disabled", if (result.effective_system.ssh.password_authentication) "enabled" else "disabled", result.effective_system.ssh.root_login, if (result.effective_system.ssh.root_password_configured) "configured" else "not configured", result.effective_system.ssh.root_authorized_key_count, @tagName(result.effective_system.security.firewall), @tagName(result.effective_system.security.selinux) });
     try ctx.writer.print("  NTP servers   {d}\n", .{result.effective_system.connectivity.ntp_servers.len});
     for (result.effective_system.connectivity.ntp_servers) |server| try ctx.writer.print("    - {s}\n", .{server});

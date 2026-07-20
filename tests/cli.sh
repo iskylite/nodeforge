@@ -70,11 +70,18 @@ grep -Fq 'kernel_args, boot_disk' "$tmp/profile-set-help"
 grep -Fq "nodeforge profile set rocky 'kernel_args=iommu=pt hugepages=4'" "$tmp/profile-set-help"
 "$cli" node set --help >"$tmp/node-set-help"
 grep -Fq 'mac, arch, profile, ip, hostname, deploy, http_accel' "$tmp/node-set-help"
-grep -Fq 'nodeforge node set r97n1 hostname=r97n1 deploy=true' "$tmp/node-set-help"
+grep -Fq 'boot_disk, install_disks' "$tmp/node-set-help"
+grep -Fq 'nodeforge node set r97n1 boot_disk=/dev/nvme0n1' "$tmp/node-set-help"
 "$cli" node unset --help >"$tmp/node-unset-help"
-grep -Fq 'nodeforge node unset r97n1 ip hostname' "$tmp/node-unset-help"
+grep -Fq 'ip, hostname, boot_disk, install_disks' "$tmp/node-unset-help"
+grep -Fq 'nodeforge node unset r97n1 boot_disk install_disks' "$tmp/node-unset-help"
 "$cli" node retry --help >"$tmp/node-retry-help"
 grep -Fq 'Supersede a stuck active session' "$tmp/node-retry-help"
+"$cli" node render --help >"$tmp/node-render-help"
+if grep -Eq '^   .*--output' "$tmp/node-render-help"; then
+    echo "node render emits an answer artifact and must not expose a view-format flag" >&2
+    exit 1
+fi
 "$cli" status --help >"$tmp/status-help"
 grep -Fq 'advertised HTTP, catalog, DHCP, and TFTP' "$tmp/status-help"
 "$cli" runtime --help >"$tmp/runtime-help"

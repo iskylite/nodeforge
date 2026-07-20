@@ -1,5 +1,11 @@
 # NodeForge PXE 特化版概要设计
 
+> 历史合并文档：本文保留 M0-M7 的早期全景和决策背景，不再承担版本边界或现行所有权模型。
+> 当前已实现范围及修复要求以 `V0_1_DESIGN.md` 为准，未实现范围以 `V0_2_DESIGN.md` 为准；
+> 与两份版本文档冲突时，以版本文档为准。本文中的 Profile 物理磁盘、`install_disks`、稳定磁盘 selector、
+> 单盘限制和旧帮助示例均为历史内容；v0.1 目标使用 Node direct `storage.boot_disk/additional_disks`、原生
+> single/LVM/RAID/RAID-LVM、Node policy override、直接分区 item CLI 和统一 `--help-full`。
+
 NodeForge 是一个面向小型 Linux 集群和实验室环境的轻量级 OS Provisioning 平台。当前阶段聚焦 PXE provisioning：用 Zig 实现内置 DHCP/TFTP/HTTP 服务，完成裸机节点发现、标准 PXE 引导、无人值守自动安装、内存无盘启动、rootfs/安装源/镜像分发和基础状态观测。
 
 本文是概要设计收敛版，重点回答：

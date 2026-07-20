@@ -566,6 +566,13 @@ fn validateNodes(config: *const model.AppConfig) ValidationError!void {
             if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed_ip))) return error.NodeOutsideDhcpSubnet;
         }
         if (node.overrides.network) |network| try validateTargetNetwork(config, node, network);
+        if (profile.mode != .install and node.overrides.storage != null) return error.InvalidInstallStorage;
+        if (profile.mode == .install) {
+            var single_disk: [1][]const u8 = undefined;
+            const install = profile_install.effectiveInstall(&node, profile, &single_disk) catch return error.InvalidInstallStorage;
+            const system = profile_install.effectiveSystem(profile) catch return error.InstallIdentityUnavailable;
+            try validateInstallConfig(config, system, install);
+        }
         for (config.nodes[i + 1 ..]) |other| {
             if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
             if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
@@ -881,6 +888,28 @@ test "M4.6 discovery rejects kernel args and install requires bootloader" {
     try std.testing.expectError(error.InvalidKernelArgs, validateConfig(&config));
     config.profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .install_source = "rocky", .install = .{ .bootloader = .{ .install = false } }, .kernel_args = "iommu=pt" }};
     try std.testing.expectError(error.KernelArgsRequiresBootloader, validateConfig(&config));
+}
+
+test "node storage overrides are install-only" {
+    var config: model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+        .profiles = &.{.{ .name = "discovery", .mode = .discovery, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "discovery", .overrides = .{ .storage = .{ .boot_disk = "/dev/vda" } } }},
+    };
+    try std.testing.expectError(error.InvalidInstallStorage, validateNodes(&config));
+
+    config.profiles = &.{.{ .name = "diskless", .mode = .diskless, .distro = "rocky", .version = "9.7", .arch = .aarch64 }};
+    config.nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "diskless", .overrides = .{ .storage = .{ .boot_disk = "/dev/vda" } } }};
+    try std.testing.expectError(error.InvalidInstallStorage, validateNodes(&config));
+}
+
+test "node storage override validates the effective install plan" {
+    const config: model.AppConfig = .{
+        .server = .{ .server_ip = "192.168.50.1" },
+        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .install = .{} }},
+        .nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "install", .overrides = .{ .storage = .{ .boot_disk = "/tmp/not-a-device" } } }},
+    };
+    try std.testing.expectError(error.InvalidInstallStorage, validateNodes(&config));
 }
 
 test "拒绝格式错误的 SHA256" {

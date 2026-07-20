@@ -835,7 +835,8 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
         break :blk url;
     } else "";
     defer if (report_url.len > 0) context.allocator.free(report_url);
-    const install_orig = profile.install orelse return error.MissingInstallConfig;
+    var effective_disk: [1][]const u8 = undefined;
+    const install_orig = @import("../profile/install.zig").effectiveInstall(node, profile, &effective_disk) catch return error.MissingInstallConfig;
     // M4.2 F5：将服务端级别的额外 SSH 公钥合并到安装配置中。
     const merged_keys: []const []const u8 = if (context.additional_keys.len > 0) blk: {
         const combined = try context.allocator.alloc([]const u8, install_orig.ssh_authorized_keys.len + context.additional_keys.len);
@@ -1934,6 +1935,8 @@ const NodeAddRequest = struct {
     hostname: ?[]const u8 = null,
     deploy: bool = true,
     http_accel: bool = false,
+    boot_disk: ?[]const u8 = null,
+    install_disks: ?[]const []const u8 = null,
 };
 
 const NodeSetRequest = struct {
@@ -1944,6 +1947,8 @@ const NodeSetRequest = struct {
     hostname: ?[]const u8 = null,
     deploy: ?bool = null,
     http_accel: ?bool = null,
+    boot_disk: ?[]const u8 = null,
+    install_disks: ?[]const []const u8 = null,
     unset: []const []const u8 = &.{},
 };
 
@@ -2011,6 +2016,9 @@ fn managementProfileSet(request: zap.Request, context: *RouteContext, name: []co
     if (lookup.findProfile(context.catalog_snapshot.value(), name) == null) return notFound(request, meta);
     for (context.catalog_snapshot.value().nodes) |node| {
         if (!std.mem.eql(u8, node.profile, name)) continue;
+        // A shared boot-disk default does not affect nodes with an explicit
+        // per-node disk override, so their pinned sessions do not block it.
+        if (has_boot_disk and node.overrides.storage != null and node.overrides.storage.?.boot_disk != null) continue;
         if (context.sessions.hasActiveNode(node.id, boot_session.monotonicNow()))
             return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.active_session_conflict\",\"message\":\"profile install plan is pinned by an active boot session\"}}\n", meta);
     }
@@ -2067,7 +2075,7 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
     const value = parsed.value;
-    node_mutation.addNode(context.io, context.allocator, context.config, context.catalog.path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .ip = value.ip, .hostname = value.hostname, .deploy = value.deploy, .http_accel = value.http_accel }) catch |err| switch (err) {
+    node_mutation.addNode(context.io, context.allocator, context.config, context.catalog.path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .ip = value.ip, .hostname = value.hostname, .deploy = value.deploy, .http_accel = value.http_accel, .boot_disk = value.boot_disk, .install_disks = value.install_disks }) catch |err| switch (err) {
         error.ProfileNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"node.profile_not_found\",\"message\":\"referenced profile does not exist; create it with nodeforge profile create\"}}\n", meta),
         error.NodeAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.already_exists\",\"message\":\"node identifier already exists\"}}\n", meta),
         error.DuplicateMac => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.duplicate_mac\",\"message\":\"MAC address is already assigned to another node\"}}\n", meta),
@@ -2110,7 +2118,11 @@ fn managementNodeSet(request: zap.Request, context: *RouteContext, node_id: []co
     for (parsed.value.unset) |key| if (std.mem.eql(u8, key, "ip")) {
         clears_ip = true;
     };
-    const protected_change = parsed.value.mac != null or parsed.value.arch != null or parsed.value.profile != null or parsed.value.ip != null or clears_ip;
+    var clears_storage = false;
+    for (parsed.value.unset) |key| {
+        if (std.mem.eql(u8, key, "boot_disk") or std.mem.eql(u8, key, "install_disks")) clears_storage = true;
+    }
+    const protected_change = parsed.value.mac != null or parsed.value.arch != null or parsed.value.profile != null or parsed.value.ip != null or parsed.value.boot_disk != null or parsed.value.install_disks != null or clears_ip or clears_storage;
     if (protected_change and context.sessions.hasActiveNode(node_id, boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.active_session_conflict\",\"message\":\"protected identity is pinned by an active boot session\"}}\n", meta);
     var params: node_mutation.SetParams = .{ .mac = parsed.value.mac, .arch = parsed.value.arch, .profile = parsed.value.profile, .deploy = parsed.value.deploy, .http_accel = parsed.value.http_accel };
     if (parsed.value.ip) |value| {
@@ -2121,6 +2133,14 @@ fn managementNodeSet(request: zap.Request, context: *RouteContext, node_id: []co
         params.hostname_set = true;
         params.hostname = value;
     }
+    if (parsed.value.boot_disk) |value| {
+        params.boot_disk_set = true;
+        params.boot_disk = value;
+    }
+    if (parsed.value.install_disks) |value| {
+        params.install_disks_set = true;
+        params.install_disks = value;
+    }
     for (parsed.value.unset) |key| {
         if (std.mem.eql(u8, key, "ip")) {
             params.ip_set = true;
@@ -2128,7 +2148,13 @@ fn managementNodeSet(request: zap.Request, context: *RouteContext, node_id: []co
         } else if (std.mem.eql(u8, key, "hostname")) {
             params.hostname_set = true;
             params.hostname = null;
-        } else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_unset\",\"message\":\"only ip and hostname can be unset\"}}\n", meta);
+        } else if (std.mem.eql(u8, key, "boot_disk")) {
+            params.boot_disk_set = true;
+            params.boot_disk = null;
+        } else if (std.mem.eql(u8, key, "install_disks")) {
+            params.install_disks_set = true;
+            params.install_disks = null;
+        } else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_unset\",\"message\":\"only ip, hostname, boot_disk, and install_disks can be unset\"}}\n", meta);
     }
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
@@ -2236,6 +2262,12 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     defer output.deinit();
     try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{f},\"profile\":{{\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"install_source\":{f},\"boot_bundle\":{f},\"kernel_args\":{f},\"safety\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), std.json.fmt(node, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.safety, .{}) });
     try writeEffectiveSystem(&output.writer, profile);
+    try output.writer.writeAll(",\"storage\":");
+    if (profile.mode == .install and profile.install != null) {
+        var single_disk: [1][]const u8 = undefined;
+        const effective = try @import("../profile/install.zig").effectiveInstall(node, profile, &single_disk);
+        try output.writer.print("{{\"profile_default\":{f},\"override\":{f},\"effective\":{f}}}", .{ std.json.fmt(profile.install.?.storage, .{}), std.json.fmt(node.overrides.storage, .{}), std.json.fmt(effective.storage, .{}) });
+    } else try output.writer.writeAll("null");
     try output.writer.writeAll(",\"status\":");
     if (status) |value| try output.writer.print("{{\"phase\":{f},\"boot_session_id\":{f},\"model_revision\":{d},\"deployment_generation\":{d},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}}}", .{
         std.json.fmt(@tagName(value.phase), .{}),

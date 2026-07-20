@@ -1,5 +1,13 @@
 # M4.12 Node/Profile 属性归属与存储覆盖设计
 
+> 状态：历史方案，已被 `docs/V0_1_DESIGN.md` 取代。本文记录已经实现的
+> `profile storage default + node storage override` 行为，不再是目标设计。现行要求是物理磁盘仅由
+> Node direct `storage.boot_disk/additional_disks` 持有，主盘默认 `/dev/sda`；语义重复且未被 adapter 消费的
+> `install_disks` 从目标 schema 删除。Profile 不持有磁盘，其 mode/wipe/partition/bootloader、系统、软件和
+> kernel argument 策略全部允许 Node override；v0.1 原生支持 single/LVM/RAID/RAID-LVM、直接分区 item CLI
+> 和统一 `--help-full`；
+> `http_accel` 继续作为默认 false 的 UEFI 实验验证属性保留。
+
 ## 目标
 
 M4.12 解决节点硬件事实、节点局部配置和 profile 部署策略混放的问题。设计必须覆盖模型、校验、渲染、持久化、HTTP API、CLI `show/set/unset`、帮助文本、迁移和后续 M5–M7 的接口边界。

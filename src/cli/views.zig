@@ -147,6 +147,17 @@ pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
     if (node.ip) |ip| try writer.print("  ip={s}\n", .{ip}) else try writer.print("  # ip is unset; action: nodeforge node unset {s} ip\n", .{node.id});
     if (node.hostname) |hostname| try writer.print("  hostname={s}\n", .{hostname}) else try writer.print("  # hostname is unset; action: nodeforge node unset {s} hostname\n", .{node.id});
     try writer.print("  deploy={s}\n  http_accel={s}\n", .{ if (node.deploy) "true" else "false", if (node.http_accel) "true" else "false" });
+    if (node.overrides.storage) |storage| {
+        if (storage.boot_disk) |disk| try writer.print("  boot_disk={s}\n", .{disk}) else try writer.print("  # boot_disk is unset; action: nodeforge node unset {s} boot_disk\n", .{node.id});
+        if (storage.install_disks) |disks| {
+            try writer.writeAll("  install_disks=");
+            try writeCommaList(writer, disks);
+            try writer.writeByte('\n');
+        } else try writer.print("  # install_disks is unset; action: nodeforge node unset {s} install_disks\n", .{node.id});
+    } else {
+        try writer.print("  # boot_disk is unset; action: nodeforge node unset {s} boot_disk\n", .{node.id});
+        try writer.print("  # install_disks is unset; action: nodeforge node unset {s} install_disks\n", .{node.id});
+    }
     try writer.writeAll("\nRead-only detail\n");
     if (node.overrides.network) |network| {
         try writer.writeAll("  Network override\n");
@@ -172,6 +183,13 @@ fn writeStringList(writer: *std.Io.Writer, label: []const u8, values: []const []
         try table.writeEscaped(writer, value);
     }
     try writer.writeByte('\n');
+}
+
+fn writeCommaList(writer: *std.Io.Writer, values: []const []const u8) !void {
+    for (values, 0..) |value, index| {
+        if (index != 0) try writer.writeByte(',');
+        try table.writeEscaped(writer, value);
+    }
 }
 
 /// 渲染 TFTP 会话列表表格。`rows` 使用借用 slice；超过 32 行返回 `error.TooManyRows`。
@@ -344,6 +362,15 @@ test "node detail uses exact set parser keys" {
         .http_accel = false,
     });
     const out = writer.buffered();
-    inline for (.{ "mac=00:50:56:2A:23:DB", "arch=aarch64", "profile=rocky", "ip=192.168.27.210", "hostname=r97n1", "deploy=true", "http_accel=false" }) |needle|
+    inline for (.{ "mac=00:50:56:2A:23:DB", "arch=aarch64", "profile=rocky", "ip=192.168.27.210", "hostname=r97n1", "deploy=true", "http_accel=false", "boot_disk is unset", "install_disks is unset" }) |needle|
         try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
+}
+
+test "node detail renders storage override in parser vocabulary" {
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try nodeDetail(&writer, .{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "rocky", .overrides = .{ .storage = .{ .boot_disk = "/dev/nvme0n1", .install_disks = &.{ "/dev/nvme0n1", "/dev/nvme1n1" } } } });
+    const out = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "boot_disk=/dev/nvme0n1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "install_disks=/dev/nvme0n1,/dev/nvme1n1") != null);
 }

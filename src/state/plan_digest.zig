@@ -32,7 +32,12 @@ pub fn forNode(allocator: std.mem.Allocator, config: *const model.AppConfig, sou
         .additional_keys = delivery.additional_keys,
     });
     try append(&canonical.writer, "node", node.*);
-    try append(&canonical.writer, "profile", profile.*);
+    var effective_profile = profile.*;
+    var single_disk: [1][]const u8 = undefined;
+    if (profile.mode == .install) effective_profile.install = try @import("../profile/install.zig").effectiveInstall(node, profile, &single_disk);
+    // Hash the effective profile, not the raw shared storage default. A profile
+    // disk-default change must not drift nodes that explicitly override it.
+    try append(&canonical.writer, "profile", effective_profile);
     try append(&canonical.writer, "distro", .{ .name = distro.name, .family = distro.family, .version = distro_version.* });
 
     switch (profile.mode) {
@@ -127,4 +132,25 @@ test "node plan digest ignores unrelated entities and tracks referenced inputs" 
     try std.testing.expect(!std.mem.eql(u8, &baseline, &(try forNode(std.testing.allocator, &config, &model_catalog, delivery, "n1"))));
     const changed_delivery: Delivery = .{ .bootstrap_key = "ssh-ed25519 AAAA-replaced", .additional_keys = delivery.additional_keys };
     try std.testing.expect(!std.mem.eql(u8, &baseline, &(try forNode(std.testing.allocator, &config, &model_catalog, changed_delivery, "n1"))));
+}
+
+test "profile disk default does not drift an overridden node" {
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1" } };
+    const versions = [_]model.DistroVersionConfig{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }};
+    const distros = [_]model.DistroConfig{.{ .name = "rocky", .family = .rhel, .versions = &versions }};
+    var profiles = [_]model.ProfileConfig{.{ .name = "target", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .install_source = "source", .install = .{} }};
+    const nodes = [_]model.NodeConfig{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "target", .overrides = .{ .storage = .{ .boot_disk = "/dev/nvme0n1" } } }};
+    const assets = [_]model.AssetConfig{
+        .{ .name = "iso", .kind = .iso, .path = "iso", .sha256 = "aa" },
+        .{ .name = "kernel", .kind = .kernel, .path = "kernel", .sha256 = "bb" },
+        .{ .name = "initrd", .kind = .installer_initrd, .path = "initrd", .sha256 = "cc" },
+        .{ .name = "grub-uefi-aarch64", .kind = .bootloader, .path = "efi/grubaa64.efi", .arch = .aarch64, .sha256 = "dd" },
+    };
+    const sources = [_]model.InstallSourceConfig{.{ .name = "source", .distro = "rocky", .version = "9.7", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "kernel", .installer_initrd = "initrd" }};
+    var model_catalog: model.Catalog = .{ .distros = &distros, .profiles = &profiles, .nodes = &nodes, .assets = &assets, .install_sources = &sources };
+    const delivery: Delivery = .{ .bootstrap_key = "ssh-ed25519 AAAA-primary", .additional_keys = &.{} };
+    const baseline = try forNode(std.testing.allocator, &config, &model_catalog, delivery, "n1");
+    profiles[0].install.?.storage.boot_disk = "/dev/vda";
+    profiles[0].install.?.storage.install_disks = &.{"/dev/vda"};
+    try std.testing.expectEqualSlices(u8, &baseline, &(try forNode(std.testing.allocator, &config, &model_catalog, delivery, "n1")));
 }

@@ -122,6 +122,7 @@ pub const log_backend = @import("observe/log_backend.zig");
 pub const cli_table = @import("cli/table.zig");
 /// CLI 输出格式化：human/JSON 模式切换和颜色控制。
 pub const cli_output = @import("cli/output.zig");
+pub const cli_properties = @import("cli/properties.zig");
 /// CLI 视图模板：status/check/asset/node/lease 等命令的展示视图。
 pub const cli_views = @import("cli/views.zig");
 /// CLI 事件工具：本地事件 JSONL 读取、过滤和字段提取。

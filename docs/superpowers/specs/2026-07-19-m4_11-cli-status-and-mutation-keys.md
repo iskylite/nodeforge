@@ -1,5 +1,8 @@
 # M4.11：统一运行状态与 mutation key 可发现性
 
+> 本文记录 M4.11 已实现的短 key 契约。v0.1 M4.13 将其升级为 canonical path、typed spec、紧凑 `--help`
+> 和详细 `--help-full`；Profile boot disk、旧 `install_disks` 和下文短 key 示例不再是目标接口。
+
 ## 1. 问题
 
 当前同时存在 `nodeforge status`、`nodeforge check` 和 `nodeforge runtime status`。三者检查范围不同，

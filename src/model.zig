@@ -451,7 +451,17 @@ pub const TargetNetworkConfig = struct {
     search_domains: []const []const u8 = &.{},
 };
 
-pub const NodeOverrideConfig = struct { network: ?TargetNetworkConfig = null };
+/// 单节点安装存储差异。字段保持 optional，避免把 profile 默认值复制到每个
+/// node；effective plan 在使用点按 node override > profile default 合并。
+pub const NodeStorageOverrideConfig = struct {
+    boot_disk: ?[]const u8 = null,
+    install_disks: ?[]const []const u8 = null,
+};
+
+pub const NodeOverrideConfig = struct {
+    network: ?TargetNetworkConfig = null,
+    storage: ?NodeStorageOverrideConfig = null,
+};
 
 /// 安装器输入配置，由 profile 引用以渲染 Kickstart/Autoinstall answer 文件。
 /// 所有字段在配置校验阶段已验证安全性；渲染器直接使用这些值生成安装脚本。

@@ -93,7 +93,7 @@ grep -Fq 'profile.already_exists' "$tmp/profile-create-duplicate"
 "$cli" profile set rocky-fresh boot_disk=/dev/nvme0n1 -c "$tmp/config.json" >"$tmp/profile-disk"
 grep -Fq 'profile boot disk updated' "$tmp/profile-disk"
 "$cli" profile show rocky-fresh -c "$tmp/config.json" >"$tmp/profile-disk-show"
-grep -Fq 'Settable properties (nodeforge profile set rocky-fresh key=value)' "$tmp/profile-disk-show"
+grep -Fq 'Settable profile properties/defaults (nodeforge profile set rocky-fresh key=value)' "$tmp/profile-disk-show"
 grep -Fq 'boot_disk=/dev/nvme0n1' "$tmp/profile-disk-show"
 grep -Fq 'wipe          yes' "$tmp/profile-disk-show"
 grep -Fq 'Owner / action' "$tmp/profile-disk-show"
@@ -109,6 +109,13 @@ fi
 grep -Fq 'profile.install_source_not_found' "$tmp/profile-create-missing"
 "$cli" profile show discovery -c "$tmp/config.json" >"$tmp/profile-show"
 grep -Fq '# kernel_args is unset' "$tmp/profile-show"
+if "$cli" profile set discovery unknown=value -o json -c "$tmp/config.json" >"$tmp/profile-property-error" 2>&1; then
+    echo "profile set unexpectedly accepted an unknown property" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+jq -e '.ok == false and .error.code == "profile.invalid_property" and (.error.message | type == "string")' "$tmp/profile-property-error" >/dev/null
 # M4.6 的窄 profile mutation：null/unset 可幂等应用；discovery 非空参数必须
 # 由稳定校验错误拒绝，并且不能改变配置文件。
 "$cli" profile unset discovery kernel_args -c "$tmp/config.json" >"$tmp/profile-unset"
@@ -184,6 +191,30 @@ grep -Fq 'node.duplicate_mac' "$tmp/node-duplicate-mac"
 grep -Fq 'Intent        initial-armed' "$tmp/install-node-show"
 grep -Fq 'PXE ready     yes' "$tmp/install-node-show"
 
+# M4.12 storage ownership: one node can override the shared profile fallback.
+# A profile-default change must not drift that node; clearing the override makes
+# the new default effective and therefore requires a fresh install generation.
+"$cli" node set install-node boot_disk=/dev/vda -o json -c "$tmp/config.json" >"$tmp/install-node-disk-set"
+jq -e '.ok and .result.node_id == "install-node"' "$tmp/install-node-disk-set" >/dev/null
+"$cli" node show install-node -o json -c "$tmp/config.json" >"$tmp/install-node-disk-show"
+jq -e '.result.storage.profile_default.boot_disk == "/dev/nvme0n1" and .result.storage.override.boot_disk == "/dev/vda" and .result.storage.effective.boot_disk == "/dev/vda"' "$tmp/install-node-disk-show" >/dev/null
+"$cli" profile set rocky-fresh boot_disk=/dev/vdb -o json -c "$tmp/config.json" >"$tmp/profile-disk-change"
+jq -e '.ok and .result.boot_disk == "/dev/vdb"' "$tmp/profile-disk-change" >/dev/null
+"$cli" node show install-node -o json -c "$tmp/config.json" >"$tmp/install-node-after-default"
+jq -e '.result.storage.profile_default.boot_disk == "/dev/vdb" and .result.storage.effective.boot_disk == "/dev/vda" and .result.deployment.install_intent == "initial-armed"' "$tmp/install-node-after-default" >/dev/null
+"$cli" node unset install-node boot_disk -o json -c "$tmp/config.json" >"$tmp/install-node-disk-unset"
+jq -e '.ok and .result.node_id == "install-node"' "$tmp/install-node-disk-unset" >/dev/null
+"$cli" node show install-node -o json -c "$tmp/config.json" >"$tmp/install-node-after-unset"
+jq -e '.result.storage.override == null and .result.storage.effective.boot_disk == "/dev/vdb" and .result.deployment.install_intent == "rearm-required"' "$tmp/install-node-after-unset" >/dev/null
+
+if "$cli" node set install-node unknown=value -o json -c "$tmp/config.json" >"$tmp/node-property-error" 2>&1; then
+    echo "node set unexpectedly accepted an unknown property" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+jq -e '.ok == false and .error.code == "node.invalid_property" and (.error.message | type == "string")' "$tmp/node-property-error" >/dev/null
+
 # M2 read-only DHCP/runtime commands consume the validated local config and
 # daemon management routes. The empty pool is still a useful contract check.
 "$cli" runtime dhcp-leases -c "$tmp/config.json" >"$tmp/dhcp-leases"
@@ -192,6 +223,10 @@ grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No DHCP leases
 grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No unknown clients\.)' "$tmp/dhcp-unknown"
 "$cli" node list -c "$tmp/config.json" >"$tmp/node-list"
 grep -Fqx 'No nodes registered.' "$tmp/node-list"
+"$cli" node list -o json -c "$tmp/config.json" >"$tmp/node-list-json"
+jq -e '.ok and (.result.items | type == "array") and .result.next_cursor == null and (.result.view_revision.catalog | type == "number")' "$tmp/node-list-json" >/dev/null
+"$cli" profile list -o json -c "$tmp/config.json" >"$tmp/profile-list-json"
+jq -e '.ok and (.result.items | type == "array") and .result.next_cursor == null and (.result.view_revision | type == "number")' "$tmp/profile-list-json" >/dev/null
 
 "$cli" status -c "$tmp/config.json" >"$tmp/status-command"
 for check in 'Overall' 'Process' 'Loopback HTTP' 'Advertised HTTP' 'Management API' 'Active config' 'Catalog API' 'DHCP API' 'TFTP API' 'TFTP transfers'; do
