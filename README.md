@@ -1,231 +1,255 @@
 # NodeForge
-一个基于 Zig 实现的轻量级 OS Provisioning 平台，面向小型 Linux 集群，内置 DHCP/TFTP/HTTP 服务。当前代码提供
-IPv4 PXE 引导、多 Linux 发行版无人值守安装和安装源分发；软件能力索引与完整属性面正在 v0.1 M4.13 补齐，
-内存无盘启动属于尚未开始的 v0.2。
 
-基于 Zig 0.16 · 内置 DHCP/TFTP/HTTP · IPv4 PXE · Rocky/Ubuntu 无人值守安装
+一个基于 Zig 实现的轻量级 OS Provisioning 平台，面向小型 Linux 集群和实验室环境。单进程内置 DHCPv4、TFTP 和 HTTP 服务，提供 IPv4 PXE 无人值守安装能力，支持 Rocky Linux / RHEL 系 Kickstart 和 Ubuntu Autoinstall 双适配器。
 
-## 设计文档
+基于 Zig 0.16 · 内置 DHCP/TFTP/HTTP · IPv4 PXE · UEFI x86_64/aarch64 · Rocky/Ubuntu 无人值守安装
 
-- [NodeForge v0.1 设计与修复计划](docs/V0_1_DESIGN.md)：M0-M4 及进入 v0.2 前必须完成的所有权、属性和软件能力修复，现行权威设计
-- [NodeForge v0.1 验证记录](docs/V0_1_VALIDATION.md)：本地、r97n0、Rocky PXE 和当前实机矩阵证据/阻塞
-- [NodeForge v0.2 设计范围](docs/V0_2_DESIGN.md)：尚未实现的 M5-M7，v0.1 完成前不得启动正式实现
-- [历史合并概要设计](docs/DESIGN.md)：保留早期 M0-M7 全景和决策记录，不再作为版本边界事实源
-- [历史分阶段详细设计与实现计划](docs/DETAILED_DESIGN.md)：保留里程碑实现、验收和专项细节
-- [M4.3 模型、运行态与可观测性专项设计](docs/superpowers/specs/2026-07-15-m4_3-model-runtime-observability-design.md)
-- [M4.4 HTTP API URL 契约专项设计](docs/superpowers/specs/2026-07-15-m4_4-http-api-url-contract-design.md)
-- [M4.6 自定义内核引导参数专项设计](docs/superpowers/specs/2026-07-16-kernel-args-custom-boot-params-design.md)
-- [M4.7 路径、模型存储与 setup 验证记录](docs/M4_7_VALIDATION.md)
-- [M4.8 并发容量扩展与启动时动态派生专项设计](docs/superpowers/specs/2026-07-17-concurrency-capacity-scaling-design.md)
-- [M4.9 部署溯源、PXE 门禁与配置入口收口补丁](docs/superpowers/specs/2026-07-18-m4_9-deployment-provenance-and-config-ownership-patch.md)
-- [M4.10 CLI fresh-deployment 闭环补全](docs/superpowers/specs/2026-07-19-m4_10-cli-fresh-deployment-completion.md)
-- [M4.11 CLI 状态入口与 mutation key 收口](docs/superpowers/specs/2026-07-19-m4_11-cli-status-and-mutation-keys.md)
-- [M4.12 Node/Profile 属性归属与存储覆盖（历史方案，已被 v0.1 取代）](docs/superpowers/specs/2026-07-19-m4_12-node-profile-ownership-design.md)
-- [M0-M4.12 系统实现审计](docs/M0_M4_12_SYSTEM_AUDIT.md)
-- [M4.9b/M4.10 Ubuntu 22.04.5 r97n0/VMware 验证](docs/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md)
-- [M0–M4.1 实现审计](docs/M0_M4_AUDIT.md)
-- [Rocky Linux 8.10 aarch64 VMware PXE 验证](docs/ROCKY_8_10_VALIDATION.md)
+仓库地址：<https://github.com/iskylite/nodeforge>
 
-## 当前阶段
+## 特性
 
-M0-M3 的基础服务、PXE 协议、HTTP 资产和安装源链路已有实现与验证记录；M4/M4.1 的 Rocky 9.7 与
-Ubuntu 22.04 正向无人值守安装、登录和生命周期链路均已完成实机验证。M4.1 的异常恢复与边界收口
-仍按审计清单持续回归；Rocky 8.10 aarch64 因 VMware/Apple-Silicon 不支持介质内核要求的 64 KiB
-page granule 单独暂缓，不影响 Rocky 9.7/Ubuntu 22.04 的已验收结论。M4.1 统一交付
-locale/timezone/keyboard、纯本地连接策略、默认 OpenSSH/root 密码登录、普通用户/password/sudo/逐账号 key、
-额外包、目标系统 DHCP/静态 IPv4、
-默认关闭主机防火墙，以及 Rocky 默认关闭 SELinux。M4.1 还承担 M0-M4 answer 审计补丁：SHA-512 crypt
-`$6$`、NodeForge bootstrap admin public key 始终合并、Ubuntu identity/schema/storage、Rocky rootpw/
-bootloader 和 installer 事件上下文。上述目标系统字段统一归入 `profile.system`；M5-M7 均须继承同一模型、
-默认值与认证语义，不能另设 diskless 私有 users/packages 或较弱默认。
+- **单进程三协议**：内置 DHCPv4、TFTP、HTTP，无需外部依赖即可完成 PXE 引导链路。
+- **双发行版适配器**：原生支持 Rocky Linux 9.x / RHEL Kickstart 和 Ubuntu 22.04+ Autoinstall/Curtin。
+- **完整存储拓扑**：Kickstart 与 Autoinstall 原生的 single、LVM、RAID 0/1/5/6/10 及 RAID 上 LVM。
+- **Profile/Node 分层配置**：Profile 定义共享策略，Node 保存物理绑定和策略 override。
+- **安装生命周期**：一次性 generation、显式 retry、desired/applied drift 追踪和部署溯源。
+- **ISO 导入与 catalog 管理**：自动识别 ISO 布局、提取安装介质、原子写入 catalog。
+- **本机管理 API**：结构化 HTTP API，支持 ETag/If-Match、分页、幂等键和持久 Operation。
+- **审计与可观测**：Event v2 JSONL 事件流、boot session 追踪和统一 `nodeforge status` 运行面检查。
+- **systemd 集成**：动态 unit 生成、故障回滚和最小特权运行。
 
-M4.1 同时补齐自动安装生命周期：install profile 默认一次性 generation，成功或已消费节点再次 PXE 不会
-自动重装，`install retry` 只显式 rearm 下一次 PXE，不倒退历史状态或调用 BMC；目标配置变更只形成
-desired/applied drift。TFTP option、DHCP T1/T2、trace 时钟回拨、运行期 asset 和 ISO orphan/空间预检等
-M1-M3 横切修正仍写在各自章节，但作为 M4.1 验收前置回归。
+## 项目结构
 
-M4.11 已完成统一 status、端到端运行面检查和 show/set owner-action 对齐。M4.12 的节点存储 fallback、有效计划合并、
-digest/API/CLI/renderer 和 JSON 契约已有代码与 254/254 自动化证据，但其 Profile/Node 所有权结论已被否决，
-不能作为 v0.1 完成依据。当前阶段是 [v0.1 M4.13 修复](docs/V0_1_DESIGN.md)：物理安装盘改为 Node direct
-`storage.boot_disk`（默认 `/dev/sda`）和 `storage.additional_disks`，删除语义重复且未被 adapter 消费的
-`install_disks`；Profile 定义共享 mode/wipe/partition/bootloader 策略，Node 可完整 override，并支持双安装器
-原生的 single/LVM/RAID0/1/5/6/10 及 RAID 上 LVM。默认自动布局为单主 1 GiB ESP、2 GiB ext4 `/boot`、
-剩余 ext4 `/`，默认无 swap；分区既可用直接 item CLI 增删改查，也可从文件原子替换。`http_accel` 作为默认
-false 的 UEFI 实验验证属性保留。目标系统未配置时继续使用普通用户
-`nodeforge/asdf1234` 和 root 密码 `asdf1234`，两者均支持明文 CLI/Profile/Node override。同步补齐 unknown DHCP client 记录/认领、
-typed property/collection/item contract、统一 `--help-full`、全资源无 Shell 内嵌 JSON mutation 和软件能力查询配置。Discovery 不再
-作为 Profile mode；IPv6 和稳定磁盘选择器是永久非目标。
-完成 schema v3、迁移和双发行版回归后才进入 v0.2。M5–M7 仍是未实现范围，不能把设计命令当作当前可执行命令。
+```text
+NodeForge/
+├── build.zig / build.zig.zon     # 构建脚本与依赖声明
+├── Makefile                      # 构建快捷封装
+├── config.example.json           # 启动配置示例
+├── catalog.example.json          # Catalog 示例（distro/asset/repository）
+├── src/
+│   ├── root.zig                  # 核心库统一导出
+│   ├── model.zig                 # 配置事实模型（AppConfig/Catalog/Profile/Node）
+│   ├── nodeforged.zig            # daemon 入口
+│   ├── main.zig                  # CLI 客户端入口
+│   ├── app.zig                   # 单进程生命周期（DHCP/TFTP/HTTP 协调）
+│   ├── paths.zig                 # 运行时安装路径自举
+│   ├── setup.zig                 # 安装初始化、迁移与 systemd unit 生成
+│   ├── version.zig               # 构建溯源信息
+│   ├── config/                   # 配置加载、校验、schema 迁移与 mutation
+│   ├── catalog/                  # Catalog 存储、ISO 导入、软件索引
+│   ├── dhcp/                     # DHCPv4 协议实现（packet/probe/server）
+│   ├── tftp/                     # TFTP 协议实现（packet/server）
+│   ├── http/                     # HTTP 服务端、管理 API、路由与客户端
+│   ├── boot/                     # 启动解析器、GRUB 渲染与内核命令行
+│   ├── profile/                  # 安装器适配器、effective 编译与存储渲染
+│   ├── state/                    # 运行时状态（lease/session/event/deployment）
+│   ├── cli/                      # CLI 输出格式化与视图
+│   └── observe/                  # 结构化日志与错误渲染
+├── tests/                        # 单元测试、CLI 契约、HTTP 集成与实机脚本
+├── vendor/zli/                   # CLI 框架（v5.1.2）
+└── docs/                         # 设计文档、审计与验证记录
+```
 
-M4.3 已落地；M4.4 的 canonical URL、三平面隔离与双发行版主链路也已验证可行。它们完成了真实 distro/family、repository
-可空与 SHA 幂等导入，补 install-source `catalog show/migrate`、完整 node 视图、typed daemon mutation、
-`profile list/show`（M4.6 追加受限 `kernel_args` set/unset）、ConfigRuntime、可恢复且自有身份数据的 BootSession、传输归属、Ubuntu webhook proof
-和构建溯源；logical id 使用统一 path-safe grammar，跨 config/catalog/目录的迁移通过可恢复联合事务发布，活动
-BootSession 使用自有 immutable install plan，inventory 以 generation/session 仲裁迟到写入。M4.3 只提前
-已实现 PXE 部署所需的运维闭环；rootfs/diskless、完整 profile/repository CRUD、全配置 diff/apply 和
-provision/reconcile 仍按 M5–M7 实现。后续里程碑仍须持续回归 Rocky 9.7、Ubuntu 22.04 完整 PXE 安装和
-Ubuntu 安装中的 daemon restart-resume。
+两个二进制共享同一核心模块（`src/root.zig`），避免 CLI 与 daemon 行为分叉：
 
-M4.4 已将节点交付 API 统一到 `/api/v1/nodes/:id/**`，本机管理 API 保持
-`/api/v1/management/**`，静态制品迁移到 `/artifacts/**`；删除重复 `/boot/config`，用显式 Kickstart/NoCloud
-install-config 路径并把 rootfs 绑定 node capability；集中 RouteSpec/405 等工程化遗留统一转入 M4.5。旧 URL 不依赖
-redirect/alias，M4.4 直接替换并删除；切换前必须结束并清理 M4.3 session/checkpoint，残留旧 schema 拒绝启动且不
-自动 rearm。M4.5–M4.9 是进入 M5 前的现行补全方案（M4.8 编号在 M4.7 之后、实施早于 M4.6）：M4.5 承接 RouteSpec/405、golden DTO、分页、目标 ETag、
-持久 Operation/Idempotency-Key 和健壮 HTTP client；M4.6 增加安全 canonical 的 `profile.kernel_args`；M4.7 已通过
-runtime Paths、schema 2、manifest/entity 事务和 `nodeforge setup` 收口部署与 config/catalog ownership；M4.8 将 5 处定长 256 上限升级为“2048 安全天花板 + 启动时 effective 派生”，加入紧凑状态持久化、TFTP 并发 `auto=max(128,2×核)` 与 DHCP `ping_timeout` 优化，使运维在安全天花板内仅靠配置即可把批量部署规模调到 512/1024（详见 §9.17）。M4.9 统一 DHCP/HTTP 的联合 desired revision，收紧 BootSession 恢复，补 fresh ISO bootloader 和 retry 可见性，并删除重复的 `config import`/死 `config set`，startup config 统一由 setup 导入（详见 §9.18）。
-它们不回改 M4.4 已验证 URL 和安装链路，但 M5–M7 必须消费完成后的统一模型。
+- **`nodeforged`**：守护进程，承载 DHCP/TFTP/HTTP 服务和本机管理接口。
+- **`nodeforge`**：管理客户端，通过 `127.0.0.1` 调用 daemon 的管理 API。
 
-NodeForge 配置中所有语义为 `password` 的字段都允许填写明文，并以明文写入 JSON、导入和导出；
-包括系统用户、root、IPMI，以及未来新增的 repository/proxy/basic-auth 等密码字段。发行版安装器要求
-hash 时只在渲染/下发阶段临时转换，不能把 hash 回写成配置事实。token、session capability、SSH 私钥和
-已经生成的 password hash 不是 password 配置字段，仍按各自的短期或受限传递规则处理。
+## 文档
 
-[`config.example.json`](config.example.json) 只展示当前代码能够加载和校验的配置。已实现基线与待实现的
-M4.5 已实施 HTTP 契约补全：集中 RouteSpec（含启动冲突/wildcard 吞路由检测）与 405/Allow、JSON 导入 body、
-统一安全头和状态码（创建 201/变更 200/校验 200/长任务 202）、错误码命名空间化（`node.*`/`http.*`/`operation.*`）、
-错误信封 `request_id`、客户端 4xx/5xx 结构化错误映射、目标 ETag/If-Match（428/409）、413/415 请求校验、
-有界 cursor 分页（CLI `node list`/`profile list` 跟随 `next_cursor`）、持久 Operation 幂等语义、客户端 202 轮询
-以及完整有界 response reader（含 204/空 body/非 2xx body）。install-config 与 boot-config 同样设置完整安全头。
-M4.5 契约已在 Rocky 9.7 aarch64 验证目标以 root 端到端回归（详见 §9.14.14）。
-M4.6–M4.9 契约分别以详细设计 §9.15–§9.18 为准（M4.8 实施早于 M4.6）。M4.6/M4.7/M4.9 已落地；
-Rocky 主机已完成 systemd 激活、fresh reconfigure 及不响应 daemon 的 readiness/rollback 故障注入。
-M4.9b 已将完整 node-scoped SHA-256 持久化到 deployment/session/status/install-plan，并以其执行安装授权、
-恢复 join 和 drift；旧联合摘要 u64 仅保留一个读取兼容窗口。自动测试已覆盖无关实体不扰动、旧 pending
-不授权和旧 applied drift `unknown`；r97n0/VMware Ubuntu 22.04.5 已完成 generation 1 正向安装、
-generation 2 活动 session 拒绝及 generation 3 force-retry 重装回归。
-M4.10 已补齐 fresh CLI 闭环：ISO import 原子创建同名安全 install profile，显式 `profile create`
-用于补充 profile，在线 node add 立即持久化 initial generation；`setup --reconfigure` 始终发布 systemd
-unit 但不控制服务生命周期；真正无历史重置（包括 `work/` 导入暂存及中断工作树）可组合为
-`--reset-all --purge-all --reconfigure`，之后由操作员显式执行 systemctl。
+详细设计、审计和验证记录位于 [`docs/`](docs/)，入口见 [文档导航](docs/README.md)：
 
-M4.11 将运行检查收口为唯一的 `nodeforge status`：同时验证 loopback/advertised HTTP、management、
-active config、catalog、DHCP 与 TFTP 管理面，并用退出码表达整体可用性。`node/profile show` 的
-Settable properties 使用与相应 `set` 完全一致的 snake_case key；跨资源和 lifecycle 字段显示
-owner/action，计算、运行态、上报和 revision 明确为只读事实。v0.1 目标由紧凑 `--help` 指向统一
-`--help-full`，后者从 typed spec 同步生成 canonical key、约束和示例。
+- [v0.1 设计与修复计划](docs/design/V0_1_DESIGN.md)：当前权威设计，定义所有权模型和完成标准。
+- [v0.2 设计范围](docs/design/V0_2_DESIGN.md)：尚未实现的内存无盘启动（M5-M7）。
+- [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
+- [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录。
 
-## ISO 与发行版
+文档冲突时的优先级：现行版本设计 > 当前代码与审计证据 > 验证记录 > 历史归档。
 
-首次 `nodeforge setup` 产生空的 distro 索引，这是正常状态。执行
-`nodeforge assets import <iso-path>` 时，daemon 会校验 ISO 的 Anaconda/`.treeinfo` 或
-Ubuntu/casper 布局，由布局确定 family，再识别产品、版本和架构，并把新的 distro tuple 与安装源原子写入
-catalog；不需要、也没有 `distro add` 子命令。
+## 实现
 
-已知产品标签会自动映射。对于布局有效但产品标签未知或含糊的定制 ISO，可使用 `--distro` 覆盖产品 id，
-必要时同时提供 `--version`、`--arch`；这些参数不能覆盖媒体布局确定的 family。无法识别为受支持布局的 ISO
-仍会拒绝导入。
+### 架构
 
-## 开发
+NodeForge 是单进程服务，在同一端口上复用 HTTP 健康检查、管理 API 和 PXE 数据路由：
+
+- **DHCPv4**：RFC 2131/2132 实现，包含 IP 池管理、ICMP 冲突探测、MAC reservation 和 PXE bootfile 决策。通过 `SO_BINDTODEVICE` 限定服务网卡。
+- **TFTP**：RFC 1350 实现，支持虚拟 GRUB 配置拦截、OACK 协商、块大小和窗口大小选项。
+- **HTTP**：基于 [Zap](https://github.com/zigzap/zap) 的单 listener，三平面隔离——节点交付 `/api/v1/nodes/:id/**`、本机管理 `/api/v1/management/**`、静态制品 `/artifacts/**`。
+
+### 配置模型
+
+采用 Resource → Profile → Node → Effective 四层模型：
+
+| 层 | 职责 |
+|---|---|
+| Resource | 可复用的部署能力（ISO/kernel/repository/asset） |
+| Profile | 共享的安装和目标系统策略模板 |
+| Node | 机器身份、物理绑定（MAC/IP/storage）和策略 override |
+| Effective | Profile + Node override 编译出的唯一部署计划 |
+
+密码字段以明文存储为配置事实，仅在渲染下发阶段临时转换为发行版要求的 hash。
+
+### 存储支持
+
+双适配器原生支持 12 种存储拓扑，默认布局为单主 1 GiB ESP、2 GiB ext4 `/boot`、剩余 ext4 `/`：
+
+| 模式 | 说明 |
+|---|---|
+| `single` | 单盘直接分区 |
+| `lvm` | 单盘 LVM |
+| `raid0`-`raid10` | 软件 RAID（2-4 盘） |
+| `raid*-lvm` | RAID 上 LVM |
+
+## 规划
+
+### v0.1（当前）
+
+IPv4 PXE 无人值守安装产品，M0-M4 的基础服务和安装链路已完成实机验证，正在通过 M4.13 收口所有权模型和 typed property registry。主要里程碑：
+
+| 里程碑 | 范围 | 状态 |
+|---|---|---|
+| M0-M3 | 基础服务、PXE 协议、HTTP 资产和安装源链路 | 已实现 |
+| M4/M4.1 | Rocky 9.7 与 Ubuntu 22.04 无人值守安装和生命周期 | 已验证 |
+| M4.2-M4.11 | 部署健壮性、URL 契约、容量扩展、fresh CLI 闭环和统一 status | 已实现 |
+| M4.12 | 存储 fallback/override | 历史实现，所有权方案已被取代 |
+| M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 进行中 |
+
+### v0.2（未开始）
+
+v0.1 冻结后才可启动，主要包括：
+
+- **M5**：内存无盘启动（squashfs overlay / ram rootfs）
+- **M6**：支持矩阵增强（BIOS PXELINUX、更多发行版版本、生产容量压测）
+- **M7**：补充包和后处理增强（archive/script/first-boot/runtime provision）
+
+IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是项目永久非目标。
+
+## 编译
+
+需要 [Zig 0.16](https://ziglang.org/)。依赖 `zli`（仓库内 `vendor/zli`）和 `zap`（构建时自动拉取）。
 
 ```bash
-zig build test
+# 本机 Debug 构建
 zig build
-zig-out/bin/nodeforge -h
-zig-out/bin/nodeforge config --help
-zig-out/bin/nodeforge config validate --help
-zig-out/bin/nodeforge config validate --config config.example.json --catalog catalog.example.json
-zig-out/bin/nodeforge catalog validate --config config.example.json --catalog catalog.example.json
-zig-out/bin/nodeforged --config config.example.json --catalog catalog.example.json --check-config
-zig-out/bin/nodeforged --config config.example.json --catalog catalog.example.json --check
+
+# ReleaseSafe 构建
+zig build -Doptimize=ReleaseSafe
+
+# 交叉编译 Linux x86_64（amd64）
+zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+
+# 交叉编译 Linux aarch64（arm64）
+zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe
+
+# 运行全部测试（单元 + CLI 契约 + HTTP 集成 + setup 布局）
+zig build test
 ```
 
-## Make Targets
-
-`Makefile` 只封装现有 Zig 构建参数：
+或使用 Make 封装：
 
 ```bash
-make build          # 本机构建（Debug）
-make test           # 本机单元、CLI 契约与 HTTP 集成测试
-make release        # 本机 ReleaseSafe 构建
-make arm64          # 交叉编译 Rocky Linux aarch64 ReleaseSafe 二进制
-make arm64-debug    # 交叉编译 aarch64 Debug 二进制
+make build              # 本机 Debug 构建
+make test               # 全部测试
+make release            # 本机 ReleaseSafe 构建
+make linux-amd64        # 交叉编译 Linux x86_64 ReleaseSafe
+make linux-arm64        # 交叉编译 Linux aarch64 ReleaseSafe
+make linux-arm64-debug  # 交叉编译 Linux aarch64 Debug
+make dist               # 打包本机 ReleaseSafe 二进制到 dist/
+make dist-linux-amd64   # 交叉编译并打包 Linux x86_64
+make dist-linux-arm64   # 交叉编译并打包 Linux aarch64
 ```
 
-`make arm64` 使用 `aarch64-linux-gnu`；可通过 `ARM64_TARGET=<zig-target>` 覆盖目标三元组。
-交叉构建产物仍位于 `zig-out/bin/`，再次执行 `make build` 可恢复本机架构产物。
+构建产物位于 `zig-out/bin/`，包含 `nodeforge` 和 `nodeforged` 两个二进制。
 
-正常安装默认根是 `/opt/nodeforge`，config 使用 schema 2 的 `config/config.json`，catalog 使用
-`catalog/manifest.json` + 8 个 entity files。自定义根由真实 executable、`.nodeforge-root` 和成对二进制布局发现；
-`--config`/`--catalog` 只用于开发、迁移和排障，后者指向 catalog 目录。
+## 部署
 
-安装布局的事实源是 `src/paths.zig` 启动时初始化一次的 runtime `Paths`。ISO、TFTP
-启动文件、仓库、密钥、rootfs、initrd 与 bundle 分别位于 `assets/iso`、`assets/boot`、`assets/repos`、
-`assets/keys`、`assets/rootfs`、`assets/initrd`、`assets/bundles`；运行态 provisioning 结果位于
-`state/provisioned`。新装或旧 schema 迁移使用同版本、同架构且同时包含 `nodeforge`/`nodeforged` 的 bundle：
+### 安装初始化
 
 ```bash
-./nodeforge setup --install-root /srv/nodeforge --non-interactive --yes \
+# 初始化安装根、写入配置并创建标记文件
+./nodeforge setup --install-root /opt/nodeforge --non-interactive --yes \
   --bind-interface enp1s0 --server-ip 192.168.50.1 \
   --subnet 192.168.50.0/24 --pool-start 192.168.50.100 --pool-end 192.168.50.200
-./nodeforge setup --install-root /srv/nodeforge --generate-systemd --print
-./nodeforge setup --install-root /srv/nodeforge --reset-state --non-interactive --yes
+
+# 生成并安装 systemd unit
+./nodeforge setup --install-root /opt/nodeforge --generate-systemd --install --yes
+
+# 启动服务
+systemctl start nodeforged
 ```
 
-`setup --reconfigure` 对 schema 1 执行带 marker/备份的幂等迁移；`--reset-state` 先恢复事务，再生成带 SHA-256
-manifest 的备份；reset 检测到 daemon 可达时会拒绝执行，必须先停服务。`--generate-systemd --install --yes` 才触发 systemd 生命周期操作，并在模型加载或 loopback
-`/healthz` 失败时恢复旧 unit 与启停状态。
+安装布局由 `src/paths.zig` 在启动时自举，默认根为 `/opt/nodeforge`：
 
-`config.example.json` 中的 `server.bind_interface = "enp1s0"` 是 Linux PXE 网卡占位值；部署
-DHCP 前必须替换为承载 `server.server_ip` 的实际接口。当前 DHCPv4 服务会拒绝空值，避免 wildcard
-UDP/67 在多网卡主机上失去接口边界。
+```text
+/opt/nodeforge/
+├── bin/            # nodeforge / nodeforged
+├── config/         # config.json (schema 3)
+├── catalog/        # manifest.json + entity files
+├── assets/
+│   ├── iso/        # ISO 镜像
+│   ├── boot/       # TFTP 启动文件（GRUB/kernel/initrd）
+│   ├── repos/      # HTTP 发布的仓库
+│   └── keys/       # SSH 密钥
+├── state/          # lease/status/session/provisioned
+├── logs/           # 服务日志和事件审计流
+├── work/           # 导入暂存
+└── systemd/        # nodeforged.service
+```
 
-CLI 使用仓库内固定的 `zli v5.1.2`。命令、参数、默认值和说明由同一命令树生成，
-新增参数不需要再同步维护手写 help。zli 的 spinner 能力暂未启用；未来只在 TTY 的
-耗时 human 输出命令中按需使用，JSON、管道和 systemd 场景保持无动画输出。
+systemd unit 授予最小特权集：`CAP_NET_BIND_SERVICE`（UDP 67/69）、`CAP_NET_RAW`（ICMP 探测）和 `CAP_SYS_ADMIN`（ISO loop mount）。
 
-M4.6 内核参数通过 profile 管理：`nodeforge profile show <name>` 查看，
-`nodeforge profile set <name> 'kernel_args=iommu=pt hugepages=4'` 修改，
-`nodeforge profile unset <name> kernel_args` 清除。修改会拒绝引用该 profile 的活动 boot session；
-install profile 还需对目标节点执行 `nodeforge node retry <node>`，显式武装包含新参数的 generation。
+### 配置与 Catalog
 
-NodeForge 只有一个 HTTP listener，默认端口 `18080`（可在配置文件 `server.http_port` 中覆盖），健康检查、管理 API 和 M3+ PXE 数据路由
-复用该端口。listener 绑定 `0.0.0.0:<http_port>`；管理路由在入口检查 direct peer，只接受
-`127.0.0.1`，且不信任 `X-Forwarded-For`。`nodeforge` CLI 固定通过
-`127.0.0.1:<http_port>` 调用管理接口，不提供远程 endpoint 参数，因此 CLI 只支持管理同机
-`nodeforged`。管理 API 尚无鉴权和 TLS，部署时
-必须限制在受信任网络；后续若作为正式远程管理接口使用，需要单独设计鉴权、TLS 和审计。
+[`config.example.json`](config.example.json) 是启动配置示例，只包含 server/http/tftp/dhcp 等站点字段。节点、Profile 和资源由 Catalog 管理，通过 `nodeforge setup --reconfigure --import-config <path>` 导入。
 
-`nodeforge` 只把 `-v/--version` 放在顶层；`-h/--help` 由 zli 在每一级命令提供。
-`--config`、`--catalog`、`--output` 是业务命令自己的参数，必须写在对应命令之后，且只在该
-命令实际读取时出现。启动配置导入统一使用
-`nodeforge setup --reconfigure --import-config <path>`；setup 在覆盖正式配置前联合校验候选
-config 与当前 catalog，完成后必须重启 `nodeforged`。
+`server.bind_interface` 是 PXE 网卡占位值，部署前必须替换为实际接口名。
 
-服务默认输出 `info` 日志到 stderr/systemd journal。`config.json` 的 `logging.level` 可设置为
-`info` 或 `debug`；临时排障使用 `nodeforged -d` 强制本次启动输出 debug 服务日志，或在
-`nodeforge` 叶子命令后使用 `-d` 显示底层错误原因。默认错误保持简短，例如
-`error: config: file not found: ./config.json`。
-
-Linux systemd unit 位于 `packaging/systemd/nodeforged.service`。DHCP 使用 UDP/67 和发送
-Ping Probe 所需的 raw ICMP，因此 unit 同时授予 `CAP_NET_BIND_SERVICE` 与 `CAP_NET_RAW`；当
-Probe 不可用时服务会拒绝 OFFER，而不会把地址当作空闲。Linux 上 DHCP 以 wildcard UDP/67
-接收客户端广播，并通过 `SO_BINDTODEVICE` 限定 `server.bind_interface`，不会回答管理网卡请求。
-Rocky Linux 9.7 aarch64 的 `192.168.27.0/24` 已完成 DHCP 生命周期、冲突隔离、M2 CLI/API 和
-独立 UEFI 固件到 GRUB 的 PXE/TFTP 闭环验证。完整记录见
-[`docs/ROCKY_9_7_VALIDATION.md`](docs/ROCKY_9_7_VALIDATION.md)。
-
-## M2.5.1 启动追踪
-
-每次 DHCP `DISCOVER`/`REQUEST` 会创建或复用一个不可预测的
-32 字符小写十六进制 `boot_session_id`（128-bit）。同一启动尝试的 DHCP 与经唯一 lease-IP 安全关联的
-TFTP 事件都会记录该 id；每条 daemon Event v2 同时带有 `daemon_instance_id`，用于识别
-服务重启边界。早期实现的 session 仅存在于进程内；现行 M4.3/M4.9 实现仅对已经签发 capability 的 active
-delivery session 在 mode 0600 checkpoint 中持久化自有身份、immutable install plan/digest、route contract 和 token，并与
-deployment generation/revision 及 immutable plan 做恢复 join；重启后只恢复合法
-安装器回调及同一 answer 语义，但不恢复 UDP transfer 或 install arm。
-超时、被新 session 取代或不可恢复时才追加明确的终止/失效 reason。
-
-TFTP 不会根据文件名、传输端口或“最近 DHCP 记录”猜测节点归属。若活动 lease-IP 没有唯一
-匹配，事件保留 `session_link_state`（例如 `no_active_lease_match`、`ambiguous_lease_match`
-或 `capacity_exhausted`），而不是伪造 `boot_session_id`。
-
-本机排障可直接读取审计流，不会访问管理 API 或改变服务状态：
+## 基本使用
 
 ```bash
-nodeforge events list --node node-01 --session 0123456789abcdef0123456789abcdef
+# 查看帮助
+nodeforge -h
+nodeforge --help-full          # 详细帮助（含全部 canonical key）
+
+# 校验配置
+nodeforge config validate --config config.example.json --catalog catalog.example.json
+nodeforged --check --config config.example.json --catalog catalog.example.json
+
+# 导入 ISO（自动识别布局并创建 install profile）
+nodeforge assets import /path/to/Rocky-9.7-aarch64-dvd.iso
+
+# 管理节点和 Profile
+nodeforge node add node-01 --mac 00:50:56:2a:23:db --profile rocky-9
+nodeforge node set node-01 storage.boot_disk=/dev/sda
+nodeforge profile set rocky-9 'kernel_args=iommu=pt hugepages=4'
+
+# 部署
+nodeforge install retry node-01     # 武装安装 generation
+
+# 运行面检查（退出码表示整体可用性）
+nodeforge status
+
+# 审计排障
+nodeforge events list --node node-01
 nodeforge node trace node-01 --latest
-nodeforge node trace node-01 --session 0123456789abcdef0123456789abcdef --output json
 ```
 
-`trace` 仅展示具有直接 session 证据的事件，并把容量耗尽、损坏 JSONL 记录和 daemon
-重启等不连续情况写入 `gaps`；因此它是审计重建工具，而不是会在信息不足时补全事实的状态机。
+### 日志
+
+服务默认输出 `info` 日志到 stderr/systemd journal。临时排障：
+
+```bash
+nodeforged -d                     # 强制 debug 日志
+nodeforge <command> -d            # 显示底层错误原因
+```
+
+### 安全边界
+
+- 管理路由只接受 `127.0.0.1` 直连，不信任 `X-Forwarded-For`。
+- 管理 API 尚无鉴权和 TLS，必须部署在受信任网络。
+- DHCP 使用 `SO_BINDTODEVICE` 限定网卡，不会回答管理网卡请求。
+- `nodeforge setup --reset-state` 检测到 daemon 可达时拒绝执行。
+
+## 许可证
+
+[MIT](LICENSE)

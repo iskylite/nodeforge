@@ -1,14 +1,20 @@
-# NodeForge 分阶段详细设计与实现计划
+# NodeForge M0-M7 历史分阶段详细设计与实现计划
 
 > 历史合并文档：本文保留 M0-M7 的实现细节、验收记录和未实现设计，便于追溯。
-> 当前权威版本边界已经拆分为 `V0_1_DESIGN.md` 和 `V0_2_DESIGN.md`。M4.12 的 fallback
+> 当前权威版本边界已经拆分为 [`V0_1_DESIGN.md`](../design/V0_1_DESIGN.md) 和
+> [`V0_2_DESIGN.md`](../design/V0_2_DESIGN.md)。M4.12 的 fallback
 > 所有权方案只代表当前代码历史，目标模型以 v0.1 的 M4.13 修复要求为准。尤其是本文中的 discovery Profile、
 > Profile `boot_disk/install_disks`、`match_mac`、稳定磁盘 selector、nullable install/diskless source、
 > `standard_packages`、单盘限制和普通 `--help` 长示例均不是目标接口。v0.1 使用独立 discovery observation、
 > Node direct `storage.boot_disk/additional_disks`、可 override 的原生 storage mode/partition policy、唯一
 > `software.*` selection、直接 item CLI 和统一 `--help-full`；v0.2 才以 tagged Profile kind 增加 diskless。
+> M4.13 后当前源码也不存在 `ProfileMode` 或 `resolveDiskless`，`bootConfig` 没有 diskless payload 分支；本文
+> 对这些符号的引用均是历史方案，不是实现证据。M7 phase 的现行拼法为
+> `install-post|rootfs-build|first-boot|runtime`；旧 `install_post|rootfs_build|firstboot|diskless_boot` 只作为
+> schema v6 migration 输入，分别唯一映射到上述名称。M5-M7 的现行契约与完成标准以
+> [`V0_2_DESIGN.md`](../design/V0_2_DESIGN.md) 为准。
 
-本文基于 `DESIGN.md` 的收敛版概要设计，作为后续代码实现的执行蓝图。它把 NodeForge 第一阶段拆成可落地的实现阶段，明确每个阶段要写哪些模块、形成哪些数据结构、暴露哪些接口和 CLI、需要哪些测试，以及达到什么标准才能进入下一阶段。
+本文基于 `M0_M7_LEGACY_OVERVIEW_DESIGN.md` 的收敛版概要设计，作为后续代码实现的执行蓝图。它把 NodeForge 第一阶段拆成可落地的实现阶段，明确每个阶段要写哪些模块、形成哪些数据结构、暴露哪些接口和 CLI、需要哪些测试，以及达到什么标准才能进入下一阶段。
 
 本文不替代概要设计。概要设计回答“做什么、边界是什么、核心取舍是什么”；本文回答“按什么顺序实现、每一步交付什么代码、如何验证”。
 
@@ -990,13 +996,13 @@ M0 验收结果：
 - `nodeforged -d` 和 `logging.level = "debug"` 均输出 M0 的 HTTP method/path debug 日志。
 
 本段只记录 2026-07-11 当时的 M0 验收；随后完成的 TFTP、DHCP 等系统级验证见
-[`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md)。
+[`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md)。
 
 ## 6. M1：PXE TFTP 闭环
 
 **完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0`
 完成系统级验证。** 验证命令、SHA-256、OACK/重传和安全负向用例记录于
-[`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md#m1-tftp-待验证)。
+[`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md#m1-tftp-待验证)。
 
 ### 6.1 目标
 
@@ -1159,7 +1165,7 @@ nodeforge asset validate
 **完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0`
 完成验证。** `asset list/show`、`tftp show/session list` 与 `status` 已迁移到统一 view/table
 层；JSON 输出、退出码及 daemon API 保持兼容。验证记录见
-[`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md#m15-cli-输出验证)。
+[`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md#m15-cli-输出验证)。
 
 ### 6.5.1 目标与边界
 
@@ -1296,7 +1302,7 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 未知节点观察、PXE bootfile 决策和 ICMP Ping Probe。`r97n0` 的
 `192.168.27.0/24` 已完成 DISCOVER/OFFER/REQUEST/ACK、RELEASE、冲突隔离和管理 CLI/API
 验证。独立 VMware ARM UEFI 客户端已实际消费 DHCP option 67 的 `efi/grubaa64.efi`，经 TFTP
-进入 GRUB 2.06；详情见 [`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md#m2-dhcp-验证)。
+进入 GRUB 2.06；详情见 [`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md#m2-dhcp-验证)。
 
 ### 7.1 目标
 
@@ -1477,7 +1483,7 @@ daemon 变更 DHCP/node 声明；在线变更属于后续配置管理阶段。
 
 > **完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0` 完成验证。**
 > Event v2 writer、注册表、日志后端、DHCP/TFTP/HTTP 接线和 `nodeforge events` 本机查询均已落地；
-> 验证记录见 [`ROCKY_9_7_VALIDATION.md`](ROCKY_9_7_VALIDATION.md#m25-结构化日志与事件验证)。
+> 验证记录见 [`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md#m25-结构化日志与事件验证)。
 
 ### 7.5.0 跨阶段重构范围与实施门槛
 
@@ -2803,7 +2809,7 @@ M3 按以下批次实施，前一批的 contract test 必须通过后才能进�
    M3 验收项，并把实际命令、hash、并发结果与未覆盖的限制同步到验证记录。
 
 任何批次改变路由、DTO、认证材料、EventType、catalog 字段或 M4/M5 消费内容时，先更新本节、§7.5.12、
-`DESIGN.md` 的 HTTP 边界和相应 fixture；实现与文档不得分别演进。
+`M0_M7_LEGACY_OVERVIEW_DESIGN.md` 的 HTTP 边界和相应 fixture；实现与文档不得分别演进。
 
 ### 8.12 M3.5 TFTP 虚拟 GRUB 配置补全
 
@@ -3957,7 +3963,7 @@ F3 扩展 M3 §8.4 的 ISO 导入 family 白名单和 `--distro` 覆盖语义；
 M4/M4.1 交付了 kickstart/autoinstall 渲染、受控 post-install provisioning 和安装生命周期事件上报。
 M4.2 是 M4/M4.1 安装链路的直接延续，在 M5（内存无盘启动）之前交付，修复部署链路的可维护性和传输性能。
 post-install 命令的异常容忍语义保持现状不动，不在本里程碑范围内。详细设计见
-`docs/superpowers/specs/2026-07-14-m4_2-provisioning-robustness-design.md`。
+`docs/archive/milestone-specs/2026-07-14-m4_2-provisioning-robustness-design.md`。
 
 缺陷清单：
 
@@ -4418,7 +4424,7 @@ M5 的小 initrd、M6 的完整支持矩阵或 M7 的常驻 agent；它负责确
 只读 `profile list/show`、install-source `catalog show` 和旧数据迁移入口，不借机扩张后续里程碑的写 CLI 面。
 
 完整设计、代码证据、迁移细节和逐条反馈映射见：
-`docs/superpowers/specs/2026-07-15-m4_3-model-runtime-observability-design.md`。
+`docs/archive/milestone-specs/2026-07-15-m4_3-model-runtime-observability-design.md`。
 
 M4.3 分成 10 个可单独测试、统一验收的工作包：
 
@@ -4684,7 +4690,7 @@ build time 优先使用 `SOURCE_DATE_EPOCH`，无 git 环境接受显式 `-Dgit-
 M4.4 是 M4.3 后、M5 前的 URL/路由补丁。M4.3 先交付正确的数据模型、ModelRuntime、profile/node/catalog 管理
 视图和 resumable session；M4.4 再把代码、CLI、生成器、fixture 和文档一次性替换为后续 rootfs、PXELINUX 和
 provision 都会消费的当前 HTTP 契约。
-完整设计见 `docs/superpowers/specs/2026-07-15-m4_4-http-api-url-contract-design.md`。
+完整设计见 `docs/archive/milestone-specs/2026-07-15-m4_4-http-api-url-contract-design.md`。
 
 路由分为三个互不重载的平面：
 
@@ -5118,7 +5124,7 @@ CLI 是唯一消费者，同版本更新即可。
 ### 9.15 M4.6：自定义内核引导参数
 
 > **完成状态（2026-07-17）：已实现。** 本地与 `r97n0`（Rocky Linux 9.7 aarch64）全量回归通过；
-> r97n0 的 adapter/负向校验记录见 `docs/ROCKY_9_7_VALIDATION.md`。真实 PXE 重装后的目标机
+> r97n0 的 adapter/负向校验记录见 `docs/validation/ROCKY_9_7_VALIDATION.md`。真实 PXE 重装后的目标机
 > `/proc/cmdline` 验收仍需在下一次受控安装窗口执行，不能由 renderer/schema 验证替代。
 
 #### 9.15.1 阶段定位
@@ -5771,14 +5777,14 @@ provisioned markers 和可安全归档的 completed journal，保留 config/cata
 自动验证覆盖 202 个测试：custom root/marker/symlink/重复 init、双二进制 bundle、schema 1 迁移与迁移续跑、manifest
 digest、catalog 三个 crash point、无关 entity 不重写、reset digest 备份、config offline-only、M4.6 kernel_args 和
 node 完整视图/时间语义。本机及 aarch64-linux ReleaseSafe 构建属于可移植性验证；`systemctl` 激活、capability、
-owner/mode 和真实 `/healthz` rollback 仍须按 `docs/M4_7_VALIDATION.md` 在 Rocky Linux root 环境执行，完成前不形成
+owner/mode 和真实 `/healthz` rollback 仍须按 `docs/validation/M4_7_VALIDATION.md` 在 Rocky Linux root 环境执行，完成前不形成
 “生产部署已验收”结论。
 
 ### 9.17 M4.8：并发容量扩展与启动时动态派生
 
 > 编号在 M4.7 之后，但实施早于 M4.6。本里程碑是横向容量优化，与 M4.6（kernel_args）和
 > M4.7（路径/存储边界）内容正交，可在 M4.5 完成后立即落地。专项设计见
-> `docs/superpowers/specs/2026-07-17-concurrency-capacity-scaling-design.md`。
+> `docs/archive/milestone-specs/2026-07-17-concurrency-capacity-scaling-design.md`。
 
 #### 9.17.1 目标与背景
 
@@ -5924,7 +5930,7 @@ nodeforged: capacity derived
 ### 9.18 M4.9：部署溯源、PXE 门禁与配置入口收口补丁
 
 > 专项设计：
-> `docs/superpowers/specs/2026-07-18-m4_9-deployment-provenance-and-config-ownership-patch.md`。
+> `docs/archive/milestone-specs/2026-07-18-m4_9-deployment-provenance-and-config-ownership-patch.md`。
 > 本节覆盖 M4.1–M4.8 中与 revision、BootSession 恢复、fresh ISO 自举和 startup-config writer 冲突的条款；
 > 历史章节继续记录当时设计，不按 M4.9 结果静默改写。
 
@@ -6023,12 +6029,12 @@ SHA-256；外部 mirror 只绑定声明 URL，NodeForge 不声称冻结远端内
 - r97n0 清空全部 NodeForge 受管数据后 fresh setup/import/node add 成功。
 - r97n1 在 VMware UEFI 拉取 GRUB/kernel/initrd，完成 Rocky 9.7 Anaconda 安装并从本地盘重启成功。
 - 上述 Rocky 证据属于 M4.9a 历史基线；M4.9b 的 r97n0/Ubuntu PXE、force-retry 和 systemd rollback
-  证据见 `docs/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。
+  证据见 `docs/validation/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。
 
 ### 9.19 M4.10：CLI fresh-deployment 闭环补全
 
 专项设计见
-`docs/superpowers/specs/2026-07-19-m4_10-cli-fresh-deployment-completion.md`。
+`docs/archive/milestone-specs/2026-07-19-m4_10-cli-fresh-deployment-completion.md`。
 
 M4.10 覆盖旧章节中“profile create 全部留到 M6”的边界：ISO import 在同一事务中自动创建与 source
 同名的安全默认 install profile，并提前交付从已导入 source 补充额外 profile 的窄入口。
@@ -6055,7 +6061,7 @@ M4.10 实机补丁同时增加受约束的 `profile set <name> boot_disk=/dev/<d
 ### 9.20 M4.11：CLI 状态入口与 mutation key 收口
 
 专项设计见
-`docs/superpowers/specs/2026-07-19-m4_11-cli-status-and-mutation-keys.md`。
+`docs/archive/milestone-specs/2026-07-19-m4_11-cli-status-and-mutation-keys.md`。
 
 M4.11 删除语义重叠但检查集合不一致的 `nodeforge check` 与 `nodeforge runtime status`，只保留
 `nodeforge status`。canonical status 除 loopback health/management/config validation 外，还必须探测配置中
@@ -6077,9 +6083,10 @@ allowlist、类型/引号约束和可复制示例，并与 parser、show 测试�
 ### 9.21 M4.12：Node/Profile 属性归属与存储覆盖
 
 > 历史实现说明：本节记录当前代码中的 Profile storage fallback，不再是目标模型。后续修复不得继续
-> 扩展该 fallback；现行所有权、完整 override 和 schema v3 迁移要求见 `V0_1_DESIGN.md`。
+> 扩展该 fallback；现行所有权、完整 override 和 schema v3 迁移要求见
+> [`V0_1_DESIGN.md`](../design/V0_1_DESIGN.md)。
 
-M4.12 冻结并实现节点属性、节点 override、profile 默认值、profile 部署策略和派生字段的归属边界，解决 `boot_disk` 等 storage 字段同时具有“共享安装计划”和“单节点物理设备”语义的问题。完整设计、影响清单和迁移要求见 `docs/superpowers/specs/2026-07-19-m4_12-node-profile-ownership-design.md`；系统证据矩阵见 `docs/M0_M4_12_SYSTEM_AUDIT.md`。
+M4.12 冻结并实现节点属性、节点 override、profile 默认值、profile 部署策略和派生字段的归属边界，解决 `boot_disk` 等 storage 字段同时具有“共享安装计划”和“单节点物理设备”语义的问题。完整设计、影响清单和迁移要求见 `docs/archive/milestone-specs/2026-07-19-m4_12-node-profile-ownership-design.md`；系统证据矩阵见 `docs/audits/M0_M4_12_SYSTEM_AUDIT.md`。
 
 本设计的强制原则如下：
 
@@ -6106,8 +6113,8 @@ PXE bootfile，见 §9.10.11/§9.11.2 F2）；`NodeConfig.http_accel` 对 diskle
 （§9.11.7 F6），M5 新增的 `diskless`/`rootfs`/`initrd`/`boot-bundle` 命令须遵循 resource-action 模型；
 boot-gate 事件状态转换去重（§9.11.7.1 F9），M5 diskless boot-gate 事件须复用同一 `BootGateSuppressor` 模式；
 HTTP 只生成 M4.4 `/artifacts/boot/**` 与 `/api/v1/nodes/:id/artifacts/rootfs/:name`，不实现任何旧 URL alias。
-M4.6 的 `profile.kernel_args`（§9.15）对 diskless 模式同样生效：`resolveDiskless` 在 PXE cmdline 末尾
-追加 `kernel_args`，initrd 从 `/proc/cmdline` 透传，无需额外处理。
+M4.6 的 `profile.kernel_args`（§9.15）对 diskless 模式同样生效：未来 M5 boot target compiler 只从 pinned
+DisklessEffectivePlan 读取并在 PXE cmdline 末尾追加 `kernel_args`，initrd 从 `/proc/cmdline` 透传，无需额外处理。
 
 M5 以 M4.7 完整模型为实现基线：所有路径从注入的 `Paths` 获取；distro/profile/node/boot bundle 从 Catalog entity
 snapshot 获取；rootfs/boot bundle publish 通过 manifest transaction；BootConfig、drift 和 deployment generation 使用
@@ -6116,9 +6123,10 @@ node/resource API 使用 cursor 和目标 ETag，M5 不新增无分页大 collec
 
 ### 10.2 代码任务
 
-实现审计状态（2026-07-20）：当前仅有模型字段、UEFI target resolver scaffold、M4 事件 stage 预留和 M4.12 effective storage 抽象；下表
-列出的 `profile/diskless.zig`、rootfs/initrd/boot-bundle 校验器、dracut module、overlay 执行器和 diskless
-CLI/HTTP payload 均尚未落地。具体缺口和证据见 `docs/M5_M7_ALIGNMENT_AUDIT.md`。
+实现审计状态（2026-07-21）：M4.13 后 Profile/BootKind 仅支持 install；当前只保留 rootfs/initrd asset kind、
+基础 BootBundleConfig tuple 和 state/event enum，UEFI target resolver 也只调用 install 分支。下表列出的
+`profile/diskless.zig`、rootfs/initrd/boot-bundle 校验器、dracut module、overlay 执行器和 diskless CLI/HTTP payload
+均尚未落地。具体缺口和证据见 `docs/audits/M5_M7_ALIGNMENT_AUDIT.md`。
 
 | 模块 | 任务 |
 | --- | --- |
@@ -6175,7 +6183,8 @@ parse /proc/cmdline
   -> switch_root merged /sbin/init
 ```
 
-> **M4.6 kernel_args 透传**：`profile.kernel_args`（§9.15.7）在 `resolveDiskless` 阶段追加到 PXE cmdline
+> **M4.6 kernel_args 透传**：`profile.kernel_args`（§9.15.7）由 M5 boot target compiler 从 pinned plan
+> 追加到 PXE cmdline
 > 末尾，内核引导时即写入 `/proc/cmdline`。initrd 不需要额外解析或处理 `kernel_args`——它已在
 > `/proc/cmdline` 中，内核初始化阶段生效（如 `iommu=pt`）。运行系统中的服务可从 `/proc/cmdline` 读取
 > 这些参数。无盘系统无磁盘 GRUB，`kernel_args` 的唯一入口是 PXE cmdline。
@@ -6224,7 +6233,8 @@ EventWriter，也不因为 session 失效重建一个伪造的 boot session。
 - `overlay.tmpfs_size` 必须传给 tmpfs `size=`。
 - `/var/log`、`/tmp` 等高写入路径先作为配置位，不强制 MVP 单独挂载。
 - 持久化 overlay 不进入 MVP。
-- rootfs 公共修改使用 `rootfs_build`；节点差异使用 `diskless_boot` 写入 overlay upper。两者复用 M4 的 provisioning runner。
+- rootfs 公共修改使用 `rootfs-build`；节点差异使用受认证 `runtime` phase 写入 overlay upper。两者复用同一
+  provisioning owner，但必须先完成 schema v6 phase migration，不能继续调用 M4 runner 的下划线 enum。
 
 ### 10.6 无盘目标系统配置
 
@@ -6346,7 +6356,7 @@ initrd 为获取 BootConfig/rootfs 始终先使用 DHCP。M5 的目标静态地�
 #### 10.6.5 无盘 SSH 身份
 
 共享 rootfs 绝不能内置同一组 SSH host private keys。rootfs build 删除 `/etc/ssh/ssh_host_*`；initrd 或
-firstboot unit 在 overlay 中执行 `ssh-keygen -A`，确保每次实例至少具有独立 key。MVP 没有持久 overlay 或
+first-boot unit 在 overlay 中执行 `ssh-keygen -A`，确保每次实例至少具有独立 key。MVP 没有持久 overlay 或
 secret backend，因此重启后 host key 会变化，CLI/status 必须展示该限制和当前 fingerprint，不能把共享 host
 key 当作“稳定体验”的捷径。持久 host identity 留到后续 secret/persistent-overlay 设计。
 
@@ -6386,13 +6396,15 @@ SELinux disabled 时，boot resolver 必须追加 `selinux=0`，同时 overlay �
 以下命令是 M5 设计目标，当前版本尚未注册，不能直接执行：
 
 ```bash
-nodeforge rootfs package rocky-9.7-aarch64 --format squashfs --version 20260706
-nodeforge rootfs validate rocky-9.7-aarch64-<kernel-release>-diskless-20260706.squashfs
-nodeforge initrd validate diskless/rocky/9.7/aarch64/<kernel-release>/initrd-nodeforge.img
-nodeforge boot-bundle publish rocky-9.7-aarch64-<kernel-release>-diskless-20260706 --kernel rocky-9.7-aarch64-kernel --initrd rocky-9.7-aarch64-nodeforge-initrd --rootfs rocky-9.7-aarch64-rootfs-20260706 --repo rocky-9.7-aarch64-dvd
-nodeforge diskless overlay update rocky-9.7-aarch64-diskless --tmpfs-size 50%
-nodeforge diskless status node-02
-nodeforge diskless retry node-02
+nodeforge assets rootfs import rocky-9.7-aarch64 --from-file rootfs.squashfs
+nodeforge assets rootfs validate rocky-9.7-aarch64
+nodeforge assets nodeforge-initrd build rocky-9.7-aarch64-<kernel-release> --from-file build.yaml --input yaml
+nodeforge assets nodeforge-initrd validate rocky-9.7-aarch64-<kernel-release>
+nodeforge assets boot-bundle create rocky-9.7-aarch64-<kernel-release>-diskless kernel=rocky-9.7-aarch64-kernel initrd=rocky-9.7-aarch64-nodeforge-initrd rootfs=rocky-9.7-aarch64-rootfs
+nodeforge assets boot-bundle validate rocky-9.7-aarch64-<kernel-release>-diskless
+nodeforge profile set rocky-9.7-aarch64-diskless diskless.overlay.tmpfs_percent 50
+nodeforge node status node-02
+nodeforge node diskless retry node-02
 ```
 
 `diskless retry` 只对 `diskless.failed`/服务端 failure quarantine 生效：清除该节点的失败隔离并允许下一次 PXE
@@ -6614,8 +6626,9 @@ M6 不因某 reason 自动执行 install retry；M7 的自动策略仍受 §12.9
 
 ### 12.1 目标
 
-M4 已交付 repository、standard-packages、managed-file 和基础 runner；M5 无盘 runner 尚未交付。本阶段目标是
-在前置能力完成后补齐 archive、script、firstboot、CLI plan/status 和三条链路的完整回归。这里的“配置可视化”
+M4 已交付 repository、`standard_packages`、managed-file 的历史 runner；其中自由 package 数组不是 v0.2 目标
+接口，必须在 schema v6 迁移为对 pinned effective software/capability 的引用。本阶段目标是在前置能力完成后
+补齐 archive、script、first-boot、runtime、CLI plan/status 和三条链路的完整回归。这里的“配置可视化”
 是指 CLI 按阶段、步骤和执行结果清晰组织输出，不引入 Web UI 或通用低代码配置系统。
 
 M7 不获得绕过 M4.1–M4.7/M5 目标系统策略和存储事务的权限。`profile.system` 与 `node.overrides.network` 是 locale、
@@ -6634,7 +6647,7 @@ M4.7 desired digest；runner 只能通过既有 transaction/status writer 发布
 本阶段不新增第二套模型，继续使用 3.5：
 
 - 启用 archive 和 script action。
-- 增加 firstboot 执行入口。
+- 增加 first-boot 和 runtime 执行入口。
 - 补齐 bundle `show/plan`、运行状态和错误摘要。
 - 对 Kickstart、autoinstall、rootfs build 和 diskless overlay 做同一 bundle 的回归。
 
@@ -6674,7 +6687,7 @@ target_root, workspace, repository_base_url, event_url
   locale/timezone/keyboard、package manifest、firewall 或 SELinux 文件与 unit。
 - action 必须声明影响域；触及上述保护域的 bundle 在 M7 校验阶段直接拒绝。未来若确需覆盖，应增加显式、
   可审计的 policy override action，不能借助通用 script 绕过。
-- runner 在 `install_post`、`rootfs_build`、`diskless_boot` 和适用的 `firstboot` 步骤之后执行目标系统
+- runner 在 `install-post`、`rootfs-build`、`runtime` 和适用的 `first-boot` 步骤之后执行目标系统
   finalizer，重新断言 M4.1 默认值/显式覆盖、用户/sudo/package 归属、bootstrap/profile public key 合并和
   逐账号 key 归属并产出摘要；finalizer 失败则该阶段失败。
 - local-only 下 archive、script 和包只能引用已发布的本地 catalog/repository；运行期隐式下载一律失败。
@@ -6699,29 +6712,30 @@ stdout/stderr 仅保留最后 2048 bytes 的转义摘要；秘密环境变量、
 阶段固定为：
 
 ```text
-rootfs_build
-install_post
-firstboot
-diskless_boot
+install-post
+rootfs-build
+first-boot
+runtime
 ```
 
 执行顺序固定：
 
 1. 挂载/确认目标 root。
-2. 配置基础 ISO repository 和额外 repository。
-3. 使用 yum/dnf/apt 安装 `standard_packages`。
-4. 下载并校验 `tar.bz2`，解压并执行其安装脚本。
-5. 原子写入 `files`，用于 `/etc/hosts`、chrony/systemd-timesyncd、resolver 和业务配置。
-6. 按声明顺序执行自定义 scripts/patch。
-7. 写入 `Paths.state_provisioned/<bundle>-<version>.json` 并上报结果。
-8. 执行 TargetSystem finalizer，校验并固化 profile 的账号、SSH、网络、连接和安全策略。
+2. pin effective plan、bundle/asset revision，并校验 action/phase、幂等和 TargetSystem 保护域。
+3. 物化基础 ISO repository、额外本地 repository 和全部已发布输入 asset。
+4. 使用 yum/dnf/apt 执行只引用 pinned effective software/capability 的 package action；不接受
+   `standard_packages` 或自由 packages 数组。
+5. 下载并校验 archive，解压并按受控契约执行其安装入口。
+6. 原子写入未触及保护域的 managed file。
+7. 按声明顺序执行有 interpreter allowlist、timeout、输出上限和影响域的 scripts/patch。
+8. 执行 TargetSystem finalizer；成功后才原子写入 `Paths.state_provisioned/<bundle>-<revision>.json` 并上报结果。
 
 同一个 bundle 可用于：
 
-- Kickstart `%post` 或 Ubuntu `late-commands`：在目标 root 内执行 `install_post`。
-- rootfs build：打包 squashfs 前执行 `rootfs_build`。
-- diskless：通用内容尽量在 rootfs build 完成；节点专属配置在 overlay 上执行 `diskless_boot`，不修改只读 lower rootfs。
-- firstboot：需要 systemd、网络或目标硬件后才能完成的操作。
+- Kickstart `%post` 或 Ubuntu `late-commands`：在目标 root 内执行 `install-post`。
+- rootfs build：打包 squashfs 前执行 `rootfs-build`。
+- diskless：通用内容尽量在 rootfs build 完成；节点专属配置在 overlay 上执行受认证 `runtime`，不修改只读 lower rootfs。
+- first-boot：需要 systemd、网络或目标硬件后才能完成的操作。
 
 ### 12.6 CLI 配置展示与预览
 
@@ -6738,12 +6752,12 @@ diskless_boot
 ```text
 Bundle  base-site@1    Rocky 9.7 aarch64    VALID
 
-PHASE         #  STEP              ACTION             REQUIRED  SUMMARY
-install_post  1  site-repository   repository         yes       site-extra
-install_post  2  base-packages     standard-packages  yes       chrony, vim
-install_post  3  hosts             managed-file       yes       -> /etc/hosts
-firstboot     1  vendor-agent      archive            yes       /opt/vendor-agent
-firstboot     2  site-patch        script             no        patch site config
+PHASE        #  STEP              ACTION              REQUIRED  SUMMARY
+install-post 1  site-repository   repository          yes       site-extra
+install-post 2  base-packages     software-selection  yes       effective@<digest>
+install-post 3  hosts             managed-file        yes       -> /etc/hosts
+first-boot   1  vendor-agent      archive             yes       /opt/vendor-agent
+first-boot   2  site-patch        script              no        patch site config
 ```
 
 Kickstart、autoinstall 和 diskless 对同一 bundle 使用相同的 `show/plan/status` 格式，只在概要中标明实际执行入口。
@@ -6753,23 +6767,23 @@ Kickstart、autoinstall 和 diskless 对同一 bundle 使用相同的 `show/plan
 - 每个 bundle/version/phase 记录执行状态和日志；同版本默认不重复执行，可用显式 `--force` 重跑。
 - script 使用固定环境变量、工作目录、超时和输出上限；required script 失败终止该阶段，optional script 只告警。
 - 文件更新采用临时文件 + rename，原文件可按 bundle 策略备份；禁止未声明的整目录覆盖。
-- 自动安装中的后处理继承 node + install profile 显式绑定；未知节点的 safe diskless 禁止执行 archive install script 和自定义 script。
+- 自动安装中的后处理继承 node + install Profile 显式绑定；未知节点没有 Profile、effective plan 或可信凭据，
+  任何 phase 均不得执行 archive、script、managed-file 或 package action。
 - bundle 变更生成新版本，不原地修改已发布内容；节点状态记录实际使用版本。
 
 ### 12.8 CLI 与验收
 
 ```bash
-nodeforge provision bundle list
-nodeforge provision bundle show base-site
-nodeforge provision bundle create base-site --distro rocky --distro-version 9.7 --arch aarch64
-nodeforge provision step add base-site --name site-repository --phase install_post --action repository --repository site-extra
-nodeforge provision step add base-site --name base-packages --phase install_post --action standard-packages --package chrony
-nodeforge provision step add base-site --name vendor-agent --phase firstboot --action archive --asset vendor-agent.tar.bz2 --extract-to /opt/vendor-agent
-nodeforge provision step add base-site --name hosts --phase install_post --action managed-file --source hosts --destination /etc/hosts
-nodeforge provision step add base-site --name site-patch --phase install_post --action script --asset patch.sh --required
-nodeforge provision bundle validate base-site
-nodeforge provision bundle publish base-site --version 1
-nodeforge provision bundle plan base-site --node node-01
+nodeforge assets provision-bundle list
+nodeforge assets provision-bundle show base-site
+nodeforge assets provision-bundle create base-site
+nodeforge assets provision-bundle item add base-site steps name=site-repository phase=install-post action=repository repository=site-extra
+nodeforge assets provision-bundle item add base-site steps name=base-packages phase=install-post action=software-selection selection=effective
+nodeforge assets provision-bundle item add base-site steps name=vendor-agent phase=first-boot action=archive asset=vendor-agent.tar.bz2 extract-to=/opt/vendor-agent
+nodeforge assets provision-bundle item add base-site steps name=hosts phase=install-post action=managed-file source=hosts destination=/etc/hosts
+nodeforge assets provision-bundle item add base-site steps name=site-patch phase=install-post action=script asset=patch.sh required=true
+nodeforge assets provision-bundle validate base-site
+nodeforge assets provision-bundle plan base-site --node node-01
 nodeforge provision run show <run-id>
 nodeforge provision status node-01
 ```
@@ -6782,20 +6796,24 @@ CLI 的 `bundle list/show/plan` 和 `status` 默认使用分组表格，`--outpu
 
 ### 12.9 已部署节点 reconciliation 与自动重试边界
 
-M7 承接 §9.10.12 中“desired 已变化但目标系统尚未同步”的节点，但不能假设 firstboot 脚本能凭普通 DHCP
+M7 承接 §9.10.12 中“desired 已变化但目标系统尚未同步”的节点，但不能假设 first-boot 脚本能凭普通 DHCP
 自动获得管理权限：
 
 - 每个节点保存 applied target-system digest 和逐域状态。`provision plan --node` 将 drift 分为可在线同步、
-  下次受认证 firstboot/agent 同步、必须重装和人工处理；没有可信 agent/enrollment channel 时保持 pending，
+  下次受认证 first-boot/agent 同步、必须重装和人工处理；没有可信 agent/enrollment channel 时保持 pending，
   不能声称已应用。
 - root/普通用户 password hash、authorized_keys、sudo membership、sshd policy、locale/timezone/keyboard、
   firewall/SELinux 配置和增加 package 可进入受保护的 TargetSystem reconciler。删除用户/包、修改默认路由/
   SSH 管理入口属于高风险变更，默认只 plan；网络变更必须有连通性预检、原子文件和有界回滚。
 - storage/partition/bootloader/install source 以及无盘 rootfs build-time users/packages 不在线 reconcile：前者
   需要新 install generation，后者需要新 rootfs/boot bundle。generic script 仍不能覆盖 protected domain。
-- firstboot/agent 使用单独的一次性 enrollment 或已建立节点凭据换取短期 capability；不能把任意新 DHCP lease
+- first-boot/agent 使用单独的一次性 enrollment 或已建立节点凭据换取短期 capability；不能把任意新 DHCP lease
   当认证，也不能复用 installer token。M4.3 允许 installer delivery capability 跨 daemon 重启恢复，只是为了
-  完成当前安装器回调；这不把它升级为 firstboot/agent 凭据。节点重启、session 终态/过期或身份校验失败仍使其失效。
+  完成当前安装器回调；这不把它升级为 first-boot/agent 凭据。节点重启、session 终态/过期或身份校验失败仍使其失效。
+- enrollment 由显式 arm/pinned plan 创建，绑定 node、plan digest、expiry 和单次 consumed 状态；当前 delivery
+  capability 只能从独立 no-store endpoint 领取 enrollment secret，不能直接认证 agent。服务端只保存 verifier。
+  installed node 以 mode 0600 保存兑换后的 node credential；无持久 overlay 的 diskless node 每次启动重新 enrollment，
+  credential 不进入共享 lower、BootConfig、boot.json、cmdline、Event 或日志，也不跨启动持久化。
 
 自动重试分三层：
 
@@ -7028,12 +7046,12 @@ v1 和 v2 事件在同一 `events.jsonl` 中共存，CLI 兼容读取。详见 �
 
 每个阶段完成时更新：
 
-- `DESIGN.md`：仅当范围或关键决策变化时更新。
-- `DETAILED_DESIGN.md`：阶段任务、接口、字段变化时更新。
+- `M0_M7_LEGACY_OVERVIEW_DESIGN.md`：仅当范围或关键决策变化时更新。
+- `M0_M7_LEGACY_DETAILED_DESIGN.md`：阶段任务、接口、字段变化时更新。
 - 示例配置：字段变化必须同步。
 - 测试 fixture：协议或模板变化必须同步。
 
-M3 的路由、DTO、认证、Range、资产 publication 或 EventType 任一变化，还必须同步检查：`DESIGN.md` 的 HTTP
+M3 的路由、DTO、认证、Range、资产 publication 或 EventType 任一变化，还必须同步检查：`M0_M7_LEGACY_OVERVIEW_DESIGN.md` 的 HTTP
 安全边界、本文件第 8 节、M2.5.1 session/trace 契约、M4/M5 的 answer/initrd 消费方式、CLI help/fixture 与
 Rocky 9.7 验证记录。未经这些同步，不得把接口变化标记为 M3 完成。
 

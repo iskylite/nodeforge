@@ -3,7 +3,7 @@
 - 日期：2026-07-14
 - 状态：设计修订中（待实现）
 - 依赖：M4.1 基线；是 M4/M4.1 安装链路的直接延续，在 M5 之前交付
-- 插入位置：`docs/DETAILED_DESIGN.md` §9.11 M4.2
+- 插入位置：`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.11 M4.2
 
 > **历史规格，后续修订（2026-07-15）**：M4.3 实机复核否定或完成收口了本稿的以下过渡契约：
 > (1) RHEL-family 介质不能统一归一为 `distro=rocky`，必须保留真实 distro；
@@ -24,13 +24,13 @@
 
 > **后续修订（2026-07-17，M4.8 并发容量与 TFTP 配置收口）**：本稿以下过渡契约
 > 已被 M4.8 取代，现行实现以 `2026-07-17-concurrency-capacity-scaling-design.md`
-> 和 DETAILED_DESIGN.md §9.17 为准：
+> 和 M0_M7_LEGACY_DETAILED_DESIGN.md §9.17 为准：
 > (1) §7.2「per-client 并发」实际为全局并发（`tftp/server.zig` 单一原子计数器）；
 > §7.3 的 `max_concurrent_transfers: u8 = 4` 已改为 `?u16 = null`（auto 派生
 > `max(128, 2×核)`，仅拒绝 0），`> 64` 上限已移除。
 > (2) §7.3 `http_accel: bool = true` 已纠正为 `false`（与 §7.3.1「默认禁用」一致）。
 > (3) §7.4「客户端省略 blksize 时的主动建议」已在 M4.3 删除：服务端不主动建议
-> 未请求的 option，不放大客户端请求值（见 DETAILED_DESIGN.md §9.12.5）。
+> 未请求的 option，不放大客户端请求值（见 M0_M7_LEGACY_DETAILED_DESIGN.md §9.12.5）。
 > (4) §6.2 的 Debian 检测已 descoped：代码未实现 Debian 介质识别，仅支持
 > Ubuntu-Server `.disk/info` + casper 布局；Debian 不在 M4 支持矩阵。
 
@@ -109,7 +109,7 @@ post-install 命令的异常容忍语义（kickstart `%post --erroronfail` 与 u
 | bootstrap admin key 仅启动时解析一次、不可更新 | M4.1 §9.10.6.2 | F5 多值数组 + state 目录扫描 + CLI reload |
 | `NodeConfig` 无"永不部署"开关 | M4.1 §9.10.11 generation 仅覆盖 install | F2 `deploy` 硬外层开关 |
 | CLI 13 个扁平命令与 canonical form 偏差 | M1.5 §6.5 / M4 §9.7 | F6 校准为 8 顶层资源模型 |
-| node 仅有 `list`，无 add/set/remove | M4 §9.7 / DESIGN.md:1675,1952 | F6 新增 node CRUD + 管理 API |
+| node 仅有 `list`，无 add/set/remove | M4 §9.7 / M0_M7_LEGACY_OVERVIEW_DESIGN.md:1675,1952 | F6 新增 node CRUD + 管理 API |
 | `install status`/`install logs` 未实现 | M4 §9.7 | F6 合并到 `node show` |
 | 安装目录 14 个子目录散乱、与 CLI 资源不对应 | M0 paths.zig | F6 安装目录资源化布局 |
 | VAL:552 "Ubuntu error 与 Rocky %onerror 在真实失败路径上报合法 failed stage" 未验证 | M4.1 验收 | F1 验收标准 #1/#2 覆盖 |
@@ -497,7 +497,7 @@ EFI 连续内存页，导致剩余连续内存不足以分配 13 MB 内核缓冲
 
 **M6 继承**：`http_accel` 仅对 GRUB UEFI 链路生效。BIOS PXELINUX 固定使用
 `pxelinux.0`（只支持 TFTP），`http_accel` 对 BIOS 节点无效，kernel/initrd
-始终通过 TFTP 传输。详见 DESIGN.md §5.2.1。
+始终通过 TFTP 传输。详见 M0_M7_LEGACY_OVERVIEW_DESIGN.md §5.2.1。
 
 ### 7.4 客户端省略 blksize 时的主动建议
 
@@ -704,19 +704,19 @@ boot-gate 诊断事件淹没。
 
 ### 9.1 既有 CLI 设计逻辑回顾
 
-文档（`DESIGN.md:1612-1628` §11.3 命令格式规范）定义了 CLI 的 canonical form：
+文档（`docs/archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md:1612-1628` §11.3 命令格式规范）定义了 CLI 的 canonical form：
 
 ```
 nodeforge <resource> [subresource] <action> [object] [options]
 ```
 
 核心原则：
-1. **resource-action 层级**：根命令 -> 资源命令 -> 动作命令（三层，`DESIGN.md:1578`），`-h/--help` 在每层可用。
-2. **命令树是唯一事实源**（`DESIGN.md:1577`）：声明一次，解析和分级帮助从同一份声明生成。
+1. **resource-action 层级**：根命令 -> 资源命令 -> 动作命令（三层，`docs/archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md:1578`），`-h/--help` 在每层可用。
+2. **命令树是唯一事实源**（`docs/archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md:1577`）：声明一次，解析和分级帮助从同一份声明生成。
 3. **动词在后**：`<resource> <action>`，action 跟在 resource 之后。
-4. **动词一致**：同类资源用同一组动作名，不混用 delete/remove、check/validate、get/show（`DESIGN.md:1608`）。
-5. **避免重复入口**：不定义 `help`/`version` 子命令（`DETAILED_DESIGN.md:795`）。
-6. **少量融合入口**：`status`/`check` 等高频快捷入口允许，但帮助中说明等价关系（`DESIGN.md:1620-1628`）。
+4. **动词一致**：同类资源用同一组动作名，不混用 delete/remove、check/validate、get/show（`docs/archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md:1608`）。
+5. **避免重复入口**：不定义 `help`/`version` 子命令（`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md:795`）。
+6. **少量融合入口**：`status`/`check` 等高频快捷入口允许，但帮助中说明等价关系（`docs/archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md:1620-1628`）。
 
 ### 9.2 当前命令树的问题
 

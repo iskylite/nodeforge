@@ -1,6 +1,6 @@
 # M4.12 Node/Profile 属性归属与存储覆盖设计
 
-> 状态：历史方案，已被 `docs/V0_1_DESIGN.md` 取代。本文记录已经实现的
+> 状态：历史方案，已被 `docs/design/V0_1_DESIGN.md` 取代。本文记录已经实现的
 > `profile storage default + node storage override` 行为，不再是目标设计。现行要求是物理磁盘仅由
 > Node direct `storage.boot_disk/additional_disks` 持有，主盘默认 `/dev/sda`；语义重复且未被 adapter 消费的
 > `install_disks` 从目标 schema 删除。Profile 不持有磁盘，其 mode/wipe/partition/bootloader、系统、软件和

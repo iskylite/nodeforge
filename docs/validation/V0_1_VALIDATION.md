@@ -33,4 +33,4 @@
 
 ## 完成结论
 
-`docs/V0_1_DESIGN.md` 第 12 节完成标准已全部具备自动化或实机证据。生产节点最终状态为 generation 34 completed、not-armed、drift clean；生产服务和全部状态探针正常。
+`docs/design/V0_1_DESIGN.md` 第 12 节完成标准已全部具备自动化或实机证据。生产节点最终状态为 generation 34 completed、not-armed、drift clean；生产服务和全部状态探针正常。

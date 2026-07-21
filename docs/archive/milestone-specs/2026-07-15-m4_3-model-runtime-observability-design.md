@@ -1,12 +1,12 @@
 # M4.3：安装源与节点模型收口、运行态热更新和可观测性完善
 
 > 历史设计说明：本文保留 M4.3 当时的 `config import`/`config set` 方案。M4.9 已删除这两个入口并将
-> startup config 写入统一到 setup；现行结论见 `DETAILED_DESIGN.md` §9.18。
+> startup config 写入统一到 setup；现行结论见 `docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.18。
 
 - 日期：2026-07-15
 - 状态：设计完成，已实现（代码落地 2026-07-16）
 - 前置：M4.2
-- 插入位置：`docs/DETAILED_DESIGN.md` §9.12，必须在 M5 前交付
+- 插入位置：`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.12，必须在 M5 前交付
 - 目标：修正 M4.2 实机验证暴露出的模型、控制面、会话恢复和可观测性问题，避免这些基础契约继续扩散到 M5–M7
 
 > **M4.4 URL 衔接**：本文出现的 `/subiquity-report`、`/repos/**` 等路径描述 M4.3 需要修复的现有 handler

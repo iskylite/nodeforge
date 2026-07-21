@@ -1,12 +1,12 @@
 # M4.4：HTTP API URL 契约收口与路由平面分离
 
 > 历史设计说明：本文保留 M4.4 对 M4.3 `config set` 的兼容要求；M4.9 已删除该命令和 management
-> config PATCH。现行路由契约见 `DETAILED_DESIGN.md` §9.18。
+> config PATCH。现行路由契约见 `docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.18。
 
 - 日期：2026-07-15
 - 状态：设计完成，待实现
 - 前置：M4.3
-- 插入位置：`docs/DETAILED_DESIGN.md` §9.13，必须在 M5 前交付
+- 插入位置：`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.13，必须在 M5 前交付
 - 目标：在 M4.3 的 ConfigRuntime、聚合管理 API 和可恢复 BootSession 基线上，统一 HTTP URL 命名、认证、缓存和迁移契约，消除重复入口和基于匹配顺序的路由歧义
 
 ## 1. 结论摘要

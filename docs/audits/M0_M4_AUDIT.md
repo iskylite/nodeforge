@@ -1,7 +1,7 @@
 # M0–M4.1 implementation audit (2026-07-13)
 
 This review separates code evidence from the target design; a documented target is
-not treated as delivered merely because it appears in `DETAILED_DESIGN.md`.
+not treated as delivered merely because it appears in `docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md`.
 
 | Milestone | Confirmed baseline | Gaps / acceptance gates |
 | --- | --- | --- |
@@ -84,7 +84,7 @@ curtin action graph for explicit partitions.
   `--netmask=255.255.255.0` syntax. r97n1 completed DHCP, TFTP GRUB, kernel
   and initrd transfer in a fresh Computer Use run, then stopped at the
   documented 64 KiB-granule EFI error. The current session and byte-level
-  provenance are recorded in `docs/ROCKY_8_10_VALIDATION.md`.
+  provenance are recorded in `docs/validation/ROCKY_8_10_VALIDATION.md`.
 - ISO-import publication/copy failures now roll back only files owned by that
   invocation, catalog-publication failures clean all unpublished outputs, and
   read-only DVD work trees use a safe removal fallback so successful imports do

@@ -7,3 +7,4 @@ zig-pkg/
 .zcode
 .kiro
 config.json
+dist

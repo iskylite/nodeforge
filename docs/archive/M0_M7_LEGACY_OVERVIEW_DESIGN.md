@@ -1,7 +1,8 @@
-# NodeForge PXE 特化版概要设计
+# NodeForge M0-M7 历史合并概要设计
 
 > 历史合并文档：本文保留 M0-M7 的早期全景和决策背景，不再承担版本边界或现行所有权模型。
-> 当前已实现范围及修复要求以 `V0_1_DESIGN.md` 为准，未实现范围以 `V0_2_DESIGN.md` 为准；
+> 当前已实现范围及修复要求以 [`V0_1_DESIGN.md`](../design/V0_1_DESIGN.md) 为准，未实现范围以
+> [`V0_2_DESIGN.md`](../design/V0_2_DESIGN.md) 为准；
 > 与两份版本文档冲突时，以版本文档为准。本文中的 Profile 物理磁盘、`install_disks`、稳定磁盘 selector、
 > 单盘限制和旧帮助示例均为历史内容；v0.1 目标使用 Node direct `storage.boot_disk/additional_disks`、原生
 > single/LVM/RAID/RAID-LVM、Node policy override、直接分区 item CLI 和统一 `--help-full`。
@@ -536,7 +537,7 @@ const ProfileSafetyConfig = struct {
 };
 ```
 
-`ProvisioningBundle` 的最小强类型步骤模型在 `DETAILED_DESIGN.md` 3.5 定义，概要设计只保留对象关系，不重复维护第二份字段定义。
+`ProvisioningBundle` 的最小强类型步骤模型在 `M0_M7_LEGACY_DETAILED_DESIGN.md` 3.5 定义，概要设计只保留对象关系，不重复维护第二份字段定义。
 
 `profile.mode` 决定运行路径，`install` 和 `diskless` 是 mode-specific 子配置。不要把 `install_profile`、`diskless_profile`、`initrd_profile` 拆成互相独立的一堆顶层表。
 
@@ -1305,18 +1306,16 @@ SHA256 失败只允许从 0 重下一次，重复失败进入 quarantine。`disk
 ### 9.10 无盘阶段状态
 
 ```text
-pxe_seen
-  -> bootfile_sent
-  -> initrd_started
-  -> diskless_config_fetched
-  -> rootfs_downloading
-  -> rootfs_verified
-  -> rootfs_mounted
-  -> switch_root
-  -> diskless_running
+dhcp_discover -> dhcp_offer -> dhcp_ack -> tftp_rrq -> tftp_complete
+  -> boot_config_fetched -> initrd_started -> rootfs_downloading
+  -> rootfs_verified -> rootfs_mounted -> switching_root -> diskless_running
 ```
 
-失败时记录 `stage`、`reason`、`rootfs`、`rootfs_sha256`、`last_event_at` 和最近 initrd 日志摘要。
+`failed` 可从任一非终态进入，`expired` 只由服务端超时进入，二者终止当前 BootSession。Node quarantine 是
+attempt 预算耗尽后的独立 boot gate，不是 session phase。历史展示名 `pxe_seen`、`bootfile_sent`、
+`diskless_config_fetched` 分别映射 `dhcp_discover`、携带 bootfile 的 `dhcp_ack`、`boot_config_fetched`；持久化、
+API 和 Event 只使用 canonical 名。失败时记录 `stage`、`reason`、`rootfs`、`rootfs_sha256`、`last_event_at` 和
+最近 initrd 日志摘要。
 
 ## 10. 配置、持久化与校验
 
@@ -1933,7 +1932,7 @@ follow 采用轮转感知的 `tail -F` 语义。事件类型、字段限制、�
 
 `boot.resolver` 是唯一 PXE 决策入口，返回 `wait/deny/discovery/install/diskless` 等明确决策。协议服务不直接理解 profile 内部细节，也不直接修改配置。
 
-代码结构、模块依赖方向、核心调用路径、复杂度预算和注释/代码文档要求详见 `DETAILED_DESIGN.md` 第 2 章。
+代码结构、模块依赖方向、核心调用路径、复杂度预算和注释/代码文档要求详见 `M0_M7_LEGACY_DETAILED_DESIGN.md` 第 2 章。
 
 ## 14. 测试策略
 
@@ -2044,8 +2043,16 @@ NodeForge/
   config.example.json
   catalog.example.json
   docs/
-    DESIGN.md
-    DETAILED_DESIGN.md
+    README.md
+    design/
+      V0_1_DESIGN.md
+      V0_2_DESIGN.md
+    audits/
+    validation/
+    archive/
+      M0_M7_LEGACY_OVERVIEW_DESIGN.md
+      M0_M7_LEGACY_DETAILED_DESIGN.md
+      milestone-specs/
     assets/
   src/
   tests/
@@ -2079,8 +2086,8 @@ M4.3 明确修订早期里程碑中的发行版身份、repository、重复导�
 webhook proof、BootSession 重启和版本输出等过渡契约，并补充 logical-id grammar、config/catalog/目录联合事务、
 model snapshot pair、inventory 写入仲裁和 session-owned immutable install plan。冲突不是“两种方案并存”：现行章节以 M4.3 为准，
 历史规格保留原文并标注 superseded，数据变化必须显式迁移且冲突 fail closed。完整冲突矩阵、迁移和验收见
-`DETAILED_DESIGN.md` §9.12 与
-`docs/superpowers/specs/2026-07-15-m4_3-model-runtime-observability-design.md`。
+`M0_M7_LEGACY_DETAILED_DESIGN.md` §9.12 与
+`docs/archive/milestone-specs/2026-07-15-m4_3-model-runtime-observability-design.md`。
 
 M4.3 只提前已实现 PXE 部署的运维闭环（含只读 `profile list/show`），不提前 M5 rootfs/diskless、
 M6 profile 写 CRUD/完整 diff/apply/PXELINUX 或
@@ -2092,11 +2099,11 @@ M4.4 提供 M5–M7 从当前基线继续扩展的 HTTP 表面：节点交付 AP
 `/api/v1/management/**`，静态制品使用 `/artifacts/**`；NoCloud 保留固定 leaf，不以 Accept 协商取代；敏感响应
 用 node-bound auth/no-store/日志脱敏保护。当前 contract 同时覆盖 method/status/error、ETag/If-Match、idempotency、
 collection/operation envelope 和 golden DTO。由于仍在开发阶段，M4.4 直接删除旧 URL，切换前显式清理 M4.3
-session state；不保留旧 loader、alias、redirect、TTL 窗口或 route migration state。详见 `DETAILED_DESIGN.md`
+session state；不保留旧 loader、alias、redirect、TTL 窗口或 route migration state。详见 `M0_M7_LEGACY_DETAILED_DESIGN.md`
 §9.13 与 M4.4 专项设计。
-专项规格为 `docs/superpowers/specs/2026-07-15-m4_4-http-api-url-contract-design.md`。
+专项规格为 `docs/archive/milestone-specs/2026-07-15-m4_4-http-api-url-contract-design.md`。
 
-每个阶段的代码任务、CLI 命令、测试和验收标准详见 `DETAILED_DESIGN.md` 第 3-12 章。
+每个阶段的代码任务、CLI 命令、测试和验收标准详见 `M0_M7_LEGACY_DETAILED_DESIGN.md` 第 3-12 章。
 
 ## 17. MVP 验收标准
 

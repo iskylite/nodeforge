@@ -2,7 +2,7 @@
 
 > 历史验证说明：本文保留 M4.7 当时的 config PATCH 兼容行为。M4.9 已删除独立 `config import`、死
 > `config set` 和 management config PATCH；现行 startup-config ownership 以
-> `DETAILED_DESIGN.md` §9.18 为准。
+> `docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.18 为准。
 
 验证日期：2026-07-17（Asia/Shanghai）。实现基线：M4.6 commit `b4b5bd6` 之后。
 

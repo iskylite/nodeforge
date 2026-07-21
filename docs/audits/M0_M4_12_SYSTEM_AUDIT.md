@@ -1,7 +1,7 @@
 # M0-M4.12 系统实现审计
 
 > 本文是当前代码证据快照，不是现行目标模型。M4.12 的 storage fallback 虽有自动化证据，
-> 但所有权结论已被 `V0_1_DESIGN.md` 的 M4.13 修复计划取代；v0.1 尚未完成。
+> 但所有权结论已被 `docs/design/V0_1_DESIGN.md` 的 M4.13 修复计划取代；v0.1 尚未完成。
 
 审计日期：2026-07-20。范围是当前 `main` 分支中 M0 至 M4.12 的代码、自动化测试、CLI 契约和 PXE 启动链。本文把证据分为：
 
@@ -62,7 +62,7 @@
 仍有一项明确的 CLI 架构债务：`src/main.zig` 当前为 2862 行，并有 201 个直接
 `ctx.writer.print/writeAll/writeByte` 调用。旧 status/assets/runtime/events handler 尚未全部迁移到公共
 success/error serializer，部分 `--output json` 的本地加载/daemon-unavailable 失败仍可能输出 human `error:`。
-此外，当前 property allowlist 和逗号分隔 list parser 不能满足 `V0_1_DESIGN.md` 定义的全资源
+此外，当前 property allowlist 和逗号分隔 list parser 不能满足 `docs/design/V0_1_DESIGN.md` 定义的全资源
 PropertySpec/CollectionSpec/ItemSpec、`list-values`、framework `--help-full` 与禁止 Shell 内嵌 JSON 契约。
 本轮没有对这些互相耦合的 handler 做机械搬移；
 M4.13 应按 `cli/commands/node.zig`、`profile.zig`、`assets.zig`、`runtime.zig`、`events.zig` 拆分，让命令模块

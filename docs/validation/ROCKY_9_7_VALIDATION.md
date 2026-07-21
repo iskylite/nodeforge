@@ -4,12 +4,12 @@
 > 其中“重复 ISO 导入被拒绝是正确行为”已被 SHA-256 + logical name 幂等语义覆盖；`tftp/`、`repos/`、
 > `provisioned/` 等旧顶层路径已由 M4.2 迁移到 `assets/*`、`state/provisioned/`；旧 `tftp`、`dhcp`、`trace`、
 > `install-source` CLI 仅用于还原历史验证步骤，M4.3 后应使用 canonical 资源命令。判断当前设计和新验收时以
-> 模型/CLI 以 `DETAILED_DESIGN.md` §9.12 与 M4.3 专项设计为历史基线，M4.9 覆盖内容以 §9.18 与
+> 模型/CLI 以 `docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.12 与 M4.3 专项设计为历史基线，M4.9 覆盖内容以 §9.18 与
 > M4.9 专项补丁为准；HTTP URL 以 §9.13 与 M4.4 专项设计为准；
 > 不能据本文旧成功条件恢复过渡行为。
 
 M0 已在 Rocky Linux 9.7 aarch64 实机完成 systemd、HTTP、CLI、端口独占和 debug 验证；结果以
-[`DETAILED_DESIGN.md` 第 5 节](DETAILED_DESIGN.md#5-m0-验收标准与验证结果)为准。本文是追加式验证
+[`M0_M7_LEGACY_DETAILED_DESIGN.md` 第 5 节](../archive/M0_M7_LEGACY_DETAILED_DESIGN.md#5-m0-验收标准与验证结果)为准。本文是追加式验证
 日志：已勾选项表示对应日期和环境下曾实际通过，不代表后续阶段自动通过；未勾选项是当前待办。
 M4/M4.1 的 Rocky 9.7 与 Ubuntu 22.04 正向安装、登录和生命周期链路均已完成实机验证；尚未执行的
 异常/负向条目继续保持未勾选。Rocky 8.10 aarch64 因 VMware/Apple-Silicon 的 64 KiB page-granule

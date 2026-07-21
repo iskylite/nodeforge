@@ -5,7 +5,7 @@
 > PXE、force-retry 和 systemd readiness rollback 系统验收均已完成。
 >
 > 本文是 M4.1–M4.8 之后的覆盖性补丁。旧章节保留当时设计和验证事实；发生冲突时，以本文和
-> `DETAILED_DESIGN.md` §9.18 为准。
+> `docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.18 为准。
 
 ## 1. 背景与触发
 
@@ -203,4 +203,4 @@ NodeForge 不把远端可变内容伪装成 immutable asset。
 - r97n2 使用 Ubuntu 22.04.5 完成 UEFI PXE、NVMe 安装、本地盘启动和 force-retry generation 3。
 - active daemon 不响应时 readiness 在 6 秒内失败，unit link、enabled/active 状态和健康服务全部恢复。
 
-完整证据见 `docs/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。
+完整证据见 `docs/validation/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。

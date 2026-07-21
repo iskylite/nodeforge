@@ -2,7 +2,7 @@
 
 - 日期：2026-07-17
 - 里程碑：M4.8（编号在 M4.7 之后，实施早于 M4.6）
-- 详细设计章节：`docs/DETAILED_DESIGN.md` §9.17
+- 详细设计章节：`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.17
 - 关联：M4.2（TFTP 性能字段）、M4.3（ConfigRuntime/observability）、M6（压测校准）
 
 ## 1. 背景与目标

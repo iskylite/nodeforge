@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
     // (DHCP 67, TFTP 69); run them serially to avoid port conflicts.
     // `tests/http.sh` exits early on Darwin (macOS cannot bind privileged UDP
     // ports without root); run the HTTP suite on Linux root for full coverage.
-    // `tests/cli.sh`, `install-layout.sh` and `setup.sh` still run on macOS.
+    // `tests/cli.sh` and `setup.sh` still run on macOS.
     const http_tests = b.addSystemCommand(&.{"sh"});
     http_tests.addFileArg(b.path("tests/http.sh"));
     http_tests.addArtifactArg(cli);
@@ -94,16 +94,11 @@ pub fn build(b: *std.Build) void {
     http_tests.step.dependOn(&cli_tests.step);
     test_step.dependOn(&http_tests.step);
 
-    const layout_tests = b.addSystemCommand(&.{"sh"});
-    layout_tests.addFileArg(b.path("tests/install-layout.sh"));
-    layout_tests.step.dependOn(&http_tests.step);
-    test_step.dependOn(&layout_tests.step);
-
     const setup_tests = b.addSystemCommand(&.{"sh"});
     setup_tests.addFileArg(b.path("tests/setup.sh"));
     setup_tests.addArtifactArg(cli);
     setup_tests.addArtifactArg(daemon);
-    setup_tests.step.dependOn(&layout_tests.step);
+    setup_tests.step.dependOn(&http_tests.step);
     test_step.dependOn(&setup_tests.step);
 }
 

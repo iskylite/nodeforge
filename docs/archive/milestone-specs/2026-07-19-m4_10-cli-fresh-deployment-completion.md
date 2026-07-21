@@ -4,7 +4,7 @@
 > M4.7/M4.9 setup、reset 和 ISO import 中妨碍 fresh deployment 的 CLI 缺口。
 >
 > 本文中的 Profile `boot_disk/install_disks` 是 M4.10 历史实现和验证命令，不是 v0.1 目标接口。现行设计以
-> `docs/V0_1_DESIGN.md` 为准：物理盘使用 Node direct `storage.boot_disk/additional_disks`，Profile 只保存可由
+> `docs/design/V0_1_DESIGN.md` 为准：物理盘使用 Node direct `storage.boot_disk/additional_disks`，Profile 只保存可由
 > Node override 的 storage policy。
 
 ## 1. 触发与目标

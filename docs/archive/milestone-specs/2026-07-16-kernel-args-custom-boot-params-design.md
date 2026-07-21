@@ -1,9 +1,9 @@
 # 自定义内核引导参数（kernel_args）设计
 
 - 日期：2026-07-16（2026-07-16 更新：补充 pykickstart/autoinstall 官方文档依据）
-- 状态：已实现并通过本地回归（2026-07-17）；r97n0 验证见 `docs/ROCKY_9_7_VALIDATION.md`
+- 状态：已实现并通过本地回归（2026-07-17）；r97n0 验证见 `docs/validation/ROCKY_9_7_VALIDATION.md`
 - 前置：M4.5
-- 权威位置：`docs/DETAILED_DESIGN.md` §9.15（M4.6）；本文件给出实现细化，冲突时以 §9.15 的后续修订为准
+- 权威位置：`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.15（M4.6）；本文件给出实现细化，冲突时以 §9.15 的后续修订为准
 - 目标：为 profile 增加 `kernel_args` 字段，使 `iommu=pt`、`intel_iommu=on`、`hugepagesz=1G hugepages=4` 等内核参数可配置，覆盖 PXE 引导和目标系统持久 GRUB 两条链路
 
 ## 1. 背景：当前代码事实
@@ -27,7 +27,7 @@
 
 ### 1.3 设计文档中的遗留概念
 
-`docs/DETAILED_DESIGN.md` 第 432 行的伪代码 `ProfileConfig` 包含 `cmdline_template: []const u8` 字段，但实际 `model.zig` 从未实现此字段。M3.5 实现时将 cmdline 拼接逻辑直接硬编码到 `target.zig`，放弃了模板方案。本设计不恢复模板方案，而是采用更安全的"追加"模型。
+`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` 第 432 行的伪代码 `ProfileConfig` 包含 `cmdline_template: []const u8` 字段，但实际 `model.zig` 从未实现此字段。M3.5 实现时将 cmdline 拼接逻辑直接硬编码到 `target.zig`，放弃了模板方案。本设计不恢复模板方案，而是采用更安全的"追加"模型。
 
 ### 1.4 目标系统 GRUB 配置缺失
 
@@ -489,7 +489,7 @@ M5 diskless initrd 从 `/proc/cmdline` 解析所有参数。`kernel_args` 中的
 
 ## 6. 文档变更
 
-### 6.1 `docs/DETAILED_DESIGN.md`
+### 6.1 `docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md`
 
 #### §9.15 M4.6 自定义内核引导参数
 
@@ -515,7 +515,7 @@ M5 diskless initrd 从 `/proc/cmdline` 解析所有参数。`kernel_args` 中的
 
 在 `parse /proc/cmdline` 步骤后注明：`kernel_args` 中的内核参数由内核直接消费，initrd 只解析 `nodeforge.config`。
 
-### 6.2 `docs/DESIGN.md`
+### 6.2 `docs/archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md`
 
 #### 修改 §5.2 标准 PXE 引导链
 
@@ -569,7 +569,7 @@ M5 diskless initrd 从 `/proc/cmdline` 解析所有参数。`kernel_args` 中的
 6. **`src/profile/adapter/ubuntu.zig`**：在 `late-commands` 中增加 GRUB 配置 + 调整 `renderUserDataM41` 签名
 7. **`src/http/server.zig`**：调整 `installConfig` 调用处，传入 `kernel_args`
 8. **`src/config/profile_mutation.zig` / HTTP client/server / CLI**：增加仅限 `kernel_args` 的 show/set/unset
-9. **文档更新**：DETAILED_DESIGN.md、DESIGN.md
+9. **文档更新**：M0_M7_LEGACY_DETAILED_DESIGN.md、M0_M7_LEGACY_OVERVIEW_DESIGN.md
 10. **测试**：运行全部测试确保无回归
 
 ## 8A. 官方文档参考

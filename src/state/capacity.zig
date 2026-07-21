@@ -2,8 +2,8 @@
 //!
 //! 替代硬编码的 256 上限与 TFTP 固定并发默认值。所有派生均取
 //! `max(按来源计算, config 显式覆盖)`，绝不因派生缩小运维意图。
-//! 详见 DETAILED_DESIGN.md §9.17 与
-//! docs/superpowers/specs/2026-07-17-concurrency-capacity-scaling-design.md。
+//! 详见 docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md §9.17 与
+//! docs/archive/milestone-specs/2026-07-17-concurrency-capacity-scaling-design.md。
 
 const std = @import("std");
 
