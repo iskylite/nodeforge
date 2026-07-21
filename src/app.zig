@@ -155,7 +155,7 @@ pub fn run(
         .bootstrap_key = bootstrap_key,
         .additional_keys = additional_keys,
     };
-    for (config.nodes) |node| if (forProfile(config, node.profile)) |profile| if (profile.mode == .install) {
+    for (config.nodes) |node| if (node.profile) |profile_name| if (forProfile(config, profile_name)) |_| {
         const digest = try @import("state/plan_digest.zig").forNode(allocator, config, catalog, delivery, node.id);
         deployments.ensureInitial(node.id, digest, current_time) catch |err| return err;
     };

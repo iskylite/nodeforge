@@ -7,7 +7,6 @@
 //! 渲染规则：
 //! - install：profile.install_source → InstallSourceConfig → installer kernel/initrd
 //!   assets，并读取已发布 repository URL。M3 不追加 inst.ks=（M4 完成后追加）。
-//! - diskless：profile.boot_bundle → kernel/initrd assets。当前只实现 M5 设计的
 //!   PXE target scaffold；完整 initrd、rootfs 下载和 diskless BootConfig payload
 //!   仍待 M5 落地。cmdline 包含 nodeforge.config=http://…/api/v1/nodes/<id>/boot-config。
 //! - discovery：不提供 kernel/initrd，返回 null。
@@ -70,9 +69,7 @@ pub fn resolve(
     http_port: u16,
     cmdline_buf: []u8,
 ) ?BootTarget {
-    if (identity.mode == .install) return resolveInstall(identity, config, catalog, server_ip, http_port, cmdline_buf);
-    if (identity.mode == .diskless) return resolveDiskless(identity, config, catalog, server_ip, http_port, cmdline_buf);
-    return null;
+    return resolveInstall(identity, config, catalog, server_ip, http_port, cmdline_buf);
 }
 
 /// 解析 install 模式的 boot target。
@@ -105,7 +102,7 @@ fn resolveInstall(
     // 按 profile 名称查找启动配置中的 profile 定义。
     const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
     // install profile 必须引用一个 install source。
-    const source_name = profile.install_source orelse return null;
+    const source_name = profile.install_source;
     // 在 catalog 中查找已发布的 install source（由 ISO 导入流程创建）。
     const source = lookup.findInstallSource(catalog, source_name) orelse return null;
 
@@ -177,55 +174,7 @@ fn resolveInstall(
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .cmdline = cmdline,
-        .arch = profile.arch,
-    };
-}
-
-/// 解析 diskless 模式的 boot target。
-///
-/// 责任链：profile → boot_bundle → kernel/initrd assets → cmdline。
-/// cmdline 包含 `ip=dhcp nodeforge.config=<config_url>`，节点 initrd 通过
-/// 该 URL 拉取 BootConfig 文档（含 rootfs 下载地址和 capability token）。
-/// kernel 必须是 .kernel，initrd 必须是 .nodeforge_initrd（NodeForge 自建的小 initrd）。
-fn resolveDiskless(
-    identity: TftpBootIdentity,
-    config: *const model.AppConfig,
-    catalog: *const model.Catalog,
-    server_ip: []const u8,
-    http_port: u16,
-    cmdline_buf: []u8,
-) ?BootTarget {
-    const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
-    const bundle_name = profile.boot_bundle orelse return null;
-    const bundle = lookup.findBootBundle(catalog, bundle_name) orelse return null;
-
-    const kernel_asset = lookup.findAsset(catalog, bundle.kernel) orelse return null;
-    const initrd_asset = lookup.findAsset(catalog, bundle.initrd) orelse return null;
-
-    // diskless 模式使用 NodeForge 自建的 initrd（.nodeforge_initrd），
-    // 而非发行版自带的 installer initrd（.installer_initrd）。
-    if (kernel_asset.kind != .kernel or initrd_asset.kind != .nodeforge_initrd) return null;
-
-    const kernel_path = toGrubPath(kernel_asset.path) orelse return null;
-    const initrd_path = toGrubPath(initrd_asset.path) orelse return null;
-
-    // cmdline 只声明 M5 预留的 config URL；当前 HTTP diskless 分支尚未生成
-    // rootfs/capability payload，真正 initrd 消费链路由 M5 实现。
-    const base = std.fmt.bufPrint(cmdline_buf, "ip=dhcp nodeforge.config=http://{s}:{d}/api/v1/nodes/{s}/boot-config", .{
-        server_ip,
-        http_port,
-        identity.node_id,
-    }) catch return null;
-    const cmdline = appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
-        log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.node_id, profile.kernel_args.?.len });
-        return null;
-    };
-
-    return .{
-        .kernel_path = kernel_path,
-        .initrd_path = initrd_path,
-        .cmdline = cmdline,
-        .arch = profile.arch,
+        .arch = source.arch,
     };
 }
 
@@ -265,10 +214,6 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
         .distros = &.{.{ .name = "rocky", .family = .rhel, .versions = &.{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }} }},
         .profiles = &.{.{
             .name = "rocky-install",
-            .mode = .install,
-            .distro = "rocky",
-            .version = "9.7",
-            .arch = .aarch64,
             .install_source = "rocky-9.7-iso",
             .kernel_args = "iommu=pt hugepages=4",
         }},
@@ -317,52 +262,6 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
     try std.testing.expect(std.mem.endsWith(u8, target.cmdline, " iommu=pt hugepages=4"));
 }
 
-test "resolve diskless target returns config url cmdline" {
-    const config: model.AppConfig = .{
-        .server = .{ .server_ip = "192.168.27.128", .http_port = 18080 },
-        .distros = &.{.{ .name = "ubuntu", .family = .ubuntu, .versions = &.{.{ .version = "22.04", .archs = &.{.aarch64}, .install_adapter = .autoinstall, .package_manager = .apt }} }},
-        .profiles = &.{.{
-            .name = "ubuntu-diskless",
-            .mode = .diskless,
-            .distro = "ubuntu",
-            .version = "22.04",
-            .arch = .aarch64,
-            .boot_bundle = "ubuntu-bundle",
-            .kernel_args = "iommu=pt",
-        }},
-    };
-    const catalog: model.Catalog = .{
-        .assets = &.{
-            .{ .name = "ub-kernel", .kind = .kernel, .path = "boot/vmlinuz" },
-            .{ .name = "ub-initrd", .kind = .nodeforge_initrd, .path = "boot/initrd.img" },
-        },
-        .boot_bundles = &.{.{
-            .name = "ubuntu-bundle",
-            .distro = "ubuntu",
-            .version = "22.04",
-            .arch = .aarch64,
-            .kernel_release = "5.15.0",
-            .kernel = "ub-kernel",
-            .initrd = "ub-initrd",
-            .rootfs = "ub-rootfs",
-        }},
-    };
-    const identity: TftpBootIdentity = .{
-        .boot_session_id = "0123456789abcdef0123456789abcdef".*,
-        .node_id = "node-02",
-        .profile = "ubuntu-diskless",
-        .mode = .diskless,
-        .mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xf0 },
-        .lease_ip = 0xc0a81bc9,
-    };
-    var cmdline_buf: [1024]u8 = undefined;
-    const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
-    try std.testing.expectEqualStrings("boot/vmlinuz", target.kernel_path);
-    try std.testing.expectEqualStrings("boot/initrd.img", target.initrd_path);
-    try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "nodeforge.config=http://192.168.27.128:18080/api/v1/nodes/node-02/boot-config") != null);
-    try std.testing.expect(std.mem.endsWith(u8, target.cmdline, " iommu=pt"));
-}
-
 // M3.6 关键测试：验证 Ubuntu install 使用 `url=`（casper ISO 下载）而非
 // `inst.repo=`（Anaconda DNF repository）。这两个参数属于不同的安装器
 // 机制，混用会导致 Ubuntu 安装器无法找到安装介质。
@@ -370,7 +269,7 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.27.128", .http_port = 18080 },
         .distros = &.{.{ .name = "ubuntu", .family = .ubuntu, .versions = &.{.{ .version = "22.04", .archs = &.{.aarch64}, .install_adapter = .autoinstall, .package_manager = .apt }} }},
-        .profiles = &.{.{ .name = "ubuntu-install", .mode = .install, .distro = "ubuntu", .version = "22.04", .arch = .aarch64, .install_source = "ubuntu-22.04-aarch64-iso", .kernel_args = "iommu=pt" }},
+        .profiles = &.{.{ .name = "ubuntu-install", .install_source = "ubuntu-22.04-aarch64-iso", .kernel_args = "iommu=pt" }},
     };
     const catalog: model.Catalog = .{
         .assets = &.{
@@ -393,31 +292,6 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
     // 绝不能包含 inst.repo=，那是 Anaconda/RHEL 专用参数。
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.repo=") == null);
     try std.testing.expect(std.mem.endsWith(u8, target.cmdline, " iommu=pt"));
-}
-
-test "resolve discovery returns null" {
-    const config: model.AppConfig = .{
-        .server = .{ .server_ip = "192.168.27.128" },
-        .profiles = &.{.{
-            .name = "discovery",
-            .mode = .discovery,
-            .distro = "rocky",
-            .version = "9.7",
-            .arch = .aarch64,
-        }},
-    };
-    const catalog: model.Catalog = .{};
-    const identity: TftpBootIdentity = .{
-        .boot_session_id = "0123456789abcdef0123456789abcdef".*,
-        .node_id = "node-03",
-        .profile = "discovery",
-        .mode = .discovery,
-        .mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xf1 },
-        .lease_ip = 0xc0a81bca,
-    };
-    var cmdline_buf: [512]u8 = undefined;
-    // discovery 模式不提供 kernel/initrd，返回 null。
-    try std.testing.expect(resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf) == null);
 }
 
 // 路径安全校验测试：拒绝包含反斜杠的路径，防止 Windows 风格路径注入。

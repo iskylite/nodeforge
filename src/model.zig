@@ -4,7 +4,7 @@
 /// NodeForge 启动配置事实源 `<install-root>/config/config.json` 的根对象。
 pub const AppConfig = struct {
     /// M4.7 纯启动配置 schema。版本 1 只作为一次性迁移输入。
-    schema_version: u32 = 2,
+    schema_version: u32 = 3,
     /// 服务网广告地址、可选网卡和 HTTP/管理共用端口。
     server: ServerConfig,
     /// HTTP 资产与仓库根目录。
@@ -29,15 +29,13 @@ pub const AppConfig = struct {
     /// 可复用的基础后处理步骤；M4 只执行 install_post 的 repository、
     /// standard_packages 和 managed_file 三种动作。
     provisioning_bundles: []const ProvisioningBundle = &.{},
-    /// 未知节点的全局默认行为。
-    policy: PolicyConfig = .{},
 };
 
 /// NodeForge 管理目录事实源 `<install-root>/catalog/` 的根对象。
 /// 该文件只由 `nodeforged` 写入，CLI 不直接编辑。
 pub const Catalog = struct {
     /// 内存 catalog schema；磁盘布局另由 manifest schema 约束。
-    schema_version: u32 = 2,
+    schema_version: u32 = 3,
     /// manifest 的单调 catalog revision；legacy 单文件输入为 0。
     revision: u64 = 0,
     /// M4.7 后由 Catalog 独占的全部可管理实体。
@@ -53,6 +51,39 @@ pub const Catalog = struct {
     install_sources: []const InstallSourceConfig = &.{},
     /// 无盘启动所需的同版本 kernel、initrd 和 rootfs 组合。
     boot_bundles: []const BootBundleConfig = &.{},
+    /// Daemon-owned singleton controlling unknown DHCP client handling.
+    discovery_policy: DiscoveryPolicy = .{},
+    /// Persistent observations are separate from ephemeral DHCP leases.
+    unknown_client_observations: []const UnknownClientObservation = &.{},
+    /// Read-only schema-v2 migration evidence; schema-v3 serializers omit it.
+    legacy_diskless_profiles: []const []const u8 = &.{},
+    legacy_multidisk_nodes: []const []const u8 = &.{},
+};
+
+pub const UnknownAction = enum { record, deny };
+
+pub const DiscoveryPolicy = struct {
+    unknown_action: UnknownAction = .record,
+    observation_retention_days: u32 = 30,
+    revision: u64 = 1,
+};
+
+pub const ObservationClaim = struct {
+    node_id: []const u8,
+    claimed_at_unix: i64,
+};
+
+pub const UnknownClientObservation = struct {
+    mac: []const u8,
+    dhcp_client_id: ?[]const u8 = null,
+    observed_architecture: ?Arch = null,
+    vendor_class: ?[]const u8 = null,
+    first_seen_unix: i64,
+    last_seen_unix: i64,
+    last_ip: ?[]const u8 = null,
+    request_count: u64 = 1,
+    revision: u64 = 1,
+    claim: ?ObservationClaim = null,
 };
 
 /// 将 daemon-owned catalog 实体投影到现有协议代码读取的 AppConfig 视图。
@@ -200,6 +231,7 @@ pub const DistroFamily = enum { rhel, ubuntu };
 
 /// 标准自动安装适配器。
 pub const InstallAdapter = enum { kickstart, autoinstall };
+pub const BootKind = enum { install };
 
 /// 基础源及额外标准包使用的包管理器。
 pub const PackageManager = enum { dnf, apt };
@@ -221,13 +253,7 @@ pub fn packageManagerForFamily(family: DistroFamily) PackageManager {
 }
 
 /// 资产类型用于阻止把 ISO、内核和 initrd 错接到其他位置。
-pub const AssetKind = enum { iso, bootloader, kernel, installer_initrd, nodeforge_initrd, rootfs, gpg_key };
-
-/// profile 的启动目的。
-pub const ProfileMode = enum { discovery, install, diskless };
-
-/// 未知节点没有显式绑定时的处理方式；永远不允许默认为 install。
-pub const DiscoveryAction = enum { wait, discovery, diskless, deny };
+pub const AssetKind = enum { iso, bootloader, kernel, installer_initrd, nodeforge_initrd, rootfs, gpg_key, managed_file };
 
 /// ISO 导入后自动形成的发行版能力索引。它不是要求操作员先创建的策略对象；
 /// 同一产品的新版本/架构由导入事务增量补齐。
@@ -271,6 +297,22 @@ pub const RepositoryConfig = struct {
     gpg_check: bool = false,
     /// GPG key 资产名称；仅当 `gpg_check = true` 时必须存在且 kind 为 `gpg_key`。
     gpg_key: ?[]const u8 = null,
+    /// Revisioned software capabilities extracted before catalog publication.
+    software_index: SoftwareIndex = .{},
+};
+
+pub const SoftwareKind = enum { environment, group, task, metapackage, package };
+
+pub const SoftwareCapability = struct {
+    id: []const u8,
+    name: []const u8,
+    kind: SoftwareKind,
+    description: ?[]const u8 = null,
+};
+
+pub const SoftwareIndex = struct {
+    revision_digest: ?[]const u8 = null,
+    capabilities: []const SoftwareCapability = &.{},
 };
 
 /// 文件资产清单。路径由 HTTP/TFTP 根目录解释，不允许直接映射任意 URL。
@@ -291,6 +333,9 @@ pub const AssetConfig = struct {
     kernel_release: ?[]const u8 = null,
     /// 导入阶段计算；M0 允许为空，后续发布资产时必须存在。
     sha256: ?[]const u8 = null,
+    revision: u64 = 1,
+    size: ?u64 = null,
+    media_type: ?[]const u8 = null,
 };
 
 /// PXE 自动安装入口使用的完整关联，不让 profile 直接拼散乱文件名。
@@ -353,29 +398,19 @@ pub const ProfileSafetyConfig = struct {
 
 pub const ReinstallPolicy = enum { explicit, always };
 
-/// 节点启动策略。install source 与 boot bundle 按 mode 二选一。
+/// v0.1 install policy. Platform capability is derived from install_source.
 pub const ProfileConfig = struct {
     /// 稳定短名称，用于 node 引用。
     name: []const u8,
-    /// 启动目的：discovery、install 或 diskless。
-    mode: ProfileMode,
-    /// 发行版名称，必须能在 `Catalog.distros` 中找到。
-    distro: []const u8,
-    /// 发行版版本，必须与 distro 的 versions 矩阵匹配。
-    version: []const u8,
-    /// 目标架构。
-    arch: Arch,
-    /// install mode 时引用的 install source 名称；discovery/diskless 必须为 null。
-    install_source: ?[]const u8 = null,
-    /// diskless mode 时引用的 boot bundle 名称；discovery/install 必须为 null。
-    boot_bundle: ?[]const u8 = null,
-    /// 安全元数据，供未知节点策略做静态判断。
-    safety: ProfileSafetyConfig = .{},
+    /// Required install-source resource reference.
+    install_source: []const u8,
     /// M4.1 的跨发行版目标系统事实。安装和后续无盘链路都消费此字段。
     system: TargetSystemConfig = .{},
+    /// Schema v3 software baseline. Repository capabilities remain resource-owned.
+    software: SoftwareSelection = .{},
     /// install mode 的安装器输入。保留 optional 以兼容 M3 catalog/boot
     /// fixture；M4 renderer 对缺省值采用安全的最小安装配置。
-    install: ?InstallConfig = null,
+    install: ProfileInstallConfig = .{},
     /// M4.6：追加到 PXE kernel cmdline，并由安装器持久化到目标系统 GRUB。
     /// 加载时会折叠空格；安全校验拒绝保留参数名和 shell/配置注入字符。
     kernel_args: ?[]const u8 = null,
@@ -409,12 +444,18 @@ pub const SelinuxMode = enum { disabled, permissive, enforcing };
 pub const TargetSecurityConfig = struct {
     firewall: FirewallPolicy = .disabled,
     selinux: SelinuxMode = .disabled,
+    apparmor: AppArmorMode = .disabled,
 };
+pub const AppArmorMode = enum { disabled, complain, enforce };
 
 pub const TargetUserConfig = struct {
     name: []const u8,
+    uid: ?u32 = null,
+    shell: ?[]const u8 = null,
+    locked: bool = false,
     password: ?[]const u8 = null,
     sudo: bool = false,
+    groups: []const []const u8 = &.{},
     ssh_authorized_keys: []const []const u8 = &.{},
 };
 
@@ -449,18 +490,104 @@ pub const TargetNetworkConfig = struct {
     gateway: ?[]const u8 = null,
     dns: []const []const u8 = &.{},
     search_domains: []const []const u8 = &.{},
+    routes: []const RouteConfig = &.{},
 };
 
-/// 单节点安装存储差异。字段保持 optional，避免把 profile 默认值复制到每个
-/// node；effective plan 在使用点按 node override > profile default 合并。
-pub const NodeStorageOverrideConfig = struct {
-    boot_disk: ?[]const u8 = null,
-    install_disks: ?[]const []const u8 = null,
+pub const RouteConfig = struct {
+    id: []const u8,
+    destination: []const u8,
+    gateway: []const u8,
+    metric: ?u32 = null,
 };
 
 pub const NodeOverrideConfig = struct {
-    network: ?TargetNetworkConfig = null,
-    storage: ?NodeStorageOverrideConfig = null,
+    install: InstallOverrideConfig = .{},
+    system: SystemOverrideConfig = .{},
+    software: SoftwareOverrideConfig = .{},
+    kernel_args: StringSetDelta = .{},
+};
+
+pub const StringSetDelta = struct {
+    add: []const []const u8 = &.{},
+    remove: []const []const u8 = &.{},
+};
+
+pub const NullableStorageOverride = struct {
+    mode: ?StorageMode = null,
+    wipe: ?bool = null,
+    partition_table: ?PartitionTable = null,
+    partitions: ?[]const PartitionConfig = null,
+};
+
+pub const BootloaderOverride = struct {
+    install: ?bool = null,
+};
+
+pub const InstallOverrideConfig = struct {
+    storage: NullableStorageOverride = .{},
+    bootloader: BootloaderOverride = .{},
+    apt_fallback: ?AptFallback = null,
+    reinstall_policy: ?ReinstallPolicy = null,
+    completion_action: ?CompletionAction = null,
+    updates_mode: ?UpdateMode = null,
+    proxy_url: ?[]const u8 = null,
+    proxy_no_proxy: StringSetDelta = .{},
+    post_install_bundle: ?[]const u8 = null,
+};
+
+pub const LocalizationOverride = struct {
+    locale: ?[]const u8 = null,
+    timezone: ?[]const u8 = null,
+    keyboard: ?[]const u8 = null,
+};
+
+pub const ConnectivityOverride = struct {
+    time_sync: ?bool = null,
+    ntp_servers: StringSetDelta = .{},
+};
+
+pub const SshOverride = struct {
+    enabled: ?bool = null,
+    password_authentication: ?bool = null,
+    root_login: ?RootLoginPolicy = null,
+    root_password: ?[]const u8 = null,
+    root_authorized_keys: StringSetDelta = .{},
+};
+
+pub const SecurityOverride = struct {
+    firewall: ?FirewallPolicy = null,
+    selinux: ?SelinuxMode = null,
+    apparmor: ?AppArmorMode = null,
+};
+
+pub const SystemOverrideConfig = struct {
+    localization: LocalizationOverride = .{},
+    connectivity: ConnectivityOverride = .{},
+    ssh: SshOverride = .{},
+    security: SecurityOverride = .{},
+    users: ?[]const TargetUserConfig = null,
+};
+
+pub const SoftwareSelection = struct {
+    repositories: []const []const u8 = &.{},
+    environment: ?[]const u8 = null,
+    groups: []const []const u8 = &.{},
+    tasks: []const []const u8 = &.{},
+    packages: PackageSelection = .{},
+};
+
+pub const PackageSelection = struct {
+    include: []const []const u8 = &.{},
+    exclude: []const []const u8 = &.{},
+};
+
+pub const SoftwareOverrideConfig = struct {
+    repositories: StringSetDelta = .{},
+    environment: ?[]const u8 = null,
+    groups: StringSetDelta = .{},
+    tasks: StringSetDelta = .{},
+    packages_include: StringSetDelta = .{},
+    packages_exclude: StringSetDelta = .{},
 };
 
 /// 安装器输入配置，由 profile 引用以渲染 Kickstart/Autoinstall answer 文件。
@@ -473,6 +600,11 @@ pub const InstallConfig = struct {
     /// Ubuntu APT 安装策略。默认允许使用 live ISO/squashfs 离线安装；
     /// 严格验收本地 HTTP mirror 时应显式设为 `abort`。
     apt: AptInstallConfig = .{},
+    reinstall_policy: ReinstallPolicy = .explicit,
+    completion: CompletionConfig = .{},
+    updates: UpdateConfig = .{},
+    proxy: ProxyConfig = .{},
+    post_install: PostInstallConfig = .{},
     /// 额外安装的包名列表；渲染器将其写入 `%packages`（Kickstart）或 `packages`（Autoinstall）段。
     packages: []const []const u8 = &.{},
     /// 创建的用户列表；Kickstart 渲染为 `user` 指令，Autoinstall 渲染为 `identity` 段。
@@ -483,6 +615,29 @@ pub const InstallConfig = struct {
     /// 渲染器将 bundle 中的步骤展开为安装后 shell 命令（`%post` 或 `late-commands`）。
     bundle: ?[]const u8 = null,
 };
+
+/// Persisted v0.1 Profile policy. Physical devices are compiled from Node.
+pub const ProfileInstallConfig = struct {
+    storage: StoragePolicyConfig = .{},
+    bootloader: BootloaderInstallConfig = .{},
+    apt: AptInstallConfig = .{},
+    reinstall_policy: ReinstallPolicy = .explicit,
+    completion: CompletionConfig = .{},
+    updates: UpdateConfig = .{},
+    proxy: ProxyConfig = .{},
+    post_install: PostInstallConfig = .{},
+    packages: []const []const u8 = &.{},
+    users: []const UserConfig = &.{},
+    ssh_authorized_keys: []const []const u8 = &.{},
+    bundle: ?[]const u8 = null,
+};
+
+pub const CompletionAction = enum { reboot, poweroff, halt };
+pub const CompletionConfig = struct { action: CompletionAction = .reboot };
+pub const UpdateMode = enum { none, security, all };
+pub const UpdateConfig = struct { mode: UpdateMode = .none };
+pub const ProxyConfig = struct { url: ?[]const u8 = null, no_proxy: []const []const u8 = &.{} };
+pub const PostInstallConfig = struct { bundle: ?[]const u8 = null };
 
 /// Subiquity 在所有候选 APT mirror 均不可用时的处理策略。
 ///
@@ -511,22 +666,39 @@ pub const StorageConfig = struct {
     /// 渲染策略，只有 profile 已通过 destructive/persistent 安全校验且
     /// generation 已显式武装时才可能执行。
     wipe: bool = true,
+    mode: StorageMode = .single,
     /// 主启动磁盘设备路径；Kickstart 的 `clearpart --drives` 和 `bootloader --boot-drive` 使用此值。
     /// 值格式为 Linux 设备路径（如 `/dev/sda`），渲染时去掉 `/dev/` 前缀。
     boot_disk: []const u8 = "/dev/sda",
-    /// 参与安装的磁盘列表；MVP 只使用 `boot_disk`，此字段为未来多磁盘安装预留。
-    install_disks: []const []const u8 = &.{"/dev/sda"},
-    /// 固件启动模式；决定是否创建 ESP 分区（UEFI）或 biosboot 分区（BIOS）。
-    boot_mode: BootMode = .uefi,
+    /// Effective ordered member devices compiled from Node direct storage facts.
+    members: []const []const u8 = &.{"/dev/sda"},
     /// 分区表类型；GPT 是 UEFI 的默认要求，MBR 用于旧式 BIOS。
     partition_table: PartitionTable = .gpt,
     /// 显式分区列表；为空时渲染器使用安全默认布局（ESP + swap + root）。
     partitions: []const PartitionConfig = &.{},
 };
 
-/// 固件启动模式。UEFI 是现代服务器的默认模式；BIOS 用于旧式硬件。
-/// 此值影响分区类型选择和引导加载器安装方式。
-pub const BootMode = enum { uefi, bios };
+pub const StoragePolicyConfig = struct {
+    wipe: bool = true,
+    mode: StorageMode = .single,
+    partition_table: PartitionTable = .gpt,
+    partitions: []const PartitionConfig = &.{},
+};
+
+pub const StorageMode = enum {
+    single,
+    lvm,
+    raid0,
+    raid1,
+    raid5,
+    raid6,
+    raid10,
+    @"raid0-lvm",
+    @"raid1-lvm",
+    @"raid5-lvm",
+    @"raid6-lvm",
+    @"raid10-lvm",
+};
 
 /// 分区表类型。GPT 是 UEFI 的标准要求；MBR 用于旧式 BIOS 系统。
 pub const PartitionTable = enum { gpt, mbr };
@@ -549,10 +721,14 @@ pub const PartitionKind = enum {
 
 /// 单个分区的配置。`mount` 和 `filesystem` 为 null 时由渲染器按 `kind` 推导默认值。
 pub const PartitionConfig = struct {
+    /// Schema v3 stable item identity. Migration derives it from semantic role.
+    id: ?[]const u8 = null,
     /// 挂载点路径；null 时按 kind 推导（swap→"swap"，esp→"/boot/efi"等）。
     mount: ?[]const u8 = null,
     /// 分区大小（MiB）；0 表示使用剩余空间（仅 root 分区适用）。
     size_mib: u32 = 0,
+    /// Consume remaining logical capacity. At most one partition may grow.
+    grow: bool = false,
     /// 文件系统类型；null 时按 kind 推导（esp→"efi"，swap→"swap"，其他→"xfs"）。
     /// Kickstart 使用此值作为 `--fstype` 参数。
     filesystem: ?[]const u8 = null,
@@ -564,10 +740,6 @@ pub const PartitionConfig = struct {
 pub const BootloaderInstallConfig = struct {
     /// 是否安装引导加载器；false 时跳过 `bootloader` 指令，适用于已有引导管理的环境。
     install: bool = true,
-    /// 安装目标；默认引用 `storage.boot_disk`，渲染器将其解析为实际设备路径。
-    target: []const u8 = "storage.boot_disk",
-    /// 是否在安装后设置固件启动顺序；MVP 默认 false，由操作员手动确认。
-    set_firmware_boot_order: bool = false,
 };
 
 /// M4 兼容拼写；M4.1 将其规范化为 `profile.system.users`。
@@ -605,6 +777,13 @@ pub const ProvisionStep = struct {
     content: ?[]const u8 = null,
     /// `managed_file` 动作的目标路径；必须是绝对路径且不含 `..`，防止路径逃逸。
     destination: ?[]const u8 = null,
+    content_asset: ?[]const u8 = null,
+    mode: u16 = 0o644,
+    owner: []const u8 = "root",
+    group: []const u8 = "root",
+    /// Runtime-only immutable delivery projection. Schema v3 DTOs never persist it.
+    content_url: ?[]const u8 = null,
+    content_sha256: ?[]const u8 = null,
 };
 
 /// 可复用的后处理步骤集合。通过 profile.install.bundle 引用。
@@ -614,6 +793,7 @@ pub const ProvisioningBundle = struct {
     name: []const u8,
     /// bundle 版本；用于未来兼容性检查，M4 不强制校验。
     version: []const u8 = "1",
+    revision: u64 = 1,
     /// 有序步骤列表；渲染器按声明顺序生成 shell 命令。
     steps: []const ProvisionStep = &.{},
 };
@@ -627,13 +807,19 @@ pub const NodeConfig = struct {
     /// 节点架构，必须与所绑定 profile 的 arch 一致。
     arch: Arch,
     /// 所绑定 profile 名称，必须能在 `Catalog.profiles` 中找到。
-    profile: []const u8,
+    profile: ?[]const u8 = null,
     /// DHCP 静态保留地址（IPv4 点分格式）；为空时从地址池动态分配。
     ip: ?[]const u8 = null,
+    /// Schema v3 canonical PXE lease reservation. `ip` is migration input only.
+    pxe: PxeConfig = .{},
     /// 节点主机名；用于渲染安装配置中的 hostname。
     hostname: ?[]const u8 = null,
     /// 节点特定的目标配置。PXE 引导阶段始终保持 DHCP。
     overrides: NodeOverrideConfig = .{},
+    /// Physical device ownership is direct Node state in schema v3.
+    storage: NodeStorageConfig = .{},
+    /// Target-system network ownership is direct Node state in schema v3.
+    network: TargetNetworkConfig = .{},
     /// M4.2 F2: 节点是否参与 PXE 部署。`false` 时即使 MAC/IP/profile 匹配，
     /// resolve() 也不下发 PXE bootfile，仍发诊断 DHCP lease。适用于 install/diskless/discovery 全模式。
     /// 通过 `node set <id> deploy=false` 管理。与 generation gate 互补不冗余。
@@ -660,12 +846,11 @@ pub const NodeConfig = struct {
     http_accel: bool = false,
 };
 
-/// 未录入节点的默认策略。
-pub const PolicyConfig = struct {
-    /// 未录入节点的默认处置方式；缺省值为 `wait`，永远不允许 `install`。
-    default_action: DiscoveryAction = .wait,
-    /// discovery/diskless action 引用的 profile 名称；wait/deny 时必须为 null。
-    default_profile: ?[]const u8 = null,
-    /// 是否显式允许未知节点进入 diskless；为 false 时 diskless action 非法。
-    allow_unknown_diskless: bool = false,
+pub const PxeConfig = struct {
+    ip_reservation: ?[]const u8 = null,
+};
+
+pub const NodeStorageConfig = struct {
+    boot_disk: []const u8 = "/dev/sda",
+    additional_disks: []const []const u8 = &.{},
 };

@@ -85,7 +85,7 @@ pub const Session = struct {
     dhcp_xid: u32 = 0,
     profile_buf: [profile_capacity]u8 = [_]u8{0} ** profile_capacity,
     profile_len: u8 = 0,
-    mode: ?model.ProfileMode = null,
+    mode: ?model.BootKind = null,
     model_revision: u64 = 0,
     model_plan_digest: @import("deployment_control.zig").Digest = @import("deployment_control.zig").empty_digest,
     deployment_generation: u64 = 0,
@@ -123,7 +123,7 @@ pub const Authenticated = struct {
     node_id: []const u8,
     boot_session_id: [id_len]u8,
     profile: []const u8,
-    mode: model.ProfileMode,
+    mode: model.BootKind,
     lease_ip: u32,
     capability: [capability_len]u8,
     capability_issued: bool,
@@ -141,7 +141,7 @@ pub const TftpBootIdentity = struct {
     boot_session_id: [id_len]u8,
     node_id: []const u8,
     profile: []const u8,
-    mode: model.ProfileMode,
+    mode: model.BootKind,
     mac: [6]u8,
     lease_ip: u32,
 };
@@ -179,7 +179,7 @@ pub const DhcpIdentity = struct {
     xid: u32,
     node_id: ?[]const u8,
     profile: ?[]const u8,
-    mode: ?model.ProfileMode,
+    mode: ?model.BootKind,
     model_revision: u64 = 0,
     model_plan_digest: @import("deployment_control.zig").Digest = @import("deployment_control.zig").empty_digest,
 };
@@ -268,6 +268,13 @@ pub const Store = struct {
         lock(&self.mutex);
         defer self.mutex.unlock();
         for (&self.sessions) |*session| if (session.active() and !sessionExpired(session, mono_now) and session.nodeId() != null and std.mem.eql(u8, session.nodeId().?, node_id)) return true;
+        return false;
+    }
+
+    pub fn hasActive(self: *Store, mono_now: i64) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| if (session.active() and !sessionExpired(session, mono_now)) return true;
         return false;
     }
 
@@ -852,7 +859,7 @@ fn lock(mutex: *std.atomic.Mutex) void {
 
 test "DHCP retransmits reuse an early MAC and XID session" {
     var store: Store = .{};
-    const identity: DhcpIdentity = .{ .mac = &.{ 1, 2, 3, 4, 5, 6 }, .xid = 7, .node_id = "node-a", .profile = "discovery", .mode = .discovery };
+    const identity: DhcpIdentity = .{ .mac = &.{ 1, 2, 3, 4, 5, 6 }, .xid = 7, .node_id = "node-a", .profile = "install", .mode = .install };
     const first = try store.acquireDhcp(std.testing.io, identity, 10, 100);
     const retry = try store.acquireDhcp(std.testing.io, identity, 20, 110);
     try std.testing.expect(first.link == .linked);
@@ -895,7 +902,7 @@ test "resolveTftpBoot returns identity for a unique ACK'd session" {
     const identity = store.resolveTftpBoot(0xc0a81bc8, 12).?;
     try std.testing.expectEqualStrings("m3-node", identity.node_id);
     try std.testing.expectEqualStrings("rocky-install", identity.profile);
-    try std.testing.expectEqual(model.ProfileMode.install, identity.mode);
+    try std.testing.expectEqual(model.BootKind.install, identity.mode);
     try std.testing.expectEqual(@as(u32, 0xc0a81bc8), identity.lease_ip);
 }
 

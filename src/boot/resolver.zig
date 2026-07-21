@@ -30,7 +30,7 @@ pub const Decision = struct {
     /// 匹配到的 profile 名称，用于 boot session 创建。
     profile: ?[]const u8 = null,
     /// profile 的启动模式（install/diskless/discovery），用于 boot session 创建。
-    mode: ?model.ProfileMode = null,
+    mode: ?model.BootKind = null,
     /// 安装 profile 被有意暂停在 PXE gate，因为没有待执行的 generation
     ///（或其请求针对的是旧计划）。
     install_not_armed: bool = false,
@@ -46,10 +46,7 @@ pub const Decision = struct {
 ///    - 架构一致：返回对应架构的 GRUB bootfile 和 profile/mode。
 ///    - 架构不一致：仍返回 known=true 和 profile/mode（lease 可发放用于诊断），
 ///      但 bootfile=null（不下发 GRUB，阻止后续 kernel/initrd 加载）。
-/// 2. 未匹配到注册节点时，按 config.policy.default_action 决策：
-///    - deny/wait：不下发 bootfile，不分配 profile。
-///    - discovery：下发 bootfile，mode=discovery。
-///    - diskless：仅在 allow_unknown_diskless=true 时下发 bootfile，mode=diskless。
+/// 2. 未匹配到注册节点时不下发 bootfile；DHCP record/deny policy 由 catalog singleton 处理。
 pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Architecture) Decision {
     for (config.nodes) |node| if (sameMac(node.mac, mac)) {
         // M4.2 F2: deploy=false 是硬外层开关，在 mode 判定前即返回无 bootfile。
@@ -59,7 +56,7 @@ pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Arc
             .bootfile = null,
             .known = true,
             .node_id = node.id,
-            .reserved_ip = node.ip,
+            .reserved_ip = node.pxe.ip_reservation orelse node.ip,
             .profile = node.profile,
             .mode = null,
             .install_not_armed = false,
@@ -69,21 +66,15 @@ pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Arc
         // lease 仍可发放以保证网络可达性可诊断，但 PXE 必须在
         // 不匹配的 kernel/initrd 被选中之前停止。
         return .{
-            .bootfile = if (architectureMatches(node.arch, arch)) bootfile(arch) else null,
+            .bootfile = if (node.profile != null and architectureMatches(node.arch, arch)) bootfile(arch) else null,
             .known = true,
             .node_id = node.id,
-            .reserved_ip = node.ip,
+            .reserved_ip = node.pxe.ip_reservation orelse node.ip,
             .profile = node.profile,
-            .mode = profileMode(config, node.profile),
+            .mode = if (node.profile) |name| profileMode(config, name) else null,
         };
     };
-    // 未注册节点按 policy.default_action 决策。
-    const profile = config.policy.default_profile;
-    return switch (config.policy.default_action) {
-        .deny, .wait => .{ .bootfile = null, .known = false, .node_id = null, .profile = profile, .mode = if (profile) |name| profileMode(config, name) else null },
-        .discovery => .{ .bootfile = bootfile(arch), .known = false, .node_id = null, .profile = profile, .mode = if (profile) |name| profileMode(config, name) else .discovery },
-        .diskless => if (config.policy.allow_unknown_diskless) .{ .bootfile = bootfile(arch), .known = false, .node_id = null, .profile = profile, .mode = if (profile) |name| profileMode(config, name) else .diskless } else .{ .bootfile = null, .known = false, .node_id = null, .profile = profile, .mode = if (profile) |name| profileMode(config, name) else null },
-    };
+    return .{ .bootfile = null, .known = false, .node_id = null, .profile = null, .mode = null };
 }
 
 /// M4.1 破坏性安装 gate。DHCP 仍可提供诊断 lease，
@@ -102,7 +93,7 @@ test "consumed install generation suppresses PXE bootfile" {
     const digest: deployment_control.Digest = [_]u8{'1'} ** 64;
     try deployments.ensureInitial("node-01", digest, 1);
     _ = try deployments.consume("node-01");
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }} };
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .install_source = "source" }} };
     const decision = resolveWithDeployment(&config, &deployments, digest, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
     try @import("std").testing.expect(decision.bootfile == null);
 }
@@ -112,7 +103,7 @@ test "deploy=false suppresses PXE bootfile but keeps diagnostic lease" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.50.1" },
         .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install", .deploy = false }},
-        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .profiles = &.{.{ .name = "install", .install_source = "source" }},
     };
     const decision = resolve(&config, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
     try std.testing.expect(decision.bootfile == null);
@@ -125,7 +116,7 @@ test "deploy=true (default) still gets bootfile" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.50.1" },
         .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
-        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .profiles = &.{.{ .name = "install", .install_source = "source" }},
     };
     const decision = resolve(&config, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
     try std.testing.expect(decision.bootfile != null);
@@ -137,7 +128,7 @@ test "always reinstall policy still requires an armed generation" {
     const digest: deployment_control.Digest = [_]u8{'1'} ** 64;
     try deployments.ensureInitial("node-01", digest, 1);
     _ = try deployments.consume("node-01");
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .safety = .{ .destructive = true, .persistent_writes = true, .reinstall_policy = .always } }} };
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .nodes = &.{.{ .id = "node-01", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }}, .profiles = &.{.{ .name = "install", .install_source = "source", .install = .{ .reinstall_policy = .always } }} };
     const decision = resolveWithDeployment(&config, &deployments, digest, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
     try @import("std").testing.expect(decision.bootfile == null);
     try @import("std").testing.expect(decision.install_not_armed);
@@ -162,8 +153,8 @@ fn architectureMatches(expected: model.Arch, actual: packet.Architecture) bool {
 /// 配置校验保证已引用的 profile 存在；保留 optional 返回值是为了让解析器
 /// 在损坏输入下仍然采取安全的无模式降级，而不是伪造一个启动模式。
 /// 返回 null 时，DHCP 仍可发放 lease 但 TFTP 不会渲染虚拟 GRUB 配置。
-fn profileMode(config: *const model.AppConfig, name: []const u8) ?model.ProfileMode {
-    for (config.profiles) |profile| if (@import("std").mem.eql(u8, profile.name, name)) return profile.mode;
+fn profileMode(config: *const model.AppConfig, name: []const u8) ?model.BootKind {
+    for (config.profiles) |profile| if (@import("std").mem.eql(u8, profile.name, name)) return .install;
     return null;
 }
 
@@ -219,7 +210,7 @@ test "known node with mismatched PXE architecture gets no bootfile" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.50.1" },
         .nodes = &.{.{ .id = "arm-node", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "arm-profile" }},
-        .profiles = &.{.{ .name = "arm-profile", .mode = .discovery, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .profiles = &.{.{ .name = "arm-profile", .install_source = "source" }},
     };
     // 节点配置为 aarch64，但 PXE 客户端以 x86_64 架构发起请求。
     const decision = resolve(&config, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .x86_64);

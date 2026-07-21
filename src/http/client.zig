@@ -31,6 +31,9 @@ pub const AssetImport = struct {
     version: ?[]const u8 = null,
     arch: ?[]const u8 = null,
     kernel_release: ?[]const u8 = null,
+    revision: u64 = 1,
+    size: ?u64 = null,
+    media_type: ?[]const u8 = null,
 };
 
 /// M3.6 ISO 导入请求。CLI 先将管理员拥有的任意 ISO 原子复制到 daemon
@@ -140,6 +143,19 @@ pub fn dhcpLeasesJson(io: std.Io, port: u16, unknown_only: bool, output: []u8) !
     return managementJson(io, port, if (unknown_only) "/api/v1/management/runtime/dhcp/leases?scope=unclaimed" else "/api/v1/management/runtime/dhcp/leases", output);
 }
 
+pub fn discoveryObservationsJson(io: std.Io, port: u16, mac: ?[]const u8, output: []u8) !?[]const u8 {
+    var path: [320]u8 = undefined;
+    const value = if (mac) |item| blk: {
+        if (!querySafe(item)) return error.InvalidMac;
+        break :blk try std.fmt.bufPrint(&path, "/api/v1/management/discovery/observations/{s}", .{item});
+    } else "/api/v1/management/discovery/observations";
+    return managementJson(io, port, value, output);
+}
+
+pub fn discoveryPolicyJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    return managementJson(io, port, "/api/v1/management/discovery/policy", output);
+}
+
 pub fn nodesJson(io: std.Io, port: u16, node_id: ?[]const u8, output: []u8) !?[]const u8 {
     var path_buffer: [256]u8 = undefined;
     const path = if (node_id) |id| std.fmt.bufPrint(&path_buffer, "/api/v1/management/nodes/{s}", .{id}) catch return error.InvalidNodeId else "/api/v1/management/nodes";
@@ -150,6 +166,13 @@ pub fn profilesJson(io: std.Io, port: u16, name: ?[]const u8, output: []u8) !?[]
     var path_buffer: [256]u8 = undefined;
     const path = if (name) |id| std.fmt.bufPrint(&path_buffer, "/api/v1/management/profiles/{s}", .{id}) catch return error.InvalidProfileName else "/api/v1/management/profiles";
     return managementJson(io, port, path, output);
+}
+
+pub fn capabilitiesJson(io: std.Io, port: u16, owner: []const u8, identity: []const u8, output: []u8) !?[]const u8 {
+    if ((!std.mem.eql(u8, owner, "profile") and !std.mem.eql(u8, owner, "node")) or !querySafe(identity)) return error.InvalidCapabilityResource;
+    var path: [320]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&path, "/api/v1/management/{s}s/{s}/capabilities", .{ owner, identity });
+    return managementJson(io, port, rendered, output);
 }
 
 /// M4.5：分页获取一个 collection 页。`cursor` 为 null 取首页，否则取后续页；
@@ -171,6 +194,33 @@ pub fn installSourceJson(io: std.Io, port: u16, name: []const u8, output: []u8) 
     return managementJson(io, port, rendered, output);
 }
 
+pub fn catalogResourcesJson(io: std.Io, port: u16, resource: []const u8, name: ?[]const u8, output: []u8) !?[]const u8 {
+    if (!std.mem.eql(u8, resource, "install-sources") and !std.mem.eql(u8, resource, "repositories")) return error.InvalidResource;
+    var path: [320]u8 = undefined;
+    const rendered = if (name) |value| blk: {
+        if (!querySafe(value)) return error.InvalidResourceName;
+        break :blk try std.fmt.bufPrint(&path, "/api/v1/management/{s}/{s}", .{ resource, value });
+    } else try std.fmt.bufPrint(&path, "/api/v1/management/{s}?limit=200", .{resource});
+    return managementJson(io, port, rendered, output);
+}
+
+pub fn softwareCapabilitiesJson(io: std.Io, port: u16, resource: []const u8, name: []const u8, kind: ?[]const u8, search: ?[]const u8, output: []u8) !?[]const u8 {
+    if (!std.mem.eql(u8, resource, "install-sources") and !std.mem.eql(u8, resource, "repositories") and !std.mem.eql(u8, resource, "profiles")) return error.InvalidResource;
+    if (!querySafe(name)) return error.InvalidResourceName;
+    if (kind) |value| if (!querySafe(value)) return error.InvalidSoftwareKind;
+    if (search) |value| if (!querySafe(value)) return error.InvalidSearch;
+    var path: [640]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&path);
+    try writer.print("/api/v1/management/{s}/{s}/software", .{ resource, name });
+    var separator: u8 = '?';
+    if (kind) |value| {
+        try writer.print("{c}kind={s}", .{ separator, value });
+        separator = '&';
+    }
+    if (search) |value| try writer.print("{c}search={s}", .{ separator, value });
+    return managementJson(io, port, writer.buffered(), output);
+}
+
 pub fn catalogMigrationPlanJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
     const reply = try managementPostJson(io, port, "/api/v1/management/catalog/migration-plans", "{}", null, output, null);
     if (reply.status < 200 or reply.status >= 300) return null;
@@ -182,6 +232,131 @@ pub fn catalogMigrationApplyJson(io: std.Io, port: u16, digest: []const u8, outp
     var body: [96]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&body, "{{\"plan_digest\":{f}}}", .{std.json.fmt(digest, .{})});
     const reply = try managementPostJson(io, port, "/api/v1/management/catalog/migrations", rendered, digest, output, null);
+    if (reply.status < 200 or reply.status >= 300) return null;
+    return reply.body;
+}
+
+pub fn schemaV3PlanJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    const reply = try managementPostJson(io, port, "/api/v1/management/catalog/schema-v3/migration-plans", "{}", null, output, null);
+    if (reply.status < 200 or reply.status >= 300) return null;
+    return reply.body;
+}
+
+pub fn schemaV3ApplyJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
+    return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v3/migrations", digest, output);
+}
+
+pub fn schemaV3RollbackJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
+    return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v3/rollbacks", digest, output);
+}
+
+pub fn valuesMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, operation: []const u8, key: []const u8, values: []const []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, reason_buf: []u8) Mutation {
+    if (!querySafe(owner) or !querySafe(identity) or !querySafe(key)) return .{ .reachable = false, .healthy = false };
+    var path_buffer: [320]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/values", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
+    var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer body.deinit();
+    std.json.Stringify.value(.{ .operation = operation, .key = key, .values = values, .mutations = mutations }, .{ .emit_null_optional_fields = true }, &body.writer) catch return .{ .reachable = true, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", path, body.written(), revision, reason_buf);
+}
+
+pub fn valuesJson(io: std.Io, port: u16, owner: []const u8, identity: []const u8, key: []const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(owner) or !querySafe(identity) or !querySafe(key)) return error.InvalidProperty;
+    var path: [384]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&path, "/api/v1/management/{s}s/{s}/values?key={s}", .{ owner, identity, key });
+    return managementJson(io, port, rendered, output);
+}
+
+pub fn itemMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, patch: @import("../config/item_mutation.zig").Patch, reason_buf: []u8) Mutation {
+    if (!querySafe(owner) or !querySafe(identity)) return .{ .reachable = false, .healthy = false };
+    var path_buffer: [320]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
+    var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer body.deinit();
+    std.json.Stringify.value(patch, .{}, &body.writer) catch return .{ .reachable = true, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", path, body.written(), revision, reason_buf);
+}
+
+pub fn itemReplacement(io: std.Io, port: u16, owner: []const u8, identity: []const u8, replacement: @import("../config/item_mutation.zig").Replacement, reason_buf: []u8) Mutation {
+    if (!querySafe(owner) or !querySafe(identity)) return .{ .reachable = false, .healthy = false };
+    var path_buffer: [320]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
+    var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer body.deinit();
+    std.json.Stringify.value(replacement, .{}, &body.writer) catch return .{ .reachable = true, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", path, body.written(), revision, reason_buf);
+}
+
+pub fn provisionBundleJson(io: std.Io, port: u16, name: ?[]const u8, items: bool, identity: ?[]const u8, output: []u8) !?[]const u8 {
+    var path: [512]u8 = undefined;
+    const rendered = if (name) |bundle| if (items) if (identity) |item| try std.fmt.bufPrint(&path, "/api/v1/management/assets/provision-bundles/{s}/items?identity={s}", .{ bundle, item }) else try std.fmt.bufPrint(&path, "/api/v1/management/assets/provision-bundles/{s}/items", .{bundle}) else try std.fmt.bufPrint(&path, "/api/v1/management/assets/provision-bundles/{s}", .{bundle}) else "/api/v1/management/assets/provision-bundles";
+    return managementJson(io, port, rendered, output);
+}
+
+pub fn provisionBundleMutation(io: std.Io, port: u16, method: []const u8, name: ?[]const u8, items: bool, body: []const u8, reason_buf: []u8) Mutation {
+    var path_buffer: [384]u8 = undefined;
+    const path = if (name) |bundle| if (items) std.fmt.bufPrint(&path_buffer, "/api/v1/management/assets/provision-bundles/{s}/items", .{bundle}) catch return .{ .reachable = false, .healthy = false } else std.fmt.bufPrint(&path_buffer, "/api/v1/management/assets/provision-bundles/{s}", .{bundle}) catch return .{ .reachable = false, .healthy = false } else "/api/v1/management/assets/provision-bundles";
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, method, path, body, revision, reason_buf);
+}
+
+pub fn managedFileRemove(io: std.Io, port: u16, name: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
+    var path: [320]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&path, "/api/v1/management/assets/managed-files/{s}", .{name}) catch return .{ .reachable = false, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "DELETE", rendered, "", revision, reason_buf);
+}
+
+pub fn scalarMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, key: []const u8, value: ?[]const u8, reason_buf: []u8) Mutation {
+    return scalarMutations(io, port, owner, identity, &.{.{ .key = key, .value = value }}, reason_buf);
+}
+
+pub fn scalarMutations(io: std.Io, port: u16, owner: []const u8, identity: []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, reason_buf: []u8) Mutation {
+    if (!querySafe(owner) or !querySafe(identity) or mutations.len == 0) return .{ .reachable = false, .healthy = false };
+    for (mutations) |mutation| if (!querySafe(mutation.key)) return .{ .reachable = false, .healthy = false };
+    var path_buffer: [320]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/properties", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
+    var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer body.deinit();
+    std.json.Stringify.value(.{ .mutations = mutations }, .{ .emit_null_optional_fields = true }, &body.writer) catch return .{ .reachable = true, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", path, body.written(), revision, reason_buf);
+}
+
+pub fn itemsJson(io: std.Io, port: u16, owner: []const u8, identity: []const u8, key: []const u8, item_identity: ?[]const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(owner) or !querySafe(identity) or !querySafe(key) or (item_identity != null and !querySafe(item_identity.?))) return error.InvalidProperty;
+    var path: [512]u8 = undefined;
+    const rendered = if (item_identity) |item| try std.fmt.bufPrint(&path, "/api/v1/management/{s}s/{s}/items?key={s}&identity={s}", .{ owner, identity, key, item }) else try std.fmt.bufPrint(&path, "/api/v1/management/{s}s/{s}/items?key={s}", .{ owner, identity, key });
+    return managementJson(io, port, rendered, output);
+}
+
+pub fn itemValuesMutation(io: std.Io, port: u16, owner: []const u8, resource_identity: []const u8, item_identity: []const u8, operation: []const u8, key: []const u8, field: []const u8, values: []const []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(owner) or !querySafe(resource_identity) or !querySafe(item_identity) or !querySafe(key) or !querySafe(field)) return .{ .reachable = false, .healthy = false };
+    var path_buffer: [320]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, resource_identity }) catch return .{ .reachable = false, .healthy = false };
+    var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer body.deinit();
+    std.json.Stringify.value(.{ .operation = operation, .key = key, .identity = item_identity, .field = field, .values = values }, .{}, &body.writer) catch return .{ .reachable = true, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", path, body.written(), revision, reason_buf);
+}
+
+pub fn itemValuesJson(io: std.Io, port: u16, owner: []const u8, resource_identity: []const u8, key: []const u8, item_identity: []const u8, field: []const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(owner) or !querySafe(resource_identity) or !querySafe(key) or !querySafe(item_identity) or !querySafe(field)) return error.InvalidItemValuesQuery;
+    var path: [512]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&path, "/api/v1/management/{s}s/{s}/items?key={s}&identity={s}&field={s}", .{ owner, resource_identity, key, item_identity, field });
+    return managementJson(io, port, rendered, output);
+}
+
+fn schemaV3MutationJson(io: std.Io, port: u16, path: []const u8, digest: []const u8, output: []u8) !?[]const u8 {
+    if (digest.len != 64 or !querySafe(digest)) return error.InvalidPlanDigest;
+    var body: [96]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&body, "{{\"plan_digest\":{f}}}", .{std.json.fmt(digest, .{})});
+    const reply = try managementPostJson(io, port, path, rendered, digest, output, null);
     if (reply.status < 200 or reply.status >= 300) return null;
     return reply.body;
 }
@@ -209,14 +384,6 @@ pub fn nodeAdd(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutati
     return managementMutation(io, port, "POST", "/api/v1/management/nodes", body, revision, reason_buf);
 }
 
-pub fn nodeSet(io: std.Io, port: u16, node_id: []const u8, body: []const u8, reason_buf: []u8) Mutation {
-    if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
-    var path: [256]u8 = undefined;
-    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}", .{node_id}) catch return .{ .reachable = false, .healthy = false };
-    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
-    return managementMutation(io, port, "PATCH", value, body, revision, reason_buf);
-}
-
 pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) Mutation {
     if (!querySafe(node_id)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
@@ -225,27 +392,19 @@ pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) 
     return managementMutation(io, port, "DELETE", value, "", revision, reason_buf);
 }
 
-/// 只允许修改 profile 的 `kernel_args` 字段；使用 catalog ETag 防止覆盖
-/// 其他 profile/node mutation 已发布的新 generation。
-pub fn profileSetKernelArgs(io: std.Io, port: u16, name: []const u8, kernel_args: ?[]const u8, reason_buf: []u8) Mutation {
-    return profileSetProperty(io, port, name, "kernel_args", kernel_args, reason_buf);
-}
-
-pub fn profileSetBootDisk(io: std.Io, port: u16, name: []const u8, boot_disk: []const u8, reason_buf: []u8) Mutation {
-    return profileSetProperty(io, port, name, "boot_disk", boot_disk, reason_buf);
-}
-
-fn profileSetProperty(io: std.Io, port: u16, name: []const u8, field: []const u8, value_to_set: ?[]const u8, reason_buf: []u8) Mutation {
-    if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
+pub fn nodeClaim(io: std.Io, port: u16, node_id: []const u8, mac: []const u8, arch: []const u8, observation_revision: u64, reason_buf: []u8) Mutation {
+    if (!querySafe(node_id) or !querySafe(mac) or !querySafe(arch)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
-    const value = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}", .{name}) catch return .{ .reachable = false, .healthy = false };
+    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/claim", .{node_id}) catch return .{ .reachable = false, .healthy = false };
     var body: [512]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&body);
-    writer.print("{{\"{s}\":", .{field}) catch return .{ .reachable = true, .healthy = false };
-    std.json.Stringify.value(value_to_set, .{}, &writer) catch return .{ .reachable = true, .healthy = false };
-    writer.writeByte('}') catch return .{ .reachable = true, .healthy = false };
+    const rendered = std.fmt.bufPrint(&body, "{{\"mac\":{f},\"arch\":{f},\"observation_revision\":{d}}}", .{ std.json.fmt(mac, .{}), std.json.fmt(arch, .{}), observation_revision }) catch return .{ .reachable = true, .healthy = false };
     const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
-    return managementMutation(io, port, "PATCH", value, writer.buffered(), revision, reason_buf);
+    return managementMutation(io, port, "POST", value, rendered, revision, reason_buf);
+}
+
+pub fn discoveryPolicySet(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutation {
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "PATCH", "/api/v1/management/discovery/policy", body, revision, reason_buf);
 }
 
 fn mutationUnreachable(reason_buf: []u8, message: []const u8) Mutation {

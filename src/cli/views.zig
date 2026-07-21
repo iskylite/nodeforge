@@ -8,6 +8,8 @@ const c = @cImport({
     @cInclude("time.h");
 });
 const table = @import("table.zig");
+const output = @import("output.zig");
+const document = @import("document.zig");
 const model = @import("../model.zig");
 
 pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const u8 };
@@ -20,6 +22,9 @@ pub const EventTypeRow = struct { name: []const u8, description: []const u8, lev
 
 /// 渲染 asset 列表表格。`rows` 使用借用 slice；超过 64 行返回 `error.TooManyRows`。
 pub fn assets(writer: *std.Io.Writer, rows: []const AssetRow) !void {
+    return assetsWithOptions(writer, rows, .{});
+}
+pub fn assetsWithOptions(writer: *std.Io.Writer, rows: []const AssetRow, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "name", .title = "NAME" }, .{ .key = "kind", .title = "KIND" }, .{ .key = "path", .title = "PATH" } };
     var cells: [64][3][]const u8 = undefined;
     var table_rows: [64]table.Row = undefined;
@@ -28,7 +33,7 @@ pub fn assets(writer: *std.Io.Writer, rows: []const AssetRow) !void {
         cells[i] = .{ row.name, row.kind, row.path };
         table_rows[i] = .{ .cells = &cells[i] };
     }
-    try table.render(writer, &columns, table_rows[0..rows.len], "No assets registered.", .{});
+    try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No assets registered.", options);
 }
 
 pub fn assetDetail(writer: *std.Io.Writer, name: []const u8, kind: []const u8, path: []const u8, sha256: []const u8) !void {
@@ -59,6 +64,9 @@ pub fn dhcpConfig(writer: *std.Io.Writer, subnet: []const u8, pool_start: []cons
 }
 
 pub fn dhcpLeases(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_only: bool) !void {
+    return dhcpLeasesWithOptions(writer, rows, unknown_only, .{});
+}
+pub fn dhcpLeasesWithOptions(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_only: bool, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "ip", .title = "IP" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "phase", .title = "PHASE" }, .{ .key = "expires", .title = "EXPIRES" } };
     var cells: [256][4][]const u8 = undefined;
     var table_rows: [256]table.Row = undefined;
@@ -67,10 +75,13 @@ pub fn dhcpLeases(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_on
         cells[i] = .{ row.ip, row.mac, row.phase, row.expires_at };
         table_rows[i] = .{ .cells = &cells[i] };
     }
-    try table.render(writer, &columns, table_rows[0..rows.len], if (unknown_only) "No unknown clients." else "No DHCP leases.", .{});
+    try renderTableDocument(writer, &columns, table_rows[0..rows.len], if (unknown_only) "No unknown clients." else "No DHCP leases.", options);
 }
 
 pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
+    return nodesWithOptions(writer, rows, .{});
+}
+pub fn nodesWithOptions(writer: *std.Io.Writer, rows: []const NodeRow, options: table.Options) !void {
     // Start/Install/Finished 分别映射任务武装、实际安装阶段开始和任务终态，
     // 避免把内部 requested_at/started_at 字段名误当成用户语义。
     const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "start_at", .title = "START" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
@@ -81,10 +92,13 @@ pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
         cells[i] = .{ row.id, row.mac, row.ip, row.profile, row.deploy, row.install_intent, row.status, row.start_at, row.install_at, row.finished_at, row.serial_number };
         table_rows[i] = .{ .cells = &cells[i] };
     }
-    try table.render(writer, &columns, table_rows[0..rows.len], "No nodes registered.", .{});
+    try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No nodes registered.", options);
 }
 
 pub fn profiles(writer: *std.Io.Writer, rows: []const ProfileRow) !void {
+    return profilesWithOptions(writer, rows, .{});
+}
+pub fn profilesWithOptions(writer: *std.Io.Writer, rows: []const ProfileRow, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "name", .title = "NAME" }, .{ .key = "mode", .title = "MODE" }, .{ .key = "distro", .title = "DISTRO" }, .{ .key = "version", .title = "VERSION" }, .{ .key = "arch", .title = "ARCH" }, .{ .key = "source", .title = "INSTALL_SOURCE" }, .{ .key = "nodes", .title = "NODES", .alignment = .right }, .{ .key = "valid", .title = "VALID" } };
     var cells: [256][8][]const u8 = undefined;
     var table_rows: [256]table.Row = undefined;
@@ -93,10 +107,13 @@ pub fn profiles(writer: *std.Io.Writer, rows: []const ProfileRow) !void {
         cells[index] = .{ row.name, row.mode, row.distro, row.version, row.arch, row.install_source, row.nodes, row.valid };
         table_rows[index] = .{ .cells = &cells[index] };
     }
-    try table.render(writer, &columns, table_rows[0..rows.len], "No profiles configured.", .{});
+    try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No profiles configured.", options);
 }
 
 pub fn events(writer: *std.Io.Writer, rows: []const EventRow) !void {
+    return eventsWithOptions(writer, rows, .{});
+}
+pub fn eventsWithOptions(writer: *std.Io.Writer, rows: []const EventRow, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "time", .title = "TIME" }, .{ .key = "type", .title = "TYPE" }, .{ .key = "node", .title = "NODE" }, .{ .key = "message", .title = "MESSAGE", .max_width = 48 }, .{ .key = "fields", .title = "FIELDS", .max_width = 64 } };
     var cells: [1000][5][]const u8 = undefined;
     var table_rows: [1000]table.Row = undefined;
@@ -105,7 +122,7 @@ pub fn events(writer: *std.Io.Writer, rows: []const EventRow) !void {
         cells[index] = .{ row.ts, row.event_type, row.node, row.message, row.fields };
         table_rows[index] = .{ .cells = &cells[index] };
     }
-    try table.render(writer, &columns, table_rows[0..rows.len], "No events recorded.", .{});
+    try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No events recorded.", options);
 }
 
 pub fn eventLine(writer: *std.Io.Writer, ts: []const u8, event_type: []const u8, fields: []const u8, message: []const u8) !void {
@@ -115,6 +132,9 @@ pub fn eventLine(writer: *std.Io.Writer, ts: []const u8, event_type: []const u8,
 }
 
 pub fn eventTypes(writer: *std.Io.Writer, rows: []const EventTypeRow) !void {
+    return eventTypesWithOptions(writer, rows, .{});
+}
+pub fn eventTypesWithOptions(writer: *std.Io.Writer, rows: []const EventTypeRow, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "name", .title = "TYPE" }, .{ .key = "level", .title = "LEVEL" }, .{ .key = "description", .title = "DESCRIPTION" } };
     var cells: [64][3][]const u8 = undefined;
     var table_rows: [64]table.Row = undefined;
@@ -123,7 +143,7 @@ pub fn eventTypes(writer: *std.Io.Writer, rows: []const EventTypeRow) !void {
         cells[index] = .{ row.name, row.level, row.description };
         table_rows[index] = .{ .cells = &cells[index] };
     }
-    try table.render(writer, &columns, table_rows[0..rows.len], "No event types registered.", .{});
+    try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No event types registered.", options);
 }
 
 /// 输出统一的成功摘要和可选键值事实。短摘要保留已有 `OK` 运维习惯，字段
@@ -143,36 +163,26 @@ pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
     try writer.writeAll("\nSettable properties (nodeforge node set ");
     try table.writeEscaped(writer, node.id);
     try writer.writeAll(" key=value)\n");
-    try writer.print("  mac={s}\n  arch={s}\n  profile={s}\n", .{ node.mac, @tagName(node.arch), node.profile });
+    try writer.print("  mac={s}\n  arch={s}\n  profile={s}\n", .{ node.mac, @tagName(node.arch), node.profile orelse "<unassigned>" });
     if (node.ip) |ip| try writer.print("  ip={s}\n", .{ip}) else try writer.print("  # ip is unset; action: nodeforge node unset {s} ip\n", .{node.id});
     if (node.hostname) |hostname| try writer.print("  hostname={s}\n", .{hostname}) else try writer.print("  # hostname is unset; action: nodeforge node unset {s} hostname\n", .{node.id});
     try writer.print("  deploy={s}\n  http_accel={s}\n", .{ if (node.deploy) "true" else "false", if (node.http_accel) "true" else "false" });
-    if (node.overrides.storage) |storage| {
-        if (storage.boot_disk) |disk| try writer.print("  boot_disk={s}\n", .{disk}) else try writer.print("  # boot_disk is unset; action: nodeforge node unset {s} boot_disk\n", .{node.id});
-        if (storage.install_disks) |disks| {
-            try writer.writeAll("  install_disks=");
-            try writeCommaList(writer, disks);
-            try writer.writeByte('\n');
-        } else try writer.print("  # install_disks is unset; action: nodeforge node unset {s} install_disks\n", .{node.id});
-    } else {
-        try writer.print("  # boot_disk is unset; action: nodeforge node unset {s} boot_disk\n", .{node.id});
-        try writer.print("  # install_disks is unset; action: nodeforge node unset {s} install_disks\n", .{node.id});
-    }
+    try writer.print("  storage.boot_disk={s}\n", .{node.storage.boot_disk});
+    try writer.writeAll("  storage.additional_disks=");
+    try writeCommaList(writer, node.storage.additional_disks);
+    try writer.writeByte('\n');
     try writer.writeAll("\nRead-only detail\n");
-    if (node.overrides.network) |network| {
-        try writer.writeAll("  Network override\n");
-        try detailField(writer, "Mode", @tagName(network.mode));
-        try detailField(writer, "Interface", network.interface orelse "-");
-        try detailField(writer, "Match MAC", network.match_mac orelse "-");
-        try detailField(writer, "Address", network.address orelse "-");
-        if (network.prefix_len) |prefix| {
-            try writeLabel(writer, "Prefix length");
-            try writer.print("{d}\n", .{prefix});
-        } else try detailField(writer, "Prefix length", "-");
-        try detailField(writer, "Gateway", network.gateway orelse "-");
-        try writeStringList(writer, "DNS", network.dns);
-        try writeStringList(writer, "Search domains", network.search_domains);
-    } else try detailField(writer, "Network override", "-");
+    try writer.writeAll("  Network\n");
+    try detailField(writer, "Mode", @tagName(node.network.mode));
+    try detailField(writer, "Interface", node.network.interface orelse "-");
+    try detailField(writer, "Address", node.network.address orelse "-");
+    if (node.network.prefix_len) |prefix| {
+        try writeLabel(writer, "Prefix length");
+        try writer.print("{d}\n", .{prefix});
+    } else try detailField(writer, "Prefix length", "-");
+    try detailField(writer, "Gateway", node.network.gateway orelse "-");
+    try writeStringList(writer, "DNS", node.network.dns);
+    try writeStringList(writer, "Search domains", node.network.search_domains);
 }
 
 fn writeStringList(writer: *std.Io.Writer, label: []const u8, values: []const []const u8) !void {
@@ -194,6 +204,9 @@ fn writeCommaList(writer: *std.Io.Writer, values: []const []const u8) !void {
 
 /// 渲染 TFTP 会话列表表格。`rows` 使用借用 slice；超过 32 行返回 `error.TooManyRows`。
 pub fn tftpSessions(writer: *std.Io.Writer, rows: []const TftpSessionRow) !void {
+    return tftpSessionsWithOptions(writer, rows, .{});
+}
+pub fn tftpSessionsWithOptions(writer: *std.Io.Writer, rows: []const TftpSessionRow, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "id", .title = "ID", .alignment = .right }, .{ .key = "phase", .title = "PHASE" }, .{ .key = "filename", .title = "FILENAME" } };
     var cells: [32][3][]const u8 = undefined;
     var table_rows: [32]table.Row = undefined;
@@ -202,7 +215,12 @@ pub fn tftpSessions(writer: *std.Io.Writer, rows: []const TftpSessionRow) !void 
         cells[i] = .{ row.id, row.phase, row.filename };
         table_rows[i] = .{ .cells = &cells[i] };
     }
-    try table.render(writer, &columns, table_rows[0..rows.len], "No TFTP sessions recorded.", .{});
+    try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No TFTP sessions recorded.", options);
+}
+
+fn renderTableDocument(writer: *std.Io.Writer, columns: []const table.Column, rows: []const table.Row, empty_message: []const u8, options: table.Options) !void {
+    const value: document.OutputDocument = .{ .human = .{ .table = .{ .columns = columns, .rows = rows, .empty_message = empty_message } }, .json = "{}" };
+    try value.render(writer, output.Output{ .mode = .human, .no_color = !options.color, .columns = options.columns, .width = options.width, .wide = options.wide, .no_header = options.no_header });
 }
 
 pub const StatusView = struct {
@@ -362,15 +380,15 @@ test "node detail uses exact set parser keys" {
         .http_accel = false,
     });
     const out = writer.buffered();
-    inline for (.{ "mac=00:50:56:2A:23:DB", "arch=aarch64", "profile=rocky", "ip=192.168.27.210", "hostname=r97n1", "deploy=true", "http_accel=false", "boot_disk is unset", "install_disks is unset" }) |needle|
+    inline for (.{ "mac=00:50:56:2A:23:DB", "arch=aarch64", "profile=rocky", "ip=192.168.27.210", "hostname=r97n1", "deploy=true", "http_accel=false", "storage.boot_disk=/dev/sda", "storage.additional_disks=" }) |needle|
         try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
 }
 
 test "node detail renders storage override in parser vocabulary" {
     var buffer: [2048]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try nodeDetail(&writer, .{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "rocky", .overrides = .{ .storage = .{ .boot_disk = "/dev/nvme0n1", .install_disks = &.{ "/dev/nvme0n1", "/dev/nvme1n1" } } } });
+    try nodeDetail(&writer, .{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "rocky", .storage = .{ .boot_disk = "/dev/nvme0n1", .additional_disks = &.{"/dev/nvme1n1"} } });
     const out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "boot_disk=/dev/nvme0n1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "install_disks=/dev/nvme0n1,/dev/nvme1n1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "storage.additional_disks=/dev/nvme1n1") != null);
 }

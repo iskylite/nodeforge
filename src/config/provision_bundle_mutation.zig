@@ -1,0 +1,123 @@
+const std = @import("std");
+const model = @import("../model.zig");
+const catalog_store = @import("../catalog/store.zig");
+const validate = @import("validate.zig");
+
+pub const Operation = enum { add, set, remove, move };
+pub const Patch = struct {
+    operation: Operation,
+    identity: []const u8,
+    before: ?[]const u8 = null,
+    after: ?[]const u8 = null,
+    unset: []const []const u8 = &.{},
+    name: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    destination: ?[]const u8 = null,
+    content_asset: ?[]const u8 = null,
+    mode: ?u16 = null,
+    owner: ?[]const u8 = null,
+    group: ?[]const u8 = null,
+};
+pub const StepInput = struct {
+    name: []const u8,
+    action: enum { @"managed-file" } = .@"managed-file",
+    destination: []const u8,
+    content_asset: []const u8,
+    mode: u16 = 0o644,
+    owner: []const u8 = "root",
+    group: []const u8 = "root",
+    pub fn modelValue(self: StepInput) model.ProvisionStep { return .{ .name = self.name, .action = .managed_file, .destination = self.destination, .content_asset = self.content_asset, .mode = self.mode, .owner = self.owner, .group = self.group }; }
+};
+
+pub fn create(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, path: []const u8, name: []const u8) !void {
+    var parsed = try catalog_store.load(io, allocator, path); defer parsed.deinit();
+    for (parsed.value.provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) return error.BundleAlreadyExists;
+    const bundles = try allocator.alloc(model.ProvisioningBundle, parsed.value.provisioning_bundles.len + 1); defer allocator.free(bundles);
+    @memcpy(bundles[0..parsed.value.provisioning_bundles.len], parsed.value.provisioning_bundles);
+    bundles[bundles.len - 1] = .{ .name = name };
+    var candidate = parsed.value; candidate.provisioning_bundles = bundles;
+    try validateCandidate(config, &candidate); try catalog_store.save(io, allocator, path, &candidate);
+}
+
+pub fn remove(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, path: []const u8, name: []const u8) !void {
+    var parsed = try catalog_store.load(io, allocator, path); defer parsed.deinit();
+    var index: ?usize = null;
+    for (parsed.value.provisioning_bundles, 0..) |bundle, current| {
+        if (std.mem.eql(u8, bundle.name, name)) index = current;
+    }
+    const found = index orelse return error.BundleNotFound;
+    for (parsed.value.profiles) |profile| if (profile.install.post_install.bundle) |reference| if (std.mem.eql(u8, reference, name)) return error.BundleInUse;
+    const bundles = try allocator.alloc(model.ProvisioningBundle, parsed.value.provisioning_bundles.len - 1); defer allocator.free(bundles);
+    @memcpy(bundles[0..found], parsed.value.provisioning_bundles[0..found]);
+    @memcpy(bundles[found..], parsed.value.provisioning_bundles[found + 1 ..]);
+    var candidate = parsed.value; candidate.provisioning_bundles = bundles;
+    try validateCandidate(config, &candidate); try catalog_store.save(io, allocator, path, &candidate);
+}
+
+pub fn mutate(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, path: []const u8, name: []const u8, patch: Patch) !void {
+    var parsed = try catalog_store.load(io, allocator, path); defer parsed.deinit();
+    const bundles = try allocator.dupe(model.ProvisioningBundle, parsed.value.provisioning_bundles); defer allocator.free(bundles);
+    var selected: ?*model.ProvisioningBundle = null;
+    for (bundles) |*bundle| if (std.mem.eql(u8, bundle.name, name)) { selected = bundle; break; };
+    const bundle = selected orelse return error.BundleNotFound;
+    const steps = try mutateSteps(allocator, bundle.steps, patch); defer allocator.free(steps);
+    bundle.steps = steps; bundle.revision += 1;
+    var candidate = parsed.value; candidate.provisioning_bundles = bundles;
+    try validateCandidate(config, &candidate); try catalog_store.save(io, allocator, path, &candidate);
+}
+
+pub fn replace(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, path: []const u8, name: []const u8, steps: []const model.ProvisionStep) !void {
+    var parsed = try catalog_store.load(io, allocator, path); defer parsed.deinit();
+    const bundles = try allocator.dupe(model.ProvisioningBundle, parsed.value.provisioning_bundles); defer allocator.free(bundles);
+    var selected: ?*model.ProvisioningBundle = null;
+    for (bundles) |*bundle| if (std.mem.eql(u8, bundle.name, name)) { selected = bundle; break; };
+    const bundle = selected orelse return error.BundleNotFound;
+    bundle.steps = steps; bundle.revision += 1;
+    var candidate = parsed.value; candidate.provisioning_bundles = bundles;
+    try validateCandidate(config, &candidate); try catalog_store.save(io, allocator, path, &candidate);
+}
+
+fn validateCandidate(config: *const model.AppConfig, catalog: *const model.Catalog) !void {
+    const projected = model.projectCatalog(config.*, catalog);
+    try validate.validate(&projected, catalog);
+}
+
+fn mutateSteps(allocator: std.mem.Allocator, current: []const model.ProvisionStep, patch: Patch) ![]model.ProvisionStep {
+    const found = stepIndex(current, patch.identity);
+    return switch (patch.operation) {
+        .add => blk: {
+            if (found != null or patch.name == null or !std.mem.eql(u8, patch.name.?, patch.identity)) return error.InvalidStepIdentity;
+            if (patch.action != null and !std.mem.eql(u8, patch.action.?, "managed-file")) return error.InvalidStepAction;
+            const values = try allocator.alloc(model.ProvisionStep, current.len + 1); @memcpy(values[0..current.len], current);
+            values[current.len] = .{ .name = patch.name.?, .action = .managed_file, .destination = patch.destination, .content_asset = patch.content_asset, .mode = patch.mode orelse 0o644, .owner = patch.owner orelse "root", .group = patch.group orelse "root" };
+            break :blk values;
+        },
+        .set => blk: {
+            const index = found orelse return error.StepNotFound;
+            const values = try allocator.dupe(model.ProvisionStep, current); var value = values[index];
+            if (patch.action) |action| if (!std.mem.eql(u8, action, "managed-file")) return error.InvalidStepAction;
+            if (patch.destination) |field| value.destination = field;
+            if (patch.content_asset) |field| value.content_asset = field;
+            if (patch.mode) |field| value.mode = field;
+            if (patch.owner) |field| value.owner = field;
+            if (patch.group) |field| value.group = field;
+            for (patch.unset) |field| {
+                if (std.mem.eql(u8, field, "mode")) value.mode = 0o644 else if (std.mem.eql(u8, field, "owner")) value.owner = "root" else if (std.mem.eql(u8, field, "group")) value.group = "root" else return error.RequiredStepField;
+            }
+            values[index] = value; break :blk values;
+        },
+        .remove => removeAt(allocator, current, found orelse return error.StepNotFound),
+        .move => moveAt(allocator, current, found orelse return error.StepNotFound, try destinationIndex(current, patch)),
+    };
+}
+
+fn stepIndex(values: []const model.ProvisionStep, identity: []const u8) ?usize { for (values, 0..) |value, index| if (std.mem.eql(u8, value.name, identity)) return index; return null; }
+fn removeAt(allocator: std.mem.Allocator, values: []const model.ProvisionStep, index: usize) ![]model.ProvisionStep { const output = try allocator.alloc(model.ProvisionStep, values.len - 1); @memcpy(output[0..index], values[0..index]); @memcpy(output[index..], values[index + 1 ..]); return output; }
+fn moveAt(allocator: std.mem.Allocator, current: []const model.ProvisionStep, from: usize, target: usize) ![]model.ProvisionStep { const values = try allocator.dupe(model.ProvisionStep, current); const value = values[from]; if (from < target) { std.mem.copyForwards(model.ProvisionStep, values[from..target], values[from + 1 .. target + 1]); values[target] = value; } else if (from > target) { std.mem.copyBackwards(model.ProvisionStep, values[target + 1 .. from + 1], values[target..from]); values[target] = value; } return values; }
+fn destinationIndex(values: []const model.ProvisionStep, patch: Patch) !usize { if ((patch.before == null) == (patch.after == null)) return error.MoveDestinationRequired; if (patch.before) |id| return stepIndex(values, id) orelse error.StepNotFound; const index = stepIndex(values, patch.after.?) orelse return error.StepNotFound; return @min(index + 1, values.len - 1); }
+
+test "managed-file step item mutation preserves stable identity and order" {
+    const current = [_]model.ProvisionStep{ .{ .name = "a", .action = .managed_file }, .{ .name = "b", .action = .managed_file } };
+    const moved = try mutateSteps(std.testing.allocator, &current, .{ .operation = .move, .identity = "a", .after = "b" }); defer std.testing.allocator.free(moved);
+    try std.testing.expectEqualStrings("b", moved[0].name); try std.testing.expectEqualStrings("a", moved[1].name);
+}

@@ -1,365 +1,339 @@
 #!/bin/sh
 set -eu
 
-# DHCP requires the privileged fixed port 67. The Rocky validation target runs
-# this contract as root; macOS developer hosts do not grant that bind here.
 if [ "$(uname -s)" = Darwin ]; then
     exit 0
 fi
 
 cli=$1
 daemon=$2
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=${TMPDIR:-/tmp}/nodeforge-http-test-$$
 port=$((20000 + ($$ % 10000)))
-mkdir -p "$tmp"
-
-# Exercise M4.7 executable-based install-root discovery rather than allowing
-# test-only fallback paths.
-install="$tmp/install"
-mkdir -p "$install/bin"
-cp "$cli" "$install/bin/nodeforge"
-cp "$daemon" "$install/bin/nodeforged"
-: >"$install/.nodeforge-root"
-cli="$install/bin/nodeforge"
-daemon="$install/bin/nodeforged"
-
+install=$tmp/install
 pid=
-stop_daemon() {
+
+cleanup() {
     if [ -n "$pid" ]; then
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
-        pid=
     fi
-}
-cleanup() {
-    stop_daemon
     rm -rf "$tmp"
 }
 trap cleanup EXIT HUP INT TERM
+mkdir -p "$tmp/bundle"
+cp "$cli" "$tmp/bundle/nodeforge"
+cp "$daemon" "$tmp/bundle/nodeforged"
 
-sed \
-    -e 's/192.168.50.1/127.0.0.1/g' \
-    -e 's/192.168.50.0\/24/127.0.0.0\/24/' \
-    -e 's/192.168.50.100/127.0.0.100/' \
-    -e 's/192.168.50.200/127.0.0.200/' \
-    -e "s/\"http_port\": 18080/\"http_port\": $port/" \
-    -e 's/"bind_interface": "enp1s0"/"bind_interface": "lo"/' \
-    "$root/config.example.json" > "$tmp/config.json"
-sed '/"policy": {/i\
-  "profiles": [{"name":"discovery","mode":"discovery","distro":"rocky","version":"9.7","arch":"aarch64"}],' "$tmp/config.json" > "$tmp/config.with-profile"
-mv "$tmp/config.with-profile" "$tmp/config.json"
+"$tmp/bundle/nodeforge" setup --install-root "$install" --non-interactive --yes \
+    --bind-interface lo --server-ip 127.0.0.1 --http-port "$port" \
+    --subnet 127.0.0.0/24 --pool-start 127.0.0.100 --pool-end 127.0.0.200 >"$tmp/setup.out"
+cli=$install/bin/nodeforge
+daemon=$install/bin/nodeforged
 
-"$daemon" -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
+test "$(jq -r .schema_version "$install/config/config.json")" = 3
+test "$(jq -r .catalog_schema_version "$install/catalog/manifest.json")" = 3
+test "$(jq -r .unknown_action "$install/catalog/discovery_policy.json")" = record
+
+publish_entity() {
+    name=$1
+    digest=$(sha256sum "$install/catalog/$name.json" | cut -d ' ' -f 1)
+    jq --arg name "$name" --arg digest "$digest" '(.entities[] | select(.name == $name) | .sha256) = $digest' "$install/catalog/manifest.json" >"$tmp/manifest"
+    mv "$tmp/manifest" "$install/catalog/manifest.json"
+}
+jq '.distros' "$repo/catalog.example.json" >"$install/catalog/distros.json"
+jq --arg base "http://127.0.0.1:$port/artifacts/repositories" '.repositories | map(
+    .base_url = ($base + "/" + .name)
+    | .software_index = {
+        revision_digest: "fixture-index-v1",
+        capabilities: [
+            {id: "core", name: "Core environment", kind: "environment", description: "Minimal operating system"},
+            {id: "bash", name: "Bash", kind: "package", description: "GNU Bourne Again shell"}
+        ]
+    }
+)' "$repo/catalog.example.json" >"$install/catalog/repositories.json"
+jq '.install_sources' "$repo/catalog.example.json" >"$install/catalog/install_sources.json"
+jq '.assets' "$repo/catalog.example.json" >"$install/catalog/assets.json"
+for entity in distros repositories install_sources assets; do publish_entity "$entity"; done
+transaction_id=$(
+    {
+        jq -r .catalog_revision "$install/catalog/manifest.json" | tr -d '\n'
+        jq -r '.entities[] | .name + .sha256' "$install/catalog/manifest.json" | tr -d '\n'
+    } | sha256sum | cut -d ' ' -f 1
+)
+jq --arg transaction_id "$transaction_id" '.transaction_id = $transaction_id' "$install/catalog/manifest.json" >"$tmp/manifest"
+mv "$tmp/manifest" "$install/catalog/manifest.json"
+
+"$daemon" -c "$install/config/config.json" -C "$install/catalog" >"$tmp/daemon.out" 2>"$tmp/daemon.err" &
 pid=$!
-
 ready=false
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
     if curl --silent --fail "http://127.0.0.1:$port/healthz" >"$tmp/health"; then
         ready=true
         break
     fi
     sleep 0.1
 done
-test "$ready" = true
-
+if [ "$ready" != true ]; then
+    cat "$tmp/daemon.err" >&2
+    exit 1
+fi
 grep -Fqx '{"ok":true,"service":"nodeforge"}' "$tmp/health"
-curl --silent --fail -D "$tmp/config-headers" "http://127.0.0.1:$port/api/v1/management/config" >"$tmp/config-status"
-grep -Fq '"config":"valid"' "$tmp/config-status"
-config_revision=$(sed -n 's/.*"revision":\([0-9][0-9]*\).*/\1/p' "$tmp/config-status")
-test -n "$config_revision"
-grep -Eqi "^etag:[[:space:]]*\"$config_revision\"" "$tmp/config-headers"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/status" >"$tmp/status"
-grep -Fq '"service":"running"' "$tmp/status"
-grep -Fq '"config_valid":true' "$tmp/status"
-curl --silent --fail -X POST "http://127.0.0.1:$port/api/v1/management/config/validations" >"$tmp/validate"
-grep -Fqx '{"ok":true,"result":{}}' "$tmp/validate"
 
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-view"
-grep -Fq '"items":[]' "$tmp/nodes-view"
-grep -Eq '"view_revision":\{"config":[0-9]+,"catalog":[0-9]+,"node_status":[0-9]+,"deployment":[0-9]+,"inventory":[0-9]+\}' "$tmp/nodes-view"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles" >"$tmp/profiles-view"
-grep -Fq '"name":"discovery"' "$tmp/profiles-view"
-"$cli" profile create rocky-fresh rocky-9.7-aarch64-dvd -c "$tmp/config.json" >"$tmp/profile-create"
-grep -Fq 'install profile created' "$tmp/profile-create"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles/rocky-fresh" >"$tmp/profile-created"
-grep -Fq '"install_source":"rocky-9.7-aarch64-dvd"' "$tmp/profile-created"
-grep -Fq '"destructive":true' "$tmp/profile-created"
-if "$cli" profile create rocky-fresh rocky-9.7-aarch64-dvd -c "$tmp/config.json" >"$tmp/profile-create-duplicate" 2>&1; then
-    echo "profile create unexpectedly accepted a duplicate name" >&2
-    exit 1
-fi
-grep -Fq 'profile.already_exists' "$tmp/profile-create-duplicate"
-"$cli" profile set rocky-fresh boot_disk=/dev/nvme0n1 -c "$tmp/config.json" >"$tmp/profile-disk"
-grep -Fq 'profile boot disk updated' "$tmp/profile-disk"
-"$cli" profile show rocky-fresh -c "$tmp/config.json" >"$tmp/profile-disk-show"
-grep -Fq 'Settable profile properties/defaults (nodeforge profile set rocky-fresh key=value)' "$tmp/profile-disk-show"
-grep -Fq 'boot_disk=/dev/nvme0n1' "$tmp/profile-disk-show"
-grep -Fq 'wipe          yes' "$tmp/profile-disk-show"
-grep -Fq 'Owner / action' "$tmp/profile-disk-show"
-grep -Fq 'nodeforge profile set rocky-fresh boot_disk=/dev/<device>' "$tmp/profile-disk-show"
-"$cli" profile set rocky-fresh 'kernel_args=iommu=pt' -c "$tmp/config.json" >"$tmp/profile-kernel-set"
-"$cli" profile show rocky-fresh -c "$tmp/config.json" >"$tmp/profile-kernel-show"
-grep -Fq 'kernel_args=iommu=pt' "$tmp/profile-kernel-show"
-"$cli" profile unset rocky-fresh kernel_args -c "$tmp/config.json" >"$tmp/profile-kernel-unset"
-if "$cli" profile create missing-source does-not-exist -c "$tmp/config.json" >"$tmp/profile-create-missing" 2>&1; then
-    echo "profile create unexpectedly accepted a missing install source" >&2
-    exit 1
-fi
-grep -Fq 'profile.install_source_not_found' "$tmp/profile-create-missing"
-"$cli" profile show discovery -c "$tmp/config.json" >"$tmp/profile-show"
-grep -Fq '# kernel_args is unset' "$tmp/profile-show"
-if "$cli" profile set discovery unknown=value -o json -c "$tmp/config.json" >"$tmp/profile-property-error" 2>&1; then
-    echo "profile set unexpectedly accepted an unknown property" >&2
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/config" >"$tmp/config"
+jq -e '.ok and .result.config == "valid"' "$tmp/config" >/dev/null
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/discovery/policy" >"$tmp/policy"
+jq -e '.ok and .result.unknown_action == "record" and .result.observation_retention_days == 30' "$tmp/policy" >/dev/null
+"$cli" runtime tftp-counters -o json --fields started,failed >"$tmp/tftp-show-json"
+jq -e '.ok and .result.started == 0 and .result.failed == 0 and (.result | keys | sort) == ["failed", "started"]' "$tmp/tftp-show-json" >/dev/null
+"$cli" runtime tftp-sessions -o json >"$tmp/tftp-sessions-json"
+jq -e '.ok and (.result.sessions | length) == 0' "$tmp/tftp-sessions-json" >/dev/null
+"$cli" runtime dhcp-leases -o json >"$tmp/dhcp-leases-json"
+jq -e '.ok and (.result.leases | length) == 0' "$tmp/dhcp-leases-json" >/dev/null
+"$cli" discovery list -o json >"$tmp/discovery-list-json"
+jq -e '.ok and (.result.items | length) == 0' "$tmp/discovery-list-json" >/dev/null
+"$cli" discovery policy show -o json --fields unknown_action >"$tmp/discovery-policy-json"
+jq -e '.ok and .result.unknown_action == "record" and (.result | keys) == ["unknown_action"]' "$tmp/discovery-policy-json" >/dev/null
+if "$cli" discovery policy show --fields missing >"$tmp/discovery-policy-bad.out" 2>"$tmp/discovery-policy-bad.err"; then
+    echo 'discovery policy accepted unknown field' >&2
     exit 1
 else
     test "$?" -eq 2
 fi
-jq -e '.ok == false and .error.code == "profile.invalid_property" and (.error.message | type == "string")' "$tmp/profile-property-error" >/dev/null
-# M4.6 的窄 profile mutation：null/unset 可幂等应用；discovery 非空参数必须
-# 由稳定校验错误拒绝，并且不能改变配置文件。
-"$cli" profile unset discovery kernel_args -c "$tmp/config.json" >"$tmp/profile-unset"
-before_kernel_reject=$(sha256sum "$tmp/config.json" | awk '{print $1}')
-if "$cli" profile set discovery 'kernel_args=iommu=pt' -c "$tmp/config.json" >"$tmp/profile-set-invalid" 2>&1; then
-    echo "discovery profile unexpectedly accepted kernel args" >&2
-    exit 1
-fi
-grep -Fq 'profile.kernel_args_invalid' "$tmp/profile-set-invalid"
-after_kernel_reject=$(sha256sum "$tmp/config.json" | awk '{print $1}')
-test "$before_kernel_reject" = "$after_kernel_reject"
+test ! -s "$tmp/discovery-policy-bad.out"
+grep -Fq 'unknown key' "$tmp/discovery-policy-bad.err"
 
-# M4.5 collection pagination (§9.14.11.1#3): limit 校验与 cursor/view_revision 字段。
-pg_bad=$(curl --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes?limit=0")
-test "$pg_bad" = 400
-pg_bad=$(curl --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes?limit=999")
-test "$pg_bad" = 400
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes?limit=1" >"$tmp/pg"
-grep -Fq '"items":' "$tmp/pg"
-grep -Fq '"next_cursor":' "$tmp/pg"
-grep -Fq '"view_revision":' "$tmp/pg"
-
-# M4.3 daemon-owned node mutations persist and publish without restarting.
-daemon_pid=$pid
-"$cli" node add test-node mac=02:00:00:00:00:11 arch=aarch64 profile=discovery -c "$tmp/config.json" >"$tmp/node-add"
-kill -0 "$daemon_pid"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes/test-node" >"$tmp/node-after-add"
-grep -Fq '"id":"test-node"' "$tmp/node-after-add"
-"$cli" node show test-node -c "$tmp/config.json" >"$tmp/node-show"
-for section in 'Node test-node' 'Profile' 'Effective system' 'Deployment' 'Runtime' 'Inventory' 'View revisions'; do
-    grep -Fq "$section" "$tmp/node-show"
-done
-grep -Fq 'Owner / action' "$tmp/node-show"
-grep -Fq 'nodeforge profile set discovery' "$tmp/node-show"
-grep -Fq 'nodeforge node retry test-node [--force]' "$tmp/node-show"
-for property in 'mac=02:00:00:00:00:11' 'arch=aarch64' 'profile=discovery' 'deploy=true' 'http_accel=false'; do
-    grep -Fq "$property" "$tmp/node-show"
-done
-"$cli" node set test-node mac=02:00:00:00:00:11 arch=aarch64 profile=discovery ip=127.0.0.111 hostname=worker-11 deploy=true http_accel=false -c "$tmp/config.json" >"$tmp/node-set"
-kill -0 "$daemon_pid"
-grep -Fq '"hostname": "worker-11"' "$tmp/config.json"
-"$cli" node show test-node -c "$tmp/config.json" >"$tmp/node-show-after-set"
-for property in 'ip=127.0.0.111' 'hostname=worker-11'; do
-    grep -Fq "$property" "$tmp/node-show-after-set"
-done
-"$cli" node unset test-node ip hostname -c "$tmp/config.json" >"$tmp/node-unset"
-kill -0 "$daemon_pid"
-if grep -Fq '"hostname": "worker-11"' "$tmp/config.json"; then
-    echo "node unset did not clear hostname" >&2
+"$cli" assets install-source list >"$tmp/source-list"
+grep -Fq 'rocky-9.7-aarch64-dvd' "$tmp/source-list"
+"$cli" assets install-source list --columns name,arch --no-header >"$tmp/source-list-columns"
+grep -Eq '^rocky-9.7-aarch64-dvd[[:space:]]+aarch64$' "$tmp/source-list-columns"
+"$cli" assets install-source list -o jsonl >"$tmp/source-list-jsonl"
+jq -e '.ok and .result.name == "rocky-9.7-aarch64-dvd"' "$tmp/source-list-jsonl" >/dev/null
+"$cli" assets install-source show rocky-9.7-aarch64-dvd -o json >"$tmp/source-show"
+jq -e '.ok and .result.install_source.name == "rocky-9.7-aarch64-dvd"' "$tmp/source-show" >/dev/null
+"$cli" assets install-source show rocky-9.7-aarch64-dvd --fields name,source_asset >"$tmp/source-show-fields"
+grep -Fq $'name\trocky-9.7-aarch64-dvd' "$tmp/source-show-fields"
+if grep -Fq 'installer_kernel' "$tmp/source-show-fields"; then
+    echo 'install-source field filter retained installer_kernel' >&2
     exit 1
 fi
-"$cli" node remove test-node -c "$tmp/config.json" >"$tmp/node-remove"
-kill -0 "$daemon_pid"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/nodes" >"$tmp/nodes-after-remove"
-grep -Fq '"items":[]' "$tmp/nodes-after-remove"
-if "$cli" node add missing-profile mac=02:00:00:00:00:12 arch=aarch64 profile=does-not-exist -c "$tmp/config.json" >"$tmp/node-missing-profile" 2>&1; then
-    echo "node add unexpectedly accepted a missing profile" >&2
-    exit 1
-fi
-grep -Fq 'node.profile_not_found' "$tmp/node-missing-profile"
-"$cli" node add install-node mac=02:00:00:00:00:13 arch=aarch64 profile=rocky-fresh -c "$tmp/config.json" >"$tmp/install-node-add"
-if "$cli" node add install-node mac=02:00:00:00:00:14 arch=aarch64 profile=rocky-fresh -c "$tmp/config.json" >"$tmp/node-duplicate-id" 2>&1; then
-    echo "node add unexpectedly accepted a duplicate identifier" >&2
-    exit 1
-fi
-grep -Fq 'node.already_exists' "$tmp/node-duplicate-id"
-if "$cli" node add duplicate-mac mac=02:00:00:00:00:13 arch=aarch64 profile=rocky-fresh -c "$tmp/config.json" >"$tmp/node-duplicate-mac" 2>&1; then
-    echo "node add unexpectedly accepted a duplicate MAC" >&2
-    exit 1
-fi
-grep -Fq 'node.duplicate_mac' "$tmp/node-duplicate-mac"
-"$cli" node show install-node -c "$tmp/config.json" >"$tmp/install-node-show"
-grep -Fq 'Intent        initial-armed' "$tmp/install-node-show"
-grep -Fq 'PXE ready     yes' "$tmp/install-node-show"
-
-# M4.12 storage ownership: one node can override the shared profile fallback.
-# A profile-default change must not drift that node; clearing the override makes
-# the new default effective and therefore requires a fresh install generation.
-"$cli" node set install-node boot_disk=/dev/vda -o json -c "$tmp/config.json" >"$tmp/install-node-disk-set"
-jq -e '.ok and .result.node_id == "install-node"' "$tmp/install-node-disk-set" >/dev/null
-"$cli" node show install-node -o json -c "$tmp/config.json" >"$tmp/install-node-disk-show"
-jq -e '.result.storage.profile_default.boot_disk == "/dev/nvme0n1" and .result.storage.override.boot_disk == "/dev/vda" and .result.storage.effective.boot_disk == "/dev/vda"' "$tmp/install-node-disk-show" >/dev/null
-"$cli" profile set rocky-fresh boot_disk=/dev/vdb -o json -c "$tmp/config.json" >"$tmp/profile-disk-change"
-jq -e '.ok and .result.boot_disk == "/dev/vdb"' "$tmp/profile-disk-change" >/dev/null
-"$cli" node show install-node -o json -c "$tmp/config.json" >"$tmp/install-node-after-default"
-jq -e '.result.storage.profile_default.boot_disk == "/dev/vdb" and .result.storage.effective.boot_disk == "/dev/vda" and .result.deployment.install_intent == "initial-armed"' "$tmp/install-node-after-default" >/dev/null
-"$cli" node unset install-node boot_disk -o json -c "$tmp/config.json" >"$tmp/install-node-disk-unset"
-jq -e '.ok and .result.node_id == "install-node"' "$tmp/install-node-disk-unset" >/dev/null
-"$cli" node show install-node -o json -c "$tmp/config.json" >"$tmp/install-node-after-unset"
-jq -e '.result.storage.override == null and .result.storage.effective.boot_disk == "/dev/vdb" and .result.deployment.install_intent == "rearm-required"' "$tmp/install-node-after-unset" >/dev/null
-
-if "$cli" node set install-node unknown=value -o json -c "$tmp/config.json" >"$tmp/node-property-error" 2>&1; then
-    echo "node set unexpectedly accepted an unknown property" >&2
+"$cli" assets repository list >"$tmp/repository-list"
+grep -Fq 'rocky-9.7-aarch64-dvd' "$tmp/repository-list"
+"$cli" assets repository show rocky-9.7-aarch64-dvd -o json >"$tmp/repository-show"
+jq -e '.ok and .result.repository.name == "rocky-9.7-aarch64-dvd"' "$tmp/repository-show" >/dev/null
+"$cli" assets repository show rocky-9.7-aarch64-dvd -o json --fields name,manager >"$tmp/repository-show-fields"
+jq -e '.ok and .result.repository.name == "rocky-9.7-aarch64-dvd" and .result.repository.manager and (.result | keys) == ["repository"] and (.result.repository | keys | sort) == ["manager", "name"]' "$tmp/repository-show-fields" >/dev/null
+if "$cli" assets repository show rocky-9.7-aarch64-dvd --fields missing >"$tmp/repository-show-bad.out" 2>"$tmp/repository-show-bad.err"; then
+    echo 'repository show accepted unknown field' >&2
     exit 1
 else
     test "$?" -eq 2
 fi
-jq -e '.ok == false and .error.code == "node.invalid_property" and (.error.message | type == "string")' "$tmp/node-property-error" >/dev/null
+test ! -s "$tmp/repository-show-bad.out"
+grep -Fq 'unknown key' "$tmp/repository-show-bad.err"
+"$cli" assets repository software list rocky-9.7-aarch64-dvd --kind package --wide >"$tmp/repository-software"
+grep -Fq 'REVISION' "$tmp/repository-software"
+"$cli" assets repository software list rocky-9.7-aarch64-dvd --kind package -o json >"$tmp/repository-software-json"
+jq -e '.ok and (.result.items | length) > 0 and .result.items[0].capability.id' "$tmp/repository-software-json" >/dev/null
+software_id=$(jq -r '.result.items[0].capability.id' "$tmp/repository-software-json")
+software_kind=$(jq -r '.result.items[0].capability.kind' "$tmp/repository-software-json")
+"$cli" assets repository software list rocky-9.7-aarch64-dvd --kind package -o jsonl >"$tmp/repository-software-jsonl"
+jq -e '.ok and .result.repository and .result.capability.id' "$tmp/repository-software-jsonl" >/dev/null
+"$cli" assets repository software show rocky-9.7-aarch64-dvd "$software_id" --kind "$software_kind" --sections stored --fields id,kind,repository >"$tmp/repository-software-show"
+grep -Fq $'id\t'"$software_id" "$tmp/repository-software-show"
+"$cli" assets repository software show rocky-9.7-aarch64-dvd "$software_id" --kind "$software_kind" -o json --fields id,revision >"$tmp/repository-software-show-json"
+jq -e --arg id "$software_id" '.ok and .result.capability.id == $id and .result.index_digest and (.result | keys | sort) == ["capability", "index_digest"]' "$tmp/repository-software-show-json" >/dev/null
 
-# M2 read-only DHCP/runtime commands consume the validated local config and
-# daemon management routes. The empty pool is still a useful contract check.
-"$cli" runtime dhcp-leases -c "$tmp/config.json" >"$tmp/dhcp-leases"
-grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No DHCP leases\.)' "$tmp/dhcp-leases"
-"$cli" runtime dhcp-unknown -c "$tmp/config.json" >"$tmp/dhcp-unknown"
-grep -Eq '^(IP[[:space:]]+MAC[[:space:]]+PHASE[[:space:]]+EXPIRES|No unknown clients\.)' "$tmp/dhcp-unknown"
-"$cli" node list -c "$tmp/config.json" >"$tmp/node-list"
-grep -Fqx 'No nodes registered.' "$tmp/node-list"
-"$cli" node list -o json -c "$tmp/config.json" >"$tmp/node-list-json"
-jq -e '.ok and (.result.items | type == "array") and .result.next_cursor == null and (.result.view_revision.catalog | type == "number")' "$tmp/node-list-json" >/dev/null
-"$cli" profile list -o json -c "$tmp/config.json" >"$tmp/profile-list-json"
-jq -e '.ok and (.result.items | type == "array") and .result.next_cursor == null and (.result.view_revision | type == "number")' "$tmp/profile-list-json" >/dev/null
-
-"$cli" status -c "$tmp/config.json" >"$tmp/status-command"
-for check in 'Overall' 'Process' 'Loopback HTTP' 'Advertised HTTP' 'Management API' 'Active config' 'Catalog API' 'DHCP API' 'TFTP API' 'TFTP transfers'; do
-    grep -Fq "$check" "$tmp/status-command"
-done
-grep -Fq 'OK nodeforged operational' "$tmp/status-command"
-"$cli" status -o json -c "$tmp/config.json" >"$tmp/status-command.json"
-jq -e '.ok and .checks.process and .checks.loopback_http and .checks.advertised_http and .checks.management_api and .checks.active_config and .checks.catalog_api and .checks.dhcp_api and .checks.tftp_api' "$tmp/status-command.json" >/dev/null
-
-if "$daemon" --check -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/preflight" 2>&1; then
-    echo "preflight unexpectedly accepted an active HTTP listener" >&2
+"$cli" profile create contract-profile rocky-9.7-aarch64-dvd >"$tmp/profile-create"
+"$cli" profile list --columns name,source --no-header >"$tmp/profile-list"
+grep -Fq 'contract-profile' "$tmp/profile-list"
+"$cli" profile list -o jsonl >"$tmp/profile-list-jsonl"
+jq -e '.ok and .result.name == "contract-profile" and .result.install_source == "rocky-9.7-aarch64-dvd"' "$tmp/profile-list-jsonl" >/dev/null
+"$cli" node add contract-node mac=02:00:00:00:00:42 arch=aarch64 profile=contract-profile deploy=false >"$tmp/node-add"
+"$cli" node replace-values contract-node storage.additional_disks /dev/sdb --set overrides.install.storage.mode=raid1 -o json >"$tmp/node-storage-atomic"
+jq -e '.ok and .result.operation == "replace"' "$tmp/node-storage-atomic" >/dev/null
+"$cli" node show contract-node -o json >"$tmp/node-storage-atomic-show"
+jq -e '.result.storage.effective.mode == "raid1" and .result.storage.effective.members == ["/dev/sda", "/dev/sdb"]' "$tmp/node-storage-atomic-show" >/dev/null
+"$cli" node clear-values contract-node storage.additional_disks --set overrides.install.storage.mode=single -o json >/dev/null
+"$cli" profile software show contract-profile --sections stored --fields software.repositories,software.packages.include >"$tmp/profile-software-show"
+grep -Fqx 'Stored' "$tmp/profile-software-show"
+grep -Fq 'software.repositories' "$tmp/profile-software-show"
+"$cli" profile software show contract-profile -o json --fields software.repositories >"$tmp/profile-software-show-json"
+jq -e '.ok and .result.software.repositories and (.result | keys) == ["software"] and (.result.software | keys) == ["repositories"]' "$tmp/profile-software-show-json" >/dev/null
+"$cli" node software show contract-node --sections effective --fields effective.software.repositories,effective.software.packages.include >"$tmp/node-software-show"
+grep -Fqx 'Effective' "$tmp/node-software-show"
+if grep -Fq 'Overrides' "$tmp/node-software-show"; then
+    echo 'node software section filter retained overrides' >&2
     exit 1
 fi
-
-if "$daemon" -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/second-daemon" 2>&1; then
-    echo "second daemon unexpectedly bound the active HTTP listener" >&2
+"$cli" node software show contract-node -o json --fields effective.software.repositories >"$tmp/node-software-show-json"
+jq -e '.ok and .result.effective_software.repositories and (.result | keys) == ["effective_software"] and (.result.effective_software | keys) == ["repositories"]' "$tmp/node-software-show-json" >/dev/null
+"$cli" profile show contract-profile --sections stored --fields name,install_source >"$tmp/profile-show-fields"
+grep -Fqx 'Stored' "$tmp/profile-show-fields"
+grep -Fq $'name\tcontract-profile' "$tmp/profile-show-fields"
+if grep -Fq 'Effective' "$tmp/profile-show-fields"; then
+    echo 'profile show section filter retained effective fields' >&2
     exit 1
 fi
-
-curl --silent --fail-with-body "http://127.0.0.1:$port/not-found" >"$tmp/not-found" 2>&1 || true
-# M4.5：错误信封带 request_id，用前缀子串校验 code/message 并断言 request_id 存在。
-grep -Fq '{"ok":false,"error":{"code":"http.not_found","message":"route not found","request_id":"' "$tmp/not-found"
-grep -Eq '"request_id":"[0-9a-f]{32}"' "$tmp/not-found"
-
-# M4.3 durable operation: the first failed import records a terminal operation;
-# retrying the same key reuses it instead of executing the side effect again.
-# Key includes the shell PID so prior runs' persisted operations don't make the
-# first call reuse an existing operation (which would return 202, not 400).
-iso_key="missing-iso-test-$$"
-op_status=$(curl --silent -o "$tmp/op-first" -w '%{http_code}' -X POST -H "Idempotency-Key: $iso_key" -H 'Content-Type: application/json' --data '{"filename":"missing.iso","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}' "http://127.0.0.1:$port/api/v1/management/install-sources")
-test "$op_status" = 400
-op_status=$(curl --silent -o "$tmp/op-reused" -w '%{http_code}' -X POST -H "Idempotency-Key: $iso_key" -H 'Content-Type: application/json' --data '{"filename":"another-missing.iso","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}' "http://127.0.0.1:$port/api/v1/management/install-sources")
-test "$op_status" = 202
-grep -Fq '"state":"failed"' "$tmp/op-reused"
-operation_id=$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' "$tmp/op-reused")
-test ${#operation_id} = 32
-
-# M4.3 migration dry-run is daemon-owned, side-effect free and reproducible
-# for the same config/catalog revision pair.
-plan_status=$(curl --silent -o "$tmp/migration-plan-1" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans")
-test "$plan_status" = 200
-grep -Fq '"applicable":true' "$tmp/migration-plan-1"
-grep -Fq '"renames":[]' "$tmp/migration-plan-1"
-curl --silent --fail -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans" >"$tmp/migration-plan-2"
-digest_1=$(sed -n 's/.*"plan_digest":"\([0-9a-f]*\)".*/\1/p' "$tmp/migration-plan-1")
-digest_2=$(sed -n 's/.*"plan_digest":"\([0-9a-f]*\)".*/\1/p' "$tmp/migration-plan-2")
-test ${#digest_1} = 64
-test "$digest_1" = "$digest_2"
-"$cli" catalog migrate --dry-run -c "$tmp/config.json" >"$tmp/migration-plan-cli"
-grep -Fq 'Applicable: yes' "$tmp/migration-plan-cli"
-config_before_migration=$(cksum "$tmp/config.json")
-catalog_present_before=false
-test -e "$tmp/catalog.json" && catalog_present_before=true
-"$cli" catalog migrate --apply --plan-digest "$digest_1" -c "$tmp/config.json" >"$tmp/migration-apply-cli"
-grep -Fq '"kind":"catalog_migration"' "$tmp/migration-apply-cli"
-grep -Fq '"state":"succeeded"' "$tmp/migration-apply-cli"
-test ! -e "$tmp/model-transactions/$digest_1.json"
-test "$config_before_migration" = "$(cksum "$tmp/config.json")"
-test "$catalog_present_before" = false
-curl --silent --fail -X POST -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/catalog/migration-plans" >"$tmp/migration-plan-after-noop"
-digest_after_noop=$(sed -n 's/.*"plan_digest":"\([0-9a-f]*\)".*/\1/p' "$tmp/migration-plan-after-noop")
-test "$digest_1" = "$digest_after_noop"
-
-# M4.5：HTTP 契约补全--405+Allow、415、428、统一安全头和错误信封 request_id。
-allow_status=$(curl --silent -o "$tmp/mna" -D "$tmp/mna-headers" -w '%{http_code}' -X PUT "http://127.0.0.1:$port/api/v1/management/config")
-test "$allow_status" = 405
-grep -Eqi '^allow:[[:space:]]*get' "$tmp/mna-headers"
-grep -Fq '"code":"http.method_not_allowed"' "$tmp/mna"
-grep -Fq '"request_id"' "$tmp/mna"
-mt_status=$(curl --silent -o "$tmp/mt" -w '%{http_code}' -X POST -H 'Content-Type: text/plain' --data 'x' "http://127.0.0.1:$port/api/v1/management/assets")
-test "$mt_status" = 415
-grep -Fq '"code":"http.unsupported_media_type"' "$tmp/mt"
-patch_status=$(curl --silent -o "$tmp/config-patch" -w '%{http_code}' -X PATCH -H 'Content-Type: application/json' --data '{}' "http://127.0.0.1:$port/api/v1/management/config")
-test "$patch_status" = 405
-grep -Fq '"code":"http.method_not_allowed"' "$tmp/config-patch"
-curl --silent -D "$tmp/sec-headers" -o /dev/null "http://127.0.0.1:$port/api/v1/management/config"
-grep -Eqi '^cache-control:[[:space:]]*no-store,[[:space:]]*private' "$tmp/sec-headers"
-grep -Eqi '^x-content-type-options:[[:space:]]*nosniff' "$tmp/sec-headers"
-
-stop_daemon
-"$daemon" -d -c "$tmp/config.json" -C "$tmp/catalog.json" >"$tmp/debug-daemon.out" 2>"$tmp/debug-daemon.err" &
-pid=$!
-
-ready=false
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if curl --silent --fail "http://127.0.0.1:$port/healthz" >"$tmp/debug-health"; then
-        ready=true
-        break
-    fi
-    sleep 0.1
-done
-test "$ready" = true
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/operations/$operation_id" >"$tmp/op-after-restart"
-grep -Fq '"state":"failed"' "$tmp/op-after-restart"
-if ! grep -Fq 'http: request received GET /healthz' "$tmp/debug-daemon.err"; then
-    cat "$tmp/debug-daemon.out" "$tmp/debug-daemon.err" >&2
+"$cli" profile show contract-profile -o json --fields name,system.localization.locale >"$tmp/profile-show-json-fields"
+jq -e '.ok and .result.name == "contract-profile" and .result.effective_system.localization.locale and (.result | keys | sort) == ["effective_system", "name"]' "$tmp/profile-show-json-fields" >/dev/null
+if "$cli" profile show contract-profile --fields missing >"$tmp/profile-show-bad-field.out" 2>"$tmp/profile-show-bad-field.err"; then
+    echo 'profile show accepted an unknown field' >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/profile-show-bad-field.out"
+grep -Fq 'unknown key' "$tmp/profile-show-bad-field.err"
+code=$(curl --silent -o "$tmp/node-list-api" -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes")
+if [ "$code" != 200 ]; then
+    cat "$tmp/node-list-api" >&2
     exit 1
 fi
-
-# M2.5 HTTP request log must include method, path, status, bytes, duration and
-# client IP in the service log. /healthz is excluded from event audit but its
-# service log line must still contain the full structured fields.
-grep -Eq 'GET /healthz -> [0-9]+ \([0-9]+ bytes, [0-9]+us, client=' "$tmp/debug-daemon.err" || {
-    echo "healthz log line missing structured fields" >&2
-    cat "$tmp/debug-daemon.err" >&2
+jq -e '.ok and .result.items[0].id == "contract-node"' "$tmp/node-list-api" >/dev/null
+code=$(curl --silent -o "$tmp/node-show-api" -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes/contract-node")
+if [ "$code" != 200 ]; then
+    cat "$tmp/node-show-api" >&2
     exit 1
-}
-
-# Non-healthz requests must produce an http.request event in events.jsonl.
-# The daemon writes to /opt/nodeforge/logs/events.jsonl; in test it uses the
-# same fixed path. Verify the event log contains the http.request type.
-events_file="/opt/nodeforge/logs/events.jsonl"
-if [ -f "$events_file" ]; then
-    grep -Fq '"type":"http.request"' "$events_file" || {
-        echo "http.request event not found in events.jsonl" >&2
-        exit 1
-    }
-    # The event must include client_ip and duration_us fields.
-    grep -Fq '"key":"client_ip"' "$events_file" || {
-        echo "http.request event missing client_ip field" >&2
-        exit 1
-    }
-    grep -Fq '"key":"duration_us"' "$events_file" || {
-        echo "http.request event missing duration_us field" >&2
-        exit 1
-    }
 fi
-
-# M2.5 service.stopped event must be written on orderly shutdown.
-stop_daemon
-if [ -f "$events_file" ]; then
-    grep -Fq '"type":"service.stopped"' "$events_file" || {
-        echo "service.stopped event not found after shutdown" >&2
-        exit 1
-    }
+"$cli" node show contract-node --sections stored --fields id,mac,profile >"$tmp/node-show-fields"
+grep -Fqx 'Stored' "$tmp/node-show-fields"
+grep -Fq $'id\tcontract-node' "$tmp/node-show-fields"
+if grep -Fq 'Runtime' "$tmp/node-show-fields"; then
+    echo 'node show section filter retained runtime fields' >&2
+    exit 1
 fi
+"$cli" node show contract-node -o json --fields id,effective.system.localization.locale >"$tmp/node-show-json-fields"
+jq -e '.ok and .result.node.id == "contract-node" and .result.effective_system.localization.locale and (.result | keys | sort) == ["effective_system", "node"]' "$tmp/node-show-json-fields" >/dev/null
+if "$cli" node show contract-node --sections commands >"$tmp/node-show-bad-section.out" 2>"$tmp/node-show-bad-section.err"; then
+    echo 'node show accepted an unknown section' >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/node-show-bad-section.out"
+grep -Fq 'unknown key' "$tmp/node-show-bad-section.err"
+"$cli" node list --columns id,mac,profile,deploy --no-header >"$tmp/node-list"
+grep -Eq '^contract-node[[:space:]]+02:00:00:00:00:42[[:space:]]+contract-profile[[:space:]]+no[[:space:]]*$' "$tmp/node-list"
+"$cli" node list -o jsonl >"$tmp/node-list-jsonl"
+jq -e '.ok and .result.id == "contract-node" and .result.profile == "contract-profile" and (.result.deploy | not)' "$tmp/node-list-jsonl" >/dev/null
+"$cli" profile item add contract-profile system.users name=ops sudo=true >"$tmp/user-add"
+"$cli" profile item add-values contract-profile system.users ops groups wheel adm >"$tmp/user-groups"
+printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey contract' >"$tmp/ops.keys"
+"$cli" profile item replace-values contract-profile system.users ops ssh_authorized_keys --from-file "$tmp/ops.keys" >"$tmp/user-keys"
+"$cli" profile item list-values contract-profile system.users ops groups --no-header >"$tmp/user-groups-list"
+grep -Eq '^wheel[[:space:]]*$' "$tmp/user-groups-list"
+grep -Eq '^adm[[:space:]]*$' "$tmp/user-groups-list"
+"$cli" profile item list contract-profile system.users -o jsonl >"$tmp/user-item-list-jsonl"
+jq -e 'select(.result.name == "ops") | .ok and .result.sudo' "$tmp/user-item-list-jsonl" >/dev/null
+"$cli" profile item show contract-profile system.users ops --fields name,sudo >"$tmp/user-item-show"
+grep -Fq $'name\tops' "$tmp/user-item-show"
+if grep -Fq 'password' "$tmp/user-item-show"; then
+    echo 'item show field filter retained password' >&2
+    exit 1
+fi
+"$cli" profile item show contract-profile system.users ops -o json --fields name,sudo >"$tmp/user-item-show-json"
+jq -e '.ok and .result.name == "ops" and .result.sudo and (.result | keys | sort) == ["name", "sudo"]' "$tmp/user-item-show-json" >/dev/null
+"$cli" profile capabilities show contract-profile --columns domain,status --width 80 >"$tmp/profile-capabilities"
+grep -Fq 'install.storage' "$tmp/profile-capabilities"
+grep -Fq 'native' "$tmp/profile-capabilities"
+if "$cli" profile capabilities show contract-profile -o jsonl >"$tmp/profile-capabilities-jsonl.out" 2>"$tmp/profile-capabilities-jsonl.err"; then
+    echo 'detail command unexpectedly accepted jsonl' >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/profile-capabilities-jsonl.out"
+grep -Fq 'output mode is not supported' "$tmp/profile-capabilities-jsonl.err"
+if "$cli" profile capabilities show contract-profile --columns missing >"$tmp/profile-capabilities-column.out" 2>"$tmp/profile-capabilities-column.err"; then
+    echo 'capabilities accepted an unknown column' >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/profile-capabilities-column.out"
+grep -Fq 'unknown key' "$tmp/profile-capabilities-column.err"
+if "$cli" profile capabilities show contract-profile --width 80 --wide >"$tmp/profile-capabilities-width.out" 2>"$tmp/profile-capabilities-width.err"; then
+    echo 'capabilities accepted mutually exclusive width options' >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/profile-capabilities-width.out"
+grep -Fq 'mutually exclusive' "$tmp/profile-capabilities-width.err"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles/contract-profile/capabilities" >"$tmp/profile-capabilities-api"
+jq -e '.ok and .result.readiness.install == "ready" and any(.result.properties[]; .key == "install.storage.mode" and .status == "native") and any(.result.properties[]; .key == "install.apt.fallback" and .status == "not_applicable")' "$tmp/profile-capabilities-api" >/dev/null
+
+code=$(curl --silent -o "$tmp/stale" -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' -H 'If-Match: "0"' \
+    -d '{"name":"stale"}' "http://127.0.0.1:$port/api/v1/management/assets/provision-bundles")
+test "$code" = 409
+jq -e '.error.code == "catalog.revision_conflict"' "$tmp/stale" >/dev/null
+
+printf 'NodeForge managed file\n' >"$tmp/motd"
+"$cli" assets managed-file import site-motd --from-file "$tmp/motd" --media-type text/plain >"$tmp/import"
+grep -Fq 'revision 1' "$tmp/import"
+"$cli" assets managed-file show site-motd -o json >"$tmp/managed-show"
+jq -e '.ok and .result.name == "site-motd" and .result.kind == "managed_file" and .result.revision == 1 and .result.size == 23' "$tmp/managed-show" >/dev/null
+"$cli" assets managed-file list --columns name,revision,size --no-header >"$tmp/managed-list"
+grep -Eq '^site-motd[[:space:]]+1[[:space:]]+23$' "$tmp/managed-list"
+"$cli" assets managed-file list -o json >"$tmp/managed-list-json"
+jq -e '.ok and .result.items[0].name == "site-motd" and .result.items[0].revision == 1' "$tmp/managed-list-json" >/dev/null
+"$cli" assets managed-file list -o jsonl >"$tmp/managed-list-jsonl"
+jq -e '.ok and .result.name == "site-motd" and .result.size == 23' "$tmp/managed-list-jsonl" >/dev/null
+"$cli" assets managed-file show site-motd --fields name,revision >"$tmp/managed-show-fields"
+grep -Fq 'name' "$tmp/managed-show-fields"
+grep -Fq 'revision' "$tmp/managed-show-fields"
+if grep -Fq 'sha256' "$tmp/managed-show-fields"; then
+    echo 'managed-file field filter retained sha256' >&2
+    exit 1
+fi
+"$cli" assets managed-file show site-motd --sections stored --fields name >"$tmp/managed-show-section"
+grep -Fqx 'Stored' "$tmp/managed-show-section"
+if "$cli" assets managed-file show site-motd --sections runtime >"$tmp/managed-show-bad-section.out" 2>"$tmp/managed-show-bad-section.err"; then
+    echo 'managed-file show accepted an unknown section' >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/managed-show-bad-section.out"
+grep -Fq 'unknown key' "$tmp/managed-show-bad-section.err"
+if "$cli" assets managed-file show site-motd -o jsonl >"$tmp/managed-show-jsonl.out" 2>"$tmp/managed-show-jsonl.err"; then
+    echo 'managed-file detail unexpectedly accepted jsonl' >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/managed-show-jsonl.out"
+grep -Fq 'output mode is not supported' "$tmp/managed-show-jsonl.err"
+
+"$cli" assets provision-bundle create base-site >"$tmp/bundle-create"
+"$cli" assets provision-bundle item add base-site steps \
+    name=motd action=managed-file destination=/etc/motd content_asset=site-motd mode=0644 owner=root group=root >"$tmp/step-add"
+"$cli" assets provision-bundle item show base-site steps motd -o json >"$tmp/step-show"
+jq -e '.ok and .result.name == "motd" and .result.content_asset == "site-motd"' "$tmp/step-show" >/dev/null
+
+curl --silent --fail -D "$tmp/artifact-headers" "http://127.0.0.1:$port/artifacts/managed-files/site-motd/1" >"$tmp/artifact"
+cmp "$tmp/motd" "$tmp/artifact"
+grep -Eqi '^cache-control:.*immutable' "$tmp/artifact-headers" || { cat "$tmp/artifact-headers" >&2; exit 1; }
+grep -Eqi '^etag:[[:space:]]*"[0-9a-f]{64}"' "$tmp/artifact-headers"
+code=$(curl --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/artifacts/managed-files/site-motd/0")
+test "$code" = 404
+
+if "$cli" assets managed-file remove site-motd >"$tmp/remove-in-use" 2>&1; then
+    echo 'managed-file remove accepted an in-use asset' >&2
+    exit 1
+fi
+grep -Fq 'AssetInUse' "$tmp/remove-in-use"
+"$cli" assets provision-bundle item remove base-site steps motd >"$tmp/step-remove"
+"$cli" assets managed-file remove site-motd >"$tmp/remove"
+test "$(jq '[.[] | select(.name == "site-motd")] | length' "$install/catalog/assets.json")" = 0
+test -f "$install/assets/managed-files/site-motd/1"
+code=$(curl --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/artifacts/managed-files/site-motd/1")
+test "$code" = 404
+
+"$cli" assets provision-bundle remove base-site >"$tmp/bundle-remove"
+"$cli" catalog validate >"$tmp/validate"
+grep -Fq 'catalog valid' "$tmp/validate"
+
+kill -0 "$pid"

@@ -169,6 +169,11 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         return err;
     };
     if (recovered != 0) nodeforge.observe_log.info("model: recovered {d} transaction journal(s) before validation", .{recovered});
+    const schema_recovered = nodeforge.schema_v3_transaction.recoverAll(ctx.io, ctx.allocator, transaction_dir) catch |err| {
+        nodeforge.observe_log.err("schema-v3: transaction recovery failed closed: {t}", .{err});
+        return err;
+    };
+    if (schema_recovered != 0) nodeforge.observe_log.info("schema-v3: recovered {d} transaction journal(s) before validation", .{schema_recovered});
 
     var parsed = nodeforge.config.load(ctx.io, ctx.allocator, config_path) catch |err| {
         nodeforge.observe_log.err("config: cannot load {s}", .{config_path});

@@ -177,7 +177,7 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
     const profile_name = decision.profile orelse return;
     var always = false;
     for (config.profiles) |profile| if (std.mem.eql(u8, profile.name, profile_name)) {
-        always = profile.safety.reinstall_policy == .always;
+        always = profile.install.reinstall_policy == .always;
         break;
     };
     if (!always or !deployments.canAutoRearm(node_id)) return;
@@ -214,6 +214,16 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
 /// DHCP 回复；将其视为探测通过将允许在缺少 CAP_NET_RAW 的主机上发生
 /// lease 碰撞。
 fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, persistence: ?*const Persistence, session_link: ?*const boot_session.Link) ?packet.Reply {
+    const initial = resolver.resolve(config, request.mac(), request.architecture);
+    const unknown_action: ?model.UnknownAction = if (!initial.known) if (persistence) |p| blk: {
+        const pair = p.models.acquire();
+        defer pair.release();
+        break :blk pair.catalog.value().discovery_policy.unknown_action;
+    } else .record else null;
+    if (unknown_action == .deny) {
+        recordUnknownObservation(io, persistence, request, null);
+        return null;
+    }
     var attempts: usize = 0;
     while (attempts < runtime_state.DhcpState.max_leases) : (attempts += 1) {
         const preliminary = resolver.resolve(config, request.mac(), request.architecture);
@@ -236,7 +246,13 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
                 if (decision.deploy_disabled) emitDeployDisabled(io, persistence, node_id);
             }
         }
-        const reply = processWithDeployment(config, runtime, request, if (persistence) |p| p.deployments else null, digest) orelse return null;
+        var reply = processWithDeployment(config, runtime, request, if (persistence) |p| p.deployments else null, digest) orelse return null;
+        if (unknown_action == .record) {
+            // Unknown clients receive a diagnostic lease only. Catalog policy
+            // never permits the legacy startup discovery profile to leak a PXE bootfile.
+            reply.bootfile = null;
+            recordUnknownObservation(io, persistence, request, reply.yiaddr);
+        }
         if (reply.kind != .offer) return reply;
         // 已注册节点的显式保留地址对其 MAC 是独占的。
         // 不要因为旧客户端网络栈在固件重新获取 DHCP 时仍回答 ICMP 而让
@@ -262,6 +278,36 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
     }
     observe_log.err("dhcp: no unchecked candidate remained after ping probes", .{});
     return null;
+}
+
+fn recordUnknownObservation(io: std.Io, persistence: ?*const Persistence, request: *const packet.Packet, ip: ?u32) void {
+    const p = persistence orelse return;
+    var mac_buffer: [18]u8 = undefined;
+    const mac = request.mac();
+    if (mac.len != 6) return;
+    const mac_text = std.fmt.bufPrint(&mac_buffer, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch return;
+    var ip_buffer: [16]u8 = undefined;
+    const ip_text: ?[]const u8 = if (ip) |value| formatIp(&ip_buffer, value) catch null else null;
+    var client_id_buffer: [512]u8 = undefined;
+    const client_id: ?[]const u8 = if (request.client_identifier) |raw| blk: {
+        if (raw.len * 2 > client_id_buffer.len) break :blk null;
+        const digits = "0123456789abcdef";
+        for (raw, 0..) |byte, index| {
+            client_id_buffer[index * 2] = digits[byte >> 4];
+            client_id_buffer[index * 2 + 1] = digits[byte & 0x0f];
+        }
+        break :blk client_id_buffer[0 .. raw.len * 2];
+    } else null;
+    const arch: ?model.Arch = switch (request.architecture) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+        .unknown => null,
+    };
+    const vendor = if (request.vendor_class) |value| if (std.unicode.utf8ValidateSlice(value)) value else null else null;
+    p.models.lock();
+    defer p.models.unlock();
+    p.models.catalogs.recordUnknownClient(io, mac_text, client_id, arch, vendor, ip_text, now()) catch |err|
+        observe_log.err("dhcp: persistent unknown-client observation failed: {t}", .{err});
 }
 
 /// 为因无匹配已武装 generation 而被暂停的节点发出 `boot.install_not_armed` 事件
@@ -656,12 +702,12 @@ fn requestEvent(kind: packet.MessageType) []const u8 {
         else => "dhcp.request",
     };
 }
-test "aarch64 discover returns catalog bootfile" {
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" }, .policy = .{ .default_action = .discovery } };
+test "legacy discovery action does not boot unknown clients" {
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.50.1" } };
     var runtime: runtime_state.RuntimeState = .{};
     const mac = [_]u8{ 1, 2, 3, 4, 5, 6 };
     const reply = process(&config, &runtime, &.{ .op = 1, .xid = 1, .flags = 0, .ciaddr = 0, .yiaddr = 0, .siaddr = 0, .giaddr = 0, .chaddr = mac ++ [_]u8{0} ** 10, .hlen = 6, .message_type = .discover, .architecture = .aarch64 }).?;
-    try std.testing.expectEqualStrings("efi/grubaa64.efi", reply.bootfile.?);
+    try std.testing.expect(reply.bootfile == null);
 }
 
 test "dynamic allocation skips another node's static reservation" {

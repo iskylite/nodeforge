@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const model = @import("../model.zig");
+const schema_v3_dto = @import("schema_v3_dto.zig");
 
 /// 磁盘 `config.json` 的唯一可序列化形状。AppConfig 中保留的 legacy 管理实体
 /// 只用于 schema 1 迁移/运行时投影，绝不能被 daemon 写回启动配置。
@@ -16,7 +17,6 @@ const StartupConfig = struct {
     capacity: model.CapacityConfig,
     logging: model.LoggingConfig,
     events: model.EventsConfig,
-    policy: model.PolicyConfig,
 };
 
 /// 将配置格式化为稳定、便于审阅的 JSON，并在末尾补换行。
@@ -25,7 +25,13 @@ pub fn render(allocator: std.mem.Allocator, config: *const model.AppConfig) ![]u
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
 
+    if (config.schema_version == 3) {
+        try std.json.Stringify.value(schema_v3_dto.fromModel(config), .{ .whitespace = .indent_2 }, &output.writer);
+        try output.writer.writeByte('\n');
+        return output.toOwnedSlice();
+    }
     const startup: StartupConfig = .{
+        .schema_version = config.schema_version,
         .server = config.server,
         .http = config.http,
         .tftp = config.tftp,
@@ -33,7 +39,6 @@ pub fn render(allocator: std.mem.Allocator, config: *const model.AppConfig) ![]u
         .capacity = config.capacity,
         .logging = config.logging,
         .events = config.events,
-        .policy = config.policy,
     };
     try std.json.Stringify.value(startup, .{ .whitespace = .indent_2 }, &output.writer);
     try output.writer.writeByte('\n');
@@ -96,15 +101,12 @@ test "M4.7 render excludes legacy catalog-owned entities" {
         .server = .{ .server_ip = "192.168.50.1" },
         .profiles = &.{.{
             .name = "strict-ubuntu",
-            .mode = .install,
-            .distro = "ubuntu",
-            .version = "22.04",
-            .arch = .aarch64,
+            .install_source = "ubuntu-source",
             .install = .{ .apt = .{ .fallback = .abort } },
         }},
     };
     const bytes = try render(allocator, &config);
     defer allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"profiles\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"schema_version\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"schema_version\": 3") != null);
 }

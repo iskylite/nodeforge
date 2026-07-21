@@ -24,7 +24,13 @@ pub const Row = struct { cells: []const []const u8 };
 
 /// 统一 renderer 的小型选项集。当前 M1.5 不输出颜色；保留 `color` 是为了让未来
 /// TTY 状态色在一个入口启用，且测试、重定向和 `--no-color` 可明确传 false。
-pub const Options = struct { color: bool = false };
+pub const Options = struct {
+    color: bool = false,
+    columns: []const u8 = "",
+    width: usize = 0,
+    wide: bool = false,
+    no_header: bool = false,
+};
 
 /// 渲染表头和所有行。空行列表仅输出 `empty_message`，避免产生误导的空表头。
 /// 输入内的控制字符会转义，确保一个 catalog 字段不能换行或重置终端状态。
@@ -35,20 +41,61 @@ pub fn render(
     empty_message: []const u8,
     options: Options,
 ) !void {
-    _ = options; // M1.5 保持无颜色输出；后续仅在此处集中增加 ANSI 包装。
     if (rows.len == 0) return writer.print("{s}\n", .{empty_message});
     if (columns.len == 0) return;
 
     var widths: [16]usize = undefined;
+    var indices: [16]usize = undefined;
     if (columns.len > widths.len) return error.TooManyColumns;
-    for (columns, 0..) |column, i| widths[i] = @max(column.min_width, displayWidth(column.title));
+    var selected_count: usize = 0;
+    for (columns, 0..) |column, index| {
+        if (!selectedColumn(options.columns, column.key)) continue;
+        indices[selected_count] = index;
+        widths[selected_count] = @max(column.min_width, displayWidth(column.title));
+        selected_count += 1;
+    }
+    if (selected_count == 0) return error.UnknownColumn;
     for (rows) |row| {
         if (row.cells.len != columns.len) return error.InvalidRow;
-        for (row.cells, 0..) |cell, i| widths[i] = @max(widths[i], boundedWidth(cell, columns[i].max_width));
+        for (indices[0..selected_count], 0..) |source_index, selected_index| {
+            const maximum = if (options.wide) null else columns[source_index].max_width;
+            widths[selected_index] = @max(widths[selected_index], boundedWidth(row.cells[source_index], maximum));
+        }
     }
-    try renderLine(writer, columns, widths[0..columns.len], null);
-    try renderSeparator(writer, widths[0..columns.len]);
-    for (rows) |row| try renderLine(writer, columns, widths[0..columns.len], row.cells);
+    constrainWidths(widths[0..selected_count], options.width);
+    if (!options.no_header) {
+        try renderSelectedLine(writer, columns, indices[0..selected_count], widths[0..selected_count], null, options.wide);
+        try renderSeparator(writer, widths[0..selected_count]);
+    }
+    for (rows) |row| try renderSelectedLine(writer, columns, indices[0..selected_count], widths[0..selected_count], row.cells, options.wide);
+}
+
+fn selectedColumn(selection: []const u8, key: []const u8) bool {
+    if (selection.len == 0) return true;
+    var iterator = std.mem.splitScalar(u8, selection, ',');
+    while (iterator.next()) |raw| if (std.mem.eql(u8, std.mem.trim(u8, raw, " \t"), key)) return true;
+    return false;
+}
+
+fn constrainWidths(widths: []usize, maximum: usize) void {
+    if (maximum == 0 or widths.len == 0) return;
+    const separators = (widths.len - 1) * 2;
+    if (maximum <= separators + widths.len) return;
+    const available = maximum - separators;
+    while (sum(widths) > available) {
+        var widest: usize = 0;
+        for (widths, 0..) |width, index| if (width > widths[widest]) {
+            widest = index;
+        };
+        if (widths[widest] <= 1) break;
+        widths[widest] -= 1;
+    }
+}
+
+fn sum(values: []const usize) usize {
+    var total: usize = 0;
+    for (values) |value| total += value;
+    return total;
 }
 
 /// 表头与数据之间的分隔线是 human table 的固定组成部分。它让长列表在滚动
@@ -61,14 +108,16 @@ fn renderSeparator(writer: *std.Io.Writer, widths: []const usize) !void {
     try writer.writeByte('\n');
 }
 
-fn renderLine(writer: *std.Io.Writer, columns: []const Column, widths: []const usize, cells: ?[]const []const u8) !void {
-    for (columns, 0..) |column, i| {
-        if (i != 0) try writer.writeAll("  ");
-        const value = if (cells) |line| line[i] else column.title;
-        const visible = boundedWidth(value, column.max_width);
-        const padding = widths[i] - visible;
+fn renderSelectedLine(writer: *std.Io.Writer, columns: []const Column, indices: []const usize, widths: []const usize, cells: ?[]const []const u8, wide: bool) !void {
+    for (indices, 0..) |source_index, selected_index| {
+        if (selected_index != 0) try writer.writeAll("  ");
+        const column = columns[source_index];
+        const value = if (cells) |line| line[source_index] else column.title;
+        const maximum = if (wide) widths[selected_index] else @min(column.max_width orelse widths[selected_index], widths[selected_index]);
+        const visible = boundedWidth(value, maximum);
+        const padding = widths[selected_index] - visible;
         if (cells != null and column.alignment == .right) try spaces(writer, padding);
-        try writeCell(writer, value, column.max_width);
+        try writeCell(writer, value, maximum);
         if (cells == null or column.alignment == .left) try spaces(writer, padding);
     }
     try writer.writeByte('\n');
@@ -255,4 +304,19 @@ test "writeEscaped escapes control characters" {
     var writer: std.Io.Writer = .fixed(&buffer);
     try writeEscaped(&writer, "a\nb\t");
     try std.testing.expectEqualStrings("a\\x0ab\\x09", writer.buffered());
+}
+
+test "output options filter columns constrain width and suppress header" {
+    const columns = [_]Column{ .{ .key = "name", .title = "NAME" }, .{ .key = "path", .title = "PATH" } };
+    const cells = [_][]const u8{ "kernel", "boot/a-very-long-image" };
+    const rows = [_]Row{.{ .cells = &cells }};
+    var filtered_buffer: [128]u8 = undefined;
+    var filtered: std.Io.Writer = .fixed(&filtered_buffer);
+    try render(&filtered, &columns, &rows, "empty", .{ .columns = "name", .no_header = true });
+    try std.testing.expectEqualStrings("kernel\n", filtered.buffered());
+    var width_buffer: [128]u8 = undefined;
+    var width_writer: std.Io.Writer = .fixed(&width_buffer);
+    try render(&width_writer, &columns, &rows, "empty", .{ .width = 14 });
+    var lines = std.mem.splitScalar(u8, width_writer.buffered(), '\n');
+    while (lines.next()) |line| try std.testing.expect(displayWidth(line) <= 14);
 }

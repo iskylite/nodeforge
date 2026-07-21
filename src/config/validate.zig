@@ -86,6 +86,11 @@ pub const ValidationError = error{
     InvalidTftpBlksize,
     InvalidKernelArgs,
     KernelArgsRequiresBootloader,
+    MissingSoftwareIndex,
+    SoftwareCapabilityMissing,
+    SoftwareKindNotApplicable,
+    SoftwareSelectionConflict,
+    PropertyNotApplicable,
 };
 
 /// 完整校验启动配置和 catalog 的引用关系。
@@ -97,8 +102,8 @@ pub fn validate(config: *const model.AppConfig, catalog: *const model.Catalog) V
     try validateConfig(config);
     try validateCatalog(config, catalog);
     try validateProfiles(config, catalog);
-    try validateNodes(config);
-    try validatePolicy(config);
+    try validateNodes(config, catalog);
+    try validateSoftware(config, catalog);
 }
 
 /// M4.7 显式三层校验入口：shape 校验不会把“文件可解析”误报为完整模型可运行。
@@ -112,7 +117,7 @@ pub fn validateConfigShape(config: *const model.AppConfig) ValidationError!void 
 }
 
 pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version != 1 and catalog.schema_version != 2) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version < 1 or catalog.schema_version > 3) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.DistroConfig, catalog.distros);
     try uniqueNamed(model.ProfileConfig, catalog.profiles);
     try uniqueNamed(model.ProvisioningBundle, catalog.provisioning_bundles);
@@ -120,6 +125,7 @@ pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void 
     try uniqueNamed(model.AssetConfig, catalog.assets);
     try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
     try uniqueNamed(model.BootBundleConfig, catalog.boot_bundles);
+    try uniqueNamed(model.ProvisioningBundle, catalog.provisioning_bundles);
     for (catalog.nodes, 0..) |node, index| {
         if (!validNodeId(node.id)) return error.InvalidLogicalId;
         if (!validMac(node.mac)) return error.InvalidNodeMac;
@@ -146,7 +152,7 @@ pub fn validateModel(config: *const model.AppConfig, catalog: *const model.Catal
 /// 不检查 catalog 引用关系，适用于 CLI 在 catalog 尚未加载时
 /// 对 config 做快速预检。
 pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
-    if (config.schema_version != 1 and config.schema_version != 2) return error.UnsupportedSchemaVersion;
+    if (config.schema_version < 1 or config.schema_version > 3) return error.UnsupportedSchemaVersion;
     if (config.server.name.len == 0) return error.EmptyServerName;
     if (config.server.bind_interface) |iface| {
         if (iface.len == 0) return error.EmptyBindInterface;
@@ -178,21 +184,16 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     for (config.profiles) |profile| try validateKernelArgs(config, profile);
 }
 
-fn validateKernelArgs(config: *const model.AppConfig, profile: model.ProfileConfig) ValidationError!void {
+fn validateKernelArgs(_: *const model.AppConfig, profile: model.ProfileConfig) ValidationError!void {
     const value = profile.kernel_args orelse return;
     if (value.len == 0) return;
-    if (profile.mode == .discovery) return error.InvalidKernelArgs;
-    const family: ?model.DistroFamily = if (lookup.findDistro(config, profile.distro)) |distro| distro.family else null;
-    if (!validKernelArgs(value, profile.mode, family)) return error.InvalidKernelArgs;
-    if (profile.mode == .install) {
-        const install = profile.install orelse return error.KernelArgsRequiresBootloader;
-        if (!install.bootloader.install) return error.KernelArgsRequiresBootloader;
-    }
+    if (!validKernelArgs(value, null)) return error.InvalidKernelArgs;
+    if (!profile.install.bootloader.install) return error.KernelArgsRequiresBootloader;
 }
 
 /// 校验已经 canonicalize 的 M4.6 token 列表。保留名只与第一个 `=` 前的
 /// 参数名精确比较，绝不做子串匹配。
-pub fn validKernelArgs(value: []const u8, mode: model.ProfileMode, family: ?model.DistroFamily) bool {
+pub fn validKernelArgs(value: []const u8, family: ?model.DistroFamily) bool {
     if (value.len == 0 or value.len > 256) return false;
     for (value) |byte| {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '=' or byte == '.' or byte == '-' or
@@ -204,7 +205,7 @@ pub fn validKernelArgs(value: []const u8, mode: model.ProfileMode, family: ?mode
     while (tokens.next()) |token| {
         token_count += 1;
         const name = kernelArgName(token);
-        if (name.len == 0 or name[0] == '-' or reservedKernelArg(name, mode, family)) return false;
+        if (name.len == 0 or name[0] == '-' or reservedKernelArg(name, family)) return false;
 
         var previous = std.mem.tokenizeScalar(u8, value, ' ');
         var previous_count: usize = 0;
@@ -222,10 +223,9 @@ fn kernelArgName(token: []const u8) []const u8 {
     return token[0..end];
 }
 
-fn reservedKernelArg(name: []const u8, mode: model.ProfileMode, family: ?model.DistroFamily) bool {
+fn reservedKernelArg(name: []const u8, family: ?model.DistroFamily) bool {
     const common = [_][]const u8{ "ip", "root", "initrd", "BOOT_IMAGE", "nodeforge.config", "boot_session_id", "token", "capability" };
     for (common) |reserved| if (std.mem.eql(u8, name, reserved)) return true;
-    if (mode != .install) return false;
     if (family == .rhel) {
         const rhel = [_][]const u8{ "rd.neednet", "inst.ks", "inst.repo", "inst.stage2" };
         for (rhel) |reserved| if (std.mem.eql(u8, name, reserved)) return true;
@@ -274,7 +274,7 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
 /// 需要 config 已经通过 `validateConfig`；catalog 中的 distro/version/arch
 /// 必须能在 ISO 导入所维护的 distro 能力索引中找到，asset kind 必须与引用方期望一致。
 pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version != 1 and catalog.schema_version != 2) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version < 1 or catalog.schema_version > 3) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.RepositoryConfig, catalog.repositories);
     try uniqueNamed(model.AssetConfig, catalog.assets);
     try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
@@ -283,6 +283,7 @@ pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Cat
     try validateRepositories(config, catalog);
     try validateInstallSources(config, catalog);
     try validateBootBundles(config, catalog);
+    try validateProvisioningBundles(catalog);
 }
 
 fn uniqueNamed(comptime T: type, items: []const T) ValidationError!void {
@@ -395,6 +396,23 @@ fn validateAssets(config: *const model.AppConfig, catalog: *const model.Catalog)
         } else if (asset.version != null or asset.arch != null) {
             return error.UnsupportedDistroTuple;
         }
+        if (asset.kind == .managed_file and (asset.revision == 0 or asset.sha256 == null or asset.size == null or asset.media_type == null)) return error.InvalidProvisioningStep;
+    }
+}
+
+fn validateProvisioningBundles(catalog: *const model.Catalog) ValidationError!void {
+    for (catalog.provisioning_bundles) |bundle| {
+        if (bundle.revision == 0) return error.InvalidProvisioningStep;
+        for (bundle.steps, 0..) |step, index| {
+            if (catalog.schema_version == 3 and (step.action != .managed_file or step.repository != null or step.packages.len != 0 or step.content != null)) return error.InvalidProvisioningStep;
+            const destination = step.destination orelse return error.InvalidProvisioningStep;
+            if (!std.mem.startsWith(u8, destination, "/") or std.mem.indexOf(u8, destination, "..") != null or step.mode > 0o777) return error.InvalidProvisioningStep;
+            if (!validIdentifier(step.owner) or !validIdentifier(step.group)) return error.InvalidProvisioningStep;
+            const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
+            const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
+            if (asset.kind != .managed_file) return error.AssetKindMismatch;
+            for (bundle.steps[index + 1 ..]) |other| if (std.mem.eql(u8, step.name, other.name)) return error.DuplicateObjectName;
+        }
     }
 }
 
@@ -464,35 +482,18 @@ fn validateBootBundles(config: *const model.AppConfig, catalog: *const model.Cat
 /// 因为无盘模式不应写本地磁盘。
 fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     for (config.profiles) |profile| {
-        _ = lookup.findDistroVersion(config, profile.distro, profile.version, profile.arch) orelse
-            return error.UnsupportedDistroTuple;
-        switch (profile.mode) {
-            .discovery => {
-                if (profile.install_source != null or profile.boot_bundle != null)
-                    return error.InvalidProfileSource;
-                if (profile.safety.destructive or profile.safety.persistent_writes)
-                    return error.InvalidProfileSafety;
-            },
-            .install => {
-                const name = profile.install_source orelse return error.MissingInstallSource;
-                const source = lookup.findInstallSource(catalog, name) orelse return error.InvalidProfileSource;
-                if (profile.boot_bundle != null or !sameTuple(profile.distro, profile.version, profile.arch, source.distro, source.version, source.arch))
-                    return error.InvalidProfileSource;
-                if (!profile.safety.destructive or !profile.safety.persistent_writes) return error.InvalidProfileSafety;
-                const system = profile_install.effectiveSystem(&profile) catch return error.InstallIdentityUnavailable;
-                if (profile.install) |install| try validateInstallConfig(config, system, install) else return error.InvalidProfileSource;
-                try validateTargetSystem(system);
-                // `always` 保留为刻意高风险选项，但仅对已要求 destructive
-                // persistent 的 profile 有效。
-                if (profile.safety.reinstall_policy == .always and (!profile.safety.destructive or !profile.safety.persistent_writes)) return error.InvalidReinstallPolicy;
-            },
-            .diskless => {
-                const name = profile.boot_bundle orelse return error.MissingBootBundle;
-                const bundle = lookup.findBootBundle(catalog, name) orelse return error.InvalidProfileSource;
-                if (profile.install_source != null or !sameTuple(profile.distro, profile.version, profile.arch, bundle.distro, bundle.version, bundle.arch))
-                    return error.InvalidProfileSource;
-                if (profile.safety.destructive) return error.InvalidProfileSafety;
-            },
+        const source = lookup.findInstallSource(catalog, profile.install_source) orelse return error.InvalidProfileSource;
+        _ = lookup.findDistroVersion(config, source.distro, source.version, source.arch) orelse return error.UnsupportedDistroTuple;
+        const system = profile_install.effectiveSystem(&profile) catch return error.InstallIdentityUnavailable;
+        const node: model.NodeConfig = .{ .id = "validation", .mac = "02:00:00:00:00:00", .arch = source.arch, .profile = profile.name };
+        var scratch: [1][]const u8 = undefined;
+        const install = profile_install.effectiveInstall(&node, &profile, &scratch) catch return error.InvalidInstallStorage;
+        try validateInstallConfig(config, system, install);
+        try validateTargetSystem(system);
+        if (system.security.apparmor != .disabled or system.security.selinux != .disabled) {
+            const distro = lookup.findDistro(catalog, source.distro) orelse return error.UnsupportedDistroTuple;
+            if (distro.family == .rhel and system.security.apparmor != .disabled) return error.PropertyNotApplicable;
+            if (distro.family == .ubuntu and system.security.selinux != .disabled) return error.PropertyNotApplicable;
         }
     }
 }
@@ -506,7 +507,9 @@ fn validateTargetSystem(system: model.TargetSystemConfig) ValidationError!void {
     if (system.ssh.root_login == .yes and system.ssh.root_password == null and system.ssh.root_authorized_keys.len == 0 and system.users.len == 0) return error.InstallAccessUnavailable;
     for (system.users, 0..) |user, i| {
         if (!validUser(user.name) or std.mem.eql(u8, user.name, "root")) return error.InstallAccessUnavailable;
-        for (system.users[i + 1 ..]) |other| if (std.mem.eql(u8, user.name, other.name)) return error.InstallAccessUnavailable;
+        if (user.shell) |shell| if (shell.len < 2 or shell[0] != '/' or std.mem.indexOfAny(u8, shell, " \t\r\n") != null) return error.InstallAccessUnavailable;
+        for (user.groups) |group| if (!validUser(group)) return error.InstallAccessUnavailable;
+        for (system.users[i + 1 ..]) |other| if (std.mem.eql(u8, user.name, other.name) or (user.uid != null and other.uid == user.uid)) return error.InstallAccessUnavailable;
         for (user.ssh_authorized_keys) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
     }
     for (system.ssh.root_authorized_keys) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
@@ -514,32 +517,37 @@ fn validateTargetSystem(system: model.TargetSystemConfig) ValidationError!void {
 
 fn validateInstallConfig(config: *const model.AppConfig, system: model.TargetSystemConfig, install: model.InstallConfig) ValidationError!void {
     const storage = install.storage;
-    if (storage.boot_disk.len == 0 or storage.install_disks.len == 0) return error.InvalidInstallStorage;
+    if (storage.boot_disk.len == 0 or storage.members.len == 0) return error.InvalidInstallStorage;
     var disk_found = false;
-    for (storage.install_disks) |disk| {
+    for (storage.members) |disk| {
         if (!validDevicePath(disk)) return error.InvalidInstallStorage;
         if (std.mem.eql(u8, disk, storage.boot_disk)) disk_found = true;
     }
     if (!disk_found) return error.InvalidInstallStorage;
-    if (install.bootloader.install and !std.mem.eql(u8, install.bootloader.target, "storage.boot_disk")) return error.InvalidInstallStorage;
-    if (install.bootloader.set_firmware_boot_order) return error.UnsupportedFirmwareBootOrder;
     var esp = false;
-    var biosboot = false;
     var root_count: usize = 0;
-    for (storage.partitions) |part| {
-        if (part.size_mib == 0) return error.InvalidInstallStorage;
+    var grow_count: usize = 0;
+    for (storage.partitions, 0..) |part, index| {
+        if (config.schema_version == 3 and (part.id == null or !validIdentifier(part.id.?))) return error.InvalidInstallStorage;
+        if (part.id) |id| for (storage.partitions[index + 1 ..]) |other| if (other.id != null and std.mem.eql(u8, id, other.id.?)) return error.InvalidInstallStorage;
+        if (part.size_mib == 0 and !part.grow) return error.InvalidInstallStorage;
+        if (part.grow) grow_count += 1;
         if (part.filesystem) |fs| if (!validIdentifier(fs)) return error.InvalidInstallStorage;
         if (part.mount) |mount| if (!validMountPath(mount)) return error.InvalidInstallStorage;
         if (part.kind == .esp and part.mount != null and std.mem.eql(u8, part.mount.?, "/boot/efi")) esp = true;
-        if (part.kind == .biosboot) biosboot = true;
         if (part.kind == .root) root_count += 1;
     }
+    if (grow_count > 1) return error.InvalidInstallStorage;
     // 空分区列表请求适配器默认布局；显式布局必须包含固件要求的分区。
-    if (storage.partitions.len != 0 and storage.boot_mode == .uefi and !esp) return error.InvalidInstallStorage;
-    if (storage.partitions.len != 0 and storage.boot_mode == .bios and storage.partition_table == .gpt and !biosboot) return error.InvalidInstallStorage;
+    if (storage.partitions.len != 0 and !esp) return error.InvalidInstallStorage;
     if (storage.partitions.len != 0 and root_count != 1) return error.InvalidInstallStorage;
     try validatePackages(system.packages);
-    if (install.bundle) |name| {
+    if (install.proxy.url) |url| {
+        const uri = std.Uri.parse(url) catch return error.InvalidProfileSource;
+        if (uri.scheme.len == 0 or uri.host == null or (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https"))) return error.InvalidProfileSource;
+    }
+    for (install.proxy.no_proxy) |value| if (!validNetworkName(value)) return error.InvalidProfileSource;
+    if (install.post_install.bundle orelse install.bundle) |name| {
         var found = false;
         for (config.provisioning_bundles) |bundle| {
             if (std.mem.eql(u8, bundle.name, name)) found = true;
@@ -555,29 +563,57 @@ fn sameTuple(distro: []const u8, version: []const u8, arch: model.Arch, other_di
     return std.mem.eql(u8, distro, other_distro) and std.mem.eql(u8, version, other_version) and arch == other_arch;
 }
 
-fn validateNodes(config: *const model.AppConfig) ValidationError!void {
+fn validateNodes(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     for (config.nodes, 0..) |node, i| {
         if (!validNodeId(node.id)) return error.InvalidLogicalId;
         if (!validMac(node.mac)) return error.InvalidNodeMac;
-        const profile = lookup.findProfile(config, node.profile) orelse return error.MissingProfile;
-        if (profile.arch != node.arch) return error.InvalidProfileSource;
-        if (node.ip) |ip| {
+        const profile_name = node.profile orelse {
+            if (node.deploy) return error.MissingProfile;
+            continue;
+        };
+        const profile = lookup.findProfile(config, profile_name) orelse return error.MissingProfile;
+        const source = lookup.findInstallSource(catalog, profile.install_source) orelse return error.InvalidProfileSource;
+        if (source.arch != node.arch) return error.InvalidProfileSource;
+        try validateKernelDelta(catalog, profile, node.overrides.kernel_args);
+        if (node.pxe.ip_reservation orelse node.ip) |ip| {
             const parsed_ip = std.Io.net.IpAddress.parseIp4(ip, 0) catch return error.InvalidNodeIpv4;
             if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed_ip))) return error.NodeOutsideDhcpSubnet;
         }
-        if (node.overrides.network) |network| try validateTargetNetwork(config, node, network);
-        if (profile.mode != .install and node.overrides.storage != null) return error.InvalidInstallStorage;
-        if (profile.mode == .install) {
-            var single_disk: [1][]const u8 = undefined;
-            const install = profile_install.effectiveInstall(&node, profile, &single_disk) catch return error.InvalidInstallStorage;
-            const system = profile_install.effectiveSystem(profile) catch return error.InstallIdentityUnavailable;
-            try validateInstallConfig(config, system, install);
-        }
+        const target_network = node.network;
+        try validateTargetNetwork(config, node, target_network);
+        var single_disk: [1][]const u8 = undefined;
+        var install = profile_install.effectiveInstall(&node, profile, &single_disk) catch return error.InvalidInstallStorage;
+        var members: [5][]const u8 = undefined;
+        if (node.storage.additional_disks.len >= members.len) return error.InvalidInstallStorage;
+        members[0] = node.storage.boot_disk;
+        @memcpy(members[1 .. 1 + node.storage.additional_disks.len], node.storage.additional_disks);
+        install.storage.members = members[0 .. 1 + node.storage.additional_disks.len];
+        const system = profile_install.effectiveSystem(profile) catch return error.InstallIdentityUnavailable;
+        try validateInstallConfig(config, system, install);
         for (config.nodes[i + 1 ..]) |other| {
             if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
             if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
-            if (node.overrides.network) |network| if (network.address) |address| if (other.overrides.network) |other_network| if (other_network.address) |other_address| if (std.mem.eql(u8, address, other_address)) return error.DuplicateStaticAddress;
+            const other_network = other.network;
+            if (target_network.address) |address| if (other_network.address) |other_address| if (std.mem.eql(u8, address, other_address)) return error.DuplicateStaticAddress;
         }
+    }
+}
+
+fn validateKernelDelta(catalog: *const model.Catalog, profile: *const model.ProfileConfig, delta: model.StringSetDelta) ValidationError!void {
+    const source = lookup.findInstallSource(catalog, profile.install_source) orelse return error.InvalidProfileSource;
+    const family: ?model.DistroFamily = if (lookup.findDistro(catalog, source.distro)) |distro| distro.family else null;
+    try validateKernelTokenSet(delta.add, family);
+    try validateKernelTokenSet(delta.remove, family);
+    for (delta.add) |added| for (delta.remove) |removed| if (std.mem.eql(u8, kernelArgName(added), kernelArgName(removed))) return error.InvalidKernelArgs;
+}
+
+fn validateKernelTokenSet(values: []const []const u8, family: ?model.DistroFamily) ValidationError!void {
+    for (values, 0..) |value, index| {
+        if (value.len == 0 or value.len > 256 or std.mem.indexOfScalar(u8, value, ' ') != null) return error.InvalidKernelArgs;
+        for (value) |byte| if (!(std.ascii.isAlphanumeric(byte) or byte == '=' or byte == '.' or byte == '-' or byte == '_' or byte == ',' or byte == ':')) return error.InvalidKernelArgs;
+        const name = kernelArgName(value);
+        if (name.len == 0 or name[0] == '-' or reservedKernelArg(name, family)) return error.InvalidKernelArgs;
+        for (values[index + 1 ..]) |other| if (std.mem.eql(u8, name, kernelArgName(other))) return error.InvalidKernelArgs;
     }
 }
 
@@ -588,13 +624,110 @@ fn validateTargetNetwork(config: *const model.AppConfig, node: model.NodeConfig,
     const address = network.address orelse return error.InvalidTargetNetwork;
     const prefix = network.prefix_len orelse return error.InvalidTargetNetwork;
     if (prefix == 0 or prefix > 32) return error.InvalidTargetNetwork;
-    const node_ip = node.ip orelse return error.StaticAddressMismatch;
-    if (!std.mem.eql(u8, node_ip, address)) return error.StaticAddressMismatch;
+    if (config.schema_version < 3) {
+        const node_ip = node.ip orelse return error.StaticAddressMismatch;
+        if (!std.mem.eql(u8, node_ip, address)) return error.StaticAddressMismatch;
+    }
     if (network.match_mac) |mac| if (!std.ascii.eqlIgnoreCase(mac, node.mac)) return error.InvalidTargetNetwork;
     const parsed = std.Io.net.IpAddress.parseIp4(address, 0) catch return error.InvalidTargetNetwork;
     if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed))) return error.NodeOutsideDhcpSubnet;
     if (network.gateway) |gateway| _ = std.Io.net.IpAddress.parseIp4(gateway, 0) catch return error.InvalidTargetNetwork;
     for (network.dns) |dns| _ = std.Io.net.IpAddress.parseIp4(dns, 0) catch return error.InvalidTargetNetwork;
+    for (network.routes, 0..) |route, index| {
+        if (!validIdentifier(route.id)) return error.InvalidTargetNetwork;
+        _ = parseIpv4Cidr(route.destination) catch return error.InvalidTargetNetwork;
+        _ = std.Io.net.IpAddress.parseIp4(route.gateway, 0) catch return error.InvalidTargetNetwork;
+        for (network.routes[index + 1 ..]) |other| if (std.mem.eql(u8, route.id, other.id)) return error.InvalidTargetNetwork;
+    }
+}
+
+fn validateSoftware(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
+    for (config.profiles) |profile| {
+        if (softwareSelectionEmpty(profile.software)) continue;
+        const source = lookup.findInstallSource(catalog, profile.install_source) orelse return error.MissingInstallSource;
+        const distro = lookup.findDistro(catalog, source.distro) orelse return error.UnsupportedDistroTuple;
+        try validateSoftwareSelection(catalog, source, distro.family, profile.software);
+    }
+    for (config.nodes) |node| {
+        if (node.profile == null) continue;
+        _ = lookup.findProfile(catalog, node.profile.?) orelse return error.MissingProfile;
+        const delta = node.overrides.software;
+        try validateDelta(delta.repositories);
+        try validateDelta(delta.groups);
+        try validateDelta(delta.tasks);
+        try validateDelta(delta.packages_include);
+        try validateDelta(delta.packages_exclude);
+    }
+}
+
+fn softwareSelectionEmpty(selection: model.SoftwareSelection) bool {
+    return selection.repositories.len == 0 and selection.environment == null and selection.groups.len == 0 and selection.tasks.len == 0 and selection.packages.include.len == 0 and selection.packages.exclude.len == 0;
+}
+
+pub fn validateProfileSoftwareReadiness(catalog: *const model.Catalog, profile: *const model.ProfileConfig) ValidationError!void {
+    if (softwareSelectionEmpty(profile.software)) return;
+    const source = lookup.findInstallSource(catalog, profile.install_source) orelse return error.MissingInstallSource;
+    try validateEffectiveSoftwareReadiness(catalog, source, profile.software);
+}
+
+pub fn validateEffectiveSoftwareReadiness(catalog: *const model.Catalog, source: *const model.InstallSourceConfig, selection: model.SoftwareSelection) ValidationError!void {
+    if (softwareSelectionEmpty(selection)) return;
+    const distro = lookup.findDistro(catalog, source.distro) orelse return error.UnsupportedDistroTuple;
+    try validateSoftwareSelection(catalog, source, distro.family, selection);
+}
+
+test "profile software readiness requires a revisioned capability index" {
+    const distro: model.DistroConfig = .{ .name = "rocky", .family = .rhel };
+    const repository: model.RepositoryConfig = .{ .name = "base", .distro = "rocky", .version = "9", .arch = .x86_64, .manager = .dnf, .base_url = "http://repo.invalid" };
+    const source: model.InstallSourceConfig = .{ .name = "rocky-9", .distro = "rocky", .version = "9", .arch = .x86_64, .source_asset = "iso", .installer_kernel = "kernel", .installer_initrd = "initrd", .repositories = &.{"base"} };
+    const profile: model.ProfileConfig = .{ .name = "p", .install_source = "rocky-9", .software = .{ .packages = .{ .include = &.{"vim"} } } };
+    const catalog: model.Catalog = .{ .distros = &.{distro}, .repositories = &.{repository}, .install_sources = &.{source}, .profiles = &.{profile} };
+    try std.testing.expectError(error.SoftwareCapabilityMissing, validateProfileSoftwareReadiness(&catalog, &profile));
+}
+
+fn validateSoftwareSelection(catalog: *const model.Catalog, source: *const model.InstallSourceConfig, family: model.DistroFamily, selection: model.SoftwareSelection) ValidationError!void {
+    if (family == .rhel and selection.tasks.len != 0) return error.SoftwareKindNotApplicable;
+    if (family == .ubuntu and (selection.environment != null or selection.groups.len != 0)) return error.SoftwareKindNotApplicable;
+    for (selection.packages.include) |included| for (selection.packages.exclude) |excluded|
+        if (std.mem.eql(u8, included, excluded)) return error.SoftwareSelectionConflict;
+    for (selection.repositories) |name| {
+        if (!containsString(source.repositories, name)) return error.SoftwareCapabilityMissing;
+        _ = lookup.findRepository(catalog, name) orelse return error.MissingRepository;
+    }
+    if (selection.environment) |id| try requireCapability(catalog, source, .environment, id);
+    for (selection.groups) |id| try requireCapability(catalog, source, .group, id);
+    for (selection.tasks) |id| try requireCapability(catalog, source, .task, id);
+    for (selection.packages.include) |id| try requirePackageCapability(catalog, source, id);
+    for (selection.packages.exclude) |id| try requirePackageCapability(catalog, source, id);
+}
+
+fn requirePackageCapability(catalog: *const model.Catalog, source: *const model.InstallSourceConfig, id: []const u8) ValidationError!void {
+    if (hasCapability(catalog, source, .package, id) or hasCapability(catalog, source, .metapackage, id)) return;
+    return error.SoftwareCapabilityMissing;
+}
+fn requireCapability(catalog: *const model.Catalog, source: *const model.InstallSourceConfig, kind: model.SoftwareKind, id: []const u8) ValidationError!void {
+    if (!hasCapability(catalog, source, kind, id)) return error.SoftwareCapabilityMissing;
+}
+fn hasCapability(catalog: *const model.Catalog, source: *const model.InstallSourceConfig, kind: model.SoftwareKind, id: []const u8) bool {
+    for (source.repositories) |repository_name| {
+        const repository = lookup.findRepository(catalog, repository_name) orelse continue;
+        if (repository.software_index.revision_digest == null) continue;
+        for (repository.software_index.capabilities) |capability| if (capability.kind == kind and std.mem.eql(u8, capability.id, id)) return true;
+    }
+    return false;
+}
+fn validateDelta(delta: model.StringSetDelta) ValidationError!void {
+    for (delta.add) |added| for (delta.remove) |removed| if (std.mem.eql(u8, added, removed)) return error.SoftwareSelectionConflict;
+}
+fn containsString(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| if (std.mem.eql(u8, value, needle)) return true;
+    return false;
+}
+fn parseIpv4Cidr(value: []const u8) !void {
+    const slash = std.mem.indexOfScalar(u8, value, '/') orelse return error.InvalidCidr;
+    _ = try std.Io.net.IpAddress.parseIp4(value[0..slash], 0);
+    const prefix = try std.fmt.parseInt(u8, value[slash + 1 ..], 10);
+    if (prefix > 32) return error.InvalidCidr;
 }
 
 fn managedRepositoryUrl(config: *const model.AppConfig, value: []const u8) bool {
@@ -687,27 +820,6 @@ fn prefixMask(prefix: u6) u32 {
     return if (prefix == 0) 0 else @as(u32, 0xffffffff) << @as(u5, @intCast(32 - prefix));
 }
 
-fn validatePolicy(config: *const model.AppConfig) ValidationError!void {
-    const profile_name = config.policy.default_profile;
-    switch (config.policy.default_action) {
-        .wait, .deny => if (profile_name != null) return error.InvalidUnknownNodePolicy,
-        .discovery => {
-            const profile = lookup.findProfile(config, profile_name orelse
-                return error.InvalidUnknownNodePolicy) orelse return error.MissingProfile;
-            if (profile.mode != .discovery) return error.InvalidUnknownNodePolicy;
-        },
-        .diskless => {
-            if (!config.policy.allow_unknown_diskless)
-                return error.InvalidUnknownNodePolicy;
-            const profile = lookup.findProfile(config, profile_name orelse
-                return error.InvalidUnknownNodePolicy) orelse return error.MissingProfile;
-            if (profile.mode != .diskless or !profile.safety.safe_for_unknown or
-                profile.safety.destructive or profile.safety.persistent_writes)
-                return error.InvalidUnknownNodePolicy;
-        },
-    }
-}
-
 fn requireAssetKind(
     catalog: *const model.Catalog,
     name: []const u8,
@@ -796,7 +908,7 @@ test "DHCP requires an explicit PXE interface" {
     try std.testing.expectError(error.DhcpBindInterfaceRequired, validateConfig(&config));
 }
 
-test "install profile must match its install source tuple" {
+test "install profile derives its platform from source" {
     const config: model.AppConfig = .{
         .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" },
         .http = test_http,
@@ -805,7 +917,7 @@ test "install profile must match its install source tuple" {
             .{ .name = "rocky", .family = .rhel, .versions = &.{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }} },
             .{ .name = "ubuntu", .family = .ubuntu, .versions = &.{.{ .version = "22.04", .archs = &.{.aarch64}, .install_adapter = .autoinstall, .package_manager = .apt }} },
         },
-        .profiles = &.{.{ .name = "wrong-profile", .mode = .install, .distro = "ubuntu", .version = "22.04", .arch = .aarch64, .install_source = "rocky-source", .safety = .{ .destructive = true } }},
+        .profiles = &.{.{ .name = "wrong-profile", .install_source = "rocky-source" }},
     };
     const catalog: model.Catalog = .{
         .assets = &.{
@@ -815,7 +927,7 @@ test "install profile must match its install source tuple" {
         },
         .install_sources = &.{.{ .name = "rocky-source", .distro = "rocky", .version = "9.7", .arch = .aarch64, .source_asset = "rocky-iso", .installer_kernel = "rocky-kernel", .installer_initrd = "rocky-initrd" }},
     };
-    try std.testing.expectError(error.InvalidProfileSource, validate(&config, &catalog));
+    try validate(&config, &catalog);
 }
 
 test "拒绝 IPv6 和非法 HTTP 端口" {
@@ -849,67 +961,66 @@ test "M4.8 explicit state capacity must fit the compiled safety ceiling" {
 }
 
 test "M4.6 kernel args accept hardware parameters and reject injection" {
-    try std.testing.expect(validKernelArgs("iommu=pt hugepagesz=1G hugepages=4", .install, .rhel));
-    try std.testing.expect(validKernelArgs("vfio-pci.ids=10de:1b06,8086:1a16 isolcpus=0,2,4-7", .diskless, .ubuntu));
-    try std.testing.expect(!validKernelArgs("iommu=pt;reboot", .install, .rhel));
-    try std.testing.expect(!validKernelArgs("foo='bar'", .install, .rhel));
-    try std.testing.expect(!validKernelArgs("foo=$bar", .install, .rhel));
-    try std.testing.expect(!validKernelArgs("-debug", .diskless, .ubuntu));
-    try std.testing.expect(!validKernelArgs("iommu=pt iommu=strict", .install, .rhel));
+    try std.testing.expect(validKernelArgs("iommu=pt hugepagesz=1G hugepages=4", .rhel));
+    try std.testing.expect(validKernelArgs("vfio-pci.ids=10de:1b06,8086:1a16 isolcpus=0,2,4-7", .ubuntu));
+    try std.testing.expect(!validKernelArgs("iommu=pt;reboot", .rhel));
+    try std.testing.expect(!validKernelArgs("foo='bar'", .rhel));
+    try std.testing.expect(!validKernelArgs("foo=$bar", .rhel));
+    try std.testing.expect(!validKernelArgs("-debug", .ubuntu));
+    try std.testing.expect(!validKernelArgs("iommu=pt iommu=strict", .rhel));
 }
 
 test "M4.6 reserved kernel args use exact mode-aware token names" {
-    try std.testing.expect(!validKernelArgs("inst.ks=http", .install, .rhel));
-    try std.testing.expect(!validKernelArgs("url=http", .install, .ubuntu));
-    try std.testing.expect(!validKernelArgs("nodeforge.config=x", .diskless, .ubuntu));
-    try std.testing.expect(validKernelArgs("foo.inst.ks=1", .install, .rhel));
-    try std.testing.expect(validKernelArgs("url=http", .diskless, .ubuntu));
+    try std.testing.expect(!validKernelArgs("inst.ks=http", .rhel));
+    try std.testing.expect(!validKernelArgs("url=http", .ubuntu));
+    try std.testing.expect(!validKernelArgs("nodeforge.config=x", .ubuntu));
+    try std.testing.expect(validKernelArgs("foo.inst.ks=1", .rhel));
 }
 
 test "M4.6 kernel args length boundary is 256 bytes" {
     var accepted: [256]u8 = undefined;
     @memset(&accepted, 'a');
     accepted[1] = '=';
-    try std.testing.expect(validKernelArgs(&accepted, .diskless, .ubuntu));
+    try std.testing.expect(validKernelArgs(&accepted, .ubuntu));
     var rejected: [257]u8 = undefined;
     @memset(&rejected, 'a');
     rejected[1] = '=';
-    try std.testing.expect(!validKernelArgs(&rejected, .diskless, .ubuntu));
+    try std.testing.expect(!validKernelArgs(&rejected, .ubuntu));
 }
 
-test "M4.6 discovery rejects kernel args and install requires bootloader" {
+test "M4.6 install kernel args require bootloader" {
     var config: model.AppConfig = .{
         .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" },
         .http = test_http,
         .tftp = test_tftp,
         .distros = &.{.{ .name = "rocky", .family = .rhel, .versions = &.{.{ .version = "9.7", .archs = &.{.aarch64}, .install_adapter = .kickstart, .package_manager = .dnf }} }},
-        .profiles = &.{.{ .name = "discovery", .mode = .discovery, .distro = "rocky", .version = "9.7", .arch = .aarch64, .kernel_args = "iommu=pt" }},
+        .profiles = &.{.{ .name = "install", .install_source = "rocky", .install = .{ .bootloader = .{ .install = false } }, .kernel_args = "iommu=pt" }},
     };
-    try std.testing.expectError(error.InvalidKernelArgs, validateConfig(&config));
-    config.profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .install_source = "rocky", .install = .{ .bootloader = .{ .install = false } }, .kernel_args = "iommu=pt" }};
     try std.testing.expectError(error.KernelArgsRequiresBootloader, validateConfig(&config));
 }
 
-test "node storage overrides are install-only" {
+test "node direct storage is independent of profile kind" {
     var config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.50.1" },
-        .profiles = &.{.{ .name = "discovery", .mode = .discovery, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
-        .nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "discovery", .overrides = .{ .storage = .{ .boot_disk = "/dev/vda" } } }},
+        .profiles = &.{.{ .name = "install", .install_source = "rocky" }},
+        .nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "install", .storage = .{ .boot_disk = "/dev/vda" } }},
     };
-    try std.testing.expectError(error.InvalidInstallStorage, validateNodes(&config));
+    const catalog: model.Catalog = .{ .install_sources = &.{.{ .name = "rocky", .distro = "rocky", .version = "9.7", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "kernel", .installer_initrd = "initrd" }} };
+    try validateNodes(&config, &catalog);
 
-    config.profiles = &.{.{ .name = "diskless", .mode = .diskless, .distro = "rocky", .version = "9.7", .arch = .aarch64 }};
-    config.nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "diskless", .overrides = .{ .storage = .{ .boot_disk = "/dev/vda" } } }};
-    try std.testing.expectError(error.InvalidInstallStorage, validateNodes(&config));
+    config.profiles = &.{.{ .name = "install", .install_source = "rocky" }};
+    config.nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "install", .storage = .{ .boot_disk = "/dev/vda" } }};
+    try validateNodes(&config, &catalog);
 }
 
 test "node storage override validates the effective install plan" {
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.50.1" },
-        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64, .install = .{} }},
-        .nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "install", .overrides = .{ .storage = .{ .boot_disk = "/tmp/not-a-device" } } }},
+        .profiles = &.{.{ .name = "install", .install_source = "rocky" }},
+        .nodes = &.{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "install", .storage = .{ .boot_disk = "/tmp/not-a-device" } }},
     };
-    try std.testing.expectError(error.InvalidInstallStorage, validateNodes(&config));
+    const catalog: model.Catalog = .{ .install_sources = &.{.{ .name = "rocky", .distro = "rocky", .version = "9.7", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "kernel", .installer_initrd = "initrd" }} };
+    try std.testing.expectError(error.InvalidInstallStorage, validateNodes(&config, &catalog));
 }
 
 test "拒绝格式错误的 SHA256" {

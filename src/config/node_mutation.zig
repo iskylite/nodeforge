@@ -13,13 +13,13 @@ pub const AddParams = struct {
     id: []const u8,
     mac: []const u8,
     arch: model.Arch,
-    profile: []const u8,
-    ip: ?[]const u8 = null,
+    profile: ?[]const u8,
+    pxe_ip_reservation: ?[]const u8 = null,
     hostname: ?[]const u8 = null,
     deploy: bool = true,
     http_accel: bool = false,
-    boot_disk: ?[]const u8 = null,
-    install_disks: ?[]const []const u8 = null,
+    storage: model.NodeStorageConfig = .{},
+    network: model.TargetNetworkConfig = .{},
 };
 pub const SetParams = struct {
     mac: ?[]const u8 = null,
@@ -33,8 +33,6 @@ pub const SetParams = struct {
     http_accel: ?bool = null,
     boot_disk: ?[]const u8 = null,
     boot_disk_set: bool = false,
-    install_disks: ?[]const []const u8 = null,
-    install_disks_set: bool = false,
 };
 
 pub fn addNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, params: AddParams) !void {
@@ -44,11 +42,12 @@ pub fn addNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.Ap
         if (std.mem.eql(u8, node.id, params.id)) return error.NodeAlreadyExists;
         if (std.mem.eql(u8, node.mac, params.mac)) return error.DuplicateMac;
     }
-    if (!profileExists(&parsed.value, params.profile)) return error.ProfileNotFound;
+    if (params.profile) |profile| if (!profileExists(&parsed.value, profile)) return error.ProfileNotFound;
+    if (params.profile == null and params.deploy) return error.ProfileRequiredWhileDeployed;
     const nodes = try allocator.alloc(model.NodeConfig, parsed.value.nodes.len + 1);
     defer allocator.free(nodes);
     @memcpy(nodes[0..parsed.value.nodes.len], parsed.value.nodes);
-    nodes[parsed.value.nodes.len] = .{ .id = params.id, .mac = params.mac, .arch = params.arch, .profile = params.profile, .ip = params.ip, .hostname = params.hostname, .deploy = params.deploy, .http_accel = params.http_accel, .overrides = .{ .storage = if (params.boot_disk != null or params.install_disks != null) .{ .boot_disk = params.boot_disk, .install_disks = params.install_disks } else null } };
+    nodes[parsed.value.nodes.len] = .{ .id = params.id, .mac = params.mac, .arch = params.arch, .profile = params.profile, .pxe = .{ .ip_reservation = params.pxe_ip_reservation }, .hostname = params.hostname, .deploy = params.deploy, .http_accel = params.http_accel, .storage = params.storage, .network = params.network };
     var candidate = parsed.value;
     candidate.nodes = nodes;
     try validateCandidate(config, &candidate);
@@ -76,12 +75,7 @@ pub fn setNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.Ap
     if (params.hostname_set) node.hostname = params.hostname;
     if (params.deploy) |value| node.deploy = value;
     if (params.http_accel) |value| node.http_accel = value;
-    if (params.boot_disk_set or params.install_disks_set) {
-        var storage = node.overrides.storage orelse model.NodeStorageOverrideConfig{};
-        if (params.boot_disk_set) storage.boot_disk = params.boot_disk;
-        if (params.install_disks_set) storage.install_disks = params.install_disks;
-        node.overrides.storage = if (storage.boot_disk == null and storage.install_disks == null) null else storage;
-    }
+    if (params.boot_disk_set) node.storage.boot_disk = params.boot_disk orelse return error.InvalidInstallStorage;
     nodes[target] = node;
     var candidate = parsed.value;
     candidate.nodes = nodes;

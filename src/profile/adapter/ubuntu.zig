@@ -44,10 +44,18 @@ const password_hash = @import("../password_hash.zig");
 /// M4.1 渲染器。原始 M4 入口点保留为兼容包装；
 /// 所有 daemon answer 下发均使用此 common-system 变体。
 pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
+    const network = node.network;
+    const software: model.SoftwareSelection = .{ .packages = .{ .include = system.packages } };
+    return renderEffective(allocator, node, install, system, network, software, bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session, token, password_scope, kernel_args);
+}
+
+pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, network: model.TargetNetworkConfig, software: model.SoftwareSelection, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.writeAll("#cloud-config\nautoinstall:\n  version: 1\n  interactive-sections: []\n  shutdown: reboot\n  refresh-installer:\n    update: false\n  locale: ");
+    try w.writeAll("#cloud-config\nautoinstall:\n  version: 1\n  interactive-sections: []\n  shutdown: ");
+    try w.writeAll(if (install.completion.action == .reboot) "reboot" else "poweroff");
+    try w.writeAll("\n  refresh-installer:\n    update: false\n  locale: ");
     try render.yamlQuote(w, system.localization.locale);
     try w.writeAll("\n  timezone: ");
     try render.yamlQuote(w, system.localization.timezone);
@@ -59,7 +67,14 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
     try w.writeAll(if (system.ssh.password_authentication) "true" else "false");
     try w.writeAll("\n  packages:\n");
     if (system.ssh.enabled) try w.writeAll("    - 'openssh-server'\n");
-    for (system.packages) |package| {
+    for (software.tasks) |task| {
+        try w.writeAll("    - ");
+        const task_name = try std.fmt.allocPrint(allocator, "{s}^", .{task});
+        defer allocator.free(task_name);
+        try render.yamlQuote(w, task_name);
+        try w.writeByte('\n');
+    }
+    for (software.packages.include) |package| {
         try w.writeAll("    - ");
         try render.yamlQuote(w, package);
         try w.writeByte('\n');
@@ -84,6 +99,12 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
     try w.writeAll("  apt:\n    mirror-selection:\n      primary:\n        - uri: ");
     try render.yamlQuote(w, apt_primary_url orelse "");
     try w.print("\n    fallback: {s}\n    geoip: false\n", .{@tagName(install.apt.fallback)});
+    if (install.proxy.url) |proxy| {
+        try w.writeAll("  proxy: ");
+        try render.yamlQuote(w, proxy);
+        try w.writeByte('\n');
+    }
+    if (install.updates.mode != .none) try w.print("  updates: {s}\n", .{@tagName(install.updates.mode)});
     // ── Subiquity 原生 reporting（curtin webhook reporter）──────────────
     //
     // curtin 的 HTTP-POST reporter 类型名为 `webhook`（不是 `http`），
@@ -112,7 +133,6 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
         try render.yamlQuote(w, report_url);
         try w.writeAll("\n      level: INFO\n");
     }
-    const network = node.overrides.network orelse model.TargetNetworkConfig{};
     try renderStorageM41(w, install);
     try w.writeAll("  network:\n    version: 2\n    ethernets:\n      ");
     try w.writeAll(network.interface orelse "nodeforge");
@@ -130,10 +150,21 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
         defer allocator.free(cidr);
         try render.yamlQuote(w, cidr);
         try w.writeAll("]\n");
-        if (network.gateway) |gateway| {
-            try w.writeAll("        routes:\n          - to: default\n            via: ");
-            try render.yamlQuote(w, gateway);
-            try w.writeByte('\n');
+        if (network.gateway != null or network.routes.len != 0) {
+            try w.writeAll("        routes:\n");
+            if (network.gateway) |gateway| {
+                try w.writeAll("          - to: default\n            via: ");
+                try render.yamlQuote(w, gateway);
+                try w.writeByte('\n');
+            }
+            for (network.routes) |route| {
+                try w.writeAll("          - to: ");
+                try render.yamlQuote(w, route.destination);
+                try w.writeAll("\n            via: ");
+                try render.yamlQuote(w, route.gateway);
+                if (route.metric) |metric| try w.print("\n            metric: {d}", .{metric});
+                try w.writeByte('\n');
+            }
         }
         if (network.dns.len != 0 or network.search_domains.len != 0) {
             try w.writeAll("        nameservers:\n");
@@ -162,8 +193,8 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
     try w.writeAll("\n    preserve_hostname: false\n    disable_root: false\n    ssh_pwauth: ");
     try w.writeAll(if (system.ssh.password_authentication) "true" else "false");
     try w.writeAll("\n    users:\n");
-    try renderCloudUser(w, allocator, "root", system.ssh.root_password, false, bootstrap_key, system.ssh.root_authorized_keys, &.{}, password_scope);
-    for (system.users, 0..) |user, index| try renderCloudUser(w, allocator, user.name, user.password, user.sudo, bootstrap_key, user.ssh_authorized_keys, if (index == 0) install.ssh_authorized_keys else &.{}, password_scope);
+    try renderCloudUser(w, allocator, "root", system.ssh.root_password, false, &.{}, bootstrap_key, system.ssh.root_authorized_keys, &.{}, password_scope);
+    for (system.users, 0..) |user, index| try renderCloudUser(w, allocator, user.name, user.password, user.sudo, user.groups, bootstrap_key, user.ssh_authorized_keys, if (index == 0) install.ssh_authorized_keys else &.{}, password_scope);
     try w.writeAll("  early-commands:\n");
     const facts_command = try std.fmt.allocPrint(allocator, "nf_fact() {{ test -r /sys/class/dmi/id/$1 && head -c 256 /sys/class/dmi/id/$1 | tr -d '\\r\\n' | sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g'; }}; s=$(nf_fact product_serial); u=$(nf_fact product_uuid); v=$(nf_fact sys_vendor); m=$(nf_fact product_name); d=$(printf '{{\"serial_number\":\"%s\",\"product_uuid\":\"%s\",\"vendor\":\"%s\",\"model\":\"%s\"}}' \"$s\" \"$u\" \"$v\" \"$m\"); curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d \"$d\" {s} || true", .{ token, session, facts_url });
     defer allocator.free(facts_command);
@@ -173,6 +204,26 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"installer_started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.writeAll("  late-commands:\n");
+    if (install.completion.action == .halt) try w.writeAll("    - 'printf \"[Unit]\\nDescription=Halt after NodeForge install\\n[Service]\\nType=oneshot\\nExecStart=/usr/bin/systemctl halt\\n[Install]\\nWantedBy=multi-user.target\\n\" > /target/etc/systemd/system/nodeforge-halt-after-install.service && curtin in-target --target=/target -- systemctl enable nodeforge-halt-after-install.service'\n");
+    if (system.security.apparmor == .disabled) try w.writeAll("    - 'curtin in-target --target=/target -- systemctl disable --now apparmor || true'\n") else if (system.security.apparmor == .complain) try w.writeAll("    - 'curtin in-target --target=/target -- aa-complain /etc/apparmor.d/* || true'\n") else try w.writeAll("    - 'curtin in-target --target=/target -- aa-enforce /etc/apparmor.d/* || true'\n");
+    if (install.proxy.no_proxy.len != 0) {
+        var no_proxy: std.Io.Writer.Allocating = .init(allocator);
+        defer no_proxy.deinit();
+        for (install.proxy.no_proxy, 0..) |value, index| {
+            if (index != 0) try no_proxy.writer.writeByte(',');
+            try no_proxy.writer.writeAll(value);
+        }
+        const command = try std.fmt.allocPrint(allocator, "printf '%s\\n' 'no_proxy={s}' > /target/etc/environment.d/60-nodeforge-proxy.conf", .{no_proxy.written()});
+        defer allocator.free(command);
+        try w.writeAll("    - ");
+        try render.yamlQuote(w, command);
+        try w.writeByte('\n');
+    }
+    for (system.users) |user| {
+        if (user.uid) |uid| try w.print("    - 'curtin in-target --target=/target -- usermod --uid {d} {s}'\n", .{ uid, user.name });
+        if (user.shell) |shell| try w.print("    - 'curtin in-target --target=/target -- usermod --shell {s} {s}'\n", .{ shell, user.name });
+        if (user.locked) try w.print("    - 'curtin in-target --target=/target -- usermod --lock {s}'\n", .{user.name});
+    }
     if (kernel_args) |args| {
         const grub_command = try std.fmt.allocPrint(allocator, "mkdir -p /target/etc/default/grub.d && printf '%s\\n' 'GRUB_CMDLINE_LINUX=\"${{GRUB_CMDLINE_LINUX}} {s}\"' > /target/etc/default/grub.d/99-nodeforge.cfg && chmod 0644 /target/etc/default/grub.d/99-nodeforge.cfg", .{args});
         defer allocator.free(grub_command);
@@ -254,41 +305,225 @@ pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeCo
 /// 防止 profile 选择的目标磁盘/分区被 Subiquity 静默丢弃。
 fn renderStorageM41(w: *std.Io.Writer, install: model.InstallConfig) !void {
     if (install.storage.partitions.len == 0) {
-        try w.writeAll("  storage:\n    layout:\n      name: direct\n      match:\n        path: ");
-        try render.yamlQuote(w, install.storage.boot_disk);
-        try w.writeByte('\n');
-        return;
+        return renderAutomaticStorage(w, install.storage);
     }
-    try w.writeAll("  storage:\n    config:\n      - type: disk\n        id: nodeforge-disk\n        path: ");
-    try render.yamlQuote(w, install.storage.boot_disk);
-    try w.writeAll("\n        ptable: ");
-    try w.writeAll(@tagName(install.storage.partition_table));
-    try w.writeAll("\n        wipe: superblock-recursive\n        preserve: false\n");
-    for (install.storage.partitions, 0..) |part, index| {
-        const fs = part.filesystem orelse switch (part.kind) {
-            .esp => "fat32",
-            .swap => "swap",
-            else => "ext4",
+    return renderCustomStorage(w, install.storage);
+}
+
+fn renderCustomStorage(w: *std.Io.Writer, storage: model.StorageConfig) !void {
+    const members = storage.members;
+    try w.writeAll("  storage:\n    config:\n");
+    for (members, 0..) |disk, index| {
+        try w.print("      - type: disk\n        id: nodeforge-disk-{d}\n        path: ", .{index});
+        try render.yamlQuote(w, disk);
+        try w.writeAll("\n        ptable: gpt\n        wipe: superblock-recursive\n        preserve: false\n");
+    }
+    for (storage.partitions) |part| if (part.kind == .esp) try curtinPhysical(w, part, 0, true);
+    switch (storage.mode) {
+        .single => for (storage.partitions) |part| if (part.kind != .esp) try curtinPhysical(w, part, 0, true),
+        .lvm => {
+            for (storage.partitions) |part| if (part.kind == .boot) try curtinPhysical(w, part, 0, true);
+            try w.writeAll("      - type: partition\n        id: nodeforge-pv-part\n        device: nodeforge-disk-0\n        size: -1\n      - type: lvm_volgroup\n        id: nodeforge-vg\n        name: nodeforge\n        devices: [nodeforge-pv-part]\n");
+            for (storage.partitions) |part| if (part.kind != .esp and part.kind != .boot) try curtinLogical(w, part);
+        },
+        else => {
+            for (storage.partitions) |part| if (part.kind == .boot) try curtinRaidVolume(w, part, members.len, "1", true);
+            if (isRaidLvm(storage.mode)) {
+                for (members, 0..) |_, index| try physicalPartition(w, "pv", index, "-1");
+                try raidAction(w, "pv", curtinRaidLevel(storage.mode), members.len);
+                try w.writeAll("      - type: lvm_volgroup\n        id: nodeforge-vg\n        name: nodeforge\n        devices: [nodeforge-pv-raid]\n");
+                for (storage.partitions) |part| if (part.kind != .esp and part.kind != .boot) try curtinLogical(w, part);
+            } else for (storage.partitions) |part| if (part.kind != .esp and part.kind != .boot) try curtinRaidVolume(w, part, members.len, curtinRaidLevel(storage.mode), true);
+        },
+    }
+}
+
+fn curtinPhysical(w: *std.Io.Writer, part: model.PartitionConfig, disk: usize, format: bool) !void {
+    const id = part.id orelse return error.InvalidPartition;
+    try w.print("      - type: partition\n        id: nodeforge-{s}-part\n        device: nodeforge-disk-{d}\n        size: ", .{ id, disk });
+    try curtinSize(w, part);
+    try w.writeByte('\n');
+    if (part.kind == .esp) try w.writeAll("        flag: boot\n        grub_device: true\n");
+    if (format) {
+        var volume: [128]u8 = undefined;
+        try curtinFormatMount(w, part, try std.fmt.bufPrint(&volume, "nodeforge-{s}-part", .{id}));
+    }
+}
+fn curtinLogical(w: *std.Io.Writer, part: model.PartitionConfig) !void {
+    const id = part.id orelse return error.InvalidPartition;
+    try w.print("      - type: lvm_partition\n        id: nodeforge-{s}-lv\n        name: {s}\n        volgroup: nodeforge-vg\n        size: ", .{ id, id });
+    try curtinSize(w, part);
+    try w.writeByte('\n');
+    var volume: [128]u8 = undefined;
+    try curtinFormatMount(w, part, try std.fmt.bufPrint(&volume, "nodeforge-{s}-lv", .{id}));
+}
+fn curtinRaidVolume(w: *std.Io.Writer, part: model.PartitionConfig, count: usize, level: []const u8, format: bool) !void {
+    const id = part.id orelse return error.InvalidPartition;
+    for (0..count) |index| {
+        try w.print("      - type: partition\n        id: nodeforge-{s}-part-{d}\n        device: nodeforge-disk-{d}\n        size: ", .{ id, index, index });
+        try curtinSize(w, part);
+        try w.writeByte('\n');
+    }
+    try w.print("      - type: raid\n        id: nodeforge-{s}-raid\n        name: md-{s}\n        raidlevel: {s}\n        devices:\n", .{ id, id, level });
+    for (0..count) |index| try w.print("          - nodeforge-{s}-part-{d}\n", .{ id, index });
+    if (format) {
+        var volume: [128]u8 = undefined;
+        try curtinFormatMount(w, part, try std.fmt.bufPrint(&volume, "nodeforge-{s}-raid", .{id}));
+    }
+}
+fn curtinFormatMount(w: *std.Io.Writer, part: model.PartitionConfig, volume: []const u8) !void {
+    const id = part.id orelse return error.InvalidPartition;
+    const fs = part.filesystem orelse switch (part.kind) {
+        .esp => "fat32",
+        .swap => "swap",
+        else => "ext4",
+    };
+    try w.print("      - type: format\n        id: nodeforge-{s}-format\n        volume: {s}\n        fstype: {s}\n", .{ id, volume, fs });
+    const mount = part.mount orelse switch (part.kind) {
+        .root => "/",
+        .boot => "/boot",
+        .esp => "/boot/efi",
+        else => null,
+    };
+    if (mount) |path| {
+        try w.print("      - type: mount\n        id: nodeforge-{s}-mount\n        device: nodeforge-{s}-format\n        path: ", .{ id, id });
+        try render.yamlQuote(w, path);
+        try w.writeByte('\n');
+    }
+}
+fn curtinSize(w: *std.Io.Writer, part: model.PartitionConfig) !void {
+    if (part.grow) try w.writeAll("-1") else try w.print("{d}", .{@as(u64, part.size_mib) * 1024 * 1024});
+}
+
+fn renderAutomaticStorage(w: *std.Io.Writer, storage: model.StorageConfig) !void {
+    const members = storage.members;
+    if (members.len == 0) return error.InvalidStorageMembers;
+    try w.writeAll("  storage:\n    config:\n");
+    for (members, 0..) |disk, index| {
+        try w.print("      - type: disk\n        id: nodeforge-disk-{d}\n        path: ", .{index});
+        try render.yamlQuote(w, disk);
+        try w.writeAll("\n        ptable: gpt\n        wipe: superblock-recursive\n        preserve: false\n");
+    }
+    try w.writeAll("      - type: partition\n        id: nodeforge-esp-part\n        device: nodeforge-disk-0\n        size: 1G\n        flag: boot\n        grub_device: true\n");
+    try w.writeAll("      - type: format\n        id: nodeforge-esp-format\n        volume: nodeforge-esp-part\n        fstype: fat32\n      - type: mount\n        id: nodeforge-esp-mount\n        device: nodeforge-esp-format\n        path: /boot/efi\n");
+    switch (storage.mode) {
+        .single => {
+            try physicalPartition(w, "boot", 0, "2G");
+            try formatMount(w, "boot", "ext4", "/boot");
+            try physicalPartition(w, "root", 0, "-1");
+            try formatMount(w, "root", "ext4", "/");
+        },
+        .lvm => {
+            try physicalPartition(w, "boot", 0, "2G");
+            try formatMount(w, "boot", "ext4", "/boot");
+            try physicalPartition(w, "pv", 0, "-1");
+            try w.writeAll("      - type: lvm_volgroup\n        id: nodeforge-vg\n        name: nodeforge\n        devices: [nodeforge-pv-part-0]\n      - type: lvm_partition\n        id: nodeforge-root-lv\n        name: root\n        volgroup: nodeforge-vg\n        size: -1\n      - type: format\n        id: nodeforge-root-format\n        volume: nodeforge-root-lv\n        fstype: ext4\n      - type: mount\n        id: nodeforge-root-mount\n        device: nodeforge-root-format\n        path: /\n");
+        },
+        else => {
+            for (members, 0..) |_, index| try physicalPartition(w, "boot", index, "2G");
+            try raidAction(w, "boot", "1", members.len);
+            try w.writeAll("      - type: format\n        id: nodeforge-boot-format\n        volume: nodeforge-boot-raid\n        fstype: ext4\n      - type: mount\n        id: nodeforge-boot-mount\n        device: nodeforge-boot-format\n        path: /boot\n");
+            for (members, 0..) |_, index| try physicalPartition(w, "root", index, "-1");
+            try raidAction(w, "root", curtinRaidLevel(storage.mode), members.len);
+            if (isRaidLvm(storage.mode)) {
+                try w.writeAll("      - type: lvm_volgroup\n        id: nodeforge-vg\n        name: nodeforge\n        devices: [nodeforge-root-raid]\n      - type: lvm_partition\n        id: nodeforge-root-lv\n        name: root\n        volgroup: nodeforge-vg\n        size: -1\n      - type: format\n        id: nodeforge-root-format\n        volume: nodeforge-root-lv\n        fstype: ext4\n");
+            } else try w.writeAll("      - type: format\n        id: nodeforge-root-format\n        volume: nodeforge-root-raid\n        fstype: ext4\n");
+            try w.writeAll("      - type: mount\n        id: nodeforge-root-mount\n        device: nodeforge-root-format\n        path: /\n");
+        },
+    }
+}
+
+fn physicalPartition(w: *std.Io.Writer, comptime name: []const u8, disk: usize, size: []const u8) !void {
+    try w.print("      - type: partition\n        id: nodeforge-{s}-part-{d}\n        device: nodeforge-disk-{d}\n        size: {s}\n", .{ name, disk, disk, size });
+}
+
+fn formatMount(w: *std.Io.Writer, comptime name: []const u8, fs: []const u8, path: []const u8) !void {
+    try w.print("      - type: format\n        id: nodeforge-{s}-format\n        volume: nodeforge-{s}-part-0\n        fstype: {s}\n      - type: mount\n        id: nodeforge-{s}-mount\n        device: nodeforge-{s}-format\n        path: {s}\n", .{ name, name, fs, name, name, path });
+}
+
+fn raidAction(w: *std.Io.Writer, comptime name: []const u8, level: []const u8, count: usize) !void {
+    try w.print("      - type: raid\n        id: nodeforge-{s}-raid\n        name: md-{s}\n        raidlevel: {s}\n        devices:\n", .{ name, name, level });
+    for (0..count) |index| try w.print("          - nodeforge-{s}-part-{d}\n", .{ name, index });
+}
+
+fn isRaidLvm(mode: model.StorageMode) bool {
+    return switch (mode) {
+        .@"raid0-lvm", .@"raid1-lvm", .@"raid5-lvm", .@"raid6-lvm", .@"raid10-lvm" => true,
+        else => false,
+    };
+}
+
+fn curtinRaidLevel(mode: model.StorageMode) []const u8 {
+    return switch (mode) {
+        .raid0, .@"raid0-lvm" => "0",
+        .raid1, .@"raid1-lvm" => "1",
+        .raid5, .@"raid5-lvm" => "5",
+        .raid6, .@"raid6-lvm" => "6",
+        .raid10, .@"raid10-lvm" => "10",
+        else => unreachable,
+    };
+}
+
+test "schema v3 automatic storage renders all modes with native Curtin actions" {
+    const modes = [_]model.StorageMode{ .single, .lvm, .raid0, .raid1, .raid5, .raid6, .raid10, .@"raid0-lvm", .@"raid1-lvm", .@"raid5-lvm", .@"raid6-lvm", .@"raid10-lvm" };
+    const disks = [_][]const u8{ "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd" };
+    for (modes) |mode| {
+        const count: usize = switch (mode) {
+            .single, .lvm => 1,
+            .raid0, .raid1, .@"raid0-lvm", .@"raid1-lvm" => 2,
+            .raid5, .@"raid5-lvm" => 3,
+            else => 4,
         };
-        try w.print("      - type: partition\n        id: nodeforge-part-{d}\n        device: nodeforge-disk\n        size: {d}\n", .{ index, @as(u64, part.size_mib) * 1024 * 1024 });
-        if (part.kind == .esp) try w.writeAll("        flag: boot\n");
-        try w.print("      - type: format\n        id: nodeforge-format-{d}\n        volume: nodeforge-part-{d}\n        fstype: {s}\n", .{ index, index, fs });
-        const mount = part.mount orelse switch (part.kind) {
-            .root => "/",
-            .boot => "/boot",
-            .esp => "/boot/efi",
-            .swap => null,
-            else => null,
-        };
-        if (mount) |path| {
-            try w.print("      - type: mount\n        id: nodeforge-mount-{d}\n        device: nodeforge-format-{d}\n        path: ", .{ index, index });
-            try render.yamlQuote(w, path);
-            try w.writeByte('\n');
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try renderAutomaticStorage(&output.writer, .{ .mode = mode, .boot_disk = disks[0], .members = disks[0..count] });
+        const bytes = output.written();
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "id: nodeforge-esp-part"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "flag: boot"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "grub_device: true"));
+        try std.testing.expectEqual(count, std.mem.count(u8, bytes, "type: disk"));
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "fstype: ext4") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "late-commands") == null);
+        if (mode != .single and mode != .lvm) {
+            try std.testing.expect(std.mem.indexOf(u8, bytes, "type: raid") != null);
+            var level: [24]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&level, "raidlevel: {s}", .{curtinRaidLevel(mode)});
+            try std.testing.expect(std.mem.indexOf(u8, bytes, expected) != null);
+        }
+        if (mode == .lvm or isRaidLvm(mode)) try std.testing.expect(std.mem.indexOf(u8, bytes, "type: lvm_volgroup") != null);
+        if (mode == .lvm) {
+            try std.testing.expect(std.mem.indexOf(u8, bytes, "id: nodeforge-pv-part-0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, bytes, "devices: [nodeforge-pv-part-0]") != null);
         }
     }
 }
 
-fn renderCloudUser(w: *std.Io.Writer, allocator: std.mem.Allocator, name: []const u8, password: ?[]const u8, sudo: bool, bootstrap_key: []const u8, keys: []const []const u8, legacy_keys: []const []const u8, session: []const u8) !void {
+test "schema v3 custom logical layout renders all modes natively in Curtin" {
+    const modes = [_]model.StorageMode{ .single, .lvm, .raid0, .raid1, .raid5, .raid6, .raid10, .@"raid0-lvm", .@"raid1-lvm", .@"raid5-lvm", .@"raid6-lvm", .@"raid10-lvm" };
+    const disks = [_][]const u8{ "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd" };
+    const partitions = [_]model.PartitionConfig{ .{ .id = "esp", .mount = "/boot/efi", .filesystem = "fat32", .size_mib = 1024, .kind = .esp }, .{ .id = "boot", .mount = "/boot", .filesystem = "ext4", .size_mib = 2048, .kind = .boot }, .{ .id = "var", .mount = "/var", .filesystem = "ext4", .size_mib = 8192 }, .{ .id = "root", .mount = "/", .filesystem = "ext4", .grow = true, .kind = .root } };
+    for (modes) |mode| {
+        const count: usize = switch (mode) {
+            .single, .lvm => 1,
+            .raid0, .raid1, .@"raid0-lvm", .@"raid1-lvm" => 2,
+            .raid5, .@"raid5-lvm" => 3,
+            else => 4,
+        };
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        try renderCustomStorage(&output.writer, .{ .mode = mode, .boot_disk = disks[0], .members = disks[0..count], .partitions = &partitions });
+        const bytes = output.written();
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "id: nodeforge-esp-part"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "flag: boot"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "grub_device: true"));
+        try std.testing.expectEqual(count, std.mem.count(u8, bytes, "type: disk"));
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "late-commands") == null and std.mem.indexOf(u8, bytes, "storage-script") == null);
+        if (mode == .lvm or isRaidLvm(mode)) try std.testing.expect(std.mem.indexOf(u8, bytes, "id: nodeforge-var-lv") != null);
+        if (mode != .single and mode != .lvm) try std.testing.expect(std.mem.indexOf(u8, bytes, "id: nodeforge-boot-raid") != null);
+    }
+}
+
+fn renderCloudUser(w: *std.Io.Writer, allocator: std.mem.Allocator, name: []const u8, password: ?[]const u8, sudo: bool, groups: []const []const u8, bootstrap_key: []const u8, keys: []const []const u8, legacy_keys: []const []const u8, session: []const u8) !void {
     try w.writeAll("      - name: ");
     try render.yamlQuote(w, name);
     try w.writeAll("\n        lock_passwd: ");
@@ -300,7 +535,21 @@ fn renderCloudUser(w: *std.Io.Writer, allocator: std.mem.Allocator, name: []cons
         try w.writeAll("\n        passwd: ");
         try render.yamlQuote(w, hash);
     }
-    if (sudo) try w.writeAll("\n        groups: [sudo]");
+    if (sudo or groups.len != 0) {
+        try w.writeAll("\n        groups: [");
+        var first = true;
+        if (sudo) {
+            try w.writeAll("sudo");
+            first = false;
+        }
+        for (groups) |group| {
+            if (sudo and std.mem.eql(u8, group, "sudo")) continue;
+            if (!first) try w.writeAll(", ");
+            try render.yamlQuote(w, group);
+            first = false;
+        }
+        try w.writeByte(']');
+    }
     try w.writeAll("\n        ssh_authorized_keys:\n          - ");
     try render.yamlQuote(w, bootstrap_key);
     try w.writeByte('\n');
@@ -554,7 +803,7 @@ test "apt fallback is rendered from the install profile" {
 }
 
 test "M4.1 autoinstall renders target defaults and static network" {
-    const node: model.NodeConfig = .{ .id = "node-04", .mac = "00:11:22:33:44:99", .arch = .aarch64, .profile = "ubuntu", .ip = "192.168.50.27", .overrides = .{ .network = .{ .mode = .static, .interface = "ens160", .address = "192.168.50.27", .prefix_len = 24, .gateway = "192.168.50.1", .dns = &.{"192.168.50.1"}, .search_domains = &.{"nodeforge.local"} } } };
+    const node: model.NodeConfig = .{ .id = "node-04", .mac = "00:11:22:33:44:99", .arch = .aarch64, .profile = "ubuntu", .ip = "192.168.50.27", .network = .{ .mode = .static, .interface = "ens160", .address = "192.168.50.27", .prefix_len = 24, .gateway = "192.168.50.1", .dns = &.{"192.168.50.1"}, .search_domains = &.{"nodeforge.local"} } };
     const system: model.TargetSystemConfig = .{ .localization = .{ .locale = "zh_CN.UTF-8", .timezone = "Asia/Shanghai", .keyboard = "us" }, .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} }, .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }} };
     const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/artifacts/repositories/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
     // report_url="" 表示未配置 installer-hooks/subiquity 端点（不渲染 reporting 块）

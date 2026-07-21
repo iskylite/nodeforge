@@ -8,6 +8,7 @@ IPv4 PXE 引导、多 Linux 发行版无人值守安装和安装源分发；软�
 ## 设计文档
 
 - [NodeForge v0.1 设计与修复计划](docs/V0_1_DESIGN.md)：M0-M4 及进入 v0.2 前必须完成的所有权、属性和软件能力修复，现行权威设计
+- [NodeForge v0.1 验证记录](docs/V0_1_VALIDATION.md)：本地、r97n0、Rocky PXE 和当前实机矩阵证据/阻塞
 - [NodeForge v0.2 设计范围](docs/V0_2_DESIGN.md)：尚未实现的 M5-M7，v0.1 完成前不得启动正式实现
 - [历史合并概要设计](docs/DESIGN.md)：保留早期 M0-M7 全景和决策记录，不再作为版本边界事实源
 - [历史分阶段详细设计与实现计划](docs/DETAILED_DESIGN.md)：保留里程碑实现、验收和专项细节

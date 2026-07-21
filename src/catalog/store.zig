@@ -7,12 +7,14 @@
 
 const std = @import("std");
 const model = @import("../model.zig");
+const schema_v3_dto = @import("schema_v3_dto.zig");
+const schema_v2_dto = @import("schema_v2_dto.zig");
 const paths = @import("../paths.zig");
 const atomic = @import("../state/dhcp_store.zig").atomicWrite;
 
 pub const max_catalog_bytes = 8 * 1024 * 1024;
 pub const layout_schema_version: u32 = 1;
-const names = [_][]const u8{ "distros", "profiles", "nodes", "provisioning_bundles", "repositories", "assets", "install_sources", "boot_bundles" };
+const names = [_][]const u8{ "distros", "profiles", "nodes", "provisioning_bundles", "repositories", "assets", "install_sources", "boot_bundles", "discovery_policy", "unknown_client_observations" };
 
 const ManifestEntity = struct { name: []const u8, file: []const u8, sha256: []const u8 };
 const Manifest = struct {
@@ -54,7 +56,10 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.jso
 pub fn loadLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(model.Catalog) {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_catalog_bytes));
     defer allocator.free(bytes);
-    return std.json.parseFromSlice(model.Catalog, allocator, bytes, .{ .allocate = .alloc_always });
+    const Header = struct { schema_version: u32 };
+    const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    return if (header.value.schema_version == 3) schema_v3_dto.parse(allocator, bytes) else schema_v2_dto.parse(allocator, bytes);
 }
 
 pub fn initializeEmpty(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !void {
@@ -91,7 +96,8 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     var parsed_manifest = try std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{ .allocate = .alloc_always });
     defer parsed_manifest.deinit();
     const manifest = parsed_manifest.value;
-    if (manifest.layout_schema_version != layout_schema_version or manifest.catalog_schema_version != 2 or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != names.len)
+    const entity_names = if (manifest.catalog_schema_version == 3) names[0..] else names[0..8];
+    if (manifest.layout_schema_version != layout_schema_version or (manifest.catalog_schema_version != 2 and manifest.catalog_schema_version != 3) or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != entity_names.len)
         return error.InvalidCatalogManifest;
     var declared_tx: [64]u8 = undefined;
     try transactionId(manifest.catalog_revision, manifest.entities, &declared_tx);
@@ -99,8 +105,8 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
 
     var combined: std.Io.Writer.Allocating = .init(allocator);
     defer combined.deinit();
-    try combined.writer.print("{{\"schema_version\":2,\"revision\":{d}", .{manifest.catalog_revision});
-    for (names) |name| {
+    try combined.writer.print("{{\"schema_version\":{d},\"revision\":{d}", .{ manifest.catalog_schema_version, manifest.catalog_revision });
+    for (entity_names) |name| {
         const entity = findEntity(manifest.entities, name) orelse return error.InvalidCatalogManifest;
         const expected_file = try std.fmt.allocPrint(allocator, "{s}.json", .{name});
         defer allocator.free(expected_file);
@@ -116,7 +122,10 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
         try combined.writer.writeAll(bytes);
     }
     try combined.writer.writeByte('}');
-    return std.json.parseFromSlice(model.Catalog, allocator, combined.written(), .{ .allocate = .alloc_always });
+    return if (manifest.catalog_schema_version == 3)
+        schema_v3_dto.parse(allocator, combined.written())
+    else
+        schema_v2_dto.parse(allocator, combined.written());
 }
 
 fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, catalog: *const model.Catalog, crash: ?CrashPoint) !void {
@@ -138,26 +147,45 @@ fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     };
     contents[0] = try content(allocator, names[0], catalog.distros);
     initialized += 1;
-    contents[1] = try content(allocator, names[1], catalog.profiles);
+    contents[1] = if (catalog.schema_version == 3)
+        try contentBytes(allocator, names[1], try schema_v3_dto.renderProfiles(allocator, catalog.profiles))
+    else
+        try content(allocator, names[1], catalog.profiles);
     initialized += 1;
-    contents[2] = try content(allocator, names[2], catalog.nodes);
+    contents[2] = if (catalog.schema_version == 3)
+        try contentBytes(allocator, names[2], try schema_v3_dto.renderNodes(allocator, catalog.nodes))
+    else
+        try content(allocator, names[2], catalog.nodes);
     initialized += 1;
-    contents[3] = try content(allocator, names[3], catalog.provisioning_bundles);
+    contents[3] = if (catalog.schema_version == 3)
+        try contentBytes(allocator, names[3], try schema_v3_dto.renderBundles(allocator, catalog.provisioning_bundles))
+    else
+        try content(allocator, names[3], catalog.provisioning_bundles);
     initialized += 1;
     contents[4] = try content(allocator, names[4], catalog.repositories);
     initialized += 1;
-    contents[5] = try content(allocator, names[5], catalog.assets);
+    contents[5] = if (catalog.schema_version == 3)
+        try contentBytes(allocator, names[5], try schema_v3_dto.renderAssets(allocator, catalog.assets))
+    else
+        try content(allocator, names[5], catalog.assets);
     initialized += 1;
     contents[6] = try content(allocator, names[6], catalog.install_sources);
     initialized += 1;
     contents[7] = try content(allocator, names[7], catalog.boot_bundles);
     initialized += 1;
+    contents[8] = try content(allocator, names[8], catalog.discovery_policy);
+    initialized += 1;
+    contents[9] = try content(allocator, names[9], catalog.unknown_client_observations);
+    initialized += 1;
 
+    const content_count: usize = if (catalog.schema_version == 3) names.len else 8;
+    const selected_contents = contents[0..content_count];
     var entities: [names.len]ManifestEntity = undefined;
-    for (&contents, 0..) |*item, index| entities[index] = .{ .name = item.name, .file = item.file, .sha256 = &item.digest };
+    for (selected_contents, 0..) |*item, index| entities[index] = .{ .name = item.name, .file = item.file, .sha256 = &item.digest };
+    const selected_entities = entities[0..content_count];
     var transaction_id: [64]u8 = undefined;
-    try transactionId(revision, &entities, &transaction_id);
-    const manifest: Manifest = .{ .layout_schema_version = layout_schema_version, .catalog_schema_version = 2, .catalog_revision = revision, .transaction_id = &transaction_id, .entities = &entities };
+    try transactionId(revision, selected_entities, &transaction_id);
+    const manifest: Manifest = .{ .layout_schema_version = layout_schema_version, .catalog_schema_version = catalog.schema_version, .catalog_revision = revision, .transaction_id = &transaction_id, .entities = selected_entities };
     const manifest_bytes = try std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 });
     defer allocator.free(manifest_bytes);
     var manifest_digest: [64]u8 = undefined;
@@ -174,7 +202,7 @@ fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
 
     var changes: [names.len]TxFile = undefined;
     var change_count: usize = 0;
-    for (&contents) |*item| {
+    for (selected_contents) |*item| {
         const unchanged = if (old_manifest) |*old| if (findEntity(old.value.entities, item.name)) |entity| std.mem.eql(u8, entity.sha256, &item.digest) else false else false;
         if (unchanged) continue;
         const final_path = try joinPath(allocator, directory, item.file);
@@ -244,6 +272,12 @@ fn content(allocator: std.mem.Allocator, name: []const u8, values: anytype) !Con
     sha256(bytes, &digest);
     return .{ .name = name, .file = try std.fmt.allocPrint(allocator, "{s}.json", .{name}), .bytes = bytes, .digest = digest };
 }
+fn contentBytes(allocator: std.mem.Allocator, name: []const u8, bytes: []u8) !Content {
+    errdefer allocator.free(bytes);
+    var digest: [64]u8 = undefined;
+    sha256(bytes, &digest);
+    return .{ .name = name, .file = try std.fmt.allocPrint(allocator, "{s}.json", .{name}), .bytes = bytes, .digest = digest };
+}
 fn findEntity(entities: []const ManifestEntity, name: []const u8) ?ManifestEntity {
     for (entities) |entity| if (std.mem.eql(u8, entity.name, name)) return entity;
     return null;
@@ -290,9 +324,8 @@ fn transactionId(revision: u64, entities: []const ManifestEntity, output: *[64]u
     const text = try std.fmt.bufPrint(&revision_text, "{d}", .{revision});
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(text);
-    for (names) |name| {
-        const entity = findEntity(entities, name) orelse return error.InvalidCatalogManifest;
-        hash.update(name);
+    for (entities) |entity| {
+        hash.update(entity.name);
         hash.update(entity.sha256);
     }
     var raw: [32]u8 = undefined;

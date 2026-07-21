@@ -96,12 +96,11 @@ pub fn candidates(allocator: std.mem.Allocator, config: *const model.AppConfig, 
             repository.distro = try catalog_arena.dupe(u8, rename.new_distro);
             repository.base_url = try replaceOne(catalog_arena, repository.base_url, rename.source, rename.target);
         };
-        for (profiles) |*profile| if (profile.install_source) |source_name| {
-            if (std.mem.eql(u8, source_name, rename.source)) {
+        for (profiles) |*profile| {
+            if (std.mem.eql(u8, profile.install_source, rename.source)) {
                 profile.install_source = try config_arena.dupe(u8, rename.target);
-                if (std.mem.eql(u8, profile.distro, rename.old_distro)) profile.distro = try config_arena.dupe(u8, rename.new_distro);
             }
-        };
+        }
     }
     try validate.validate(&result.config.value, &result.catalog.value);
     return result;
@@ -141,7 +140,7 @@ pub fn build(allocator: std.mem.Allocator, config: *const model.AppConfig, catal
         }
         var profile_names = std.ArrayList([]const u8).empty;
         defer profile_names.deinit(allocator);
-        for (config.profiles) |profile| if (profile.install_source) |name| if (std.mem.eql(u8, name, source.name)) try profile_names.append(allocator, profile.name);
+        for (config.profiles) |profile| if (std.mem.eql(u8, profile.install_source, source.name)) try profile_names.append(allocator, profile.name);
         const from = try std.fmt.allocPrint(allocator, "repos/{s}", .{source.name});
         errdefer allocator.free(from);
         const to = try std.fmt.allocPrint(allocator, "repos/{s}", .{target});
@@ -233,7 +232,7 @@ test "legacy wrong distro produces stable migration plan and profile patch" {
         .{ .name = "rocky-old-installer-initrd", .kind = .installer_initrd, .path = "install/rocky-old/initrd.img" },
     };
     const source: model.InstallSourceConfig = .{ .name = "rocky-old", .source_label = "CentOS Linux 8.4 DVD", .distro = "rocky", .version = "8.4", .arch = .x86_64, .source_asset = "rocky-old-image", .installer_kernel = "rocky-old-installer-kernel", .installer_initrd = "rocky-old-installer-initrd", .media_tree_url = "http://192.0.2.1/artifacts/repositories/rocky-old" };
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1" }, .profiles = &.{.{ .name = "legacy", .mode = .install, .distro = "rocky", .version = "8.4", .arch = .x86_64, .install_source = "rocky-old" }} };
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1" }, .profiles = &.{.{ .name = "legacy", .install_source = "rocky-old" }} };
     const catalog: model.Catalog = .{ .assets = &assets, .install_sources = &.{source} };
     var first = try build(std.testing.allocator, &config, &catalog, 11, 4);
     defer first.deinit();
@@ -263,7 +262,7 @@ test "typed candidates update source assets and profile without text-wide replac
     };
     const source: model.InstallSourceConfig = .{ .name = "rocky-old", .source_label = "CentOS Linux 8.4 DVD", .distro = "rocky", .version = "8.4", .arch = .x86_64, .source_asset = "rocky-old-image", .installer_kernel = "rocky-old-installer-kernel", .installer_initrd = "rocky-old-installer-initrd", .media_tree_url = "http://192.0.2.1/artifacts/repositories/rocky-old" };
     const versions = [_]model.DistroVersionConfig{.{ .version = "8.4", .archs = &.{.x86_64}, .install_adapter = .kickstart, .package_manager = .dnf }};
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .bind_interface = "eth0" }, .http = .{ .asset_root = "/tmp/nodeforge/iso", .repository_root = "/tmp/nodeforge/repos" }, .tftp = .{ .asset_root = "/tmp/nodeforge/boot" }, .distros = &.{.{ .name = "centos", .family = .rhel, .versions = &versions }}, .profiles = &.{.{ .name = "legacy", .mode = .install, .distro = "rocky", .version = "8.4", .arch = .x86_64, .install_source = "rocky-old", .safety = .{ .destructive = true, .persistent_writes = true }, .install = .{} }} };
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .bind_interface = "eth0" }, .http = .{ .asset_root = "/tmp/nodeforge/iso", .repository_root = "/tmp/nodeforge/repos" }, .tftp = .{ .asset_root = "/tmp/nodeforge/boot" }, .distros = &.{.{ .name = "centos", .family = .rhel, .versions = &versions }}, .profiles = &.{.{ .name = "legacy", .install_source = "rocky-old" }} };
     const catalog: model.Catalog = .{ .assets = &assets, .install_sources = &.{source} };
     var plan = try build(std.testing.allocator, &config, &catalog, 3, 4);
     defer plan.deinit();
@@ -271,5 +270,5 @@ test "typed candidates update source assets and profile without text-wide replac
     defer next.deinit();
     try std.testing.expectEqualStrings("centos-8.4-x86_64-dvd", next.catalog.value.install_sources[0].name);
     try std.testing.expectEqualStrings("install/centos-8.4-x86_64-dvd/vmlinuz", next.catalog.value.assets[1].path);
-    try std.testing.expectEqualStrings("centos", next.config.value.profiles[0].distro);
+    try std.testing.expectEqualStrings("centos-8.4-x86_64-dvd", next.config.value.profiles[0].install_source);
 }

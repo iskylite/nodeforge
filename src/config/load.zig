@@ -5,6 +5,8 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const paths = @import("../paths.zig");
+const schema_v3_dto = @import("schema_v3_dto.zig");
+const schema_v2_dto = @import("schema_v2_dto.zig");
 
 /// 默认启动配置路径。必须在进程路径自举完成后调用。
 pub fn defaultPath() []const u8 {
@@ -30,9 +32,13 @@ pub fn load(
     );
     defer allocator.free(bytes);
 
-    var parsed = try std.json.parseFromSlice(model.AppConfig, allocator, bytes, .{
-        .allocate = .alloc_always,
-    });
+    const Header = struct { schema_version: u32 };
+    const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    var parsed = if (header.value.schema_version == 3)
+        try schema_v3_dto.parse(allocator, bytes)
+    else
+        try schema_v2_dto.parse(allocator, bytes);
     canonicalizeKernelArgs(&parsed.value);
     return parsed;
 }
@@ -127,7 +133,7 @@ test "M4.6 load canonicalizes kernel args" {
     var parsed = try std.json.parseFromSlice(
         model.AppConfig,
         std.testing.allocator,
-        \\{"server":{"server_ip":"192.168.50.1"},"profiles":[{"name":"p","mode":"diskless","distro":"ubuntu","version":"22.04","arch":"aarch64","kernel_args":"  iommu=pt   isolcpus=0,2  "},{"name":"empty","mode":"discovery","distro":"rocky","version":"9.7","arch":"aarch64","kernel_args":"   "}]}
+        \\{"server":{"server_ip":"192.168.50.1"},"profiles":[{"name":"p","install_source":"ubuntu","kernel_args":"  iommu=pt   isolcpus=0,2  "},{"name":"empty","install_source":"rocky","kernel_args":"   "}]}
     ,
         .{ .allocate = .alloc_always },
     );

@@ -30,6 +30,8 @@ pub const specs = [_]RouteSpec{
     .{ .method = "POST", .template = "/api/v1/nodes/:id/installer-hooks/subiquity", .plane = .node, .auth = .node_session, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/artifacts/images/:name", .plane = .artifact, .auth = .none, .cache = .immutable, .log = .artifact },
     .{ .method = "HEAD", .template = "/artifacts/images/:name", .plane = .artifact, .auth = .none, .cache = .immutable, .log = .artifact },
+    .{ .method = "GET", .template = "/artifacts/managed-files/:name/:revision", .plane = .artifact, .auth = .none, .cache = .immutable, .log = .artifact },
+    .{ .method = "HEAD", .template = "/artifacts/managed-files/:name/:revision", .plane = .artifact, .auth = .none, .cache = .immutable, .log = .artifact },
     .{ .method = "GET", .template = "/artifacts/repositories/:name/*", .plane = .artifact, .auth = .none, .cache = .immutable, .log = .artifact },
     .{ .method = "HEAD", .template = "/artifacts/repositories/:name/*", .plane = .artifact, .auth = .none, .cache = .immutable, .log = .artifact },
     .{ .method = "GET", .template = "/artifacts/boot/*", .plane = .artifact, .auth = .none, .cache = .immutable, .log = .artifact },
@@ -40,23 +42,53 @@ pub const specs = [_]RouteSpec{
     .{ .method = "GET", .template = "/api/v1/management/nodes", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/nodes", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/nodes/:id", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
-    .{ .method = "PATCH", .template = "/api/v1/management/nodes/:id", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/nodes/:id/values", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/nodes/:id/values", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/nodes/:id/items", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/nodes/:id/items", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/nodes/:id/capabilities", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/nodes/:id/properties", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "DELETE", .template = "/api/v1/management/nodes/:id", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/nodes/:id/install-generations", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/nodes/:id/claim", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/discovery/observations", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/discovery/observations/:mac", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/discovery/policy", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "PATCH", .template = "/api/v1/management/discovery/policy", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/profiles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
-    .{ .method = "PATCH", .template = "/api/v1/management/profiles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/profiles/:name/values", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/profiles/:name/values", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/profiles/:name/items", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/profiles/:name/items", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/profiles/:name/capabilities", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/profiles/:name/properties", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/assets", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/assets", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/assets/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/assets/provision-bundles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/assets/provision-bundles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/assets/provision-bundles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "DELETE", .template = "/api/v1/management/assets/provision-bundles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/assets/provision-bundles/:name/items", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/assets/provision-bundles/:name/items", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "DELETE", .template = "/api/v1/management/assets/managed-files/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/install-sources", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/install-sources", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/install-sources/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/install-sources/:name/software", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/repositories", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/repositories/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/repositories/:name/software", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "GET", .template = "/api/v1/management/profiles/:name/software/available", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/operations", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/operations/:id", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/catalog/migration-plans", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/catalog/migrations", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/catalog/schema-v3/migration-plans", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/catalog/schema-v3/migrations", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "POST", .template = "/api/v1/management/catalog/schema-v3/rollbacks", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/runtime", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/runtime/tftp", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/runtime/tftp/sessions", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
@@ -204,8 +236,13 @@ test "Allow aggregation reflects registered methods for detail and collection pa
     try std.testing.expect(!methodAllowed("/api/v1/management/config", "POST"));
     // 资产 detail 只注册了 GET，PUT/DELETE 应得到 405 + Allow: GET。
     try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/assets/rocky-kernel", &buffer).?);
-    // M4.6 profile detail 既可查看，也只允许 PATCH kernel_args。
-    try std.testing.expectEqualStrings("GET, PATCH", allowed("/api/v1/management/profiles/rocky-install", &buffer).?);
+    // v3 profile detail is read-only; canonical mutations use /properties,
+    // /values, and /items subresources.
+    try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/profiles/rocky-install", &buffer).?);
+    try std.testing.expectEqualStrings("POST", allowed("/api/v1/management/profiles/rocky-install/properties", &buffer).?);
+    try std.testing.expectEqualStrings("GET, PATCH", allowed("/api/v1/management/discovery/policy", &buffer).?);
+    try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/discovery/observations/02:00:00:00:00:01", &buffer).?);
+    try std.testing.expectEqualStrings("POST", allowed("/api/v1/management/nodes/node-01/claim", &buffer).?);
     // 真正不存在的路径返回 null（404），而非空 Allow。
     try std.testing.expect(allowed("/api/v1/management/never-registered", &buffer) == null);
 }

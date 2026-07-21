@@ -10,6 +10,14 @@ const std = @import("std");
 const zap = @import("zap");
 const model = @import("../model.zig");
 const config_validate = @import("../config/validate.zig");
+const config_load = @import("../config/load.zig");
+const cli_properties = @import("../cli/properties.zig");
+const adapter_capabilities = @import("../profile/capabilities.zig");
+const effective_compiler = @import("../profile/effective.zig");
+const value_mutation = @import("../config/value_mutation.zig");
+const item_mutation = @import("../config/item_mutation.zig");
+const scalar_mutation = @import("../config/scalar_mutation.zig");
+const provision_bundle_mutation = @import("../config/provision_bundle_mutation.zig");
 const node_mutation = @import("../config/node_mutation.zig");
 const runtime_state = @import("../state/runtime.zig");
 const catalog_runtime = @import("../state/catalog_runtime.zig");
@@ -26,7 +34,10 @@ const lookup = @import("../catalog.zig");
 const asset_validate = @import("../assets/validate.zig");
 const iso_import = @import("../catalog/iso_import.zig");
 const catalog_migration = @import("../catalog/migration.zig");
+const catalog_discovery = @import("../catalog/discovery.zig");
+const schema_v3 = @import("../catalog/schema_v3.zig");
 const model_transaction = @import("../state/model_transaction.zig");
+const schema_v3_transaction = @import("../state/schema_v3_transaction.zig");
 const config_store = @import("../config/store.zig");
 const catalog_store = @import("../catalog/store.zig");
 const dhcp_server = @import("../dhcp/server.zig");
@@ -269,6 +280,7 @@ fn route(request: zap.Request) !void {
         };
         // ── 静态制品路由 ──────────────────────────────────────
         if (assetRoute(path, "/artifacts/images/")) |name| return imageAsset(request, context, name, meta);
+        if (managedFileRoute(path)) |managed| return managedFileAsset(request, context, managed.name, managed.revision, meta);
         if (artifactRepoRoute(path)) |repo| return repositoryAsset(request, context, repo.name, repo.tail, meta);
         if (artifactBootRoute(path)) |relative| return bootFile(request, context, relative, meta);
     }
@@ -294,20 +306,38 @@ fn route(request: zap.Request) !void {
         return json(request, .ok, "{\"ok\":true,\"result\":{}}\n", meta);
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/nodes")) return managementNodeAdd(request, context, meta);
+    if (std.mem.eql(u8, method, "POST")) if (claimPath(path)) |node_id| return managementNodeClaim(request, context, node_id, meta);
     if (nodePath(path, "/api/v1/management/nodes/")) |node_id| {
-        if (std.mem.eql(u8, method, "PATCH")) return managementNodeSet(request, context, node_id, meta);
         if (std.mem.eql(u8, method, "DELETE")) return managementNodeRemove(request, context, node_id, meta);
     }
-    if (std.mem.eql(u8, method, "PATCH")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfileSet(request, context, name, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/values")) |name| return managementValuesMutation(request, context, .profile, name, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/values")) |name| return managementValuesGet(request, context, .profile, name, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/items")) |name| return managementItemMutation(request, context, .profile, name, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/items")) |name| return managementItemsGet(request, context, .profile, name, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/capabilities")) |name| return managementCapabilities(request, context, .profile, name, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/properties")) |name| return managementScalarMutation(request, context, .profile, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (installGenerationsPath(path)) |node_id| return installGenerations(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime")) {
         return runtimeSummary(request, context, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/nodes")) return managementNodes(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/nodes/")) |node_id| return managementNode(request, context, node_id, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/values")) |node_id| return managementValuesMutation(request, context, .node, node_id, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/values")) |node_id| return managementValuesGet(request, context, .node, node_id, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/items")) |node_id| return managementItemMutation(request, context, .node, node_id, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/items")) |node_id| return managementItemsGet(request, context, .node, node_id, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/capabilities")) |node_id| return managementCapabilities(request, context, .node, node_id, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/properties")) |node_id| return managementScalarMutation(request, context, .node, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfiles(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/software/available")) |name| return managementProfileSoftware(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfileCreate(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfile(request, context, name, meta);
+    if (std.mem.eql(u8, path, "/api/v1/management/discovery/policy")) {
+        if (std.mem.eql(u8, method, "GET")) return managementDiscoveryPolicy(request, context, meta);
+        if (std.mem.eql(u8, method, "PATCH")) return managementDiscoveryPolicySet(request, context, meta);
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/discovery/observations")) return managementDiscoveryObservations(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/discovery/observations/")) |mac| return managementDiscoveryObservation(request, context, mac, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime/tftp")) {
         return tftpStatus(request, context.runtime, meta);
     }
@@ -325,14 +355,27 @@ fn route(request: zap.Request) !void {
         return importAsset(request, context, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/assets")) return managementAssets(request, context, meta);
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/assets/provision-bundles")) return managementProvisionBundles(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/assets/provision-bundles")) return managementProvisionBundleCreate(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/assets/provision-bundles/", "/items")) |name| return managementProvisionBundleItems(request, context, name, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/assets/provision-bundles/", "/items")) |name| return managementProvisionBundleItemMutation(request, context, name, meta);
+    if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "DELETE")) if (logicalPath(path, "/api/v1/management/assets/provision-bundles/")) |name| return if (std.mem.eql(u8, method, "GET")) managementProvisionBundle(request, context, name, meta) else managementProvisionBundleRemove(request, context, name, meta);
+    if (std.mem.eql(u8, method, "DELETE")) if (logicalPath(path, "/api/v1/management/assets/managed-files/")) |name| return managementManagedFileRemove(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/assets/")) |name| return managementAsset(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/install-sources")) {
         return importInstallSource(request, context, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/install-sources")) return managementInstallSources(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/install-sources/", "/software")) |name| return managementInstallSourceSoftware(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/install-sources/")) |name| return managementInstallSource(request, context, name, meta);
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/repositories")) return managementRepositories(request, context, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/repositories/", "/software")) |name| return managementRepositorySoftware(request, context, name, meta);
+    if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/repositories/")) |name| return managementRepository(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/migration-plans")) return catalogMigrationPlan(request, context, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/migrations")) return catalogMigrationApply(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/migration-plans")) return schemaV3MigrationPlan(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/migrations")) return schemaV3MigrationApply(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/rollbacks")) return schemaV3MigrationRollback(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/operations/")) |operation_id| return managementOperation(request, context, operation_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/operations")) return managementOperations(request, context, meta);
     var allow_buffer: [128]u8 = undefined;
@@ -369,6 +412,12 @@ fn nodePath(path: []const u8, prefix: []const u8) ?[]const u8 {
 fn logicalPath(path: []const u8, prefix: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, path, prefix)) return null;
     const value = path[prefix.len..];
+    return if (config_validate.validLogicalId(value)) value else null;
+}
+
+fn resourceWithSuffix(path: []const u8, prefix: []const u8, suffix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const value = path[prefix.len .. path.len - suffix.len];
     return if (config_validate.validLogicalId(value)) value else null;
 }
 
@@ -435,6 +484,34 @@ fn imageAsset(request: zap.Request, context: *const RouteContext, name: []const 
     return staticFile(request, context, context.config.http.asset_root, path, checksum, meta);
 }
 
+const ManagedFileRoute = struct { name: []const u8, revision: u64 };
+fn managedFileRoute(path: []const u8) ?ManagedFileRoute {
+    const prefix = "/artifacts/managed-files/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const name = rest[0..slash];
+    if (!@import("../config/validate.zig").validLogicalId(name)) return null;
+    const revision = std.fmt.parseInt(u64, rest[slash + 1 ..], 10) catch return null;
+    if (revision == 0) return null;
+    return .{ .name = name, .revision = revision };
+}
+
+test "managed-file artifact path requires canonical name and positive revision" {
+    const parsed = managedFileRoute("/artifacts/managed-files/site-motd/3").?;
+    try std.testing.expectEqualStrings("site-motd", parsed.name);
+    try std.testing.expectEqual(@as(u64, 3), parsed.revision);
+    try std.testing.expect(managedFileRoute("/artifacts/managed-files/../3") == null);
+    try std.testing.expect(managedFileRoute("/artifacts/managed-files/site-motd/0") == null);
+    try std.testing.expect(managedFileRoute("/artifacts/managed-files/site-motd/latest") == null);
+}
+
+fn managedFileAsset(request: zap.Request, context: *const RouteContext, name: []const u8, revision: u64, meta: RequestMeta) !void {
+    const asset = lookup.findAsset(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    if (asset.kind != .managed_file or asset.revision != revision or asset.sha256 == null) return notFound(request, meta);
+    return staticFile(request, context, paths.require().assets_dir, asset.path, asset.sha256, meta);
+}
+
 /// M4.2 F4：从 `tftp.asset_root` 提供启动文件（kernel/initrd）。
 /// Catalog 白名单 + ETag checksum 支持条件请求和断点续传。
 fn bootFile(request: zap.Request, context: *const RouteContext, relative: []const u8, meta: RequestMeta) !void {
@@ -476,6 +553,8 @@ fn staticFile(request: zap.Request, context: *const RouteContext, root: []const 
     var file = asset_validate.openRegularFile(context.io, root, relative) catch return notFound(request, meta);
     errdefer file.close(context.io);
     const size = (try file.stat(context.io)).size;
+    try request.setHeader("cache-control", "public, max-age=31536000, immutable");
+    try request.setHeader("x-content-type-options", "nosniff");
     // Subiquity 在运行 apt-get 前用 HEAD 探测 APT 候选镜像。因此仅支持
     // GET 的仓库会表现为不可用，尽管包文件可以被下载。保留与 GET 相同的
     // 路径约束和元数据，但按 HTTP HEAD 要求不返回响应体。
@@ -765,12 +844,6 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
             }
             try output.writer.writeByte(']');
         },
-        // M5 design placeholder: diskless BootConfig must add target_system,
-        // required_features, rootfs URL and capability. Keep the response
-        // intentionally empty until the authenticated rootfs artifact and
-        // initrd contract land; do not imply a working diskless payload.
-        .diskless => {},
-        .discovery => {},
     }
     try output.writer.print(",\"access\":{{\"session_header\":\"X-NodeForge-Session\",\"session_id\":{f},\"authorization_header\":\"Authorization\",\"bearer_token\":{f}}}}}\n", .{
         std.json.fmt(session.boot_session_id[0..], .{}), std.json.fmt(session.capability[0..], .{}),
@@ -835,8 +908,9 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
         break :blk url;
     } else "";
     defer if (report_url.len > 0) context.allocator.free(report_url);
-    var effective_disk: [1][]const u8 = undefined;
-    const install_orig = @import("../profile/install.zig").effectiveInstall(node, profile, &effective_disk) catch return error.MissingInstallConfig;
+    var effective_plan = @import("../profile/effective.zig").compileInputs(context.allocator, node, profile, &plan.install_source) catch return error.MissingInstallConfig;
+    defer effective_plan.deinit();
+    const install_orig = effective_plan.install;
     // M4.2 F5：将服务端级别的额外 SSH 公钥合并到安装配置中。
     const merged_keys: []const []const u8 = if (context.additional_keys.len > 0) blk: {
         const combined = try context.allocator.alloc([]const u8, install_orig.ssh_authorized_keys.len + context.additional_keys.len);
@@ -853,9 +927,10 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
         .ssh_authorized_keys = merged_keys,
         .bundle = install_orig.bundle,
         .apt = install_orig.apt,
+        .reinstall_policy = install_orig.reinstall_policy,
     } else install_orig;
-    const system = try @import("../profile/install.zig").effectiveSystem(profile);
-    const bundle = if (install.bundle) |name| findProvisioningBundleIn(plan.provisioning_bundles, name) else null;
+    const system = effective_plan.system;
+    const bundle = if (install.post_install.bundle orelse install.bundle) |name| findProvisioningBundleIn(plan.provisioning_bundles, name) else null;
     var password_scope_buffer: [96]u8 = undefined;
     // Salt scope must survive daemon restart. The session id is random and the
     // captured model revision is immutable for this delivery; daemon instance
@@ -877,13 +952,13 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     } else null;
     const body = switch (format) {
         .meta_data => try @import("../profile/adapter/ubuntu.zig").renderMetaData(context.allocator, node),
-        .user_data => try @import("../profile/adapter/ubuntu.zig").renderUserDataM41(context.allocator, node, install, system, context.bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session.boot_session_id[0..], session.capability[0..], password_scope, profile.kernel_args),
+        .user_data => try @import("../profile/adapter/ubuntu.zig").renderEffective(context.allocator, node, install, system, effective_plan.network, effective_plan.software, context.bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session.boot_session_id[0..], session.capability[0..], password_scope, effective_plan.kernel_args),
         .vendor_data => try context.allocator.dupe(u8, ""),
         .kickstart => blk: {
             const source = &plan.install_source;
             const install_root = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ context.config.server.server_ip, context.config.server.http_port, source.name });
             defer context.allocator.free(install_root);
-            break :blk try @import("../profile/adapter/kickstart.zig").renderAnswerM41(context.allocator, node, install, system, context.bootstrap_key, install_root, bundle, facts_url, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope, profile.kernel_args);
+            break :blk try @import("../profile/adapter/kickstart.zig").renderEffective(context.allocator, node, install, system, effective_plan.network, effective_plan.software, context.bootstrap_key, install_root, bundle, facts_url, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope, effective_plan.kernel_args);
         },
     };
     defer context.allocator.free(body);
@@ -928,28 +1003,41 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
 }
 
 fn buildInstallPlan(context: *const RouteContext, node_id: []const u8, profile_name: []const u8, desired_revision: u64, desired_digest: deployment_control.Digest) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(context.allocator);
+    defer arena.deinit();
+    const plan_allocator = arena.allocator();
     const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return error.MissingNode;
     const profile = lookup.findProfile(context.catalog_snapshot.value(), profile_name) orelse return error.MissingProfile;
-    const distro = lookup.findDistro(context.catalog_snapshot.value(), profile.distro) orelse return error.MissingDistro;
     const catalog_snapshot = context.catalog_snapshot;
-    const source = lookup.findInstallSource(catalog_snapshot.value(), profile.install_source orelse return error.MissingInstallSource) orelse return error.MissingInstallSource;
+    const source = lookup.findInstallSource(catalog_snapshot.value(), profile.install_source) orelse return error.MissingInstallSource;
+    const distro = lookup.findDistro(context.catalog_snapshot.value(), source.distro) orelse return error.MissingDistro;
     const kernel = lookup.findAsset(catalog_snapshot.value(), source.installer_kernel) orelse return error.MissingAsset;
     const initrd = lookup.findAsset(catalog_snapshot.value(), source.installer_initrd) orelse return error.MissingAsset;
     const repositories = try context.allocator.alloc(model.RepositoryConfig, source.repositories.len);
     defer context.allocator.free(repositories);
     for (source.repositories, 0..) |name, index|
         repositories[index] = (lookup.findRepository(catalog_snapshot.value(), name) orelse return error.MissingRepository).*;
-    const bundle_count: usize = if (profile.install != null and profile.install.?.bundle != null) 1 else 0;
-    const bundles = try context.allocator.alloc(model.ProvisioningBundle, bundle_count);
-    defer context.allocator.free(bundles);
-    if (profile.install) |install| if (install.bundle) |name| {
+    const bundle_count: usize = if (profile.install.post_install.bundle orelse profile.install.bundle) |_| 1 else 0;
+    const bundles = try plan_allocator.alloc(model.ProvisioningBundle, bundle_count);
+    if (profile.install.post_install.bundle orelse profile.install.bundle) |name| {
         var found: ?model.ProvisioningBundle = null;
         for (catalog_snapshot.value().provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) {
             found = bundle;
             break;
         };
-        bundles[0] = found orelse return error.MissingProvisioningBundle;
-    };
+        const source_bundle = found orelse return error.MissingProvisioningBundle;
+        const steps = try plan_allocator.alloc(model.ProvisionStep, source_bundle.steps.len);
+        for (source_bundle.steps, 0..) |step, index| {
+            if (step.action != .managed_file) return error.InvalidProvisioningStep;
+            const asset = lookup.findAsset(catalog_snapshot.value(), step.content_asset orelse return error.InvalidProvisioningStep) orelse return error.MissingAsset;
+            if (asset.kind != .managed_file or asset.sha256 == null) return error.InvalidProvisioningStep;
+            steps[index] = step;
+            steps[index].content_url = try std.fmt.allocPrint(plan_allocator, "http://{s}:{d}/artifacts/managed-files/{s}/{d}", .{ context.config.server.server_ip, context.config.server.http_port, asset.name, asset.revision });
+            steps[index].content_sha256 = asset.sha256;
+        }
+        bundles[0] = source_bundle;
+        bundles[0].steps = steps;
+    }
     return std.json.Stringify.valueAlloc(context.allocator, .{
         .schema_version = @as(u32, 1),
         .model_revision = desired_revision,
@@ -1043,11 +1131,7 @@ fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const 
     defer summary.params.deinit();
     @import("contracts.zig").validateLogSummary(summary.value) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_log\",\"message\":\"invalid node log summary\"}}\n", meta);
     if (!std.mem.eql(u8, summary.value.boot_session_id, checked.session.boot_session_id[0..])) return nodeAuthError(request, error.ProofMismatch, meta);
-    const event_type = switch (checked.session.mode) {
-        .install => "install.failed",
-        .diskless => "diskless.failed",
-        .discovery => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.stage_invalid\",\"message\":\"logs unavailable for discovery\"}}\n", meta),
-    };
+    const event_type = "install.failed";
     context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, .failed, summary.value.reason, unixNow(), false) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
@@ -1296,15 +1380,10 @@ fn stringParam(value: ?zap.Request.HttpParam) ?[]const u8 {
 }
 
 const StageMapping = struct { event_type: []const u8, phase: node_status.Phase };
-fn mapStage(mode: model.ProfileMode, stage: []const u8) ?StageMapping {
+fn mapStage(mode: model.BootKind, stage: []const u8) ?StageMapping {
     if (mode == .install) {
         const values = [_]struct { []const u8, []const u8, node_status.Phase }{
             .{ "installer_started", "install.installer_started", .installer_started }, .{ "config_fetched", "install.config_fetched", .install_config_fetched }, .{ "started", "install.started", .install_started }, .{ "partitioning", "install.partitioning", .install_partitioning }, .{ "packages", "install.packages", .install_packages }, .{ "bootloader", "install.bootloader", .install_bootloader }, .{ "post", "install.post", .install_post }, .{ "rebooting", "install.rebooting", .install_rebooting }, .{ "completed", "install.completed", .completed }, .{ "failed", "install.failed", .failed },
-        };
-        for (values) |value| if (std.mem.eql(u8, stage, value[0])) return .{ .event_type = value[1], .phase = value[2] };
-    } else if (mode == .diskless) {
-        const values = [_]struct { []const u8, []const u8, node_status.Phase }{
-            .{ "initrd_started", "diskless.initrd_started", .initrd_started }, .{ "rootfs_download_started", "diskless.rootfs_download_started", .rootfs_downloading }, .{ "rootfs_verified", "diskless.rootfs_verified", .rootfs_verified }, .{ "rootfs_mounted", "diskless.rootfs_mounted", .rootfs_mounted }, .{ "switch_root", "diskless.switch_root", .switching_root }, .{ "running", "diskless.running", .running }, .{ "failed", "diskless.failed", .failed },
         };
         for (values) |value| if (std.mem.eql(u8, stage, value[0])) return .{ .event_type = value[1], .phase = value[2] };
     }
@@ -1377,7 +1456,7 @@ fn undefined_meta(context: *const RouteContext) RequestMeta {
 /// 字符串会被与直接 TFTP 服务相同的资产校验器拒绝。
 fn importAsset(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
-    const AssetRequest = struct { name: []const u8, kind: model.AssetKind, path: []const u8, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null, kernel_release: ?[]const u8 = null };
+    const AssetRequest = struct { name: []const u8, kind: model.AssetKind, path: []const u8, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null, kernel_release: ?[]const u8 = null, revision: u64 = 1, size: ?u64 = null, media_type: ?[]const u8 = null };
     const body = request.body orelse return assetInputError(request, "missing body", meta);
     const parsed = std.json.parseFromSlice(AssetRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid JSON body", meta);
     defer parsed.deinit();
@@ -1385,20 +1464,29 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
     const has_tuple = value.distro != null or value.version != null or value.arch != null;
     if (has_tuple and (value.distro == null or value.version == null or value.arch == null)) return assetInputError(request, "incomplete distro tuple", meta);
     var checksum: [64]u8 = undefined;
-    @import("../assets/validate.zig").sha256File(context.io, context.config.tftp.asset_root, value.path, &checksum) catch |err| {
+    const root = switch (value.kind) {
+        .managed_file => paths.require().assets_dir,
+        .iso => context.config.http.asset_root,
+        .bootloader, .kernel, .installer_initrd => context.config.tftp.asset_root,
+        .gpg_key => paths.require().keys_dir,
+        .nodeforge_initrd => paths.require().initrd_dir,
+        .rootfs => paths.require().rootfs_dir,
+    };
+    @import("../assets/validate.zig").sha256File(context.io, root, value.path, &checksum) catch |err| {
         observe_log.err("asset: import failed for {s}: {t}", .{ value.path, err });
         return assetInputError(request, "unreadable asset", meta);
     };
-    if (lookup.findAsset(context.catalog_snapshot.value(), value.name)) |existing| {
+    if (lookup.findAsset(context.catalog_snapshot.value(), value.name)) |existing| if (value.kind != .managed_file) {
         const same = existing.kind == value.kind and std.mem.eql(u8, existing.path, value.path) and optionalEqual(existing.distro, value.distro) and optionalEqual(existing.version, value.version) and existing.arch == value.arch and optionalEqual(existing.kernel_release, value.kernel_release) and optionalEqual(existing.sha256, &checksum);
         if (!same) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"asset.name_conflict\",\"message\":\"asset name already identifies different canonical metadata\"}}\n", meta);
         var reused: [384]u8 = undefined;
         const response = try std.fmt.bufPrint(&reused, "{{\"ok\":true,\"result\":{{\"name\":{f},\"kind\":{f},\"sha256\":{f}}}}}\n", .{ std.json.fmt(existing.name, .{}), std.json.fmt(@tagName(existing.kind), .{}), std.json.fmt(existing.sha256.?, .{}) });
         return json(request, .ok, response, meta);
-    }
+    };
+    if (value.kind == .managed_file and (value.revision == 0 or value.size == null or value.media_type == null)) return assetInputError(request, "managed-file metadata incomplete", meta);
     context.models.lock();
     defer context.models.unlock();
-    context.catalog.addAsset(context.io, context.config, .{
+    const asset: model.AssetConfig = .{
         .name = value.name,
         .kind = value.kind,
         .path = value.path,
@@ -1407,7 +1495,11 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
         .arch = value.arch,
         .kernel_release = value.kernel_release,
         .sha256 = &checksum,
-    }) catch |err| return assetInputError(request, @errorName(err), meta);
+        .revision = value.revision,
+        .size = value.size,
+        .media_type = value.media_type,
+    };
+    if (value.kind == .managed_file) context.catalog.publishManagedFile(context.io, context.config, asset) catch |err| return assetInputError(request, @errorName(err), meta) else context.catalog.addAsset(context.io, context.config, asset) catch |err| return assetInputError(request, @errorName(err), meta);
     var location: [320]u8 = undefined;
     const location_value = try std.fmt.bufPrint(&location, "/api/v1/management/assets/{s}", .{value.name});
     try request.setHeader("location", location_value);
@@ -1567,6 +1659,121 @@ fn managementAssets(request: zap.Request, context: *const RouteContext, meta: Re
     return json(request, .ok, output.written(), meta);
 }
 
+fn managementProvisionBundles(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    for (context.catalog_snapshot.value().provisioning_bundles, 0..) |bundle, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("{{\"name\":{f},\"revision\":{d},\"steps\":{d}}}", .{ std.json.fmt(bundle.name, .{}), bundle.revision, bundle.steps.len });
+    }
+    try output.writer.print("],\"revision\":{d}}}}}\n", .{context.catalog_snapshot.revision});
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementProvisionBundle(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    for (context.catalog_snapshot.value().provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) {
+        var output: std.Io.Writer.Allocating = .init(context.allocator);
+        defer output.deinit();
+        try output.writer.print("{{\"ok\":true,\"result\":{f}}}\n", .{std.json.fmt(bundle, .{})});
+        return json(request, .ok, output.written(), meta);
+    };
+    return notFound(request, meta);
+}
+
+fn managementProvisionBundleItems(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    for (context.catalog_snapshot.value().provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) {
+        const identity = request.getParamSlice("identity");
+        var output: std.Io.Writer.Allocating = .init(context.allocator);
+        defer output.deinit();
+        try output.writer.writeAll("{\"ok\":true,\"result\":{\"key\":\"steps\",\"items\":[");
+        var first = true;
+        for (bundle.steps) |step| {
+            if (identity != null and !std.mem.eql(u8, identity.?, step.name)) continue;
+            if (!first) try output.writer.writeByte(',');
+            first = false;
+            try output.writer.print("{f}", .{std.json.fmt(step, .{})});
+        }
+        try output.writer.print("],\"revision\":{d}}}}}\n", .{bundle.revision});
+        return json(request, .ok, output.written(), meta);
+    };
+    return notFound(request, meta);
+}
+
+fn provisionMutationGuard(request: zap.Request, context: *RouteContext, meta: RequestMeta) !bool {
+    if (!ifMatchCurrent(request, context)) {
+        try revisionConflict(request, meta);
+        return false;
+    }
+    if (context.sessions.hasActive(boot_session.monotonicNow())) {
+        try json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"provision.active_session\",\"message\":\"bundle mutation is blocked by an active boot session\"}}\n", meta);
+        return false;
+    }
+    return true;
+}
+
+fn managementProvisionBundleCreate(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    const parsed = std.json.parseFromSlice(struct { name: []const u8 }, context.allocator, request.body orelse return assetInputError(request, "missing body", meta), .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid bundle request", meta);
+    defer parsed.deinit();
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!try provisionMutationGuard(request, context, meta)) return;
+    provision_bundle_mutation.create(context.io, context.allocator, context.config, context.catalog.path, parsed.value.name) catch |err| return assetInputError(request, @errorName(err), meta);
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"bundle persisted but snapshot publish failed\"}}\n", meta);
+    return json(request, .created, "{\"ok\":true,\"result\":{\"created\":true}}\n", meta);
+}
+
+fn managementProvisionBundleRemove(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!try provisionMutationGuard(request, context, meta)) return;
+    provision_bundle_mutation.remove(context.io, context.allocator, context.config, context.catalog.path, name) catch |err| return assetInputError(request, @errorName(err), meta);
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"bundle removal persisted but snapshot publish failed\"}}\n", meta);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"removed\":true}}\n", meta);
+}
+
+fn managementManagedFileRemove(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!try provisionMutationGuard(request, context, meta)) return;
+    context.catalog.removeManagedFile(context.io, context.config, name) catch |err| return assetInputError(request, @errorName(err), meta);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"removed\":true,\"immutable_bytes_retained\":true}}\n", meta);
+}
+
+fn managementProvisionBundleItemMutation(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse return assetInputError(request, "missing body", meta);
+    const raw = std.json.parseFromSlice(std.json.Value, context.allocator, body, .{}) catch return assetInputError(request, "invalid item request", meta);
+    defer raw.deinit();
+    const operation = if (raw.value == .object) raw.value.object.get("operation") else null;
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!try provisionMutationGuard(request, context, meta)) return;
+    if (operation != null and operation.? == .string and (std.mem.eql(u8, operation.?.string, "replace") or std.mem.eql(u8, operation.?.string, "clear"))) {
+        const Replacement = struct { operation: enum { replace, clear }, key: []const u8 = "steps", steps: []const provision_bundle_mutation.StepInput = &.{} };
+        const parsed = std.json.parseFromSlice(Replacement, context.allocator, body, .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid step replacement", meta);
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.key, "steps")) return assetInputError(request, "unknown item collection", meta);
+        const steps = try context.allocator.alloc(model.ProvisionStep, parsed.value.steps.len);
+        defer context.allocator.free(steps);
+        for (parsed.value.steps, 0..) |step, index| steps[index] = step.modelValue();
+        provision_bundle_mutation.replace(context.io, context.allocator, context.config, context.catalog.path, name, if (parsed.value.operation == .clear) &.{} else steps) catch |err| return assetInputError(request, @errorName(err), meta);
+    } else {
+        const parsed = std.json.parseFromSlice(provision_bundle_mutation.Patch, context.allocator, body, .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid step patch", meta);
+        defer parsed.deinit();
+        provision_bundle_mutation.mutate(context.io, context.allocator, context.config, context.catalog.path, name, parsed.value) catch |err| return assetInputError(request, @errorName(err), meta);
+    }
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"bundle persisted but snapshot publish failed\"}}\n", meta);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"updated\":true}}\n", meta);
+}
+
 fn managementAsset(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
     const asset = lookup.findAsset(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
     var output: [2048]u8 = undefined;
@@ -1594,6 +1801,112 @@ fn managementInstallSources(request: zap.Request, context: *const RouteContext, 
     return json(request, .ok, output.written(), meta);
 }
 
+fn managementRepositories(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const all = context.catalog_snapshot.value().repositories;
+    const page = pageRequest(request, "repositories", context.catalog_snapshot.revision) catch |err| return pageError(request, err, meta);
+    if (page.offset > all.len) return pageError(request, error.InvalidCursor, meta);
+    const end = @min(page.offset + page.limit, all.len);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    for (all[page.offset..end], 0..) |repository, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("{f}", .{std.json.fmt(repository, .{})});
+    }
+    try output.writer.writeByte(']');
+    try writeNextCursor(&output.writer, "repositories", context.catalog_snapshot.revision, end, all.len);
+    try output.writer.print(",\"view_revision\":{d}}}}}\n", .{context.catalog_snapshot.revision});
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementRepository(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const repository = lookup.findRepository(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"repository\":{f},\"supported_kinds\":", .{std.json.fmt(repository.*, .{})});
+    try writeSupportedSoftwareKinds(&output.writer, repository.manager);
+    try output.writer.writeAll("}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementRepositorySoftware(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const repository = lookup.findRepository(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    return softwareCapabilitiesResponse(request, context, &.{repository}, meta);
+}
+
+fn managementInstallSourceSoftware(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const source = lookup.findInstallSource(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    const repositories = try context.allocator.alloc(*const model.RepositoryConfig, source.repositories.len);
+    defer context.allocator.free(repositories);
+    for (source.repositories, 0..) |repository_name, index| repositories[index] = lookup.findRepository(context.catalog_snapshot.value(), repository_name) orelse return notFound(request, meta);
+    return softwareCapabilitiesResponse(request, context, repositories, meta);
+}
+
+fn managementProfileSoftware(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const profile = lookup.findProfile(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    const source = lookup.findInstallSource(context.catalog_snapshot.value(), profile.install_source) orelse return notFound(request, meta);
+    const repositories = try context.allocator.alloc(*const model.RepositoryConfig, source.repositories.len);
+    defer context.allocator.free(repositories);
+    for (source.repositories, 0..) |repository_name, index| repositories[index] = lookup.findRepository(context.catalog_snapshot.value(), repository_name) orelse return notFound(request, meta);
+    return softwareCapabilitiesResponse(request, context, repositories, meta);
+}
+
+fn softwareCapabilitiesResponse(request: zap.Request, context: *const RouteContext, repositories: []const *const model.RepositoryConfig, meta: RequestMeta) !void {
+    if (repositories.len == 0) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"software.index_unavailable\",\"message\":\"no indexed repository is available\"}}\n", meta);
+    const kind_text = request.getParamSlice("kind");
+    const kind = if (kind_text) |value| std.meta.stringToEnum(model.SoftwareKind, value) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"software.invalid_kind\",\"message\":\"unknown software capability kind\"}}\n", meta) else null;
+    const manager = repositories[0].manager;
+    if (kind) |value| if (!softwareKindApplicable(manager, value)) {
+        var output: std.Io.Writer.Allocating = .init(context.allocator);
+        defer output.deinit();
+        try output.writer.writeAll("{\"ok\":false,\"error\":{\"code\":\"software.kind_not_applicable\",\"message\":\"kind is not applicable to this repository\",\"details\":{\"supported_kinds\":");
+        try writeSupportedSoftwareKinds(&output.writer, manager);
+        try output.writer.writeAll("}}}\n");
+        return json(request, .unprocessable_content, output.written(), meta);
+    };
+    const search = request.getParamSlice("search") orelse "";
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    var first = true;
+    for (repositories) |repository| for (repository.software_index.capabilities) |capability| {
+        if (kind != null and capability.kind != kind.?) continue;
+        if (search.len != 0 and !containsAsciiInsensitive(capability.id, search) and !containsAsciiInsensitive(capability.name, search)) continue;
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        try output.writer.print("{{\"repository\":{f},\"capability\":{f}}}", .{ std.json.fmt(repository.name, .{}), std.json.fmt(capability, .{}) });
+    };
+    try output.writer.writeAll("],\"supported_kinds\":");
+    try writeSupportedSoftwareKinds(&output.writer, manager);
+    try output.writer.writeAll(",\"index_digests\":[");
+    for (repositories, 0..) |repository, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try output.writer.print("{f}", .{std.json.fmt(repository.software_index.revision_digest, .{})});
+    }
+    try output.writer.writeAll("]}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn softwareKindApplicable(manager: model.PackageManager, kind: model.SoftwareKind) bool {
+    return switch (manager) {
+        .dnf => kind == .environment or kind == .group or kind == .package,
+        .apt => kind == .task or kind == .metapackage or kind == .package,
+    };
+}
+fn writeSupportedSoftwareKinds(writer: *std.Io.Writer, manager: model.PackageManager) !void {
+    return switch (manager) {
+        .dnf => writer.writeAll("[\"environment\",\"group\",\"package\"]"),
+        .apt => writer.writeAll("[\"task\",\"metapackage\",\"package\"]"),
+    };
+}
+fn containsAsciiInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    return false;
+}
+
 fn managementOperations(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     var all: [operations.max_operations]operations.Entry = undefined;
     context.operations.snapshot(&all);
@@ -1619,6 +1932,105 @@ fn managementOperations(request: zap.Request, context: *const RouteContext, meta
     try output.writer.print(",\"view_revision\":{d}}}}}\n", .{revision});
     try setRevisionEtag(request, revision);
     return json(request, .ok, output.written(), meta);
+}
+
+fn schemaV3MigrationPlan(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    if (request.body) |body| if (body.len != 0 and !std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "{}"))
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"request.unknown_field\",\"message\":\"schema-v3 plan accepts an empty object\"}}\n", meta);
+    var plan = schema_v3.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.plan_failed\",\"message\":\"cannot construct schema-v3 plan\"}}\n", meta);
+    defer plan.deinit();
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"applicable\":{s},\"plan\":", .{ std.json.fmt(&plan.digest, .{}), if (plan.applicable()) "true" else "false" });
+    try output.writer.writeAll(plan.canonical_json);
+    try output.writer.writeAll("}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+const SchemaV3DigestRequest = struct { plan_digest: []const u8 };
+
+fn parseSchemaV3Digest(request: zap.Request, allocator: std.mem.Allocator) !std.json.Parsed(SchemaV3DigestRequest) {
+    const body = request.body orelse return error.MissingRequestBody;
+    const parsed = try std.json.parseFromSlice(SchemaV3DigestRequest, allocator, body, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    if (parsed.value.plan_digest.len != 64 or !allLowerHex(parsed.value.plan_digest)) return error.InvalidPlanDigest;
+    return parsed;
+}
+
+fn schemaV3MigrationApply(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    var parsed = parseSchemaV3Digest(request, context.allocator) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.invalid_request\",\"message\":\"plan_digest must be 64 lowercase hexadecimal characters\"}}\n", meta);
+    defer parsed.deinit();
+    context.models.lock();
+    defer context.models.unlock();
+    if (context.configs.currentRevision() != context.config_revision or context.catalog.currentRevision() != context.catalog_snapshot.revision)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"model.revision_conflict\",\"message\":\"model changed after plan was read\"}}\n", meta);
+    if (context.sessions.hasActive(boot_session.monotonicNow()))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.active_session\",\"message\":\"all active boot sessions must finish or be terminated\"}}\n", meta);
+    var plan = schema_v3.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.plan_failed\",\"message\":\"cannot rebuild schema-v3 plan\"}}\n", meta);
+    defer plan.deinit();
+    if (!std.mem.eql(u8, &plan.digest, parsed.value.plan_digest))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.digest_conflict\",\"message\":\"plan digest no longer identifies the current model\"}}\n", meta);
+    if (!plan.applicable()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.blocked\",\"message\":\"migration plan contains blockers\"}}\n", meta);
+    var candidate = schema_v3.candidates(context.allocator, context.config, context.catalog_snapshot.value(), &plan) catch
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.materialization_failed\",\"message\":\"cannot materialize migration candidate\"}}\n", meta);
+    defer candidate.deinit();
+    config_validate.validateModel(&candidate.config.value, &candidate.catalog.value) catch |err|
+        return validationError(request, err, meta);
+    const config_json = try config_store.render(context.allocator, &candidate.config.value);
+    defer context.allocator.free(config_json);
+    const config_revision = try deployment_control.revisionForConfig(context.allocator, &candidate.config.value);
+    const prepared_config = try context.configs.prepare(candidate.config.value, config_revision);
+    var published = false;
+    defer if (!published) prepared_config.release();
+    const prepared_catalog = try context.catalog.prepare(candidate.catalog.value, context.catalog_snapshot.revision + 1);
+    defer if (!published) prepared_catalog.release();
+    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
+    defer context.allocator.free(transaction_dir);
+    schema_v3_transaction.commit(context.io, context.allocator, transaction_dir, &plan.digest, context.config_path, context.catalog.path, config_json, &candidate.catalog.value) catch |err| {
+        observe_log.err("schema-v3 transaction failed: {t}", .{err});
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.transaction_failed\",\"message\":\"schema-v3 transaction did not commit\"}}\n", meta);
+    };
+    context.configs.publishPrepared(prepared_config);
+    context.catalog.lock();
+    context.catalog.publishPreparedLocked(prepared_catalog);
+    context.catalog.unlock();
+    published = true;
+    var output: [256]u8 = undefined;
+    const body = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"schema_version\":3,\"catalog_revision\":{d}}}}}\n", .{ std.json.fmt(&plan.digest, .{}), context.catalog_snapshot.revision + 1 });
+    return json(request, .ok, body, meta);
+}
+
+fn schemaV3MigrationRollback(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    var parsed = parseSchemaV3Digest(request, context.allocator) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.invalid_request\",\"message\":\"plan_digest must identify a retained migration backup\"}}\n", meta);
+    defer parsed.deinit();
+    context.models.lock();
+    defer context.models.unlock();
+    if (context.sessions.hasActive(boot_session.monotonicNow()))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.active_session\",\"message\":\"all active boot sessions must finish or be terminated\"}}\n", meta);
+    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
+    defer context.allocator.free(transaction_dir);
+    schema_v3_transaction.rollback(context.io, context.allocator, transaction_dir, parsed.value.plan_digest) catch |err| {
+        observe_log.err("schema-v3 rollback failed: {t}", .{err});
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.rollback_failed\",\"message\":\"retained backup cannot be rolled back\"}}\n", meta);
+    };
+    var old_config = try config_load.load(context.io, context.allocator, context.config_path);
+    defer old_config.deinit();
+    var old_catalog = try catalog_store.load(context.io, context.allocator, context.catalog.path);
+    defer old_catalog.deinit();
+    config_validate.validateModel(&old_config.value, &old_catalog.value) catch |err| return validationError(request, err, meta);
+    const projected = model.projectCatalog(old_config.value, &old_catalog.value);
+    const config_revision = try deployment_control.revisionForConfig(context.allocator, &projected);
+    const prepared_config = try context.configs.prepare(projected, config_revision);
+    const prepared_catalog = try context.catalog.prepare(old_catalog.value, old_catalog.value.revision);
+    context.configs.publishPrepared(prepared_config);
+    context.catalog.lock();
+    context.catalog.publishPreparedLocked(prepared_catalog);
+    context.catalog.unlock();
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"rolled_back\":true}}\n", meta);
 }
 
 fn catalogMigrationPlan(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
@@ -1655,7 +2067,7 @@ fn managementInstallSource(request: zap.Request, context: *const RouteContext, n
     }
     try output.writer.writeAll("],\"profiles\":[");
     var first = true;
-    for (context.catalog_snapshot.value().profiles) |profile| if (profile.install_source) |source_name| if (std.mem.eql(u8, source_name, name)) {
+    for (context.catalog_snapshot.value().profiles) |profile| if (std.mem.eql(u8, profile.install_source, name)) {
         if (!first) try output.writer.writeByte(',');
         first = false;
         try output.writer.print("{f}", .{std.json.fmt(profile.name, .{})});
@@ -1827,10 +2239,19 @@ fn installGenerationsPath(path: []const u8) ?[]const u8 {
     return if (auth.nodeIdSafe(node_id)) node_id else null;
 }
 
+fn claimPath(path: []const u8) ?[]const u8 {
+    const prefix = "/api/v1/management/nodes/";
+    const suffix = "/claim";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const node_id = path[prefix.len .. path.len - suffix.len];
+    return if (auth.nodeIdSafe(node_id)) node_id else null;
+}
+
 fn installGenerations(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return notFound(request, meta);
-    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile) orelse return notFound(request, meta);
-    if (profile.mode != .install) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.not_profile\",\"message\":\"node does not have an install profile\"}}\n", meta);
+    _ = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.profile_unassigned\",\"message\":\"node has no bound profile\"}}\n", meta)) orelse return notFound(request, meta);
+    var effective_plan = @import("../profile/effective.zig").compile(context.allocator, context.catalog_snapshot.value(), node) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"effective.unavailable\",\"message\":\"effective node plan cannot be compiled\"}}\n", meta);
+    defer effective_plan.deinit();
     const ForceRequest = struct { force: bool = false };
     const force = if (request.body) |body| blk: {
         const parsed = std.json.parseFromSlice(ForceRequest, context.allocator, body, .{}) catch
@@ -1930,33 +2351,369 @@ const NodeAddRequest = struct {
     id: []const u8,
     mac: []const u8,
     arch: model.Arch,
-    profile: []const u8,
-    ip: ?[]const u8 = null,
+    profile: ?[]const u8,
+    pxe: model.PxeConfig = .{},
     hostname: ?[]const u8 = null,
     deploy: bool = true,
     http_accel: bool = false,
-    boot_disk: ?[]const u8 = null,
-    install_disks: ?[]const []const u8 = null,
+    storage: model.NodeStorageConfig = .{},
+    network: model.TargetNetworkConfig = .{},
 };
 
-const NodeSetRequest = struct {
-    mac: ?[]const u8 = null,
-    arch: ?model.Arch = null,
-    profile: ?[]const u8 = null,
-    ip: ?[]const u8 = null,
-    hostname: ?[]const u8 = null,
-    deploy: ?bool = null,
-    http_accel: ?bool = null,
-    boot_disk: ?[]const u8 = null,
-    install_disks: ?[]const []const u8 = null,
-    unset: []const []const u8 = &.{},
-};
-
-const ProfileMutationRequest = struct {
-    kernel_args: ?[]const u8 = null,
-    boot_disk: ?[]const u8 = null,
-};
 const ProfileCreateRequest = struct { name: []const u8, install_source: []const u8 };
+const ValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, values: []const []const u8 = &.{}, mutations: []const scalar_mutation.Mutation = &.{} };
+const ItemValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, identity: []const u8, field: []const u8, values: []const []const u8 = &.{} };
+
+fn managementValuesMutation(request: zap.Request, context: *RouteContext, owner: cli_properties.Owner, identity: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_request\",\"message\":\"missing values request\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(ValuesMutationRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_request\",\"message\":\"operation, key, and values are required\"}}\n", meta);
+    defer parsed.deinit();
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.active_session\",\"message\":\"collection mutation is blocked by an active boot session\"}}\n", meta);
+    const mutation = switch (owner) {
+        .profile => if (parsed.value.mutations.len == 0) value_mutation.profile(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value.key, parsed.value.operation, parsed.value.values) else error.UnsupportedProperty,
+        .node => value_mutation.node(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value.key, parsed.value.operation, parsed.value.values, parsed.value.mutations),
+        else => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_owner\",\"message\":\"unsupported values owner\"}}\n", meta),
+    };
+    mutation catch |err| switch (err) {
+        error.UnknownProperty => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown collection key\"}}\n", meta),
+        error.UnsupportedProperty => return json(request, .unprocessable_content, "{\"ok\":false,\"error\":{\"code\":\"property.unsupported\",\"message\":\"collection is not implemented by this resource\"}}\n", meta),
+        error.DuplicateValue => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.duplicate_value\",\"message\":\"collection values must be unique\"}}\n", meta),
+        error.ValueNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"property.value_not_found\",\"message\":\"collection value does not exist\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"values persisted but snapshot publish failed\"}}\n", meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"resource\":{f},\"key\":{f},\"operation\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(identity, .{}), std.json.fmt(parsed.value.key, .{}), std.json.fmt(@tagName(parsed.value.operation), .{}), context.catalog.currentRevision() });
+    try setRevisionEtag(request, context.catalog.currentRevision());
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementValuesGet(request: zap.Request, context: *const RouteContext, owner: cli_properties.Owner, identity: []const u8, meta: RequestMeta) !void {
+    const key = request.getParamSlice("key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.key_required\",\"message\":\"key query parameter is required\"}}\n", meta);
+    var kernel_values: std.ArrayList([]const u8) = .empty;
+    defer kernel_values.deinit(context.allocator);
+    const values = switch (owner) {
+        .profile => blk: {
+            const profile = lookup.findProfile(context.catalog_snapshot.value(), identity) orelse return notFound(request, meta);
+            if (std.mem.eql(u8, key, "kernel_args")) {
+                if (profile.kernel_args) |text| {
+                    var iterator = std.mem.tokenizeScalar(u8, text, ' ');
+                    while (iterator.next()) |value| try kernel_values.append(context.allocator, value);
+                }
+                break :blk kernel_values.items;
+            }
+            break :blk profileValues(profile, key) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown collection key\"}}\n", meta);
+        },
+        .node => blk: {
+            const node = lookup.findNode(context.catalog_snapshot.value(), identity) orelse return notFound(request, meta);
+            break :blk nodeValues(node, key) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown collection key\"}}\n", meta);
+        },
+        else => return error.InvalidOwner,
+    };
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"resource\":{f},\"key\":{f},\"values\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(identity, .{}), std.json.fmt(key, .{}), std.json.fmt(values, .{}), context.catalog_snapshot.revision });
+    return json(request, .ok, output.written(), meta);
+}
+
+fn profileValues(profile: *const model.ProfileConfig, key: []const u8) ?[]const []const u8 {
+    if (std.mem.eql(u8, key, "system.connectivity.ntp_servers")) return profile.system.connectivity.ntp_servers;
+    if (std.mem.eql(u8, key, "system.ssh.root_authorized_keys")) return profile.system.ssh.root_authorized_keys;
+    if (std.mem.eql(u8, key, "software.repositories")) return profile.software.repositories;
+    if (std.mem.eql(u8, key, "software.groups")) return profile.software.groups;
+    if (std.mem.eql(u8, key, "software.tasks")) return profile.software.tasks;
+    if (std.mem.eql(u8, key, "software.packages.include")) return profile.software.packages.include;
+    if (std.mem.eql(u8, key, "software.packages.exclude")) return profile.software.packages.exclude;
+    if (std.mem.eql(u8, key, "install.proxy.no_proxy")) return profile.install.proxy.no_proxy;
+    return null;
+}
+fn nodeValues(node: *const model.NodeConfig, key: []const u8) ?[]const []const u8 {
+    if (std.mem.eql(u8, key, "network.dns")) return node.network.dns;
+    if (std.mem.eql(u8, key, "network.search_domains")) return node.network.search_domains;
+    if (std.mem.eql(u8, key, "storage.additional_disks")) return node.storage.additional_disks;
+    if (std.mem.eql(u8, key, "overrides.software.repositories.add")) return node.overrides.software.repositories.add;
+    if (std.mem.eql(u8, key, "overrides.software.repositories.remove")) return node.overrides.software.repositories.remove;
+    if (std.mem.eql(u8, key, "overrides.software.groups.add")) return node.overrides.software.groups.add;
+    if (std.mem.eql(u8, key, "overrides.software.groups.remove")) return node.overrides.software.groups.remove;
+    if (std.mem.eql(u8, key, "overrides.software.tasks.add")) return node.overrides.software.tasks.add;
+    if (std.mem.eql(u8, key, "overrides.software.tasks.remove")) return node.overrides.software.tasks.remove;
+    if (std.mem.eql(u8, key, "overrides.software.packages.include.add")) return node.overrides.software.packages_include.add;
+    if (std.mem.eql(u8, key, "overrides.software.packages.include.remove")) return node.overrides.software.packages_include.remove;
+    if (std.mem.eql(u8, key, "overrides.kernel_args.add")) return node.overrides.kernel_args.add;
+    if (std.mem.eql(u8, key, "overrides.kernel_args.remove")) return node.overrides.kernel_args.remove;
+    if (std.mem.eql(u8, key, "overrides.system.connectivity.ntp_servers.add")) return node.overrides.system.connectivity.ntp_servers.add;
+    if (std.mem.eql(u8, key, "overrides.system.connectivity.ntp_servers.remove")) return node.overrides.system.connectivity.ntp_servers.remove;
+    if (std.mem.eql(u8, key, "overrides.system.ssh.root_authorized_keys.add")) return node.overrides.system.ssh.root_authorized_keys.add;
+    if (std.mem.eql(u8, key, "overrides.system.ssh.root_authorized_keys.remove")) return node.overrides.system.ssh.root_authorized_keys.remove;
+    if (std.mem.eql(u8, key, "overrides.software.packages.exclude.add")) return node.overrides.software.packages_exclude.add;
+    if (std.mem.eql(u8, key, "overrides.software.packages.exclude.remove")) return node.overrides.software.packages_exclude.remove;
+    if (std.mem.eql(u8, key, "overrides.install.proxy.no_proxy.add")) return node.overrides.install.proxy_no_proxy.add;
+    if (std.mem.eql(u8, key, "overrides.install.proxy.no_proxy.remove")) return node.overrides.install.proxy_no_proxy.remove;
+    return null;
+}
+
+fn managementItemMutation(request: zap.Request, context: *RouteContext, owner: cli_properties.Owner, identity: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.invalid_request\",\"message\":\"missing item patch\"}}\n", meta);
+    const raw = std.json.parseFromSlice(std.json.Value, context.allocator, body, .{}) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.invalid_request\",\"message\":\"invalid item request\"}}\n", meta);
+    defer raw.deinit();
+    if (raw.value == .object and raw.value.object.get("field") != null) return managementItemValuesMutation(request, context, owner, identity, body, meta);
+    if (raw.value == .object) if (raw.value.object.get("operation")) |operation| if (operation == .string and (std.mem.eql(u8, operation.string, "replace") or std.mem.eql(u8, operation.string, "clear"))) return managementItemReplacement(request, context, owner, identity, body, meta);
+    const parsed = std.json.parseFromSlice(item_mutation.Patch, context.allocator, body, .{ .allocate = .alloc_always }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.invalid_request\",\"message\":\"invalid typed item patch\"}}\n", meta);
+    defer parsed.deinit();
+    const spec = cli_properties.collection(owner, parsed.value.key) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown structured collection\"}}\n", meta);
+    if (spec.item_spec == null or spec.mutability != .mutable) return json(request, .unprocessable_content, "{\"ok\":false,\"error\":{\"code\":\"property.unsupported\",\"message\":\"collection does not support item mutation\"}}\n", meta);
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item mutation is blocked by an active boot session\"}}\n", meta);
+    const mutation = switch (owner) {
+        .profile => item_mutation.profile(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value),
+        .node => item_mutation.node(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value),
+        else => return error.InvalidOwner,
+    };
+    mutation catch |err| switch (err) {
+        error.ItemNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"item.not_found\",\"message\":\"item identity does not exist\"}}\n", meta),
+        error.InvalidItemIdentity => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.invalid_identity\",\"message\":\"identity field is missing, duplicate, or inconsistent\"}}\n", meta),
+        error.UnknownItemField => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.unknown_field\",\"message\":\"field is not part of this ItemSpec\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"item persisted but snapshot publish failed\"}}\n", meta);
+    var output: [320]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"resource\":{f},\"key\":{f},\"identity\":{f},\"operation\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(identity, .{}), std.json.fmt(parsed.value.key, .{}), std.json.fmt(parsed.value.identity, .{}), std.json.fmt(@tagName(parsed.value.operation), .{}), context.catalog.currentRevision() });
+    return json(request, .ok, rendered, meta);
+}
+
+fn managementItemValuesMutation(request: zap.Request, context: *RouteContext, owner: cli_properties.Owner, resource_identity: []const u8, body: []const u8, meta: RequestMeta) !void {
+    const parsed = std.json.parseFromSlice(ItemValuesMutationRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.invalid_request\",\"message\":\"invalid item values request\"}}\n", meta);
+    defer parsed.deinit();
+    const expected_key = if (owner == .profile) "system.users" else "overrides.system.users";
+    if (!std.mem.eql(u8, parsed.value.key, expected_key) or (!std.mem.eql(u8, parsed.value.field, "groups") and !std.mem.eql(u8, parsed.value.field, "ssh_authorized_keys"))) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.unknown_field\",\"message\":\"unknown item collection field\"}}\n", meta);
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item mutation is blocked by an active boot session\"}}\n", meta);
+    const mutation = switch (owner) {
+        .profile => item_mutation.profileUserValues(context.io, context.allocator, context.config, context.catalog.path, resource_identity, parsed.value.identity, parsed.value.field, parsed.value.operation, parsed.value.values),
+        .node => item_mutation.nodeUserValues(context.io, context.allocator, context.config, context.catalog.path, resource_identity, parsed.value.identity, parsed.value.field, parsed.value.operation, parsed.value.values),
+        else => return error.InvalidOwner,
+    };
+    mutation catch |err| switch (err) {
+        error.ItemNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"item.not_found\",\"message\":\"item identity does not exist\"}}\n", meta),
+        error.DuplicateValue => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.duplicate_value\",\"message\":\"collection values must be unique\"}}\n", meta),
+        error.ValueNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"property.value_not_found\",\"message\":\"collection value does not exist\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"item values persisted but snapshot publish failed\"}}\n", meta);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"updated\":true}}\n", meta);
+}
+
+fn managementItemReplacement(request: zap.Request, context: *RouteContext, owner: cli_properties.Owner, identity: []const u8, body: []const u8, meta: RequestMeta) !void {
+    const parsed = std.json.parseFromSlice(item_mutation.Replacement, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.invalid_request\",\"message\":\"invalid typed item replacement\"}}\n", meta);
+    defer parsed.deinit();
+    const spec = cli_properties.collection(owner, parsed.value.key) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown structured collection\"}}\n", meta);
+    if (spec.item_spec == null or spec.mutability != .mutable) return json(request, .unprocessable_content, "{\"ok\":false,\"error\":{\"code\":\"property.unsupported\",\"message\":\"collection does not support replacement\"}}\n", meta);
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item replacement is blocked by an active boot session\"}}\n", meta);
+    const mutation = switch (owner) {
+        .profile => item_mutation.replaceProfile(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value),
+        .node => item_mutation.replaceNode(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value),
+        else => return error.InvalidOwner,
+    };
+    mutation catch |err| switch (err) {
+        error.UnsupportedProperty => return json(request, .unprocessable_content, "{\"ok\":false,\"error\":{\"code\":\"property.unsupported\",\"message\":\"collection replacement is not implemented\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"items persisted but snapshot publish failed\"}}\n", meta);
+    var output: [320]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"resource\":{f},\"key\":{f},\"operation\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(identity, .{}), std.json.fmt(parsed.value.key, .{}), std.json.fmt(@tagName(parsed.value.operation), .{}), context.catalog.currentRevision() });
+    return json(request, .ok, rendered, meta);
+}
+
+const ScalarMutationRequest = struct { mutations: []const scalar_mutation.Mutation };
+
+fn managementScalarMutation(request: zap.Request, context: *RouteContext, owner: cli_properties.Owner, identity: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_request\",\"message\":\"missing property request\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(ScalarMutationRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_request\",\"message\":\"mutations array is required\"}}\n", meta);
+    defer parsed.deinit();
+    if (parsed.value.mutations.len == 0) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_request\",\"message\":\"at least one scalar mutation is required\"}}\n", meta);
+    for (parsed.value.mutations, 0..) |mutation, index| {
+        const spec = cli_properties.property(owner, mutation.key) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown scalar property\"}}\n", meta);
+        if (spec.mutability != .mutable or (mutation.value == null and !spec.optional)) return json(request, .unprocessable_content, "{\"ok\":false,\"error\":{\"code\":\"property.required\",\"message\":\"required scalar cannot be unset\"}}\n", meta);
+        for (parsed.value.mutations[0..index]) |prior| if (std.mem.eql(u8, prior.key, mutation.key)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.duplicate\",\"message\":\"a scalar key may appear only once per atomic request\"}}\n", meta);
+    }
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.active_session\",\"message\":\"property mutation is blocked by an active boot session\"}}\n", meta);
+    const mutation = switch (owner) {
+        .profile => scalar_mutation.profileBatch(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value.mutations),
+        .node => scalar_mutation.nodeBatch(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value.mutations),
+        else => return error.InvalidOwner,
+    };
+    mutation catch |err| switch (err) {
+        error.UnknownProperty => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown scalar property\"}}\n", meta),
+        error.InvalidPropertyValue => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_value\",\"message\":\"scalar value does not match PropertySpec\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"property persisted but snapshot publish failed\"}}\n", meta);
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"updated\":true}}\n", meta);
+}
+
+fn managementItemsGet(request: zap.Request, context: *const RouteContext, owner: cli_properties.Owner, identity: []const u8, meta: RequestMeta) !void {
+    const key = request.getParamSlice("key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.key_required\",\"message\":\"key query parameter is required\"}}\n", meta);
+    const item_identity = request.getParamSlice("identity");
+    if (request.getParamSlice("field")) |field| return managementItemValuesGet(request, context, owner, identity, key, item_identity orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.identity_required\",\"message\":\"item identity is required\"}}\n", meta), field, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"resource\":{f},\"key\":{f},\"items\":", .{ std.json.fmt(identity, .{}), std.json.fmt(key, .{}) });
+    switch (owner) {
+        .profile => {
+            const profile = lookup.findProfile(context.catalog_snapshot.value(), identity) orelse return notFound(request, meta);
+            if (std.mem.eql(u8, key, "install.storage.partitions")) {
+                const configured = profile.install.storage.partitions;
+                const automatic = [_]model.PartitionConfig{ .{ .id = "esp", .mount = "/boot/efi", .filesystem = "fat32", .size_mib = 1024, .kind = .esp }, .{ .id = "boot", .mount = "/boot", .filesystem = "ext4", .size_mib = 2048, .kind = .boot }, .{ .id = "root", .mount = "/", .filesystem = "ext4", .size_mib = 1, .grow = true, .kind = .root } };
+                try writeFilteredItems(&output.writer, if (configured.len == 0) &automatic else configured, item_identity, "id");
+            } else if (std.mem.eql(u8, key, "system.users")) try writeFilteredItems(&output.writer, profile.system.users, item_identity, "name") else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown structured collection\"}}\n", meta);
+        },
+        .node => {
+            const node = lookup.findNode(context.catalog_snapshot.value(), identity) orelse return notFound(request, meta);
+            if (std.mem.eql(u8, key, "network.routes")) try writeFilteredItems(&output.writer, node.network.routes, item_identity, "id") else if (std.mem.eql(u8, key, "overrides.install.storage.partitions")) try writeFilteredItems(&output.writer, node.overrides.install.storage.partitions orelse &.{}, item_identity, "id") else if (std.mem.eql(u8, key, "effective.install.storage.partitions")) {
+                var plan = @import("../profile/effective.zig").compile(context.allocator, context.catalog_snapshot.value(), node) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"effective.unavailable\",\"message\":\"effective plan is unavailable\"}}\n", meta);
+                defer plan.deinit();
+                try writeFilteredItems(&output.writer, plan.storage.partitions, item_identity, "id");
+            } else if (std.mem.eql(u8, key, "overrides.system.users")) {
+                if (node.overrides.system.users) |users| try writeFilteredItems(&output.writer, users, item_identity, "name") else {
+                    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"effective.unavailable\",\"message\":\"node has no profile\"}}\n", meta)) orelse return notFound(request, meta);
+                    const system = @import("../profile/install.zig").effectiveSystem(profile) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"effective.unavailable\",\"message\":\"effective users unavailable\"}}\n", meta);
+                    try writeFilteredItems(&output.writer, system.users, item_identity, "name");
+                }
+            } else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown structured collection\"}}\n", meta);
+        },
+        else => return error.InvalidOwner,
+    }
+    try output.writer.print(",\"revision\":{d}}}}}\n", .{context.catalog_snapshot.revision});
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementCapabilities(request: zap.Request, context: *const RouteContext, owner: cli_properties.Owner, identity: []const u8, meta: RequestMeta) !void {
+    var target_node: ?*const model.NodeConfig = null;
+    const profile = switch (owner) {
+        .profile => lookup.findProfile(context.catalog_snapshot.value(), identity) orelse return notFound(request, meta),
+        .node => blk: {
+            const node = lookup.findNode(context.catalog_snapshot.value(), identity) orelse return notFound(request, meta);
+            target_node = node;
+            break :blk lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.profile_unassigned\",\"message\":\"node has no bound profile\"}}\n", meta)) orelse return notFound(request, meta);
+        },
+        else => return error.InvalidOwner,
+    };
+    const source = lookup.findInstallSource(context.catalog_snapshot.value(), profile.install_source) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"capabilities.platform_missing\",\"message\":\"profile install source is unavailable\"}}\n", meta);
+    const capability = lookup.findDistroVersion(context.catalog_snapshot.value(), source.distro, source.version, source.arch) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"capabilities.platform_missing\",\"message\":\"profile platform capability is unavailable\"}}\n", meta);
+    var readiness_issue: ?anyerror = null;
+    config_validate.validateProfileSoftwareReadiness(context.catalog_snapshot.value(), profile) catch |err| {
+        readiness_issue = err;
+    };
+    if (target_node) |node| {
+        var effective: ?effective_compiler.Plan = effective_compiler.compile(context.allocator, context.catalog_snapshot.value(), node) catch |err| blk: {
+            readiness_issue = err;
+            break :blk null;
+        };
+        if (effective) |*plan| {
+            defer plan.deinit();
+            config_validate.validateEffectiveSoftwareReadiness(context.catalog_snapshot.value(), &plan.install_source, plan.software) catch |err| {
+                readiness_issue = err;
+            };
+        }
+    }
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"resource\":{f},\"profile\":{f},\"adapter\":{f},\"readiness\":", .{ std.json.fmt(identity, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(capability.install_adapter), .{}) });
+    if (readiness_issue) |issue|
+        try output.writer.print("{{\"install\":\"blocked\",\"issues\":[{{\"code\":{f},\"message\":\"effective install plan is not ready\"}}]}}", .{std.json.fmt(@errorName(issue), .{})})
+    else
+        try output.writer.writeAll("{\"install\":\"ready\",\"issues\":[]}");
+    try output.writer.writeAll(",\"domains\":[");
+    for (adapter_capabilities.entries, 0..) |entry, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        const status = if (capability.install_adapter == .kickstart) entry.kickstart else entry.autoinstall;
+        try output.writer.print("{{\"domain\":{f},\"status\":{f}}}", .{ std.json.fmt(entry.domain, .{}), std.json.fmt(@tagName(status), .{}) });
+    }
+    try output.writer.writeAll("],\"properties\":[");
+    var first = true;
+    for (cli_properties.properties) |spec| {
+        if (spec.owner != owner or spec.mutability != .mutable) continue;
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        const status = adapter_capabilities.status(capability.install_adapter, spec.path, spec.applicability);
+        try output.writer.print("{{\"key\":{f},\"status\":{f}}}", .{ std.json.fmt(spec.path, .{}), std.json.fmt(@tagName(status), .{}) });
+    }
+    for (cli_properties.collections) |spec| {
+        if (spec.owner != owner or spec.mutability != .mutable) continue;
+        if (!first) try output.writer.writeByte(',');
+        first = false;
+        const status = adapter_capabilities.status(capability.install_adapter, spec.path, .all);
+        try output.writer.print("{{\"key\":{f},\"status\":{f}}}", .{ std.json.fmt(spec.path, .{}), std.json.fmt(@tagName(status), .{}) });
+    }
+    try output.writer.writeAll("]}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementItemValuesGet(request: zap.Request, context: *const RouteContext, owner: cli_properties.Owner, resource_identity: []const u8, key: []const u8, item_identity: []const u8, field: []const u8, meta: RequestMeta) !void {
+    const users = switch (owner) {
+        .profile => blk: {
+            if (!std.mem.eql(u8, key, "system.users")) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown structured collection\"}}\n", meta);
+            const profile = lookup.findProfile(context.catalog_snapshot.value(), resource_identity) orelse return notFound(request, meta);
+            break :blk profile.system.users;
+        },
+        .node => blk: {
+            if (!std.mem.eql(u8, key, "overrides.system.users")) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown structured collection\"}}\n", meta);
+            const node = lookup.findNode(context.catalog_snapshot.value(), resource_identity) orelse return notFound(request, meta);
+            if (node.overrides.system.users) |values| break :blk values;
+            const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return notFound(request, meta)) orelse return notFound(request, meta);
+            break :blk profile.system.users;
+        },
+        else => return error.InvalidOwner,
+    };
+    const user = blk: {
+        for (users) |*value| if (std.mem.eql(u8, value.name, item_identity)) break :blk value;
+        return notFound(request, meta);
+    };
+    const values = if (std.mem.eql(u8, field, "groups")) user.groups else if (std.mem.eql(u8, field, "ssh_authorized_keys")) user.ssh_authorized_keys else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.unknown_field\",\"message\":\"unknown item collection field\"}}\n", meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"resource\":{f},\"key\":{f},\"identity\":{f},\"field\":{f},\"values\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(resource_identity, .{}), std.json.fmt(key, .{}), std.json.fmt(item_identity, .{}), std.json.fmt(field, .{}), std.json.fmt(values, .{}), context.catalog_snapshot.revision });
+    return json(request, .ok, output.written(), meta);
+}
+
+fn writeFilteredItems(writer: *std.Io.Writer, items: anytype, identity: ?[]const u8, comptime field_name: []const u8) !void {
+    try writer.writeByte('[');
+    var first = true;
+    for (items) |item| {
+        const item_id = if (comptime std.mem.eql(u8, field_name, "name")) item.name else if (comptime @TypeOf(item) == model.RouteConfig) item.id else item.id orelse continue;
+        if (identity != null and !std.mem.eql(u8, identity.?, item_id)) continue;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}", .{std.json.fmt(item, .{})});
+    }
+    try writer.writeByte(']');
+}
 
 fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
     const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"missing request body\"}}\n", meta);
@@ -1984,66 +2741,6 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
     return json(request, .created, rendered, meta);
 }
 
-test "profile kernel args patch requires the single typed field" {
-    const set = try std.json.parseFromSlice(ProfileMutationRequest, std.testing.allocator, "{\"kernel_args\":\"iommu=pt\"}", .{});
-    defer set.deinit();
-    try std.testing.expectEqualStrings("iommu=pt", set.value.kernel_args.?);
-    const unset = try std.json.parseFromSlice(ProfileMutationRequest, std.testing.allocator, "{\"kernel_args\":null}", .{});
-    defer unset.deinit();
-    try std.testing.expect(unset.value.kernel_args == null);
-    const disk = try std.json.parseFromSlice(ProfileMutationRequest, std.testing.allocator, "{\"boot_disk\":\"/dev/nvme0n1\"}", .{});
-    defer disk.deinit();
-    try std.testing.expectEqualStrings("/dev/nvme0n1", disk.value.boot_disk.?);
-}
-
-/// Profile 安装计划属性的唯一写入口。活动 session 已经固定 PXE/answer 计划，
-/// 因此引用该 profile 的任一节点仍有活动 session 时拒绝变更；成功后发布新的
-/// catalog revision，install 节点仍需显式 `node retry` 武装新计划。
-fn managementProfileSet(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
-    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"missing request body\"}}\n", meta);
-    const raw = std.json.parseFromSlice(std.json.Value, context.allocator, body, .{}) catch
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"expected one profile property\"}}\n", meta);
-    defer raw.deinit();
-    if (raw.value != .object or raw.value.object.count() != 1)
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"expected exactly one of kernel_args or boot_disk\"}}\n", meta);
-    const has_kernel_args = raw.value.object.contains("kernel_args");
-    const has_boot_disk = raw.value.object.contains("boot_disk");
-    if (!has_kernel_args and !has_boot_disk)
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"expected exactly one of kernel_args or boot_disk\"}}\n", meta);
-    const parsed = std.json.parseFromSlice(ProfileMutationRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"kernel_args accepts string/null; boot_disk accepts a device path\"}}\n", meta);
-    defer parsed.deinit();
-    if (lookup.findProfile(context.catalog_snapshot.value(), name) == null) return notFound(request, meta);
-    for (context.catalog_snapshot.value().nodes) |node| {
-        if (!std.mem.eql(u8, node.profile, name)) continue;
-        // A shared boot-disk default does not affect nodes with an explicit
-        // per-node disk override, so their pinned sessions do not block it.
-        if (has_boot_disk and node.overrides.storage != null and node.overrides.storage.?.boot_disk != null) continue;
-        if (context.sessions.hasActiveNode(node.id, boot_session.monotonicNow()))
-            return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.active_session_conflict\",\"message\":\"profile install plan is pinned by an active boot session\"}}\n", meta);
-    }
-    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
-    defer config_mutation_mutex.unlock();
-    context.models.lock();
-    defer context.models.unlock();
-    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    const mutation_result = if (has_kernel_args)
-        @import("../config/profile_mutation.zig").setKernelArgs(context.io, context.allocator, context.config, context.catalog.path, name, parsed.value.kernel_args)
-    else if (parsed.value.boot_disk) |boot_disk|
-        @import("../config/profile_mutation.zig").setBootDisk(context.io, context.allocator, context.config, context.catalog.path, name, boot_disk)
-    else
-        error.InvalidInstallStorage;
-    mutation_result catch |err| switch (err) {
-        error.InvalidKernelArgs, error.KernelArgsRequiresBootloader => return validationError(request, err, meta),
-        error.InvalidInstallStorage, error.NotInstallProfile => return validationError(request, err, meta),
-        error.ProfileNotFound => return notFound(request, meta),
-        else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"profile.persist_failed\",\"message\":\"cannot persist profile install plan\"}}\n", meta),
-    };
-    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"profile persisted but snapshot publish failed\"}}\n", meta);
-    try setRevisionEtag(request, context.catalog.currentRevision());
-    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
-}
-
 /// 在 model gate 内从 manifest store 载入新 catalog generation，同时用相同
 /// config revision 发布兼容投影视图。启动配置 revision 不会因 node/profile
 /// mutation 改变；catalog revision 由 manifest 单调推进。
@@ -2065,6 +2762,120 @@ fn applyCatalogFromDisk(context: *RouteContext) !void {
     context.catalog.publishPreparedLocked(catalog_next);
 }
 
+fn managementDiscoveryPolicy(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    var output: [384]u8 = undefined;
+    const policy = context.catalog_snapshot.value().discovery_policy;
+    const body = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"unknown_action\":{f},\"observation_retention_days\":{d},\"revision\":{d},\"catalog_revision\":{d}}}}}\n", .{
+        std.json.fmt(@tagName(policy.unknown_action), .{}), policy.observation_retention_days, policy.revision, context.catalog_snapshot.revision,
+    });
+    try setRevisionEtag(request, context.catalog_snapshot.revision);
+    return json(request, .ok, body, meta);
+}
+
+const DiscoveryPolicyMutation = struct {
+    unknown_action: ?model.UnknownAction = null,
+    observation_retention_days: ?u32 = null,
+};
+
+fn managementDiscoveryPolicySet(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.policy.invalid\",\"message\":\"missing request body\"}}\n", meta);
+    var parsed = std.json.parseFromSlice(DiscoveryPolicyMutation, context.allocator, body, .{}) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.policy.invalid\",\"message\":\"invalid discovery policy properties\"}}\n", meta);
+    defer parsed.deinit();
+    if (parsed.value.unknown_action == null and parsed.value.observation_retention_days == null)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.policy.invalid\",\"message\":\"at least one policy property is required\"}}\n", meta);
+    if (parsed.value.observation_retention_days) |days| if (days == 0)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.policy.invalid_retention\",\"message\":\"observation_retention_days must be positive\"}}\n", meta);
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    var candidate = context.catalog_snapshot.value().*;
+    if (parsed.value.unknown_action) |value| candidate.discovery_policy.unknown_action = value;
+    if (parsed.value.observation_retention_days) |value| candidate.discovery_policy.observation_retention_days = value;
+    candidate.discovery_policy.revision += 1;
+    candidate.revision = context.catalog_snapshot.revision + 1;
+    try catalog_store.save(context.io, context.allocator, context.catalog.path, &candidate);
+    try applyCatalogFromDisk(context);
+    try setRevisionEtag(request, context.catalog.currentRevision());
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
+}
+
+fn managementDiscoveryObservations(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    const observations = context.catalog_snapshot.value().unknown_client_observations;
+    const page = pageRequest(request, "discovery-observations", context.catalog_snapshot.revision) catch |err| return pageError(request, err, meta);
+    if (page.offset > observations.len) return pageError(request, error.InvalidCursor, meta);
+    const end = @min(page.offset + page.limit, observations.len);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    for (observations[page.offset..end], 0..) |observation, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try std.json.Stringify.value(observation, .{}, &output.writer);
+    }
+    try output.writer.writeByte(']');
+    try writeNextCursor(&output.writer, "discovery-observations", context.catalog_snapshot.revision, end, observations.len);
+    try output.writer.print(",\"view_revision\":{d}}}}}\n", .{context.catalog_snapshot.revision});
+    try setRevisionEtag(request, context.catalog_snapshot.revision);
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementDiscoveryObservation(request: zap.Request, context: *const RouteContext, mac: []const u8, meta: RequestMeta) !void {
+    for (context.catalog_snapshot.value().unknown_client_observations) |observation| {
+        if (!std.ascii.eqlIgnoreCase(observation.mac, mac)) continue;
+        var output: std.Io.Writer.Allocating = .init(context.allocator);
+        defer output.deinit();
+        try output.writer.writeAll("{\"ok\":true,\"result\":");
+        try std.json.Stringify.value(observation, .{}, &output.writer);
+        try output.writer.writeAll("}\n");
+        try setRevisionEtag(request, context.catalog_snapshot.revision);
+        return json(request, .ok, output.written(), meta);
+    }
+    return notFound(request, meta);
+}
+
+const NodeClaimRequest = struct {
+    mac: []const u8,
+    arch: model.Arch,
+    observation_revision: u64,
+};
+
+fn managementNodeClaim(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.claim.invalid\",\"message\":\"missing request body\"}}\n", meta);
+    var parsed = std.json.parseFromSlice(NodeClaimRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.claim.invalid\",\"message\":\"invalid claim properties\"}}\n", meta);
+    defer parsed.deinit();
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    var candidate = context.catalog_snapshot.value().*;
+    catalog_discovery.claim(context.allocator, &candidate, .{
+        .node_id = node_id,
+        .mac = parsed.value.mac,
+        .arch = parsed.value.arch,
+        .expected_observation_revision = parsed.value.observation_revision,
+        .claimed_at_unix = unixNow(),
+    }) catch |err| switch (err) {
+        error.ObservationNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"discovery.observation_not_found\",\"message\":\"unknown client observation does not exist\"}}\n", meta),
+        error.ObservationRevisionConflict => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.observation_revision_conflict\",\"message\":\"observation revision changed; refresh before claiming\"}}\n", meta),
+        error.ObservationAlreadyClaimed => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.already_claimed\",\"message\":\"observation is already claimed\"}}\n", meta),
+        error.MacAlreadyClaimed => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.duplicate_mac\",\"message\":\"MAC address is already assigned to another node\"}}\n", meta),
+        error.NodeNotClaimable => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.not_claimable\",\"message\":\"existing node must be unassigned and deploy=false\"}}\n", meta),
+        else => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.claim_failed\",\"message\":\"observation could not be claimed\"}}\n", meta),
+    };
+    defer context.allocator.free(candidate.nodes);
+    defer context.allocator.free(candidate.unknown_client_observations);
+    candidate.revision = context.catalog_snapshot.revision + 1;
+    config_validate.validate(context.config, &candidate) catch |err| return validationError(request, err, meta);
+    try catalog_store.save(context.io, context.allocator, context.catalog.path, &candidate);
+    try applyCatalogFromDisk(context);
+    try setRevisionEtag(request, context.catalog.currentRevision());
+    var output: [320]u8 = undefined;
+    const response = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"profile\":null,\"deploy\":false,\"revision\":{d}}}}}\n", .{ std.json.fmt(node_id, .{}), context.catalog.currentRevision() });
+    return json(request, .created, response, meta);
+}
+
 fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
     const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"missing request body\"}}\n", meta);
     var parsed = std.json.parseFromSlice(NodeAddRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"invalid node properties\"}}\n", meta);
@@ -2075,7 +2886,7 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
     const value = parsed.value;
-    node_mutation.addNode(context.io, context.allocator, context.config, context.catalog.path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .ip = value.ip, .hostname = value.hostname, .deploy = value.deploy, .http_accel = value.http_accel, .boot_disk = value.boot_disk, .install_disks = value.install_disks }) catch |err| switch (err) {
+    node_mutation.addNode(context.io, context.allocator, context.config, context.catalog.path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .pxe_ip_reservation = value.pxe.ip_reservation, .hostname = value.hostname, .deploy = value.deploy, .http_accel = value.http_accel, .storage = value.storage, .network = value.network }) catch |err| switch (err) {
         error.ProfileNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"node.profile_not_found\",\"message\":\"referenced profile does not exist; create it with nodeforge profile create\"}}\n", meta),
         error.NodeAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.already_exists\",\"message\":\"node identifier already exists\"}}\n", meta),
         error.DuplicateMac => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.duplicate_mac\",\"message\":\"MAC address is already assigned to another node\"}}\n", meta),
@@ -2093,7 +2904,7 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
     // generation 语义。否则 fresh CLI 流程会在 node add 成功后仍显示
     // deployment=null，必须额外重启或 retry 才能获得 PXE。
     if (value.deploy) {
-        if (lookup.findProfile(current.value(), value.profile)) |profile| if (profile.mode == .install) {
+        if (value.profile) |profile_name| if (lookup.findProfile(current.value(), profile_name) != null) {
             const desired_digest = @import("../state/plan_digest.zig").forNode(context.allocator, context.config, current.value(), .{
                 .bootstrap_key = context.bootstrap_key,
                 .additional_keys = context.additional_keys,
@@ -2108,63 +2919,6 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
     const response = try std.fmt.bufPrint(&result, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(value.id, .{}), context.catalog.currentRevision() });
     try setRevisionEtag(request, context.catalog.currentRevision());
     return json(request, .created, response, meta);
-}
-
-fn managementNodeSet(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
-    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"missing request body\"}}\n", meta);
-    var parsed = std.json.parseFromSlice(NodeSetRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"invalid node properties\"}}\n", meta);
-    defer parsed.deinit();
-    var clears_ip = false;
-    for (parsed.value.unset) |key| if (std.mem.eql(u8, key, "ip")) {
-        clears_ip = true;
-    };
-    var clears_storage = false;
-    for (parsed.value.unset) |key| {
-        if (std.mem.eql(u8, key, "boot_disk") or std.mem.eql(u8, key, "install_disks")) clears_storage = true;
-    }
-    const protected_change = parsed.value.mac != null or parsed.value.arch != null or parsed.value.profile != null or parsed.value.ip != null or parsed.value.boot_disk != null or parsed.value.install_disks != null or clears_ip or clears_storage;
-    if (protected_change and context.sessions.hasActiveNode(node_id, boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.active_session_conflict\",\"message\":\"protected identity is pinned by an active boot session\"}}\n", meta);
-    var params: node_mutation.SetParams = .{ .mac = parsed.value.mac, .arch = parsed.value.arch, .profile = parsed.value.profile, .deploy = parsed.value.deploy, .http_accel = parsed.value.http_accel };
-    if (parsed.value.ip) |value| {
-        params.ip_set = true;
-        params.ip = value;
-    }
-    if (parsed.value.hostname) |value| {
-        params.hostname_set = true;
-        params.hostname = value;
-    }
-    if (parsed.value.boot_disk) |value| {
-        params.boot_disk_set = true;
-        params.boot_disk = value;
-    }
-    if (parsed.value.install_disks) |value| {
-        params.install_disks_set = true;
-        params.install_disks = value;
-    }
-    for (parsed.value.unset) |key| {
-        if (std.mem.eql(u8, key, "ip")) {
-            params.ip_set = true;
-            params.ip = null;
-        } else if (std.mem.eql(u8, key, "hostname")) {
-            params.hostname_set = true;
-            params.hostname = null;
-        } else if (std.mem.eql(u8, key, "boot_disk")) {
-            params.boot_disk_set = true;
-            params.boot_disk = null;
-        } else if (std.mem.eql(u8, key, "install_disks")) {
-            params.install_disks_set = true;
-            params.install_disks = null;
-        } else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_unset\",\"message\":\"only ip, hostname, boot_disk, and install_disks can be unset\"}}\n", meta);
-    }
-    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
-    defer config_mutation_mutex.unlock();
-    context.models.lock();
-    defer context.models.unlock();
-    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    node_mutation.setNode(context.io, context.allocator, context.config, context.catalog.path, node_id, params) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.mutation_failed\",\"message\":\"node could not be updated\"}}\n", meta);
-    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"node persisted but snapshot publish failed\"}}\n", meta);
-    try setRevisionEtag(request, context.catalog.currentRevision());
-    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
 }
 
 fn managementNodeRemove(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
@@ -2202,17 +2956,17 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
     try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"items\":[", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision() });
     for (context.catalog_snapshot.value().nodes[page.offset..end], 0..) |node, index| {
         if (index != 0) try output.writer.writeByte(',');
-        const desired_digest = desiredPlanDigest(context, node.id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
+        const desired_digest: ?deployment_control.Digest = desiredPlanDigest(context, node.id) catch null;
         const deployment = context.deployments.view(node.id);
-        const status = currentProjectedStatus(context, node.id, deployment, desired_digest);
+        const status = if (desired_digest) |digest| currentProjectedStatus(context, node.id, deployment, digest) else null;
         const inventory = context.inventories.get(node.id);
         try output.writer.print("{{\"id\":{f},\"mac\":{f},\"ip\":", .{ std.json.fmt(node.id, .{}), std.json.fmt(node.mac, .{}) });
         if (node.ip) |ip| try output.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try output.writer.writeAll("null");
         try output.writer.print(",\"profile\":{f},\"deploy\":{s},\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"armed_generation\":{f},\"status\":", .{
             std.json.fmt(node.profile, .{}),
             if (node.deploy) "true" else "false",
-            std.json.fmt(installIntent(node.deploy, deployment, desired_digest), .{}),
-            if (installPxeReady(node.deploy, deployment, desired_digest)) "true" else "false",
+            std.json.fmt(if (desired_digest) |digest| installIntent(node.deploy, deployment, digest) else if (node.deploy) "blocked" else "disabled", .{}),
+            if (desired_digest) |digest| if (installPxeReady(node.deploy, deployment, digest)) "true" else "false" else "false",
             if (retryPending(deployment)) "true" else "false",
             std.json.fmt(if (deployment) |value| value.armed_generation else null, .{}),
         });
@@ -2236,8 +2990,10 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
             if (times.finished_at != 0) try output.writer.print("{d}", .{times.finished_at}) else try output.writer.writeAll("null");
             try output.writer.writeAll(",\"deployed_at\":");
             if (value.deployed_at != 0) try output.writer.print("{d}", .{value.deployed_at}) else try output.writer.writeAll("null");
-            const drift = context.deployments.drift(node.id, desired_digest);
-            try output.writer.print(",\"drifted\":{s},\"drift_state\":{f}", .{ if (drift == .drifted) "true" else "false", std.json.fmt(@tagName(drift), .{}) });
+            if (desired_digest) |digest| {
+                const drift = context.deployments.drift(node.id, digest);
+                try output.writer.print(",\"drifted\":{s},\"drift_state\":{f}", .{ if (drift == .drifted) "true" else "false", std.json.fmt(@tagName(drift), .{}) });
+            } else try output.writer.writeAll(",\"drifted\":false,\"drift_state\":\"unavailable\"");
         } else try output.writer.writeAll(",\"start_at\":null,\"install_at\":null,\"finished_at\":null,\"deployed_at\":null,\"drifted\":false");
         try output.writer.writeAll(",\"serial_number\":");
         if (inventory) |value| if (value.serial_number) |serial| try output.writer.print("{f}", .{std.json.fmt(serial, .{})}) else try output.writer.writeAll("null") else try output.writer.writeAll("null");
@@ -2252,22 +3008,22 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
 
 fn managementNode(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return notFound(request, meta);
-    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile) orelse return notFound(request, meta);
+    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.profile_unassigned\",\"message\":\"node has no bound profile\"}}\n", meta)) orelse return notFound(request, meta);
+    const profile_source = lookup.findInstallSource(context.catalog_snapshot.value(), profile.install_source) orelse return notFound(request, meta);
+    var effective_plan = @import("../profile/effective.zig").compile(context.allocator, context.catalog_snapshot.value(), node) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"effective.unavailable\",\"message\":\"effective node plan cannot be compiled\"}}\n", meta);
+    defer effective_plan.deinit();
     const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
-    const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
+    const desired_digest = desiredPlanDigest(context, node_id) catch deployment_control.empty_digest;
     const deployment = context.deployments.view(node_id);
     const status = currentProjectedStatus(context, node_id, deployment, desired_digest);
     const inventory = context.inventories.get(node_id);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{f},\"profile\":{{\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"install_source\":{f},\"boot_bundle\":{f},\"kernel_args\":{f},\"safety\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), std.json.fmt(node, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.safety, .{}) });
-    try writeEffectiveSystem(&output.writer, profile);
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{f},\"profile\":{{\"name\":{f},\"install_source\":{f},\"kernel_args\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), std.json.fmt(node, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile_source.distro, .{}), std.json.fmt(profile_source.version, .{}), std.json.fmt(@tagName(profile_source.arch), .{}) });
+    try writeTargetSystem(&output.writer, effective_plan.system);
+    try output.writer.print(",\"effective_software\":{f}", .{std.json.fmt(effective_plan.software, .{})});
     try output.writer.writeAll(",\"storage\":");
-    if (profile.mode == .install and profile.install != null) {
-        var single_disk: [1][]const u8 = undefined;
-        const effective = try @import("../profile/install.zig").effectiveInstall(node, profile, &single_disk);
-        try output.writer.print("{{\"profile_default\":{f},\"override\":{f},\"effective\":{f}}}", .{ std.json.fmt(profile.install.?.storage, .{}), std.json.fmt(node.overrides.storage, .{}), std.json.fmt(effective.storage, .{}) });
-    } else try output.writer.writeAll("null");
+    try output.writer.print("{{\"direct\":{f},\"override\":{f},\"effective\":{f}}}", .{ std.json.fmt(node.storage, .{}), std.json.fmt(node.overrides.install.storage, .{}), std.json.fmt(effective_plan.install.storage, .{}) });
     try output.writer.writeAll(",\"status\":");
     if (status) |value| try output.writer.print("{{\"phase\":{f},\"boot_session_id\":{f},\"model_revision\":{d},\"deployment_generation\":{d},\"last_event_at\":{d},\"last_error\":{s},\"reason\":{f},\"session_active\":{s}}}", .{
         std.json.fmt(@tagName(value.phase), .{}),
@@ -2282,10 +3038,11 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     try output.writer.writeAll(",\"deployment\":");
     if (deployment) |value| {
         const times = deploymentTimes(value);
-        const drift = context.deployments.drift(node_id, desired_digest);
+        const digest_available = deployment_control.digestSet(desired_digest);
+        const drift = if (digest_available) context.deployments.drift(node_id, desired_digest) else .unknown;
         try output.writer.print("{{\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"current_generation\":{f},\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"requested_plan_digest\":{f},\"applied_plan_digest\":{f},\"desired_plan_digest\":{f},\"drifted\":{s},\"drift_state\":{f},\"requested_by\":{f},\"start_at\":{d},\"install_at\":{d},\"finished_at\":{d},\"successful_generation\":{d},\"deployed_at\":{d}}}", .{
-            std.json.fmt(installIntent(node.deploy, value, desired_digest), .{}),
-            if (installPxeReady(node.deploy, value, desired_digest)) "true" else "false",
+            std.json.fmt(if (digest_available) installIntent(node.deploy, value, desired_digest) else if (node.deploy) "blocked" else "disabled", .{}),
+            if (digest_available and installPxeReady(node.deploy, value, desired_digest)) "true" else "false",
             if (retryPending(value)) "true" else "false",
             std.json.fmt(value.currentGeneration(), .{}),
             std.json.fmt(value.armed_generation, .{}),
@@ -2296,9 +3053,9 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
             desired_revision,
             std.json.fmt(if (deployment_control.digestSet(value.requested_plan_digest)) value.requested_plan_digest[0..] else null, .{}),
             std.json.fmt(if (deployment_control.digestSet(value.applied_plan_digest)) value.applied_plan_digest[0..] else null, .{}),
-            std.json.fmt(desired_digest[0..], .{}),
+            std.json.fmt(if (digest_available) desired_digest[0..] else null, .{}),
             if (drift == .drifted) "true" else "false",
-            std.json.fmt(@tagName(drift), .{}),
+            std.json.fmt(if (digest_available) @tagName(drift) else "unavailable", .{}),
             std.json.fmt(@tagName(value.requested_by), .{}),
             times.start_at,
             times.install_at,
@@ -2505,23 +3262,36 @@ test "legacy terminal status is adopted only when deployment facts corroborate i
 
 fn writeEffectiveSystem(writer: *std.Io.Writer, profile: *const model.ProfileConfig) !void {
     const system = @import("../profile/install.zig").effectiveSystem(profile) catch return error.InvalidEffectiveSystem;
-    try writer.print("{{\"localization\":{f},\"connectivity\":{f},\"ssh\":{{\"enabled\":{s},\"password_authentication\":{s},\"root_login\":{f},\"root_password_configured\":{s},\"root_authorized_key_count\":{d}}},\"security\":{f},\"users\":[", .{
+    return writeTargetSystem(writer, system);
+}
+
+fn writeTargetSystem(writer: *std.Io.Writer, system: model.TargetSystemConfig) !void {
+    try writer.print("{{\"localization\":{f},\"connectivity\":{f},\"ssh\":{{\"enabled\":{s},\"password_authentication\":{s},\"root_login\":{f},\"root_password\":{f},\"root_authorized_keys\":{f}}},\"security\":{f},\"users\":[", .{
         std.json.fmt(system.localization, .{}),
         std.json.fmt(system.connectivity, .{}),
         if (system.ssh.enabled) "true" else "false",
         if (system.ssh.password_authentication) "true" else "false",
         std.json.fmt(@tagName(system.ssh.root_login), .{}),
-        if (system.ssh.root_password != null) "true" else "false",
-        system.ssh.root_authorized_keys.len,
+        std.json.fmt(system.ssh.root_password, .{}),
+        std.json.fmt(system.ssh.root_authorized_keys, .{}),
         std.json.fmt(system.security, .{}),
     });
     for (system.users, 0..) |user, index| {
         if (index != 0) try writer.writeByte(',');
-        try writer.print("{{\"name\":{f},\"sudo\":{s},\"password_configured\":{s},\"authorized_key_count\":{d}}}", .{ std.json.fmt(user.name, .{}), if (user.sudo) "true" else "false", if (user.password != null) "true" else "false", user.ssh_authorized_keys.len });
+        try writer.print("{f}", .{std.json.fmt(user, .{})});
     }
     try writer.writeAll("],\"packages\":");
     try std.json.Stringify.value(system.packages, .{}, writer);
     try writer.writeByte('}');
+}
+
+test "management effective system exposes canonical password policy values" {
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeTargetSystem(&writer, .{ .ssh = .{ .root_password = "root-secret" }, .users = &.{.{ .name = "nodeforge", .password = "user-secret" }} });
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"root_password\":\"root-secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"password\":\"user-secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "password_configured") == null);
 }
 
 fn managementProfiles(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
@@ -2534,12 +3304,11 @@ fn managementProfiles(request: zap.Request, context: *const RouteContext, meta: 
     for (context.catalog_snapshot.value().profiles[page.offset..end], 0..) |profile, index| {
         if (index != 0) try output.writer.writeByte(',');
         var refs: usize = 0;
-        for (context.catalog_snapshot.value().nodes) |node| if (std.mem.eql(u8, node.profile, profile.name)) {
+        for (context.catalog_snapshot.value().nodes) |node| if (node.profile != null and std.mem.eql(u8, node.profile.?, profile.name)) {
             refs += 1;
         };
-        try output.writer.print("{{\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"install_source\":", .{ std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}) });
-        if (profile.install_source) |source| try output.writer.print("{f}", .{std.json.fmt(source, .{})}) else try output.writer.writeAll("null");
-        try output.writer.print(",\"nodes\":{d},\"valid\":true}}", .{refs});
+        const source = lookup.findInstallSource(context.catalog_snapshot.value(), profile.install_source) orelse return notFound(request, meta);
+        try output.writer.print("{{\"name\":{f},\"install_source\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"nodes\":{d},\"valid\":true}}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(source.distro, .{}), std.json.fmt(source.version, .{}), std.json.fmt(@tagName(source.arch), .{}), refs });
     }
     try output.writer.writeByte(']');
     try writeNextCursor(&output.writer, "profiles", context.catalog_snapshot.revision, end, context.catalog_snapshot.value().profiles.len);
@@ -2550,16 +3319,17 @@ fn managementProfiles(request: zap.Request, context: *const RouteContext, meta: 
 
 fn managementProfile(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
     const profile = lookup.findProfile(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
-    const distro = lookup.findDistro(context.catalog_snapshot.value(), profile.distro) orelse return notFound(request, meta);
-    const capability = lookup.findDistroVersion(context.catalog_snapshot.value(), profile.distro, profile.version, profile.arch) orelse return notFound(request, meta);
+    const source = lookup.findInstallSource(context.catalog_snapshot.value(), profile.install_source) orelse return notFound(request, meta);
+    const distro = lookup.findDistro(context.catalog_snapshot.value(), source.distro) orelse return notFound(request, meta);
+    const capability = lookup.findDistroVersion(context.catalog_snapshot.value(), source.distro, source.version, source.arch) orelse return notFound(request, meta);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"name\":{f},\"mode\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"boot_bundle\":{f},\"kernel_args\":{f},\"install\":{f},\"safety\":{f},\"validation\":{{\"valid\":true}},\"capability\":{{\"family\":{f},\"install_adapter\":{f},\"package_manager\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.mode), .{}), std.json.fmt(profile.distro, .{}), std.json.fmt(profile.version, .{}), std.json.fmt(@tagName(profile.arch), .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.install, .{}), std.json.fmt(profile.safety, .{}), std.json.fmt(@tagName(distro.family), .{}), std.json.fmt(@tagName(capability.install_adapter), .{}), std.json.fmt(@tagName(capability.package_manager), .{}) });
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"name\":{f},\"kernel_args\":{f},\"install\":{f},\"validation\":{{\"valid\":true}},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"capability\":{{\"family\":{f},\"install_adapter\":{f},\"package_manager\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(profile.name, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.install, .{}), std.json.fmt(source.distro, .{}), std.json.fmt(source.version, .{}), std.json.fmt(@tagName(source.arch), .{}), std.json.fmt(@tagName(distro.family), .{}), std.json.fmt(@tagName(capability.install_adapter), .{}), std.json.fmt(@tagName(capability.package_manager), .{}) });
     try writeEffectiveSystem(&output.writer, profile);
+    try output.writer.print(",\"software\":{f}", .{std.json.fmt(profile.software, .{})});
     try output.writer.writeAll(",\"install_source\":");
     const catalog_snapshot = context.catalog_snapshot;
-    if (profile.install_source) |source_name| {
-        const source = lookup.findInstallSource(catalog_snapshot.value(), source_name) orelse return notFound(request, meta);
+    {
         try output.writer.print("{f},\"assets\":[", .{std.json.fmt(source.*, .{})});
         const asset_names = [_][]const u8{ source.source_asset, source.installer_kernel, source.installer_initrd };
         for (asset_names, 0..) |asset_name, index| {
@@ -2568,10 +3338,10 @@ fn managementProfile(request: zap.Request, context: *const RouteContext, name: [
             try output.writer.print("{f}", .{std.json.fmt(asset.*, .{})});
         }
         try output.writer.writeByte(']');
-    } else try output.writer.writeAll("null,\"assets\":[]");
+    }
     try output.writer.writeAll(",\"nodes\":[");
     var first = true;
-    for (context.catalog_snapshot.value().nodes) |node| if (std.mem.eql(u8, node.profile, name)) {
+    for (context.catalog_snapshot.value().nodes) |node| if (node.profile != null and std.mem.eql(u8, node.profile.?, name)) {
         if (!first) try output.writer.writeByte(',');
         first = false;
         try output.writer.print("{f}", .{std.json.fmt(node.id, .{})});

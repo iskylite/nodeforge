@@ -3,7 +3,6 @@
 //! 本模块只提供已进入现行 CLI/HTTP 契约的窄写入口：
 //! - 从已有 install source 创建安全默认 install profile；
 //! - 规范化修改 `kernel_args`；
-//! - 同步修改 install profile 的 `boot_disk`/`install_disks`。
 //! 每次写入都先投影完整 config+catalog 模型并校验，再由 catalog store
 //! 原子发布；这里不实现 M6 规划中的通用 profile CRUD。
 const std = @import("std");
@@ -29,13 +28,7 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
     // 任意 safety/storage JSON，避免形成绕过模型校验的第二套创建语义。
     profiles[parsed.value.profiles.len] = .{
         .name = name,
-        .mode = .install,
-        .distro = selected.distro,
-        .version = selected.version,
-        .arch = selected.arch,
         .install_source = selected.name,
-        .safety = .{ .destructive = true, .persistent_writes = true, .reinstall_policy = .explicit },
-        .install = .{},
     };
     var candidate = parsed.value;
     candidate.profiles = profiles;
@@ -65,33 +58,9 @@ pub fn setKernelArgs(io: std.Io, allocator: std.mem.Allocator, config: *const mo
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
-/// 修改 profile 级安装目标盘。磁盘是安装计划的一部分而不是节点发现
-/// 属性；同时更新 boot_disk/install_disks，避免产生自相矛盾的存储模型。
-pub fn setBootDisk(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, profile_name: []const u8, boot_disk: []const u8) !void {
-    var parsed = try catalog_store.load(io, allocator, catalog_path);
-    defer parsed.deinit();
-    const profiles = try allocator.dupe(model.ProfileConfig, parsed.value.profiles);
-    defer allocator.free(profiles);
-    var install_disks = [_][]const u8{boot_disk};
-    var found = false;
-    for (profiles) |*profile| if (std.mem.eql(u8, profile.name, profile_name)) {
-        if (profile.mode != .install or profile.install == null) return error.NotInstallProfile;
-        profile.install.?.storage.boot_disk = boot_disk;
-        profile.install.?.storage.install_disks = &install_disks;
-        found = true;
-        break;
-    };
-    if (!found) return error.ProfileNotFound;
-    var candidate = parsed.value;
-    candidate.profiles = profiles;
-    const projected = model.projectCatalog(config.*, &candidate);
-    try validate.validate(&projected, &candidate);
-    try catalog_store.save(io, allocator, catalog_path, &candidate);
-}
-
 test "profile kernel args mutation canonicalizes projected catalog data" {
     var args = [_]u8{ ' ', 'i', 'o', 'm', 'm', 'u', '=', 'p', 't', ' ', ' ', 'i', 's', 'o', 'l', 'c', 'p', 'u', 's', '=', '0', ',', '2', ' ' };
-    var profiles = [_]model.ProfileConfig{.{ .name = "diskless", .mode = .diskless, .distro = "rocky", .version = "9.7", .arch = .aarch64, .boot_bundle = "bundle", .kernel_args = &args }};
+    var profiles = [_]model.ProfileConfig{.{ .name = "install", .install_source = "source", .kernel_args = &args }};
     var catalog: model.Catalog = .{ .profiles = &profiles };
     var projected = model.projectCatalog(.{ .server = .{ .server_ip = "192.0.2.1" } }, &catalog);
     config_load.canonicalizeKernelArgs(&projected);

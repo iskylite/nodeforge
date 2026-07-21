@@ -76,16 +76,39 @@ pub fn renderInstallPost(allocator: std.mem.Allocator, bundle: *const model.Prov
             // 换行折叠后把终止标记当成命令执行。
             .managed_file => {
                 const destination = step.destination orelse return error.InvalidStep;
-                const content = step.content orelse return error.InvalidStep;
                 // 路径安全校验：必须是绝对路径且不含 `..`，防止路径逃逸
                 if (!std.mem.startsWith(u8, destination, "/") or std.mem.indexOf(u8, destination, "..") != null) return error.InvalidStep;
                 try w.writeAll("install -d -m 0755 \"$(dirname -- ");
                 try writeShellQuoted(w, destination);
                 try w.writeAll(")\" && ");
-                try writePrintfBytes(w, content);
-                try w.writeAll(" > ");
-                try writeShellQuoted(w, destination);
-                try w.writeByte('\n');
+                if (step.content_asset != null) {
+                    const url = step.content_url orelse return error.InvalidStep;
+                    const digest = step.content_sha256 orelse return error.InvalidStep;
+                    try w.writeAll("curl -fsS --output ");
+                    try writeShellQuoted(w, destination);
+                    try w.writeByte(' ');
+                    try writeShellQuoted(w, url);
+                    try w.writeAll(" && printf '%s  %s\\n' ");
+                    try writeShellQuoted(w, digest);
+                    try w.writeByte(' ');
+                    try writeShellQuoted(w, destination);
+                    try w.writeAll(" | sha256sum -c - && chmod ");
+                    try w.print("{o:0>4} ", .{step.mode});
+                    try writeShellQuoted(w, destination);
+                    try w.writeAll(" && chown ");
+                    try writeShellQuoted(w, step.owner);
+                    try w.writeByte(':');
+                    try writeShellQuoted(w, step.group);
+                    try w.writeByte(' ');
+                    try writeShellQuoted(w, destination);
+                    try w.writeByte('\n');
+                } else {
+                    const content = step.content orelse return error.InvalidStep;
+                    try writePrintfBytes(w, content);
+                    try w.writeAll(" > ");
+                    try writeShellQuoted(w, destination);
+                    try w.writeByte('\n');
+                }
             },
         }
     }
@@ -115,4 +138,25 @@ test "managed file rendering is single-line and heredoc-free" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "printf '%b'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\\0012") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, "\n"));
+}
+
+test "canonical managed file downloads immutable revision and verifies digest" {
+    const bundle: model.ProvisioningBundle = .{ .name = "base", .steps = &.{.{
+        .name = "motd",
+        .action = .managed_file,
+        .destination = "/etc/motd",
+        .content_asset = "motd",
+        .content_url = "http://192.0.2.1/artifacts/managed-files/motd/2",
+        .content_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .mode = 0o640,
+        .owner = "root",
+        .group = "adm",
+    }} };
+    const bytes = try renderInstallPost(std.testing.allocator, &bundle, .dnf);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "artifacts/managed-files/motd/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "sha256sum -c -") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "chmod 0640") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "chown 'root':'adm'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "printf '%b'") == null);
 }

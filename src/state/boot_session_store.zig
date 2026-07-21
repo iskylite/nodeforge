@@ -8,7 +8,7 @@ pub const Record = struct {
     boot_session_id: []const u8,
     node_id: []const u8,
     profile: []const u8,
-    mode: model.ProfileMode,
+    mode: model.BootKind,
     mac: [6]u8,
     lease_ip: u32,
     phase: boot_session.Phase,
@@ -94,9 +94,9 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
         if (elapsed >= boot_session.delivery_ttl_seconds) continue;
         const node = findNode(catalog, record.node_id) orelse continue;
         const node_mac = parseMac(node.mac) catch continue;
-        if (!std.mem.eql(u8, node.profile, record.profile) or !std.mem.eql(u8, &record.mac, &node_mac)) continue;
-        const profile = findProfile(catalog, record.profile) orelse continue;
-        if (profile.mode != record.mode) continue;
+        if (node.profile == null or !std.mem.eql(u8, node.profile.?, record.profile) or !std.mem.eql(u8, &record.mac, &node_mac)) continue;
+        _ = findProfile(catalog, record.profile) orelse continue;
+        if (record.mode != .install) continue;
         if (record.mode == .install) {
             // M4.9：boot-sessions.json 与 deployment-control.json 分别原子写。
             // 恢复破坏性 delivery 前必须校验 join，避免只清理/回滚一个文件后
@@ -216,7 +216,7 @@ test "delivery checkpoint restores capability and remaining TTL" {
     var deployments: deployment_control.Store = .{};
     try deployments.ensureInitial("n1", [_]u8{'4'} ** 64, 999);
     const catalog: model.Catalog = .{
-        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .profiles = &.{.{ .name = "install", .install_source = "source" }},
         .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
         .assets = &.{
             .{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "aa" },
@@ -237,7 +237,7 @@ test "resume rejects install session whose deployment provenance was reset" {
     defer std.testing.allocator.free(path);
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.27.128" } };
     const catalog: model.Catalog = .{
-        .profiles = &.{.{ .name = "install", .mode = .install, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
+        .profiles = &.{.{ .name = "install", .install_source = "source" }},
         .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
         .assets = &.{
             .{ .name = "kernel", .kind = .kernel, .path = "install/kernel", .sha256 = "aa" },
@@ -259,30 +259,6 @@ test "resume rejects install session whose deployment provenance was reset" {
     var after: boot_session.Store = .{};
     defer after.deinit();
     try std.testing.expectError(error.BootSessionDeploymentMismatch, load(std.testing.io, std.testing.allocator, path, &config, &catalog, &reset_deployments, &after, 1012, 500));
-}
-
-test "resume accepts diskless capability without an install plan" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/boot-sessions.json", .{tmp.sub_path});
-    defer std.testing.allocator.free(path);
-    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.27.128" } };
-    const catalog: model.Catalog = .{
-        .profiles = &.{.{ .name = "diskless", .mode = .diskless, .distro = "rocky", .version = "9.7", .arch = .aarch64 }},
-        .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "diskless" }},
-    };
-    var before: boot_session.Store = .{};
-    defer before.deinit();
-    const acquired = try before.acquireDhcp(std.testing.io, .{ .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .xid = 1, .node_id = "n1", .profile = "diskless", .mode = .diskless, .model_revision = 7, .model_plan_digest = [_]u8{'7'} ** 64 }, 100, 1000);
-    before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 101, 1001);
-    const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
-    try save(std.testing.io, std.testing.allocator, path, &before, 1002);
-
-    var deployments: deployment_control.Store = .{};
-    var after: boot_session.Store = .{};
-    defer after.deinit();
-    try std.testing.expectEqual(@as(usize, 1), try load(std.testing.io, std.testing.allocator, path, &config, &catalog, &deployments, &after, 1012, 500));
-    _ = try after.authenticateCapability("n1", issued.boot_session_id[0..], issued.capability[0..], 501);
 }
 
 test "resume fails closed when a pinned asset digest changes or disappears" {

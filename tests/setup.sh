@@ -5,10 +5,14 @@ cli=$1
 daemon=$2
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+cleanup() {
+    chmod -R u+w "$tmp" 2>/dev/null || true
+    rm -rf "$tmp"
+}
+trap cleanup EXIT HUP INT TERM
 
 mode() {
-    stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 
 bundle="$tmp/bundle"
@@ -22,8 +26,9 @@ grep -Fq 'NodeForge initialized' "$tmp/init.out"
 test -f "$install/.nodeforge-root"
 test -x "$install/bin/nodeforge"
 test -x "$install/bin/nodeforged"
-test "$(jq -r .schema_version "$install/config/config.json")" = 2
+test "$(jq -r .schema_version "$install/config/config.json")" = 3
 test "$(jq -r .layout_schema_version "$install/catalog/manifest.json")" = 1
+test "$(jq -r .catalog_schema_version "$install/catalog/manifest.json")" = 3
 test "$(mode "$install/config/config.json")" = 600
 test "$(mode "$install/catalog/manifest.json")" = 600
 test "$(mode "$install/config")" = 700
@@ -98,7 +103,10 @@ if printf 'n\n' | "$install/bin/nodeforge" setup --reset-all --purge-all --recon
 fi
 test -f "$install/backups/old/manifest.json"
 test -f "$install/work/import/stale.iso"
-grep -Fq 'permanently purge NodeForge state' "$tmp/purge-denied"
+grep -Fq 'permanently purge NodeForge state' "$tmp/purge-denied" || {
+    cat "$tmp/purge-denied" >&2
+    exit 1
+}
 printf 'yes\n' | "$install/bin/nodeforge" setup --reset-all --purge-all --reconfigure >"$tmp/purge-all"
 grep -Fq 'purged by --purge-all' "$tmp/purge-all"
 grep -Fq 'deployment reconfigured' "$tmp/purge-all"

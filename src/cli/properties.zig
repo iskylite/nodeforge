@@ -5,42 +5,201 @@
 
 const std = @import("std");
 
-pub const node_set_keys = "mac, arch, profile, ip, hostname, deploy, http_accel, boot_disk, install_disks";
-pub const node_unset_keys = "ip, hostname, boot_disk, install_disks";
-pub const profile_set_keys = "kernel_args, boot_disk";
-pub const profile_unset_keys = "kernel_args";
+pub const Owner = enum { site, node, profile, assets };
+pub const ValueKind = enum { string, boolean, positive_integer, arch, enumeration };
+pub const Mutability = enum { mutable, read_only };
+pub const Applicability = enum { all, kickstart, autoinstall, uefi_grub };
 
-pub const NodeKey = enum(u4) {
-    mac,
-    arch,
-    profile,
-    ip,
-    hostname,
-    deploy,
-    http_accel,
-    boot_disk,
-    install_disks,
-
-    pub fn parse(value: []const u8) ?NodeKey {
-        return std.meta.stringToEnum(NodeKey, value);
-    }
-
-    pub fn mask(self: NodeKey) u16 {
-        return @as(u16, 1) << @intFromEnum(self);
-    }
-
-    pub fn optional(self: NodeKey) bool {
-        return switch (self) {
-            .ip, .hostname, .boot_disk, .install_disks => true,
-            else => false,
-        };
-    }
+pub const PropertySpec = struct {
+    owner: Owner,
+    path: []const u8,
+    kind: ValueKind,
+    optional: bool = false,
+    mutability: Mutability = .mutable,
+    applicability: Applicability = .all,
 };
 
-test "node mutation vocabulary has stable masks and optional boundary" {
-    try std.testing.expectEqual(NodeKey.boot_disk, NodeKey.parse("boot_disk").?);
-    try std.testing.expect(NodeKey.install_disks.optional());
-    try std.testing.expect(!NodeKey.profile.optional());
-    try std.testing.expectEqual(@as(u16, 256), NodeKey.install_disks.mask());
-    try std.testing.expect(NodeKey.parse("effective_storage") == null);
+pub const CollectionSemantics = enum { ordered_replace, set, delta, kernel_arguments };
+pub const CollectionSpec = struct {
+    owner: Owner,
+    path: []const u8,
+    semantics: CollectionSemantics,
+    item_spec: ?[]const u8 = null,
+    mutability: Mutability = .mutable,
+};
+
+pub const ItemField = struct { name: []const u8, kind: ValueKind, required: bool = false };
+pub const ItemCollectionField = struct { name: []const u8, semantics: CollectionSemantics = .set };
+pub const ItemSpec = struct { name: []const u8, identity: []const u8, fields: []const ItemField, collections: []const ItemCollectionField = &.{} };
+
+pub const properties = [_]PropertySpec{
+    .{ .owner = .site, .path = "discovery.policy.unknown_action", .kind = .enumeration },
+    .{ .owner = .site, .path = "discovery.policy.observation_retention_days", .kind = .positive_integer },
+    .{ .owner = .node, .path = "mac", .kind = .string },
+    .{ .owner = .node, .path = "arch", .kind = .arch },
+    .{ .owner = .node, .path = "profile", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "pxe.ip_reservation", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "hostname", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "deploy", .kind = .boolean },
+    .{ .owner = .node, .path = "http_accel", .kind = .boolean, .applicability = .uefi_grub },
+    .{ .owner = .node, .path = "network.mode", .kind = .enumeration },
+    .{ .owner = .node, .path = "network.interface_name", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "network.address", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "network.prefix_len", .kind = .positive_integer, .optional = true },
+    .{ .owner = .node, .path = "network.gateway", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "storage.boot_disk", .kind = .string },
+    .{ .owner = .node, .path = "overrides.install.storage.mode", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.storage.wipe", .kind = .boolean, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.storage.partition_table", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.bootloader.install", .kind = .boolean, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.localization.locale", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.localization.timezone", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.localization.keyboard", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.connectivity.time_sync", .kind = .boolean, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.ssh.enabled", .kind = .boolean, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.ssh.password_authentication", .kind = .boolean, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.ssh.root_login", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.ssh.root_password", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.security.firewall", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.security.selinux", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.security.apparmor", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.software.environment", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.apt.fallback", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.completion.action", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.updates.mode", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.proxy.url", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.reinstall_policy", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.post_install.bundle", .kind = .string, .optional = true },
+    .{ .owner = .profile, .path = "install_source", .kind = .string },
+    .{ .owner = .profile, .path = "install.storage.mode", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.storage.wipe", .kind = .boolean },
+    .{ .owner = .profile, .path = "install.storage.partition_table", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.bootloader.install", .kind = .boolean },
+    .{ .owner = .profile, .path = "system.localization.locale", .kind = .string },
+    .{ .owner = .profile, .path = "system.localization.timezone", .kind = .string },
+    .{ .owner = .profile, .path = "system.localization.keyboard", .kind = .string },
+    .{ .owner = .profile, .path = "system.connectivity.time_sync", .kind = .boolean },
+    .{ .owner = .profile, .path = "system.ssh.enabled", .kind = .boolean },
+    .{ .owner = .profile, .path = "system.ssh.password_authentication", .kind = .boolean },
+    .{ .owner = .profile, .path = "system.ssh.root_login", .kind = .enumeration },
+    .{ .owner = .profile, .path = "system.ssh.root_password", .kind = .string, .optional = true },
+    .{ .owner = .profile, .path = "system.security.firewall", .kind = .enumeration },
+    .{ .owner = .profile, .path = "system.security.selinux", .kind = .enumeration, .applicability = .kickstart },
+    .{ .owner = .profile, .path = "system.security.apparmor", .kind = .enumeration, .applicability = .autoinstall },
+    .{ .owner = .profile, .path = "software.environment", .kind = .string, .optional = true, .applicability = .kickstart },
+    .{ .owner = .profile, .path = "install.apt.fallback", .kind = .enumeration, .applicability = .autoinstall },
+    .{ .owner = .profile, .path = "install.completion.action", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.updates.mode", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.proxy.url", .kind = .string, .optional = true },
+    .{ .owner = .profile, .path = "install.reinstall_policy", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.post_install.bundle", .kind = .string, .optional = true },
+};
+
+pub const collections = [_]CollectionSpec{
+    .{ .owner = .node, .path = "network.dns", .semantics = .set },
+    .{ .owner = .node, .path = "network.search_domains", .semantics = .set },
+    .{ .owner = .node, .path = "network.routes", .semantics = .ordered_replace, .item_spec = "route" },
+    .{ .owner = .node, .path = "overrides.install.storage.partitions", .semantics = .ordered_replace, .item_spec = "partition" },
+    .{ .owner = .node, .path = "overrides.system.users", .semantics = .ordered_replace, .item_spec = "user" },
+    .{ .owner = .node, .path = "storage.additional_disks", .semantics = .set },
+    .{ .owner = .node, .path = "overrides.software.repositories.add", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.repositories.remove", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.groups.add", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.groups.remove", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.tasks.add", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.tasks.remove", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.packages.include.add", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.packages.include.remove", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.kernel_args.add", .semantics = .kernel_arguments },
+    .{ .owner = .node, .path = "overrides.kernel_args.remove", .semantics = .kernel_arguments },
+    .{ .owner = .node, .path = "overrides.system.connectivity.ntp_servers.add", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.system.connectivity.ntp_servers.remove", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.system.ssh.root_authorized_keys.add", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.system.ssh.root_authorized_keys.remove", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.packages.exclude.add", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.software.packages.exclude.remove", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.install.proxy.no_proxy.add", .semantics = .delta },
+    .{ .owner = .node, .path = "overrides.install.proxy.no_proxy.remove", .semantics = .delta },
+    .{ .owner = .profile, .path = "install.storage.partitions", .semantics = .ordered_replace, .item_spec = "partition" },
+    .{ .owner = .profile, .path = "system.connectivity.ntp_servers", .semantics = .set },
+    .{ .owner = .profile, .path = "system.ssh.root_authorized_keys", .semantics = .set },
+    .{ .owner = .profile, .path = "system.users", .semantics = .ordered_replace, .item_spec = "user" },
+    .{ .owner = .profile, .path = "software.repositories", .semantics = .set },
+    .{ .owner = .profile, .path = "software.groups", .semantics = .set },
+    .{ .owner = .profile, .path = "software.tasks", .semantics = .set },
+    .{ .owner = .profile, .path = "software.packages.include", .semantics = .set },
+    .{ .owner = .profile, .path = "software.packages.exclude", .semantics = .set },
+    .{ .owner = .profile, .path = "kernel_args", .semantics = .kernel_arguments },
+    .{ .owner = .profile, .path = "install.proxy.no_proxy", .semantics = .set },
+    .{ .owner = .node, .path = "effective.install.storage.partitions", .semantics = .ordered_replace, .item_spec = "partition", .mutability = .read_only },
+    .{ .owner = .assets, .path = "steps", .semantics = .ordered_replace, .item_spec = "managed-file-step" },
+};
+
+const partition_fields = [_]ItemField{
+    .{ .name = "id", .kind = .string, .required = true }, .{ .name = "mount", .kind = .string }, .{ .name = "filesystem", .kind = .string }, .{ .name = "size_mib", .kind = .positive_integer }, .{ .name = "grow", .kind = .boolean },
+};
+const route_fields = [_]ItemField{
+    .{ .name = "id", .kind = .string, .required = true }, .{ .name = "destination", .kind = .string, .required = true }, .{ .name = "gateway", .kind = .string, .required = true }, .{ .name = "metric", .kind = .positive_integer },
+};
+const user_fields = [_]ItemField{
+    .{ .name = "name", .kind = .string, .required = true }, .{ .name = "uid", .kind = .positive_integer }, .{ .name = "shell", .kind = .string }, .{ .name = "locked", .kind = .boolean }, .{ .name = "password", .kind = .string }, .{ .name = "sudo", .kind = .boolean },
+};
+const user_collections = [_]ItemCollectionField{ .{ .name = "groups" }, .{ .name = "ssh_authorized_keys" } };
+const managed_file_step_fields = [_]ItemField{
+    .{ .name = "name", .kind = .string, .required = true }, .{ .name = "action", .kind = .enumeration, .required = true }, .{ .name = "destination", .kind = .string, .required = true }, .{ .name = "content_asset", .kind = .string, .required = true }, .{ .name = "mode", .kind = .positive_integer }, .{ .name = "owner", .kind = .string }, .{ .name = "group", .kind = .string },
+};
+pub const items = [_]ItemSpec{
+    .{ .name = "partition", .identity = "id", .fields = &partition_fields },
+    .{ .name = "route", .identity = "id", .fields = &route_fields },
+    .{ .name = "user", .identity = "name", .fields = &user_fields, .collections = &user_collections },
+    .{ .name = "managed-file-step", .identity = "name", .fields = &managed_file_step_fields },
+};
+
+pub fn property(owner: Owner, path: []const u8) ?*const PropertySpec {
+    for (&properties) |*spec| if (spec.owner == owner and std.mem.eql(u8, spec.path, path)) return spec;
+    return null;
+}
+
+pub fn collection(owner: Owner, path: []const u8) ?*const CollectionSpec {
+    for (&collections) |*spec| if (spec.owner == owner and std.mem.eql(u8, spec.path, path)) return spec;
+    return null;
+}
+
+test "typed registries have unique canonical paths and valid item references" {
+    for (properties, 0..) |left, index| {
+        try std.testing.expect(left.path.len != 0 and left.path[0] != '.');
+        for (properties[index + 1 ..]) |right| try std.testing.expect(!(left.owner == right.owner and std.mem.eql(u8, left.path, right.path)));
+        try std.testing.expect(collection(left.owner, left.path) == null);
+    }
+    for (collections, 0..) |left, index| {
+        for (collections[index + 1 ..]) |right| try std.testing.expect(!(left.owner == right.owner and std.mem.eql(u8, left.path, right.path)));
+        if (left.item_spec) |name| {
+            var found = false;
+            for (items) |item| {
+                if (std.mem.eql(u8, item.name, name)) found = true;
+            }
+            try std.testing.expect(found);
+        }
+    }
+    for (items) |item| {
+        var identity_found = false;
+        for (item.fields, 0..) |field, index| {
+            if (std.mem.eql(u8, field.name, item.identity) and field.required) identity_found = true;
+            for (item.fields[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, field.name, other.name));
+        }
+        for (item.collections, 0..) |field, index| {
+            for (item.collections[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, field.name, other.name));
+            for (item.fields) |scalar| try std.testing.expect(!std.mem.eql(u8, field.name, scalar.name));
+        }
+        try std.testing.expect(identity_found);
+    }
+}
+
+test "canonical v3 storage and discovery keys are registered without legacy aliases" {
+    try std.testing.expect(property(.site, "discovery.policy.unknown_action") != null);
+    try std.testing.expect(property(.node, "storage.boot_disk") != null);
+    try std.testing.expect(collection(.node, "storage.additional_disks") != null);
+    try std.testing.expect(property(.node, "ip") == null);
+    try std.testing.expect(property(.profile, "boot_disk") == null);
+    try std.testing.expect(collection(.node, "install_disks") == null);
 }

@@ -29,7 +29,7 @@ pub const Network = struct {
 
 pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppConfig {
     return .{
-        .schema_version = 2,
+        .schema_version = 3,
         .server = .{ .bind_interface = network.bind_interface, .server_ip = network.server_ip, .http_port = network.http_port },
         .http = .{ .asset_root = p.iso_dir, .repository_root = p.repos_dir },
         .tftp = .{ .asset_root = p.boot_dir },
@@ -70,11 +70,11 @@ pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     const config = if (imported_config) |candidate| candidate.* else generatedConfig(p, network);
     // 空 distro 索引是正常的首次安装状态；首个通过媒体布局校验的 ISO
     // 会与 install source 一起原子创建对应 family/version/arch 能力记录。
-    const catalog: model.Catalog = .{};
+    const catalog: model.Catalog = .{ .schema_version = 3 };
     try validate.validate(&config, &catalog);
     try installBundle(io, allocator, p);
     try config_store.save(io, allocator, p.config_path, &config);
-    try catalog_store.initializeEmpty(io, allocator, p.catalog_dir);
+    try catalog_store.save(io, allocator, p.catalog_dir, &catalog);
     const unit = try renderSystemd(allocator, p);
     defer allocator.free(unit);
     try atomicWrite(io, p.service_path, unit);
@@ -87,6 +87,7 @@ pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
     defer parsed.deinit();
     const marker = try std.fmt.allocPrint(allocator, "{s}/m4.7-migration.json", .{p.state_dir});
     defer allocator.free(marker);
+    if (parsed.value.schema_version == 3) return false;
     if (parsed.value.schema_version == 2) {
         // A crash after publishing config.json can leave a valid manifest beside
         // legacy catalog.json. The migration marker is the proof that this mixed

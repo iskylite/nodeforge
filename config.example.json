@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "server": {
     "name": "nodeforge-dev",
     "bind_interface": "enp1s0",
@@ -40,9 +40,5 @@
   "events": {
     "max_size_mb": 100,
     "keep": 5
-  },
-  "policy": {
-    "default_action": "wait",
-    "allow_unknown_diskless": false
   }
 }

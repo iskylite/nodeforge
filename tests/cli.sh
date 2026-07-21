@@ -4,6 +4,15 @@ set -eu
 cli=$1
 daemon=$2
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+direct_writes=$(grep -Ec 'ctx\.writer\.(writeAll|print|writeByte)\(' "$root/src/main.zig" || true)
+test "$direct_writes" -eq 7
+test "$(grep -Fc 'ctx.writer.print("This will permanently purge NodeForge state' "$root/src/main.zig")" -eq 1
+test "$(grep -Fc 'ctx.writer.print("This will back up and reset NodeForge startup configuration' "$root/src/main.zig")" -eq 1
+test "$(grep -Fc 'ctx.writer.print("This will modify {s}. Continue?' "$root/src/main.zig")" -eq 1
+test "$(grep -Fc 'ctx.writer.writeAll(unit);' "$root/src/main.zig")" -eq 1
+test "$(grep -Fc 'ctx.writer.writeAll(bytes);' "$root/src/main.zig")" -eq 2
+test "$(grep -Fc 'ctx.writer.writeAll(answer);' "$root/src/main.zig")" -eq 1
 tmp=${TMPDIR:-/tmp}/nodeforge-cli-test-$$
 mkdir -p "$tmp"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
@@ -65,16 +74,25 @@ grep -q -- "--purge-all" "$tmp/setup-help"
 grep -Fq 'Create an install profile from an imported install source' "$tmp/profile-create-help"
 grep -Fq 'Derives distro, version, and architecture' "$tmp/profile-create-help"
 "$cli" profile set --help >"$tmp/profile-set-help"
-grep -Fq 'boot_disk=/dev/<device>' "$tmp/profile-set-help"
-grep -Fq 'kernel_args, boot_disk' "$tmp/profile-set-help"
-grep -Fq "nodeforge profile set rocky 'kernel_args=iommu=pt hugepages=4'" "$tmp/profile-set-help"
+grep -Fq 'exact mutable Profile PropertySpec key' "$tmp/profile-set-help"
+grep -Fq 'Collections require' "$tmp/profile-set-help"
+"$cli" profile set --help-full >"$tmp/profile-set-help-full"
+grep -Fq 'install.storage.mode' "$tmp/profile-set-help-full"
+grep -Fq 'software.packages.include' "$tmp/profile-set-help-full"
+grep -Fq 'system.users' "$tmp/profile-set-help-full"
+grep -Fq 'user.groups' "$tmp/profile-set-help-full"
+grep -Fq 'user.ssh_authorized_keys' "$tmp/profile-set-help-full"
+"$cli" profile item replace-values --help >"$tmp/profile-item-values-help"
+grep -Fq -- '--from-file' "$tmp/profile-item-values-help"
 "$cli" node set --help >"$tmp/node-set-help"
-grep -Fq 'mac, arch, profile, ip, hostname, deploy, http_accel' "$tmp/node-set-help"
-grep -Fq 'boot_disk, install_disks' "$tmp/node-set-help"
-grep -Fq 'nodeforge node set r97n1 boot_disk=/dev/nvme0n1' "$tmp/node-set-help"
+grep -Fq 'exact mutable Node PropertySpec keys' "$tmp/node-set-help"
+grep -Fq 'structured collections require item commands' "$tmp/node-set-help"
+"$cli" node set --help-full >"$tmp/node-set-help-full"
+grep -Fq 'storage.boot_disk' "$tmp/node-set-help-full"
+grep -Fq 'storage.additional_disks' "$tmp/node-set-help-full"
+grep -Fq 'overrides.install.storage.mode' "$tmp/node-set-help-full"
 "$cli" node unset --help >"$tmp/node-unset-help"
-grep -Fq 'ip, hostname, boot_disk, install_disks' "$tmp/node-unset-help"
-grep -Fq 'nodeforge node unset r97n1 boot_disk install_disks' "$tmp/node-unset-help"
+grep -Fq 'overrides.* scalar keys' "$tmp/node-unset-help"
 "$cli" node retry --help >"$tmp/node-retry-help"
 grep -Fq 'Supersede a stuck active session' "$tmp/node-retry-help"
 "$cli" node render --help >"$tmp/node-render-help"
@@ -84,6 +102,12 @@ if grep -Eq '^   .*--output' "$tmp/node-render-help"; then
 fi
 "$cli" status --help >"$tmp/status-help"
 grep -Fq 'advertised HTTP, catalog, DHCP, and TFTP' "$tmp/status-help"
+grep -Fq 'human, json, or jsonl' "$tmp/status-help"
+grep -Fq -- '--fields' "$tmp/status-help"
+grep -Fq -- '--columns' "$tmp/status-help"
+grep -Fq -- '--width' "$tmp/status-help"
+grep -Fq -- '--wide' "$tmp/status-help"
+grep -Fq -- '--no-header' "$tmp/status-help"
 "$cli" runtime --help >"$tmp/runtime-help"
 if grep -Fq 'Show runtime status overview' "$tmp/runtime-help"; then
     echo "runtime status must not remain beside canonical top-level status" >&2
@@ -101,6 +125,19 @@ grep -Fq 'Architecture, used with --distro and --version; e.g. aarch64' "$tmp/as
 
 "$cli" assets import --help >"$tmp/assets-import-help"
 grep -Fq 'Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso' "$tmp/assets-import-help"
+"$cli" assets install-source --help >"$tmp/install-source-help"
+grep -Fq 'software' "$tmp/install-source-help"
+"$cli" assets repository software show --help >"$tmp/repository-software-help"
+grep -Fq -- '--kind' "$tmp/repository-software-help"
+"$cli" profile software --help >"$tmp/profile-software-help"
+grep -Fq 'available' "$tmp/profile-software-help"
+grep -Fq 'show' "$tmp/profile-software-help"
+"$cli" profile capabilities show --help >"$tmp/profile-capabilities-help"
+grep -Fq 'adapter capability registry' "$tmp/profile-capabilities-help"
+"$cli" node software --help >"$tmp/node-software-help"
+grep -Fq 'show' "$tmp/node-software-help"
+"$cli" node capabilities show --help >"$tmp/node-capabilities-help"
+grep -Fq 'adapter capability registry' "$tmp/node-capabilities-help"
 grep -Fq 'Override an unknown or ambiguous product id; e.g. rocky, kylin, ubuntu. Family still comes from ISO layout' "$tmp/assets-import-help"
 grep -Fq 'atomically publishes the distro tuple with the install source' "$tmp/assets-import-help"
 if grep -Fq 'relative to /opt/nodeforge/work/import' "$tmp/assets-import-help"; then
@@ -196,7 +233,31 @@ fi
 "$cli" assets list -C "$root/catalog.example.json" --no-color >"$tmp/asset-list-no-color"
 cmp "$tmp/asset-list" "$tmp/asset-list-no-color"
 "$cli" assets list -C "$root/catalog.example.json" -o json >"$tmp/asset-list-json"
-grep -Fq '"assets":[' "$tmp/asset-list-json"
+jq -e '.ok and (.result.assets | length > 0) and .result.assets[0].name' "$tmp/asset-list-json" >/dev/null
+"$cli" assets list -C "$root/catalog.example.json" -o jsonl >"$tmp/asset-list-jsonl"
+test "$(wc -l <"$tmp/asset-list-jsonl" | tr -d ' ')" = "$(jq '.assets | length' "$root/catalog.example.json")"
+jq -e '.ok and .result.name and .result.kind and .result.path' "$tmp/asset-list-jsonl" >/dev/null
+"$cli" assets list -C "$root/catalog.example.json" --columns name,path --no-header >"$tmp/asset-list-columns"
+if grep -Fq 'KIND' "$tmp/asset-list-columns"; then
+    echo "filtered asset list unexpectedly retained KIND" >&2
+    exit 1
+fi
+if "$cli" assets list -C "$root/catalog.example.json" --columns missing >"$tmp/asset-list-bad-column.out" 2>"$tmp/asset-list-bad-column.err"; then
+    echo "asset list accepted an unknown output column" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/asset-list-bad-column.out"
+grep -Fq 'unknown key' "$tmp/asset-list-bad-column.err"
+if "$cli" assets list -C "$root/catalog.example.json" -o json --no-header >"$tmp/asset-list-json-header.out" 2>"$tmp/asset-list-json-header.err"; then
+    echo "JSON asset list accepted human-only --no-header" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+test ! -s "$tmp/asset-list-json-header.out"
+grep -Fq 'not applicable' "$tmp/asset-list-json-header.err"
 
 if "$cli" --config "$root/config.example.json" config validate >"$tmp/root-config" 2>&1; then
     echo "root config flag unexpectedly succeeded" >&2
@@ -300,8 +361,9 @@ grep -Fq 'boot.session.terminated' "$tmp/events-types"
 grep -Eq '^TYPE[[:space:]]+LEVEL[[:space:]]+DESCRIPTION' "$tmp/events-types"
 
 "$cli" events types -o json >"$tmp/events-types-json"
-grep -Fq '"name":"service.started"' "$tmp/events-types-json"
-grep -Fq '"name":"dhcp.ack"' "$tmp/events-types-json"
+jq -e '.ok and any(.result.items[]; .name == "service.started") and any(.result.items[]; .name == "dhcp.ack")' "$tmp/events-types-json" >/dev/null
+"$cli" events types -o jsonl >"$tmp/events-types-jsonl"
+jq -s -e 'any(.[]; .result.name == "service.started" and .ok)' "$tmp/events-types-jsonl" >/dev/null
 
 # events list returns an empty table when no events file exists.
 # Use an explicit non-existent path so the test is not affected by a
@@ -309,9 +371,9 @@ grep -Fq '"name":"dhcp.ack"' "$tmp/events-types-json"
 "$cli" events list --events-path "$tmp/nonexistent.jsonl" >"$tmp/events-list-empty"
 grep -Fqx 'No events recorded.' "$tmp/events-list-empty"
 
-# events list JSON returns an empty array when no events file exists.
+# events list JSON returns a stable empty collection envelope.
 "$cli" events list --events-path "$tmp/nonexistent.jsonl" -o json >"$tmp/events-list-empty-json"
-grep -Fqx '[]' "$tmp/events-list-empty-json"
+jq -e '.ok and (.result.items | length) == 0 and .result.skipped == 0' "$tmp/events-list-empty-json" >/dev/null
 
 # events list with an unknown --type is a usage error (exit 2).
 if "$cli" events list --type bogus.type >"$tmp/events-bad-type" 2>&1; then
@@ -350,7 +412,9 @@ cat >"$events_dir/events.jsonl" <<EOF
 EOF
 "$cli" events list --events-path "$events_dir/events.jsonl" --session "$session_id" -o json >"$tmp/events-session-json"
 python3 -m json.tool "$tmp/events-session-json" >/dev/null
-grep -Fq '"type":"tftp.transfer.complete"' "$tmp/events-session-json"
+jq -e '.ok and any(.result.items[]; .type == "tftp.transfer.complete")' "$tmp/events-session-json" >/dev/null
+"$cli" events list --events-path "$events_dir/events.jsonl" --session "$session_id" -o jsonl >"$tmp/events-session-jsonl"
+jq -s -e 'any(.[]; .result.type == "tftp.transfer.complete" and .ok)' "$tmp/events-session-jsonl" >/dev/null
 "$cli" node trace node-01 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-session-json"
 python3 -m json.tool "$tmp/trace-session-json" >/dev/null
 grep -Fq '"boot_session_id":"'"$session_id"'"' "$tmp/trace-session-json"

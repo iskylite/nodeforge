@@ -33,18 +33,29 @@ pub const catalog_store = @import("catalog/store.zig");
 /// M3 ISO 导入器：通过只读 loop mount 从 DVD ISO 提取安装介质并发布到 catalog。
 pub const iso_import = @import("catalog/iso_import.zig");
 pub const catalog_migration = @import("catalog/migration.zig");
+pub const catalog_discovery = @import("catalog/discovery.zig");
+pub const catalog_schema_v3 = @import("catalog/schema_v3.zig");
+pub const catalog_schema_v3_dto = @import("catalog/schema_v3_dto.zig");
+pub const catalog_schema_v2_dto = @import("catalog/schema_v2_dto.zig");
+pub const software_index = @import("catalog/software_index.zig");
 /// Daemon 应用入口：绑定端口、启动 DHCP/TFTP/HTTP 服务和管理信号处理。
 pub const app = @import("app.zig");
 /// 启动配置加载器：从 JSON 文件解析 AppConfig，失败时返回结构化错误。
 pub const config = @import("config/load.zig");
 /// 启动配置存储器：原子写入和规范化渲染配置 JSON。
 pub const config_store = @import("config/store.zig");
+pub const config_schema_v3_dto = @import("config/schema_v3_dto.zig");
+pub const config_schema_v2_dto = @import("config/schema_v2_dto.zig");
 /// 配置和 catalog 校验器：纯函数校验所有不变量和跨文件引用关系。
 pub const config_validate = @import("config/validate.zig");
 /// 节点资源增删改：load-modify-validate-save 事务写回 catalog/nodes.json。
 pub const node_mutation = @import("config/node_mutation.zig");
 /// Profile kernel_args 的受限、规范化 catalog 事务写入器。
 pub const profile_mutation = @import("config/profile_mutation.zig");
+pub const value_mutation = @import("config/value_mutation.zig");
+pub const item_mutation = @import("config/item_mutation.zig");
+pub const scalar_mutation = @import("config/scalar_mutation.zig");
+pub const provision_bundle_mutation = @import("config/provision_bundle_mutation.zig");
 /// 启动前预检：检查端口可用性、目录权限和必需的系统 capability。
 pub const preflight = @import("preflight.zig");
 /// 进程内运行时状态：DHCP lease 表、TFTP 传输计数器和 catalog 运行时快照。
@@ -59,6 +70,7 @@ pub const operations = @import("state/operations.zig");
 pub const config_runtime = @import("state/config_runtime.zig");
 pub const model_runtime = @import("state/model_runtime.zig");
 pub const model_transaction = @import("state/model_transaction.zig");
+pub const schema_v3_transaction = @import("state/schema_v3_transaction.zig");
 /// 节点状态跟踪：记录已注册节点的当前启动阶段和终态。
 pub const node_status = @import("state/node_status.zig");
 /// Catalog 运行时快照：管理 catalog 的原子替换和只读引用计数。
@@ -107,6 +119,9 @@ pub const boot_target = @import("boot/target.zig");
 pub const profile_render = @import("profile/render.zig");
 pub const password_hash = @import("profile/password_hash.zig");
 pub const profile_install = @import("profile/install.zig");
+pub const profile_storage = @import("profile/storage.zig");
+pub const profile_effective = @import("profile/effective.zig");
+pub const adapter_capabilities = @import("profile/capabilities.zig");
 pub const admin_key = @import("server/admin_key.zig");
 pub const kickstart = @import("profile/adapter/kickstart.zig");
 pub const ubuntu_autoinstall = @import("profile/adapter/ubuntu.zig");
@@ -122,6 +137,7 @@ pub const log_backend = @import("observe/log_backend.zig");
 pub const cli_table = @import("cli/table.zig");
 /// CLI 输出格式化：human/JSON 模式切换和颜色控制。
 pub const cli_output = @import("cli/output.zig");
+pub const cli_document = @import("cli/document.zig");
 pub const cli_properties = @import("cli/properties.zig");
 /// CLI 视图模板：status/check/asset/node/lease 等命令的展示视图。
 pub const cli_views = @import("cli/views.zig");
@@ -137,12 +153,23 @@ test {
     _ = catalog_store;
     _ = iso_import;
     _ = catalog_migration;
+    _ = catalog_discovery;
+    _ = catalog_schema_v3;
+    _ = catalog_schema_v3_dto;
+    _ = catalog_schema_v2_dto;
+    _ = software_index;
     _ = app;
     _ = config;
     _ = config_store;
+    _ = config_schema_v3_dto;
+    _ = config_schema_v2_dto;
     _ = config_validate;
     _ = node_mutation;
     _ = profile_mutation;
+    _ = value_mutation;
+    _ = item_mutation;
+    _ = scalar_mutation;
+    _ = provision_bundle_mutation;
     _ = preflight;
     _ = runtime_state;
     _ = capacity;
@@ -153,6 +180,7 @@ test {
     _ = config_runtime;
     _ = model_runtime;
     _ = model_transaction;
+    _ = schema_v3_transaction;
     _ = node_status;
     _ = catalog_runtime;
     _ = events;
@@ -177,6 +205,8 @@ test {
     _ = grub;
     _ = boot_target;
     _ = profile_render;
+    _ = profile_storage;
+    _ = profile_effective;
     _ = kickstart;
     _ = ubuntu_autoinstall;
     _ = provision_runner;

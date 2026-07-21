@@ -19,6 +19,7 @@ const paths = @import("../paths.zig");
 const assets = @import("../assets/validate.zig");
 const observe_log = @import("../observe/log.zig");
 const dhcp_store = @import("../state/dhcp_store.zig");
+const software_index = @import("software_index.zig");
 
 /// 导入请求。filename 是 CLI 已暂存到 import_dir 的不透明文件名。
 /// distro/version/arch 是可选覆盖。family 始终由经过结构校验的 ISO 布局决定；
@@ -184,6 +185,15 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     try assets.sha256File(io, config.tftp.asset_root, kernel_rel, &kernel_hash);
     try assets.sha256File(io, config.tftp.asset_root, initrd_rel, &initrd_hash);
 
+    const repository_index: model.SoftwareIndex = if (media.repository_base) |base| blk: {
+        const index_root = if (base.len == 0)
+            try allocator.dupe(u8, repo_destination)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_destination, base });
+        defer allocator.free(index_root);
+        break :blk try software_index.build(io, allocator, index_root, model.packageManagerForFamily(detected.family));
+    } else .{};
+
     const repository_names = if (media.repository_base != null) blk: {
         const names = try allocator.alloc([]const u8, 1);
         names[0] = source_name;
@@ -206,7 +216,7 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
         .bootloader_created = bootloader_created,
         .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
         .initrd_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .kind = .installer_initrd, .path = initrd_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &initrd_hash) },
-        .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = model.packageManagerForFamily(detected.family), .base_url = if (base.len == 0) try allocator.dupe(u8, media_tree_url) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base }) } else null,
+        .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = model.packageManagerForFamily(detected.family), .base_url = if (base.len == 0) try allocator.dupe(u8, media_tree_url) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base }), .software_index = repository_index } else null,
         .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names },
     };
     retain_outputs = true;

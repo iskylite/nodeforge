@@ -174,6 +174,7 @@ pub const InitOptions = struct {
     writer: *Io.Writer,
     reader: *Io.Reader,
     allocator: Allocator,
+    full_help_fn: ?*const fn (*Command) Io.Writer.Error!void = null,
 };
 
 /// Represents a single command in the Command Line Interface (CLI),
@@ -230,6 +231,14 @@ pub const Command = struct {
         };
 
         try cmd.addFlag(helpFlag);
+
+        try cmd.addFlag(.{
+            .name = "help-full",
+            .description = "Shows detailed help for a command",
+            .type = .Bool,
+            .default_value = .{ .Bool = false },
+            .persistent = true,
+        });
 
         return cmd;
     }
@@ -990,6 +999,13 @@ fn parseArgs(self: *Command, argsIterator: *std.process.Args.Iterator) CommandPa
                 }
             },
             .NEGATED_FLAG => {
+                const exact_name = arg[2..];
+                if (current_cmd.findFlag(exact_name)) |flag| {
+                    if (flag.type == .Bool) {
+                        try current_cmd.flag_values.put(exact_name, .{ .Bool = true });
+                        continue :outer;
+                    }
+                }
                 const no_len = "--no-".len;
                 const flag_name = arg[no_len..];
                 if (current_cmd.findFlag(flag_name)) |flag| {
@@ -1012,6 +1028,12 @@ fn parseArgs(self: *Command, argsIterator: *std.process.Args.Iterator) CommandPa
     remaining_args = try positional_args.toOwnedSlice(allocator);
     errdefer if (remaining_args.len > 0) allocator.free(remaining_args);
 
+    const full_help_requested = blk: {
+        if (current_cmd.flag_values.get("help-full")) |flagValue| {
+            if (flagValue.Bool == true) break :blk true;
+        }
+        break :blk argsContainFullHelpFlag(remaining_args);
+    };
     const help_requested = blk: {
         if (current_cmd.flag_values.get("help")) |flagValue| {
             if (flagValue.Bool == true) break :blk true;
@@ -1019,8 +1041,9 @@ fn parseArgs(self: *Command, argsIterator: *std.process.Args.Iterator) CommandPa
         break :blk argsContainHelpFlag(remaining_args);
     };
 
-    if (help_requested) {
+    if (help_requested or full_help_requested) {
         try current_cmd.printHelp();
+        if (full_help_requested) if (current_cmd.init_options.full_help_fn) |render| try render(current_cmd);
         try current_cmd.init_options.writer.flush();
         return .{
             .program_name = prog_name,
@@ -1091,5 +1114,10 @@ fn argsContainHelpFlag(args: []const []const u8) bool {
         }
     }
 
+    return false;
+}
+
+fn argsContainFullHelpFlag(args: []const []const u8) bool {
+    for (args) |arg| if (std.mem.eql(u8, arg, "--help-full")) return true;
     return false;
 }

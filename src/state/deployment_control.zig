@@ -577,12 +577,7 @@ pub fn revisionForModel(allocator: std.mem.Allocator, config: *const model.AppCo
 test "M4.7 config revision excludes catalog-owned profiles" {
     var profiles = [_]model.ProfileConfig{.{
         .name = "rocky-install",
-        .mode = .install,
-        .distro = "rocky",
-        .version = "9.7",
-        .arch = .aarch64,
         .install_source = "rocky-source",
-        .install = .{},
     }};
     var config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.50.1" },

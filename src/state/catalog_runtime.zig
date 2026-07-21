@@ -59,6 +59,57 @@ pub const CatalogRuntime = struct {
         defer snapshot.release();
         return snapshot.revision;
     }
+
+    /// Caller holds ModelRuntime.mutation_gate so config/catalog readers see a
+    /// coherent pair while this catalog-only observation generation publishes.
+    pub fn recordUnknownClient(self: *CatalogRuntime, io: std.Io, mac: []const u8, client_id: ?[]const u8, arch: ?model.Arch, vendor_class: ?[]const u8, ip: ?[]const u8, seen_at: i64) !void {
+        self.lock();
+        defer self.unlock();
+        const old = self.acquireLocked();
+        defer old.release();
+        const source = old.value().unknown_client_observations;
+        const retention_seconds = @as(i64, old.value().discovery_policy.observation_retention_days) * 86400;
+        var retained: usize = 0;
+        var found = false;
+        for (source) |item| {
+            const expired = item.claim == null and seen_at > item.last_seen_unix and seen_at - item.last_seen_unix > retention_seconds;
+            if (expired) continue;
+            retained += 1;
+            if (std.ascii.eqlIgnoreCase(item.mac, mac)) found = true;
+        }
+        const observations = try self.allocator.alloc(model.UnknownClientObservation, retained + @as(usize, if (found) 0 else 1));
+        defer self.allocator.free(observations);
+        var index: usize = 0;
+        for (source) |item| {
+            const expired = item.claim == null and seen_at > item.last_seen_unix and seen_at - item.last_seen_unix > retention_seconds;
+            if (expired) continue;
+            observations[index] = item;
+            if (std.ascii.eqlIgnoreCase(item.mac, mac)) {
+                observations[index].last_seen_unix = seen_at;
+                observations[index].last_ip = ip;
+                observations[index].request_count +|= 1;
+                observations[index].revision += 1;
+                if (client_id != null) observations[index].dhcp_client_id = client_id;
+                if (arch != null) observations[index].observed_architecture = arch;
+                if (vendor_class != null) observations[index].vendor_class = vendor_class;
+            }
+            index += 1;
+        }
+        if (!found) observations[index] = .{
+            .mac = mac,
+            .dhcp_client_id = client_id,
+            .observed_architecture = arch,
+            .vendor_class = vendor_class,
+            .first_seen_unix = seen_at,
+            .last_seen_unix = seen_at,
+            .last_ip = ip,
+        };
+        var candidate = old.value().*;
+        candidate.revision = old.revision + 1;
+        candidate.unknown_client_observations = observations;
+        try catalog_store.save(io, self.allocator, self.path, &candidate);
+        try self.publishLocked(candidate, old.revision + 1);
+    }
     pub fn containsAssetPath(self: *CatalogRuntime, path: []const u8) bool {
         const snapshot = self.acquire();
         defer snapshot.release();
@@ -76,6 +127,54 @@ pub const CatalogRuntime = struct {
         defer self.allocator.free(next_assets);
         @memcpy(next_assets[0..old.value().assets.len], old.value().assets);
         next_assets[old.value().assets.len] = asset;
+        var candidate = old.value().*;
+        candidate.revision = old.revision + 1;
+        candidate.assets = next_assets;
+        try validate.validate(config, &candidate);
+        try catalog_store.save(io, self.allocator, self.path, &candidate);
+        try self.publishLocked(candidate, old.revision + 1);
+    }
+
+    pub fn publishManagedFile(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, asset: model.AssetConfig) !void {
+        self.lock();
+        defer self.unlock();
+        const old = self.acquireLocked();
+        defer old.release();
+        var found: ?usize = null;
+        for (old.value().assets, 0..) |existing, index| if (std.mem.eql(u8, existing.name, asset.name)) {
+            if (existing.kind != .managed_file or asset.revision != existing.revision + 1) return error.AssetRevisionConflict;
+            found = index;
+        };
+        if (found == null and asset.revision != 1) return error.AssetRevisionConflict;
+        const next_len = old.value().assets.len + @as(usize, if (found == null) 1 else 0);
+        const next_assets = try self.allocator.alloc(model.AssetConfig, next_len);
+        defer self.allocator.free(next_assets);
+        @memcpy(next_assets[0..old.value().assets.len], old.value().assets);
+        if (found) |index| next_assets[index] = asset else next_assets[old.value().assets.len] = asset;
+        var candidate = old.value().*;
+        candidate.revision = old.revision + 1;
+        candidate.assets = next_assets;
+        try validate.validate(config, &candidate);
+        try catalog_store.save(io, self.allocator, self.path, &candidate);
+        try self.publishLocked(candidate, old.revision + 1);
+    }
+
+    pub fn removeManagedFile(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, name: []const u8) !void {
+        self.lock();
+        defer self.unlock();
+        const old = self.acquireLocked();
+        defer old.release();
+        var found: ?usize = null;
+        for (old.value().assets, 0..) |asset, index| if (std.mem.eql(u8, asset.name, name)) {
+            if (asset.kind != .managed_file) return error.AssetKindMismatch;
+            found = index;
+        };
+        const index = found orelse return error.AssetNotFound;
+        for (old.value().provisioning_bundles) |bundle| for (bundle.steps) |step| if (step.content_asset != null and std.mem.eql(u8, step.content_asset.?, name)) return error.AssetInUse;
+        const next_assets = try self.allocator.alloc(model.AssetConfig, old.value().assets.len - 1);
+        defer self.allocator.free(next_assets);
+        @memcpy(next_assets[0..index], old.value().assets[0..index]);
+        @memcpy(next_assets[index..], old.value().assets[index + 1 ..]);
         var candidate = old.value().*;
         candidate.revision = old.revision + 1;
         candidate.assets = next_assets;
@@ -142,13 +241,7 @@ pub const CatalogRuntime = struct {
         @memcpy(profiles[0..value.profiles.len], value.profiles);
         profiles[value.profiles.len] = .{
             .name = imported.install_source.name,
-            .mode = .install,
-            .distro = imported.install_source.distro,
-            .version = imported.install_source.version,
-            .arch = imported.install_source.arch,
             .install_source = imported.install_source.name,
-            .safety = .{ .destructive = true, .persistent_writes = true, .reinstall_policy = .explicit },
-            .install = .{},
         };
         var candidate = value.*;
         candidate.revision = old.revision + 1;
@@ -295,6 +388,33 @@ test "old catalog generation survives replacement until reader release" {
     try std.testing.expectEqualStrings("new", current.value().assets[0].name);
 }
 
+test "persistent observations update revisions and retain claimed audit past retention" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try temp.dir.realPath(std.testing.io, &path_buffer);
+    const path = path_buffer[0..path_len];
+    try catalog_store.initializeEmpty(std.testing.io, std.testing.allocator, path);
+    const initial: model.Catalog = .{
+        .discovery_policy = .{ .observation_retention_days = 1 },
+        .unknown_client_observations = &.{
+            .{ .mac = "02:00:00:00:00:01", .first_seen_unix = 1, .last_seen_unix = 1 },
+            .{ .mac = "02:00:00:00:00:02", .first_seen_unix = 1, .last_seen_unix = 1, .claim = .{ .node_id = "audit-node", .claimed_at_unix = 2 } },
+        },
+    };
+    var runtime = try CatalogRuntime.init(std.testing.allocator, path, &initial);
+    defer runtime.deinit();
+    try runtime.recordUnknownClient(std.testing.io, "02:00:00:00:00:03", "0102", .x86_64, "PXEClient", "192.0.2.10", 200000);
+    try runtime.recordUnknownClient(std.testing.io, "02:00:00:00:00:03", null, .x86_64, null, "192.0.2.11", 200001);
+    const snapshot = runtime.acquire();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.value().unknown_client_observations.len);
+    try std.testing.expect(snapshot.value().unknown_client_observations[0].claim != null);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.value().unknown_client_observations[1].request_count);
+    try std.testing.expectEqual(@as(u64, 2), snapshot.value().unknown_client_observations[1].revision);
+    try std.testing.expectEqualStrings("192.0.2.11", snapshot.value().unknown_client_observations[1].last_ip.?);
+}
+
 fn importedFixture(distro: []const u8, version: []const u8, arch: model.Arch, family: model.DistroFamily) iso_import.Result {
     return .{
         .source_name = "fixture-source",
@@ -387,7 +507,7 @@ test "first install source publication persists and projects its derived distro"
     try std.testing.expectEqual(@as(usize, 1), live_catalog.value().install_sources.len);
     try std.testing.expectEqual(@as(usize, 1), live_catalog.value().profiles.len);
     try std.testing.expectEqualStrings("fixture-source", live_catalog.value().profiles[0].name);
-    try std.testing.expect(live_catalog.value().profiles[0].safety.destructive);
+    try std.testing.expectEqualStrings("fixture-source", live_catalog.value().profiles[0].install_source);
     try std.testing.expectEqual(@as(usize, 4), live_catalog.value().assets.len);
     try std.testing.expectEqualStrings("efi/grubaa64.efi", live_catalog.value().assets[3].path);
     try std.testing.expectEqualStrings("rocky", live_catalog.value().distros[0].name);
