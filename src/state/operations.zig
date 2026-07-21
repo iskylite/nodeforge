@@ -3,11 +3,18 @@ const boot_session = @import("boot_session.zig");
 const dhcp_store = @import("dhcp_store.zig");
 const model_transaction = @import("model_transaction.zig");
 
+/// 操作表最大条目数。终态条目按 `retention_seconds` 自动淘汰。
 pub const max_operations = 128;
+/// 终态条目的保留时间（24 小时）。超过此时间的终态条目可被新操作复用槽位。
 pub const retention_seconds: i64 = 24 * 60 * 60;
+/// 操作类型。`install_source_import` 为 ISO 导入，`catalog_migration` 为
+/// schema 升级等需要 model_transaction 的批量变更。
 pub const Kind = enum { install_source_import, catalog_migration };
+/// 操作状态机。
 pub const State = enum { queued, running, succeeded, failed };
 
+/// 进程内操作记录。所有文本字段使用固定缓冲区避免堆分配；`id` 是
+/// 32 字符十六进制 operation id，`key` 是调用方提供的幂等键。
 pub const Entry = struct {
     id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
     key: [128]u8 = [_]u8{0} ** 128,
@@ -23,6 +30,7 @@ pub const Entry = struct {
     error_code: [96]u8 = [_]u8{0} ** 96,
     error_len: u8 = 0,
 
+    /// 条目是否被使用（id 非 0）。
     pub fn used(self: *const Entry) bool {
         return self.id[0] != 0;
     }
@@ -41,19 +49,28 @@ pub const Entry = struct {
     pub fn errorSlice(self: *const Entry) []const u8 {
         return self.error_code[0..self.error_len];
     }
+    /// 是否处于终态（succeeded 或 failed）。
     pub fn terminal(self: *const Entry) bool {
         return self.state == .succeeded or self.state == .failed;
     }
 };
 
+/// 磁盘上的操作记录。字符串借用自 JSON 缓冲区。
 const DiskEntry = struct { id: []const u8, idempotency_key: []const u8, request_digest: ?[]const u8 = null, kind: Kind, state: State, created_at: i64, updated_at: i64, result: ?[]const u8 = null, error_code: ?[]const u8 = null };
 const File = struct { schema_version: u32 = 1, entries: []const DiskEntry = &.{} };
+/// `begin` / `beginRequest` 的返回值。`reused=true` 表示命中已有终态操作，
+/// 调用方应直接返回缓存的 result/error；`reused=false` 表示创建了新操作，
+/// 调用方应执行实际工作并调用 `succeed`/`fail`。
 pub const BeginResult = struct { entry: Entry, reused: bool };
 
+/// 进程内操作存储。固定 128 槽位，mutex 保护所有读写。
+/// 终态操作超过 `retention_seconds` 后可被新操作复用槽位。
 pub const Store = struct {
     entries: [max_operations]Entry = [_]Entry{.{}} ** max_operations,
     mutex: std.atomic.Mutex = .unlocked,
 
+    /// 开始一个幂等操作。key 长度 1-128。若 key 已存在且为终态，直接返回
+    /// 缓存的 entry；若为 interrupted failed，则替换为新 operation。
     pub fn begin(self: *Store, io: std.Io, key: []const u8, kind: Kind, now: i64) !BeginResult {
         return self.beginRequest(io, key, "", kind, now);
     }
@@ -94,12 +111,15 @@ pub const Store = struct {
         return .{ .entry = entry.*, .reused = false };
     }
 
+    /// 标记操作为成功并记录 result 文本（长度 <=128）。
     pub fn succeed(self: *Store, id: []const u8, result: []const u8, now: i64) !Entry {
         return self.finish(id, .succeeded, result, now);
     }
+    /// 标记操作为失败并记录 error code（长度 <=96）。
     pub fn fail(self: *Store, id: []const u8, code: []const u8, now: i64) !Entry {
         return self.finish(id, .failed, code, now);
     }
+    /// 内部终态写入函数。succeeded 写入 `result`，failed 写入 `error_code`。
     fn finish(self: *Store, id: []const u8, state: State, text: []const u8, now: i64) !Entry {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -119,6 +139,7 @@ pub const Store = struct {
         };
         return error.OperationNotFound;
     }
+    /// 查询操作状态。终态操作超过 `retention_seconds` 后返回 null（视为已淘汰）。
     pub fn get(self: *Store, id: []const u8, now: i64) ?Entry {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -128,6 +149,7 @@ pub const Store = struct {
         };
         return null;
     }
+    /// 快照当前所有操作到 `out`。调用方用于持久化或 CLI 展示。
     pub fn snapshot(self: *Store, out: *[max_operations]Entry) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -135,6 +157,7 @@ pub const Store = struct {
     }
 };
 
+/// 原子保存操作快照到磁盘。写入后 `chmod 600` 收紧权限，父目录 `chmod 700`。
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store) !void {
     var snapshot: [max_operations]Entry = undefined;
     store.snapshot(&snapshot);
@@ -153,6 +176,8 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     try chmod(io, allocator, "600", path);
 }
 
+/// 从磁盘加载操作快照。schema 1 为当前格式。loading 时会将 queued/running
+/// 状态的操作强制转为 failed + `operation.interrupted`，使调用方可以安全重试。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store, now: i64) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(2 * 1024 * 1024));
     defer allocator.free(bytes);
@@ -237,6 +262,7 @@ pub fn clearMigrationRecoveryRecords(io: std.Io, allocator: std.mem.Allocator, d
     }
 }
 
+/// 从磁盘记录重建内存 Entry。校验所有字段的长度不越界。
 fn fromDisk(disk: DiskEntry) !Entry {
     var entry: Entry = .{ .kind = disk.kind, .state = disk.state, .created_at = disk.created_at, .updated_at = disk.updated_at };
     @memcpy(&entry.id, disk.id);
@@ -259,6 +285,7 @@ fn fromDisk(disk: DiskEntry) !Entry {
     }
     return entry;
 }
+/// 调用 `chmod` 调整文件权限。非零退出码返回 `PermissionUpdateFailed`。
 fn chmod(io: std.Io, allocator: std.mem.Allocator, mode: []const u8, path: []const u8) !void {
     const result = try std.process.run(allocator, io, .{ .argv = &.{ "chmod", mode, path }, .stdout_limit = .limited(1024), .stderr_limit = .limited(1024) });
     defer allocator.free(result.stdout);
@@ -268,6 +295,7 @@ fn chmod(io: std.Io, allocator: std.mem.Allocator, mode: []const u8, path: []con
         else => return error.PermissionUpdateFailed,
     }
 }
+/// 自旋获取 mutex，通过 `Thread.yield` 让出 CPU。
 fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }

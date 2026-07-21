@@ -12,7 +12,9 @@ const schema_v2_dto = @import("schema_v2_dto.zig");
 const paths = @import("../paths.zig");
 const atomic = @import("../state/dhcp_store.zig").atomicWrite;
 
+/// catalog 文件最大允许 8 MiB，防止错误路径或异常文件耗尽内存。
 pub const max_catalog_bytes = 8 * 1024 * 1024;
+/// manifest 布局 schema 版本。当前固定为 1。
 pub const layout_schema_version: u32 = 1;
 const names = [_][]const u8{ "distros", "profiles", "nodes", "provisioning_bundles", "repositories", "assets", "install_sources", "boot_bundles", "discovery_policy", "unknown_client_observations" };
 
@@ -35,14 +37,20 @@ const Journal = struct {
 const Content = struct { name: []const u8, file: []const u8, bytes: []u8, digest: [64]u8 };
 pub const CrashPoint = enum { after_journal, after_entities, after_manifest };
 
+/// 返回默认 catalog 目录路径。必须在进程路径自举完成后调用。
 pub fn defaultPath() []const u8 {
     return paths.require().catalog_dir;
 }
+/// 返回空 catalog 对象。用于首次安装初始化。
 pub fn empty() model.Catalog {
     return .{};
 }
 
 /// 显式 `.json` 路径只用于 legacy 诊断/迁移；正常路径必须是 catalog 目录。
+/// 加载 catalog。路径可以是目录（manifest 布局）或 `.json` 文件（legacy 单文件）。
+///
+/// 目录路径走 `loadDirectory`，会先恢复未完成事务，再按 manifest 加载实体。
+/// `.json` 路径走 `loadLegacy`，只用于诊断/迁移，不会触发事务恢复。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(model.Catalog) {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return err,
@@ -53,6 +61,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.jso
     return loadDirectory(io, allocator, path);
 }
 
+/// 加载 legacy 单文件 catalog。根据 schema_version 选择 v2 或 v3 DTO 解析。
 pub fn loadLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(model.Catalog) {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_catalog_bytes));
     defer allocator.free(bytes);

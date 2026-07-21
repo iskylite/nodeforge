@@ -13,6 +13,8 @@ pub const EventDefinition = struct {
     default_level: model.LogLevel = .info,
 };
 
+/// 所有受支持的稳定事件类型枚举。枚举顺序与 `definitions` 数组一一对应。
+/// daemon 生产者和 CLI 发现共用此注册表，确保事件词汇表一致。
 pub const EventType = enum {
     service_started,
     service_stopped,
@@ -58,11 +60,14 @@ pub const EventType = enum {
     provision_step_warned,
     provision_step_failed,
 
+    /// 返回该事件类型的稳定定义（名称、描述、默认日志等级）。
     pub fn definition(self: EventType) EventDefinition {
         return definitions[@intFromEnum(self)];
     }
 };
 
+/// 事件类型定义表。数组顺序与 `EventType` 枚举顺序一一对应，
+/// 通过 `@intFromEnum` 索引访问。每个定义包含稳定事件名称、描述和默认日志等级。
 pub const definitions = [_]EventDefinition{
     .{ .name = "service.started", .description = "all listeners ready" },
     .{ .name = "service.stopped", .description = "orderly shutdown complete" },
@@ -109,6 +114,8 @@ pub const definitions = [_]EventDefinition{
     .{ .name = "provision.step.failed", .description = "required provisioning step failed", .default_level = .err },
 };
 
+/// 根据稳定事件名称查找 `EventType`。未知名返回 null。
+/// 用于 CLI 从 events.jsonl 的 `type` 字段反向解析事件类型。
 pub fn fromName(name: []const u8) ?EventType {
     inline for (@typeInfo(EventType).@"enum".fields) |field| {
         const value: EventType = @enumFromInt(field.value);

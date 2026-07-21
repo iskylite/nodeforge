@@ -1,25 +1,42 @@
-//! Canonical effective-plan compiler shared by validation, digesting and
-//! installer rendering.
+//! # Canonical effective-plan compiler
+//!
+//! 将 Node + Profile + InstallSource + Catalog 合并为唯一可执行的部署计划。
+//! 校验器、plan digest 和安装器渲染器共享同一编译结果，确保三者看到一致的配置。
 const std = @import("std");
 const model = @import("../model.zig");
 const catalog_lookup = @import("../catalog.zig");
 const install_compiler = @import("install.zig");
 const storage_compiler = @import("storage.zig");
 
+/// 完整的 effective plan。合并 Node 直接属性、Profile 策略和 InstallSource 资源。
+/// 所有派生内存由 `allocator` 持有，调用方通过 `deinit` 释放。
 pub const Plan = struct {
+    /// 持有所有派生内存的 allocator。
     allocator: std.mem.Allocator,
+    /// 节点快照（值拷贝）。
     node: model.NodeConfig,
+    /// Profile 名称。
     profile_name: []const u8,
+    /// InstallSource 资源快照（值拷贝）。
     install_source: model.InstallSourceConfig,
+    /// 有效安装配置（合并了 Profile 策略和 Node override）。
     install: model.InstallConfig,
+    /// 存储计划（物理设备 + 分区布局）。
     storage: storage_compiler.Plan,
+    /// 目标系统配置。
     system: model.TargetSystemConfig,
+    /// 软件选择基线。
     software: model.SoftwareSelection,
+    /// 目标网络配置。
     network: model.TargetNetworkConfig,
+    /// kernel arguments。
     kernel_args: ?[]const u8,
+    /// 拥有的动态分配字符串列表，`deinit` 时释放。
     owned_strings: std.ArrayList([]u8) = .empty,
+    /// 拥有的动态分配切片列表，`deinit` 时释放。
     owned_slices: std.ArrayList([]const []const u8) = .empty,
 
+    /// 释放所有派生内存。
     pub fn deinit(self: *Plan) void {
         self.storage.deinit(self.allocator);
         for (self.owned_strings.items) |value| self.allocator.free(value);
@@ -29,12 +46,20 @@ pub const Plan = struct {
     }
 };
 
+/// 从 catalog 编译节点的 effective plan。
+///
+/// 查找节点绑定的 profile 和 install source，然后调用 `compileInputs` 合并。
+/// 未绑定 profile 的节点返回 `NodeUnassigned`。
 pub fn compile(allocator: std.mem.Allocator, catalog: *const model.Catalog, node: *const model.NodeConfig) !Plan {
     const profile = catalog_lookup.findProfile(catalog, node.profile orelse return error.NodeUnassigned) orelse return error.MissingProfile;
     const source = catalog_lookup.findInstallSource(catalog, profile.install_source) orelse return error.MissingInstallSource;
     return compileInputs(allocator, node, profile, source);
 }
 
+/// 从已解析的 Node/Profile/InstallSource 编译 effective plan。
+///
+/// 合并存储、安装策略、目标系统、软件选择和网络配置。
+/// 派生内存由 `allocator` 持有，调用方通过 `Plan.deinit` 释放。
 pub fn compileInputs(allocator: std.mem.Allocator, node: *const model.NodeConfig, profile: *const model.ProfileConfig, source: *const model.InstallSourceConfig) !Plan {
     var storage = try storage_compiler.compile(allocator, node, profile);
     errdefer storage.deinit(allocator);

@@ -11,6 +11,11 @@ const catalog_store = @import("../catalog/store.zig");
 const config_load = @import("load.zig");
 const validate = @import("validate.zig");
 
+/// 从已有 install source 创建安全默认 install profile。
+///
+/// 新 profile 使用与 ISO import 自动创建相同的默认安全基线（destructive=true,
+/// persistent_writes=true, reinstall_policy=explicit）。CLI 不接收任意 safety/storage JSON，
+/// 避免形成绕过模型校验的第二套创建语义。
 pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, install_source: []const u8) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();
@@ -37,6 +42,10 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
+/// 修改已有 profile 的 kernel_args 字段。
+///
+/// 执行 load-find-canonicalize-validate-save 事务。
+/// canonicalize 在写入前折叠空格并消除空字符串为 null。
 pub fn setKernelArgs(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, profile_name: []const u8, kernel_args: ?[]const u8) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();

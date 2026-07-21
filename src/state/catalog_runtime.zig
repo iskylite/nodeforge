@@ -1,4 +1,12 @@
-//! Ref-counted immutable catalog generations owned by the daemon.
+//! 引用计数、不可变的 catalog 世代，由 daemon 拥有。
+//!
+//! CatalogRuntime 维护一个原子指针指向当前 `Snapshot`；协议 worker 通过
+//! `acquire` 拿到一个引用计数 +1 的快照，期间即使 daemon 通过 `publish`
+//! 替换了 `current`，旧快照仍保持存活直到最后一个 reader 调用 `release`。
+//! 这种 RCU 风格的发布/订阅使协议热路径无锁读取 catalog。
+//!
+//! 写入路径由 `writer` mutex 串行化，与 ConfigRuntime 的 mutex 配合构成
+//! `ModelRuntime.mutation_gate`——保证 config/catalog 的原子对发布。
 
 const std = @import("std");
 const model = @import("../model.zig");
@@ -7,15 +15,21 @@ const validate = @import("../config/validate.zig");
 const iso_import = @import("../catalog/iso_import.zig");
 const config_runtime = @import("config_runtime.zig");
 
+/// 不可变的 catalog 快照。`parsed` 持有堆分配的 JSON 解码结果；`refs`
+/// 是原子引用计数，降到 0 时释放 parsed 和 snapshot 本身。
+/// 调用方通过 `value()` 读取 catalog 内容，通过 `release()` 释放引用。
 pub const Snapshot = struct {
     allocator: std.mem.Allocator,
     parsed: std.json.Parsed(model.Catalog),
+    /// 此快照的 catalog revision；与 `model.Catalog.revision` 相同。
     revision: u64,
     refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 
+    /// 返回此快照包含的只读 catalog 指针。指针在 `release()` 前一直有效。
     pub fn value(self: *const Snapshot) *const model.Catalog {
         return &self.parsed.value;
     }
+    /// 释放一个引用。引用计数降到 0 时释放 JSON 解析缓冲区和 snapshot 自身。
     pub fn release(self: *const Snapshot) void {
         const mutable: *Snapshot = @constCast(self);
         if (mutable.refs.fetchSub(1, .acq_rel) != 1) return;
@@ -25,43 +39,58 @@ pub const Snapshot = struct {
     }
 };
 
+/// Catalog 世代运行时。`current` 是指向当前快照的原子指针；`writer`
+/// 串行化所有发布操作。`path` 是持久化 catalog 目录路径。
 pub const CatalogRuntime = struct {
     allocator: std.mem.Allocator,
     path: []const u8,
     current: std.atomic.Value(*Snapshot),
     writer: std.atomic.Mutex = .unlocked,
 
+    /// 初始化 runtime，生成第一个 snapshot 并以 `initial.revision`（为 0 时取 1）发布。
     pub fn init(allocator: std.mem.Allocator, path: []const u8, initial: *const model.Catalog) !CatalogRuntime {
         const snapshot = try createSnapshot(allocator, initial.*, if (initial.revision == 0) 1 else initial.revision);
         return .{ .allocator = allocator, .path = path, .current = std.atomic.Value(*Snapshot).init(snapshot) };
     }
+    /// 释放 runtime 持有的当前快照引用。仅在 daemon 关闭时调用。
     pub fn deinit(self: *CatalogRuntime) void {
         self.current.load(.acquire).release();
     }
+    /// 获取 writer mutex。与 `unlock` 配对用于显式事务中。
     pub fn lock(self: *CatalogRuntime) void {
         lockMutex(&self.writer);
     }
+    /// 释放 writer mutex。
     pub fn unlock(self: *CatalogRuntime) void {
         self.writer.unlock();
     }
+    /// 获取一个引用计数 +1 的当前快照。调用方负责 `release()`。
+    /// 加锁是为了避免与 `publishPreparedLocked` 的 swap 竞态。
     pub fn acquire(self: *CatalogRuntime) *const Snapshot {
         self.lock();
         defer self.unlock();
         return self.acquireLocked();
     }
+    /// 在已持有 writer mutex 的情况下获取快照。用于嵌套事务中避免重复加锁。
     pub fn acquireLocked(self: *CatalogRuntime) *const Snapshot {
         const snapshot = self.current.load(.acquire);
         _ = snapshot.refs.fetchAdd(1, .monotonic);
         return snapshot;
     }
+    /// 返回当前 catalog revision（获取并立即释放一个快照）。
     pub fn currentRevision(self: *CatalogRuntime) u64 {
         const snapshot = self.acquire();
         defer snapshot.release();
         return snapshot.revision;
     }
 
-    /// Caller holds ModelRuntime.mutation_gate so config/catalog readers see a
-    /// coherent pair while this catalog-only observation generation publishes.
+    /// 记录一个未知客户端的 DHCP 观察。调用方必须已持有
+    /// `ModelRuntime.mutation_gate`，确保 config/catalog 读者看到一致的对。
+    ///
+    /// 观察按 MAC 去重，命中已存在条目时更新 `last_seen_unix`、
+    /// `last_ip`、`request_count`、`revision` 及任何新观察到的字段。
+    /// 已被 claim（关联节点）的观察永久保留；未 claim 且超过
+    /// `observation_retention_days` 的观察在本次写入中被淘汰。
     pub fn recordUnknownClient(self: *CatalogRuntime, io: std.Io, mac: []const u8, client_id: ?[]const u8, arch: ?model.Arch, vendor_class: ?[]const u8, ip: ?[]const u8, seen_at: i64) !void {
         self.lock();
         defer self.unlock();
@@ -110,6 +139,8 @@ pub const CatalogRuntime = struct {
         try catalog_store.save(io, self.allocator, self.path, &candidate);
         try self.publishLocked(candidate, old.revision + 1);
     }
+    /// 检查当前 catalog 中是否存在指定的 asset path。
+    /// 用于 catalog-migration 回滚时判断 asset 文件是否需要一起回滚。
     pub fn containsAssetPath(self: *CatalogRuntime, path: []const u8) bool {
         const snapshot = self.acquire();
         defer snapshot.release();
@@ -117,6 +148,8 @@ pub const CatalogRuntime = struct {
         return false;
     }
 
+    /// 添加一个新的 asset 到 catalog。name 必须唯一，否则返回 `DuplicateObjectName`。
+    /// 校验通过后写入磁盘并发布新 revision。调用方必须持有 mutation_gate。
     pub fn addAsset(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, asset: model.AssetConfig) !void {
         self.lock();
         defer self.unlock();
@@ -135,6 +168,9 @@ pub const CatalogRuntime = struct {
         try self.publishLocked(candidate, old.revision + 1);
     }
 
+    /// 发布或更新一个 `managed_file` asset。如果 name 已存在，必须仍是
+    /// `managed_file` 类型且 `asset.revision` 恰好为 `existing.revision + 1`；
+    /// 否则返回 `AssetRevisionConflict`。新 asset 的 `revision` 必须为 1。
     pub fn publishManagedFile(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, asset: model.AssetConfig) !void {
         self.lock();
         defer self.unlock();
@@ -159,6 +195,9 @@ pub const CatalogRuntime = struct {
         try self.publishLocked(candidate, old.revision + 1);
     }
 
+    /// 删除一个 `managed_file` asset。若该 asset 仍被任何 provisioning bundle
+    /// 步骤引用则返回 `AssetInUse`；name 不存在返回 `AssetNotFound`；
+    /// 类型不是 `managed_file` 返回 `AssetKindMismatch`。
     pub fn removeManagedFile(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, name: []const u8) !void {
         self.lock();
         defer self.unlock();
@@ -183,6 +222,16 @@ pub const CatalogRuntime = struct {
         try self.publishLocked(candidate, old.revision + 1);
     }
 
+    /// 将一次 ISO 导入结果作为完整 install source 发布到 catalog。
+    ///
+    /// 这是 M4.10 fresh-deployment 的主路径：一个 ISO 同时创建 distro/
+    /// version/arch tuple、iso/kernel/initrd asset、可选 bootloader、可选
+    /// repository、install source 以及同名默认 install profile。所有写入
+    /// 在单一 manifest-last 事务中完成，使读者要么看到全部新增内容，
+    /// 要么看到全部旧内容，不会出现中间态。
+    ///
+    /// `configs` 用于在同一临界区内准备 config 投影，保证 catalog 与 config
+    /// 一起发布。校验失败、name/path 冲突、family 不匹配等均返回相应错误。
     pub fn publishInstallSource(
         self: *CatalogRuntime,
         io: std.Io,
@@ -264,25 +313,37 @@ pub const CatalogRuntime = struct {
         self.publishPreparedLocked(catalog_next);
     }
 
+    /// 在已持有 writer mutex 的情况下发布一个新 catalog 世代。
+    /// 调用方负责保证 `candidate` 已通过校验、已持久化到磁盘。
+    /// 内部调用 `prepare` 创建 snapshot，再 `publishPreparedLocked` 原子替换。
     pub fn publishLocked(self: *CatalogRuntime, candidate: model.Catalog, revision: u64) !void {
         const next = try self.prepare(candidate, revision);
         self.publishPreparedLocked(next);
     }
+    /// 创建一个未发布的 snapshot。用于在持久化前预先准备世代，
+    /// 再通过 `publishPreparedLocked` 原子提交，缩短临界区。
     pub fn prepare(self: *CatalogRuntime, candidate: model.Catalog, revision: u64) !*Snapshot {
         return createSnapshot(self.allocator, candidate, revision);
     }
+    /// 原子替换 `current` 并释放旧 snapshot 的 runtime 引用。
+    /// 调用方必须已持有 writer mutex。仍在使用旧 snapshot 的 reader
+    /// 不会受影响——它们的引用计数保证旧 snapshot 存活到 release。
     pub fn publishPreparedLocked(self: *CatalogRuntime, next: *Snapshot) void {
         const previous = self.current.swap(next, .acq_rel);
         previous.release();
     }
 };
 
+/// ISO 导入后 distro/version/arch tuple 的扩展结果。`values` 是最终用于
+/// 写入 catalog 的 distros 切片；其它字段记录中间分配的切片，用于 `deinit`。
 const DistroExpansion = struct {
     values: []const model.DistroConfig,
     distros: ?[]model.DistroConfig = null,
     versions: ?[]model.DistroVersionConfig = null,
     archs: ?[]model.Arch = null,
 
+    /// 释放所有中间分配。`values` 不被释放——它指向 `distros` 或 catalog
+    /// 原有切片，由调用方在持久化后决定生命周期。
     fn deinit(self: *DistroExpansion, allocator: std.mem.Allocator) void {
         if (self.archs) |items| allocator.free(items);
         if (self.versions) |items| allocator.free(items);
@@ -360,6 +421,9 @@ fn expandDistroTuple(allocator: std.mem.Allocator, catalog: *const model.Catalog
     return .{ .values = distros, .distros = distros, .versions = versions, .archs = archs };
 }
 
+/// 创建一个独立的 snapshot：先序列化 `value` 为 JSON，再解析回来，
+/// 使 snapshot 完全拥有其堆分配且不与任何外部切片共享。`revision`
+/// 直接写入 snapshot；调用方负责保证其单调性。
 fn createSnapshot(allocator: std.mem.Allocator, value: model.Catalog, revision: u64) !*Snapshot {
     const bytes = try std.json.Stringify.valueAlloc(allocator, value, .{});
     defer allocator.free(bytes);
@@ -369,6 +433,8 @@ fn createSnapshot(allocator: std.mem.Allocator, value: model.Catalog, revision: 
     snapshot.* = .{ .allocator = allocator, .parsed = parsed, .revision = revision };
     return snapshot;
 }
+/// 自旋获取 mutex，通过 `Thread.yield` 让出 CPU 而非忙等。
+/// catalog 发布操作时间短，自旋比 futex 更高效。
 fn lockMutex(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }

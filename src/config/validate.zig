@@ -116,6 +116,8 @@ pub fn validateConfigShape(config: *const model.AppConfig) ValidationError!void 
     try validateConfig(&startup);
 }
 
+/// 校验 catalog 的结构形状：schema 版本、名称唯一性、节点 ID/MAC 格式和资产路径安全。
+/// 不校验跨文件引用关系——那由 `validate` 统一执行。
 pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void {
     if (catalog.schema_version < 1 or catalog.schema_version > 3) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.DistroConfig, catalog.distros);
@@ -140,6 +142,8 @@ pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void 
     }
 }
 
+/// 完整模型校验入口：先校验 config/catalog 各自形状，再投影 catalog 后执行完整交叉校验。
+/// 用于 setup 初始化和 schema 迁移后的全量验证。
 pub fn validateModel(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     try validateConfigShape(config);
     try validateCatalogShape(catalog);
@@ -184,6 +188,7 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     for (config.profiles) |profile| try validateKernelArgs(config, profile);
 }
 
+/// 校验单个 profile 的 kernel_args 字符串安全性和保留参数冲突。
 fn validateKernelArgs(_: *const model.AppConfig, profile: model.ProfileConfig) ValidationError!void {
     const value = profile.kernel_args orelse return;
     if (value.len == 0) return;
@@ -193,6 +198,8 @@ fn validateKernelArgs(_: *const model.AppConfig, profile: model.ProfileConfig) V
 
 /// 校验已经 canonicalize 的 M4.6 token 列表。保留名只与第一个 `=` 前的
 /// 参数名精确比较，绝不做子串匹配。
+/// 判断 kernel_args 字符串是否安全且不含保留参数。
+/// 保留参数由安装器和引导加载器使用，操作员覆盖会导致启动失败。
 pub fn validKernelArgs(value: []const u8, family: ?model.DistroFamily) bool {
     if (value.len == 0 or value.len > 256) return false;
     for (value) |byte| {
@@ -218,11 +225,14 @@ pub fn validKernelArgs(value: []const u8, family: ?model.DistroFamily) bool {
     return token_count != 0;
 }
 
+/// 提取 `key=value` 或 `key` 格式 kernel arg 的参数名部分。
 fn kernelArgName(token: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, token, '=') orelse token.len;
     return token[0..end];
 }
 
+/// 判断参数名是否为安装器或引导加载器保留的不可覆盖参数。
+/// RHEL 和 Ubuntu 的保留集不同，`family` 控制具体检查逻辑。
 fn reservedKernelArg(name: []const u8, family: ?model.DistroFamily) bool {
     const common = [_][]const u8{ "ip", "root", "initrd", "BOOT_IMAGE", "nodeforge.config", "boot_session_id", "token", "capability" };
     for (common) |reserved| if (std.mem.eql(u8, name, reserved)) return true;
@@ -236,6 +246,7 @@ fn reservedKernelArg(name: []const u8, family: ?model.DistroFamily) bool {
     return false;
 }
 
+/// 校验日志和事件轮转配置的有效性。
 fn validateObservability(config: *const model.AppConfig) ValidationError!void {
     if (config.events.max_size_mb == 0 or config.events.keep == 0 or config.events.keep > 20)
         return error.InvalidEventsRotation;
@@ -246,6 +257,7 @@ fn validateObservability(config: *const model.AppConfig) ValidationError!void {
     }
 }
 
+/// 校验 DHCP 地址池、子网、DNS、lease 时间和 ICMP ping 超时的有效性。
 fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
     const slash = std.mem.indexOfScalar(u8, dhcp.subnet, '/') orelse return error.InvalidDhcpSubnet;
     const network = std.Io.net.IpAddress.parseIp4(dhcp.subnet[0..slash], 0) catch return error.InvalidDhcpSubnet;
@@ -273,6 +285,9 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
 ///
 /// 需要 config 已经通过 `validateConfig`；catalog 中的 distro/version/arch
 /// 必须能在 ISO 导入所维护的 distro 能力索引中找到，asset kind 必须与引用方期望一致。
+/// 校验 catalog 内部一致性和跨文件引用关系。
+/// 检查 distros/profiles/nodes/assets/repositories/install_sources/boot_bundles/provisioning_bundles
+/// 的名称唯一性、引用有效性和语义不变量。
 pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     if (catalog.schema_version < 1 or catalog.schema_version > 3) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.RepositoryConfig, catalog.repositories);
@@ -286,6 +301,7 @@ pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Cat
     try validateProvisioningBundles(catalog);
 }
 
+/// 泛型唯一性校验：检查 `[]const T` 切片中每个元素的 `name` 字段是否唯一。
 fn uniqueNamed(comptime T: type, items: []const T) ValidationError!void {
     for (items, 0..) |item, i| {
         if (item.name.len == 0) return error.EmptyObjectName;
@@ -295,6 +311,7 @@ fn uniqueNamed(comptime T: type, items: []const T) ValidationError!void {
     }
 }
 
+/// 判断字符串是否为合法逻辑 ID：小写 ASCII 字母/数字/`-`，3..64 字符。
 pub fn validLogicalId(value: []const u8) bool {
     if (value.len == 0 or value.len > 128 or !std.ascii.isAlphanumeric(value[0]) or !std.ascii.isAlphanumeric(value[value.len - 1])) return false;
     for (value) |byte| {
@@ -306,6 +323,8 @@ pub fn validLogicalId(value: []const u8) bool {
 
 /// Node IDs use the canonical logical-ID alphabet but have a smaller bound
 /// because they are retained in fixed-size hot-path and persisted state.
+/// 判断字符串是否为合法节点 ID：长度 ≤ 96，匹配 logical-id 规则。
+/// 长度上限来自固定大小运行态投影（boot_session/deployment_control/node_status）。
 pub fn validNodeId(value: []const u8) bool {
     return value.len <= node_id_max_len and validLogicalId(value);
 }

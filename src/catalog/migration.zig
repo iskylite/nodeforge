@@ -1,18 +1,37 @@
-//! Reproducible M4.3 catalog migration planning.
+//! # Reproducible M4.3 catalog migration planning
+//!
+//! 生成可复现的 catalog 迁移计划：检测需要重命名的实体和迁移阻碍。
+//! 计划的 canonical JSON 和 SHA-256 摘要用于乐观并发控制和审计追溯。
 const std = @import("std");
 const model = @import("../model.zig");
 const validate = @import("../config/validate.zig");
 
+/// 迁移重命名计划条目。
 pub const Rename = struct {
+    /// 原 install source 名称。
     source: []const u8,
+    /// 新 install source 名称。
     target: []const u8,
+    /// 原 distro 名称。
     old_distro: []const u8,
+    /// 新 distro 名称。
     new_distro: []const u8,
+    /// 受影响的 profile 名称列表。
     profiles: []const []const u8,
+    /// 原资产目录路径。
     directory_from: []const u8,
+    /// 新资产目录路径。
     directory_to: []const u8,
 };
-pub const Blocker = struct { source: []const u8, code: []const u8, detail: []const u8 };
+/// 迁移阻碍条目。存在任何阻碍时计划不可执行。
+pub const Blocker = struct {
+    /// 阻碍来源对象名称。
+    source: []const u8,
+    /// 阻碍代码。
+    code: []const u8,
+    /// 人类可读详情。
+    detail: []const u8,
+};
 const Payload = struct {
     schema_version: u32 = 1,
     config_revision: u64,
@@ -20,12 +39,19 @@ const Payload = struct {
     renames: []const Rename,
     blockers: []const Blocker,
 };
+/// 迁移计划。包含 canonical JSON、摘要和重命名/阻碍列表。
 pub const Plan = struct {
+    /// 持有 canonical_json/renames/blockers 内存的 allocator。
     allocator: std.mem.Allocator,
+    /// 计划的 canonical JSON 表示，用于持久化和审计。
     canonical_json: []u8,
+    /// canonical JSON 的 SHA-256 摘要（64 字符十六进制）。
     digest: [64]u8,
+    /// 迁移重命名列表。
     renames: []Rename,
+    /// 迁移阻碍列表。
     blockers: []Blocker,
+    /// 计划是否可执行（无阻碍）。
     pub fn applicable(self: *const Plan) bool {
         return self.blockers.len == 0;
     }

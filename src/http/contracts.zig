@@ -6,19 +6,25 @@
 const std = @import("std");
 const boot_session = @import("../state/boot_session.zig");
 
+/// 面向节点 HTTP 契约的 schema 版本。
 pub const schema_version: u8 = 1;
+/// 节点事件 POST 请求体最大字节数。防止安装器异常导致内存耗尽。
 pub const max_event_body_bytes = 4 * 1024;
+/// 安装失败 reason 字段最大字节数。
 pub const max_reason_bytes = 128;
+/// 安装日志 message 字段最大字节数。
 pub const max_message_bytes = 1024;
+/// 安装失败日志摘要最大字节数。
 pub const max_log_summary_bytes = 2048;
 
 /// M4.2 F1：安装失败日志摘要的稳定 reason 值。
 pub const reason_anaconda_error = "install.anaconda_error";
 pub const reason_subiquity_error = "install.subiquity_error";
 
-/// 稳定的 capability 传输 header 名称。token 永远不允许出现在 query string 中，
+/// 稳定的能力 token 传输 header 名称。token 永远不允许出现在 query string 中，
 /// 只通过 HTTP header 传输，防止通过 URL 日志泄漏。
 pub const authorization_header = "authorization";
+/// session ID 传输 header 名称。
 pub const session_header = "x-nodeforge-session";
 
 /// M4.5 stable management envelopes. Resource payloads remain endpoint

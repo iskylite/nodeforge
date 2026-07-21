@@ -108,10 +108,14 @@ pub const Writer = struct {
     }
 };
 
+/// 对外暴露的事件校验入口。校验事件类型、消息长度、字段格式和保留字段规则。
+/// 不包含 daemon instance id 注入逻辑，用于 HTTP API 等外部入口。
 pub fn validate(event_type: []const u8, message: []const u8, fields: []const Field) !void {
     try validateFields(event_type, message, fields, false);
 }
 
+/// 内部校验实现。`allow_daemon_instance` 控制是否允许 `daemon_instance_id`
+/// 字段——只有 Writer 内部注入时才为 true。
 fn validateFields(event_type: []const u8, message: []const u8, fields: []const Field, allow_daemon_instance: bool) !void {
     if (event_types.fromName(event_type) == null) return error.UnknownEventType;
     if (message.len > max_message_bytes) return error.MessageTooLong;
@@ -125,6 +129,8 @@ fn validateFields(event_type: []const u8, message: []const u8, fields: []const F
     }
 }
 
+/// 校验保留字段（boot_session_id、daemon_instance_id、session_link_state）
+/// 的格式和权限。`daemon_instance_id` 只有在 Writer 内部注入时才被允许。
 fn validateReservedField(field: Field, allow_daemon_instance: bool) !void {
     if (std.mem.eql(u8, field.key, "boot_session_id")) {
         if (!validCorrelationId(field.value)) return error.InvalidBootSessionId;
@@ -152,6 +158,7 @@ pub fn validSessionLinkState(value: []const u8) bool {
         std.mem.eql(u8, value, "ambiguous_lease_match");
 }
 
+/// 校验字段 key 格式：以小写字母开头，只含小写字母、数字和下划线，长度 1-64。
 pub fn validFieldKey(key: []const u8) bool {
     if (key.len == 0 or key.len > max_field_key_bytes or key[0] < 'a' or key[0] > 'z') return false;
     for (key[1..]) |byte|
@@ -159,6 +166,9 @@ pub fn validFieldKey(key: []const u8) bool {
     return true;
 }
 
+/// 在追加前检查文件大小并在超过 `max_size` 时执行轮转。
+/// 轮转策略：删除最旧的 `.{keep}` 文件，将 `.{n}` 重命名为 `.{n+1}`，
+/// 最后将当前文件重命名为 `.1`。文件不存在时静默跳过。
 fn rotateBeforeAppend(io: std.Io, allocator: std.mem.Allocator, path: []const u8, max_size: u64, keep: u8, line_len: usize) !void {
     const dir = std.Io.Dir.cwd();
     const current_size: u64 = blk: {
@@ -186,12 +196,15 @@ fn rotateBeforeAppend(io: std.Io, allocator: std.mem.Allocator, path: []const u8
     try std.Io.Dir.rename(dir, path, dir, first, io);
 }
 
+/// 获取当前时间的 RFC 3339 UTC 时间戳（秒精度，20 字节固定缓冲区）。
 pub fn rfc3339Now(buffer: *[20]u8) ![]const u8 {
     var clock: std.posix.timespec = undefined;
     if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) != .SUCCESS) return error.ClockUnavailable;
     return rfc3339FromUnix(buffer, clock.sec);
 }
 
+/// 将 Unix 时间戳（秒）格式化为 RFC 3339 UTC 字符串（`YYYY-MM-DDTHH:MM:SSZ`）。
+/// 负时间戳返回 `InvalidTimestamp`。
 pub fn rfc3339FromUnix(buffer: *[20]u8, seconds: i64) ![]const u8 {
     if (seconds < 0) return error.InvalidTimestamp;
     const instant: std.time.epoch.EpochSeconds = .{ .secs = @intCast(seconds) };

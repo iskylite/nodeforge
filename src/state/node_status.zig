@@ -10,6 +10,19 @@ const deployment_control = @import("deployment_control.zig");
 /// `max(受管节点数, config)` 派生（`min(派生, max_statuses)`）。
 pub const max_statuses = capacity.store_ceiling;
 
+/// 节点安装/启动的生命周期阶段。
+///
+/// M3 有两条独立进度路径：
+/// - **安装器路径**（diskful）：boot_config_fetched → installer_started →
+///   install_config_fetched → install_started → install_partitioning →
+///   install_packages → install_bootloader → install_post →
+///   install_rebooting → completed
+/// - **无盘路径**（diskless）：boot_config_fetched → initrd_started →
+///   rootfs_downloading → rootfs_verified → rootfs_mounted →
+///   switching_root → running
+///
+/// `failed` 对当前 session 是终止性的；新的 boot session 由 `update`
+/// 作为全新投影处理。`phaseAdvances` 确保重传不会使已推进的阶段回退。
 pub const Phase = enum {
     boot_config_fetched,
     installer_started,
@@ -30,29 +43,44 @@ pub const Phase = enum {
     failed,
 };
 
+/// 单个节点的当前状态投影。采用固定大小数组存储字符串字段，避免动态分配。
+/// `node_id` 是主键；同一 node_id 的投影会被原地更新而非创建新条目。
 pub const Status = struct {
+    /// 节点 ID 的固定缓冲区（最多 96 字节）。
     node_id: [96]u8 = [_]u8{0} ** 96,
+    /// node_id 的有效长度。
     node_id_len: u8 = 0,
+    /// 关联的 boot session ID（32 字符十六进制）。
     boot_session_id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
+    /// 生成该投影的 daemon 实例 ID。
     daemon_instance_id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
     /// 该投影所属的不可变 config/model revision；0 仅表示旧格式未知。
     model_revision: u64 = 0,
     model_plan_digest: deployment_control.Digest = deployment_control.empty_digest,
     /// install generation；diskless/discovery 或旧格式可为 0。
     deployment_generation: u64 = 0,
+    /// 当前阶段。
     phase: Phase = .boot_config_fetched,
+    /// 最后一次事件的时间戳（Unix 秒）。
     last_event_at: i64 = 0,
+    /// 是否处于失败状态（phase == .failed）。
     last_error: bool = false,
+    /// 失败原因的固定缓冲区（最多 128 字节）。
     reason: [128]u8 = [_]u8{0} ** 128,
+    /// reason 的有效长度。
     reason_len: u8 = 0,
+    /// 该节点的 boot session 是否仍活跃。daemon 重启恢复的投影为 false。
     session_active: bool = false,
 
+    /// 返回 node_id 的有效切片。
     pub fn node(self: *const Status) []const u8 {
         return self.node_id[0..self.node_id_len];
     }
+    /// 返回 reason 的有效切片。
     pub fn reasonSlice(self: *const Status) []const u8 {
         return self.reason[0..self.reason_len];
     }
+    /// 该条目是否被使用（node_id_len != 0）。
     pub fn used(self: *const Status) bool {
         return self.node_id_len != 0;
     }
@@ -82,6 +110,8 @@ pub const Store = struct {
         self.effective = @max(self.effective, @min(minimum, max_statuses));
     }
 
+    /// 不带 deployment 信息的简化更新入口。等价于调用 `updateForDeployment`
+    /// 时传入 revision=0、digest=empty、generation=0。
     pub fn update(self: *Store, node_id: []const u8, session_id: []const u8, daemon_id: []const u8, phase: Phase, reason: ?[]const u8, timestamp: i64, active: bool) !void {
         return self.updateForDeployment(node_id, session_id, daemon_id, 0, deployment_control.empty_digest, 0, phase, reason, timestamp, active);
     }
@@ -125,6 +155,8 @@ pub const Store = struct {
         self.revision += 1;
     }
 
+    /// 将所有投影的 session_active 标记为 false。用于 daemon 重启后
+    /// 将恢复的历史投影与新的活跃 session 区分开。
     pub fn deactivateAll(self: *Store) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -138,6 +170,7 @@ pub const Store = struct {
         if (changed) self.revision += 1;
     }
 
+    /// 查询指定节点的当前状态投影。返回值拷贝，不持有 mutex。
     pub fn get(self: *Store, node_id: []const u8) ?Status {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -145,11 +178,13 @@ pub const Store = struct {
         return null;
     }
 
+    /// 在锁内快照全部投影到 destination 数组。用于持久化或 API 响应。
     pub fn snapshot(self: *Store, destination: *[max_statuses]Status) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         destination.* = self.entries;
     }
+    /// 返回当前 revision 号。用于检测投影是否发生变化（如 HTTP 长轮询）。
     pub fn currentRevision(self: *Store) u64 {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -172,6 +207,9 @@ pub const Store = struct {
 /// M3 有两条独立进度路径（安装器和无盘），加上公共的初始配置获取。
 /// 失败对当前 session 是终止性的；新的 boot session 由 `update` 作为
 /// 全新投影处理。
+///
+/// 返回 true 表示 phase 可以从 current 推进到 next；false 表示应跳过更新
+///（重传或回退）。
 fn phaseAdvances(current: Phase, next: Phase) bool {
     if (current == next) return true;
     if (current == .failed or current == .completed or current == .running) return next == .failed;
@@ -179,6 +217,8 @@ fn phaseAdvances(current: Phase, next: Phase) bool {
     return phaseRank(next) >= phaseRank(current);
 }
 
+/// 将 phase 映射为单调递增的 rank 值，用于判断安装/无盘路径的进度推进。
+/// 安装器路径和无盘路径各自有独立的 rank 序列，但共享公共的初始阶段。
 fn phaseRank(phase: Phase) u8 {
     return switch (phase) {
         .boot_config_fetched => 1,
@@ -196,6 +236,7 @@ fn phaseRank(phase: Phase) u8 {
     };
 }
 
+/// 自旋等待获取 mutex。投影操作时间极短，自旋比系统 futex 更高效。
 fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }

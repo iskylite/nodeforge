@@ -1,20 +1,36 @@
-//! Adapter-independent schema v3 storage compiler.
+//! # Adapter-independent schema v3 storage compiler
+//!
+//! 将 Node 物理设备和 Profile 存储策略合并为有效的存储计划。
+//! 物理设备（boot_disk + additional_disks）从 Node 直接属性编译，
+//! 存储策略（mode/wipe/partition_table/partitions）从 Profile 派生并应用 Node override。
 const std = @import("std");
 const model = @import("../model.zig");
 
+/// 有效存储计划。合并 Node 物理设备和 Profile 存储策略。
 pub const Plan = struct {
+    /// 存储拓扑模式。
     mode: model.StorageMode,
+    /// 是否擦盘。
     wipe: bool,
+    /// 分区表类型。
     partition_table: model.PartitionTable,
+    /// 有序成员设备路径列表（boot_disk + additional_disks）。
     members: []const []const u8,
+    /// 分区列表。
     partitions: []const model.PartitionConfig,
+    /// 是否安装引导加载器。
     bootloader_install: bool,
 
+    /// 释放 `members` 切片内存。
     pub fn deinit(self: Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.members);
     }
 };
 
+/// 为单个节点编译有效存储计划。
+///
+/// 合并 Profile 存储策略和 Node override，从 Node 直接属性编译成员设备列表。
+/// RAID 模式下验证成员设备数量是否满足最小要求。
 pub fn compile(allocator: std.mem.Allocator, node: *const model.NodeConfig, profile: *const model.ProfileConfig) !Plan {
     const install = profile.install;
     var mode = install.storage.mode;

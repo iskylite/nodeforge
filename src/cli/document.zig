@@ -1,24 +1,41 @@
-//! Typed CLI output document and the only normal-result renderer.
+//! 类型化 CLI 输出文档与唯一的正常结果渲染器。
+//!
+//! `OutputDocument` 将 human 输出（文本/详情/表格）与机器输出（JSON/JSONL）
+//! 统一在一个值中。`render` 根据输出模式选择渲染路径，`validate` 在渲染前
+//! 校验选项与文档类型的兼容性（如表格不支持 sections/fields 筛选）。
 const std = @import("std");
 const output = @import("output.zig");
 const table = @import("table.zig");
 
+/// 详情视图的分区定义。`key` 用于 --sections 筛选，`title` 用于 human 输出标题。
 pub const Section = struct { key: []const u8, title: []const u8 };
+/// 详情视图的单个字段。`json_path` 支持点分路径从 JSON envelope 中提取嵌套值。
 pub const Field = struct {
     key: []const u8,
     value: []const u8,
     section: []const u8 = "",
     json_path: ?[]const u8 = null,
 };
+/// 详情视图定义。包含标题、可选分区列表和字段列表。
 pub const Detail = struct { title: []const u8, sections: []const Section = &.{}, fields: []const Field };
+/// 表格视图定义。包含列定义、行数据和空表提示消息。
 pub const Table = struct { columns: []const table.Column, rows: []const table.Row, empty_message: []const u8 };
+/// human 输出的三种形式：纯文本、详情块、表格。
 pub const Human = union(enum) { text: []const u8, detail: Detail, table: Table };
 
+/// CLI 命令的统一输出文档。包含 human 可读输出和机器可读 JSON/JSONL。
 pub const OutputDocument = struct {
+    /// human 输出内容（文本/详情/表格）。
     human: Human,
+    /// JSON 输出内容（已序列化的 JSON 字符串）。
     json: []const u8,
+    /// JSONL 输出内容（可选，多行 JSON 数组）。
     jsonl: ?[]const []const u8 = null,
 
+    /// 根据输出模式渲染文档到 writer。先校验选项兼容性，再按模式分支渲染。
+    /// - human：根据 human 联合类型分别渲染文本/详情/表格。
+    /// - json：输出 JSON 字符串；detail 模式下支持 sections/fields 过滤。
+    /// - jsonl：逐行输出 JSONL 记录。
     pub fn render(self: OutputDocument, writer: *std.Io.Writer, options: output.Output) !void {
         try self.validate(options);
         switch (options.mode) {
@@ -40,6 +57,9 @@ pub const OutputDocument = struct {
         }
     }
 
+    /// 校验输出选项与文档类型的兼容性。在 render 前调用，提前发现不兼容组合。
+    /// 例如：表格不支持 sections/fields 筛选；text 不支持任何筛选选项；
+    /// --width 和 --wide 互斥；jsonl 模式要求文档提供 jsonl 数据。
     pub fn validate(self: OutputDocument, options: output.Output) output.ContractError!void {
         if (options.width != 0 and options.wide) return error.MutuallyExclusiveOptions;
         if (options.mode == .jsonl and self.jsonl == null) return error.ModeNotSupported;

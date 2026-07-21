@@ -1,20 +1,61 @@
-//! M4.5 centralized HTTP route contract registry.
+//! # M4.5 centralized HTTP route contract registry
+//!
+//! 定义所有 HTTP 路由的元数据：方法、模板、平面、认证模式、缓存策略和日志级别。
+//! 用于路由匹配、安全审计和 API 文档生成。
 const std = @import("std");
 
-pub const Plane = enum { health, node, management, artifact };
-pub const Auth = enum { none, node_session, loopback };
-pub const Cache = enum { no_store, immutable };
-pub const Log = enum { health, api, artifact };
+/// 路由平面分类。不同平面的安全边界和日志行为不同。
+pub const Plane = enum {
+    /// 健康检查平面。无需认证，用于负载均衡器和 systemd 探活。
+    health,
+    /// 节点平面。面向 PXE 客户端，需要 node_session 认证。
+    node,
+    /// 管理平面。面向 CLI，需要 loopback 认证。
+    management,
+    /// 资产平面。只读文件下载，无需认证。
+    artifact,
+};
+/// 认证模式。
+pub const Auth = enum {
+    /// 无需认证。
+    none,
+    /// 节点 session 认证（bootstrap IP 或 capability token）。
+    node_session,
+    /// 本机 loopback 认证（仅 127.0.0.1）。
+    loopback,
+};
+/// 缓存策略。
+pub const Cache = enum {
+    /// 不缓存（`Cache-Control: no-store`）。
+    no_store,
+    /// 不可变（`Cache-Control: public, max-age=31536000, immutable`）。
+    immutable,
+};
+/// 日志级别分类。控制每条路由的日志详细度。
+pub const Log = enum {
+    /// 健康检查路由。默认不记录每次请求。
+    health,
+    /// API 路由。记录请求方法、路径和状态码。
+    api,
+    /// 资产路由。记录下载请求和字节数。
+    artifact,
+};
 
+/// 单个路由的元数据规范。
 pub const RouteSpec = struct {
+    /// HTTP 方法（GET/POST/PUT/PATCH/DELETE/HEAD）。
     method: []const u8,
+    /// 路径模板（支持 `:param` 和 `*` 通配符）。
     template: []const u8,
+    /// 路由平面。
     plane: Plane,
+    /// 认证模式。
     auth: Auth,
+    /// 缓存策略。
     cache: Cache,
+    /// 日志级别。
     log: Log,
-    /// Dispatch symbol is kept in the registry contract even though Zap's
-    /// callback invokes the typed server handler after matching.
+    /// 分发符号。Zap 回调在匹配后调用对应 server handler。
     handler: []const u8 = "server.route",
 };
 

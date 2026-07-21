@@ -1,4 +1,8 @@
-//! Registry-addressed scalar collection mutations.
+//! # Registry-addressed scalar collection mutations
+//!
+//! 处理 `software.packages.include`、`system.connectivity.ntp_servers` 等
+//! 字符串集合的 add/remove/replace/clear 操作。与 item_mutation 不同，
+//! 这些集合的元素是字符串而非结构化对象。
 const std = @import("std");
 const model = @import("../model.zig");
 const properties = @import("../cli/properties.zig");
@@ -6,8 +10,20 @@ const catalog_store = @import("../catalog/store.zig");
 const validate = @import("validate.zig");
 const scalar_mutation = @import("scalar_mutation.zig");
 
-pub const Operation = enum { add, remove, replace, clear };
+/// 集合操作类型。
+pub const Operation = enum {
+    /// 追加元素。
+    add,
+    /// 删除元素。
+    remove,
+    /// 用新列表完整替换。
+    replace,
+    /// 清空集合。
+    clear,
+};
 
+/// 修改 profile 的字符串集合属性。
+/// `key` 指定目标字段（如 `software.groups`），`operation` 指定操作类型。
 pub fn profile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, key: []const u8, operation: Operation, values: []const []const u8) !void {
     const spec = properties.collection(.profile, key) orelse return error.UnknownProperty;
     if (spec.mutability != .mutable or spec.item_spec != null) return error.UnsupportedProperty;

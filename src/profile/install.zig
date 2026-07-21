@@ -1,4 +1,8 @@
-//! 适配器无关的 M4.1 安装计划规范化。
+//! # 适配器无关的 M4.1 安装计划规范化
+//!
+//! 提供 `effectiveSystem` 和 `effectiveInstall` 两个纯函数，
+//! 将 Profile 策略和 Node override 合并为安装器可消费的有效配置。
+//! 物理设备选择器从 Node 直接属性编译，不来自 Profile 策略。
 const std = @import("std");
 const model = @import("../model.zig");
 
@@ -8,8 +12,13 @@ pub fn effectiveSystem(profile: *const model.ProfileConfig) !model.TargetSystemC
     return profile.system;
 }
 
-/// Resolve the install plan for one node. The caller-owned one-element buffer
-/// backs the derived single-disk list when only boot_disk is overridden.
+/// 为单个节点编译有效安装配置。
+///
+/// 合并 Profile 策略和 Node override，生成安装器可消费的 `InstallConfig`。
+/// 物理设备（`boot_disk`/`members`）从 Node 直接属性编译；
+/// `single_disk` 是调用方提供的单元素缓冲区，用于无额外磁盘时的零分配成员列表。
+///
+/// 合并语义：Node override 中非 null 字段完整替换 Profile 基线值。
 pub fn effectiveInstall(node: *const model.NodeConfig, profile: *const model.ProfileConfig, single_disk: *[1][]const u8) !model.InstallConfig {
     const policy_install = profile.install;
     var install: model.InstallConfig = .{

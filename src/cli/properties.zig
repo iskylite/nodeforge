@@ -1,35 +1,62 @@
-//! Canonical CLI mutation vocabulary.
+//! 规范化 CLI 变更词汇表。
 //!
-//! Help, list/show navigation, parsers and contract tests must consume these
-//! names instead of maintaining independent allowlists.
+//! Help、list/show 导航、parser 和 contract test 必须消费这些名称，
+//! 而不是维护独立的白名单。这确保 CLI 变更命令、帮助文本和校验逻辑
+//! 始终引用同一组属性路径和集合语义，避免漂移。
 
 const std = @import("std");
 
+/// 属性归属的配置层级。决定 `node set`/`profile set`/`site set` 等命令的目标。
 pub const Owner = enum { site, node, profile, assets };
+/// 属性值的类型。用于 parser 校验和 help 文档。
 pub const ValueKind = enum { string, boolean, positive_integer, arch, enumeration };
+/// 属性的可变性。`read_only` 表示只能通过 list/show 查看不能通过 set 变更。
 pub const Mutability = enum { mutable, read_only };
+/// 属性的适用范围。限定属性只在特定安装适配器或引导方式下有效。
 pub const Applicability = enum { all, kickstart, autoinstall, uefi_grub };
 
+/// 标量属性规范。描述一个属性的归属、路径、值类型和变更约束。
 pub const PropertySpec = struct {
+    /// 归属层级（site/node/profile/assets）。
     owner: Owner,
+    /// 点分属性路径（如 `storage.boot_disk`）。
     path: []const u8,
+    /// 值类型。
     kind: ValueKind,
+    /// 是否可选（缺省为必填）。
     optional: bool = false,
+    /// 可变性。
     mutability: Mutability = .mutable,
+    /// 适用范围。
     applicability: Applicability = .all,
 };
 
-pub const CollectionSemantics = enum { ordered_replace, set, delta, kernel_arguments };
+/// 集合变更语义。决定 `set`/`add`/`remove` 命令如何处理集合内容。
+pub const CollectionSemantics = enum {
+    /// 有序列表替换：用新列表整体替换旧列表（如 partitions、routes）。
+    ordered_replace,
+    /// 集合：无序去重，add/remove 增删元素。
+    set,
+    /// 增量：add/remove 分别追加/移除元素，不要求整体替换。
+    delta,
+    /// 内核参数：特殊语义，支持 `key=value` 和 `key` 两种形式。
+    kernel_arguments,
+};
+/// 集合属性规范。描述一个集合属性的归属、路径和变更语义。
 pub const CollectionSpec = struct {
     owner: Owner,
     path: []const u8,
     semantics: CollectionSemantics,
+    /// 引用的 item 规格名称（如 `partition`、`route`、`user`）。
     item_spec: ?[]const u8 = null,
     mutability: Mutability = .mutable,
 };
 
+/// 集合 item 的标量字段定义。
 pub const ItemField = struct { name: []const u8, kind: ValueKind, required: bool = false };
+/// 集合 item 的嵌套集合字段定义。
 pub const ItemCollectionField = struct { name: []const u8, semantics: CollectionSemantics = .set };
+/// 集合 item 规格。定义有序替换集合中每个元素的标识字段、标量字段和嵌套集合。
 pub const ItemSpec = struct { name: []const u8, identity: []const u8, fields: []const ItemField, collections: []const ItemCollectionField = &.{} };
 
 pub const properties = [_]PropertySpec{
@@ -155,11 +182,13 @@ pub const items = [_]ItemSpec{
     .{ .name = "managed-file-step", .identity = "name", .fields = &managed_file_step_fields },
 };
 
+/// 按归属和路径查找标量属性规范。未找到返回 null。
 pub fn property(owner: Owner, path: []const u8) ?*const PropertySpec {
     for (&properties) |*spec| if (spec.owner == owner and std.mem.eql(u8, spec.path, path)) return spec;
     return null;
 }
 
+/// 按归属和路径查找集合属性规范。未找到返回 null。
 pub fn collection(owner: Owner, path: []const u8) ?*const CollectionSpec {
     for (&collections) |*spec| if (spec.owner == owner and std.mem.eql(u8, spec.path, path)) return spec;
     return null;

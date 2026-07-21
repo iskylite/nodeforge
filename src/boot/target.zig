@@ -178,6 +178,8 @@ fn resolveInstall(
     };
 }
 
+/// 将 profile 的额外 kernel_args 追加到基础 cmdline 后面，以空格分隔。
+/// 返回拼接后的完整 cmdline 切片；缓冲区不足时返回 null（调用方记录警告日志）。
 fn appendKernelArgs(buf: []u8, base: []const u8, kernel_args: ?[]const u8) ?[]const u8 {
     const extra = kernel_args orelse return base;
     if (extra.len == 0) return base;

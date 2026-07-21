@@ -1,7 +1,16 @@
-//! Repository software capability indexing.
+//! # Repository software capability indexing
+//!
+//! 从 dnf repodata 或 apt Packages 索引提取软件能力条目。
+//! 生成 `SoftwareIndex` 对象，包含能力列表和 SHA-256 revision digest。
+//! digest 变化时表示仓库内容已更新，引用该仓库的 install plan 需要重新计算。
 const std = @import("std");
 const model = @import("../model.zig");
 
+/// 构建仓库软件能力索引。
+///
+/// 根据 `manager` 类型调用 RHEL（repomd.xml + primary.xml）或
+/// Ubuntu（Packages 索引）索引器。提取的能力按 id 排序后持久化。
+/// revision_digest 覆盖输入内容的 SHA-256 摘要。
 pub fn build(io: std.Io, allocator: std.mem.Allocator, root: []const u8, manager: model.PackageManager) !model.SoftwareIndex {
     var capabilities: std.ArrayList(model.SoftwareCapability) = .empty;
     defer capabilities.deinit(allocator);
@@ -21,6 +30,7 @@ pub fn build(io: std.Io, allocator: std.mem.Allocator, root: []const u8, manager
     };
 }
 
+/// RHEL/dnf 仓库索引器。解析 repomd.xml 和 primary.xml 提取 package 能力。
 fn indexRhel(io: std.Io, allocator: std.mem.Allocator, root: []const u8, output: *std.ArrayList(model.SoftwareCapability), hashed: *std.Io.Writer) !void {
     const repomd_path = try std.fmt.allocPrint(allocator, "{s}/repodata/repomd.xml", .{root});
     defer allocator.free(repomd_path);

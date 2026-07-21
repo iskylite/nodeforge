@@ -6,56 +6,114 @@
 
 const std = @import("std");
 
+/// 默认安装根路径。标准部署使用此路径，自定义安装根通过 `--install-root` 覆盖。
 pub const default_install_root = "/opt/nodeforge";
+
+/// 根目录标记文件名。`setup` 在安装根创建此文件，`Paths.resolve` 验证其存在。
+/// 防止误将任意目录当作 NodeForge 安装根。
 pub const root_marker_name = ".nodeforge-root";
 
 /// 一个进程内不可变的完整路径投影。全部字符串由调用 `resolve`/`discover` 时的
 /// allocator 持有，通常使用进程 arena；测试可显式 `deinit`。
 pub const Paths = struct {
+    /// 安装根目录的 canonical 绝对路径（已解析 symlink）。
     install_root: []const u8,
+    /// 根目录标记文件完整路径（`<root>/.nodeforge-root`）。
     marker_path: []const u8,
+    /// 二进制目录（`<root>/bin`），存放 `nodeforge` 和 `nodeforged`。
     bin_dir: []const u8,
+    /// CLI 二进制完整路径（`<root>/bin/nodeforge`）。
     nodeforge_path: []const u8,
+    /// daemon 二进制完整路径（`<root>/bin/nodeforged`）。
     nodeforged_path: []const u8,
+    /// systemd unit 文件目录（`<root>/systemd`）。
     systemd_dir: []const u8,
+    /// 配置文件目录（`<root>/config`），存放 `config.json`。
     config_dir: []const u8,
+    /// Catalog 目录（`<root>/catalog`），存放 manifest 和 entity 文件。
     catalog_dir: []const u8,
+    /// 运行态目录（`<root>/state`），存放 lease/status/session 等持久状态。
     state_dir: []const u8,
+    /// 日志目录（`<root>/logs`），存放服务日志和事件审计流。
     logs_dir: []const u8,
+    /// 资产根目录（`<root>/assets`），存放 ISO/boot/repos/keys 等子目录。
     assets_dir: []const u8,
+    /// ISO 镜像目录（`<root>/assets/iso`）。
     iso_dir: []const u8,
+    /// TFTP 启动文件目录（`<root>/assets/boot`），存放 GRUB/kernel/initrd。
     boot_dir: []const u8,
+    /// 仓库目录（`<root>/assets/repos`），通过 HTTP 只读发布。
     repos_dir: []const u8,
+    /// SSH 密钥目录（`<root>/assets/keys`），存放 bootstrap 和操作员密钥。
     keys_dir: []const u8,
+    /// Bootstrap SSH 私钥路径（`<root>/assets/keys/id_ed25519`）。
+    /// 仅 daemon 可读，用于安装后首次访问目标节点。
     bootstrap_private_key_path: []const u8,
+    /// Bootstrap SSH 公钥路径（`<root>/assets/keys/id_ed25519.pub`）。
+    /// 注入到所有目标节点的 authorized_keys。
     bootstrap_public_key_path: []const u8,
+    /// 私钥临时写入路径，用于原子替换（写完后 rename 到正式路径）。
     bootstrap_private_key_temp_path: []const u8,
+    /// 公钥临时写入路径，用于原子替换。
     bootstrap_public_key_temp_path: []const u8,
+    /// 小 initrd 目录（`<root>/assets/initrd`），v0.2 无盘启动用。
     initrd_dir: []const u8,
+    /// rootfs 目录（`<root>/assets/rootfs`），v0.2 无盘启动用。
     rootfs_dir: []const u8,
+    /// boot bundle 目录（`<root>/assets/bundles`），v0.2 无盘启动用。
     bundles_dir: []const u8,
+    /// 后处理结果目录（`<root>/state/provisioned`），存放 provision 产物。
     provisioned_dir: []const u8,
+    /// 运行时 PID/socket 目录（`<root>/run`）。
     run_dir: []const u8,
+    /// 临时工作目录（`<root>/work`），ISO 导入暂存和中断工作树。
+    /// `--purge-all` 会删除此目录。
     work_dir: []const u8,
+    /// ISO 导入暂存子目录（`<root>/work/import`）。
     import_dir: []const u8,
+    /// 启动配置文件路径（`<root>/config/config.json`）。
     config_path: []const u8,
-    /// M4.7b 前兼容单文件输入；完成 manifest 迁移后仅用于 legacy 检测。
+    /// M4.7b 前兼容单文件 catalog 路径；完成 manifest 迁移后仅用于 legacy 检测。
     legacy_catalog_path: []const u8,
+    /// Legacy 运行态文件路径（`<root>/state/runtime.json`）。M4.7 后拆分为多个独立文件。
     runtime_path: []const u8,
+    /// DHCP lease 持久化文件路径（`<root>/state/leases.json`）。
     leases_path: []const u8,
+    /// 节点状态持久化文件路径（`<root>/state/node-status.json`）。
     node_status_path: []const u8,
+    /// 部署控制文件路径（`<root>/state/deployment-control.json`）。
+    /// 记录 install generation/consumed/config revision。
     deployment_control_path: []const u8,
+    /// Boot session 持久化文件路径（`<root>/state/boot-sessions.json`）。
+    /// 记录活动安装会话的 immutable plan 和 checkpoint。
     boot_sessions_path: []const u8,
+    /// 节点 inventory 文件路径（`<root>/state/node-inventory.json`）。
+    /// 记录安装器上报的硬件事实（serial/UUID/vendor/model）。
     node_inventory_path: []const u8,
+    /// 操作记录文件路径（`<root>/state/operations.json`）。
+    /// 记录管理 API 的持久操作（幂等 key + 状态轮询）。
     operations_path: []const u8,
+    /// 模型事务目录（`<root>/state/model-transactions`）。
+    /// 存放 schema v3 迁移等大事务的 before/after 快照。
     model_transactions_dir: []const u8,
+    /// 事件审计流文件路径（`<root>/logs/events.jsonl`）。追加型 JSONL。
     events_path: []const u8,
+    /// 服务日志文件路径（`<root>/logs/nodeforged.log`）。追加型文本日志。
     service_log_path: []const u8,
+    /// systemd unit 文件路径（`<root>/systemd/nodeforged.service`）。
     service_path: []const u8,
 
-    /// 从现存根目录解析路径并验证 marker 与成对二进制。`realPathFileAlloc`
-    /// 同时消除 `..` 和 symlink；解析结果必须与调用方文本路径不同也无妨，但
-    /// 后续所有写入只使用 canonical root。
+    /// 从现存根目录解析路径并验证 marker 与成对二进制。
+    ///
+    /// `realPathFileAlloc` 同时消除 `..` 和 symlink；解析结果必须与调用方文本路径
+    /// 不同也无妨，但后续所有写入只使用 canonical root。
+    ///
+    /// # 错误
+    /// - `InstallRootNotAbsolute`：根路径不是绝对路径。
+    /// - `InvalidInstallRoot`：根路径包含 `..` 组件。
+    /// - `InstallRootSymlink`：根路径本身是 symlink。
+    /// - `FileNotFound`：根目录或 marker 文件不存在。
+    /// - `InvalidExecutableLayout`：marker 存在但成对二进制缺失。
     pub fn resolve(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !Paths {
         if (!std.fs.path.isAbsolute(root)) return error.InstallRootNotAbsolute;
         if (hasDotDot(root)) return error.InvalidInstallRoot;
@@ -70,8 +128,10 @@ pub const Paths = struct {
     }
 
     /// 从操作系统提供的真实 executable 位置发现根，不信任 argv[0] 或 PATH。
+    ///
     /// `realPathFileAlloc` 会继续解析软链后的真实位置。
     /// 只有标准根会作为兜底候选，且同样必须通过完整布局校验。
+    /// 用于 daemon 启动时自动定位安装根（无需 `--install-root`）。
     pub fn discover(io: std.Io, allocator: std.mem.Allocator) !Paths {
         const reported = std.process.executablePathAlloc(io, allocator) catch |cause| {
             return resolve(io, allocator, default_install_root) catch return cause;
@@ -93,7 +153,9 @@ pub const Paths = struct {
     }
 
     /// setup 在创建 marker 前需要一个只派生、不声称部署有效的候选路径。
+    ///
     /// 该入口仍要求绝对、canonical、已存在且为目录；它不写盘。
+    /// 用于 `setup --install-root <new-root>` 场景，此时 marker 尚未创建。
     pub fn candidate(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !Paths {
         if (!std.fs.path.isAbsolute(root)) return error.InstallRootNotAbsolute;
         if (hasDotDot(root)) return error.InvalidInstallRoot;
@@ -117,11 +179,14 @@ pub const Paths = struct {
         return derive(allocator, canonical);
     }
 
+    /// 释放所有路径字符串内存。测试使用；生产进程使用 arena allocator，不调用此函数。
     pub fn deinit(self: *Paths, allocator: std.mem.Allocator) void {
         inline for (std.meta.fields(Paths)) |field| allocator.free(@field(self, field.name));
         self.* = undefined;
     }
 
+    /// 验证安装根布局：marker 文件可读、成对二进制存在且为常规文件。
+    /// 任何一项不满足都返回错误，确保进程不会在残缺安装根上启动特权服务。
     fn validateLayout(self: *const Paths, io: std.Io) !void {
         const cwd = std.Io.Dir.cwd();
         var marker = try cwd.openFile(io, self.marker_path, .{ .mode = .read_only });
@@ -135,9 +200,12 @@ pub const Paths = struct {
     }
 };
 
+/// 全局路径单例。进程内只初始化一次，之后只读访问。
 var global: ?Paths = null;
 
 /// 发布全局路径只能发生一次，防止命令解析后再切换写入边界。
+///
+/// 返回 `AlreadyInitialized` 表示路径已发布，不允许二次初始化。
 pub fn init(value: Paths) error{AlreadyInitialized}!void {
     if (global != null) return error.AlreadyInitialized;
     global = value;
@@ -156,8 +224,11 @@ pub fn require() *const Paths {
 }
 
 /// 在构造任何 CLI 默认值之前扫描唯一的 bootstrap flag 并发布路径。
+///
 /// 这里只识别 `--install-root VALUE`/`--install-root=VALUE`；其余语法仍由
 /// zli 负责，因此预扫描不会改变业务参数的校验或所有权。
+///
+/// `setup` 子命令使用 `candidate`（允许 marker 不存在），其他子命令使用 `resolve`（要求 marker 存在）。
 pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator, args: std.process.Args) !void {
     var iterator = args.iterate();
     _ = iterator.next();
@@ -179,6 +250,7 @@ pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator, args: std.process.Arg
     try init(value);
 }
 
+/// 从 canonical root 派生所有子路径。每条路径由 allocator 独立持有。
 fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
     return .{
         .install_root = try allocator.dupe(u8, root),
@@ -223,10 +295,12 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
     };
 }
 
+/// 使用 `std.fmt.allocPrint` 拼接 `root/suffix` 路径。
 fn join(allocator: std.mem.Allocator, root: []const u8, suffix: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, suffix });
 }
 
+/// 检查路径中是否包含 `..` 组件，防止路径逃逸。
 fn hasDotDot(value: []const u8) bool {
     var parts = std.mem.splitScalar(u8, value, std.fs.path.sep);
     while (parts.next()) |part| if (std.mem.eql(u8, part, "..")) return true;

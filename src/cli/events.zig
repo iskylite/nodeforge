@@ -10,17 +10,27 @@ const events = @import("../state/events.zig");
 pub const max_records = 1000;
 pub const max_rotations: u8 = 20;
 
+/// 事件过滤条件。空字符串表示不筛选该维度；limit 限制最大返回记录数。
 pub const Filters = struct {
+    /// 事件类型名称筛选（如 `dhcp.ack`）。
     event_type: []const u8 = "",
+    /// 节点 ID 筛选。
     node: []const u8 = "",
+    /// boot session ID 筛选。
     session: []const u8 = "",
+    /// 起始时间（Unix 秒，闭区间）。
     since: ?i64 = null,
+    /// 截止时间（Unix 秒，闭区间）。
     until: ?i64 = null,
+    /// 最大返回记录数。
     limit: usize = 100,
 };
 
+/// 事件读取结果统计。
 pub const ReadResult = struct {
+    /// 成功解析并匹配的记录数。
     count: usize,
+    /// 因损坏或半写入而跳过的行数。
     skipped: usize,
 };
 
@@ -52,6 +62,7 @@ pub fn matches(event: events.ReadEvent, filters: *const Filters) bool {
     return true;
 }
 
+/// 从事件中提取节点 ID。优先使用 v1 顶层 `node` 字段，回退到 v2 fields 中的 `node_id`。
 pub fn node(event: events.ReadEvent) ?[]const u8 {
     if (event.node) |value| return value;
     return field(event, "node_id");
@@ -62,11 +73,13 @@ pub fn session(event: events.ReadEvent) ?[]const u8 {
     return field(event, "boot_session_id");
 }
 
+/// 从事件 fields 中按 key 查找值。用于提取 `node_id`、`mac` 等关联字段。
 pub fn field(event: events.ReadEvent, key: []const u8) ?[]const u8 {
     for (event.fields) |item| if (std.mem.eql(u8, item.key, key)) return item.value;
     return null;
 }
 
+/// 将 fields 渲染为 `key=value key=value` 格式的单行字符串。用于 human 输出。
 pub fn fieldsText(allocator: std.mem.Allocator, fields: []const events.Field) ![]const u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     for (fields, 0..) |field_value, index| {
@@ -88,6 +101,8 @@ pub fn displayTs(buffer: *[20]u8, ts: []const u8) []const u8 {
     return ts;
 }
 
+/// 解析事件时间戳为 Unix 秒。支持 RFC 3339 和 `unix:<seconds>` 两种格式。
+/// RFC 3339 解析手动实现以避免引入额外的日期库依赖。
 pub fn parseTime(value: []const u8) !i64 {
     if (std.mem.startsWith(u8, value, events.unix_timestamp_prefix)) return std.fmt.parseInt(i64, value[events.unix_timestamp_prefix.len..], 10);
     if (value.len != 20 or value[4] != '-' or value[7] != '-' or value[10] != 'T' or value[13] != ':' or value[16] != ':' or value[19] != 'Z') return error.InvalidTimestamp;
@@ -134,6 +149,7 @@ fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, filters:
     }
 }
 
+/// 释放克隆事件的分配器内存。每个字段（ts/type/message/fields/node）单独释放。
 pub fn freeEvent(allocator: std.mem.Allocator, event: events.ReadEvent) void {
     allocator.free(event.ts);
     allocator.free(event.type);

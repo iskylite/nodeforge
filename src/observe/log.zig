@@ -5,6 +5,8 @@ const std = @import("std");
 const backend = @import("log_backend.zig");
 const model = @import("../model.zig");
 
+/// NodeForge 服务日志的 scoped logger。所有模块通过此 logger 输出日志，
+/// 确保日志前缀统一为 `[nodeforge]`。
 pub const log = std.log.scoped(.nodeforge);
 
 /// 服务日志等级，按严重程度从低到高排列。
@@ -38,4 +40,5 @@ pub fn debug(comptime format: []const u8, args: anytype) void {
     log.debug(format, args);
 }
 
+/// 将 `model.LogLevel` 转换为 `std.log.Level`，供 `log_backend` 使用。
 fn toStdLevel(level: Level) std.log.Level { return level.toStdLevel(); }

@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) void {
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
+/// 检查命令行是否仅为 `--version` 或 `-v`，用于在路径自举前快速短路返回版本信息。
 fn versionOnly(args: std.process.Args) bool {
     var iterator = args.iterate();
     _ = iterator.next();
@@ -266,13 +267,22 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     try nodeforge.app.run(ctx.io, ctx.allocator, &effective_config, config_path, catalog, catalog_path);
 }
 
+/// 日志输出模式枚举。控制服务日志的写入目标。
 const LogOutput = enum {
+    /// 自动模式：配置了日志文件则双写，否则只输出到终端。
     auto,
+    /// 仅输出到终端（stderr/systemd journal）。
     terminal,
+    /// 仅写入日志文件。
     file,
+    /// 同时输出到终端和日志文件。
     both,
 };
 
+/// 根据命令行 `--log-output` 参数和配置文件日志策略配置日志后端。
+///
+/// `auto` 模式根据 `logging.file` 是否为 null 决定输出目标；
+/// `file`/`both` 模式使用配置文件路径或 `--log-file` 覆盖路径。
 fn configureLogOutput(
     io: std.Io,
     requested: LogOutput,

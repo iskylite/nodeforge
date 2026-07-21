@@ -1,4 +1,7 @@
-//! Typed structured-item catalog mutations.
+//! # Typed structured-item catalog mutations
+//!
+//! 处理 partitions/users/routes 等结构化列表项的增删改查。
+//! 每个 item 使用 stable id 定位，支持 add/set/remove/move 四种操作。
 const std = @import("std");
 const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
@@ -6,8 +9,25 @@ const validate = @import("validate.zig");
 const install_compiler = @import("../profile/install.zig");
 const value_mutation = @import("value_mutation.zig");
 
-pub const Operation = enum { add, set, remove, move };
-pub const BulkOperation = enum { replace, clear };
+/// 列表项操作类型。
+pub const Operation = enum {
+    /// 追加新项。
+    add,
+    /// 修改已有项。
+    set,
+    /// 删除项。
+    remove,
+    /// 重排序项。
+    move,
+};
+/// 批量替换操作类型。
+pub const BulkOperation = enum {
+    /// 用新列表完整替换旧列表。
+    replace,
+    /// 清空列表。
+    clear,
+};
+/// 批量替换参数。根据 `key` 选择使用哪个字段。
 pub const Replacement = struct {
     operation: BulkOperation,
     key: []const u8,
@@ -15,6 +35,7 @@ pub const Replacement = struct {
     users: []const model.TargetUserConfig = &.{},
     routes: []const model.RouteConfig = &.{},
 };
+/// 单个列表项 patch 参数。所有可选字段 null 表示不修改。
 pub const Patch = struct {
     operation: Operation,
     key: []const u8,

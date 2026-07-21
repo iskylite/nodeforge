@@ -9,32 +9,57 @@ const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
 const validate = @import("validate.zig");
 
+/// `node add` 命令的参数集。所有字符串由调用方拥有，mutation 期间不释放。
 pub const AddParams = struct {
+    /// 节点 ID（canonical logical-id）。
     id: []const u8,
+    /// 网卡 MAC 地址（冒号分隔）。
     mac: []const u8,
+    /// 节点架构。
     arch: model.Arch,
+    /// 绑定的 profile 名称；null 且 `deploy=true` 时返回错误。
     profile: ?[]const u8,
+    /// PXE 静态保留 IP；null 时从 DHCP 地址池动态分配。
     pxe_ip_reservation: ?[]const u8 = null,
+    /// 节点 hostname；null 时回退到 node.id。
     hostname: ?[]const u8 = null,
+    /// 是否参与 PXE 部署。
     deploy: bool = true,
+    /// 是否使用 HTTP 加速 initrd 下载。
     http_accel: bool = false,
+    /// 物理设备存储配置。
     storage: model.NodeStorageConfig = .{},
+    /// 目标系统网络配置。
     network: model.TargetNetworkConfig = .{},
 };
+/// `node set` 命令的参数集。每对 `_set`/value 控制是否覆盖对应字段。
 pub const SetParams = struct {
+    /// 新 MAC 地址；null 不修改。
     mac: ?[]const u8 = null,
+    /// 新架构；null 不修改。
     arch: ?model.Arch = null,
+    /// 新 profile 名称；null 不修改。空字符串显式解绑。
     profile: ?[]const u8 = null,
+    /// Legacy IP 字段值。
     ip: ?[]const u8 = null,
+    /// Legacy IP 字段是否被显式设置（区分 null=不修改 vs null=清空）。
     ip_set: bool = false,
+    /// hostname 值。
     hostname: ?[]const u8 = null,
+    /// hostname 是否被显式设置。
     hostname_set: bool = false,
+    /// deploy 开关。
     deploy: ?bool = null,
+    /// http_accel 开关。
     http_accel: ?bool = null,
+    /// boot_disk 设备路径。
     boot_disk: ?[]const u8 = null,
+    /// boot_disk 是否被显式设置。
     boot_disk_set: bool = false,
 };
 
+/// 向 catalog 原子添加一个节点。执行 load-duplicate-check-validate-save 事务。
+/// 重复 ID 或 MAC 返回错误；`deploy=true` 但 `profile=null` 返回错误。
 pub fn addNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, params: AddParams) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();
@@ -54,6 +79,8 @@ pub fn addNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.Ap
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
+/// 修改已有节点的属性。执行 load-find-patch-validate-save 事务。
+/// `_set` 标志区分 null=不修改 vs null=显式清空。
 pub fn setNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, node_id: []const u8, params: SetParams) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();

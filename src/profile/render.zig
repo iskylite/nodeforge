@@ -13,14 +13,27 @@
 
 const std = @import("std");
 
+/// 比较两个 SSH 公钥是否相同（忽略注释部分）。
+///
+/// SSH 公钥格式为 `<algorithm> <base64-blob> [comment]`。
+/// 此函数只比较 algorithm 和 blob，忽略可选的 comment。
+/// 用于检测重复密钥时去重。
 pub fn sameSshKey(left: []const u8, right: []const u8) bool {
     const left_parts = sshKeyParts(left) orelse return false;
     const right_parts = sshKeyParts(right) orelse return false;
     return std.mem.eql(u8, left_parts.algorithm, right_parts.algorithm) and std.mem.eql(u8, left_parts.blob, right_parts.blob);
 }
 
-const SshKeyParts = struct { algorithm: []const u8, blob: []const u8 };
+/// SSH 公钥解析结果。
+const SshKeyParts = struct {
+    /// 密钥算法（如 `ssh-ed25519`）。
+    algorithm: []const u8,
+    /// Base64 编码的密钥 blob。
+    blob: []const u8,
+};
 
+/// 将 SSH 公钥字符串解析为 algorithm + blob 部分。
+/// 格式无效时返回 null。
 fn sshKeyParts(value: []const u8) ?SshKeyParts {
     const first = std.mem.indexOfScalar(u8, value, ' ') orelse return null;
     const tail = std.mem.trimStart(u8, value[first + 1 ..], " \t");

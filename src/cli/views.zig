@@ -12,12 +12,19 @@ const output = @import("output.zig");
 const document = @import("document.zig");
 const model = @import("../model.zig");
 
+/// asset 列表表格的单行数据。所有字段为预格式化字符串，由调用者负责格式化。
 pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const u8 };
+/// TFTP 会话列表表格的单行数据。
 pub const TftpSessionRow = struct { id: []const u8, phase: []const u8, filename: []const u8 };
+/// DHCP 租约列表表格的单行数据。`expires_at` 为预格式化的本地时间字符串。
 pub const DhcpLeaseRow = struct { ip: []const u8, mac: []const u8, phase: []const u8, expires_at: []const u8 };
+/// 节点列表表格的单行数据。start/install/finished 分别映射任务武装、安装开始和终态时间。
 pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8, deploy: []const u8, install_intent: []const u8, status: []const u8, start_at: []const u8, install_at: []const u8, finished_at: []const u8, serial_number: []const u8 };
+/// profile 列表表格的单行数据。`nodes` 为关联节点计数，`valid` 为校验状态文本。
 pub const ProfileRow = struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: []const u8, nodes: []const u8, valid: []const u8 };
+/// 事件列表表格的单行数据。`fields` 为预格式化的 `key=value key=value` 字符串。
 pub const EventRow = struct { ts: []const u8, event_type: []const u8, node: []const u8, message: []const u8, fields: []const u8 };
+/// 事件类型列表表格的单行数据。
 pub const EventTypeRow = struct { name: []const u8, description: []const u8, level: []const u8 };
 
 /// 渲染 asset 列表表格。`rows` 使用借用 slice；超过 64 行返回 `error.TooManyRows`。
@@ -36,6 +43,7 @@ pub fn assetsWithOptions(writer: *std.Io.Writer, rows: []const AssetRow, options
     try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No assets registered.", options);
 }
 
+/// 渲染 asset 详情块。以标签-值形式展示名称、类型、路径和 SHA-256 校验值。
 pub fn assetDetail(writer: *std.Io.Writer, name: []const u8, kind: []const u8, path: []const u8, sha256: []const u8) !void {
     try writer.writeAll("Asset\n");
     try detailField(writer, "Name", name);
@@ -44,6 +52,7 @@ pub fn assetDetail(writer: *std.Io.Writer, name: []const u8, kind: []const u8, p
     try detailField(writer, "SHA-256", sha256);
 }
 
+/// 渲染 TFTP 传输计数器详情块。展示已启动、已完成和失败的传输总数。
 pub fn tftpCounters(writer: *std.Io.Writer, started: u64, completed: u64, failed: u64) !void {
     try writer.writeAll("TFTP\n");
     try writeLabel(writer, "Started");
@@ -54,6 +63,7 @@ pub fn tftpCounters(writer: *std.Io.Writer, started: u64, completed: u64, failed
     try writer.print("{d}\n", .{failed});
 }
 
+/// 渲染 DHCP 配置详情块。展示子网、地址池范围和租约时长。
 pub fn dhcpConfig(writer: *std.Io.Writer, subnet: []const u8, pool_start: []const u8, pool_end: []const u8, lease_seconds: u32) !void {
     try writer.writeAll("DHCP\n");
     try detailField(writer, "Subnet", subnet);
@@ -63,9 +73,11 @@ pub fn dhcpConfig(writer: *std.Io.Writer, subnet: []const u8, pool_start: []cons
     try writer.print("{d}\n", .{lease_seconds});
 }
 
+/// 渲染 DHCP 租约列表表格。`unknown_only` 控制空表提示消息。
 pub fn dhcpLeases(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_only: bool) !void {
     return dhcpLeasesWithOptions(writer, rows, unknown_only, .{});
 }
+/// 渲染 DHCP 租约列表表格（带选项）。超过 256 行返回 `error.TooManyRows`。
 pub fn dhcpLeasesWithOptions(writer: *std.Io.Writer, rows: []const DhcpLeaseRow, unknown_only: bool, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "ip", .title = "IP" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "phase", .title = "PHASE" }, .{ .key = "expires", .title = "EXPIRES" } };
     var cells: [256][4][]const u8 = undefined;
@@ -78,9 +90,11 @@ pub fn dhcpLeasesWithOptions(writer: *std.Io.Writer, rows: []const DhcpLeaseRow,
     try renderTableDocument(writer, &columns, table_rows[0..rows.len], if (unknown_only) "No unknown clients." else "No DHCP leases.", options);
 }
 
+/// 渲染节点列表表格。使用默认选项（无列筛选、无宽度限制）。
 pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
     return nodesWithOptions(writer, rows, .{});
 }
+/// 渲染节点列表表格（带选项）。超过 256 行返回 `error.TooManyRows`。
 pub fn nodesWithOptions(writer: *std.Io.Writer, rows: []const NodeRow, options: table.Options) !void {
     // Start/Install/Finished 分别映射任务武装、实际安装阶段开始和任务终态，
     // 避免把内部 requested_at/started_at 字段名误当成用户语义。
@@ -95,9 +109,11 @@ pub fn nodesWithOptions(writer: *std.Io.Writer, rows: []const NodeRow, options: 
     try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No nodes registered.", options);
 }
 
+/// 渲染 profile 列表表格。使用默认选项。
 pub fn profiles(writer: *std.Io.Writer, rows: []const ProfileRow) !void {
     return profilesWithOptions(writer, rows, .{});
 }
+/// 渲染 profile 列表表格（带选项）。超过 256 行返回 `error.TooManyRows`。
 pub fn profilesWithOptions(writer: *std.Io.Writer, rows: []const ProfileRow, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "name", .title = "NAME" }, .{ .key = "mode", .title = "MODE" }, .{ .key = "distro", .title = "DISTRO" }, .{ .key = "version", .title = "VERSION" }, .{ .key = "arch", .title = "ARCH" }, .{ .key = "source", .title = "INSTALL_SOURCE" }, .{ .key = "nodes", .title = "NODES", .alignment = .right }, .{ .key = "valid", .title = "VALID" } };
     var cells: [256][8][]const u8 = undefined;
@@ -110,9 +126,11 @@ pub fn profilesWithOptions(writer: *std.Io.Writer, rows: []const ProfileRow, opt
     try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No profiles configured.", options);
 }
 
+/// 渲染事件列表表格。使用默认选项。MESSAGE 和 FIELDS 列有最大宽度限制。
 pub fn events(writer: *std.Io.Writer, rows: []const EventRow) !void {
     return eventsWithOptions(writer, rows, .{});
 }
+/// 渲染事件列表表格（带选项）。超过 1000 行返回 `error.TooManyRows`。
 pub fn eventsWithOptions(writer: *std.Io.Writer, rows: []const EventRow, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "time", .title = "TIME" }, .{ .key = "type", .title = "TYPE" }, .{ .key = "node", .title = "NODE" }, .{ .key = "message", .title = "MESSAGE", .max_width = 48 }, .{ .key = "fields", .title = "FIELDS", .max_width = 64 } };
     var cells: [1000][5][]const u8 = undefined;
@@ -125,15 +143,18 @@ pub fn eventsWithOptions(writer: *std.Io.Writer, rows: []const EventRow, options
     try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No events recorded.", options);
 }
 
+/// 渲染单行事件摘要。格式为 `时间  类型  [字段]  消息`，用于 follow 模式的实时输出。
 pub fn eventLine(writer: *std.Io.Writer, ts: []const u8, event_type: []const u8, fields: []const u8, message: []const u8) !void {
     try writer.print("{s}  {s}", .{ ts, event_type });
     if (fields.len != 0) try writer.print("  {s}", .{fields});
     try writer.print("  {s}\n", .{message});
 }
 
+/// 渲染事件类型列表表格。使用默认选项。
 pub fn eventTypes(writer: *std.Io.Writer, rows: []const EventTypeRow) !void {
     return eventTypesWithOptions(writer, rows, .{});
 }
+/// 渲染事件类型列表表格（带选项）。超过 64 行返回 `error.TooManyRows`。
 pub fn eventTypesWithOptions(writer: *std.Io.Writer, rows: []const EventTypeRow, options: table.Options) !void {
     const columns = [_]table.Column{ .{ .key = "name", .title = "TYPE" }, .{ .key = "level", .title = "LEVEL" }, .{ .key = "description", .title = "DESCRIPTION" } };
     var cells: [64][3][]const u8 = undefined;
@@ -153,6 +174,7 @@ pub fn success(writer: *std.Io.Writer, summary: []const u8, fields: []const Fiel
     for (fields) |field| try detailField(writer, field.label, field.value);
 }
 
+/// 成功摘要的键值对字段。`label` 为人类可读标签，`value` 为预格式化字符串。
 pub const Field = struct { label: []const u8, value: []const u8 };
 
 /// M4.11: render mutable node facts as the exact `node set` key=value
@@ -185,6 +207,7 @@ pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
     try writeStringList(writer, "Search domains", node.network.search_domains);
 }
 
+/// 写入标签和字符串列表。空列表输出 "-"，非空列表以逗号分隔并转义控制字符。
 fn writeStringList(writer: *std.Io.Writer, label: []const u8, values: []const []const u8) !void {
     try writeLabel(writer, label);
     if (values.len == 0) return writer.writeAll("-\n");
@@ -195,6 +218,7 @@ fn writeStringList(writer: *std.Io.Writer, label: []const u8, values: []const []
     try writer.writeByte('\n');
 }
 
+/// 写入逗号分隔的字符串列表（无标签前缀）。用于 `storage.additional_disks` 等内联集合。
 fn writeCommaList(writer: *std.Io.Writer, values: []const []const u8) !void {
     for (values, 0..) |value, index| {
         if (index != 0) try writer.writeByte(',');
@@ -218,11 +242,15 @@ pub fn tftpSessionsWithOptions(writer: *std.Io.Writer, rows: []const TftpSession
     try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No TFTP sessions recorded.", options);
 }
 
+/// 通过 `OutputDocument` 管道渲染表格，确保 human 表格输出与 JSON 输出走同一渲染路径。
 fn renderTableDocument(writer: *std.Io.Writer, columns: []const table.Column, rows: []const table.Row, empty_message: []const u8, options: table.Options) !void {
     const value: document.OutputDocument = .{ .human = .{ .table = .{ .columns = columns, .rows = rows, .empty_message = empty_message } }, .json = "{}" };
     try value.render(writer, output.Output{ .mode = .human, .no_color = !options.color, .columns = options.columns, .width = options.width, .wide = options.wide, .no_header = options.no_header });
 }
 
+/// M4.11 运维就绪状态视图。每个字段对应一个必须检查的运维平面，
+/// 确保绿色摘要意味着 nodeforged 真正能服务 provisioning 流量，
+/// 而不仅仅是某个 HTTP 路由可达。
 pub const StatusView = struct {
     ok: bool,
     process: bool,
@@ -282,6 +310,8 @@ pub fn formatTimestamp(buffer: *[20]u8, epoch: i64) []const u8 {
 const label_width: usize = 16;
 
 /// 写入 label 并用空格填充到 `label_width`，末尾留一个分隔空格。
+/// 写入标签并用空格填充到 `label_width`，末尾留一个分隔空格。
+/// 使用 display-width-aware 填充确保 CJK 字符也能正确对齐。
 fn writeLabel(writer: *std.Io.Writer, label: []const u8) !void {
     try writer.writeAll("  ");
     try writer.writeAll(label);
@@ -292,6 +322,7 @@ fn writeLabel(writer: *std.Io.Writer, label: []const u8) !void {
     try writer.writeByte(' ');
 }
 
+/// 写入详情字段行：标签 + 填充 + 转义值 + 换行。用于 asset/node 详情等块状输出。
 fn detailField(writer: *std.Io.Writer, label: []const u8, value: []const u8) !void {
     try writeLabel(writer, label);
     try table.writeEscaped(writer, value);
@@ -300,6 +331,8 @@ fn detailField(writer: *std.Io.Writer, label: []const u8, value: []const u8) !vo
 
 const status_label_width: usize = label_width;
 
+/// 写入状态标签并用空格填充到 `status_label_width`（不追加末尾空格）。
+/// 状态行的值由调用者自行格式化（如含 OK/FAIL 前缀和 URL）。
 fn writeStatusLabel(writer: *std.Io.Writer, label: []const u8) !void {
     try writer.writeAll("  ");
     try writer.writeAll(label);
@@ -309,6 +342,7 @@ fn writeStatusLabel(writer: *std.Io.Writer, label: []const u8) !void {
     }
 }
 
+/// 写入状态字段行：标签 + 填充 + 转义值 + 换行。用于 status 命令的各检查项输出。
 fn statusField(writer: *std.Io.Writer, label: []const u8, value: []const u8) !void {
     try writeStatusLabel(writer, label);
     try table.writeEscaped(writer, value);

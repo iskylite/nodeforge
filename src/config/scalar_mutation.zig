@@ -1,15 +1,27 @@
-//! Canonical scalar property mutations.
+//! # Canonical scalar property mutations
+//!
+//! 提供 `profile set <name> <key>=<value>` 和 `node set <id> <key>=<value>` 的
+//! 标量属性写入口。每个 mutation 执行 load-patch-validate-save 事务。
+//! 支持的 key 由 `applyProfile`/`applyNode` 的 switch 分支定义。
 const std = @import("std");
 const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
 const validate = @import("validate.zig");
 
-pub const Mutation = struct { key: []const u8, value: ?[]const u8 = null };
+/// 单个标量 mutation。
+pub const Mutation = struct {
+    /// 属性键（如 `install.storage.mode`）。
+    key: []const u8,
+    /// 属性值；null 表示清空。
+    value: ?[]const u8 = null,
+};
 
+/// 修改单个 profile 标量属性。`profile set` 命令的入口。
 pub fn profile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, key: []const u8, value: ?[]const u8) !void {
     return profileBatch(io, allocator, config, catalog_path, name, &.{.{ .key = key, .value = value }});
 }
 
+/// 批量修改 profile 标量属性。所有 mutation 在同一事务中提交，任一失败回滚。
 pub fn profileBatch(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, mutations: []const Mutation) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();
@@ -29,6 +41,7 @@ pub fn profileBatch(io: std.Io, allocator: std.mem.Allocator, config: *const mod
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
+/// 将单个 key=value 应用到 profile 对象。不支持的关键字返回 `UnknownProperty`。
 fn applyProfile(catalog: *const model.Catalog, target: *model.ProfileConfig, key: []const u8, text: ?[]const u8) !void {
     if (eq(key, "install_source")) {
         const source_name = text orelse return error.PropertyRequired;
@@ -37,10 +50,12 @@ fn applyProfile(catalog: *const model.Catalog, target: *model.ProfileConfig, key
     } else if (eq(key, "install.storage.mode")) target.install.storage.mode = try parseEnum(model.StorageMode, text) else if (eq(key, "install.storage.wipe")) target.install.storage.wipe = try parseBool(text) else if (eq(key, "install.storage.partition_table")) target.install.storage.partition_table = try parseEnum(model.PartitionTable, text) else if (eq(key, "install.bootloader.install")) target.install.bootloader.install = try parseBool(text) else if (eq(key, "system.localization.locale")) target.system.localization.locale = text orelse return error.PropertyRequired else if (eq(key, "system.localization.timezone")) target.system.localization.timezone = text orelse return error.PropertyRequired else if (eq(key, "system.localization.keyboard")) target.system.localization.keyboard = text orelse return error.PropertyRequired else if (eq(key, "system.connectivity.time_sync")) target.system.connectivity.time_sync = try parseBool(text) else if (eq(key, "system.ssh.enabled")) target.system.ssh.enabled = try parseBool(text) else if (eq(key, "system.ssh.password_authentication")) target.system.ssh.password_authentication = try parseBool(text) else if (eq(key, "system.ssh.root_login")) target.system.ssh.root_login = try parseEnum(model.RootLoginPolicy, text) else if (eq(key, "system.ssh.root_password")) target.system.ssh.root_password = text else if (eq(key, "system.security.firewall")) target.system.security.firewall = try parseEnum(model.FirewallPolicy, text) else if (eq(key, "system.security.selinux")) target.system.security.selinux = try parseEnum(model.SelinuxMode, text) else if (eq(key, "system.security.apparmor")) target.system.security.apparmor = try parseEnum(model.AppArmorMode, text) else if (eq(key, "software.environment")) target.software.environment = text else if (eq(key, "install.apt.fallback")) target.install.apt.fallback = try parseEnum(model.AptFallback, text) else if (eq(key, "install.completion.action")) target.install.completion.action = try parseEnum(model.CompletionAction, text) else if (eq(key, "install.updates.mode")) target.install.updates.mode = try parseEnum(model.UpdateMode, text) else if (eq(key, "install.proxy.url")) target.install.proxy.url = text else if (eq(key, "install.reinstall_policy")) target.install.reinstall_policy = try parseEnum(model.ReinstallPolicy, text) else if (eq(key, "install.post_install.bundle")) target.install.post_install.bundle = text else return error.UnknownProperty;
 }
 
+/// 修改单个 node 标量属性。`node set <id> <key>=<value>` 的入口。
 pub fn node(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, id: []const u8, key: []const u8, value: ?[]const u8) !void {
     return nodeBatch(io, allocator, config, catalog_path, id, &.{.{ .key = key, .value = value }});
 }
 
+/// 批量修改 node 标量属性。所有 mutation 在同一事务中提交，任一失败回滚。
 pub fn nodeBatch(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, id: []const u8, mutations: []const Mutation) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();

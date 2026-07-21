@@ -290,6 +290,8 @@ pub fn run(
     if (serve_error) |err| return err;
 }
 
+/// 在 config.profiles 中按名称查找 profile。用于在初始化 deployment control 时
+/// 跳过未绑定 profile 的节点。
 fn forProfile(config: *const model.AppConfig, name: []const u8) ?*const model.ProfileConfig {
     for (config.profiles) |*profile| if (std.mem.eql(u8, profile.name, name)) return profile;
     return null;
@@ -325,6 +327,7 @@ fn loadStatuses(io: std.Io, allocator: std.mem.Allocator, store: *node_status.St
     };
 }
 
+/// 获取当前 Unix 时间戳（秒）。clock_gettime 失败时返回 0。
 fn now() i64 {
     var ts: std.posix.timespec = undefined;
     return if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) == .SUCCESS) @intCast(ts.sec) else 0;
@@ -378,10 +381,14 @@ fn runCheckpoint(
     }
 }
 
+/// DHCP worker 线程入口。在独立线程中运行 DHCPv4 服务端循环。
+/// `stop` 标志为 true 时退出循环并关闭 socket。
 fn runDhcp(io: std.Io, socket: std.Io.net.Socket, configs: *config_runtime.ConfigRuntime, runtime: *runtime_state.RuntimeState, persistence: *const dhcp_server.Persistence, stop: *const std.atomic.Value(bool)) void {
     dhcp_server.serveSocket(io, socket, configs, runtime, persistence, stop) catch |err| observe_log.err("dhcp: stopped: {t}", .{err});
 }
 
+/// TFTP worker 线程入口。在独立线程中运行 TFTP 服务端循环。
+/// `stop` 标志为 true 时退出循环并关闭 socket。
 fn runTftp(
     io: std.Io,
     allocator: std.mem.Allocator,

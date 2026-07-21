@@ -1,15 +1,32 @@
-//! Persistent unknown-client observation and atomic claim operations.
+//! # Persistent unknown-client observation and atomic claim operations
+//!
+//! 管理未知 DHCP 客户端的观察记录和原子认领操作。
+//! 认领将观察记录转换为 Node，使用乐观并发控制防止竞争。
 const std = @import("std");
 const model = @import("../model.zig");
 
+/// 原子认领请求参数。
 pub const Claim = struct {
+    /// 要创建或绑定的 Node ID。
     node_id: []const u8,
+    /// 观察到的客户端 MAC 地址。
     mac: []const u8,
+    /// 客户端架构。
     arch: model.Arch,
+    /// 预期的观察记录 revision，用于乐观并发控制。
     expected_observation_revision: u64,
+    /// 认领操作的 Unix 时间戳（秒）。
     claimed_at_unix: i64,
 };
 
+/// 原子认领未知 DHCP 客户端为 Node。
+///
+/// 执行以下检查：
+/// 1. 观察记录存在且 revision 匹配（乐观并发控制）。
+/// 2. 观察记录未被认领。
+/// 3. MAC 未被其他 Node 占用。
+///
+/// 成功后创建/更新 Node 并标记观察记录为已认领。
 pub fn claim(allocator: std.mem.Allocator, catalog: *model.Catalog, request: Claim) !void {
     var observation_index: ?usize = null;
     for (catalog.unknown_client_observations, 0..) |observation, index| {

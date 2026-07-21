@@ -1,34 +1,71 @@
+//! # Provisioning bundle catalog mutations
+//!
+//! 提供 provisioning bundle 和 step 的增删改查事务入口。
+//! 每个 mutation 执行 load-patch-validate-save 事务。
 const std = @import("std");
 const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
 const validate = @import("validate.zig");
 
-pub const Operation = enum { add, set, remove, move };
+/// Step 操作类型。
+pub const Operation = enum {
+    /// 追加新 step。
+    add,
+    /// 修改已有 step。
+    set,
+    /// 删除 step。
+    remove,
+    /// 重排序 step。
+    move,
+};
+/// 单个 step patch 参数。
 pub const Patch = struct {
+    /// 操作类型。
     operation: Operation,
+    /// step 名称（identity）。
     identity: []const u8,
+    /// move 操作时插入到此 step 之前。
     before: ?[]const u8 = null,
+    /// move 操作时插入到此 step 之后。
     after: ?[]const u8 = null,
+    /// set 操作时清除的字段列表。
     unset: []const []const u8 = &.{},
+    /// step 名称。
     name: ?[]const u8 = null,
+    /// step 动作类型（`repository`/`standard_packages`/`managed_file`）。
     action: ?[]const u8 = null,
+    /// `managed_file` 目标路径。
     destination: ?[]const u8 = null,
+    /// `managed_file` 内容资产引用。
     content_asset: ?[]const u8 = null,
+    /// `managed_file` 权限模式。
     mode: ?u16 = null,
+    /// `managed_file` 属主。
     owner: ?[]const u8 = null,
+    /// `managed_file` 属组。
     group: ?[]const u8 = null,
 };
+/// `managed_file` step 创建输入。
 pub const StepInput = struct {
+    /// step 名称。
     name: []const u8,
+    /// 动作类型固定为 `managed_file`。
     action: enum { @"managed-file" } = .@"managed-file",
+    /// 目标文件绝对路径。
     destination: []const u8,
+    /// 内容资产引用。
     content_asset: []const u8,
+    /// 权限模式。默认 `0644`。
     mode: u16 = 0o644,
+    /// 属主。默认 `root`。
     owner: []const u8 = "root",
+    /// 属组。默认 `root`。
     group: []const u8 = "root",
+    /// 转换为 `model.ProvisionStep`。
     pub fn modelValue(self: StepInput) model.ProvisionStep { return .{ .name = self.name, .action = .managed_file, .destination = self.destination, .content_asset = self.content_asset, .mode = self.mode, .owner = self.owner, .group = self.group }; }
 };
 
+/// 创建空 provisioning bundle。重复名称返回错误。
 pub fn create(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, path: []const u8, name: []const u8) !void {
     var parsed = try catalog_store.load(io, allocator, path); defer parsed.deinit();
     for (parsed.value.provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) return error.BundleAlreadyExists;

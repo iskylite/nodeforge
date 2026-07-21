@@ -16,17 +16,29 @@ const deployment_control = @import("state/deployment_control.zig");
 const model_transaction = @import("state/model_transaction.zig");
 const atomicWrite = @import("state/dhcp_store.zig").atomicWrite;
 
+/// `nodeforge setup` 收集的网络配置输入。
+///
+/// 这些字段在交互式提示中收集，生成初始 `config.json`。
 pub const Network = struct {
+    /// PXE 服务网卡名称（如 `enp1s0`）。DHCP 服务绑定该网卡收发广播。
     bind_interface: []const u8 = "eth0",
+    /// PXE 服务网对外 IPv4 地址。用于生成 HTTP/TFTP URL 和 DHCP next-server。
     server_ip: []const u8 = "192.168.50.1",
     /// HTTP/管理共用监听端口。默认 18080，避免与常见 Web 服务 8080 冲突；
     /// `nodeforge setup --http-port <n>` 可覆盖。
     http_port: u16 = 18080,
+    /// PXE 管理网 CIDR 子网。
     subnet: []const u8 = "192.168.50.0/24",
+    /// 动态地址池起始 IP。
     pool_start: []const u8 = "192.168.50.100",
+    /// 动态地址池结束 IP。
     pool_end: []const u8 = "192.168.50.200",
 };
 
+/// 根据网络配置和运行时路径生成初始 `AppConfig`。
+///
+/// 生成的配置使用 schema v3，只包含启动/策略输入，不含 catalog 实体。
+/// asset_root/repository_root 指向运行时路径中的目录。
 pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppConfig {
     return .{
         .schema_version = 3,
@@ -37,6 +49,13 @@ pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppCon
     };
 }
 
+/// 创建安装根下的全部子目录并设置安全权限。
+///
+/// 目录权限策略：
+/// - `750`：安装根、bin、systemd、logs、assets 及其子目录（iso/boot/repos/initrd/rootfs/bundles）。
+/// - `700`：config、catalog、state、keys、provisioned、run、work、import、model-transactions。
+///
+/// 错误时部分目录可能已创建，但 `setup` 的幂等性保证重试可完成。
 pub fn repairDirectories(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) !void {
     const cwd = std.Io.Dir.cwd();
     inline for (.{ p.bin_dir, p.systemd_dir, p.config_dir, p.catalog_dir, p.state_dir, p.logs_dir, p.iso_dir, p.boot_dir, p.repos_dir, p.keys_dir, p.initrd_dir, p.rootfs_dir, p.bundles_dir, p.provisioned_dir, p.run_dir, p.work_dir, p.import_dir, p.model_transactions_dir }) |directory|
@@ -66,6 +85,10 @@ pub fn installBundle(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
     try atomicWrite(io, p.marker_path, "nodeforge-root-v1\n");
 }
 
+/// 执行首次安装初始化：校验配置、安装二进制对、写入 config/catalog/systemd unit。
+///
+/// 如果提供了 `imported_config`，使用该配置而非 `generatedConfig` 的输出。
+/// 空 catalog（无 distro 索引）是合法的首次安装状态——首个 ISO 导入会创建能力记录。
 pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths, network: Network, imported_config: ?*const model.AppConfig) !void {
     const config = if (imported_config) |candidate| candidate.* else generatedConfig(p, network);
     // 空 distro 索引是正常的首次安装状态；首个通过媒体布局校验的 ISO
@@ -147,6 +170,13 @@ pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
     return true;
 }
 
+/// 重置运行态文件到干净状态，但保留 config/catalog。
+///
+/// 备份 leases/node-status/deployment-control/boot-sessions/inventory/operations
+/// 到 `<install-root>/backups/state-<timestamp>/`，删除原文件。
+/// 同时清空 `provisioned/` 目录。未完成的 model transaction journal 会先恢复再删除。
+///
+/// 返回备份目录路径，由调用方展示给操作员。
 pub fn resetState(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) ![]u8 {
     // Reset may archive completed evidence, but never deletes an unresolved
     // catalog/model journal. Both coordinators must reach a proven generation.
@@ -189,6 +219,11 @@ pub fn resetState(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     return backup;
 }
 
+/// 渲染 systemd unit 文件内容。
+///
+/// 生成的 unit 以 root 运行，显式收窄 bounding set 为
+/// `CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN`。
+/// `ExecStartPre` 执行 `--check` 预检，失败时 systemd 不会启动主进程。
 pub fn renderSystemd(allocator: std.mem.Allocator, p: *const paths_mod.Paths) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\[Unit]
@@ -214,14 +249,18 @@ pub fn renderSystemd(allocator: std.mem.Allocator, p: *const paths_mod.Paths) ![
     , .{ p.install_root, p.nodeforged_path, p.nodeforged_path });
 }
 
+/// 检查路径是否为常规文件（非目录/symlink/socket）。
 fn regularFile(io: std.Io, path: []const u8) bool {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
     return stat.kind == .file;
 }
+/// 检查路径是否存在（任何类型）。
 fn exists(io: std.Io, path: []const u8) bool {
     _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
     return true;
 }
+/// 比较两个路径的 canonical 绝对路径是否相同。
+/// 用于避免不必要的文件复制（原地安装场景）。
 fn samePath(io: std.Io, allocator: std.mem.Allocator, left: []const u8, right: []const u8) bool {
     const a = std.Io.Dir.cwd().realPathFileAlloc(io, left, allocator) catch return false;
     defer allocator.free(a);
@@ -230,6 +269,10 @@ fn samePath(io: std.Io, allocator: std.mem.Allocator, left: []const u8, right: [
     return std.mem.eql(u8, a, b);
 }
 
+/// 验证 daemon 二进制与当前 CLI 属于同一构建批次。
+///
+/// 执行 `daemon --version` 并比较版本字符串。版本不匹配时返回
+/// `BundleProvenanceMismatch`，防止混合不同版本的二进制对。
 fn verifyCompanion(io: std.Io, allocator: std.mem.Allocator, daemon: []const u8) !void {
     const version = @import("version.zig");
     const result = std.process.run(allocator, io, .{ .argv = &.{ daemon, "--version" }, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return error.BundleProvenanceMismatch;
@@ -244,12 +287,14 @@ fn verifyCompanion(io: std.Io, allocator: std.mem.Allocator, daemon: []const u8)
     if (!std.mem.eql(u8, std.mem.trim(u8, result.stdout, " \t\r\n"), expected)) return error.BundleProvenanceMismatch;
 }
 
+/// 计算字节的 SHA-256 摘要并以十六进制字符串输出到 64 字节缓冲区。
 fn sha256(bytes: []const u8, output: *[64]u8) void {
     var raw: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &raw, .{});
     _ = std.fmt.bufPrint(output, "{x}", .{raw}) catch unreachable;
 }
 
+/// 使用外部 `chmod` 命令设置目录权限。
 fn chmod(io: std.Io, allocator: std.mem.Allocator, mode: []const u8, path: []const u8) !void {
     const result = try std.process.run(allocator, io, .{ .argv = &.{ "chmod", mode, path }, .stdout_limit = .limited(1024), .stderr_limit = .limited(1024) });
     defer allocator.free(result.stdout);

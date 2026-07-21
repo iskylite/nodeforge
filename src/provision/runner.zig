@@ -17,6 +17,8 @@
 const std = @import("std");
 const model = @import("../model.zig");
 
+/// 将字符串用单引号包裹以安全嵌入 shell 命令。字符串内的单引号通过
+/// `'\''` 转义，这是 POSIX shell 中在单引号字符串中嵌入单引号的标准方法。
 fn writeShellQuoted(writer: *std.Io.Writer, value: []const u8) !void {
     try writer.writeByte('\'');
     for (value) |c| if (c == '\'') try writer.writeAll("'\\''") else try writer.writeByte(c);

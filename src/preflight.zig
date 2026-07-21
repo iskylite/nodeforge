@@ -58,6 +58,10 @@ pub fn checkInstallSourcePrerequisites(io: std.Io, allocator: std.mem.Allocator)
     std.Io.Dir.cwd().createDirPath(io, mount_check) catch return error.InstallSourceMountUnavailable;
 }
 
+/// 检查当前进程是否拥有 `CAP_SYS_ADMIN` Linux capability。
+///
+/// root 快速路径：systemd unit 以 root 运行并显式收窄 bounding set。
+/// 非 root 进程从 `/proc/self/status` 读取 `CapEff` 并检查 bit 21（CAP_SYS_ADMIN）。
 fn hasLinuxCapSysAdmin(io: std.Io, allocator: std.mem.Allocator) bool {
     // NodeForge 打包的 systemd unit 以 root 运行并显式收窄 bounding set。
     // 因此 root 是有效的快速路径；非 root 服务必须在下方证明其有效 capability。
@@ -72,6 +76,7 @@ fn hasLinuxCapSysAdmin(io: std.Io, allocator: std.mem.Allocator) bool {
     return effective & (@as(u64, 1) << 21) != 0;
 }
 
+/// 执行外部命令并检查退出码是否为 0。用于验证 `mount`/`umount` 可用性。
 fn commandSucceeds(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const result = try std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(1024), .stderr_limit = .limited(1024) });
     defer allocator.free(result.stdout);
@@ -82,6 +87,11 @@ fn commandSucceeds(io: std.Io, allocator: std.mem.Allocator, argv: []const []con
     }
 }
 
+/// 尝试绑定后立即释放 TCP 端口，用于发现 HTTP 端口占用。
+///
+/// 首先探测已有 TCP listener：connect 成功说明端口被占用。
+/// 连接失败后以 SO_REUSEADDR bind，避免 systemd 快速重启被 TIME_WAIT 窗口误伤。
+/// macOS 在两个 socket 都设置 SO_REUSEADDR 时允许共同 bind wildcard 地址。
 fn checkTcpBind(io: std.Io, ip: []const u8, port: u16) !void {
     const address = try std.Io.net.IpAddress.parseIp4(ip, port);
     // 首先探测已有 TCP listener。macOS 在两个 socket 都设置 SO_REUSEADDR

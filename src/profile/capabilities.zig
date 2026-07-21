@@ -1,10 +1,31 @@
-//! Adapter capability registry for every canonical mutable configuration path.
+//! # Adapter capability registry for every canonical mutable configuration path
+//!
+//! 记录每个可变配置域在 Kickstart 和 Autoinstall 适配器中的支持状态。
+//! 用于 CLI 展示能力矩阵和校验器拒绝不支持的配置组合。
 const std = @import("std");
 const model = @import("../model.zig");
 const properties = @import("../cli/properties.zig");
 
-pub const Status = enum { native, translated, not_applicable, unsupported };
-pub const Entry = struct { domain: []const u8, kickstart: Status, autoinstall: Status };
+/// 适配器能力状态。
+pub const Status = enum {
+    /// 原生支持，直接映射到安装器语法。
+    native,
+    /// 翻译支持，需要适配器转换为安装器等价语法。
+    translated,
+    /// 不适用于此适配器（如 apt 配置对 Kickstart 无意义）。
+    not_applicable,
+    /// 不支持，校验器拒绝此组合。
+    unsupported,
+};
+/// 单个配置域的适配器能力条目。
+pub const Entry = struct {
+    /// 配置域名称（如 `storage`、`system.ssh`）。
+    domain: []const u8,
+    /// Kickstart 适配器能力状态。
+    kickstart: Status,
+    /// Autoinstall 适配器能力状态。
+    autoinstall: Status,
+};
 
 pub const entries = [_]Entry{
     .{ .domain = "resource", .kickstart = .native, .autoinstall = .native },

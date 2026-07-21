@@ -14,15 +14,23 @@ const c = @cImport({
 pub const max_line_bytes = 8 * 1024;
 const truncation_suffix = "… [truncated]";
 
+/// 日志输出目标模式。控制日志行写入到终端、文件或两者。
 pub const OutputMode = enum(u8) {
+    /// 仅输出到 stderr（终端）。
     terminal,
+    /// 仅输出到文件 sink。
     file,
+    /// 同时输出到终端和文件。
     both,
 };
 
+/// 文件 sink 配置。在 daemon 启动时传入，用于初始化文件日志后端。
 pub const FileSinkConfig = struct {
+    /// 日志文件路径（相对于工作目录或绝对路径）。
     path: []const u8,
+    /// 单个日志文件最大大小（MB），超过后触发滚动轮转。
     max_size_mb: u16,
+    /// 保留的轮转文件数量（`.1` 到 `.<keep>`）。
     keep: u8,
 };
 
@@ -32,10 +40,13 @@ var sink_mutex: std.atomic.Mutex = .unlocked;
 var file_backend: ?FileSink = null;
 var config_io: ?std.Io = null;
 
+/// 设置当前进程的日志级别阈值。低于此级别的日志消息将被丢弃。
+/// 使用原子 store 确保多线程可见性。
 pub fn setLevel(level: std.log.Level) void {
     threshold.store(@intFromEnum(level), .release);
 }
 
+/// 检查指定级别的日志是否应被输出。在 `logFn` 中调用以实现运行时级别过滤。
 pub fn enabled(comptime level: std.log.Level) bool {
     return @intFromEnum(level) <= threshold.load(.acquire);
 }
@@ -54,10 +65,16 @@ pub fn configure(io: std.Io, mode: OutputMode, file: ?FileSinkConfig) void {
     } else null;
 }
 
+/// 文件日志后端的运行时状态。跟踪当前文件路径、大小限制、轮转保留数
+/// 和降级计数器。降级计数器在写入失败时递增，超过阈值后禁用文件 sink。
 const FileSink = struct {
+    /// 日志文件路径。
     path: []const u8,
+    /// 单个日志文件最大大小（字节）。
     max_size_bytes: u64,
+    /// 保留的轮转文件数量。
     keep: u8,
+    /// 连续写入失败次数。用于节流诊断和最终降级决策。
     degraded_count: u64 = 0,
 
     fn writeOrReportDegraded(self: *FileSink, io: std.Io, line: []const u8) bool {
@@ -78,6 +95,8 @@ const FileSink = struct {
         return true;
     }
 
+/// 文件写入的内部实现。先检查是否需要滚动轮转，然后以追加模式写入文件。
+/// 文件不存在时自动创建。
     fn writeLine(self: *FileSink, io: std.Io, line: []const u8) !void {
         const dir = std.Io.Dir.cwd();
         try rotateIfNeeded(io, dir, self.path, self.max_size_bytes, self.keep, line.len);
@@ -91,6 +110,9 @@ const FileSink = struct {
     }
 };
 
+/// 检查当前日志文件大小是否超过限制，如超过则执行滚动轮转。
+/// 轮转策略：删除最旧的 `.<keep>` 文件，将 `.<n>` 重命名为 `.<n+1>`，
+/// 最后将当前文件重命名为 `.1`，使新日志写入全新的当前文件。
 fn rotateIfNeeded(io: std.Io, dir: std.Io.Dir, path: []const u8, max_size: u64, keep: u8, line_len: usize) !void {
     const current_size: u64 = blk: {
         var file = dir.openFile(io, path, .{}) catch |err| switch (err) {
@@ -184,6 +206,9 @@ fn localRfc3339Now(buffer: *[25]u8) ![]const u8 {
     return buffer;
 }
 
+/// std.log 的自定义日志函数。由 Zig 编译器在每个 `log.info()` 等调用点展开调用。
+/// 渲染有界日志行后，在 sink mutex 保护下写入配置的输出目标（终端/文件/两者）。
+/// 文件写入失败时降级为 stderr，并按节流策略报告降级状态。
 pub fn logFn(
     comptime level: std.log.Level,
     comptime scope: @EnumLiteral(),

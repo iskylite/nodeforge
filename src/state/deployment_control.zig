@@ -12,10 +12,12 @@ const plan_digest = @import("plan_digest.zig");
 pub const Digest = plan_digest.Digest;
 pub const empty_digest: Digest = [_]u8{0} ** 64;
 
+/// 判断 digest 是否已设置（非全零）。
 pub fn digestSet(value: Digest) bool {
     return !std.mem.allEqual(u8, &value, 0);
 }
 
+/// 使用恒定时间比较两个 digest 是否相等，防止时序侧信道攻击。
 pub fn digestEqual(a: Digest, b: Digest) bool {
     return std.crypto.timing_safe.eql(Digest, a, b);
 }
@@ -31,6 +33,9 @@ pub const ModelRevision = struct {
     catalog: u64,
     desired_digest: [64]u8,
 
+    /// 将 desired_digest 前 16 个字符解析为 u64，作为旧 schema/CLI 兼容的
+    /// 紧凑 revision 投影。0 保留为 unavailable sentinel，映射为 1。
+    /// 该值没有递增或大小顺序语义，仅用于 ETag 和旧 API 兼容。
     pub fn desiredRevision(self: ModelRevision) u64 {
         const value = std.fmt.parseInt(u64, self.desired_digest[0..16], 16) catch unreachable;
         return if (value == 0) 1 else value;
@@ -42,7 +47,15 @@ const capacity = @import("capacity.zig");
 /// `max(受管节点数, config)` 派生（`min(派生, max_entries)`）。
 pub const max_entries = capacity.store_ceiling;
 
-pub const RequestSource = enum { initial, operator, policy_always };
+/// generation 武装的请求来源。用于区分初始武装、操作员手动 retry 和策略自动 retry。
+pub const RequestSource = enum {
+    /// daemon 首次观测到节点时的自动武装（generation 1）。
+    initial,
+    /// 操作员通过 CLI/API 显式请求的 retry。
+    operator,
+    /// `deploy.always` 策略在 terminal 后自动触发的 retry。
+    policy_always,
+};
 
 pub const Entry = struct {
     node_id: [96]u8 = [_]u8{0} ** 96,
@@ -72,9 +85,11 @@ pub const Entry = struct {
     deployed_at: i64 = 0,
     requested_by: RequestSource = .initial,
 
+    /// 返回 node_id 的有效切片。
     pub fn node(self: *const Entry) []const u8 {
         return self.node_id[0..self.node_id_len];
     }
+    /// 该条目是否被使用（node_id_len != 0）。
     pub fn used(self: *const Entry) bool {
         return self.node_id_len != 0;
     }
@@ -104,8 +119,12 @@ pub const DiskEntry = struct {
     requested_by: RequestSource = .initial,
 };
 
+/// 持久化文件格式。schema_version 1/2/3 均可加载；schema 3 新增 plan digest 字段。
 pub const File = struct { schema_version: u32 = 3, revision: u64 = 0, entries: []const DiskEntry = &.{} };
 
+/// `rearm` 操作的返回结果。`changed=false` 表示幂等复用；`changed=true` 表示
+/// 创建了新 generation 或替换了待执行的 generation。持久化失败时调用方使用
+/// `previous_*` 字段通过 `rollbackRearm` 恢复内存状态。
 pub const RearmResult = struct {
     generation: u64,
     changed: bool,
@@ -124,6 +143,8 @@ pub const RearmResult = struct {
     previous_deployed_at: i64 = 0,
 };
 
+/// `consume` 操作的返回结果。持久化失败时调用方使用 `previous_*` 字段
+/// 通过 `rollbackConsume` 恢复内存状态。
 pub const ConsumeResult = struct {
     generation: u64,
     previous_consumed_generation: ?u64,
@@ -131,6 +152,8 @@ pub const ConsumeResult = struct {
     previous_consumed_plan_digest: Digest,
 };
 
+/// `markTerminal` 操作的返回结果。持久化失败时调用方使用 `previous_*` 字段
+/// 通过 `rollbackTerminal` 恢复内存状态。
 pub const TerminalResult = struct {
     generation: u64,
     previous_terminal_generation: ?u64,
@@ -203,6 +226,7 @@ pub const Store = struct {
         }
     }
 
+    /// 检查节点是否有一个待执行的 armed generation。
     pub fn isArmed(self: *Store, node_id: []const u8) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -220,7 +244,7 @@ pub const Store = struct {
         return false;
     }
 
-    /// `install.started` 精确消费当前已武装的 generation。
+    /// `install.started` 精确消费当前已武装的 generation（不带时间戳版本）。
     pub fn consume(self: *Store, node_id: []const u8) !?ConsumeResult {
         return self.consumeAt(node_id, 0);
     }
@@ -299,6 +323,8 @@ pub const Store = struct {
         return .{ .generation = generation, .changed = true, .previous_next_generation = previous_next, .previous_requested_revision = entry.consumed_revision, .previous_requested_plan_digest = entry.consumed_plan_digest, .previous_started_at = previous_started, .previous_finished_at = previous_finished, .previous_deployed_at = previous_deployed };
     }
 
+    /// 回滚一次 `consume` 操作。当原子状态写入失败时，将 consumed generation
+    /// 恢复到 previous 值并重新武装被消费的 generation。
     pub fn rollbackConsume(self: *Store, node_id: []const u8, result: ConsumeResult) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -332,6 +358,8 @@ pub const Store = struct {
         };
     }
 
+    /// 检查节点是否可以自动重新武装（`deploy.always` 策略）。
+    /// 条件：无 armed generation，有 consumed generation，且 consumed 已 terminal。
     pub fn canAutoRearm(self: *Store, node_id: []const u8) bool {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -376,6 +404,8 @@ pub const Store = struct {
         return null;
     }
 
+    /// 回滚一次 `markTerminal` 操作。当持久化失败时恢复 terminal/applied/deployed
+    /// 字段到 previous 值。
     pub fn rollbackTerminal(self: *Store, node_id: []const u8, result: TerminalResult) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -399,6 +429,7 @@ pub const Store = struct {
         return .unknown;
     }
 
+    /// 返回指定节点的只读视图快照。返回值拷贝，不持有 mutex。
     pub fn view(self: *Store, node_id: []const u8) ?View {
         lock(&self.mutex);
         defer self.mutex.unlock();
@@ -421,28 +452,33 @@ pub const Store = struct {
         return null;
     }
 
+    /// 在锁内快照全部条目到 out 数组。用于运行时查询。
     pub fn snapshot(self: *Store, out: *[max_entries]Entry) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         out.* = self.entries;
     }
+    /// 在锁内快照全部条目并返回下一个 revision 号。用于持久化前的原子快照。
     pub fn snapshotForSave(self: *Store, out: *[max_entries]Entry) u64 {
         lock(&self.mutex);
         defer self.mutex.unlock();
         out.* = self.entries;
         return self.revision + 1;
     }
+    /// 提交持久化后的 revision 号。只在 revision 大于当前值时更新。
     pub fn commitRevision(self: *Store, revision: u64) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         if (revision > self.revision) self.revision = revision;
     }
+    /// 返回当前 revision 号。用于检测状态是否发生变化。
     pub fn currentRevision(self: *Store) u64 {
         lock(&self.mutex);
         defer self.mutex.unlock();
         return self.revision;
     }
 
+    /// 在锁内查找已有条目或创建新条目。容量检查使用 `effective` 而非 `max_entries`。
     fn findOrCreateLocked(self: *Store, node_id: []const u8) !*Entry {
         if (node_id.len == 0 or node_id.len > 96) return error.InvalidNodeId;
         var free: ?*Entry = null;
@@ -459,6 +495,8 @@ pub const Store = struct {
     }
 };
 
+/// 从持久化文件加载 deployment-control 状态到内存 store。
+/// 支持 schema 1/2/3；schema 3 新增 plan digest 字段。加载后更新 effective 容量。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
@@ -508,6 +546,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     store.effective = @max(store.effective, count);
 }
 
+/// 解析 64 字符小写十六进制 plan digest。null 或长度不为 64 返回错误。
 fn parseDigest(value: ?[]const u8) !Digest {
     if (value == null) return empty_digest;
     if (value.?.len != 64) return error.InvalidDeploymentControl;
@@ -519,6 +558,8 @@ fn parseDigest(value: ?[]const u8) !Digest {
     return result;
 }
 
+/// 校验 generation 序列的逻辑一致性。返回 false 表示文件损坏。
+/// terminal <= consumed 是合法的（正在进行的安装比上次完成的更新）。
 fn validGenerations(entry: DiskEntry) bool {
     if (entry.next_generation == 0) return false;
     if (entry.armed_generation) |generation| if (generation == 0 or generation >= entry.next_generation) return false;
@@ -535,6 +576,7 @@ fn validGenerations(entry: DiskEntry) bool {
     return true;
 }
 
+/// 校验 node ID 只包含字母、数字、连字符和下划线，长度 1-96。
 fn validNodeId(value: []const u8) bool {
     if (value.len == 0 or value.len > 96) return false;
     for (value) |byte| if (!((byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9') or byte == '-' or byte == '_')) return false;
@@ -590,6 +632,9 @@ test "M4.7 config revision excludes catalog-owned profiles" {
     try std.testing.expect((try revisionForConfig(std.testing.allocator, &config)) != expected);
 }
 
+/// 将内存 store 序列化为紧凑 JSON 并通过原子写保存到磁盘。
+/// 只序列化已使用的条目（跳过空闲槽位），避免磁盘上的 NUL 填充浪费。
+/// 保存后调用 `commitRevision` 更新内存中的 revision 号。
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store) !void {
     var entries: [max_entries]Entry = undefined;
     const revision = store.snapshotForSave(&entries);
@@ -629,6 +674,7 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     store.commitRevision(revision);
 }
 
+/// 自旋等待获取 mutex。generation 操作时间极短，自旋比系统 futex 更高效。
 fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }
