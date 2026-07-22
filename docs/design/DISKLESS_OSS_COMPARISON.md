@@ -1,8 +1,10 @@
 # NodeForge 无盘方案开源情报对比
 
-状态：设计参考。本文调研主流开源 diskless/stateless 方案，对照 NodeForge v0.2 约束给出选型依据，
+状态：非规范性参考资料。本文调研主流开源 diskless/stateless 方案，对照 NodeForge v0.2 约束给出选型依据，
 是 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) §3 的完整版。最终方案见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，
 版本边界见 [`V0_2_DESIGN.md`](V0_2_DESIGN.md)。
+
+本文只解释“为什么这样选”，不定义产品行为；出现差异时以总纲和对应设计分册为准。
 
 ## 1. 调研范围与 NodeForge 约束
 
@@ -68,7 +70,7 @@ NodeForge v0.2 的 diskless 必须满足以下硬约束（均来自 [`V0_2_DESIG
 
 - **机制**：PXE 引导最小 OS 镜像，ignition 配置在 initrd 阶段注入。
 - **参考价值**：ignition 的“配置不烤入镜像、boot 时注入”理念与 NodeForge BootConfig 一致
-  （per-boot/per-Node DTO 经 initrd 拉取，差异落 overlay upper）。但 CoreOS 是不可变专用 OS，NodeForge 需要
+  （per-boot/per-Node DTO 经 initrd 拉取并交接，由最终 rootfs 的 agent pre-init 将差异落 overlay upper）。但 CoreOS 是不可变专用 OS，NodeForge 需要
   通用发行版（Rocky/Ubuntu）rootfs，故只借鉴理念、不采用其 OS 与 ignition 格式。
 - **结论**：理念借鉴，不采用。
 

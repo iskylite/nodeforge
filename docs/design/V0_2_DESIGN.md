@@ -1,8 +1,38 @@
 # NodeForge v0.2 设计范围
 
-状态：设计冻结，实现未开始。本文只定义 v0.2 边界和进入条件；在 v0.1 完成前，不把这里的类型、命令或脚手架
-描述为已实现能力。完整 CLI 接口见 `V0_2_CLI.md`，实现细节见 `V0_2_IMPL_DETAILS.md`，diskless 收敛见
-`DISKLESS_FINAL.md`，程序边界见 `V0_2_PROGRAM_DESIGN.md`。
+状态：设计冻结，实现未开始。本文是 v0.2 的**唯一总纲入口**，负责版本边界、跨分册不变式、实现切片和完成标准；
+在 v0.1 完成前，不把这里的类型、命令或脚手架描述为已实现能力。具体架构、程序、实现、CLI 和操作细节由下列
+分册各自负责，本文不重复维护其完整细节。
+
+## 0. 文档结构与阅读路径
+
+### 0.1 总分职责
+
+| 层级 | 文档 | 唯一职责 | 不负责 |
+|---|---|---|---|
+| 总纲 | 本文 `V0_2_DESIGN.md` | 版本范围、继承契约、跨域不变式、实现切片、完成标准 | 完整命令参数、逐状态转移、操作教程 |
+| 架构分册 | [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) | squashfs overlay、共享 rootfs、BootConfig、启动/恢复/安全时序 | CLI 语法、代码模块任务 |
+| 程序分册 | [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md) | `nodeforged`、`nodeforge-initrd`、`nodeforge-agent` 的职责和凭据边界 | 命令参考、逐协议状态机 |
+| 实现分册 | [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) | 状态机、协议栈、compiler/readiness/validator、builder、迁移 | 操作员教程、方案选型论证 |
+| 接口分册 | [`V0_2_CLI.md`](V0_2_CLI.md) | CLI 命令树、参数、CAS、输出和 exit code | 内部模块如何实现 |
+| 流程分册 | [`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md) | 从空 catalog 到启用、观测和恢复的端到端操作顺序 | 穷举字段和内部状态转移 |
+| 参考资料 | [`DISKLESS_OSS_COMPARISON.md`](DISKLESS_OSS_COMPARISON.md) | 选型依据和开源方案对比 | 规范性产品行为 |
+
+审计文件位于 `docs/audits/`，只记录代码事实、发现和设计修订证据，不定义产品行为。
+
+### 0.2 推荐阅读
+
+- 评审版本范围：本文 -> 架构分册 -> 完成标准。
+- 开始实现：本文 -> 程序分册 -> 实现分册 -> 接口分册。
+- 使用或验收 CLI：流程分册 -> 接口分册 -> 本文 §9。
+- 追溯选型：架构分册 -> 参考资料；无需先读实现分册。
+
+### 0.3 冲突裁决
+
+跨版本范围和完成标准冲突时以本文为准；同一领域的细节冲突时，以职责表中对应分册为准。例如 CLI flag 以
+`V0_2_CLI.md` 为准，BootSession 转移以 `V0_2_IMPL_DETAILS.md` 为准，BootConfig/启动时序以
+`DISKLESS_FINAL.md` 为准。流程分册中的命令是串联示例，不能覆盖接口分册；参考资料和审计不能覆盖任何设计文档。
+发现跨分册冲突时必须同时修正引用方，不能通过再新增一份“最终版”文档解决。
 
 ## 1. 进入条件
 
@@ -26,7 +56,7 @@ v0.2 聚焦 diskless 主流程。原 M5-M7 拆分到三个版本，避免把 VMw
 |---|---|---|
 | v0.2 | diskless only | M5 内存无盘启动 + M7 diskless 后处理（`rootfs-build`/`first-boot`） |
 | v0.3 | PXELINUX/BIOS install | M6 BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v5 + M7 `install-post`，见 `V0_3_DESIGN.md` |
-| v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、远程/节点上 rootfs 构建（agent 驱动）；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
+| v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 | v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
 
 下文 M5-M7 仍按里程碑组织，每节标注其目标版本；未标 v0.2 的内容不计入 v0.2 完成。
@@ -43,8 +73,9 @@ v0.2 聚焦 diskless 主流程。原 M5-M7 拆分到三个版本，避免把 VMw
 - diskless readiness、status、failure quarantine、retry 和事件闭环。
 - target-system、software 和 kernel arguments 直接复用 v0.1 effective compiler。
 
-Diskless 不消费安装磁盘选择器，但必须复用同一个 Profile/Node override 模型，不能建立第二套
-users/packages/network 默认值。
+Diskless 不消费安装磁盘选择器，但必须复用同一个 Profile/Node owner、PropertySpec 与 override merge 框架，不能建立第二套
+users/packages/network 默认值。凡是描述“最终运行系统”的 system/software/kernel/network override，diskless 与 install
+使用同一 effective 语义；只有 partition/bootloader/reinstall/completion 等依赖安装生命周期或持久磁盘的字段不适用。
 
 ### M6：支持矩阵增强（BIOS/发行版 -> v0.3；多 NIC/容量 -> v0.4）
 
@@ -57,7 +88,7 @@ IPv6 是项目永久非目标，不进入 M6 或后续 schema。BIOS 与更多�
 
 M6 整体属 v0.3（BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v5），不属 v0.2 diskless 主流程；
 diskless 最小功能并发已在 M5（v0.2）验证。其中 PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网，
-以及大规模容量压测，在 VMware 难以有效验证且不属主流程，**延后到 v0.4**（需显式 initrd feature、schema 和验收）。
+以及大规模容量压测，在 VMware 难以有效验证且不属主流程，**延后到 v0.4**（需显式 consumer feature、schema 和验收）。
 
 ### M7：补充包和后处理增强（rootfs-build/first-boot -> v0.2；install-post -> v0.3；install-agent -> v0.4；reconciliation 永久非目标）
 
@@ -75,7 +106,8 @@ capability/selection，不再引入 `standard_packages` 作为第四个包配置
 
 v0.2 不是在 M5-M7 命令旁保留旧 M4 语义的并行产品。以下契约原样继承：
 
-- Resource 回答“有什么可用”，Profile 选择共享策略，Node 保存机器 direct facts 和 policy override，
+- Resource 回答“有什么可用”，InstallSource 是 install/diskless Profile 的共同 OS 来源，Profile 选择共享基线，
+  Node 保存机器 direct facts 和 policy override，
   Effective 是唯一编译结果，Runtime/Observed 不反向成为 desired 默认值。
 - `show key == --help-full key == parser key == API operation path`；新增 mutable key 必须先注册 PropertySpec。
 - scalar collection 注册 CollectionSpec，structured collection 注册 ItemSpec 和稳定 identity；CLI mutation
@@ -89,16 +121,23 @@ v0.2 不是在 M5-M7 命令旁保留旧 M4 语义的并行产品。以下契约�
   artifact stdout 命令继续作为明确白名单，不注册含义冲突的 `--output`。
 - capability、resource revision、Profile selection、Node delta 和 effective plan 必须共同进入 plan digest；
   renderer/initrd/runner 不得自行实现 fallback。
-- 软件 delta 原样继承 v0.1 的完整路径：`packages.include.add/remove` 与
+- 软件 delta 的 canonical path 原样继承 v0.1：`packages.include.add/remove` 与
   `packages.exclude.add/remove` 分别修改两个 Profile 集合；不得在 v4 合并成含义不明的 `packages.add/remove`。
+  Profile 与 Node 在 install/diskless 下都继续沿用 v0.1 merge 行为；diskless 只是把 Node software delta 延后到
+  切根后的 agent `node-apply`，不把它烤入公共 rootfs。
 - 其他 override path 同样不改名：NTP/SSH key 使用各自 `add/remove`，users/partitions 使用 nullable ordered
   replacement，`kernel_args` 使用 `overrides.kernel_args.add/remove` 并按参数名合并。Diskless 不能建立第二套 delta。
 - 原样继承 v0.1 的默认普通用户 `nodeforge/asdf1234`、默认 root 密码 `asdf1234` 及其明文
   Profile/Node override 契约；不新增第二套默认用户/密码、默认包列表、target network 或 kernel arguments。
 
-明文 password 是 desired 配置事实，不是节点交付格式。DisklessEffectivePlan 在受控编译阶段使用 v0.1
-PasswordHasher 派生发行版兼容的 `$6$` hash；BootConfig 只携带 root/普通用户 hash 和 public authorized key，
-绝不携带明文 password、SSH private key 或 bootstrap private key。hash、完整 `target_system`、capability 和请求/响应
+明文 password 是 desired 配置事实，不是节点交付格式。Profile 基线密码由 rootfs builder 使用 v0.1
+PasswordHasher 派生发行版兼容的 `$6$` hash 并写入共享 rootfs；但 diskless 不能直接沿用 install 的 per-session salt。
+每个 Profile password credential revision 在创建/修改事务中用 CSPRNG salt 生成一次 hash 并安全持久化，普通 plan/build/
+`--verify-reproducibility` 始终复用该 hash；只有显式修改密码才产生新 credential/Profile revision 和新 input digest。
+Install Profile 继续保持 v0.1 的既有免密与 password 渲染逻辑。Node password/authorized_keys/hosts 等 override
+由 DisklessEffectivePlan 编译为 node-bound AgentPlan/target-system projection；最小 BootConfig 不携带账号配置，AgentPlan
+只携带该节点必需的 hash/公钥/文件差量，
+不携带明文 password 或 Profile 共享 SSH private keys。hash、完整 `target_system`、capability 和请求/响应
 body 均视为敏感数据：不得进入 access log、Event、错误信封或 CLI 普通输出，结构化诊断最多报告 changed/fingerprint
 和非 secret 摘要。
 
@@ -117,22 +156,29 @@ v0.2 使用唯一的 catalog schema v4，同时包含 M5 diskless tagged Profile
 长期接受 nullable 半成品。v0.3 的 `firmware.mode` 与 `install-post` 使用 schema v5；v0.4 使用 schema v6；
 v0.5 rootfs 形态使用 schema v7。不能在已经发布的 schema 号下静默改变 shape。每次迁移都需
 plan/digest/apply/rollback、活动 session 保护和 manifest transaction。v0.1 install
-Profile 在 v4 映射到 `ProfileKind.install`；diskless Profile 必须引用完整 boot bundle（source + kernel +
-nodeforge-initrd，明确不含 rootfs）。build readiness 通过后才允许构建派生 rootfs，boot readiness 通过后才允许
+Profile 在 v4 映射到 `ProfileKind.install`；install/diskless Profile 都必须引用唯一 InstallSource，diskless Profile
+另引用与该 source 一致的完整 boot bundle（source + kernel + nodeforge-initrd，明确不含 rootfs）。build readiness
+通过后才允许构建派生 rootfs，boot readiness 通过后才允许
 `deploy=true`。
 v4-v7 复用 v0.1 已落地的 schema-v3 发布事务机制：plan/digest、journal、apply/rollback 与 daemon 启动崩溃恢复沿用
 同一套 `.schema-v3` 风格事务目录与活动 session snapshot，不为每个版本另起迁移原语。`catalog/schema_v3.zig` 现拒绝
 `schema_version > 3`，后续各版本新增对应 parser 校验分支并把 config 与 catalog 的 `schema_version` 同步提升；
 旧 parser 不得接受半成品 nullable v0.2 shape。
 
+这里的 rollback 只表示 migration transaction finalize 前从 durable journal 恢复 pre-migration snapshot，不等于允许
+任意版本 downgrade。已写入目标旧 schema 无法表达的新 kind/field/item 后，downgrade preflight 必须返回
+`migration.non_representable` 并列出 resource/path/reason；不得丢字段、改成 nullable 或丢 collection identity/order。
+active/recoverable session 始终消费创建时 immutable snapshot，不随 catalog apply/rollback/downgrade 重编译。统一细节见
+[`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) §5，v0.3-v0.5 迁移均复用该契约。
+
 ### 3.1 schema v3 到 v4 的唯一转换
 
 | v0.1 schema v3 事实 | v0.2 schema v4 处理 | 禁止的替代实现 |
 |---|---|---|
 | install Profile + `install_source` | 包入 `ProfileKind.install`，共享 policy path 原样保留 | 同时保留旧 nullable source 和新 kind |
-| 无 diskless Profile | 新增 `ProfileKind.diskless` + 必填 `boot_bundle`（source+kernel+initrd） | 在 v3 预留 nullable bundle、把派生 rootfs 塞入 bundle或 mode |
+| 无 diskless Profile | 新增 `ProfileKind.diskless` + 必填 `install_source` + `boot_bundle`（两者 source 一致） | 在 v3 预留 nullable bundle、把派生 rootfs 塞入 bundle或 mode |
 | Node direct identity/network/storage | 原样继承；diskless effective 对 storage 标记 not-applicable | 建立 diskless 私有 network/storage 默认值 |
-| Node policy overrides | 共享 `system.*`、`software.*`、`kernel_args`；install-only key 对 diskless fail closed | 为 diskless 复制 users/packages/kernel args |
+| Node policy overrides | 原样共享 v0.1 `system.*`、`software.*`、`kernel_args` 合并语义；全部 target-system 差量由最终 rootfs 内的 agent pre-init 写运行根 | 为 diskless 复制 users/packages/kernel args、让 initrd 实现第二套 projector 或按 Node 重建 rootfs |
 | install source/repository software revision | rootfs build 和 diskless plan 固定引用同一 capability identity | rootfs 内包集合与 show/effective selection 各自漂移 |
 | `AssetKind.kernel` 仅表示 installer kernel | 新增 `runtime_kernel`，由本地 kernel package + modules closure prepare | 默认把 installer kernel 当运行 kernel |
 | discovery policy/observation + claim | 原样继承 daemon-owned singleton、观察资源和审计 | 恢复 discovery Profile、startup unknown policy 或 unknown auto-diskless |
@@ -140,44 +186,74 @@ v4-v7 复用 v0.1 已落地的 schema-v3 发布事务机制：plan/digest、jour
 | schema v3 effective/digest | v4 compiler 扩展 tagged branch，并保持一个 canonical digest 输入 | renderer/initrd/HTTP handler 各自补默认值 |
 
 v4 migration 只改变 Profile 的外层 discriminated shape；不能借机移动 v3 已冻结 owner。转换计划必须逐个列出
-Profile、引用它的 Node、旧/新 effective digest 和 active session 阻塞原因。rollback 恢复完整 v3 manifest；
-不能生成 v3 无法表示的 diskless Profile 后再回滚到部分 nullable 数据。
+Profile、引用它的 Node、旧/新 effective digest 和 active session 阻塞原因。事务 finalize 前 rollback 恢复完整 v3
+manifest；一旦 catalog 已写入 diskless Profile，降回 v3 必须以 `migration.non_representable` 拒绝，不能生成部分 nullable 数据。
 
 ## 4. M5 具体继承与变更
 
 ### 4.1 Profile 与 effective plan / rootfs 共享模型
 
-M5 把 v0.1 单一 install Profile 扩展成 tagged union（`ProfileKind = install | diskless`）。diskless effective
-compiler 复用 v0.1 effective compiler，增 `kind=diskless` tagged branch；diskless 不消费安装磁盘选择器，但复用
-同一 Profile/Node override 模型，不建第二套 users/packages/network 默认值。
+M5 把 v0.1 单一 install Profile 扩展成 tagged union（`ProfileKind = install | diskless`）。ISO 导入先产生
+InstallSource，install Profile 和 diskless Profile 都从 InstallSource 创建/派生；两者共用 v0.1 的 Profile + Node override
+effective compiler 与适用 override 语义。差别只在落地时点：install 由 Kickstart/Autoinstall 把 effective plan
+写入磁盘；diskless 先由 Profile revision 生成唯一共享 rootfs lower，再把 Node effective override 写入
+per-boot overlay upper。不得为 Node 生成另一份 rootfs。
 
 Node 只持有一个 Profile ref，因此任一 desired revision 只能解析出一个 kind。runtime current state 同样是
 `install|diskless` tagged union：同一 Node 最多一个 active session，不保存可同时非空的 install/diskless 状态。
 换绑到另一 kind 只允许 `deploy=false` 且无 active/recoverable session；旧 kind 只保留在带 session/digest 的历史审计。
 
-**单一共享 rootfs**。M5 固定采用单一共享 rootfs：rootfs builder 从 effective plan 生成 rootfs（OS 层经
-发行版 install-root 工具烤入 effective software/system + `rootfs-build` phase 业务内容 + Profile 级 target-system 骨架），
-按 `rootfs_input_digest` 缓存。cache key 覆盖 build-safe effective system/software（含 Node 软件 override）、
-`rootfs-build` phase、first-boot manifest/payload/package closure、Profile 级 target-system 骨架和 builder ABI，
-**不含 Node identity/network/secrets**：两个 Node
-effective 配置相同即共享同一 rootfs，相同输入复用、任一输入变化产生新 rootfs。Node 只有在 rootfs ready 后才可
-diskless boot。M5 不依赖尚未实现的 M7 first-boot 安装包，也不允许先启动半成品 rootfs 后把缺失 package 留给运行期
-补齐。reconciliation 为永久非目标（见 §7），但不能改变历史 session snapshot 指定的 rootfs。
+**Profile revision 对应一个共享 rootfs**。rootfs builder 只从 Profile build projection 生成 rootfs（OS 层经
+发行版 install-root 工具烤入 Profile software/system + `rootfs-build` phase 业务内容 + target-system），
+按 `rootfs_input_digest` 缓存。cache key 覆盖 Profile 固定的 system/software、`rootfs-build` phase、Profile first-boot
+manifest/payload/package closure、source/kernel/repository revisions、构建参数和 builder ABI，**不含任何 Node 输入**。
+同一 Profile revision 的所有 Node 必须解析到同一个 `rootfs_input_digest`；不同 Profile 若 canonical build projection
+完全相同，可以在内容寻址存储层去重，但产品语义仍是 Profile 拥有构建结果。Node 只有在该 Profile rootfs ready 后才可
+diskless boot。v0.2 同版交付 M7 的 `rootfs-build`/`first-boot`，其固定 manifest、asset 与 package closure 必须在
+rootfs ready 前完整预置；不允许先启动半成品 rootfs 后把缺失 package 留给运行期补齐。reconciliation 为永久非目标
+（见 §7），但不能改变历史 session snapshot 指定的 rootfs。
 
-rootfs 是由 effective plan 派生、按 `rootfs_input_digest` 跨 Node 共享的缓存制品，不是可手工编辑的 catalog Resource、
-也不绑定单个 Node。OS 层（effective software/system 镜像）可由 builder 内部按 software digest 缓存复用（业务内容
-变更不重建 OS 层），但对设计透明、不作为独立 Resource 暴露。per-Node 数据（hostname、`$6$` 密码 hash、authorized
-key、machine-id、SSH host key、节点静态网络）不烤入 rootfs，而由 BootConfig 在 boot 时写入 overlay upper（见 §4.3、
-§4.4 边界表），故 rootfs lower 不含节点专属机密、可跨 Node 共享。Node 软件 override 改变 effective software、会
-产生不同 rootfs；Node 的机密/网络 override 只影响 overlay、不分裂 rootfs。rootfs 经 `assets rootfs list|show`
-（按 digest 只读列出）或 `node rootfs status <node>`（节点解析）查询，由显式
-`node rootfs build <node> --if-input-digest ...` 构建；readiness 不暗中触发有副作用的构建。下载经绑定自身的
+rootfs 是由 Profile build projection 派生、按 `rootfs_input_digest` 存储的只读缓存制品，不是可手工编辑的 catalog
+Resource。账号、固定 UID/GID/group/sudo、password hash、公共 `/etc/hosts`、sshd policy、SSH client 公钥/私钥和
+`authorized_keys` 都是 Profile 共享基线，在 build 时写入 rootfs。每个 diskless Profile 在首次 rootfs build 前
+由 Profile create/clone 的 rootfs-build preparation 自动生成并固定 Profile 级 SSH client keypair 和 sshd host keys；client public key 与配置的管理/其他节点公钥
+合并到对应账号 `authorized_keys`，client private key 按 0600 写入账号 `.ssh`。同 Profile 节点因而共享该
+SSH 信任基线并可相互免密。自动生成的 Profile client public key 是域内互信的 mandatory key，不属于
+`authorized_keys.remove` 可删除的管理员 key；Node 可以追加 key，或删除其他可删除的继承 key。Node password、
+`authorized_keys`、公共 hosts 等 override 不修改 rootfs lower，由 agent pre-init 从 AgentPlan 写入 overlay upper，并按
+Node effective hosts 重新生成该节点的 `ssh_known_hosts`。hostname、网络、machine-id 与 session credential 同样属于
+Node boot projection。sshd 仍必须使用 `/etc/ssh/ssh_host_*_key` 完成 SSH 握手，但在“信任整个 Profile 域”的模型下，
+这些文件也是 Profile 公共基线：同 Profile 节点共享 host key 和 host fingerprint，不把 fingerprint 当作 Node 唯一身份。
+rootfs 同时写入由 Profile `system.hosts` 中全部 address/names/aliases 与共享 host public key 生成的
+`/etc/ssh/ssh_known_hosts`，使同域节点首次连接也无需人工确认。只要 Profile `system.hosts` 覆盖全部节点
+address/name/alias、SSH policy 保持启用且后处理没有显式改写这些文件，任意规模的同 Profile 节点都使用同一 client key
+完成双向免密，并使用同一 Profile host fingerprint 完成服务端校验。rootfs 经 `profile rootfs plan|status`
+（Profile 归属）或 `assets rootfs list|show`（按 digest 查看物理对象）查询，由显式
+`profile rootfs build <profile>` 构建；自动化可选 `--if-input-digest` 防漂移，readiness 不暗中触发有副作用的构建。下载经绑定自身的
 capability route（per-Node 鉴权，内容按 digest 共享/缓存）。
+需要在重建时换掉全部共享 SSH keys，可执行 `profile rootfs build <profile> --new-ssh-keys`；自动化需要锁定先前
+plan 时再追加 `--if-input-digest <current>`。服务端重新生成 client keypair + sshd host keys，重算
+`authorized_keys`/`ssh_known_hosts`，发布新 Profile revision/new input digest，再直接构建新 rootfs；该操作不覆盖旧
+artifact 或 active session，也不输出私钥。轮换导致新旧 rootfs 混跑期间无法保证双向免密且 host fingerprint 改变，
+CLI 必须显式警告。
 v0.2 已发布 rootfs 只增不删，不设计 delete/GC 或引用计数；Runtime 只记录 build/status/consumer，不反向写入
 desired 配置。容量由 status 告警，空间不足时新 build fail closed，回收策略不进入 v0.2。
 
+**Profile 克隆/派生构建**。`profile clone <source> <target>` 从指定 source revision 拷贝完整配置，
+新 Profile 创建后是独立、唯一、可直接修改的事实，不在运行时继承 source，不形成多层关系或
+额外 rootfs 类型。diskless clone 默认复用 source 的 Profile SSH client keypair/sshd host keys，便于新旧 Profile 节点继续相互免密；
+`--new-ssh-keys` 在 clone 事务中显式生成全新共享 keys。`--set KEY=VALUE` 在同一创建事务中修改新 Profile，`--build`
+紧接着对新 diskless Profile 执行 plan/build。builder 可在内部复用 source rootfs 的已校验层作为构建优化，
+但最终仍发布一个独立、完整、由 target Profile 输入唯一决定的 squashfs。`cloned_from`
+只是 audit provenance，不参与 effective 继承。
+
+每个 Profile 必须持久保存 `created_at/updated_at`、直接引用的 InstallSource name/revision/digest，以及
+`provenance.origin=create|clone`。clone 额外保存 source Profile name/revision 和 `cloned_at`；CLI 可沿这些不可变直接引用
+派生只读 clone chain，但 chain 不进入 effective compiler。`profile show` 同时展示 InstallSource imported time、上述时间与
+lineage，保证能回答“这个 Profile 基于哪个 OS 源、从哪个 Profile 的哪个版本何时复制而来”。
+
 **无盘属性适用性**。v0.1 已梳理的全部属性在 diskless Profile/Node 上的适用性如下；`not-applicable` 表示
-install-only 字段对 diskless 返回 `property.not_applicable` 且使 not ready，除非该字段本就为空：
+该字段对 diskless 返回 `property.not_applicable` 且使 not ready，除非该字段本就为空：
 
 | 属性（v0.1 canonical） | diskless 适用性 | 说明 |
 |---|---|---|
@@ -185,18 +261,60 @@ install-only 字段对 diskless 返回 `property.not_applicable` 且使 not read
 | Node `http_accel` | 可用（UEFI） | 仅 GRUB 取 kernel/initrd；BIOS not-applicable；不治理 initrd rootfs 下载（见 §5.1）|
 | Node `network.*` | 可用 | 目标系统网络，见下文网络标准 |
 | Node `storage.boot_disk`/`additional_disks` | 持久但不消费 | diskless effective 标记 not-applicable；保留以便日后绑 install Profile |
-| Profile `system.*`（localization/ssh/users/security） | 可用 | 骨架入 rootfs build，per-boot 差异入 overlay（见 §4.4）|
+| Node `overrides.software.*` | 全部可用（node-apply） | repositories/environment/groups/tasks/packages include/exclude 原样复用 v0.1 merge；解析为 pinned local repository/package closure 后重放，不改变公共 rootfs |
+| Profile `system.*`（localization/ssh/users/security） | 可用 | 完整共享基线进入 rootfs；Node override 按 v0.1 effective 语义写 overlay upper |
+| Profile `system.hosts` | 可用 | v0.2 structured collection（`id/address/names`）；Profile 进 rootfs，Node `overrides.system.hosts` 写 upper |
 | Profile `system.connectivity.time_sync`/`ntp_servers` | 可用（受限） | local-only 不变式：NTP 只用显式服务器，无 vendor NTP |
-| Profile `software.*` | 可用（build 期） | rootfs 构建消费固定 revision 的 effective software；runtime package action 只装受限补充包/组/环境（本地 repo），不重装 base software.* 选择 |
+| Profile `software.*` | 可用（build 期） | Profile effective software 构建公共 baseline；Node effective 的 repositories/environment/groups/tasks/packages 全量 delta 相对 manifest 解析为受保护的 add/remove closure，由 node-apply 从本地 pinned repo 应用 |
 | Profile `kernel_args` | 可用 | PXE cmdline 追加，initrd 透传 |
 | Profile `diskless.overlay.tmpfs_percent` | 可用（diskless-only） | 控制 tmpfs upper 预算 |
 | Profile `diskless.failure.max_attempts`/`backoff_seconds` | 可用（diskless-only） | 达预算 quarantine；不负责 BMC 重启 |
-| Profile `diskless.provision.bundle` | 可用（diskless-only） | 引用 provision-bundle（rootfs-build/first-boot phase），与 install 的 `install.post_install.bundle` 对应 |
+| Profile `diskless.provision.bundle` | 可用（diskless-only） | 引用 provision-bundle（rootfs-build/first-boot phase）；Node 可用 `overrides.diskless.provision.bundle` 替换自身 first-boot，见下文 |
 | Profile `install.*`（source/storage/bootloader/apt/completion/updates/proxy/reinstall/post_install.bundle） | not-applicable | install-only（`install.apt.fallback` 是安装器 apt 行为、非仓库源），对 diskless 返回 `property.not_applicable` |
 
+**diskless Node override 规则**。diskless 对所有跨 kind 的 target-system policy 原样复用 v0.1 override namespace、
+类型、merge 优先级和 effective compiler：Profile 是公用基础，Node override 是该节点最终结果。localization、
+time sync/NTP、password、users、`authorized_keys.add/remove`、sshd、security、公共 hosts、software 的全部
+repositories/environment/groups/tasks/packages include/exclude，以及 kernel args 都参与 Node effective plan；它们只改变 `desired_plan_digest`，不改变
+`rootfs_input_digest`。服务端把完整 Node effective 差量编译为 immutable AgentPlan/`node_apply_projection`，随
+session snapshot 固定；给 initrd 的最小 BootConfig 只包含 AgentPlan locator/digest/size/expiry，不包含高层配置。
+`switch_root` 直接进入 rootfs 内的 `nodeforge-agent --pre-init`：agent 使用继承的 bootstrap 网络从服务端拉取并校验
+AgentPlan 与全部 Node payload，清零短时 `agent:read` token 后，使用完整运行根的库和工具先执行 pinned software transaction，再运行 TargetSystem
+finalizer，把 password/users/SSH/hosts/network/NTP/localization/security/machine-id 等最终结果写入 overlay upper，最后
+`exec /sbin/init`。systemd、renderer、sshd 和业务服务因此只会看到覆写后的最终状态。所有 Node override 每次 PXE 启动重放，
+因此 tmpfs upper 重启丢失也不会要求人工重配。
+这里没有第二套 initrd projector：同一个 agent/TargetSystem runner 承担 install 等价的最终系统配置；pre-init 只是它在
+真正 PID 1 前的执行入口。显式 first-boot managed-file/script 在 systemd 启动后继续按固定 plan 执行，力度与 install 后处理一致。
+
+跨 kind 的能力对照如下；“一致”指同一 canonical path、同一 merge 后得到相同最终系统语义，执行时机与持久介质可以不同：
+
+| Node override | install 落地 | diskless 落地 |
+|---|---|---|
+| `overrides.system.localization.*` | installer 写目标盘 | agent pre-init 写 upper |
+| `overrides.system.connectivity.time_sync` / `ntp_servers.add/remove` | installer 写配置并启用服务 | agent pre-init 写配置和 enable/mask 状态 |
+| `overrides.system.ssh.*` / authorized keys delta | installer 写目标盘 | agent pre-init 在 sshd/systemd 启动前写 upper；mandatory Profile client key 保护不变 |
+| `overrides.system.users` | installer 创建最终账号 | agent pre-init 原子物化 passwd/group/shadow/home/sudo 到 upper |
+| `overrides.system.security.*` | adapter 渲染安装配置 | compiler 固定 boot-required kernel args；agent pre-init 写 policy/enablement 并在 exec systemd 前 finalizer 验证 |
+| `overrides.software.repositories/environment/groups/tasks/packages.*` | installer 解析并安装 effective closure | agent pre-init 从 pinned local repository revision 应用 exact add/remove closure，再运行 target-system finalizer |
+| `overrides.kernel_args.add/remove` | installer PXE + 目标 bootloader | 当前 PXE kernel cmdline；每次启动重放，无持久 bootloader |
+| postprocess bundle reference | `overrides.install.post_install.bundle` 由 installer 执行 | `overrides.diskless.provision.bundle` 替换该 Node 的 first-boot，由 agent 执行 |
+
+纯安装机械字段 `overrides.install.storage.*`、bootloader、apt installer policy、completion、updates、proxy、
+reinstall policy 没有“最终运行系统”的 diskless 对象，因此仅这些字段 not-applicable；这不减少共享 target-system
+配置面。任一已注册为 diskless 可用的 override 都必须在 adapter/build manifest 中有可验证 agent pre-init consumer 与 prerequisite，
+不能出现 CLI 接受但 agent 忽略，或因 Profile baseline 未携带必要工具而运行时才发现不可执行。
+software exclude/remove 事务必须保护当前 kernel/modules、PID 1、network renderer、package manager、nodeforge-agent、
+sshd（SSH enabled 时）及其必需依赖；若 effective delta 会移除 protected closure，readiness 以稳定 reason 拒绝，
+不能静默保留而伪装 override 已生效。
+为保证 Node 可以从 Profile 的 disabled 值覆写为 enabled，builder 必须按 adapter 的
+`diskless_override_capabilities` 把 sshd、NTP、firewall、发行版适用的 SELinux/AppArmor policy/tool 与 package manager
+支持闭包烤入公共 rootfs，只把 Profile 选择的默认 service state 写为 baseline；这些 prerequisite revision 进入
+`rootfs_input_digest`/manifest。不能因 Profile 当前关闭某功能就裁掉其已声明可 Node override 的执行能力。
+
 **无盘以太网配置标准**。`pxe.ip_reservation`（旧 `node.ip` 已由 v0.1 重命名），且匹配 MAC、prefix、gateway、DNS 和
-renderer capability 必须在 effective/readiness 阶段共同校验。initrd 下载期间不切换地址，只向 overlay 写持久网络配置，
-由 `switch_root` 后的 NetworkManager/Netplan 接管同一地址；不一致必须在切根前以稳定 reason 失败，不能回退到未声明
+renderer capability 必须在 effective/readiness 阶段共同校验。initrd 下载期间不切换地址，也不写 renderer 配置；
+`switch_root` 后由 agent pre-init 在最终 rootfs 写入持久网络配置，再由 NetworkManager/Netplan 接管同一地址；不一致必须在切根前的
+server/initrd 检点或真正 init 前的 agent 检点以稳定 reason 失败，不能回退到未声明
 DHCP 目标配置。PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网不属于 M5，亦不在 M6 范围，延后到 v0.4。
 renderer 由 adapter capability 选择：RHEL 系写 NetworkManager connection、Ubuntu 写 Netplan，均以
 `match.macaddress`/`connection.mac-address` 绑定 `node.mac` 对应的启动 NIC；`network.mode=dhcp` 时目标系统在
@@ -210,6 +328,11 @@ M5 新增的最小 Profile policy 面：
 | `diskless.overlay.tmpfs_percent` | 10-80 的整数，默认 50 | `overrides.diskless.overlay.tmpfs_percent` | v0.2 固定 `squashfs_overlay`，控制 tmpfs overlay upper 预算 |
 | `diskless.failure.max_attempts` | 1-10，默认 1 | `overrides.diskless.failure.max_attempts` | 达到预算后 quarantine |
 | `diskless.failure.backoff_seconds` | 0-3600，默认 0 | `overrides.diskless.failure.backoff_seconds` | 不负责 BMC 重启 |
+| `diskless.provision.bundle` | nullable provision-bundle ref | `overrides.diskless.provision.bundle` | Node override 完整替换该 Node 的 first-boot；引用 bundle 只允许 first-boot item，不得含 rootfs-build |
+
+`system.hosts` 是 v0.2 对 target-system 的正常扩展，不是通用文件 patch。Profile 与 Node 共用同一
+ItemSpec；Node 第一次对 `overrides.system.hosts` 执行 item add/set/remove 时，复用 v0.1 `system.users`
+的 ordered replacement 语义，先原子物化当前 Profile hosts 再修改；unset 后恢复继承。
 
 ### 4.2 Assets 资源树
 
@@ -233,7 +356,7 @@ collection，使用 values 命令；manifest entries 或 build steps 若为 stru
 
 | Resource | 必填持久事实 | 只读派生事实 |
 |---|---|---|
-| rootfs | format、arch、content digest/size、uncompressed size、builder version、software capability revision、effective system/software digest、features | validation/readiness、rootfs consumers |
+| rootfs | format、arch、content digest/size、uncompressed size、builder version、software capability revision、Profile build digest、features | validation/readiness、rootfs consumers |
 | runtime-kernel | source/package revision、arch、kernel release、content digest、modules/package closure digest | initrd/rootfs modules ABI compatibility |
 | nodeforge-initrd | arch、kernel release、content digest/size、builder version、modules/features | validation/readiness、supported overlay/network features |
 | boot-bundle | install-source ref、runtime-kernel ref、nodeforge-initrd ref、arch、kernel release、required features | joint boot digest、build compatibility/readiness、consumer count |
@@ -263,65 +386,78 @@ Rootfs/initrd 构建的工具链和驱动放置属于 M5 的显式实现边界�
   必须使用 NodeForge `server_ip` 字面地址，M5 不做 DNS fallback，也不访问其他地址。出口 ACL 是纵深防御，
   不能替代 rootfs 静态检查、隔离网抓包和运行时 fail-closed。
 
-DisklessEffectivePlan 至少固定：Profile/Node/resource revision、arch、boot bundle、kernel/initrd revision、
-network、target system、effective software、kernel arguments、overlay 配置（v0.2 固定 squashfs_overlay +
-tmpfs_percent）、required initrd features 和全部 node-bound URL。BootSession 保存该计划的 digest 和 immutable
+DisklessEffectivePlan 至少固定：Profile build projection/rootfs input digest、Node/resource revision、arch、boot bundle、
+kernel/initrd revision、network、Node identity projection、kernel arguments、overlay 配置（v0.2 固定 squashfs_overlay +
+tmpfs_percent）、按 initrd/agent 分域的 required features 和全部 node-bound URL。BootSession 保存该计划的 digest 和 immutable
 capability identity；rootfs output digest 不进入会导致构建环的 desired plan，而是在 session DeliveryManifest
 中与 plan 一起固定为 delivery snapshot。服务重启只能按相同 delivery digest 恢复，不能重新编译后继续旧 session。
 
-Boot-config 只返回 initrd 实际需要的 DTO：session/scoped capabilities、network、rootfs URL/digest/size、Range recovery、
-overlay、target-system projection、event URL 和过期时间。除 `$6$` password hash 和 public authorized key 外不含任何
-长期 secret；`/run/nodeforge/boot.json` 只保存 plan/config digest 与非 secret 摘要，mode 0600，且不保存 password hash
-或 token。能力拆成一次性 `config:read`、只读 `artifact:read` 和只写 `event:append`，分别绑定
+Boot-config 只返回 initrd 实际需要的最小 DTO：session/scoped capabilities、bootstrap network、rootfs URL/digest/size、
+Range recovery、overlay、AgentPlan URL/digest/size/expiry、consumer feature 摘要和 event URL；不包含 hostname、users、
+password hash、SSH、hosts、software 等 Node 运行根配置。完整差量只存在于 agent 拉取的 AgentPlan，其中不含明文密码
+或 Profile 共享 SSH private keys；
+`/run/nodeforge/boot.json` 只保存 plan/config digest 与非 secret 摘要，mode 0600，且不保存 secret
+或 token。能力拆成 single-purpose、bounded-replay 的 `config:read`、initrd 只读 rootfs 的 `artifact:read`、agent
+只读固定 plan/payload closure 的 `agent:read` 和只写 `event:append`，分别绑定
 node、session、audience、HTTP method/path、plan digest 与短有效期；不能访问其他 Node rootfs，也不能升级为
 management credential（management credential 指 daemon 管理 API 的服务端管理员鉴权，与 boot 传输 token 是不同凭据
-类型、不同鉴权路径：传输 token 仅授权该 Node 的 GET/HEAD/Range config/rootfs 与 event POST，无 catalog 写、无管理
-API 调用能力，防止 per-boot 传输 token 被滥用为服务端管理权限）。此 token 与已永久移除的 enrollment/credential 无关：
-enrollment 是运行期节点认证 secret，已永久移除；此处 token 仅是 boot 期 initrd 拉取 BootConfig/rootfs 的传输鉴权。
-initrd 在 `switch_root` 前清零 config/artifact token；短时 `event:append` token 以独立 0400 文件跨 `/run`
-交给 agent，完成后删除，永不写入 boot.json。首次 hash mismatch 删除 partial 后完整重试；重复完整 mismatch、
+类型、不同鉴权路径：传输 token 仅授权该 Node/session 的精确 config/rootfs/AgentPlan/payload GET/HEAD/Range 与 event POST，无 catalog 写、无管理
+API 调用能力，防止 per-boot 传输 token 被滥用为服务端管理权限）。此 token 与已永久移除的可续期 enrollment
+credential 无关：enrollment 是运行期节点认证 secret，已永久移除；此处 token 仅是本次 boot 中 initrd/agent
+拉取不可变输入的传输鉴权。
+`config:read` 首次授权时固定 immutable bytes/config digest；在 initrd 以相同 digest 上报 `diskless.initrd_started` 前，
+只允许短窗口重取相同 bytes，确认或过期后撤销。未知/无效 token 只产生不关联 session 的安全审计；只有验证成功的 claim
+发生 scope/path/node 越权时才可归责其所属 session，不能让外部 401/403 探测推进 victim session 或 quarantine。
+initrd 在 `switch_root` 前清零 config/rootfs-artifact token；短时 `agent:read` 与 `event:append` token 以独立 0400
+文件跨 `/run` 交给 agent。agent 预取并校验全部输入后、修改目标系统前清零 agent token，first-boot 完成后删除 event
+token，二者永不写入 boot.json。首次 hash mismatch 删除 partial 后完整重试；重复完整 mismatch、
 feature mismatch、过期 token、越权 Range、switch_root 失败进入稳定 error code、`diskless.failed` 和 quarantine。
 
 交付给 initrd 的 BootConfig DTO 使用与 `ProfileKind` 一致的 `kind` 判别字段，废弃 legacy `mode="diskless"` 写法；
 install 与 diskless 共用同一判别字段，install 交付内容（config/event URL、capability）不变，仅把判别字段对齐为
 `kind`。diskless BootConfig 的 `schema_version` 提升到 v2（BootConfig DTO 自身版本，与 catalog `schema_version`
-v3/v4 分属不同命名空间）并携带上文的 DTO 字段；旧 initrd 未声明对应 feature 时，引用含 target-system/静态网络
-override 的 Profile 必须在发布 readiness 阶段失败，不允许旧客户端静默忽略。`required_features` 至少枚举稳定 token：
-`target-system-v1`、`static-network-v1`、`sha512-crypt-v1`、`bootstrap-admin-key-v1`、`target-accounts-v1`；initrd
-在 boot bundle manifest 中声明支持的 feature 子集，缺失或冲突在 `switch_root` 前以稳定 error code 拒绝，不得回退降级。
+v3/v4 分属不同命名空间）并携带上文的 DTO 字段。`required_features` 按 consumer 分为
+`{initrd:[...],agent:[...]}`：initrd 集合至少含 `node-identity-handoff-v1`/`agent-plan-handoff-v1`，agent 集合至少含覆盖完整
+TargetSystem/software transaction 的 `node-apply-v1`，静态目标网络另需 agent 的 `static-network-v1`。boot bundle initrd manifest 与
+rootfs agent manifest 分别声明支持集合；旧 consumer 缺失或冲突时必须在 readiness/切根前以稳定 error code 拒绝，
+不允许 initrd 代替 agent 解释高层字段，也不得回退降级。
 
 **BootConfig 定义与 boot 写入流程**。BootConfig 是 per-boot、per-Node 的短时 DTO，由服务端按 session
 DisklessEffectivePlan snapshot
-在 boot 时生成、initrd 经 node-bound capability 拉取；它只携带动态/按节点参数（session/capability token、network
-投影、rootfs URL/digest/size + Range recovery、overlay 配置、target-system 投影、event URL、过期时间），不烤入
-rootfs lower，故 rootfs lower 可共享、per-Node 差异只落 overlay upper。写入流程：① DHCP/TFTP 引导 boot bundle
+在 boot 时生成、initrd 经 node-bound capability 拉取；它携带 boot 所需参数（session/capability token、bootstrap
+network、rootfs URL/digest/size + Range recovery、overlay 配置、AgentPlan locator/digest/size/expiry、event URL），不携带
+完整 Node 配置。rootfs lower 可共享、per-Node 差异由 agent pre-init 从服务端取得 AgentPlan 后落 overlay upper。写入流程：① DHCP/TFTP 引导 boot bundle
 （kernel + 共享 NodeForge initrd）和 per-session credential capsule；kernel cmdline 只携带无密钥的 config URL、
-node/session 与 `kernel_args`，config token 由 GRUB 作为第二 initrd cpio 追加；② initrd 从 capsule 读取 token
-后拉 BootConfig；③ initrd 把 target-system 投影写 overlay upper
-（NM/Netplan 网络、hostname、`/etc/shadow` `$6$` hash、authorized_keys、machine-id、SSH host key），并下载/校验/挂载
-rootfs lower；④ `switch_root` 后 NM/Netplan 接管网络，agent 开机顺序执行 `first-boot` 后处理。BootConfig 除 `$6$`
-hash 与 public authorized key 外不含长期 secret，token 与 `/run/nodeforge/boot.json` 边界见本节上文。
+node/session 与 `kernel_args`，config token 由 GRUB 作为第二 initrd cpio 追加；② initrd 从 capsule 读取 token，
+有界重放地拉取固定 BootConfig，校验后用 config digest 确认并撤销 token；③ initrd 下载、校验并挂载 rootfs lower，
+建立 upper/merged，只将 AgentPlan locator 与 agent/event token 写入 `/run` handoff，不下载 Node 配置/payload、不写目标系统配置；
+④ 清除 config/rootfs-artifact token；⑤ `switch_root` 执行 `nodeforge-agent --pre-init`，agent 通过 bootstrap 网络拉取并校验
+AgentPlan/全部 payload、清除 agent token，再应用全部 Node override 后 `exec /sbin/init`；⑥ NM/Netplan/sshd 等只看到
+最终配置，同一 agent 的 systemd unit 再执行 effective `first-boot`。
+token 与 `/run/nodeforge/boot.json` 边界见本节上文。
 
-**boot-time 职责划分与共享参数来源**。共享参数不全部 build-time 打包：静态/公共内容（包、locale 数据、openssh 二进制、
-用户骨架）在 rootfs build 烤入只读 lower；动态/按节点/按启动参数（server 端点、capability token、target-system 投影含
-network/SSH/users/keys）经 BootConfig 交付；kernel cmdline 携带无密钥 config URL 与 `kernel_args`，一次性
-config token 位于 per-session credential capsule。initrd 取 BootConfig 后写入 overlay upper，不切换地址。
-boot-time 的 target-system 应用（含网络配置）由
-**initrd**（非 agent）完成：initrd 从 BootConfig 的 network/target-system 投影写 NetworkManager/Netplan 静态或 DHCP
-配置到 overlay upper，`switch_root` 后 NM/Netplan 接管同一地址；agent 只在切根后开机顺序执行 `first-boot` 后处理
-（一次性，无远程控制、无 reconciliation），不负责 boot-time 网络。
+**boot-time 职责划分与共享参数来源**。静态/公共内容（包、locale、账号/password、Profile SSH client/host keys、
+authorized_keys、hosts、sshd policy）全部在 Profile rootfs build 烤入只读 lower；动态/按节点/按启动参数
+（server 端点、capability token、network、hostname、machine-id 和 target-system delta）经 node-bound AgentPlan 交付；
+kernel cmdline 携带无密钥 config URL 与 `kernel_args`，单用途 config token 位于 per-session credential capsule。
+initrd 只验证 AgentPlan locator 并交接到 `/run`，不取得/解释 target-system 字段，也不写 overlay upper 中的配置。
+boot-time 的 Node projection（含网络配置）由 rootfs 内的 **nodeforge-agent pre-init** 完成：`switch_root` 后它先从服务端
+取得 session 固定的 plan/payload，再在真正
+systemd 启动前写 NetworkManager/Netplan 与全部 Node effective 配置，然后 exec `/sbin/init`；renderer 接管继承的
+同一地址。systemd 启动后同一 agent binary 再以 unit 执行 effective `first-boot`（一次性，无远程控制、无 reconciliation）。
 
 跨 DHCP/TFTP/HTTP/initrd 的 canonical BootSession 状态机固定为：
 
 ```text
 boot.dhcp_discover -> boot.dhcp_offer -> boot.dhcp_ack -> boot.tftp_rrq -> boot.tftp_complete
   -> boot.config_fetched -> diskless.initrd_started -> diskless.rootfs_downloading
-  -> diskless.rootfs_verified -> diskless.rootfs_mounted -> diskless.switching_root -> diskless.running
+  -> diskless.rootfs_verified -> diskless.rootfs_mounted -> diskless.switching_root
+  -> diskless.agent_configuring -> diskless.running
 ```
 
 历史概要中的 `pxe_seen`、`bootfile_sent`、`diskless_config_fetched` 分别是 `dhcp_discover`、携带 bootfile 的
 `dhcp_ack`、`boot_config_fetched` 的展示别名，不是额外持久状态；v0.2 API、Event 和持久化只使用 canonical 名。
-`failed` 可从任一非终态进入，`expired` 只能由服务端超时进入；两者都是本次 session 的终态。`node_status` 可以投影
+`<kind>.failed` 可从任一非终态进入，`boot.expired` 只能由服务端超时进入；两者都是本次 session 的终态。`node_status` 可以投影
 上述状态，但不得用 `ready/booting/downloading` 等粗粒度枚举替代而丢失早期诊断证据。重复同阶段上报幂等，跳跃、
 回退、错绑 node/session 一律拒绝。
 
@@ -337,14 +473,15 @@ diskless 终态为 `diskless.running`，不得新增无 kind 的 `running` 或�
 
 Quarantine 是 Node 级 boot gate，不是 BootSession phase。一次 attempt 进入 `failed` 后按 session snapshot 的
 `max_attempts/backoff_seconds` 计数；达到预算才进入 quarantine，并拒绝新 session。`diskless.running` 是启动成功
-终态；切根后的 agent `first-boot` 后处理失败属于 M7 运行期，不回写或倒退已完成 BootSession。
+终态。agent pre-init `node-apply` 成功并 exec `/sbin/init` 前仍属于 boot attempt，失败进入 `diskless.failed`/
+quarantine 计数；只有真正 init 启动后的 `first-boot` 失败属于运行期，令 `postprocess=degraded` 而不倒退 BootSession。
 
 `nodeforge node diskless retry <node>` 只清除终态 failure quarantine；不创建 install generation、不修改 Profile、
 不远程重启。存在活动 session、`deploy=false`、Profile 非 diskless 或 desired digest 已变化时 fail closed。
 
 ### 4.4 无盘构建方案
 
-M5 rootfs 构建为单一共享 rootfs：rootfs builder 从 effective plan 生成 rootfs = OS 层（effective software/system 经
+M5 rootfs 构建为 Profile 共享 rootfs：rootfs builder 从 Profile build projection 生成 rootfs = OS 层（Profile software/system 经
 发行版原生 install-root 工具烤入只读 lower）+ `rootfs-build` phase 业务内容（managed-file/archive/script/package 追加到 lower）
 + Profile 级 target-system 骨架。rootfs 按 `rootfs_input_digest` 缓存、跨 Node 共享；OS 层可由 builder 内部按 software
 digest 缓存复用（业务内容变更不重建 OS 层），但对设计透明、不作为独立 Resource。rootfs-build 与 first-boot 共用
@@ -358,49 +495,77 @@ kernel_release 一致的环境中运行。builder 固定 software capability rev
 environment/group/task/package selection（metapackage 仍按 `software.packages.include` 选择），并按 local-only 不变式
 移除/禁用公网 mirror、metalink、GeoIP 和 vendor NTP，只引用本地 repository。OS 层可按 software capability revision
 内部缓存复用；build manifest 记录 builder image/environment digest、构建工具版本与命令、module/firmware 清单、
-generated locales、available timezones/keyboards、user 账号骨架（passwd/group/home/shell/sudo membership，不含密码/key）、
-capability revision、effective system/software digest 和输出 squashfs digest/size/uncompressed size。
+generated locales、available timezones/keyboards、完整共享账号基线（passwd/group/shadow/home/shell/sudo membership/
+authorized_keys）、capability revision、Profile system/software digest 和输出 squashfs digest/size/uncompressed size。
 
 **rootfs-build phase**。provision bundle 的 `rootfs-build` phase 步骤在 OS 层之上向只读 lower 追加业务内容：managed-file、
 archive、受控 script 和经本地 repo 解析的 package action（受限 `packages`/`group`/`environment`/`selection`，如更新
 `/etc/hosts`、写入 motd、预装补充包）。该 phase 由服务端 rootfs builder 执行（无节点 agent），builder 提供
 chroot/staging 上下文使步骤以 `/` 为目标写入 lower，步骤作者不感知暂存目录。OS/source/repository revisions +
-rootfs-build inputs + first-boot fixed payload + build-safe effective system/software + builder ABI 共同决定
+rootfs-build inputs + first-boot fixed payload + Profile system/software + builder ABI 共同决定
 `rootfs_input_digest`；构建输出另以 content SHA-512 标识。
 
-**first-boot payload 预置**。builder 解析 first-boot package closure，并把 manifest、RPM/DEB、managed-file、
+**first-boot payload 固定**。builder 解析 Profile first-boot package closure，并把 manifest、RPM/DEB、managed-file、
 archive、script 以内容寻址形式写入 `/usr/lib/nodeforge/firstboot/<bundle-digest>/`，但不在 build 期执行。
-agent 切根后只消费该只读本地 payload，不使用 event token 读取 bundle/repository。任何缺包、asset digest
-不匹配或 payload 超预算都在 build 阶段失败，不能留到节点启动时在线补齐。
+Node 未 override 时 agent 只消费该只读本地 payload。Node override bundle 不进入公共 rootfs，其完整 immutable closure
+由 agent pre-init 使用 `agent:read` 一次性预取；first-boot 阶段不再联网读取配置/artifact。任何缺包、asset digest
+不匹配或 payload 超预算都在 build/readiness 或 agent pre-init 阶段 fail closed，不能启动后再临时解析依赖。
 
 **构建环境保真**。rootfs-build phase 执行 package/script 时按动作所需提供构建环境：纯 userspace 动作（写文件、装普通包、
 配置）只需 chroot；触及硬件/内核的动作（装驱动、dkms、重生成 initramfs、装载内核模块）须 bind-mount `/dev`/`/proc`/
 `/sys` 并使用与目标 distro/version/arch/`kernel_release` 一致的内核，否则驱动/dkms 类安装不适用；内核与 OS 一致时需
-加载完整内核态以满足模块构建。v0.2 本地 server builder 按此保真执行；更高保真的远程/节点上构建（经节点 agent 在真实
-硬件与内核态构建 rootfs）需 agent、加载完整内核态/设备/proc，复杂且牵扯 agent，作为 v0.4 后续设计，v0.2 不实现。
+加载完整内核态以满足模块构建。v0.2 本地 server builder 按此保真执行；更高保真的临时 PXE rootfs 构建节点在真实
+硬件与内核态构建 rootfs，需专用 builder boot、完整内核态/设备/proc 和有界上传 claim，作为 v0.4 后续设计，v0.2 不实现。
 
-**rootfs 缓存与共享**。rootfs 按 `rootfs_input_digest` 标识、跨 Node 共享：per-Node 机密与配置（hostname、`$6$` hash、
-authorized key、machine-id、SSH host key、节点静态网络）不烤入 rootfs，而由 BootConfig 在 boot 时写 overlay upper
-（见 §4.3/§4.4 边界表），故 rootfs 不绑定单个 Node、可跨 Node 共享。节点经绑定自身的 capability route 下载（per-Node
-鉴权），只由 `node rootfs build <node> --if-input-digest ...` 显式触发；readiness 只读、不暗中构建。
-`node rootfs status <node>` / `assets rootfs list|show` 查询（见 §4.1/§4.2）。
+**rootfs 缓存与共享**。同一 Profile revision 的 `rootfs_input_digest` 唯一；其密码 hash、公共授权 key 等敏感
+build 输入参与 digest 计算时必须先进入带字段域分离的 canonical secret hash，不得出现在 plan 输出或日志。节点经绑定
+自身的 capability route 下载（per-Node 鉴权），只由 `profile rootfs build <profile>` 显式触发；可选
+`--new-ssh-keys` 先生成并固定新 Profile client/host keys revision，再构建其新 input digest；
+readiness 只读、不暗中构建。`profile rootfs status <profile>` / `assets rootfs list|show` 查询（见 §4.1/§4.2）。
 
-**构建期与启动期边界**（只读 lower vs per-boot overlay upper）：
+**构建期与启动期边界**（只读 lower vs agent pre-init 写 per-boot overlay upper）：
 
 | 内容 | rootfs build（公共 lower） | diskless boot（节点 upper） |
 |---|---|---|
-| locale 数据包、tzdata、keyboard 数据 | 安装并生成支持矩阵 | 只选择已存在 locale/timezone/keyboard |
-| openssh-server 二进制/unit | 从本地 repo 安装 | 写认证策略、authorized_keys，生成 host key |
-| `software.*` 包 | 从本地 repo 安装并记 manifest | runtime 只引用 snapshot 中的 effective software，不通用安装 |
-| `system.users` 账号骨架 | 创建 passwd/group/home/shell/sudo，不写密码/key | 写每账号 `$6$` hash 和 authorized_keys |
-| 外部 repository | 删除/禁用/替换为本地源 | 不新增源 |
+| locale 数据包、tzdata、keyboard 数据 | 安装并写 Profile 选择 | 有 Node localization override 时写 effective 选择 |
+| openssh-server 二进制/unit | 安装并写共享认证策略、Profile SSH client/host keys、authorized_keys、ssh_known_hosts | 应用 Node SSH override |
+| `software.*` 包 | 从本地 repo 安装并记 manifest | Node software override 由 agent `node-apply` 按 session 固定的 local-only repository revision/package closure 安装或移除 |
+| `system.users` | 创建 passwd/group/home/shell/sudo，写 password hash 与 authorized_keys | 将 Node users/password/key effective 差量写 upper |
+| 公共 `/etc/hosts` | 由 Profile/rootfs-build 写入 | 合并 Node hosts override、写节点 hostname/self entry，并以 effective hosts + 共享 host public key 重算 `ssh_known_hosts` |
+| repository | 删除/禁用公网源，只保留 Profile 选中的本地源 | Node repositories add/remove 只接受 InstallSource capability id；compiler 固定 effective repository revision/GPG policy，agent 使用临时本地 repo 配置，不接受 URL |
 | hostname | 通用占位 | 写节点 hostname |
 | 网络 | 保留 DHCP bootstrap 能力和 NM/Netplan | 写目标静态/DHCP 持久配置 |
-| machine-id、SSH host key | 清理，不在共享 lower 留唯一身份 | 每次启动在 upper 生成 |
-| root/用户 key | 不放节点专属或 bootstrap private key | 从受认证 BootConfig 写 bootstrap public key + 账号 profile key |
+| machine-id | 清理，不在共享 lower 留唯一身份 | 每次启动在 upper 生成 |
+| SSH key/authorized_keys | Profile create/clone preparation 自动生成并固定 client/host keys，合并所有 Profile 公钥并生成域内 ssh_known_hosts | 追加 key/删除可删除的继承 key；mandatory Profile client key 不可由标准 remove 删除；显式后处理仍可改最终文件 |
 
 boot readiness 时把 Profile 的 target-system 与 rootfs manifest 对照：自定义 locale/timezone/keyboard、用户或包不存在、
 SSH enabled 但无 sshd、静态网络缺 renderer/tool 时拒绝启用 PXE，不等切根后失败。
+
+### 4.5 配置落地与后处理框架
+
+后处理与 install 保持同等配置力度：可以通过 typed target-system 投影、managed-file、package、archive 和
+script 修改最终运行根。v0.2 固定落地顺序，以便同一 effective plan 可重放且最终结果可预览：
+
+| 层 | owner / 执行者 | 适用内容 | digest | 边界 |
+|---|---|---|---|---|
+| `rootfs-build` | Profile / server builder | packages、users/UID/GID、password hash、hosts、sshd policy、Profile SSH client/host keys、authorized_keys/ssh_known_hosts、公共文件与服务 | `rootfs_input_digest` | 只构建 Profile 公用 lower，不读 Node override |
+| `boot-project` | Node + BootSession / server effective compiler | 把 hostname/network/machine-id、完整 target-system 与 software/service/security Node effective 差量编译为 immutable AgentPlan | `desired_plan_digest`，交付时再入 `delivery_digest` | 只编译/签名，不操作 rootfs；BootConfig 只引用 plan digest/locator |
+| `node-apply` | Node effective / `nodeforge-agent --pre-init` | 从服务端获取并验证 AgentPlan/payload，清除读 token；先做 exact software add/remove transaction，再以 TargetSystem finalizer 写 users/password/SSH/hosts/network/NTP/localization/security/machine-id 与 service enablement | `desired_plan_digest` + session snapshot | `switch_root` 后、`/sbin/init` 前执行；成功后 exec 真正 init，只用 session-pinned local-only 输入 |
+| `first-boot` | effective bundle / node agent | managed-file、package、archive、script，力度与 install postprocess 一致 | Profile payload manifest 入 `rootfs_input_digest`；Node override payload digest 只入 desired/delivery，执行身份入 session | 默认执行 Profile bundle；`overrides.diskless.provision.bundle` 可按 Node 完整替换 first-boot，禁止其含 rootfs-build item |
+
+`rootfs-build` 和 `first-boot` 是 provision bundle 的声明 phase；`boot-project` 与 `node-apply` 是 effective compiler
+的内建落地 stage，不是新 bundle phase。后处理可以修改 passwd/shadow/group、sudoers、sshd、
+authorized_keys、hosts 和其他运行根文件，因为 install 的同类 postprocess 也具备该力度。安全边界改为
+禁止读取/泄漏 `/run/nodeforge/credentials`、篡改 session identity、写只读 lower 或引入远程持续任务；
+plan/preview 必须显示 action 类型、目标路径、输入 revision 和最终覆盖顺序。
+
+Profile bundle 的 rootfs-build/first-boot payload 随公共 rootfs 构建。Node 设置
+`overrides.diskless.provision.bundle` 时，引用 bundle 必须只含 first-boot item；服务端将其解析为不可变 package/
+asset closure，agent pre-init 使用 session-bound `agent:read` 在 `switch_root` 后下载并完整校验到
+`/run/nodeforge/node-firstboot/<payload-digest>/`，随后清除 agent token。first-boot 只读取本地 payload；agent 先执行
+pre-init node-apply 并 exec systemd，再由同一 binary 的 first-boot unit 执行该 Node bundle；未设置 override 时执行
+rootfs 内的 Profile first-boot payload。该流程不产生
+per-Node rootfs、variant、远程任务或真正 init 后的配置/artifact 下载。
 
 ## 5. M6/M7 对新契约的影响
 
@@ -436,40 +601,47 @@ phase 固定为 `install-post|rootfs-build|first-boot`（canonical 集合；sche
 | `diskless_boot` | `first-boot` | 迁移后为 diskless 切根后 agent 开机顺序执行 |
 
 每个 phase 的执行顺序固定为八步，跳过不适用步骤但不得重排：1）挂载/确认 target root；2）pin effective、bundle、
-asset revision 并验证 action/phase/保护域；3）物化已发布的本地 repository 和输入 asset；4）原子写 managed file（文件更新）；
+asset revision 并验证 action/phase/credential-session-lower 边界；3）物化已发布的本地 repository 和输入 asset；
+4）原子写 managed file（文件更新）；
 5）执行只引用 snapshot 中 effective software/capability 的 package action；6）校验并展开 archive；7）按声明顺序
 执行受控 script；8）运行 TargetSystem finalizer 后原子发布 status/audit。任一步失败都不得发布 succeeded 状态。
 顺序固定为 文件更新 -> package -> archive -> script。
 
-TargetSystem 保护域包括 passwd/shadow/group/sudoers、sshd、各账号 authorized_keys、Netplan/NetworkManager、
-resolver、locale/timezone/keyboard、software manifest、firewall 和 SELinux 配置/unit。managed-file、archive 和 script
-声明影响域；触及保护域的 action 在 plan/validate 阶段直接拒绝，不能用 `--force` 绕过。finalizer 在每个 phase
-末尾重新断言 effective owner、bootstrap/profile public key 合并和离线策略。
+managed-file、archive 和 script 可修改 passwd/shadow/group/sudoers、sshd、authorized_keys、
+Netplan/NetworkManager、resolver、locale/timezone/keyboard、firewall 和 SELinux 配置/unit，与 install postprocess
+保持同等力度。它们必须声明预期影响路径，plan/preview 按顺序显示最终覆盖关系。只有
+`/run/nodeforge/credentials`、session handoff/journal 和只读 lower 是不可触碰边界；finalizer 验证凭据未泄漏、
+effective 操作顺序和 local-only 策略。
 
-`first-boot` agent 的节点身份由 cmdline node/session、BootConfig 与 token claim 三方相等后确定，initrd 写入
-`/run/nodeforge/boot.json`（mode 0600，非 secret 摘要）。agent 切根后开机顺序执行后处理，状态/异常/审计经
+diskless agent 的节点身份由 cmdline node/session、BootConfig 与 token claim 三方相等后确定，initrd 写入
+`/run/nodeforge/boot.json`（mode 0600，非 secret 摘要）。agent 切根后先执行 session 固定的 Node node-apply，
+再顺序执行 effective first-boot（默认 Profile bundle，Node override 时为预下载的 first-boot-only bundle）；状态/异常/审计经
 event_url best-effort 回传服务端（带 node_id），回传失败不阻塞执行、仅本地留存日志/console/boot.json。
-v0.2 diskless 不引入 enrollment/credential/reconciliation/远程控制（reconciliation/远程控制为永久非目标，见 §5.3、§7）。
+v0.2 diskless 不引入可续期 enrollment credential、reconciliation 或远程控制（reconciliation/远程控制为永久非目标，
+见 §5.3、§7）；per-boot 短时 capability token 只服务固定 session。
 
 v0.2 diskless 不引入 enrollment 机制：agent 身份来自已验证的 session handoff（见 §5.2 上文、§5.3），
-状态/异常 best-effort 回传，回传失败本地兜底（日志/console/boot.json）。enrollment/credential/远程控制/reconciliation
-为永久非目标（见 §7）；install 侧 agent（确定性 first-boot，无 reconciliation）延后 v0.4。v0.2 的 HTTP bearer 只在隔离
+状态/异常 best-effort 回传，回传失败本地兜底（日志/console/boot.json）。可续期 enrollment credential、远程控制和
+reconciliation 为永久非目标（见 §7）；install 侧 agent（确定性 first-boot，无 reconciliation）延后 v0.4。v0.2 的 HTTP bearer 只在隔离
 `local-only` 网络内提供认证，不提供链路机密性；跨不可信网络的 TLS/mTLS 与远程管理仍是非目标，部署必须以隔离
 VLAN/ACL 防止旁路窃听。
 
 ### 5.3 运行期后处理与 agent
 
-三个 phase 的执行者不同：`install-post` 由安装器（Kickstart `%post`/Autoinstall `late-commands`）在安装期执行，无
+三个声明 phase 的执行者不同：`install-post` 由安装器（Kickstart `%post`/Autoinstall `late-commands`）在安装期执行，无
 agent、属 install（v0.3）；`rootfs-build` 由服务端 rootfs builder 执行，无节点 agent（v0.2，见 §4.4/§5.4）；`first-boot`
-由 node-bound agent 在 diskless 切根后开机顺序执行（一次性，无 `runtime` 周期、无远程控制）。v0.2 的 agent **仅服务
-diskless**（diskless 无安装器，`first-boot` 是其后处理主路径）；rootfs-build 不需 agent（builder 本地受信），`install-post`
+由 node-bound agent 在 diskless 真正 init 启动后顺序执行（一次性，无 `runtime` 周期、无远程控制）。此外，effective compiler
+生成的内部 `node-apply` 由同一 agent 的 pre-init 入口在真正 PID 1 前执行，它不是第四个用户可配置 phase。v0.2 的 agent **仅服务
+diskless**（diskless 无安装器，`node-apply`/`first-boot` 是其运行根执行路径）；rootfs-build 不需 agent（builder 本地受信），`install-post`
 随 v0.3（PXELINUX install）落地，install 侧 agent 延后到 v0.4（reconciliation 为永久非目标，见 §7）。本节 agent 设计
 以 diskless 后处理为唯一 v0.2 目标。
 
 **agent 身份与生命周期**。agent 无 enrollment：节点身份由 cmdline node/session、BootConfig 和 token claim
-三方相等后固定为 session snapshot，initrd 写入 `/run/nodeforge/boot.json`（mode 0600，非 secret 摘要），agent 切根后读取
-并开机顺序执行 `first-boot` 后处理。agent 是确定性顺序执行器（开机即跑 rootfs 烤入的 bundle first-boot steps，固定顺序
-文件更新 -> package -> archive -> script，一次性），不接受远程任务下发、不做 reconciliation、不做通用远程命令或配置
+三方相等后固定为 session snapshot，initrd 写入 `/run/nodeforge/boot.json` 与 `agent-handoff.json`（mode 0600，非 secret 摘要）。
+`switch_root` 以 `nodeforge-agent --pre-init` 为入口；agent 校验身份，使用 `agent:read` 从服务端获取 expected digest 的
+AgentPlan/Node payload，清除读 token，应用 immutable `node_apply_projection` 后 exec 真正 init。systemd 启动后同一 binary
+的 first-boot unit 再读取 rootfs Profile payload 或 agent pre-init 预下载的 Node override payload，固定顺序
+文件更新 -> package -> archive -> script，一次性。两种入口都不接受远程任务下发、不做 reconciliation、不做通用远程命令或配置
 管理平台。状态/异常/审计经 event_url best-effort 回传（带 node_id），失败本地兜底，不阻塞执行。
 
 **first-boot 执行与重试语义**。diskless overlay upper 为 tmpfs（per-boot 易失）、系统无状态，故 first-boot **每次开机
@@ -489,7 +661,7 @@ action、稳定 reason；脚本 stdout/stderr 仅留最后 2048 bytes 转义摘�
 失败信息（日志/console/boot.json），不因事件上报失败中断或回滚已完成切根/后处理；事件 fields 有界且脱敏，不含下载 URL
 query、Authorization、完整 journal 或 debug shell 输出。
 
-**reconciliation**（永久非目标）。全版本不实现 reconciliation/远程控制：agent 开机顺序执行确定性 first-boot，无 drift 重跑、
+**reconciliation**（永久非目标）。全版本不实现 reconciliation/远程控制：agent 开机顺序执行确定性 node-apply/first-boot，无 drift 重跑、
 无远程任务下发。reconciliation 与远程控制不再仅延后 v0.4，而是升级为永久非目标（见 §7）；install 侧 agent（确定性
 first-boot）延后 v0.4，但同样无 reconciliation。
 
@@ -515,7 +687,8 @@ builder/agent 提供挂载或 chroot 上下文把写入落到对应 lower 或 ov
 不设 `script|extract` 策略、`target_root`、`install --root` 参数或 `NODEFORGE_TARGET_ROOT` 环境变量。
 
 **provision-bundle item 编写**（复用 v0.1 §7.1 structured collection `item add/set/move`、`replace-items`、`--before/--after`、
-`--unset`）。字段示例见 `V0_2_CLI.md` §6。`managed-file` 的 `destination` 为 `/` 下绝对路径（rootfs-build 落 lower、first-boot
+`--unset`，canonical collection key 为 `steps`）。字段示例见 `V0_2_CLI.md` §3。`managed-file` asset 只保存不可变内容；
+`destination/mode/owner/group` 属于引用 asset 的 step，不得复制到 asset metadata。`destination` 为 `/` 下绝对路径（rootfs-build 落 lower、first-boot
 落 overlay upper）；`archive` 无 `destination`，按 archive 规则解压到 `/` 或在临时目录执行 `install.sh`；`script` 由
 `script_asset` 提供受审计可执行内容；`package` 的 `packages`/`group`/`environment`/`selection` 至少一项，均经本地
 repository 解析校验、幂等。
@@ -524,11 +697,11 @@ repository 解析校验、幂等。
 
 | 维度 | `rootfs-build`（build 期） | `first-boot`（运行期） |
 |---|---|---|
-| 执行者 | 服务端 rootfs builder，无节点 agent、无 enrollment | node-bound agent，无 enrollment（身份由 `nodeforge.node_id` cmdline/boot.json 携带） |
+| 执行者 | 服务端 rootfs builder，无节点 agent、无 enrollment | node-bound agent，无 enrollment（身份由 cmdline、BootConfig/session snapshot 与短时 agent/event token claim 共同证明） |
 | 目标上下文 | builder 提供 chroot（按需 bind-mount `/dev`/`/proc`/`/sys` 与匹配内核，见 §4.4），步骤以 `/` 写入只读 lower | agent 在已切根系统写 overlay upper，`/` 为运行系统 |
 | 持久化 | 烤入 rootfs digest，跨启动只读不变 | diskless 写临时 overlay（per-boot），install 写磁盘 |
 | 脚本约束 | build chroot（按需 /dev/proc/sys + 匹配内核）内执行，须 build-safe、幂等；驱动/dkms 须声明影响域 | 运行系统执行，受 bounded action 与 finalizer 约束 |
-| 触发 | 显式 `node rootfs build --if-input-digest`；readiness 只读 | agent 切根后执行 rootfs 内 fixed bundle payload |
+| 触发 | 显式 `profile rootfs build [--new-ssh-keys] [--if-input-digest]`；readiness 只读 | 真正 init 启动后，agent unit 执行 effective fixed bundle payload |
 | 失败语义 | 阻止 rootfs ready，不发 succeeded，不入节点 session | step failed 可 retry；不回写或倒退已完成 BootSession |
 
 **日志、进度与结果回传**（统一 step I/O，按执行者分流）：统一 step 返回 `{changed, status, summary, outputs, warnings}`；
@@ -549,15 +722,17 @@ revision，`retry` 只重跑明确 retryable 的失败 step。脱敏：token、A
 可绕过事务的 catalog path 写入口。新命令必须先进入 typed
 PropertySpec/CollectionSpec/ItemSpec 再给 handler；预留 enum/空 handler 不算实现。
 
-**v0.2（diskless）**：`profile create --kind diskless`、`profile set diskless.provision.bundle/overlay.*/failure.*`、
-`node add/set`、`assets managed-file|archive|script import`、`assets provision-bundle create/item add/set/move/replace-items`、
-`assets nodeforge-initrd config/build`、`node rootfs plan/build/status`、`node diskless retry`、`node postprocess show`、
-`node trace`、`runtime dhcp-leases|tftp-sessions`、`events list|follow|types`、`nodeforge status`。
+**v0.2（diskless）**：`operation show/wait`、`profile list/create --kind diskless`、`profile set diskless.provision.bundle/overlay.*/failure.*`、
+`profile effective`、`node add/set/effective`、`assets managed-file|archive|script import`、`assets provision-bundle create/list/item add/set/remove/move/replace-items`、
+`assets nodeforge-initrd config/build`、`profile rootfs plan/build/status`、`node readiness --stage build|boot`、
+`node boot preview`、`node diskless retry`、`node postprocess show`、
+`node trace`、`runtime dhcp-leases|tftp-sessions`、`events list|follow|types`、`nodeforge status`、`preflight diskless-builder`。
 
-**v0.3（PXELINUX/BIOS install）**：`node set firmware.mode=bios`（schema v5）、`profile set install.post_install.bundle`、
-`install-post` phase item。
+**v0.3（PXELINUX/BIOS install）**：`node set firmware.mode=bios`（schema v5，仅 install）、
+`profile set install.post_install.bundle`、`install-post` phase item、`node postprocess show --phase install-post --generation`。
 
-**v0.4（延后增强项）**：多 NIC/VLAN/bonding、大规模容量压测与 install 侧 agent 的 CLI 随其设计落地；
+**v0.4（延后增强项）**：Node direct network topology ItemSpec、builder placement + 临时 PXE rootfs 构建 operation、
+大规模容量压测与 install 侧 agent generation 查询随其设计落地；
 reconciliation/远程控制为永久非目标，无对应 CLI（见 §7）。v0.2/v0.3 不提供这些命令的 help/handler，预留 enum 不算实现。
 
 ## 6. 对当前 v0.2 脚手架的代码影响
@@ -582,22 +757,33 @@ reconciliation/远程控制为永久非目标，无对应 CLI（见 §7）。v0.
 - 未经强类型约束和审计的任意远程命令执行。
 - reconciliation/远程控制：服务端不检测已部署节点 drift 后远程主动触发 agent 重跑收敛，agent 永远是开机确定性顺序执行
   （diskless/install 通用）；drift 仅报告（v0.1 既有）不自动修复。这是项目永久非目标。
-- v0.2 不提供持久化 overlay、跨重启 rootfs partial 或稳定无盘 SSH host identity；这些需要独立 secret/backend、生命周期和恢复设计，
-  不能把共享 host private key 或节点本地残留当作实现。
+- v0.2 不提供持久化 overlay 或跨重启 rootfs partial：无盘 upper/work 重启即丢；`rootfs.part`
+  仅在同一 BootSession/initrd 运行内 Range 续传。Profile SSH client/host keys 属于共享 rootfs 基线，不依赖持久
+  overlay。完整语义见 `DISKLESS_FINAL.md` §4。
 - v0.2 不支持 PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网；该项延后到 v0.4，需显式 capability 扩展，
   不得由 initrd 猜测或静默接受。
 - 在线/远程 mirror rootfs 模式或可切换的 `local-only` 开关；v0.1 删除 `connectivity.mode` 正因 `local-only` 是唯一行为，M5
   rootfs/initrd 恒 `local-only`，不存在 online 变体，也不新增 `local-only` PropertySpec。
 - 可切换的 rootfs 形态（`ram_rootfs` 等全内存模式、`diskless.overlay.mode` 字段）作为 v0.5 单独项；v0.2 固定 `squashfs_overlay`，
   不提供 mode 字段（同上单值无选择意义逻辑）。
-- NFS root（任何形态）、iPXE 菜单/脚本、远程或节点上构建 rootfs（agent 驱动）。
-- enrollment/credential 机制（运行期节点认证 secret）；agent 身份由 `nodeforge.node_id` cmdline 携带，全版本不引入。
+- NFS root（任何形态）、iPXE 菜单/脚本；临时 PXE rootfs 构建节点延后 v0.4。
+- enrollment 机制（可续期的运行期节点认证 secret）全版本不引入；boot/first-boot 仍使用与 session 或 generation
+  绑定、短时、最小权限且服务端只存 hash 的 capability token，不能升级为 management credential。
 - 跨不可信网络 TLS/mTLS、远程管理。
+- `profile remove`/`node remove`：v0.2 不提供删除命令。Profile/Node 与 delivery snapshot、
+  active session 和历史审计存在引用关系，删除会产生孤儿引用或丢失历史证据。废弃通过 `deploy=false` 停用 +
+  换绑归档；有引用的 Profile/Node 不能删除，无引用时也不提供 remove。后续版本若需要回收，必须另行设计
+  tombstone、retention 和审计引用，不由 v0.2 提前宣告为全版本永久非目标。
 
 ## 8. 文档与实现规则
 
 - v0.2 的 schema 只能扩展 v0.1 owner，不得复制字段到新的资源对象。
 - 新的 CLI/API key 必须先进入 typed PropertySpec/CollectionSpec/ItemSpec。
+- registry contract test 必须计算
+  `diskless_shared_node_override_paths == (v0.1_install_node_override_paths - overrides.install.*) + v0.2_shared_additions`；
+  当前 shared addition 为 `overrides.system.hosts`，并同时适用于 install/diskless。不得维护“diskless 初期只开放几个字段”的手工 allowlist。
+- 对上述集合中的每个 path，测试必须同时证明 help/show/parser/API operation、v0.1 merge 来源 metadata、
+  `desired_plan_digest` 变化、唯一 boot-project/node-apply consumer 和重启重放；任何一项缺失都视为不支持，不能仅凭 PropertySpec 宣称完成。
 - 所有 persisted/effective/runtime 输出继续遵守 v0.1 JSON 分层。
 - 新的 list/item mutation、help、show 和 API operation path 必须通过 v0.1 同一组 registry contract/golden tests。
 - 每个里程碑必须同时具备代码、自动化、可复现系统验证和更新后的审计记录。
@@ -618,11 +804,16 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
 - schema v4 plan/apply/rollback 将每个 v3 Profile 无损映射为 `kind.install`，旧 parser 不接受 nullable v4 半成品。
 - diskless Profile、rootfs、nodeforge-initrd 和 boot-bundle 的 PropertySpec/CollectionSpec/ItemSpec、Assets CLI/API、
   exact-key show/help 和 transaction 全部通过 contract test。
-- rootfs 由完整 `rootfs_input_digest` 可复现构建/缓存；Profile 或 Node software delta 与实际文件系统内容一致。
-- node-bound boot-config 和 rootfs GET/HEAD/Range 通过跨 Node 越权、token 过期、If-Range、断点续传、错误 digest、
-  feature mismatch、重复失败 quarantine 和 daemon restart-resume 负向测试。
-- BootConfig fixture 证明只含 `$6$` hash/public key，boot.json、access log、Event、错误和 CLI 输出均不含明文、hash、
-  private key 或 token；initrd 切根前清零 capability。
+- rootfs 由完整 `rootfs_input_digest` 可复现构建/缓存；Profile software/system/SSH 基线改变 digest，
+  Node override 只改 `desired_plan_digest` 并经 boot-project/node-apply 在 upper 重放，不生成第二份 rootfs。
+- node-bound boot-config、rootfs 与 AgentPlan/payload GET/HEAD/Range 通过跨 Node/session/path 越权、token 过期、
+  If-Range、断点续传、错误 digest、redirect/latest/catalog 拒绝、agent token 清除、
+  feature mismatch、BootConfig 响应中断/有界重放、无效 token 不归责 victim、有效 claim 越权、重复失败 quarantine 和
+  daemon restart-resume 负向测试。restart-resume 只保证客户端已完整取得 raw token 后的阶段；capsule 交付前/中重启且
+  客户端没有完整 token时必须 `recovery_incomplete`，不能重建 secret。
+- AgentPlan fixture 证明 Node password hash/authorized_keys/hosts delta 可编译且只由 agent pre-init 写 upper，
+  不含明文密码或 Profile SSH private key；boot.json、access log、Event、错误和 CLI 输出均不含明文、hash、private key 或 token；
+  initrd 切根前清零 config/rootfs capability；agent 在预取完成后清零 agent capability。
 - `local-only` rootfs 静态检查和隔离网抓包证明无公网 mirror/metalink/GeoIP/vendor NTP/update，全部 initrd URL 使用
   server IP；静态目标地址不等于 MAC reservation、MAC 不匹配和 renderer 缺失均在切根前失败。
 - BootSession 覆盖 DHCP/TFTP/boot-config/initrd 全链路、失败/过期分支、重复/跳跃/回退/错绑拒绝及 quarantine gate，
@@ -631,8 +822,9 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
   active session。跨 kind 换绑仅在 `deploy=false` 且无 active/recoverable session 时允许，历史只进 trace。
 - `squashfs_overlay`（v0.2 唯一 rootfs 形态）通过 UEFI x86_64/aarch64 QEMU smoke + VMware 虚拟机部署（compute_use）
   实机代理验证；至少一架构完成断网恢复、switch_root、running event 和 retry 闭环，覆盖真机 NIC/firmware/内存差异。
-  大镜像内存预算场景（squashfs compressed size + tmpfs upper + initrd reserve）在可信 inventory 存在时须
-  readiness 校验通过；无 inventory 时 readiness 明示 unknown/required minimum，并由 initrd 实测硬闸。可切换 rootfs 形态
+  大镜像内存预算场景按统一 `available_budget` 计 squashfs compressed size + 完整 upper limit + safety margin；readiness
+  用 inventory 减 kernel/initrd，initrd 直接使用 `MemAvailable`，不得重复扣 kernel/initrd。无 inventory 时 readiness 明示
+  unknown/checked required minimum，并由 initrd 实测硬闸。可切换 rootfs 形态
   （`ram_rootfs` 等）属 v0.5，不纳入 v0.2 验收。
 - install Profile 的既有 PXE、全部 v0.1 storage/software/override 和 schema v3 migration 回归不退化。
 
@@ -650,30 +842,34 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
 - schema v4 migration/rollback 将 v3 managed-file bundle 无损映射到 canonical tagged action/phase；v0.3 schema v5
   仅增加 `install-post` 适用性，不另建 bundle owner；同一 Assets owner 扩展后的
   tagged ItemSpec 拒绝 action/phase 非法字段组合。
-- bundle CRUD、ordered item mutation、atomic file replacement、plan/apply/status/retry、If-Match 和幂等键通过并发及
+- bundle CRUD、ordered item mutation、atomic file replacement、plan/apply/status、phase-specific retry、If-Match 和幂等键通过并发及
   crash-recovery 测试；plan 无副作用。
 - `install-post`、`rootfs-build`、`first-boot` 各 phase 只执行明确允许的 bounded action；script 来自受管 asset，
   日志/stdout/stderr 有界且脱敏，不存在 argv script/JSON 或任意未审计远程命令入口。
-- package action 只引用 snapshot 中的 effective software/capability，不存在 `standard_packages` 或自由 packages 数组。
-- schema/CLI/API/event 对 canonical phase 的旧名迁移唯一且八步顺序稳定；保护域 action 在 plan 阶段被拒绝，每个 phase
+- package action 的 `packages/group/environment/selection` 只能在 snapshot 固定的 software capability 与本地 repository
+  revision 中解析；不存在 `standard_packages` 旧字段、未固定 repository 或在线自由安装入口。
+- schema/CLI/API/event 对 canonical phase 的旧名迁移唯一且八步顺序稳定；action 可修改与 install
+  postprocess 相同的运行根路径，但 credential/session/lower 边界越权在 plan 阶段被拒绝；每个 phase
   的 finalizer 失败均阻止 succeeded 发布。
-- first-boot 节点身份（`nodeforge.node_id` cmdline/boot.json）与 best-effort 事件回传（带 node_id）通过测试；回传失败
-  本地兜底不阻塞后处理；无 enrollment/credential（reconciliation/远程控制为永久非目标，见 §7），验收确认 agent 无远程
+- first-boot 节点身份（`nodeforge.node_id` cmdline/boot.json + session-bound event token claim）与 best-effort 事件回传
+  通过测试；回传失败本地兜底不阻塞后处理；无可续期 enrollment credential（reconciliation/远程控制为永久非目标，见 §7），验收确认 agent 无远程
   任务入口、无 drift 重跑，first-boot 一次性顺序执行。
 - Kickstart、Autoinstall、rootfs build 和 diskless 对同一 bundle revision 的 plan/status/audit 语义一致。
+- retry 不能抽象成远程通用动作：rootfs-build 由 operation 重建；diskless first-boot 仅同 session 内自动 step retry；
+  install-post 仅同 generation/installer execution 内自动 step retry；耗尽后的重新执行分别需要新 build 或新 install generation。
 
 ## 10. 变更记录（设计收敛轨迹）
 
-**第一轮（属性适用性 / 无盘构建 / 运行期 agent / local-only / 网络）**：补全无盘属性适用性矩阵；补 base rootfs 构建工具链
+**第一轮（属性适用性 / 无盘构建 / 运行期 agent / local-only / 网络）**：补全无盘属性适用性矩阵；补 rootfs 构建工具链
 （lorax/debootstrap、pin capability、local-only）、`rootfs-build` phase、构建期/启动期边界表；补 step I/O、两类包（标准经本地
-repo / 非标准 tar.bz2+install.sh）、保护域、事件回传；固化为不变式并补贯穿影响；补 renderer 按 adapter 选择、MAC 绑定。
+repo / 非标准 tar.bz2+install.sh）、credential/session/lower 边界、事件回传；补 renderer 按 adapter 选择、MAC 绑定。
 
 **第二轮（BootConfig / 后处理与 agent / 网络 / local-only）**：补 BootConfig 定义与 boot 写入流程、per-Node 投影、共享参数来源、
-boot-time 职责划分（initrd 写网络 vs agent 跑 first-boot）。
+boot-time 职责划分；最终边界在后续复审收敛为 initrd 只交接 AgentPlan locator、agent pre-init 从服务端取得 plan 后应用 Node override。
 
-**第三至十一轮（variant 收敛 / CLI / rootfs 查询 / BootConfig 澄清）**：variant（节点下载/引导的 rootfs）按 effective digest 跨 Node
-共享；最终取消 variant 与暴露的 base rootfs 两层概念，收敛为单一共享 rootfs（OS 层为 builder 内部按 software digest 缓存、不暴露为
-独立 Resource）；补 rootfs 查询/构建 CLI；补 BootConfig per-boot per-Node 短时 DTO 流程。
+**第三至十一轮（共享 rootfs / CLI / rootfs 查询 / BootConfig 澄清）**：收敛为每 Profile 单一共享
+rootfs（OS 层为 builder 内部按 software digest 缓存、不暴露为独立 Resource）；补 rootfs 查询/构建 CLI；
+补 BootConfig per-boot per-Node 短时 DTO 流程。
 
 **第十二轮（状态机统一 / reconciliation 升级永久非目标 / management-credential 边界澄清 / 实现细节细化）**：单一 canonical `Phase`
 枚举覆盖两条流、所有者分离（BootSession 传输态 + deployment 投影）；reconciliation/远程控制升级永久非目标；management-credential
@@ -711,3 +907,53 @@ build/boot readiness 定义及跨 kind 换绑的 blockers/next commands。
 `kernel_args.add/remove`、`ProfileKind=install|diskless`、schema 版本号（v3/v4/v5/v6/v7）上无遗留冲突。除 `local-only` 系
 v0.1 删除字段后的孤立遗留（已固化为不变式）外，v0.2 未发现因 v0.1 变动而失效或需废弃的条款。全部改动未改变 v0.1 冻结 owner 或
 v0.2 进入条件，且未触碰任何代码。
+
+**第二十一轮（CLI 流程查漏补缺 / 跨版本命名统一 / digest 流转）**：`V0_2_CLI.md` 补全 exit code 1、`--wait`/operation id/
+daemon 依赖约定；补 `profile list`、`provision-bundle list/item remove`、per-action 字段矩阵、`preflight` human 输出、
+`rootfs plan` JSON digest 字段、`boot preview`/`node status`/`runtime`/`status --component` 输出格式、`postprocess` 默认 session
+与 `--include-output` 语义；新增 §13 digest 流转表与从零启用流程示例；统一 `preflight diskless-builder` 命令形式
+（`V0_2_DISKLESS_WORKFLOW.md` 同步）；补 `profile create` 向后兼容默认 `--kind install`、`node effective` vs `node show` 区分、
+`profile/node remove` 为 v0.2 非目标（§7）。`V0_3/V0_4` 的 `postinstall` 统一为 `postprocess`。全部改动未触碰代码、未改变 v0.1 冻结
+owner 或 v0.2 进入条件。
+
+**第二十二轮（跨版本契约复审）**：修正 digest 漂移分类，明确 identity/network/secret/overlay 只改变 desired plan、
+不分裂 rootfs cache；补通用 opaque operation show/wait、stdout/stderr 与 exit code 边界，删除 `preflight --scope` 双语法；
+修复 managed-file 字段矩阵与 BootConfig config digest 自引用、session supersede CAS。v0.3 将 BIOS 范围限定为 install，
+install-post 以 install generation 标识并只在 installer 内自动 retry。v0.4 网络改为 ItemSpec topology +
+BootConfig v3 bootstrap transport + AgentPlan v2 target topology，
+节点构建收敛为临时 PXE rootfs 构建 operation，install first-boot 补磁盘 handoff/journal，容量验收补 workload/SLO 证据。
+v0.5 固定复用同一 squashfs 传输制品，BootConfig 升 v4，mode 只改变 desired/delivery digest、不改变 rootfs input digest。
+
+**第二十三轮（实现契约与认证复审）**：恢复 v0.1 冻结的 Assets import owner/参数顺序与 provision-bundle `steps`
+collection；Profile boot effective 只输出可证明 requirements，resolved projection 归 Node，`postprocess show` 改为
+active-first。v0.3 补 generation-bound callback credential。v0.4 topology 增 `routes` 并冻结无损迁移，全部新 delivery
+统一使用 BootConfig v3 + AgentPlan v2；临时构建节点补 BuilderBootAttempt、boot-slot 互斥、scoped upload claim 和 digest 边界，install
+first-boot 补一次性 bootstrap token 交换。v0.5 冻结 ram_rootfs 双预算公式、feature 适用性与 unsquashfs metadata 保真。
+
+**第二十四轮（可执行性复核）**：v0.3 明确 install callback raw token 通过 per-generation credential capsule 以 0400
+文件交付，服务端只持 hash 且 restart 后不产生并行有效 token。v0.4 要求 effective compiler 在选择物理 builder Node
+前唯一导出 capability class/ABI 并固定 input digest。v0.5 将内存校验改为规范化 available budget：运行态限制展开根，
+峰值同时计入 compressed/uncompressed 副本，避免对 initrd `MemAvailable` 重复扣 kernel/initrd，并冻结 checked
+`required_min_memory_bytes` 公式。
+
+**第二十五轮（协议恢复与迁移复核）**：DHCP 新 XID 改为 correlation-window transaction alias，不再自动误杀同次 PXE；
+BootConfig token 改为 single-purpose bounded replay，以 `diskless.initrd_started` config digest 确认；冻结 hash-only raw
+token 在 capsule 交付前/中的 restart 恢复边界和鉴权错误归责。统一 v0.2-v0.5 transaction rollback 与 schema downgrade
+representability 契约；v0.2 squashfs 内存预算与 v0.5 共用 available-budget 口径。
+
+**第二十六轮（v0.2-v0.5 再复审）**：修正 workflow 遗留的旧 asset/item CLI；diskless Node software override
+保留与 install 相同的 effective merge，切根后由 agent `node-apply` 重放，不进入公共 rootfs；diskless Profile password hash 改为按
+credential revision 固定，避免 per-session salt 破坏可复现 rootfs；mandatory Profile client key 与 effective-hosts
+known_hosts 重算保证标准路径的域内互信。统一 rootfs cache key、BootConfig 挂载/投影顺序和 agent session/token 身份；
+v0.5 mode 固定为 Profile-only，schema v7 下两种取值均显式表达。
+
+**第二十七轮（initrd / Node override 边界复审）**：删除 initrd 内静态配置 projector 的设计残留。nodeforged 只编译
+immutable `node_apply_projection`；initrd 只 transport/verify/mount/handoff，并以 rootfs 内
+`nodeforge-agent --pre-init` 为 `switch_root` 入口。agent 使用最终 rootfs 的 TargetSystem/package/renderer 能力应用全部
+Node override，成功后在同一 PID `exec /sbin/init`；systemd 启动后的同一 binary 只执行 effective first-boot。
+`required_features` 按 initrd/agent consumer 分域，pre-init 失败属于 boot failure，first-boot 失败才属于 degraded postprocess。
+
+**第二十八轮（agent 拉取模型复审）**：进一步将 initrd handoff 缩减为最小 BootConfig + AgentPlan locator。
+`nodeforge-agent --pre-init` 定义为单次启动执行框架：继承 bootstrap 网络，从服务端拉取 session-pinned AgentPlan 和全部
+Node payload，校验 digest/feature 后清零 `agent:read` token，再按固定 stage 应用 Node override。initrd 不下载 AgentPlan/
+Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或远程命令，节点侧也不重新 merge Profile/Node。

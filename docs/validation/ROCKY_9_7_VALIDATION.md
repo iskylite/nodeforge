@@ -727,7 +727,7 @@ M0 默认 HTTP/管理共用端口为 `18080`（可在配置文件 `server.http_p
 ### M5 继承验收
 
 - [ ] diskless rootfs build 继承 M4.1 locale/timezone、OpenSSH/root/password、防火墙和 Rocky SELinux 默认值。
-- [ ] BootConfig 声明 `sha512-crypt-v1`、`bootstrap-admin-key-v1`，只含 `$6$` hash 和合并后的 public keys；
+- [ ] AgentPlan 声明 `sha512-crypt-v1`、`bootstrap-admin-key-v1`，只含 `$6$` hash 和合并后的 public keys；最小 BootConfig 不含账号/SSH 配置；
   不含 config 明文 password 或 NodeForge bootstrap private key。
 - [ ] 额外包只在 rootfs build 阶段安装；initrd/diskless_boot 不运行 apt/dnf，不访问公网。
 - [ ] DHCP/静态节点 overlay 遵循 M4.1 网络约束，BootConfig 只携带目标 hash，不携带明文 root 密码。
