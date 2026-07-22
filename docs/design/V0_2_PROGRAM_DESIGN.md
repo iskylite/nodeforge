@@ -11,7 +11,7 @@ diskless 时序见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，状态机/协议�
 |---|---|---|---|---|
 | `nodeforged` | 单进程守护进程：DHCP/TFTP/HTTP 协议栈 + 本机管理 API + 服务端 rootfs builder | 服务端常驻 | daemon 管理 API 自身鉴权 | 是（v0.1 已有 daemon，v0.2 扩 diskless/builder） |
 | `nodeforge-initrd` | dracut 引导程序：拉 BootConfig、下载/校验/挂载 rootfs、写 target-system 投影、switch_root | initrd（switch_root 前） | node-bound capability token（仅 boot 传输） | 是 |
-| `nodeforge-agent` | 切根后确定性顺序执行器：开机跑 first-boot 后处理 | 切根后运行期 | `nodeforge.node_id` cmdline/boot.json，无 enrollment | 是（仅 diskless） |
+| `nodeforge-agent` | 切根后确定性顺序执行器：开机跑 first-boot 后处理 | 切根后运行期 | session 身份 + 短时 `event:append` token，无 enrollment | 是（仅 diskless） |
 
 三者共享核心模块（`src/root.zig` 为 `nodeforge` 模块），避免行为分叉；当前 `build.zig` 仅产出
 `nodeforged` 与 `nodeforge`（管理 CLI），v0.2 新增 `nodeforge-initrd` 与 `nodeforge-agent` 两个
@@ -25,13 +25,13 @@ v0.1 已实现单进程内置 DHCPv4/TFTP/HTTP 与本机管理 API。v0.2 在其
 
 - DHCP/TFTP/HTTP 协议栈：按 canonical BootSession 状态机驱动引导
   （[`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) §2）。
-- BootConfig 生成与投递：按 pinned DisklessEffectivePlan 在 boot 时生成 per-boot、per-Node 的
+- BootConfig 生成与投递：按 immutable DisklessEffectivePlan snapshot 在 boot 时生成 per-boot、per-Node 的
   短时 BootConfig DTO，经 node-bound capability token 拉取。
-- node-bound rootfs HTTP GET/HEAD/Range：按 effective digest 共享 rootfs，token 绑定
+- node-bound rootfs HTTP GET/HEAD/Range：按 `rootfs_input_digest` 缓存、content SHA-512 交付，token 绑定
   node/session/method/path 与短有效期。
 - 服务端 rootfs builder：构建 squashfs lower（OS 层 + rootfs-build phase），按 digest 缓存
   （[`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) §4）。
-- effective compiler / readiness / validator：与 v0.1 同一编译结果（diskless 分支消费 pinned
+- effective compiler / readiness / validator：与 v0.1 同一编译结果（diskless 分支消费 immutable
   DisklessEffectivePlan）。
 - 管理本机 API：复用 v0.1 management API 与 `admin_key` 鉴权。
 
@@ -54,17 +54,20 @@ initrd 内完成上述职责。
 
 ### 3.2 功能列表
 
-1. 从 kernel cmdline 读取 `nodeforge.config_url` 与 `nodeforge.node_id`（或 MAC/
-   `pxe.ip_reservation`）。
-2. 经 node-bound capability token 从 `config_url` 拉取 BootConfig（短有效期 token）。
+1. 从 kernel cmdline 读取无密钥的 config URL、node/session，并从 GRUB 追加加载的 per-session credential
+   capsule 读取一次性 config token；token 不进入 `/proc/cmdline`。
+2. 经 `config:read` token 从 `config_url` 拉取 BootConfig，再使用分域 `artifact:read` token。
 3. 校验 BootConfig：feature 子集、`required_features`、`schema_version` v2、digest；缺失或冲突
    以稳定 error code 拒绝，不回退降级。
-4. 下载/校验（sha512）/挂载 rootfs lower（HTTP GET/HEAD/Range 恢复）。
+4. 做内存预算闸，下载到 `.part`，严格校验 ETag/Content-Range/size，完整 SHA-512 成功后才挂载
+   rootfs lower（HTTP GET/HEAD/Range 恢复）。
 5. 建立 squashfs 只读 lower + tmpfs overlay upper。
 6. 把 target-system 投影写 overlay upper：NM/Netplan 网络配置、hostname、`/etc/shadow` `$6$`
    hash、authorized_keys、machine-id、SSH host key。
-7. 写 `/run/nodeforge/boot.json`（mode 0600，plan/config digest 与非 secret 摘要）。
-8. `switch_root` 前清零 capability token。
+7. 写 `/run/nodeforge/boot.json`（mode 0600，plan/config digest 与非 secret 摘要）及独立的
+   `/run/nodeforge/credentials/event.token`（0400）。
+8. pre-switch 检查通过后清零 config/artifact token，move-mount `/run` 并 `switch_root`；event token
+   仅由 agent 使用，完成后删除。
 
 ### 3.3 实现要点
 
@@ -85,12 +88,13 @@ agent **仅服务 diskless**（diskless 无安装器，first-boot 是其后处�
 
 ### 4.2 功能列表
 
-1. 切根后读取 `/run/nodeforge/boot.json` 取 `node_id`。
-2. 按 pinned bundle revision 拉取 first-boot steps。
+1. 切根后读取 `/run/nodeforge/boot.json` 取 node/session/plan identity，并校验 event token 文件权限。
+2. 从 rootfs 中固定 revision/digest 的 bundle manifest/payload 读取 first-boot steps；package closure、archive 和 script
+   均由 builder 预置，v0.2 不在切根后远程拉取可变步骤或包。
 3. 固定顺序执行：文件更新 -> package -> archive -> script（八步执行契约见
    [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §5.2）。
-4. 幂等：`(bundle revision, effective digest, node, phase, idempotency key)` 使已成功 step
-   重跑时 no-op。
+4. 幂等：`(boot session, bundle revision, desired plan digest, node, phase, idempotency key)` 使同次启动
+   崩溃恢复/重试时已成功 step no-op；新 PXE session 重新执行全部步骤。
 5. retryable 失败 step 在当次开机内按 step 声明重试，耗尽标 failed（节点仍启动、该 step 失败）。
 6. 每 step 前后产生 `provision.step.started/succeeded/warned/failed`，经 `event_url` best-effort
    回传（带 `node_id`）。
@@ -98,8 +102,8 @@ agent **仅服务 diskless**（diskless 无安装器，first-boot 是其后处�
 
 ### 4.3 实现要点
 
-- **无 enrollment/credential**：身份由 `nodeforge.node_id` cmdline 携带，initrd 写 boot.json，
-  agent 读取。不引入运行期节点认证 secret。
+- **无 enrollment**：身份来自 cmdline、BootConfig、token claim 三方相等的 session snapshot。event token 是 per-boot、
+  append-only、短时传输能力，不是可续期的运行期 enrollment credential。
 - **无远程控制**：reconciliation/远程控制为永久非目标；agent 开机确定性顺序执行，无 drift 重跑、
   无远程任务下发。
 - **无独立 first-boot retry CLI**：重启即重跑（确定性+幂等保证安全）；`node diskless retry` 仅清
@@ -114,10 +118,12 @@ agent **仅服务 diskless**（diskless 无安装器，first-boot 是其后处�
 
 | 凭据 | 类型 | 鉴权路径 | 权限 | 生命周期 |
 |---|---|---|---|---|
-| boot 传输 token | per-boot 传输鉴权 | initrd 拉 BootConfig/rootfs | 仅该 Node 的 GET/HEAD/Range config/rootfs + event POST | 短有效期，switch_root 前清零 |
+| config token | per-boot 一次性能力 | initrd 拉 BootConfig | 仅本 node/session 的一次 GET | BootConfig 成功校验后撤销 |
+| artifact token | per-boot 只读能力 | initrd 拉 manifest/rootfs | 固定 digest 路径的 GET/HEAD/Range | switch_root 前清零 |
+| event token | per-boot 只写能力 | initrd/agent 上报本 session 事件 | 固定 event path 的 POST，无读权限 | agent 完成或过期后删除 |
 | management credential | daemon 管理 API 鉴权 | 服务端管理员 | catalog 写、管理 API 全权限 | daemon 常驻 admin_key |
 
-- 传输 token 不能访问其他 Node rootfs、不能升级为 management credential（防 per-boot token 被滥用
+- 三种传输 token 不能互换、不能访问其他 Node rootfs、不能升级为 management credential（防 per-boot token 被滥用
   为服务端管理权限）。
 - **enrollment**（运行期节点认证 secret）已永久移除，与上述 token 无关：token 仅是 boot 期 initrd
   拉取 BootConfig/rootfs 的传输鉴权，agent 身份由 `nodeforge.node_id` cmdline 携带。
@@ -125,10 +131,10 @@ agent **仅服务 diskless**（diskless 无安装器，first-boot 是其后处�
 ## 6. 三者协作时序
 
 ```text
-nodeforged 生成 BootConfig（per pinned DisklessEffectivePlan）
-  -> DHCP/TFTP 引导 boot bundle（kernel + nodeforge-initrd）
+nodeforged 生成 BootConfig（per immutable DisklessEffectivePlan snapshot）
+  -> DHCP/TFTP 引导 boot bundle（kernel + shared nodeforge-initrd + per-session credential capsule）
   -> nodeforge-initrd: 拉 BootConfig、下载/校验/挂载 rootfs、写 overlay upper、switch_root
-     （switch_root 前清零 token）
+     （switch_root 前清零 config/artifact token，仅交接 event token）
   -> nodeforge-agent: 读 boot.json(node_id)、固定顺序执行 first-boot、best-effort 回传事件
 ```
 

@@ -14,6 +14,9 @@ v0.4 必须基于 v0.3 完成：
 
 ## 2. 范围
 
+v0.4 的持久 shape 统一使用 catalog schema v6；v0.3 schema v5 到 v6 的迁移必须显式物化网络拓扑
+与 builder placement 默认值。不能在 v5 下静默增加多 NIC/VLAN/bonding 或 agent placement 字段。
+
 | 项 | v0.4 范围 | 说明 |
 |---|---|---|
 | 多 NIC/VLAN/bonding | 是 | PXE 阶段纯静态、下载后切换地址/子网；需显式 initrd feature/schema/验收 |

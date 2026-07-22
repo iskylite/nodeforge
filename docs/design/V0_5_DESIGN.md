@@ -67,7 +67,7 @@ overlay 配置，与 rootfs **如何物化**（squashfs loop vs 全内存解压�
 |---|---|---|
 | lower 物化 | squashfs 压缩镜像 loop 只读 | 整 rootfs 解压进内存 |
 | 写层 | tmpfs overlay upper | 内存根可写部分 |
-| 内存预算校验 | 不需要（中占用） | 需要（高占用，不足 fail closed） |
+| 内存预算校验 | 需要：压缩镜像 tmpfs + upper + reserve | 需要：uncompressed root + reserve（阈值更高） |
 | Range recovery | 支持（squashfs 文件） | 支持（传输层一致） |
 | 共享 lower | 是 | 否（每节点独立解压） |
 | `diskless.overlay.mode` | 不声明（v0.2 单值） | 声明 `ram_rootfs` |
@@ -78,7 +78,7 @@ overlay 配置，与 rootfs **如何物化**（squashfs loop vs 全内存解压�
 - v0.2 不存在该字段（单值无选择意义，同 v0.1 `connectivity.mode` 逻辑）；v0.5 迁移时默认补
   `squashfs_overlay`，旧配置无 mode 字段等价于 `squashfs_overlay`。
 - `ram_rootfs` 形态的 rootfs build manifest 必须记录 `uncompressed_size`（预算校验依赖）。
-- schema 版本：v0.5 rootfs 形态字段对应 catalog schema 演进（v6），与 BootConfig DTO v2、
+- schema 版本：v0.5 rootfs 形态字段对应 catalog schema v7（v0.4 使用 v6），与 BootConfig DTO v2、
   `firmware.mode` v5 分属不同命名空间。
 
 ## 6. CLI（v0.5）
@@ -90,7 +90,7 @@ nodeforge node effective <node>          # 投影 rootfs mode 与 uncompressed_s
 nodeforge node rootfs show <node>         # 显示当前形态/digest/uncompressed_size
 ```
 
-- `ram_rootfs` 在 readiness 阶段额外校验预算：节点可用内存 >= uncompressed_size + 预留；不足则
+- 两种形态都在 readiness/initrd 双检预算；`ram_rootfs` 额外要求节点可用内存 >= uncompressed_size + 预留；不足则
   readiness 失败（`diskless.insufficient_memory`），不发 bootfile。
 - v0.2/v0.3/v0.4 不提供 `diskless.overlay.mode` 的 help/handler；预留 enum 不算实现。
 

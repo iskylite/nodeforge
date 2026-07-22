@@ -7,6 +7,7 @@
 - [v0.1 设计与修复计划](design/V0_1_DESIGN.md)：M0-M4 及进入 v0.2 前必须完成的修复，当前权威设计。
 - [v0.2 设计范围](design/V0_2_DESIGN.md)：diskless 主流程版本边界与进入条件，v0.2 权威设计入口。
 - [v0.2 无盘最终方案](design/DISKLESS_FINAL.md)：squashfs_overlay 收敛选型、共享 rootfs、BootConfig 与启动时序。
+- [v0.2 Diskless 从零构建与 PXE 流程](design/V0_2_DISKLESS_WORKFLOW.md)：从本地 OS 源、initrd、Profile/Node、rootfs 构建到 PXE 启动和恢复的操作闭环。
 - [v0.2 无盘方案开源情报对比](design/DISKLESS_OSS_COMPARISON.md)：NFS/iSCSI/iPXE/squashfs/ram 对比与 local-only 选型依据。
 - [v0.2 程序边界](design/V0_2_PROGRAM_DESIGN.md)：`nodeforged` / `nodeforge-initrd` / `nodeforge-agent` 三程序职责与凭据边界。
 - [v0.2 实现细节](design/V0_2_IMPL_DETAILS.md)：BootSession 状态机、DHCP/TFTP/HTTP 协议栈、effective compiler/readiness/validator 三项核心闭环。
@@ -18,6 +19,9 @@
 v0.3（PXELINUX/BIOS install）与 v0.4（延后增强项）的设计在 v0.2 启动后展开；reconciliation/远程控制为永久非目标。
 
 ## 审计与验证
+
+- [`audits/V0_2_V0_5_DESIGN_REVIEW.md`](audits/V0_2_V0_5_DESIGN_REVIEW.md)：基于 v0.1 M0-M4.13
+  代码事实的 v0.2-v0.5 差距、版本依赖与推荐实施顺序。
 
 - [`audits/`](audits/)：代码事实、设计对齐和缺口审计。
 - [`validation/`](validation/)：自动化、虚拟机和实机验证记录。
