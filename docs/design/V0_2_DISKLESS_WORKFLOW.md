@@ -199,7 +199,7 @@ add/remove package closure、pinned local repository revision/GPG policy、prote
 可达性；Node first-boot bundle 还必须 first-boot-only 且 payload closure/digest/size 可由 session-bound `agent:read`
 精确投递，不能退化成按 Node 构建、公网装包或拉取可变任务。
 此处必须发现：install-only storage 字段、缺 source/repository capability、跨架构不安全 step、读取/复制
-`/run/nodeforge/credentials`、修改只读 lower 或篡改 session handoff 的 step、公网 repository、kernel/modules ABI
+`/var/lib/nodeforge/credentials`、修改只读 lower 或篡改 session handoff 的 step、公网 repository、kernel/modules ABI
 不匹配和 bundle revision 漂移。修改用户、密码、SSH、hosts 或其他运行根文件本身不是拒绝理由。
 
 `node effective` 不得把 password hash/token 完整打印到 human 输出；JSON 的 secret-bearing 字段默认 redacted，
@@ -272,7 +272,7 @@ NIC PXE DHCPDISCOVER
  -> 有界重放地获取固定 BootConfig，校验后以 config digest 确认并撤销 token
  -> HEAD/Range 下载 rootfs.part，完整 SHA-512 校验
  -> loop(ro) lower + tmpfs upper/work + overlay merged
- -> 校验 AgentPlan locator/expected digest/size/agent feature 摘要，交接到 /run/nodeforge/agent-handoff.json
+ -> 校验 AgentPlan locator/expected digest/size/agent feature 摘要，交接到 /var/lib/nodeforge/agent-handoff.json
  -> pre-switch 检查，move-mount /run，清 config/rootfs-artifact token，保留短时 agent/event token
  -> switch_root 到 nodeforge-agent --pre-init
  -> agent 以 bootstrap 网络从服务端拉取并校验 immutable AgentPlan + 全部 Node payload，写 /run 后清 agent token

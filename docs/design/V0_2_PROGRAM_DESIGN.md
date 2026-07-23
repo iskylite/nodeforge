@@ -30,7 +30,7 @@ executable，复用同一 core module。
 | agent `--pre-init` | `switch_root` 后、`/sbin/init` 前 | immutable AgentPlan 与全部 Node payload | 预取校验后清读 token；写最终 rootfs 的 network/hostname/machine-id/users/password/SSH/hosts/NTP/localization/security/software/services | 不读取 latest catalog，不接远程临时命令，不 daemonize |
 | agent `--first-boot` | 真正 init/systemd 后 | 不再获取配置；只读 pre-init/rootfs 本地 payload | 按固定 action 顺序执行后处理并上报结果 | 不重复 merge/apply Node baseline，不做 reconciliation |
 
-这里“initrd 写 handoff”与“更新 rootfs 配置”是两类动作：前者只写 `/run/nodeforge/*` 的 locator、摘要和短时凭据，
+这里“initrd 写 handoff”与“更新 rootfs 配置”是两类动作：前者只写 `/var/lib/nodeforge/*` 的 locator、摘要和短时凭据，
 后者只允许 agent 在最终 rootfs 中执行。
 
 ## 2. nodeforged（守护进程）
@@ -85,7 +85,7 @@ initrd 内完成上述职责；它不链接 TargetSystem/effective runner，不�
 5. 建立 squashfs 只读 lower + tmpfs overlay upper。
 6. 只校验 AgentPlan locator envelope（URL host/path、expected digest/size、expiry、required agent feature 摘要），
    不下载或解析完整 plan；检查已挂载 rootfs 的 agent manifest 能满足 feature 摘要。
-7. 写 `/run/nodeforge/boot.json` 与 `/run/nodeforge/agent-handoff.json`（均 0600，仅含 node/session、URL、digest、size
+7. 写 `/var/lib/nodeforge/boot.json` 与 `/var/lib/nodeforge/agent-handoff.json`（均 0600，仅含 node/session、URL、digest、size
    和非 secret 摘要），将独立 `agent:read` 与 `event:append` token 写入 0400 credential 文件。
 8. pre-switch 检查通过后清零只属于 initrd 的 config/rootfs-artifact token，move-mount `/run`，保留 agent/event token，
    以 merged root 执行 `switch_root ... /usr/lib/nodeforge/nodeforge-agent --pre-init`。
@@ -116,7 +116,7 @@ agent **仅服务 diskless**，是消费服务端 immutable AgentPlan 的一次�
 
 ### 4.2 功能列表
 
-1. pre-init 读取 `/run/nodeforge/boot.json` 和 `agent-handoff.json`，校验 node/session/plan identity、handoff
+1. pre-init 读取 `/var/lib/nodeforge/boot.json` 和 `agent-handoff.json`，校验 node/session/plan identity、handoff
    owner/mode、expected digest/size/expiry 与 `agent:read` claim。
 2. 使用继承的 bootstrap 网络从精确 URL 拉取 immutable AgentPlan；只接受 expected digest 的 canonical bytes，禁止
    catalog list/get、latest、重定向到未声明 host 或服务端临时下发命令。
@@ -128,7 +128,7 @@ agent **仅服务 diskless**，是消费服务端 immutable AgentPlan 的一次�
 5. pre-init 成功后原进程 `exec /sbin/init`；失败先 best-effort 上报稳定 reason，再按失败策略在 console 留证并终止，
    不能启动未完成 override 的系统，也不能回退 Profile baseline。
 6. first-boot 按 AgentPlan 指定的唯一来源读取 payload：无 Node override 时读取 rootfs 中固定 revision/digest 的
-   Profile payload；有 override 时读取 pre-init 已下载到 `/run/nodeforge/node-firstboot/<payload-digest>/` 的 payload。
+   Profile payload；有 override 时读取 pre-init 已下载到 `/var/lib/nodeforge/node-firstboot/<payload-digest>/` 的 payload。
    first-boot 阶段没有读 token，不能再访问服务端配置/artifact API。
 7. first-boot 固定顺序执行：文件更新 -> package -> archive -> script（八步执行契约见
    [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §5.2）。

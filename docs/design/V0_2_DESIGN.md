@@ -396,7 +396,7 @@ Boot-config 只返回 initrd 实际需要的最小 DTO：session/scoped capabili
 Range recovery、overlay、AgentPlan URL/digest/size/expiry、consumer feature 摘要和 event URL；不包含 hostname、users、
 password hash、SSH、hosts、software 等 Node 运行根配置。完整差量只存在于 agent 拉取的 AgentPlan，其中不含明文密码
 或 Profile 共享 SSH private keys；
-`/run/nodeforge/boot.json` 只保存 plan/config digest 与非 secret 摘要，mode 0600，且不保存 secret
+`/var/lib/nodeforge/boot.json` 只保存 plan/config digest 与非 secret 摘要，mode 0600，且不保存 secret
 或 token。能力拆成 single-purpose、bounded-replay 的 `config:read`、initrd 只读 rootfs 的 `artifact:read`、agent
 只读固定 plan/payload closure 的 `agent:read` 和只写 `event:append`，分别绑定
 node、session、audience、HTTP method/path、plan digest 与短有效期；不能访问其他 Node rootfs，也不能升级为
@@ -434,7 +434,7 @@ node/session 与 `kernel_args`，config token 由 GRUB 作为第二 initrd cpio 
 ④ 清除 config/rootfs-artifact token；⑤ `switch_root` 执行 `nodeforge-agent --pre-init`，agent 通过 bootstrap 网络拉取并校验
 AgentPlan/全部 payload、清除 agent token，再应用全部 Node override 后 `exec /sbin/init`；⑥ NM/Netplan/sshd 等只看到
 最终配置，同一 agent 的 systemd unit 再执行 effective `first-boot`。
-token 与 `/run/nodeforge/boot.json` 边界见本节上文。
+token 与 `/var/lib/nodeforge/boot.json` 边界见本节上文。
 
 **boot-time 职责划分与共享参数来源**。静态/公共内容（包、locale、账号/password、Profile SSH client/host keys、
 authorized_keys、hosts、sshd policy）全部在 Profile rootfs build 烤入只读 lower；动态/按节点/按启动参数
@@ -556,13 +556,13 @@ script 修改最终运行根。v0.2 固定落地顺序，以便同一 effective 
 `rootfs-build` 和 `first-boot` 是 provision bundle 的声明 phase；`boot-project` 与 `node-apply` 是 effective compiler
 的内建落地 stage，不是新 bundle phase。后处理可以修改 passwd/shadow/group、sudoers、sshd、
 authorized_keys、hosts 和其他运行根文件，因为 install 的同类 postprocess 也具备该力度。安全边界改为
-禁止读取/泄漏 `/run/nodeforge/credentials`、篡改 session identity、写只读 lower 或引入远程持续任务；
+禁止读取/泄漏 `/var/lib/nodeforge/credentials`、篡改 session identity、写只读 lower 或引入远程持续任务；
 plan/preview 必须显示 action 类型、目标路径、输入 revision 和最终覆盖顺序。
 
 Profile bundle 的 rootfs-build/first-boot payload 随公共 rootfs 构建。Node 设置
 `overrides.diskless.provision.bundle` 时，引用 bundle 必须只含 first-boot item；服务端将其解析为不可变 package/
 asset closure，agent pre-init 使用 session-bound `agent:read` 在 `switch_root` 后下载并完整校验到
-`/run/nodeforge/node-firstboot/<payload-digest>/`，随后清除 agent token。first-boot 只读取本地 payload；agent 先执行
+`/var/lib/nodeforge/node-firstboot/<payload-digest>/`，随后清除 agent token。first-boot 只读取本地 payload；agent 先执行
 pre-init node-apply 并 exec systemd，再由同一 binary 的 first-boot unit 执行该 Node bundle；未设置 override 时执行
 rootfs 内的 Profile first-boot payload。该流程不产生
 per-Node rootfs、variant、远程任务或真正 init 后的配置/artifact 下载。
@@ -610,11 +610,11 @@ asset revision 并验证 action/phase/credential-session-lower 边界；3）物�
 managed-file、archive 和 script 可修改 passwd/shadow/group/sudoers、sshd、authorized_keys、
 Netplan/NetworkManager、resolver、locale/timezone/keyboard、firewall 和 SELinux 配置/unit，与 install postprocess
 保持同等力度。它们必须声明预期影响路径，plan/preview 按顺序显示最终覆盖关系。只有
-`/run/nodeforge/credentials`、session handoff/journal 和只读 lower 是不可触碰边界；finalizer 验证凭据未泄漏、
+`/var/lib/nodeforge/credentials`、session handoff/journal 和只读 lower 是不可触碰边界；finalizer 验证凭据未泄漏、
 effective 操作顺序和 local-only 策略。
 
 diskless agent 的节点身份由 cmdline node/session、BootConfig 与 token claim 三方相等后确定，initrd 写入
-`/run/nodeforge/boot.json`（mode 0600，非 secret 摘要）。agent 切根后先执行 session 固定的 Node node-apply，
+`/var/lib/nodeforge/boot.json`（mode 0600，非 secret 摘要）。agent 切根后先执行 session 固定的 Node node-apply，
 再顺序执行 effective first-boot（默认 Profile bundle，Node override 时为预下载的 first-boot-only bundle）；状态/异常/审计经
 event_url best-effort 回传服务端（带 node_id），回传失败不阻塞执行、仅本地留存日志/console/boot.json。
 v0.2 diskless 不引入可续期 enrollment credential、reconciliation 或远程控制（reconciliation/远程控制为永久非目标，
@@ -637,7 +637,7 @@ diskless**（diskless 无安装器，`node-apply`/`first-boot` 是其运行根�
 以 diskless 后处理为唯一 v0.2 目标。
 
 **agent 身份与生命周期**。agent 无 enrollment：节点身份由 cmdline node/session、BootConfig 和 token claim
-三方相等后固定为 session snapshot，initrd 写入 `/run/nodeforge/boot.json` 与 `agent-handoff.json`（mode 0600，非 secret 摘要）。
+三方相等后固定为 session snapshot，initrd 写入 `/var/lib/nodeforge/boot.json` 与 `agent-handoff.json`（mode 0600，非 secret 摘要）。
 `switch_root` 以 `nodeforge-agent --pre-init` 为入口；agent 校验身份，使用 `agent:read` 从服务端获取 expected digest 的
 AgentPlan/Node payload，清除读 token，应用 immutable `node_apply_projection` 后 exec 真正 init。systemd 启动后同一 binary
 的 first-boot unit 再读取 rootfs Profile payload 或 agent pre-init 预下载的 Node override payload，固定顺序

@@ -158,7 +158,7 @@ v0.4 **不**包含：可切换 rootfs 形态（-> v0.5）；NFS root/iPXE/IPv6�
 - **无 reconciliation**：agent 不检测 drift 后远程重跑收敛；drift 仅报告（v0.1 既有）不自动修复。
 - **无长期 enrollment credential**：`nodeforge.node_id`/generation 只提供关联身份，不单独构成认证；短时、
   generation-bound bootstrap/event token 只服务本次 first-boot，不能续期为运行期身份。initrd 写
-  `/run/nodeforge/boot.json`，agent 读取；状态/异常经 `event_url` best-effort 回传，失败本地兜底。
+  `/var/lib/nodeforge/boot.json`，agent 读取；状态/异常经 `event_url` best-effort 回传，失败本地兜底。
 - install 侧 agent 与 diskless agent 共用同一程序（`nodeforge-agent`）与执行契约，差异只在目标上下文
   （install 写磁盘 vs diskless 写 overlay upper）。
 - install 的 first-boot handoff 必须在安装完成前写入目标磁盘：bootloader entry 固定无密钥 node/generation identity，

@@ -138,7 +138,7 @@ Node effective 差量，不重复交付 Profile SSH private keys。
 2. initrd 起后从 `config_url` 拉 BootConfig（单用途、仅容忍响应中断的有界重放 config token），校验 DTO、计划 snapshot、时钟窗口和
    feature，再取得 rootfs 专用 artifact token；agent/event token 已在 credential capsule 中分域，initrd 不使用其读权限。
 3. initrd 先完成 rootfs HEAD/Range 下载、整文件校验，再建立 lower/upper/work/merged；它只把 AgentPlan
-   URL/digest/size/expiry 写入 `/run/nodeforge/agent-handoff.json`，不下载/解析 plan 或 Node first-boot payload，
+   URL/digest/size/expiry 写入 `/var/lib/nodeforge/agent-handoff.json`，不下载/解析 plan 或 Node first-boot payload，
    也不写 merged root 的 target-system；lower 保持只读。
 4. initrd 做 pre-switch 验证，原子写交接目录，撤销并清零 config/rootfs-artifact token；把短时 `agent:read` 和
    `event:append` token 分别以 0400 文件交给切根后的 agent。
@@ -153,8 +153,8 @@ AgentPlan 可包含 Node override 派生的 password hash、authorized_keys 和 
 scope：`config:read`（initrd 单用途有界重放）、`artifact:read`（initrd 只读 rootfs/manifest）、`agent:read`
 （agent 只读固定 AgentPlan 及其显式 payload closure）和 `event:append`（限定本 session 的事件 POST）。四者都绑定 node、session、audience、method/path、计划
 digest 与绝对过期时间，不能访问其他 Node、不能列目录、不能写 catalog，也不能升级为 management
-credential。`/run/nodeforge/boot.json` 只保存 plan/config digest 与非 secret 摘要，mode 0600；短时
-`event:append` token 单独保存于 `/run/nodeforge/credentials/event.token`，mode 0400，不能进入 boot.json、
+credential。`/var/lib/nodeforge/boot.json` 只保存 plan/config digest 与非 secret 摘要，mode 0600；短时
+`event:append` token 单独保存于 `/var/lib/nodeforge/credentials/event.token`，mode 0400，不能进入 boot.json、
 日志或进程 argv。initrd 在 `switch_root` 前清零 config/rootfs-artifact token；agent 在预取并校验全部输入后、修改
 目标系统前清零 agent token，first-boot 结束后清零 event token。
 BootConfig DTO 自身 `schema_version` v2（与 catalog schema v3/v4 分属不同命名空间），
@@ -237,7 +237,7 @@ digest 内从安全检查点继续。具体顺序固定如下：
 7. **mount**：只读 loop 挂载 squashfs 到 `lower`；tmpfs 挂载到独立 `upper-tmpfs`，创建同一文件系统内的
    `upper`/`work`，以 `nodev,nosuid` 挂载 overlay 到 `merged`。lower 必须 `ro,nodev`。
 8. **handoff-agent**：校验 AgentPlan locator envelope 与 rootfs agent feature manifest，写
-   `/run/nodeforge/agent-handoff.json`；不下载/解析 AgentPlan 或 Node payload，不写 merged root。
+   `/var/lib/nodeforge/agent-handoff.json`；不下载/解析 AgentPlan 或 Node payload，不写 merged root。
 9. **pre-switch**：确认 `/sbin/init` 与 `/usr/lib/nodeforge/nodeforge-agent` 可执行、modules ABI、挂载和 `/run`
    move-mount 可持续；写 boot.json、agent/event token 和 journal，均禁止跟随 symlink。target-system/DNS/账号/renderer 的
    最终验证属于 agent pre-init，不得在 initrd 复制一套 parser。
@@ -254,19 +254,18 @@ digest 内从安全检查点继续。具体顺序固定如下：
 入口/动态库、rootfs/kernel modules ABI、挂载选项、目标 `/run` 目录和凭据 owner/mode；任何一项失败都不执行
 switch_root。renderer/账号/SSH 等最终语义由 agent pre-init 校验，initrd 不复制其 parser。它不是 first-boot，也不修改共享 lower。
 
-`/run handoff` 是把 initrd 阶段的 `/run` tmpfs **move-mount** 到 `merged/run`，再切根；不是把文件复制进
-rootfs upper。交接前 mount propagation 设为 private，目录布局固定：
+`/var/lib` handoff：initrd 把 session handoff 与 payload 直接写到 merged 根的 `/var/lib/nodeforge/`（overlay upper）；systemd 不会像 `/run` 那样重建 tmpfs 覆盖 `/var/lib`，故切根前后同一文件，pre-init 与 first-boot 均可读。目录布局固定：
 
 ```text
-/run/nodeforge/boot.json                 0600 root:root，非 secret session 摘要
-/run/nodeforge/journal.json              0600 root:root，initrd 检查点
-/run/nodeforge/agent-handoff.json        0600 root:root，AgentPlan URL/digest/size/expiry，非 secret
-/run/nodeforge/node-apply.json           0600 root:root，agent 拉取并校验后的 immutable Node 运行根投影
-/run/nodeforge/node-firstboot/<digest>/  root:root，agent 预取、只读使用的 immutable Node first-boot payload（可选）
-/run/nodeforge/credentials/agent.token   0400 root:root，预取完成后立即删除的短时 agent:read token
-/run/nodeforge/credentials/event.token   0400 root:root，短时 append-only token
-/run/nodeforge/image/rootfs              rootfs 下载文件，由 loop mount 持有
+/var/lib/nodeforge/boot.json             0600 root:root，session handoff（node/session + AgentPlan locator + agent/event token）
+/var/lib/nodeforge/payload/              root:root，agent pre-init 预取、校验后的 content-addressed payload
 ```
+
+> **实现现状**：当前实现把 handoff 与 payload 直接写在 merged 根的 `/var/lib/nodeforge/`（overlay upper）。
+> systemd 不会像 `/run` 那样重建 tmpfs 覆盖 `/var/lib`，故切根前后同一文件，pre-init 与 first-boot 均可读。
+> `agent_token`/`event_token` 直接放在 `boot.json`（一次性、session 绑定、RAM-only overlay，无重放风险）。
+> 设计文档原描述的 `/run` move-mount + 多文件（`journal`/`agent-handoff`/`node-apply`/`credentials/`）安全模型为后续演进目标，
+> 当前未实现；initrd 阶段的 rootfs 下载等仍用 initramfs `/run`（切根前释放，不涉及）。
 
 这样新系统看到的是同一个 tmpfs/loop backing，loop lower 不因旧 initrd root 被回收而失效，agent 也能取得同一
 session 的 handoff 事实。agent pre-init 自身在应用任何差量前验证目录不是 symlink、owner/mode/digest/session

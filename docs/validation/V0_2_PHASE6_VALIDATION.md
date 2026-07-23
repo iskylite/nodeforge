@@ -36,8 +36,8 @@ v0.2 Phase 6 = diskless 启动链（initrd PID-1 编排 + 切根后 agent pre-in
 
 通过 QEMU 串口逐步定位，修复了 5 个会阻断 diskless 启动的真实缺陷：
 
-1. **handoff 写入旧根**：`writeHandoff` 写 `/run/nodeforge/boot.json`（initramfs 旧根），
-   `switch_root` 会删除旧根 → agent 读不到。改为写新根 `/merged/run/nodeforge/boot.json`。
+1. **handoff 写入旧根**：`writeHandoff` 写 `/var/lib/nodeforge/boot.json`（initramfs 旧根），
+   `switch_root` 会删除旧根 → agent 读不到。改为写新根 `/merged/var/lib/nodeforge/boot.json`。
 2. **squashfs 挂载缺 loop**：直接 `mount -t squashfs -o ro <file>` 不挂 loop 设备，且
    `losetup -f` 结果未用 → 改 `-o ro,loop`。
 3. **overlay upper/work 跨文件系统**：`upperdir=/upper`、`workdir=/work` 分属不同 tmpfs，
@@ -87,7 +87,7 @@ machine-id: ef98ecbb54a375670d4074aab76a3115
 1. initrd PID-1：mount proc/sys/dev → 读 `/proc/cmdline`（config_url/node/session）→
    network up → 读 capsule config-token → curl 拉 BootConfig v2 → 下载 rootfs.squashfs →
    **SHA-512 校验通过** → squashfs loop 挂载（lower）+ tmpfs（rw upper/work）+ overlay 合并 →
-   写 handoff 至新根 `/merged/run/nodeforge/boot.json`。
+   写 handoff 至新根 `/merged/var/lib/nodeforge/boot.json`。
 2. `switch_root`（execve as PID 1）→ `/sbin/nodeforge-agent --pre-init`。
 3. agent：读 handoff → curl 拉 AgentPlan v1 → **SHA-256 digest 校验通过**（空 payload）→
    node-apply 写 `/etc/hostname=smoke01`、`/etc/machine-id`、`/etc/hosts` → `exec /sbin/init`。
