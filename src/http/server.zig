@@ -3179,6 +3179,32 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
     defer context.allocator.free(base);
     const event_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/events", .{ base, node_id });
     defer context.allocator.free(event_url);
+    // Phase 8：把 Profile-fixed first-boot 步骤内联进 AgentPlan（仅八步契约的四类动作，
+    // 跳过 repository/standard_packages）。步骤字符串引用 catalog/plan 内存，
+    // 仅外层数组由 context.allocator 拥有，render 后即释放。
+    var fb_steps: std.ArrayList(diskless_dto.FirstBootStep) = .empty;
+    defer fb_steps.deinit(context.allocator);
+    for (plan.profile_build.first_boot_fixed_steps) |ps| {
+        const act: ?diskless_dto.FirstBootAction = switch (ps.action) {
+            .managed_file => .managed_file,
+            .archive => .archive,
+            .script => .script,
+            .@"package" => .@"package",
+            else => null,
+        };
+        if (act) |a| try fb_steps.append(context.allocator, .{
+            .id = ps.name,
+            .action = a,
+            .content = ps.content,
+            .destination = ps.destination,
+            .mode = ps.mode,
+            .owner = ps.owner,
+            .group = ps.group,
+            .packages = ps.packages,
+        });
+    }
+    const fb_steps_slice = try fb_steps.toOwnedSlice(context.allocator);
+    defer context.allocator.free(fb_steps_slice);
     const ap: diskless_dto.AgentPlan = .{
         .node_id = node_id,
         .session_id = session_id_slice,
@@ -3186,6 +3212,7 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
         .rootfs_input_digest = rootfs_input_digest,
         .first_boot_bundle = profile.boot_bundle,
         .payload = &.{},
+        .steps = fb_steps_slice,
         .event_url = event_url,
         .expires_at = session.expires_at,
     };

@@ -266,6 +266,12 @@ switch_root。renderer/账号/SSH 等最终语义由 agent pre-init 校验，ini
 > `agent_token`/`event_token` 直接放在 `boot.json`（一次性、session 绑定、RAM-only overlay，无重放风险）。
 > 设计文档原描述的 `/run` move-mount + 多文件（`journal`/`agent-handoff`/`node-apply`/`credentials/`）安全模型为后续演进目标，
 > 当前未实现；initrd 阶段的 rootfs 下载等仍用 initramfs `/run`（切根前释放，不涉及）。
+> **Phase 8（first-boot 八步重放）**：pre-init 拉取并校验 AgentPlan 后，把整份 plan 覆盖写回
+> `boot.json`（AgentPlan v1 现内联 `steps`，固定顺序 managed_file -> package -> archive ->
+> script）。first-boot unit 读 `boot.json` 内联步骤一次性重放，无远程控制、无 reconciliation；
+> 失败只记 `/var/lib/nodeforge/firstboot.log`，不阻断启动。覆盖写同时移除盘上 agent/event token
+> （旧 `clearToken` 仅清内存副本，未清盘上 `boot.json`）。步骤内容当前为内联 `content`；
+> content-addressed payload blob 下发（步骤内容引用 `payload/`）为后续增强。
 
 这样新系统看到的是同一个 tmpfs/loop backing，loop lower 不因旧 initrd root 被回收而失效，agent 也能取得同一
 session 的 handoff 事实。agent pre-init 自身在应用任何差量前验证目录不是 symlink、owner/mode/digest/session

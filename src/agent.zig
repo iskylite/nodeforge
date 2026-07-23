@@ -2,15 +2,17 @@
 //!
 //! `V0_2_DESIGN.md` §4.3/§5.3。`switch_root` 后由 initrd exec 为 `--pre-init`：
 //! 从 `/var/lib/nodeforge/boot.json` 取 agent:read token -> 拉取并校验 immutable AgentPlan v1
-//! 与其 content-addressed payload -> 清零 agent token -> 在真正 init 前把 Node
-//! effective override（hostname/hosts/machine-id/network/target-system delta）写入
-//! overlay upper -> `exec /sbin/init`。同一 binary 之后以 systemd unit 执行 effective
-//! `first-boot`（一次性，无远程控制、无 reconciliation）。
+//! 与其 content-addressed payload -> node-apply 写入 overlay upper -> 把校验过的 AgentPlan
+//! 覆盖写回 boot.json（供 first-boot 重放八步，同时清除盘上 token）-> 清零内存 token ->
+//! `exec /sbin/init`。同一 binary 之后以 systemd unit 执行 effective `first-boot`（一次性、
+//! 无远程控制、无 reconciliation）：读 boot.json 内联步骤按固定顺序 managed_file -> package
+//! -> archive -> script 重放，失败只记日志不阻断启动。
 //!
 //! agent 不取得/解释 BootConfig 字段，不写 Profile 共享基线（已烤入 lower）；只重放
 //! Node 运行根差量。payload digest/size 不符或拉取失败时真正 init 不启动，不使用本地旧
 //! plan fallback（§10 fail-closed）。
 const std = @import("std");
+const first_boot = @import("provision/first_boot.zig");
 
 const handoff_path = "/var/lib/nodeforge/boot.json";
 const payload_dir = "/var/lib/nodeforge/payload";
@@ -66,8 +68,14 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
     // node-apply：把 Node effective 运行根差量写入 overlay upper（真正 init 看到最终配置）。
     try nodeApply(io, allocator, &plan, h.node);
 
-    // 预取完成，清零 agent token（内存用后即弃；handoff 落 /var/lib 持久化，供 first-boot 读取）。
-    try clearToken(allocator, h.agent_token);
+    // 持久化已校验的 AgentPlan 到 boot.json（覆盖 handoff）。同时达成两件事：
+    // (1) first-boot 在切根+systemd 后可直接读 boot.json 重放八步，无需远程控制；
+    // (2) agent:read token 仅用于本次 AgentPlan GET，落盘 handoff 此刻被覆盖 -> token
+    //     不残留于磁盘（旧 clearToken 仅清内存副本，未清盘上 boot.json）。
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = handoff_path, .data = plan_json });
+
+    // 内存 token 用后即弃：显式置零 Handoff 副本。
+    clearToken(h.agent_token);
 }
 
 fn nodeApply(io: std.Io, allocator: std.mem.Allocator, plan: *const AgentPlan, node: []const u8) !void {
@@ -85,9 +93,12 @@ fn execInit(io: std.Io) noreturn {
 }
 
 fn firstBoot(io: std.Io, allocator: std.mem.Allocator) !void {
-    _ = io;
-    _ = allocator;
-    // v0.2 first-boot 占位：一次性、无远程控制。后续 Phase 8 接入 provision-bundle 八步。
+    // Phase 8：切根+systemd 后作为 unit 执行。读 pre-init 持久化的 boot.json（已覆盖为
+    // 校验过的 AgentPlan，内联 first-boot 步骤），按固定顺序一次性重放，失败只记日志、
+    // 不阻断启动。无远程控制、无 reconciliation。
+    const plan_json = readFile(io, allocator, handoff_path) catch return;
+    defer allocator.free(plan_json);
+    _ = first_boot.runFromPlanJson(io, allocator, plan_json);
 }
 
 const Handoff = struct {
@@ -208,11 +219,9 @@ fn appendHosts(io: std.Io, allocator: std.mem.Allocator) !void {
     try dir.writeFile(io, .{ .sub_path = "/etc/hosts", .data = content });
 }
 
-fn clearToken(allocator: std.mem.Allocator, token: []const u8) !void {
-    // 内存 token 用后即弃；仅显式置零局部副本以防残留。
-    const buf = try allocator.alloc(u8, token.len);
-    defer allocator.free(buf);
-    @memset(buf, 0);
+fn clearToken(token: []u8) void {
+    // 内存 token 用后即弃；显式置零 Handoff 副本以防残留（盘上 boot.json 已被覆盖）。
+    @memset(token, 0);
 }
 
 fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {

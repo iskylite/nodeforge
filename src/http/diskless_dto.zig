@@ -63,6 +63,22 @@ pub const PayloadEntry = struct {
     size: u64,
 };
 
+/// First-boot 步骤动作（八步契约固定顺序 managed_file -> package -> archive -> script）。
+pub const FirstBootAction = enum { managed_file, @"package", archive, script };
+
+/// AgentPlan v1 内联的 first-boot 步骤；切根后由 agent 一次性按固定顺序重放。
+/// 步骤内容当前为内联（`content`）；content-addressed payload blob 下发为后续增强。
+pub const FirstBootStep = struct {
+    id: []const u8 = "",
+    action: FirstBootAction,
+    content: ?[]const u8 = null,
+    destination: ?[]const u8 = null,
+    mode: u16 = 0o644,
+    owner: []const u8 = "root",
+    group: []const u8 = "root",
+    packages: []const []const u8 = &.{},
+};
+
 /// AgentPlan v1。切根后 agent pre-init 拉取并校验的 immutable 运行根计划。
 pub const AgentPlan = struct {
     schema_version: u32 = agent_plan_schema_version,
@@ -74,6 +90,8 @@ pub const AgentPlan = struct {
     first_boot_bundle: ?[]const u8 = null,
     /// content-addressed payload 列表；相同 token 只能访问此处明列的 path。
     payload: []const PayloadEntry = &.{},
+    /// first-boot 步骤（内联）；agent 切根后按固定顺序一次性重放（Phase 8）。
+    steps: []const FirstBootStep = &.{},
     event_url: []const u8,
     expires_at: i64,
 };
@@ -158,4 +176,41 @@ test "agent plan v1 lists payload entries" {
     // 相同输入稳定。
     const again = try agentPlanDigest(std.testing.allocator, plan);
     try std.testing.expectEqualSlices(u8, &digest, &again);
+}
+
+test "agent plan v1 round-trips first-boot steps" {
+    const steps = [_]FirstBootStep{
+        .{ .id = "motd", .action = .managed_file, .content = "hello\n", .destination = "/etc/motd", .mode = 0o644 },
+        .{ .id = "pkgs", .action = .@"package", .packages = &.{ "tmux", "vim" } },
+        .{ .id = "arc", .action = .archive, .content = "x", .destination = "/opt/app" },
+        .{ .id = "scr", .action = .script, .content = "echo hi\n" },
+    };
+    const plan: AgentPlan = .{
+        .node_id = "n1",
+        .session_id = "s1",
+        .plan_digest = "pd",
+        .rootfs_input_digest = "rid",
+        .first_boot_bundle = "fb",
+        .payload = &.{},
+        .steps = &steps,
+        .event_url = "https://srv/api/v1/nodes/n1/events",
+        .expires_at = 99,
+    };
+    const rendered = try renderAgentPlan(std.testing.allocator, plan);
+    defer std.testing.allocator.free(rendered);
+    // 枚举动作序列化为 tag 名（@"package" -> "package"）。
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"managed_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"package\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"archive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"script\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "/etc/motd") != null);
+    // 解析回来：步骤顺序与内容保持。
+    const P = struct { steps: []const FirstBootStep = &.{} };
+    const parsed = try std.json.parseFromSlice(P, std.testing.allocator, rendered, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.steps.len);
+    try std.testing.expectEqual(FirstBootAction.managed_file, parsed.value.steps[0].action);
+    try std.testing.expectEqual(FirstBootAction.@"package", parsed.value.steps[1].action);
+    try std.testing.expect(std.mem.eql(u8, parsed.value.steps[1].packages[1], "vim"));
+    try std.testing.expect(std.mem.eql(u8, parsed.value.steps[0].destination.?, "/etc/motd"));
 }
