@@ -239,12 +239,29 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(schema_v3_rollback);
     try addDebugFlag(schema_v3_rollback);
     try schema_v3_command.addCommands(&.{ schema_v3_plan, schema_v3_apply, schema_v3_rollback });
+    const schema_v4_command = try zli.Command.init(init_options, .{ .name = "schema-v4", .description = "Plan, apply, or roll back the schema-v4 diskless migration" }, showCurrentHelp);
+    const schema_v4_plan = try zli.Command.init(init_options, .{ .name = "plan", .description = "Generate a side-effect-free schema-v4 migration plan" }, schemaV4PlanHandler);
+    try addConfigPathFlag(schema_v4_plan);
+    try addOutputFlag(schema_v4_plan);
+    try addDebugFlag(schema_v4_plan);
+    const schema_v4_apply = try zli.Command.init(init_options, .{ .name = "apply", .description = "Apply the exact current schema-v4 migration plan" }, schemaV4ApplyHandler);
+    try schema_v4_apply.addPositionalArg(.{ .name = "plan-digest", .description = "64-character digest returned by schema-v4 plan", .required = true });
+    try addConfigPathFlag(schema_v4_apply);
+    try addOutputFlag(schema_v4_apply);
+    try addDebugFlag(schema_v4_apply);
+    const schema_v4_rollback = try zli.Command.init(init_options, .{ .name = "rollback", .description = "Restore the retained pre-schema-v4 model generation" }, schemaV4RollbackHandler);
+    try schema_v4_rollback.addPositionalArg(.{ .name = "plan-digest", .description = "Digest of the applied schema-v4 migration", .required = true });
+    try addConfigPathFlag(schema_v4_rollback);
+    try addOutputFlag(schema_v4_rollback);
+    try addDebugFlag(schema_v4_rollback);
+    try schema_v4_command.addCommands(&.{ schema_v4_plan, schema_v4_apply, schema_v4_rollback });
     try catalog.addCommands(&.{
         catalog_validate,
         catalog_export,
         catalog_show,
         catalog_migrate,
         schema_v3_command,
+        schema_v4_command,
     });
 
     // ── node 资源（节点 CRUD + 部署生命周期）──────────────────────────
@@ -340,7 +357,17 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     });
     try addOutputFlag(node_trace);
 
-    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_trace });
+    const node_boot_prepare = try zli.Command.init(init_options, .{
+        .name = "boot-prepare",
+        .description = "Prepare a diskless boot session (issue config token + agent plan)",
+        .usage = "nodeforge node boot-prepare <node_id> [options]",
+    }, nodeBootPrepareHandler);
+    try node_boot_prepare.addPositionalArg(.{ .name = "node_id", .description = "Registered diskless node identifier", .required = true });
+    try addConfigPathFlag(node_boot_prepare);
+    try addOutputFlag(node_boot_prepare);
+    try addDebugFlag(node_boot_prepare);
+
+    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_trace, node_boot_prepare });
     try addValuesCommands(node, init_options, "node");
     try addItemCommands(node, init_options, "node");
     try addNodeSoftwareCommands(node, init_options);
@@ -358,6 +385,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_create);
     try addOutputFlag(profile_create);
     try addDebugFlag(profile_create);
+    try profile_create.addFlag(.{ .name = "kind", .description = "Profile kind: install (default) or diskless", .type = .String, .default_value = .{ .String = "install" } });
+    try profile_create.addFlag(.{ .name = "boot-bundle", .description = "Boot bundle name (required for --kind diskless)", .type = .String, .default_value = .{ .String = "" } });
     const profile_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List PXE profiles" }, profileListHandler);
     try addConfigPathFlag(profile_list);
     try addOutputFlag(profile_list);
@@ -389,7 +418,25 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_unset);
     try addOutputFlag(profile_unset);
     try addDebugFlag(profile_unset);
-    try profile.addCommands(&.{ profile_create, profile_list, profile_show, profile_set, profile_unset });
+    const profile_rootfs = try zli.Command.init(init_options, .{ .name = "rootfs", .description = "Compile and register diskless rootfs artifacts" }, showCurrentHelp);
+    const profile_rootfs_plan = try zli.Command.init(init_options, .{ .name = "plan", .description = "Compile a diskless profile rootfs input digest and cache state", .usage = "nodeforge profile rootfs plan <profile> [options]" }, profileRootfsPlanHandler);
+    try profile_rootfs_plan.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try addConfigPathFlag(profile_rootfs_plan);
+    try addOutputFlag(profile_rootfs_plan);
+    try addDebugFlag(profile_rootfs_plan);
+    const profile_rootfs_register = try zli.Command.init(init_options, .{ .name = "register", .description = "Register a prebuilt rootfs artifact for a diskless profile", .usage = "nodeforge profile rootfs register <profile> --path <file> [options]" }, profileRootfsRegisterHandler);
+    try profile_rootfs_register.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try profile_rootfs_register.addFlag(.{ .name = "path", .description = "Path to the prebuilt squashfs rootfs file", .type = .String, .default_value = .{ .String = "" } });
+    try addConfigPathFlag(profile_rootfs_register);
+    try addOutputFlag(profile_rootfs_register);
+    try addDebugFlag(profile_rootfs_register);
+    const profile_rootfs_status = try zli.Command.init(init_options, .{ .name = "status", .description = "Show the registered rootfs artifact for a diskless profile", .usage = "nodeforge profile rootfs status <profile> [options]" }, profileRootfsStatusHandler);
+    try profile_rootfs_status.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try addConfigPathFlag(profile_rootfs_status);
+    try addOutputFlag(profile_rootfs_status);
+    try addDebugFlag(profile_rootfs_status);
+    try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_register, profile_rootfs_status });
+    try profile.addCommands(&.{ profile_create, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
     try addValuesCommands(profile, init_options, "profile");
     try addItemCommands(profile, init_options, "profile");
     try addProfileSoftwareCommands(profile, init_options);
@@ -1709,6 +1756,26 @@ fn schemaV3ApplyHandler(ctx: zli.CommandContext) !void {
     return schemaV3MutationHandler(ctx, false);
 }
 
+fn schemaV4PlanHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_config.deinit();
+    var response: [256 * 1024]u8 = undefined;
+    const body = nodeforge.management_client.schemaV4PlanJson(ctx.io, parsed_config.value.server.http_port, &response) catch null orelse {
+        try writeCommandError(ctx, "schema-v4.plan_failed", "schema-v4 migration plan request failed", 1);
+        return;
+    };
+    const Response = struct { result: struct { plan_digest: []const u8, applicable: bool, plan: struct { affected_profiles: []const []const u8, affected_nodes: []const []const u8, blockers: []const std.json.Value } } };
+    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidManagementResponse;
+    defer parsed.deinit();
+    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "affected_profiles", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_profiles.len}), .section = "runtime", .json_path = "plan.affected_profiles" }, .{ .key = "affected_nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_nodes.len}), .section = "runtime", .json_path = "plan.affected_nodes" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "yes" else "no", .section = "runtime" } };
+    const sections = [_]nodeforge.cli_document.Section{.{ .key = "runtime", .title = "Runtime" }};
+    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = "Schema v4 migration plan", .sections = &sections, .fields = &fields } }, .json = body });
+}
+
 fn schemaV3RollbackHandler(ctx: zli.CommandContext) !void {
     return schemaV3MutationHandler(ctx, true);
 }
@@ -1734,6 +1801,37 @@ fn schemaV3MutationHandler(ctx: zli.CommandContext, rollback: bool) !void {
         return;
     };
     try renderOutputDocument(ctx, .{ .human = .{ .text = if (rollback) "schema v3 migration rolled back" else "schema v3 migration applied" }, .json = body });
+}
+
+fn schemaV4ApplyHandler(ctx: zli.CommandContext) !void {
+    return schemaV4MutationHandler(ctx, false);
+}
+
+fn schemaV4RollbackHandler(ctx: zli.CommandContext) !void {
+    return schemaV4MutationHandler(ctx, true);
+}
+
+fn schemaV4MutationHandler(ctx: zli.CommandContext, rollback: bool) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const digest = ctx.positional_args[0];
+    if (digest.len != 64) {
+        try writeCommandError(ctx, "schema-v4.invalid_digest", "schema-v4 plan digest must be 64 lowercase hexadecimal characters", 2);
+        return;
+    }
+    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer parsed_config.deinit();
+    var response: [256 * 1024]u8 = undefined;
+    const body = (if (rollback)
+        nodeforge.management_client.schemaV4RollbackJson(ctx.io, parsed_config.value.server.http_port, digest, &response)
+    else
+        nodeforge.management_client.schemaV4ApplyJson(ctx.io, parsed_config.value.server.http_port, digest, &response)) catch null orelse {
+        try writeCommandError(ctx, "schema-v4.mutation_failed", if (rollback) "schema-v4 rollback request failed" else "schema-v4 apply request failed", 1);
+        return;
+    };
+    try renderOutputDocument(ctx, .{ .human = .{ .text = if (rollback) "schema v4 migration rolled back" else "schema v4 migration applied" }, .json = body });
 }
 
 /// 通过本机 daemon 注册一个已经位于受管根目录中的资产。
@@ -2733,6 +2831,8 @@ fn assetRoot(config: *const nodeforge.model.AppConfig, kind: nodeforge.model.Ass
         .gpg_key => nodeforge.paths.require().keys_dir,
         .nodeforge_initrd => nodeforge.paths.require().initrd_dir,
         .rootfs => nodeforge.paths.require().rootfs_dir,
+        .runtime_kernel => config.tftp.asset_root,
+        .archive, .script => nodeforge.paths.require().assets_dir,
         .managed_file => nodeforge.paths.require().assets_dir,
     };
 }
@@ -3275,19 +3375,124 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
         setExitCode(ctx, 2);
         return;
     }
+    const kind = ctx.flag("kind", []const u8);
+    const boot_bundle = ctx.flag("boot-bundle", []const u8);
+    if (!std.mem.eql(u8, kind, "install") and !std.mem.eql(u8, kind, "diskless")) {
+        const output = outputFromContext(ctx) orelse return;
+        try cli_output.writeError(errorWriter(ctx), output, "profile.invalid", "profile create: --kind must be install or diskless");
+        setExitCode(ctx, 2);
+        return;
+    }
+    const bundle_opt: ?[]const u8 = if (boot_bundle.len == 0) null else boot_bundle;
+    if (std.mem.eql(u8, kind, "diskless") and bundle_opt == null) {
+        const output = outputFromContext(ctx) orelse return;
+        try cli_output.writeError(errorWriter(ctx), output, "profile.invalid", "profile create: --kind diskless requires --boot-bundle");
+        setExitCode(ctx, 2);
+        return;
+    }
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
     var reason: [256]u8 = undefined;
-    const result = nodeforge.management_client.profileCreate(ctx.io, config.value.server.http_port, name, install_source, &reason);
+    const result = nodeforge.management_client.profileCreate(ctx.io, config.value.server.http_port, name, install_source, kind, bundle_opt, &reason);
     if (!result.healthy) {
         try reportMutationFailure(ctx, result, "profile create failed: daemon unreachable");
         return;
     }
-    const human = try std.fmt.allocPrint(ctx.allocator, "install profile created: {s}", .{name});
-    try renderCommandResult(ctx, human, .{ .profile = name, .mode = "install", .install_source = install_source });
+    const human = try std.fmt.allocPrint(ctx.allocator, "{s} profile created: {s}", .{ kind, name });
+    try renderCommandResult(ctx, human, .{ .profile = name, .mode = kind, .install_source = install_source, .boot_bundle = bundle_opt });
+}
+
+fn profileRootfsPlanHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    var response: [64 * 1024]u8 = undefined;
+    const body = nodeforge.management_client.rootfsPlanJson(ctx.io, config.value.server.http_port, name, &response) catch null;
+    if (body == null) {
+        try writeCommandError(ctx, "rootfs.unavailable", "local daemon management API unavailable", 1);
+        return;
+    }
+    const Resp = struct { ok: bool, result: struct { profile: []const u8, rootfs_input_digest: []const u8, cache_state: []const u8, content_sha512: ?[]const u8 = null, compressed_bytes: ?u64 = null, kernel_release: ?[]const u8 = null, file: ?[]const u8 = null } };
+    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
+        try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
+        return;
+    };
+    defer parsed.deinit();
+    const r = parsed.value.result;
+    const human = try std.fmt.allocPrint(ctx.allocator, "profile: {s}\nrootfs_input_digest: {s}\ncache_state: {s}", .{ r.profile, r.rootfs_input_digest, r.cache_state });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+}
+
+fn profileRootfsRegisterHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    const file_path = ctx.flag("path", []const u8);
+    if (file_path.len == 0) {
+        try writeCommandError(ctx, "rootfs.invalid", "profile rootfs register: --path is required", 2);
+        return;
+    }
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.rootfsRegister(ctx.io, config.value.server.http_port, name, file_path, &reason);
+    if (!result.healthy) {
+        try reportMutationFailure(ctx, result, "rootfs register failed: daemon unreachable");
+        return;
+    }
+    var response: [64 * 1024]u8 = undefined;
+    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, &response) catch null;
+    if (body == null) {
+        const human = try std.fmt.allocPrint(ctx.allocator, "rootfs registered for profile {s}", .{name});
+        try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = "{}" });
+        return;
+    }
+    const Resp = struct { ok: bool, result: struct { profile: []const u8, rootfs_input_digest: []const u8, state: []const u8, content_sha512: ?[]const u8 = null, compressed_bytes: ?u64 = null, kernel_release: ?[]const u8 = null, file: ?[]const u8 = null } };
+    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
+        try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
+        return;
+    };
+    defer parsed.deinit();
+    const r = parsed.value.result;
+    const human = try std.fmt.allocPrint(ctx.allocator, "profile: {s}\nrootfs_input_digest: {s}\nstate: {s}\ncontent_sha512: {s}\ncompressed_bytes: {d}\nkernel_release: {s}\nfile: {s}", .{ r.profile, r.rootfs_input_digest, r.state, r.content_sha512 orelse "-", r.compressed_bytes orelse 0, r.kernel_release orelse "-", r.file orelse "-" });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+}
+
+fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    var response: [64 * 1024]u8 = undefined;
+    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, &response) catch null;
+    if (body == null) {
+        try writeCommandError(ctx, "rootfs.unavailable", "local daemon management API unavailable", 1);
+        return;
+    }
+    const Resp = struct { ok: bool, result: struct { profile: []const u8, rootfs_input_digest: []const u8, state: []const u8, content_sha512: ?[]const u8 = null, compressed_bytes: ?u64 = null, uncompressed_bytes: ?u64 = null, kernel_release: ?[]const u8 = null, file: ?[]const u8 = null, created_at: ?i64 = null } };
+    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
+        try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
+        return;
+    };
+    defer parsed.deinit();
+    const r = parsed.value.result;
+    const human = try std.fmt.allocPrint(ctx.allocator, "profile: {s}\nrootfs_input_digest: {s}\nstate: {s}\ncontent_sha512: {s}\ncompressed_bytes: {d}\nkernel_release: {s}\nfile: {s}", .{ r.profile, r.rootfs_input_digest, r.state, r.content_sha512 orelse "-", r.compressed_bytes orelse 0, r.kernel_release orelse "-", r.file orelse "-" });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
 }
 
 fn profileSetHandler(ctx: zli.CommandContext) !void {
@@ -3456,6 +3661,35 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     };
     defer ctx.allocator.free(answer);
     try ctx.writer.writeAll(answer);
+}
+
+fn nodeBootPrepareHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const node_id = ctx.getArg("node_id") orelse return;
+    var response: [64 * 1024]u8 = undefined;
+    var reason: [256]u8 = [_]u8{0} ** 256;
+    const body = nodeforge.management_client.bootPrepareJson(ctx.io, config.value.server.http_port, node_id, &response, &reason) catch null;
+    if (body == null) {
+        const reason_slice = std.mem.sliceTo(&reason, 0);
+        const msg = if (reason_slice.len > 0) reason_slice else "local daemon management API unavailable";
+        try writeCommandError(ctx, "diskless.unavailable", msg, 1);
+        return;
+    }
+    const Resp = struct { ok: bool, result: struct { node_id: []const u8, session_id: []const u8, config_token: []const u8, config_url: []const u8, agent_plan_digest: []const u8, rootfs_input_digest: []const u8 } };
+    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
+        try writeCommandError(ctx, "diskless.invalid_response", message, 1);
+        return;
+    };
+    defer parsed.deinit();
+    const r = parsed.value.result;
+    const human = try std.fmt.allocPrint(ctx.allocator, "node: {s}\nsession_id: {s}\nconfig_token: {s}\nconfig_url: {s}\nagent_plan_digest: {s}\nrootfs_input_digest: {s}", .{ r.node_id, r.session_id, r.config_token, r.config_url, r.agent_plan_digest, r.rootfs_input_digest });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
 }
 
 fn installRetryHandler(ctx: zli.CommandContext) !void {

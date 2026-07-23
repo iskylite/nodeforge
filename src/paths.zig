@@ -93,6 +93,9 @@ pub const Paths = struct {
     /// 操作记录文件路径（`<root>/state/operations.json`）。
     /// 记录管理 API 的持久操作（幂等 key + 状态轮询）。
     operations_path: []const u8,
+    /// rootfs 制品登记文件路径（`<root>/state/rootfs-artifacts.json`）。
+    /// 记录已构建 diskless rootfs 的内容寻址制品（digest/sha512/size）。
+    rootfs_artifacts_path: []const u8,
     /// 模型事务目录（`<root>/state/model-transactions`）。
     /// 存放 schema v3 迁移等大事务的 before/after 快照。
     model_transactions_dir: []const u8,
@@ -288,6 +291,7 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .boot_sessions_path = try join(allocator, root, "state/boot-sessions.json"),
         .node_inventory_path = try join(allocator, root, "state/node-inventory.json"),
         .operations_path = try join(allocator, root, "state/operations.json"),
+        .rootfs_artifacts_path = try join(allocator, root, "state/rootfs-artifacts.json"),
         .model_transactions_dir = try join(allocator, root, "state/model-transactions"),
         .events_path = try join(allocator, root, "logs/events.jsonl"),
         .service_log_path = try join(allocator, root, "logs/nodeforged.log"),

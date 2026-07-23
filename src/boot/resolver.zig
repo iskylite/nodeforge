@@ -154,7 +154,7 @@ fn architectureMatches(expected: model.Arch, actual: packet.Architecture) bool {
 /// 在损坏输入下仍然采取安全的无模式降级，而不是伪造一个启动模式。
 /// 返回 null 时，DHCP 仍可发放 lease 但 TFTP 不会渲染虚拟 GRUB 配置。
 fn profileMode(config: *const model.AppConfig, name: []const u8) ?model.BootKind {
-    for (config.profiles) |profile| if (@import("std").mem.eql(u8, profile.name, name)) return .install;
+    for (config.profiles) |profile| if (@import("std").mem.eql(u8, profile.name, name)) return profile.kind;
     return null;
 }
 

@@ -249,6 +249,19 @@ pub fn schemaV3ApplyJson(io: std.Io, port: u16, digest: []const u8, output: []u8
 pub fn schemaV3RollbackJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
     return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v3/rollbacks", digest, output);
 }
+pub fn schemaV4PlanJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    const reply = try managementPostJson(io, port, "/api/v1/management/catalog/schema-v4/migration-plans", "{}", null, output, null);
+    if (reply.status < 200 or reply.status >= 300) return null;
+    return reply.body;
+}
+
+pub fn schemaV4ApplyJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
+    return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v4/migrations", digest, output);
+}
+
+pub fn schemaV4RollbackJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
+    return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v4/rollbacks", digest, output);
+}
 
 pub fn valuesMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, operation: []const u8, key: []const u8, values: []const []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, reason_buf: []u8) Mutation {
     if (!querySafe(owner) or !querySafe(identity) or !querySafe(key)) return .{ .reachable = false, .healthy = false };
@@ -370,13 +383,63 @@ pub const Mutation = struct {
     reason: []const u8 = "",
 };
 
-pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []const u8, reason_buf: []u8) Mutation {
+pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []const u8, kind: []const u8, boot_bundle: ?[]const u8, reason_buf: []u8) Mutation {
     if (!querySafe(name) or !querySafe(install_source)) return .{ .reachable = false, .healthy = false };
-    var body: [512]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&body, "{{\"name\":{f},\"install_source\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}) }) catch
+    if (boot_bundle) |bb| if (!querySafe(bb)) return .{ .reachable = false, .healthy = false };
+    var body: [640]u8 = undefined;
+    const rendered = if (boot_bundle) |bb|
+        std.fmt.bufPrint(&body, "{{\"name\":{f},\"install_source\":{f},\"kind\":{f},\"boot_bundle\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}), std.json.fmt(kind, .{}), std.json.fmt(bb, .{}) }) catch
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.invalid", "profile request is too large") }
+    else
+        std.fmt.bufPrint(&body, "{{\"name\":{f},\"install_source\":{f},\"kind\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}), std.json.fmt(kind, .{}) }) catch
         return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.invalid", "profile request is too large") };
     const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "POST", "/api/v1/management/profiles", rendered, revision, reason_buf);
+}
+
+/// `profile rootfs plan`：编译 diskless Profile 的 rootfs_input_digest 与 cache_state。
+pub fn rootfsPlanJson(io: std.Io, port: u16, name: []const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(name)) return error.InvalidProfileName;
+    var path: [256]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/plan", .{name});
+    return managementJson(io, port, rendered, output);
+}
+
+/// `profile rootfs status`：查询 Profile 当前 rootfs_input_digest 的 ready 制品。
+pub fn rootfsStatusJson(io: std.Io, port: u16, name: []const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(name)) return error.InvalidProfileName;
+    var path: [256]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs", .{name});
+    return managementJson(io, port, rendered, output);
+}
+
+/// `profile rootfs register`：登记一个已构建 rootfs 制品（内容寻址）。
+pub fn rootfsRegister(io: std.Io, port: u16, name: []const u8, file_path: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
+    var body: [1024]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&body, "{{\"path\":{f}}}", .{std.json.fmt(file_path, .{})}) catch
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs register request is too large") };
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/register", .{name}) catch return .{ .reachable = false, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", route, rendered, revision, reason_buf);
+}
+
+/// v0.2: 为 diskless 节点创建交付 session（POST boot-prepare）。
+/// 返回 capsule 交付所需的 config_token、session_id、agent_plan_digest 等。
+pub fn bootPrepareJson(io: std.Io, port: u16, node_id: []const u8, output: []u8, reason_buf: []u8) !?[]const u8 {
+    if (!querySafe(node_id)) return null;
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/boot-prepare", .{node_id}) catch return null;
+    const reply = try managementPostJson(io, port, route, "{}", null, output, null);
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body|
+            _ = formatErrorReason(reason_buf, err_body)
+        else
+            _ = formatHttpStatus(reason_buf, reply.status);
+        return null;
+    }
+    return reply.body;
 }
 
 pub fn nodeAdd(io: std.Io, port: u16, body: []const u8, reason_buf: []u8) Mutation {

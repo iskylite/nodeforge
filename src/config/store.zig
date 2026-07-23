@@ -25,7 +25,7 @@ pub fn render(allocator: std.mem.Allocator, config: *const model.AppConfig) ![]u
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
 
-    if (config.schema_version == 3) {
+    if (config.schema_version >= 3) {
         try std.json.Stringify.value(schema_v3_dto.fromModel(config), .{ .whitespace = .indent_2 }, &output.writer);
         try output.writer.writeByte('\n');
         return output.toOwnedSlice();

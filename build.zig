@@ -56,6 +56,30 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli);
 
+    // nodeforge-initrd：v0.2 diskless 启动 init（PID 1），运行在 dracut userspace。
+    const initrd = b.addExecutable(.{
+        .name = "nodeforge-initrd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/initrd.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(initrd);
+
+    // nodeforge-agent：v0.2 切根后 pre-init / first-boot。
+    const agent = b.addExecutable(.{
+        .name = "nodeforge-agent",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/agent.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(agent);
+
     const run_daemon = b.addRunArtifact(daemon);
     if (b.args) |args| run_daemon.addArgs(args);
     const run_daemon_step = b.step("run-daemon", "Run nodeforged");

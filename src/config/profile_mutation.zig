@@ -16,7 +16,7 @@ const validate = @import("validate.zig");
 /// 新 profile 使用与 ISO import 自动创建相同的默认安全基线（destructive=true,
 /// persistent_writes=true, reinstall_policy=explicit）。CLI 不接收任意 safety/storage JSON，
 /// 避免形成绕过模型校验的第二套创建语义。
-pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, install_source: []const u8) !void {
+pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, install_source: []const u8, kind: model.ProfileKind, boot_bundle: ?[]const u8) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();
     for (parsed.value.profiles) |profile| if (std.mem.eql(u8, profile.name, name)) return error.ProfileAlreadyExists;
@@ -26,6 +26,10 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
         break;
     };
     const selected = source orelse return error.InstallSourceNotFound;
+    if (kind == .diskless) {
+        if (parsed.value.schema_version < 4) return error.DisklessRequiresSchemaV4;
+        if (boot_bundle == null) return error.DisklessBootBundleRequired;
+    }
     const profiles = try allocator.alloc(model.ProfileConfig, parsed.value.profiles.len + 1);
     defer allocator.free(profiles);
     @memcpy(profiles[0..parsed.value.profiles.len], parsed.value.profiles);
@@ -34,6 +38,8 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
     profiles[parsed.value.profiles.len] = .{
         .name = name,
         .install_source = selected.name,
+        .kind = kind,
+        .boot_bundle = boot_bundle,
     };
     var candidate = parsed.value;
     candidate.profiles = profiles;

@@ -34,6 +34,8 @@ const node_status = @import("state/node_status.zig");
 const deployment_control = @import("state/deployment_control.zig");
 const node_inventory = @import("state/node_inventory.zig");
 const operations = @import("state/operations.zig");
+const rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
+const diskless_delivery = @import("state/diskless_delivery.zig");
 const model_transaction = @import("state/model_transaction.zig");
 const capacity = @import("state/capacity.zig");
 
@@ -104,6 +106,21 @@ pub fn run(
     _ = try operations.reconcileMigrationRecovery(io, allocator, transaction_dir, &operation_store, current_time);
     try operations.save(io, allocator, paths.require().operations_path, &operation_store);
     try operations.clearMigrationRecoveryRecords(io, allocator, transaction_dir);
+    var rootfs_artifacts = rootfs_artifact_store.Store.init(allocator, paths.require().rootfs_artifacts_path);
+    defer rootfs_artifacts.deinit();
+    rootfs_artifacts.load(io) catch |err| switch (err) {
+        error.InvalidRootfsArtifactStore => {
+            observe_log.err("rootfs-artifacts: refusing startup with invalid state: {t}", .{err});
+            return err;
+        },
+        else => return err,
+    };
+    // v0.2 diskless delivery：进程内 session + scoped token store。HMAC secret 进程内
+    // 随机生成（v0.2 不持久化 diskless session；跨重启需重新 prepare，见 V0_2 阶段说明）。
+    var diskless_secret: [32]u8 = undefined;
+    io.randomSecure(&diskless_secret) catch return error.DisklessSecretUnavailable;
+    var diskless_store = diskless_delivery.Store.init(allocator, &diskless_secret, "");
+    defer diskless_store.deinit();
     const model_revision = try deployment_control.revisionForModel(allocator, config, catalog);
     const config_revision = model_revision.config;
     var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);
@@ -226,6 +243,8 @@ pub fn run(
         &deployments,
         &inventories,
         &operation_store,
+        &rootfs_artifacts,
+        &diskless_store,
         config_revision,
         bootstrap_key,
         additional_keys,

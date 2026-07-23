@@ -27,6 +27,8 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
+const schema_v4 = @import("../catalog/schema_v4.zig");
+const config_store = @import("../config/store.zig");
 const atomicWrite = @import("dhcp_store.zig").atomicWrite;
 
 /// 事务状态机的四个阶段。journal 在每次状态转换时被原子重写。
@@ -348,4 +350,56 @@ test "directory catalog schema migration commits and rolls back retained generat
     var restored_catalog = try catalog_store.load(std.testing.io, std.testing.allocator, catalog_path);
     defer restored_catalog.deinit();
     try std.testing.expectEqual(@as(u32, 2), restored_catalog.value.schema_version);
+}
+
+test "schema-v4 migration commits diskless-ready catalog and rolls back to v3" {
+    // Phase 1b 契约：v4 apply 经同一 2PC 事务持久化 config+catalog，schema_version
+    // 升至 4 且 Profile 显式 wrap 为 install；rollback 恢复 v3 备份。事务机制与 v3
+    // 完全复用，仅内容（schema_version=4 的 catalog）不同。
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const config_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{root});
+    defer std.testing.allocator.free(config_path);
+    const catalog_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/catalog", .{root});
+    defer std.testing.allocator.free(catalog_path);
+    const tx_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/transactions", .{root});
+    defer std.testing.allocator.free(tx_path);
+    const old_config = "{\"schema_version\":3,\"server\":{\"server_ip\":\"192.0.2.1\"}}\n";
+    try atomicWrite(std.testing.io, config_path, old_config);
+    try catalog_store.initializeEmpty(std.testing.io, std.testing.allocator, catalog_path);
+    const profile: model.ProfileConfig = .{ .name = "rocky-install", .install_source = "s" };
+    const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
+    const nodes = [_]model.NodeConfig{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "rocky-install" }};
+    const old_catalog: model.Catalog = .{ .schema_version = 3, .profiles = &.{profile}, .nodes = &nodes, .install_sources = &.{source} };
+    try catalog_store.save(std.testing.io, std.testing.allocator, catalog_path, &old_catalog);
+    var loaded = try catalog_store.load(std.testing.io, std.testing.allocator, catalog_path);
+    defer loaded.deinit();
+    const config: model.AppConfig = .{ .schema_version = 3, .server = .{ .server_ip = "192.0.2.1" } };
+    var plan = try schema_v4.build(std.testing.allocator, &config, &loaded.value, 1, loaded.value.revision);
+    defer plan.deinit();
+    try std.testing.expect(plan.applicable());
+    var candidate = try schema_v4.candidates(std.testing.allocator, &config, &loaded.value, &plan);
+    defer candidate.deinit();
+    try std.testing.expectEqual(@as(u32, 4), candidate.catalog.value.schema_version);
+    try std.testing.expectEqual(model.ProfileKind.install, candidate.catalog.value.profiles[0].kind);
+    const new_config = try config_store.render(std.testing.allocator, &candidate.config.value);
+    defer std.testing.allocator.free(new_config);
+    try std.testing.expect(std.mem.indexOf(u8, new_config, "\"schema_version\": 4") != null);
+    try commit(std.testing.io, std.testing.allocator, tx_path, &plan.digest, config_path, catalog_path, new_config, &candidate.catalog.value);
+    const committed_config = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(committed_config);
+    try std.testing.expect(std.mem.indexOf(u8, committed_config, "\"schema_version\": 4") != null);
+    var committed_catalog = try catalog_store.load(std.testing.io, std.testing.allocator, catalog_path);
+    defer committed_catalog.deinit();
+    try std.testing.expectEqual(@as(u32, 4), committed_catalog.value.schema_version);
+    try std.testing.expectEqual(model.ProfileKind.install, committed_catalog.value.profiles[0].kind);
+    try rollback(std.testing.io, std.testing.allocator, tx_path, &plan.digest);
+    const restored_config = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, config_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(restored_config);
+    try std.testing.expectEqualStrings(old_config, restored_config);
+    var restored_catalog = try catalog_store.load(std.testing.io, std.testing.allocator, catalog_path);
+    defer restored_catalog.deinit();
+    try std.testing.expectEqual(@as(u32, 3), restored_catalog.value.schema_version);
 }

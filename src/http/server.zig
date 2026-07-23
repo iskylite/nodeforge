@@ -36,6 +36,7 @@ const iso_import = @import("../catalog/iso_import.zig");
 const catalog_migration = @import("../catalog/migration.zig");
 const catalog_discovery = @import("../catalog/discovery.zig");
 const schema_v3 = @import("../catalog/schema_v3.zig");
+const schema_v4 = @import("../catalog/schema_v4.zig");
 const model_transaction = @import("../state/model_transaction.zig");
 const schema_v3_transaction = @import("../state/schema_v3_transaction.zig");
 const config_store = @import("../config/store.zig");
@@ -46,6 +47,11 @@ const boot_session_store = @import("../state/boot_session_store.zig");
 const deployment_control = @import("../state/deployment_control.zig");
 const node_inventory = @import("../state/node_inventory.zig");
 const operations = @import("../state/operations.zig");
+const rootfs_artifact_store = @import("../state/rootfs_artifact_store.zig");
+const diskless_delivery = @import("../state/diskless_delivery.zig");
+const dhcp_store = @import("../state/dhcp_store.zig");
+const diskless = @import("../profile/diskless.zig");
+const diskless_dto = @import("diskless_dto.zig");
 const routes = @import("routes.zig");
 const log = std.log.scoped(.http);
 
@@ -64,6 +70,8 @@ const RouteContext = struct {
     deployments: *deployment_control.Store,
     inventories: *node_inventory.Store,
     operations: *operations.Store,
+    rootfs_artifacts: *rootfs_artifact_store.Store,
+    diskless_store: *diskless_delivery.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     /// M4.2 F5：来自配置和状态目录的额外 SSH 公钥。
@@ -143,6 +151,8 @@ pub fn serve(
     deployments: *deployment_control.Store,
     inventories: *node_inventory.Store,
     operation_store: *operations.Store,
+    rootfs_artifacts: *rootfs_artifact_store.Store,
+    diskless_store: *diskless_delivery.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     additional_keys: []const []const u8,
@@ -172,6 +182,8 @@ pub fn serve(
         .deployments = deployments,
         .inventories = inventories,
         .operations = operation_store,
+        .rootfs_artifacts = rootfs_artifacts,
+        .diskless_store = diskless_store,
         .config_revision = config_revision,
         .bootstrap_key = bootstrap_key,
         .additional_keys = additional_keys,
@@ -273,10 +285,16 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD")) {
         if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/boot-config")) return bootConfig(request, context, node_route.node_id, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/rootfs")) return disklessRootfs(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/install-config/kickstart")) return installConfig(request, context, node_route.node_id, .kickstart, meta);
             if (std.mem.eql(u8, node_route.suffix, "/install-config/nocloud/user-data")) return installConfig(request, context, node_route.node_id, .user_data, meta);
             if (std.mem.eql(u8, node_route.suffix, "/install-config/nocloud/meta-data")) return installConfig(request, context, node_route.node_id, .meta_data, meta);
             if (std.mem.eql(u8, node_route.suffix, "/install-config/nocloud/vendor-data")) return installConfig(request, context, node_route.node_id, .vendor_data, meta);
+        };
+        // v0.2: diskless boot-session 交付路由（agent-plan / payload）。
+        if (std.mem.startsWith(u8, path, "/api/v1/boot-sessions/")) if (splitBootSessionRoute(path["/api/v1/boot-sessions/".len..])) |bs| {
+            if (bs.kind == .agent_plan) return disklessAgentPlan(request, context, bs.session, bs.digest, meta);
+            if (bs.kind == .payload) return disklessPayload(request, context, bs.session, bs.tail, meta);
         };
         // ── 静态制品路由 ──────────────────────────────────────
         if (assetRoute(path, "/artifacts/images/")) |name| return imageAsset(request, context, name, meta);
@@ -317,6 +335,7 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/capabilities")) |name| return managementCapabilities(request, context, .profile, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/properties")) |name| return managementScalarMutation(request, context, .profile, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (installGenerationsPath(path)) |node_id| return installGenerations(request, context, node_id, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/boot-prepare")) |node_id| return managementBootPrepare(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime")) {
         return runtimeSummary(request, context, meta);
     }
@@ -330,6 +349,9 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/properties")) |node_id| return managementScalarMutation(request, context, .node, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfiles(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/software/available")) |name| return managementProfileSoftware(request, context, name, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/plan")) |name| return managementRootfsPlan(request, context, name, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/register")) |name| return managementRootfsRegister(request, context, name, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs")) |name| return managementRootfsStatus(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfileCreate(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfile(request, context, name, meta);
     if (std.mem.eql(u8, path, "/api/v1/management/discovery/policy")) {
@@ -376,6 +398,9 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/migration-plans")) return schemaV3MigrationPlan(request, context, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/migrations")) return schemaV3MigrationApply(request, context, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/rollbacks")) return schemaV3MigrationRollback(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v4/migration-plans")) return schemaV4MigrationPlan(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v4/migrations")) return schemaV4MigrationApply(request, context, meta);
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v4/rollbacks")) return schemaV4MigrationRollback(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/operations/")) |operation_id| return managementOperation(request, context, operation_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/operations")) return managementOperations(request, context, meta);
     var allow_buffer: [128]u8 = undefined;
@@ -432,6 +457,45 @@ fn splitNodeRoute(tail: []const u8) ?NodeRoute {
     const node_id = tail[0..slash];
     if (!auth.nodeIdSafe(node_id)) return null;
     return .{ .node_id = node_id, .suffix = tail[slash..] };
+}
+
+const BootSessionKind = enum { agent_plan, payload };
+
+const BootSessionRoute = struct {
+    session: []const u8,
+    kind: BootSessionKind,
+    digest: []const u8 = "",
+    tail: []const u8 = "",
+};
+
+/// v0.2: 解析 `/api/v1/boot-sessions/<session>/<kind>/<rest>` 路由。
+/// session 必须是 32 hex 字符（diskless_delivery.id_len）。
+fn splitBootSessionRoute(tail: []const u8) ?BootSessionRoute {
+    const slash = std.mem.indexOfScalar(u8, tail, '/') orelse return null;
+    const session = tail[0..slash];
+    if (session.len != diskless_delivery.id_len) return null;
+    for (session) |c| if (!std.ascii.isHex(c)) return null;
+    const rest = tail[slash + 1 ..];
+    if (std.mem.startsWith(u8, rest, "agent-plan/")) {
+        const digest = rest["agent-plan/".len..];
+        if (digest.len == 0 or std.mem.indexOfScalar(u8, digest, '/') != null) return null;
+        return .{ .session = session, .kind = .agent_plan, .digest = digest };
+    }
+    if (std.mem.startsWith(u8, rest, "payload/")) {
+        const file_path = rest["payload/".len..];
+        if (file_path.len == 0) return null;
+        return .{ .session = session, .kind = .payload, .tail = file_path };
+    }
+    return null;
+}
+
+/// v0.2: 从 `Authorization: Bearer <token>` 提取 raw token。
+fn parseBearer(header: ?[]const u8) ?[]const u8 {
+    const value = header orelse return null;
+    if (!std.mem.startsWith(u8, value, "Bearer ")) return null;
+    const token = value["Bearer ".len..];
+    if (token.len == 0) return null;
+    return token;
 }
 
 fn assetRoute(path: []const u8, prefix: []const u8) ?[]const u8 {
@@ -570,7 +634,7 @@ fn staticFile(request: zap.Request, context: *const RouteContext, root: []const 
         var length: [20]u8 = undefined;
         try request.setHeader("content-length", try std.fmt.bufPrint(&length, "{d}", .{size}));
         if (checksum) |hash| {
-            var etag: [68]u8 = undefined;
+            var etag: [132]u8 = undefined;
             try request.setHeader("etag", try std.fmt.bufPrint(&etag, "\"{s}\"", .{hash}));
         }
         try request.sendBody("");
@@ -579,7 +643,7 @@ fn staticFile(request: zap.Request, context: *const RouteContext, root: []const 
         return;
     }
     if (checksum) |hash| {
-        var etag: [68]u8 = undefined;
+        var etag: [132]u8 = undefined;
         const value = try std.fmt.bufPrint(&etag, "\"{s}\"", .{hash});
         try request.setHeader("etag", value);
         if (request.getHeader("range")) |range_value| if (request.getHeader("if-range")) |if_range| {
@@ -754,6 +818,14 @@ fn parseSingleRange(value: []const u8, size: u64) !ByteRange {
 /// 签发 M3 BootConfig v1 文档。密钥只出现在此认证响应中，永远不会出现在
 /// 事件、错误信封、URL 或日志中。
 fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    // v0.2: diskless 节点走独立的 BootConfig v2 交付路径（capsule config-token 认证），
+    // 不经过 DHCP-coupled boot_session 认证。
+    {
+        const catalog = context.catalog_snapshot.value();
+        if (lookup.findNode(catalog, node_id)) |node| if (node.profile) |profile_name|
+            if (lookup.findProfile(catalog, profile_name)) |profile| if (profile.kind == .diskless)
+                return disklessBootConfig(request, context, node_id, meta);
+    }
     const checked = auth.authenticate(
         context.sessions,
         node_id,
@@ -844,6 +916,8 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
             }
             try output.writer.writeByte(']');
         },
+        // v0.2 diskless BootConfig v2 交付尚未实现；任何 diskless session 在此 fail-closed。
+        .diskless => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.not_implemented\",\"message\":\"diskless boot-config delivery is not yet available\"}}\n", meta),
     }
     try output.writer.print(",\"access\":{{\"session_header\":\"X-NodeForge-Session\",\"session_id\":{f},\"authorization_header\":\"Authorization\",\"bearer_token\":{f}}}}}\n", .{
         std.json.fmt(session.boot_session_id[0..], .{}), std.json.fmt(session.capability[0..], .{}),
@@ -1471,6 +1545,8 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
         .gpg_key => paths.require().keys_dir,
         .nodeforge_initrd => paths.require().initrd_dir,
         .rootfs => paths.require().rootfs_dir,
+        .runtime_kernel => context.config.tftp.asset_root,
+        .archive, .script => paths.require().assets_dir,
     };
     @import("../assets/validate.zig").sha256File(context.io, root, value.path, &checksum) catch |err| {
         observe_log.err("asset: import failed for {s}: {t}", .{ value.path, err });
@@ -1948,6 +2024,95 @@ fn schemaV3MigrationPlan(request: zap.Request, context: *const RouteContext, met
     return json(request, .ok, output.written(), meta);
 }
 
+fn schemaV4MigrationPlan(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    if (request.body) |body| if (body.len != 0 and !std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "{}"))
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"request.unknown_field\",\"message\":\"schema-v4 plan accepts an empty object\"}}\n", meta);
+    var plan = schema_v4.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.plan_failed\",\"message\":\"cannot construct schema-v4 plan\"}}\n", meta);
+    defer plan.deinit();
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"applicable\":{s},\"plan\":", .{ std.json.fmt(&plan.digest, .{}), if (plan.applicable()) "true" else "false" });
+    try output.writer.writeAll(plan.canonical_json);
+    try output.writer.writeAll("}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn schemaV4MigrationApply(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    var parsed = parseSchemaV3Digest(request, context.allocator) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.invalid_request\",\"message\":\"plan_digest must be 64 lowercase hexadecimal characters\"}}\n", meta);
+    defer parsed.deinit();
+    context.models.lock();
+    defer context.models.unlock();
+    if (context.configs.currentRevision() != context.config_revision or context.catalog.currentRevision() != context.catalog_snapshot.revision)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"model.revision_conflict\",\"message\":\"model changed after plan was read\"}}\n", meta);
+    if (context.sessions.hasActive(boot_session.monotonicNow()))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.active_session\",\"message\":\"all active boot sessions must finish or be terminated\"}}\n", meta);
+    var plan = schema_v4.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.plan_failed\",\"message\":\"cannot rebuild schema-v4 plan\"}}\n", meta);
+    defer plan.deinit();
+    if (!std.mem.eql(u8, &plan.digest, parsed.value.plan_digest))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.digest_conflict\",\"message\":\"plan digest no longer identifies the current model\"}}\n", meta);
+    if (!plan.applicable()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.blocked\",\"message\":\"migration plan contains blockers\"}}\n", meta);
+    var candidate = schema_v4.candidates(context.allocator, context.config, context.catalog_snapshot.value(), &plan) catch
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.materialization_failed\",\"message\":\"cannot materialize migration candidate\"}}\n", meta);
+    defer candidate.deinit();
+    config_validate.validateModel(&candidate.config.value, &candidate.catalog.value) catch |err|
+        return validationError(request, err, meta);
+    const config_json = try config_store.render(context.allocator, &candidate.config.value);
+    defer context.allocator.free(config_json);
+    const config_revision = try deployment_control.revisionForConfig(context.allocator, &candidate.config.value);
+    const prepared_config = try context.configs.prepare(candidate.config.value, config_revision);
+    var published = false;
+    defer if (!published) prepared_config.release();
+    const prepared_catalog = try context.catalog.prepare(candidate.catalog.value, context.catalog_snapshot.revision + 1);
+    defer if (!published) prepared_catalog.release();
+    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
+    defer context.allocator.free(transaction_dir);
+    schema_v3_transaction.commit(context.io, context.allocator, transaction_dir, &plan.digest, context.config_path, context.catalog.path, config_json, &candidate.catalog.value) catch |err| {
+        observe_log.err("schema-v4 transaction failed: {t}", .{err});
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.transaction_failed\",\"message\":\"schema-v4 transaction did not commit\"}}\n", meta);
+    };
+    context.configs.publishPrepared(prepared_config);
+    context.catalog.lock();
+    context.catalog.publishPreparedLocked(prepared_catalog);
+    context.catalog.unlock();
+    published = true;
+    var output: [256]u8 = undefined;
+    const body = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"schema_version\":4,\"catalog_revision\":{d}}}}}\n", .{ std.json.fmt(&plan.digest, .{}), context.catalog_snapshot.revision + 1 });
+    return json(request, .ok, body, meta);
+}
+
+fn schemaV4MigrationRollback(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    var parsed = parseSchemaV3Digest(request, context.allocator) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.invalid_request\",\"message\":\"plan_digest must identify a retained migration backup\"}}\n", meta);
+    defer parsed.deinit();
+    context.models.lock();
+    defer context.models.unlock();
+    if (context.sessions.hasActive(boot_session.monotonicNow()))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.active_session\",\"message\":\"all active boot sessions must finish or be terminated\"}}\n", meta);
+    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
+    defer context.allocator.free(transaction_dir);
+    schema_v3_transaction.rollback(context.io, context.allocator, transaction_dir, parsed.value.plan_digest) catch |err| {
+        observe_log.err("schema-v4 rollback failed: {t}", .{err});
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.rollback_failed\",\"message\":\"retained backup cannot be rolled back\"}}\n", meta);
+    };
+    var old_config = try config_load.load(context.io, context.allocator, context.config_path);
+    defer old_config.deinit();
+    var old_catalog = try catalog_store.load(context.io, context.allocator, context.catalog.path);
+    defer old_catalog.deinit();
+    config_validate.validateModel(&old_config.value, &old_catalog.value) catch |err| return validationError(request, err, meta);
+    const projected = model.projectCatalog(old_config.value, &old_catalog.value);
+    const config_revision = try deployment_control.revisionForConfig(context.allocator, &projected);
+    const prepared_config = try context.configs.prepare(projected, config_revision);
+    const prepared_catalog = try context.catalog.prepare(old_catalog.value, old_catalog.value.revision);
+    context.configs.publishPrepared(prepared_config);
+    context.catalog.lock();
+    context.catalog.publishPreparedLocked(prepared_catalog);
+    context.catalog.unlock();
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"rolled_back\":true}}\n", meta);
+}
+
 const SchemaV3DigestRequest = struct { plan_digest: []const u8 };
 
 fn parseSchemaV3Digest(request: zap.Request, allocator: std.mem.Allocator) !std.json.Parsed(SchemaV3DigestRequest) {
@@ -2360,7 +2525,7 @@ const NodeAddRequest = struct {
     network: model.TargetNetworkConfig = .{},
 };
 
-const ProfileCreateRequest = struct { name: []const u8, install_source: []const u8 };
+const ProfileCreateRequest = struct { name: []const u8, install_source: []const u8, kind: ?[]const u8 = null, boot_bundle: ?[]const u8 = null };
 const ValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, values: []const []const u8 = &.{}, mutations: []const scalar_mutation.Mutation = &.{} };
 const ItemValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, identity: []const u8, field: []const u8, values: []const []const u8 = &.{} };
 
@@ -2722,21 +2887,27 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
     defer parsed.deinit();
     if (!config_validate.validLogicalId(parsed.value.name) or !config_validate.validLogicalId(parsed.value.install_source))
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"name and install_source must be canonical logical identifiers\"}}\n", meta);
+    const kind: model.ProfileKind = if (parsed.value.kind) |k| std.meta.stringToEnum(model.ProfileKind, k) orelse
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"--kind must be install or diskless\"}}\n", meta)
+    else .install;
+    const boot_bundle = parsed.value.boot_bundle;
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    @import("../config/profile_mutation.zig").addInstallProfile(context.io, context.allocator, context.config, context.catalog.path, parsed.value.name, parsed.value.install_source) catch |err| switch (err) {
+    @import("../config/profile_mutation.zig").addInstallProfile(context.io, context.allocator, context.config, context.catalog.path, parsed.value.name, parsed.value.install_source, kind, boot_bundle) catch |err| switch (err) {
         error.ProfileAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.already_exists\",\"message\":\"profile name already exists\"}}\n", meta),
         error.InstallSourceNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"profile.install_source_not_found\",\"message\":\"install source does not exist\"}}\n", meta),
+        error.DisklessRequiresSchemaV4 => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.diskless_requires_schema_v4\",\"message\":\"diskless profiles require the catalog to be migrated to schema v4 first\"}}\n", meta),
+        error.DisklessBootBundleRequired => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.boot_bundle_required\",\"message\":\"--kind diskless requires a boot bundle\"}}\n", meta),
         else => return validationError(request, err, meta),
     };
     applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"profile persisted but snapshot publish failed\"}}\n", meta);
     var location: [320]u8 = undefined;
     try request.setHeader("location", try std.fmt.bufPrint(&location, "/api/v1/management/profiles/{s}", .{parsed.value.name}));
-    var response: [384]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"name\":{f},\"mode\":\"install\",\"install_source\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(parsed.value.name, .{}), std.json.fmt(parsed.value.install_source, .{}), context.catalog.currentRevision() });
+    var response: [512]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"name\":{f},\"mode\":{f},\"kind\":{f},\"install_source\":{f},\"boot_bundle\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(parsed.value.name, .{}), std.json.fmt(@tagName(kind), .{}), std.json.fmt(@tagName(kind), .{}), std.json.fmt(parsed.value.install_source, .{}), std.json.fmt(boot_bundle, .{}), context.catalog.currentRevision() });
     try setRevisionEtag(request, context.catalog.currentRevision());
     return json(request, .created, rendered, meta);
 }
@@ -2760,6 +2931,277 @@ fn applyCatalogFromDisk(context: *RouteContext) !void {
     context.catalog.lock();
     defer context.catalog.unlock();
     context.catalog.publishPreparedLocked(catalog_next);
+}
+
+const RootfsRegisterRequest = struct { path: []const u8 };
+
+/// `profile rootfs plan`：编译 diskless Profile 的 `rootfs_input_digest`（Node-independent）
+/// 并报告该 digest 是否已有 ready 制品（cache_state）。不要求存在 Node 或 deploy=true。
+fn managementRootfsPlan(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const catalog = context.catalog_snapshot.value();
+    const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
+    if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs plan is only available for diskless profiles\"}}\n", meta);
+    const digest = diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile) catch |err| return validationError(request, err, meta);
+    const digest_hex: []const u8 = digest[0..];
+    const artifact = context.rootfs_artifacts.find(digest_hex);
+    const cache_state: []const u8 = if (artifact != null) "ready" else "miss";
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"cache_state\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(cache_state, .{}) });
+    if (artifact) |a| try output.writer.print(",\"content_sha512\":{f},\"compressed_bytes\":{d},\"uncompressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}", .{ std.json.fmt(a.content_sha512, .{}), a.compressed_size, a.uncompressed_size, std.json.fmt(a.kernel_release, .{}), std.json.fmt(a.file, .{}) });
+    try output.writer.writeAll("}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+/// `profile rootfs register`：登记一个已构建 rootfs 制品（测试/导入用）。daemon 从
+/// Profile 编译 `rootfs_input_digest`，校验文件 sha512+size，内容寻址拷贝到 rootfs_dir，
+/// 再经 rootfs_artifact_store 幂等登记（同 digest sha512 一致则静默成功，漂移则拒绝）。
+fn managementRootfsRegister(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"missing request body\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(RootfsRegisterRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"path is required\"}}\n", meta);
+    defer parsed.deinit();
+    if (parsed.value.path.len == 0) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"path is required\"}}\n", meta);
+    const catalog = context.catalog_snapshot.value();
+    const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
+    if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs register is only available for diskless profiles\"}}\n", meta);
+    const digest = diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile) catch |err| return validationError(request, err, meta);
+    const digest_hex: []const u8 = digest[0..];
+    const bundle_name = profile.boot_bundle orelse return validationError(request, error.MissingBootBundle, meta);
+    const boot_bundle = lookup.findBootBundle(catalog, bundle_name) orelse return validationError(request, error.MissingBootBundle, meta);
+    const cwd = std.Io.Dir.cwd();
+    // 流式导入：rootfs 可能数 GB，不能整块读入内存。边读边算 SHA-512、边写
+    // 内容寻址目标文件（先写 .part 再原子 rename），仅持有固定缓冲。
+    const rootfs_dir = paths.require().rootfs_dir;
+    cwd.createDirPath(context.io, rootfs_dir) catch {};
+    const file_name = try std.fmt.allocPrint(context.allocator, "{s}.squashfs", .{digest_hex});
+    defer context.allocator.free(file_name);
+    const dest = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ rootfs_dir, file_name });
+    defer context.allocator.free(dest);
+    const tmp = try std.fmt.allocPrint(context.allocator, "{s}.part", .{dest});
+    defer context.allocator.free(tmp);
+
+    var src_file = cwd.openFile(context.io, parsed.value.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"rootfs.file_not_found\",\"message\":\"rootfs file does not exist\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    defer src_file.close(context.io);
+    const src_stat = src_file.stat(context.io) catch |err| return validationError(request, err, meta);
+    if (src_stat.kind != .file) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"rootfs path is not a regular file\"}}\n", meta);
+    const total_size: u64 = src_stat.size;
+
+    var sha = std.crypto.hash.sha2.Sha512.init(.{});
+    {
+        var out_file = cwd.createFile(context.io, tmp, .{ .truncate = true }) catch |err| return validationError(request, err, meta);
+        defer out_file.close(context.io);
+        errdefer cwd.deleteFile(context.io, tmp) catch {};
+        var buf: [256 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (true) {
+            const n = src_file.readPositionalAll(context.io, &buf, offset) catch |err| return validationError(request, err, meta);
+            if (n == 0) break;
+            sha.update(buf[0..n]);
+            out_file.writeStreamingAll(context.io, buf[0..n]) catch |err| return validationError(request, err, meta);
+            offset += n;
+        }
+        out_file.sync(context.io) catch |err| return validationError(request, err, meta);
+    }
+    var sha512_raw: [64]u8 = undefined;
+    sha.final(&sha512_raw);
+    var content_sha512: [128]u8 = undefined;
+    _ = std.fmt.bufPrint(&content_sha512, "{x}", .{sha512_raw}) catch unreachable;
+    std.Io.Dir.rename(cwd, tmp, cwd, dest, context.io) catch |err| return validationError(request, err, meta);
+
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    const artifact: rootfs_artifact_store.Artifact = .{
+        .rootfs_input_digest = digest_hex,
+        .profile = profile.name,
+        .content_sha512 = content_sha512[0..],
+        .compressed_size = total_size,
+        .uncompressed_size = total_size,
+        .kernel_release = boot_bundle.kernel_release,
+        .file = file_name,
+        .created_at = unixNow(),
+    };
+    const result = context.rootfs_artifacts.register(context.io, artifact) catch |err| switch (err) {
+        error.RootfsDigestDrift => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.digest_drift\",\"message\":\"a different rootfs is already registered for this profile build\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    const state_str: []const u8 = if (result == .registered) "registered" else "already_present";
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":{f},\"content_sha512\":{f},\"compressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(state_str, .{}), std.json.fmt(content_sha512[0..], .{}), total_size, std.json.fmt(boot_bundle.kernel_release, .{}), std.json.fmt(file_name, .{}) });
+    try output.writer.writeAll("}}\n");
+    return json(request, .created, output.written(), meta);
+}
+
+/// `profile rootfs status`：报告 Profile 当前 rootfs_input_digest 对应的 ready 制品。
+fn managementRootfsStatus(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const catalog = context.catalog_snapshot.value();
+    const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
+    if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs status is only available for diskless profiles\"}}\n", meta);
+    const digest = diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile) catch |err| return validationError(request, err, meta);
+    const digest_hex: []const u8 = digest[0..];
+    const artifact = context.rootfs_artifacts.find(digest_hex);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    if (artifact) |a| {
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":\"ready\",\"content_sha512\":{f},\"compressed_bytes\":{d},\"uncompressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f},\"created_at\":{d}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(a.content_sha512, .{}), a.compressed_size, a.uncompressed_size, std.json.fmt(a.kernel_release, .{}), std.json.fmt(a.file, .{}), a.created_at });
+    } else {
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":\"miss\"", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}) });
+    }
+    try output.writer.writeAll("}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+/// v0.2 diskless BootConfig v2 交付。initrd 用 capsule 交付的 config-token +
+/// X-NodeForge-Session 认证后，首次 GET 签发 agent/event token 并返回 immutable
+/// rootfs + AgentPlan 定位器。
+fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const config_token = parseBearer(request.getHeader("authorization")) orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <config-token> is required\"}}\n", meta);
+    const session_hdr = request.getHeader("x-nodeforge-session") orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_required\",\"message\":\"X-NodeForge-Session header is required\"}}\n", meta);
+    const session = context.diskless_store.find(session_hdr) orelse
+        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
+    if (!std.mem.eql(u8, session.nodeId(), node_id))
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.node_mismatch\",\"message\":\"session does not belong to this node\"}}\n", meta);
+    const decision = context.diskless_store.verify(session_hdr, config_token, .config, node_id, "", session.rootfsSha512(), 0, boot_session.monotonicNow());
+    if (decision != .ok)
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n", meta);
+    // 首次 GET 签发 agent + event token（幂等：已签发则跳过，保持 raw token 不变）。
+    if (!session.agent_token.issued) {
+        context.diskless_store.issue(context.io, session_hdr, .agent) catch
+            return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_issue_failed\",\"message\":\"cannot issue agent token\"}}\n", meta);
+        context.diskless_store.issue(context.io, session_hdr, .event) catch
+            return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_issue_failed\",\"message\":\"cannot issue event token\"}}\n", meta);
+    }
+    const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
+    defer context.allocator.free(base);
+    const config_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/boot-config", .{ base, node_id });
+    defer context.allocator.free(config_url);
+    const rootfs_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/rootfs", .{ base, node_id });
+    defer context.allocator.free(rootfs_url);
+    const session_id_slice: []const u8 = session.session_id[0..];
+    const agent_plan_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/boot-sessions/{s}/agent-plan/{s}", .{ base, session_id_slice, session.agentPlanDigest() });
+    defer context.allocator.free(agent_plan_url);
+    const event_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/events", .{ base, node_id });
+    defer context.allocator.free(event_url);
+    const bc: diskless_dto.BootConfig = .{
+        .node_id = node_id,
+        .session_id = session_id_slice,
+        .profile = session.profileName(),
+        .kernel_release = session.kernelRelease(),
+        .config_url = config_url,
+        .rootfs = .{ .url = rootfs_url, .sha512 = session.rootfsSha512(), .size = session.rootfs_size, .uncompressed_size = session.rootfs_size },
+        .agent_plan = .{ .url = agent_plan_url, .digest = session.agentPlanDigest(), .size = @intCast(session.agent_plan_len) },
+        .event_url = event_url,
+        .access = .{ .agent_token = context.diskless_store.rawToken(session, .agent), .event_token = context.diskless_store.rawToken(session, .event) },
+        .expires_at = session.expires_at,
+    };
+    const body = try diskless_dto.renderBootConfig(context.allocator, bc);
+    defer context.allocator.free(body);
+    try request.setHeader("cache-control", "no-store, private");
+    try request.setHeader("x-content-type-options", "nosniff");
+    return json(request, .ok, body, meta);
+}
+
+/// v0.2 diskless rootfs 下载。initrd 用 config-token（与 boot-config 相同）认证，
+/// 通过 rootfs_artifact_store 定位已注册的 squashfs 制品并经 staticFile 交付。
+fn disklessRootfs(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const config_token = parseBearer(request.getHeader("authorization")) orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <config-token> is required\"}}\n", meta);
+    const session_hdr = request.getHeader("x-nodeforge-session") orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_required\",\"message\":\"X-NodeForge-Session header is required\"}}\n", meta);
+    const session = context.diskless_store.find(session_hdr) orelse
+        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
+    if (!std.mem.eql(u8, session.nodeId(), node_id))
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.node_mismatch\",\"message\":\"session does not belong to this node\"}}\n", meta);
+    const decision = context.diskless_store.verify(session_hdr, config_token, .config, node_id, "", session.rootfsSha512(), 0, boot_session.monotonicNow());
+    if (decision != .ok)
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n", meta);
+    const artifact = context.rootfs_artifacts.find(session.rootfsInputDigest()) orelse
+        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.rootfs_not_found\",\"message\":\"no rootfs artifact registered for this profile build\"}}\n", meta);
+    return staticFile(request, context, paths.require().rootfs_dir, artifact.file, artifact.content_sha512, meta);
+}
+
+/// v0.2 diskless AgentPlan v1 交付。agent pre-init 用 agent:read token 认证后，
+/// 获取 pinned immutable AgentPlan JSON（digest 必须与 URL 中的 digest 一致）。
+fn disklessAgentPlan(request: zap.Request, context: *const RouteContext, session_id: []const u8, digest: []const u8, meta: RequestMeta) !void {
+    const agent_token = parseBearer(request.getHeader("authorization")) orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <agent-token> is required\"}}\n", meta);
+    const session = context.diskless_store.find(session_id) orelse
+        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
+    if (!std.mem.eql(u8, digest, session.agentPlanDigest()))
+        return notFound(request, meta);
+    const decision = context.diskless_store.verify(session_id, agent_token, .agent, session.nodeId(), "", session.agentPlanDigest(), 0, boot_session.monotonicNow());
+    if (decision != .ok)
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n", meta);
+    return json(request, .ok, session.agentPlanJson(), meta);
+}
+
+/// v0.2 diskless payload 交付。agent 用 agent:read token 认证后下载 content-addressed
+/// payload。v0.2 smoke test 的 AgentPlan payload 为空，此路由 fail-closed（404）。
+fn disklessPayload(request: zap.Request, context: *const RouteContext, session_id: []const u8, file_path: []const u8, meta: RequestMeta) !void {
+    const agent_token = parseBearer(request.getHeader("authorization")) orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <agent-token> is required\"}}\n", meta);
+    const session = context.diskless_store.find(session_id) orelse
+        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
+    const decision = context.diskless_store.verify(session_id, agent_token, .agent, session.nodeId(), file_path, session.agentPlanDigest(), 0, boot_session.monotonicNow());
+    if (decision != .ok)
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n", meta);
+    return notFound(request, meta);
+}
+
+/// `node boot-prepare`：为 diskless 节点创建交付 session。编译 diskless plan 得到
+/// rootfs_input_digest + desired_plan_digest，定位已注册 rootfs 制品，创建 session，
+/// 渲染并 pin immutable AgentPlan，签发 config-token。返回 capsule 交付所需的全部门票。
+fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const catalog = context.catalog_snapshot.value();
+    const node = lookup.findNode(catalog, node_id) orelse return notFound(request, meta);
+    const profile_name = node.profile orelse
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.node_unassigned\",\"message\":\"node has no profile assigned\"}}\n", meta);
+    const profile = lookup.findProfile(catalog, profile_name) orelse return notFound(request, meta);
+    if (profile.kind != .diskless)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"boot-prepare is only available for diskless profiles\"}}\n", meta);
+    var plan = diskless.compile(context.allocator, context.config, catalog, node) catch |err| return validationError(request, err, meta);
+    defer plan.deinit();
+    const rootfs_input_digest: []const u8 = plan.rootfs_input_digest[0..];
+    const desired_plan_digest: []const u8 = plan.desired_plan_digest[0..];
+    const artifact = context.rootfs_artifacts.find(rootfs_input_digest) orelse
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.rootfs_not_registered\",\"message\":\"no rootfs artifact registered for this profile build; run 'profile rootfs register' first\"}}\n", meta);
+    const bundle_name = profile.boot_bundle orelse return validationError(request, error.MissingBootBundle, meta);
+    const boot_bundle = lookup.findBootBundle(catalog, bundle_name) orelse return validationError(request, error.MissingBootBundle, meta);
+    const session = context.diskless_store.begin(context.io, node_id, profile.name, rootfs_input_digest, artifact.content_sha512, artifact.compressed_size, boot_bundle.kernel_release, boot_session.monotonicNow(), unixNow()) catch |err| return validationError(request, err, meta);
+    const session_id_slice: []const u8 = session.session_id[0..];
+    const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
+    defer context.allocator.free(base);
+    const event_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/events", .{ base, node_id });
+    defer context.allocator.free(event_url);
+    const ap: diskless_dto.AgentPlan = .{
+        .node_id = node_id,
+        .session_id = session_id_slice,
+        .plan_digest = desired_plan_digest,
+        .rootfs_input_digest = rootfs_input_digest,
+        .first_boot_bundle = profile.boot_bundle,
+        .payload = &.{},
+        .event_url = event_url,
+        .expires_at = session.expires_at,
+    };
+    const plan_json = try diskless_dto.renderAgentPlan(context.allocator, ap);
+    defer context.allocator.free(plan_json);
+    context.diskless_store.pinAgentPlan(session_id_slice, plan_json) catch |err| return validationError(request, err, meta);
+    context.diskless_store.issue(context.io, session_id_slice, .config) catch |err| return validationError(request, err, meta);
+    const config_token = context.diskless_store.rawToken(session, .config);
+    const config_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/boot-config", .{ base, node_id });
+    defer context.allocator.free(config_url);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"config_token\":{f},\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
+        std.json.fmt(node_id, .{}), std.json.fmt(session_id_slice, .{}), std.json.fmt(config_token, .{}), std.json.fmt(config_url, .{}), std.json.fmt(session.agentPlanDigest(), .{}), std.json.fmt(rootfs_input_digest, .{}),
+    });
+    return json(request, .ok, output.written(), meta);
 }
 
 fn managementDiscoveryPolicy(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {

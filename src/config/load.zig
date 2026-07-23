@@ -35,7 +35,7 @@ pub fn load(
     const Header = struct { schema_version: u32 };
     const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer header.deinit();
-    var parsed = if (header.value.schema_version == 3)
+    var parsed = if (header.value.schema_version >= 3)
         try schema_v3_dto.parse(allocator, bytes)
     else
         try schema_v2_dto.parse(allocator, bytes);

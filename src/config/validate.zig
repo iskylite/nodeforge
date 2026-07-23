@@ -119,7 +119,7 @@ pub fn validateConfigShape(config: *const model.AppConfig) ValidationError!void 
 /// 校验 catalog 的结构形状：schema 版本、名称唯一性、节点 ID/MAC 格式和资产路径安全。
 /// 不校验跨文件引用关系——那由 `validate` 统一执行。
 pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version < 1 or catalog.schema_version > 3) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version < 1 or catalog.schema_version > 4) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.DistroConfig, catalog.distros);
     try uniqueNamed(model.ProfileConfig, catalog.profiles);
     try uniqueNamed(model.ProvisioningBundle, catalog.provisioning_bundles);
@@ -156,7 +156,7 @@ pub fn validateModel(config: *const model.AppConfig, catalog: *const model.Catal
 /// 不检查 catalog 引用关系，适用于 CLI 在 catalog 尚未加载时
 /// 对 config 做快速预检。
 pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
-    if (config.schema_version < 1 or config.schema_version > 3) return error.UnsupportedSchemaVersion;
+    if (config.schema_version < 1 or config.schema_version > 4) return error.UnsupportedSchemaVersion;
     if (config.server.name.len == 0) return error.EmptyServerName;
     if (config.server.bind_interface) |iface| {
         if (iface.len == 0) return error.EmptyBindInterface;
@@ -289,7 +289,7 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
 /// 检查 distros/profiles/nodes/assets/repositories/install_sources/boot_bundles/provisioning_bundles
 /// 的名称唯一性、引用有效性和语义不变量。
 pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version < 1 or catalog.schema_version > 3) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version < 1 or catalog.schema_version > 4) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.RepositoryConfig, catalog.repositories);
     try uniqueNamed(model.AssetConfig, catalog.assets);
     try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
@@ -423,18 +423,51 @@ fn validateProvisioningBundles(catalog: *const model.Catalog) ValidationError!vo
     for (catalog.provisioning_bundles) |bundle| {
         if (bundle.revision == 0) return error.InvalidProvisioningStep;
         for (bundle.steps, 0..) |step, index| {
-            if (catalog.schema_version == 3 and (step.action != .managed_file or step.repository != null or step.packages.len != 0 or step.content != null)) return error.InvalidProvisioningStep;
-            const destination = step.destination orelse return error.InvalidProvisioningStep;
-            if (!std.mem.startsWith(u8, destination, "/") or std.mem.indexOf(u8, destination, "..") != null or step.mode > 0o777) return error.InvalidProvisioningStep;
-            if (!validIdentifier(step.owner) or !validIdentifier(step.group)) return error.InvalidProvisioningStep;
-            const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
-            const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
-            if (asset.kind != .managed_file) return error.AssetKindMismatch;
+            switch (step.phase) {
+                .install_post => {
+                    // install_post 仅 managed_file，不含 repository/packages/content（v3+v4 一致）。
+                    if (step.action != .managed_file or step.repository != null or step.packages.len != 0 or step.content != null) return error.InvalidProvisioningStep;
+                    try validateManagedFileStep(catalog, &step);
+                },
+                .rootfs_build, .first_boot => {
+                    // v0.2 build/first-boot 阶段仅 schema v4：允许 managed_file/archive/script/package。
+                    if (catalog.schema_version < 4) return error.InvalidProvisioningStep;
+                    switch (step.action) {
+                        .managed_file => try validateManagedFileStep(catalog, &step),
+                        .archive => {
+                            const destination = step.destination orelse return error.InvalidProvisioningStep;
+                            if (!std.mem.startsWith(u8, destination, "/") or std.mem.indexOf(u8, destination, "..") != null or step.mode > 0o777) return error.InvalidProvisioningStep;
+                            if (!validIdentifier(step.owner) or !validIdentifier(step.group)) return error.InvalidProvisioningStep;
+                            const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
+                            const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
+                            if (asset.kind != .archive) return error.AssetKindMismatch;
+                        },
+                        .script => {
+                            const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
+                            const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
+                            if (asset.kind != .script) return error.AssetKindMismatch;
+                        },
+                        .@"package" => {
+                            if (step.packages.len == 0 and step.repository == null) return error.InvalidProvisioningStep;
+                        },
+                        .repository, .standard_packages => return error.InvalidProvisioningStep,
+                    }
+                },
+            }
             for (bundle.steps[index + 1 ..]) |other| if (std.mem.eql(u8, step.name, other.name)) return error.DuplicateObjectName;
         }
     }
 }
 
+/// managed_file 步骤共享校验：destination 合法、属主属组合法、content_asset 指向 managed_file 资产。
+fn validateManagedFileStep(catalog: *const model.Catalog, step: *const model.ProvisionStep) ValidationError!void {
+    const destination = step.destination orelse return error.InvalidProvisioningStep;
+    if (!std.mem.startsWith(u8, destination, "/") or std.mem.indexOf(u8, destination, "..") != null or step.mode > 0o777) return error.InvalidProvisioningStep;
+    if (!validIdentifier(step.owner) or !validIdentifier(step.group)) return error.InvalidProvisioningStep;
+    const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
+    const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
+    if (asset.kind != .managed_file) return error.AssetKindMismatch;
+}
 fn validateRepositories(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     for (catalog.repositories) |repository| {
         const version = lookup.findDistroVersion(
@@ -547,7 +580,8 @@ fn validateInstallConfig(config: *const model.AppConfig, system: model.TargetSys
     var root_count: usize = 0;
     var grow_count: usize = 0;
     for (storage.partitions, 0..) |part, index| {
-        if (config.schema_version == 3 and (part.id == null or !validIdentifier(part.id.?))) return error.InvalidInstallStorage;
+        if (config.schema_version >= 3 and (part.id == null or !validIdentifier(part.id.?))) return error.InvalidInstallStorage;
+        // install storage partition id 要求对 schema v3+ 生效（v4 install profile 同样要求）。
         if (part.id) |id| for (storage.partitions[index + 1 ..]) |other| if (other.id != null and std.mem.eql(u8, id, other.id.?)) return error.InvalidInstallStorage;
         if (part.size_mib == 0 and !part.grow) return error.InvalidInstallStorage;
         if (part.grow) grow_count += 1;
@@ -877,6 +911,13 @@ test "最小配置和空 catalog 有效" {
     const config: model.AppConfig = .{ .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
     const cat: model.Catalog = .{};
     try validate(&config, &cat);
+}
+
+test "v4 forward-migrated config and catalog pass validateModel" {
+    // 回归：schema-v4 apply 经 validateModel 校验候选，schema_version=4 不得被拒。
+    const config: model.AppConfig = .{ .schema_version = 4, .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
+    const cat: model.Catalog = .{ .schema_version = 4 };
+    try validateModel(&config, &cat);
 }
 
 test "M4.1 default UTC timezone is accepted" {

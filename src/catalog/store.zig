@@ -68,7 +68,12 @@ pub fn loadLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !s
     const Header = struct { schema_version: u32 };
     const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer header.deinit();
-    return if (header.value.schema_version == 3) schema_v3_dto.parse(allocator, bytes) else schema_v2_dto.parse(allocator, bytes);
+    // schema 4 stores the full model shape directly (preserves diskless kind,
+    // boot_bundle, rootfs_build/first_boot steps and runtime_kernel assets that
+    // the strict v3 DTO omits); schema 3 uses the strict v3 DTO; else legacy v2.
+    if (header.value.schema_version == 3) return schema_v3_dto.parse(allocator, bytes);
+    if (header.value.schema_version == 4) return std.json.parseFromSlice(model.Catalog, allocator, bytes, .{ .allocate = .alloc_always });
+    return schema_v2_dto.parse(allocator, bytes);
 }
 
 pub fn initializeEmpty(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !void {
@@ -105,8 +110,9 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     var parsed_manifest = try std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{ .allocate = .alloc_always });
     defer parsed_manifest.deinit();
     const manifest = parsed_manifest.value;
-    const entity_names = if (manifest.catalog_schema_version == 3) names[0..] else names[0..8];
-    if (manifest.layout_schema_version != layout_schema_version or (manifest.catalog_schema_version != 2 and manifest.catalog_schema_version != 3) or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != entity_names.len)
+    // schema 3 and 4 persist the full 10-entity set; legacy v2 only 8.
+    const entity_names = if (manifest.catalog_schema_version >= 3) names[0..] else names[0..8];
+    if (manifest.layout_schema_version != layout_schema_version or (manifest.catalog_schema_version < 2 or manifest.catalog_schema_version > 4) or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != entity_names.len)
         return error.InvalidCatalogManifest;
     var declared_tx: [64]u8 = undefined;
     try transactionId(manifest.catalog_revision, manifest.entities, &declared_tx);
@@ -131,8 +137,11 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
         try combined.writer.writeAll(bytes);
     }
     try combined.writer.writeByte('}');
+    // schema 4 entities are direct model serialization; parse as model.Catalog.
     return if (manifest.catalog_schema_version == 3)
         schema_v3_dto.parse(allocator, combined.written())
+    else if (manifest.catalog_schema_version == 4)
+        std.json.parseFromSlice(model.Catalog, allocator, combined.written(), .{ .allocate = .alloc_always })
     else
         schema_v2_dto.parse(allocator, combined.written());
 }
@@ -187,7 +196,8 @@ fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     contents[9] = try content(allocator, names[9], catalog.unknown_client_observations);
     initialized += 1;
 
-    const content_count: usize = if (catalog.schema_version == 3) names.len else 8;
+    // schema 3 and 4 persist all 10 entities; legacy v2 only 8.
+    const content_count: usize = if (catalog.schema_version >= 3) names.len else 8;
     const selected_contents = contents[0..content_count];
     var entities: [names.len]ManifestEntity = undefined;
     for (selected_contents, 0..) |*item, index| entities[index] = .{ .name = item.name, .file = item.file, .sha256 = &item.digest };
@@ -404,4 +414,37 @@ test "manifest load rejects entity digest mismatch" {
     defer std.testing.allocator.free(nodes);
     try secureAtomic(std.testing.io, std.testing.allocator, nodes, "[{\"id\":\"tampered\"}]");
     try std.testing.expectError(error.CatalogDigestMismatch, load(std.testing.io, std.testing.allocator, root));
+}
+
+test "v4 catalog round-trips diskless profile, boot bundle and rootfs_build step" {
+    // v4 uses direct model serialization, so diskless-only fields (kind=diskless,
+    // boot_bundle, rootfs_build phase, package action, runtime_kernel asset) must
+    // survive save/load exactly. A v3 DTO round-trip would silently drop them.
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try temp.dir.realPath(std.testing.io, &root_buf);
+    const root = root_buf[0..n];
+    try initializeEmpty(std.testing.io, std.testing.allocator, root);
+    const profiles = [_]model.ProfileConfig{.{ .name = "diskless-9", .install_source = "s", .kind = .diskless, .boot_bundle = "bb", .software = .{ .packages = .{ .include = &.{"curl"} } } }};
+    const bundles = [_]model.BootBundleConfig{.{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i", .rootfs = "r" }};
+    const steps = [_]model.ProvisionStep{.{ .name = "pkgs", .phase = .rootfs_build, .action = .@"package", .packages = &.{"vim"} }};
+    const prov_bundles = [_]model.ProvisioningBundle{.{ .name = "pb", .steps = &steps }};
+    const assets = [_]model.AssetConfig{.{ .name = "rk", .kind = .runtime_kernel, .path = "/rk" }};
+    const candidate: model.Catalog = .{ .schema_version = 4, .profiles = &profiles, .boot_bundles = &bundles, .provisioning_bundles = &prov_bundles, .assets = &assets };
+    try save(std.testing.io, std.testing.allocator, root, &candidate);
+    var loaded = try load(std.testing.io, std.testing.allocator, root);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 4), loaded.value.schema_version);
+    try std.testing.expectEqual(model.ProfileKind.diskless, loaded.value.profiles[0].kind);
+    try std.testing.expectEqualStrings("bb", loaded.value.profiles[0].boot_bundle.?);
+    try std.testing.expectEqual(model.ProvisionPhase.rootfs_build, loaded.value.provisioning_bundles[0].steps[0].phase);
+    try std.testing.expectEqual(model.ProvisionAction.@"package", loaded.value.provisioning_bundles[0].steps[0].action);
+    try std.testing.expectEqual(model.AssetKind.runtime_kernel, loaded.value.assets[0].kind);
+    // idempotent re-save keeps the manifest stable at schema 4 with 10 entities.
+    try save(std.testing.io, std.testing.allocator, root, &loaded.value);
+    var reloaded = try load(std.testing.io, std.testing.allocator, root);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(u32, 4), reloaded.value.schema_version);
+    try std.testing.expectEqual(model.ProfileKind.diskless, reloaded.value.profiles[0].kind);
 }

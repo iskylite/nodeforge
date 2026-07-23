@@ -196,7 +196,7 @@ pub fn resetState(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     defer manifest.deinit();
     try manifest.writer.writeAll("{\"schema_version\":1,\"files\":[");
     var first = true;
-    for ([_][]const u8{ p.leases_path, p.node_status_path, p.deployment_control_path, p.boot_sessions_path, p.node_inventory_path, p.operations_path }) |state_path| {
+    for ([_][]const u8{ p.leases_path, p.node_status_path, p.deployment_control_path, p.boot_sessions_path, p.node_inventory_path, p.operations_path, p.rootfs_artifacts_path }) |state_path| {
         if (!regularFile(io, state_path)) continue;
         const destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ backup, std.fs.path.basename(state_path) });
         defer allocator.free(destination);

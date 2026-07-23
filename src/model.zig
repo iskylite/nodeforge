@@ -326,7 +326,16 @@ pub const DistroFamily = enum { rhel, ubuntu };
 pub const InstallAdapter = enum { kickstart, autoinstall };
 
 /// 引导类型。v0.1 只支持 install 引导；diskless 属于 v0.2 范围。
-pub const BootKind = enum { install };
+/// Profile 的部署类型。v0.2 扩展为 tagged union `install | diskless`。
+/// 设计文档中的 `ProfileKind` 等价于此枚举（代码沿用 `BootKind`）。
+pub const BootKind = enum {
+    install,
+    /// 内存无盘启动（v0.2 范围）。完整 diskless 链路尚未接入前所有路径 fail-closed。
+    diskless,
+};
+
+/// 设计文档使用的 `ProfileKind` 即代码 [`BootKind`]。
+pub const ProfileKind = BootKind;
 
 /// 基础源及额外标准包使用的包管理器。由 [`packageManagerForFamily`] 从 family 派生。
 pub const PackageManager = enum { dnf, apt };
@@ -361,6 +370,8 @@ pub const AssetKind = enum {
     bootloader,
     /// 安装器内核（vmlinuz）。由 ISO 提取或独立导入。
     kernel,
+    /// 运行时内核（v0.2 范围）。由本地内核包 + modules closure 派生，与 installer kernel 区分。
+    runtime_kernel,
     /// 安装器 initrd（initrd.img）。由 ISO 提取或独立导入。
     installer_initrd,
     /// NodeForge 定制小 initrd（v0.2 无盘启动用）。由 dracut 模块构建。
@@ -371,6 +382,10 @@ pub const AssetKind = enum {
     gpg_key,
     /// 受管文件资产。由 provision `managed_file` 动作通过 HTTP 分发。
     managed_file,
+    /// 归档资产（v0.2 范围）。tar/cpio 等受管归档，由 `archive` 动作解压到目标。
+    archive,
+    /// 脚本资产（v0.2 范围）。受管可执行脚本，由 `script` 动作在受控上下文中执行。
+    script,
 };
 
 /// ISO 导入后自动形成的发行版能力索引。
@@ -533,6 +548,9 @@ pub const BootBundleConfig = struct {
     kernel_release: []const u8,
     /// 内核资产名称；必须指向 kind 为 `kernel` 的资产。
     kernel: []const u8,
+    /// 运行时内核资产名称（v0.2）。必须指向 kind 为 `runtime_kernel` 的资产；
+    /// 与目标 rootfs 的 modules ABI 一致。v4 起由 bundle 固定，不再把派生 rootfs 塞入 bundle。
+    runtime_kernel: ?[]const u8 = null,
     /// NodeForge 小 initrd 资产名称；必须指向 kind 为 `nodeforge_initrd` 的资产。
     initrd: []const u8,
     /// rootfs 资产名称；必须指向 kind 为 `rootfs` 的资产。
@@ -574,7 +592,17 @@ pub const ProfileConfig = struct {
     /// 稳定短名称，用于 node 引用。
     name: []const u8,
     /// 引用的 install source 资源名称。平台能力（distro/version/arch）由此派生。
+    /// install 与 diskless Profile 都从 InstallSource 创建/派生，共用同一 source。
     install_source: []const u8,
+    /// Profile 部署类型（schema v4 tagged kind）。v3 迁移后 install Profile 为 `.install`。
+    kind: ProfileKind = .install,
+    /// diskless Profile 引用的 boot bundle 名称；仅 `kind == .diskless` 时必填。
+    /// install Profile 忽略此字段。
+    boot_bundle: ?[]const u8 = null,
+    /// diskless Profile 引用的构建 bundle（`rootfs_build` + `first_boot` 阶段步骤）。
+    /// builder 把 `rootfs_build` 步骤烤入只读 lower，把 `first_boot` 步骤作为固定
+    /// payload 预置但不执行；install Profile 忽略此字段。
+    bundle: ?[]const u8 = null,
     /// M4.1 的跨发行版目标系统事实。安装和后续无盘链路都消费此字段。
     /// 包含 locale/timezone/keyboard、SSH、用户、安全和包配置。
     system: TargetSystemConfig = .{},
@@ -794,6 +822,23 @@ pub const NodeOverrideConfig = struct {
     software: SoftwareOverrideConfig = .{},
     /// kernel arguments delta（按参数名 add/remove）。
     kernel_args: StringSetDelta = .{},
+    /// diskless 运行期 override（first-boot bundle 替换等）。仅 diskless Node 生效。
+    diskless: DisklessOverrideConfig = .{},
+};
+
+/// diskless Node 运行期 override。只承载切根后由 agent pre-init 重放的差异，
+/// 不复制 Profile 已烤入 rootfs lower 的共享基线。
+pub const DisklessOverrideConfig = struct {
+    /// first-boot provision override。Node 可完整替换自身从 Profile 继承的 first-boot。
+    provision: DisklessProvisionOverride = .{},
+};
+
+/// diskless Node first-boot provision override。
+pub const DisklessProvisionOverride = struct {
+    /// Node first-boot bundle 名称；引用 `Catalog.provisioning_bundles`。
+    /// 设置后完整替换 Profile 的 first_boot 步骤，且只允许 `first_boot` 阶段 item；
+    /// 不影响 rootfs lower（Profile rootfs-build projection 永不读取此 override）。
+    bundle: ?[]const u8 = null,
 };
 
 /// 字符串集合 delta。用于列表型字段的 add/remove 语义。
@@ -1214,17 +1259,27 @@ pub const UserConfig = TargetUserConfig;
 pub const ProvisionPhase = enum {
     /// 安装后阶段。在 `%post`（Kickstart）或 `late-commands`（Autoinstall）中执行。
     install_post,
+    /// rootfs 构建阶段（v0.2）。在服务端 rootfs builder 内向只读 lower 追加业务内容。
+    rootfs_build,
+    /// 首次启动阶段（v0.2）。切根后由 agent 在真正 init 之后执行，一次性、无远程控制。
+    first_boot,
 };
 
 /// 后处理动作类型。M4 只实现这三种受约束动作；
 /// 任意脚本执行在 M7 作为 `script` 动作补充。
 pub const ProvisionAction = enum {
+    /// 写入受管文件（使用 heredoc 创建指定路径的文件）。
+    managed_file,
+    /// 解压受管归档资产（v0.2）。`archive` 动作，仅 rootfs-build/first-boot 可用。
+    archive,
+    /// 执行受管脚本资产（v0.2）。`script` 动作，来源必须是 catalog 受管 asset。
+    script,
+    /// 安装预解析的离线包闭包（v0.2）。`package` 动作，缺依赖在 build 阶段失败。
+    @"package",
     /// 添加软件仓库（dnf config-manager 或 apt sources.list）。
     repository,
     /// 安装标准软件包（dnf install 或 apt-get install）。
     standard_packages,
-    /// 写入受管文件（使用 heredoc 创建指定路径的文件）。
-    managed_file,
 };
 
 /// 单个后处理步骤。渲染器按 `action` 类型生成对应的 shell 命令。

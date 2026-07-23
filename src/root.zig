@@ -35,6 +35,7 @@ pub const iso_import = @import("catalog/iso_import.zig");
 pub const catalog_migration = @import("catalog/migration.zig");
 pub const catalog_discovery = @import("catalog/discovery.zig");
 pub const catalog_schema_v3 = @import("catalog/schema_v3.zig");
+pub const catalog_schema_v4 = @import("catalog/schema_v4.zig");
 pub const catalog_schema_v3_dto = @import("catalog/schema_v3_dto.zig");
 pub const catalog_schema_v2_dto = @import("catalog/schema_v2_dto.zig");
 pub const software_index = @import("catalog/software_index.zig");
@@ -52,6 +53,8 @@ pub const config_validate = @import("config/validate.zig");
 pub const node_mutation = @import("config/node_mutation.zig");
 /// Profile kernel_args 的受限、规范化 catalog 事务写入器。
 pub const profile_mutation = @import("config/profile_mutation.zig");
+/// v0.2 diskless effective compiler：三投影与两摘要。
+pub const profile_diskless = @import("profile/diskless.zig");
 pub const value_mutation = @import("config/value_mutation.zig");
 pub const item_mutation = @import("config/item_mutation.zig");
 pub const scalar_mutation = @import("config/scalar_mutation.zig");
@@ -65,7 +68,19 @@ pub const capacity = @import("state/capacity.zig");
 /// PXE boot session 注册表：关联 DHCP→TFTP→HTTP 启动链路的进程内状态。
 pub const boot_session = @import("state/boot_session.zig");
 pub const boot_session_store = @import("state/boot_session_store.zig");
+/// v0.2 canonical diskless BootSession 状态机 reducer。
+pub const diskless_session = @import("state/diskless_session.zig");
+/// v0.2 diskless 分域 scoped capability token（hash-only、有界、一次性）。
+pub const diskless_credential = @import("state/diskless_credential.zig");
+/// v0.2 diskless delivery DTOs：BootConfig v2 与 AgentPlan v1。
+pub const http_diskless_dto = @import("http/diskless_dto.zig");
+/// v0.2 rootfs builder core：制品记录、构建状态机、DeliveryManifest、local-only 检查。
+pub const provision_rootfs_build = @import("provision/rootfs_build.zig");
 pub const node_inventory = @import("state/node_inventory.zig");
+/// v0.2 rootfs artifact store：已构建 rootfs 制品按 rootfs_input_digest 内容寻址登记。
+pub const state_rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
+/// v0.2 diskless delivery session + scoped token store（config/agent/event token）。
+pub const state_diskless_delivery = @import("state/diskless_delivery.zig");
 pub const operations = @import("state/operations.zig");
 pub const config_runtime = @import("state/config_runtime.zig");
 pub const model_runtime = @import("state/model_runtime.zig");
@@ -155,6 +170,7 @@ test {
     _ = catalog_migration;
     _ = catalog_discovery;
     _ = catalog_schema_v3;
+    _ = catalog_schema_v4;
     _ = catalog_schema_v3_dto;
     _ = catalog_schema_v2_dto;
     _ = software_index;
@@ -175,6 +191,12 @@ test {
     _ = capacity;
     _ = boot_session;
     _ = boot_session_store;
+    _ = diskless_session;
+    _ = diskless_credential;
+    _ = http_diskless_dto;
+    _ = provision_rootfs_build;
+    _ = state_rootfs_artifact_store;
+    _ = state_diskless_delivery;
     _ = node_inventory;
     _ = operations;
     _ = config_runtime;
@@ -189,6 +211,7 @@ test {
     _ = status_store;
     _ = deployment_control;
     _ = plan_digest;
+    _ = profile_diskless;
     _ = management_client;
     _ = http_routes;
     _ = management;

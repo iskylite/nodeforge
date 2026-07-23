@@ -1,0 +1,161 @@
+//! # v0.2 diskless delivery DTOs
+//!
+//! `V0_2_DESIGN.md` §2.3 / §4.3 的 BootConfig v2 与 AgentPlan v1。两者均为独立
+//! 命名空间（`schema_version` 各自计数，见 `V0_2_IMPL_DETAILS.md` §5）。
+//!
+//! - BootConfig v2：initrd 用 config:read token 拉取的固定 immutable 快照，引用
+//!   rootfs 与 AgentPlan 的 URL/digest/size，不携带任何 token（token 经 per-session
+//!   credential capsule 交付）。相同 token/相同 config digest 重复 GET 返回相同 bytes。
+//! - AgentPlan v1：agent pre-init 用 agent:read token 拉取的 immutable 运行根计划，
+//!   列出 content-addressed payload path/digest/size 供 agent 校验后清零 token。
+const std = @import("std");
+
+pub const boot_config_schema_version: u32 = 2;
+pub const agent_plan_schema_version: u32 = 1;
+
+/// BootConfig v2 中引用的 rootfs 定位器。
+pub const RootfsLocator = struct {
+    url: []const u8,
+    /// rootfs 内容 SHA-512（immutable ETag）。
+    sha512: []const u8,
+    size: u64,
+    uncompressed_size: u64,
+};
+
+/// BootConfig v2 中引用的 AgentPlan 定位器。
+pub const AgentPlanLocator = struct {
+    url: []const u8,
+    digest: []const u8,
+    size: u64,
+};
+
+/// BootConfig v2 在首次授权 GET 时签发的分域 token（config token 仍由 capsule 交付，
+/// 此处只给 initrd 切根后 agent/event 使用的 agent:read / event:append token）。
+pub const Access = struct {
+    agent_token: []const u8,
+    event_token: []const u8,
+};
+
+/// BootConfig v2。initrd 下载 rootfs 并交接 agent_plan locator 的最小 DTO。
+pub const BootConfig = struct {
+    schema_version: u32 = boot_config_schema_version,
+    node_id: []const u8,
+    session_id: []const u8,
+    profile: []const u8,
+    kind: []const u8 = "diskless",
+    kernel_release: []const u8,
+    kernel_args: ?[]const u8 = null,
+    /// 自身 boot-config URL（有界重放时重复 GET 相同 bytes）。
+    config_url: []const u8,
+    rootfs: RootfsLocator,
+    agent_plan: AgentPlanLocator,
+    event_url: []const u8,
+    /// 首次 GET 签发的 agent/event token；initrd 写入 /run handoff 后清零自身 token。
+    access: ?Access = null,
+    /// 过期时刻（Unix 秒）。
+    expires_at: i64,
+};
+
+/// AgentPlan v1 中 content-addressed payload 条目。
+pub const PayloadEntry = struct {
+    path: []const u8,
+    digest: []const u8,
+    size: u64,
+};
+
+/// AgentPlan v1。切根后 agent pre-init 拉取并校验的 immutable 运行根计划。
+pub const AgentPlan = struct {
+    schema_version: u32 = agent_plan_schema_version,
+    node_id: []const u8,
+    session_id: []const u8,
+    plan_digest: []const u8,
+    rootfs_input_digest: []const u8,
+    /// Node first-boot bundle（override 完整替换 Profile 继承值）。
+    first_boot_bundle: ?[]const u8 = null,
+    /// content-addressed payload 列表；相同 token 只能访问此处明列的 path。
+    payload: []const PayloadEntry = &.{},
+    event_url: []const u8,
+    expires_at: i64,
+};
+
+/// 渲染 BootConfig v2 为 JSON。
+pub fn renderBootConfig(allocator: std.mem.Allocator, config: BootConfig) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, config, .{ .whitespace = .indent_2 });
+}
+
+/// 渲染 AgentPlan v1 为 JSON。
+pub fn renderAgentPlan(allocator: std.mem.Allocator, plan: AgentPlan) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, plan, .{ .whitespace = .indent_2 });
+}
+
+/// 计算 BootConfig 的 canonical SHA-256 十六进制（config digest，用于固定 immutable
+/// bytes 与有界重放比对）。
+pub fn bootConfigDigest(allocator: std.mem.Allocator, config: BootConfig) ![64]u8 {
+    const json = try std.json.Stringify.valueAlloc(allocator, config, .{});
+    defer allocator.free(json);
+    return sha256Hex(json);
+}
+
+/// 计算 AgentPlan 的 canonical SHA-256 十六进制（plan digest，用于 agent 校验）。
+pub fn agentPlanDigest(allocator: std.mem.Allocator, plan: AgentPlan) ![64]u8 {
+    const json = try std.json.Stringify.valueAlloc(allocator, plan, .{});
+    defer allocator.free(json);
+    return sha256Hex(json);
+}
+
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var raw: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &raw, .{});
+    var out: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&out, "{x}", .{raw}) catch unreachable;
+    return out;
+}
+
+test "boot config v2 renders stable canonical digest" {
+    const cfg: BootConfig = .{
+        .node_id = "n1",
+        .session_id = "s1",
+        .profile = "p",
+        .kernel_release = "5.14.0",
+        .kernel_args = "console=ttyAMA0",
+        .config_url = "https://srv/api/v1/nodes/n1/boot-config",
+        .rootfs = .{ .url = "https://srv/api/v1/nodes/n1/rootfs", .sha512 = "ab", .size = 100, .uncompressed_size = 400 },
+        .agent_plan = .{ .url = "https://srv/api/v1/nodes/n1/boot-sessions/s1/agent-plan/d", .digest = "d", .size = 50 },
+        .event_url = "https://srv/api/v1/nodes/n1/events",
+        .expires_at = 1234,
+    };
+    const first = try bootConfigDigest(std.testing.allocator, cfg);
+    const second = try bootConfigDigest(std.testing.allocator, cfg);
+    try std.testing.expectEqualSlices(u8, &first, &second);
+    const rendered = try renderBootConfig(std.testing.allocator, cfg);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"schema_version\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"sha512\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"ab\"") != null);
+}
+
+test "agent plan v1 lists payload entries" {
+    const payload = [_]PayloadEntry{
+        .{ .path = "payload/a.bin", .digest = "da", .size = 10 },
+        .{ .path = "payload/b.bin", .digest = "db", .size = 20 },
+    };
+    const plan: AgentPlan = .{
+        .node_id = "n1",
+        .session_id = "s1",
+        .plan_digest = "pd",
+        .rootfs_input_digest = "rid",
+        .first_boot_bundle = "fb",
+        .payload = &payload,
+        .event_url = "https://srv/api/v1/nodes/n1/events",
+        .expires_at = 99,
+    };
+    const rendered = try renderAgentPlan(std.testing.allocator, plan);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"schema_version\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "payload/a.bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "payload/b.bin") != null);
+    const digest = try agentPlanDigest(std.testing.allocator, plan);
+    // 相同输入稳定。
+    const again = try agentPlanDigest(std.testing.allocator, plan);
+    try std.testing.expectEqualSlices(u8, &digest, &again);
+}

@@ -50,6 +50,9 @@ pub fn renderInstallPost(allocator: std.mem.Allocator, bundle: *const model.Prov
         // 只处理 install_post 阶段的步骤；其他阶段在 M7 实现
         if (step.phase != .install_post) continue;
         switch (step.action) {
+            // v0.2 rootfs-build/first-boot 动作不在 install_post 渲染器中执行；
+            // phase 过滤已跳过非 install_post 步骤，到达此处即配置错误。
+            .archive, .script, .@"package" => return error.InvalidStep,
             // 仓库添加：dnf 使用 config-manager，apt 使用 sources.list.d
             .repository => if (step.repository) |repo| switch (manager) {
                 .dnf => {
