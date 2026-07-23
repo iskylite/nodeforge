@@ -1,7 +1,7 @@
 //! # nodeforge-agent（v0.2 diskless 切根后 pre-init / first-boot）
 //!
 //! `V0_2_DESIGN.md` §4.3/§5.3。`switch_root` 后由 initrd exec 为 `--pre-init`：
-//! 从 `/run/nodeforge/boot.json` 取 agent:read token -> 拉取并校验 immutable AgentPlan v1
+//! 从 `/var/lib/nodeforge/boot.json` 取 agent:read token -> 拉取并校验 immutable AgentPlan v1
 //! 与其 content-addressed payload -> 清零 agent token -> 在真正 init 前把 Node
 //! effective override（hostname/hosts/machine-id/network/target-system delta）写入
 //! overlay upper -> `exec /sbin/init`。同一 binary 之后以 systemd unit 执行 effective
@@ -12,8 +12,8 @@
 //! plan fallback（§10 fail-closed）。
 const std = @import("std");
 
-const handoff_path = "/run/nodeforge/boot.json";
-const payload_dir = "/run/nodeforge/payload";
+const handoff_path = "/var/lib/nodeforge/boot.json";
+const payload_dir = "/var/lib/nodeforge/payload";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -66,7 +66,7 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
     // node-apply：把 Node effective 运行根差量写入 overlay upper（真正 init 看到最终配置）。
     try nodeApply(io, allocator, &plan, h.node);
 
-    // 预取完成，清零 agent token（内存用后即弃；handoff 文件随 /run tmpfs 易失）。
+    // 预取完成，清零 agent token（内存用后即弃；handoff 落 /var/lib 持久化，供 first-boot 读取）。
     try clearToken(allocator, h.agent_token);
 }
 

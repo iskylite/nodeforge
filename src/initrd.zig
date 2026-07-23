@@ -3,7 +3,7 @@
 //! `V0_2_DESIGN.md` §4.3 boot-time 序列。作为 dracut initrd 的 PID 1，在获得网络后：
 //! 从 per-session credential capsule 读取 config token -> 有界重放拉取 BootConfig v2 ->
 //! 下载并 SHA-512 校验 rootfs -> loop 挂载只读 lower + tmpfs upper -> overlay 合并 ->
-//! 写 `/run/nodeforge/boot.json` handoff（AgentPlan locator 与 agent/event token）->
+//! 写 `/var/lib/nodeforge/boot.json` handoff（AgentPlan locator 与 agent/event token）->
 //! 清除 config/rootfs token -> `switch_root` 执行 `nodeforge-agent --pre-init`。
 //!
 //! 本程序运行在 dracut 提供的最小 userspace（含 `ip`/`dhclient`/`curl`/`mount`/
@@ -14,8 +14,8 @@ const std = @import("std");
 
 const capsule_token_path = "/capsule/config-token";
 const cmdline_path = "/proc/cmdline";
-const handoff_dir = "/merged/run/nodeforge";
-const handoff_path = "/merged/run/nodeforge/boot.json";
+const handoff_dir = "/merged/var/lib/nodeforge";
+const handoff_path = "/merged/var/lib/nodeforge/boot.json";
 const rootfs_blob = "/run/rootfs.squashfs";
 const lower_mnt = "/lower";
 const rw_mnt = "/rw";
@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(overlay_opts);
     try mustRun(io, allocator, &.{ "mount", "-t", "overlay", "overlay", "-o", overlay_opts, merged_mnt });
 
-    // handoff：AgentPlan locator + agent/event token 交给 agent pre-init（写入新根 /run）。
+    // handoff：AgentPlan locator + agent/event token 交给 agent pre-init（写入新根 /var/lib）。
     try writeHandoff(io, allocator, &bc, cmdline.session, cmdline.node);
     // 切根前清零 config/rootfs capability（内存 token 用后即弃）。
     try zeroMemoryToken(allocator);
