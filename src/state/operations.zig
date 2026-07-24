@@ -85,9 +85,10 @@ pub const Store = struct {
         defer self.mutex.unlock();
         for (&self.entries) |*entry| if (entry.used() and std.mem.eql(u8, entry.keySlice(), key)) {
             if (!std.mem.eql(u8, entry.requestDigestSlice(), request_digest)) return error.IdempotencyConflict;
-            if (!(entry.state == .failed and std.mem.eql(u8, entry.errorSlice(), "operation.interrupted")))
+            // 成功的终态重用（幂等保证）；失败的终态允许重试（暂时性条件可恢复）。
+            if (entry.state == .succeeded)
                 return .{ .entry = entry.*, .reused = true };
-            entry.* = .{}; // 被中断的终态由其持久后继替换
+            entry.* = .{}; // 失败终态由其持久后继替换
             break;
         };
         var target: ?*Entry = null;
