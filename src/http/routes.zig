@@ -1,4 +1,4 @@
-//! # M4.5 centralized HTTP route contract registry
+//! # M4.5 集中式 HTTP 路由契约注册表
 //!
 //! 定义所有 HTTP 路由的元数据：方法、模板、平面、认证模式、缓存策略和日志级别。
 //! 用于路由匹配、安全审计和 API 文档生成。
@@ -285,8 +285,8 @@ test "Allow aggregation reflects registered methods for detail and collection pa
     try std.testing.expect(!methodAllowed("/api/v1/management/config", "POST"));
     // 资产 detail 只注册了 GET，PUT/DELETE 应得到 405 + Allow: GET。
     try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/assets/rocky-kernel", &buffer).?);
-    // v3 profile detail is read-only; canonical mutations use /properties,
-    // /values, and /items subresources.
+    // v3 profile detail 为只读；规范变更使用 /properties、
+    // /values 和 /items 子资源。
     try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/profiles/rocky-install", &buffer).?);
     try std.testing.expectEqualStrings("POST", allowed("/api/v1/management/profiles/rocky-install/properties", &buffer).?);
     try std.testing.expectEqualStrings("GET, PATCH", allowed("/api/v1/management/discovery/policy", &buffer).?);

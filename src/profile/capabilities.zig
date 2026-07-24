@@ -1,4 +1,4 @@
-//! # Adapter capability registry for every canonical mutable configuration path
+//! # 每条规范可变配置路径的适配器能力注册表
 //!
 //! 记录每个可变配置域在 Kickstart 和 Autoinstall 适配器中的支持状态。
 //! 用于 CLI 展示能力矩阵和校验器拒绝不支持的配置组合。

@@ -1,4 +1,4 @@
-//! # Provisioning bundle catalog mutations
+//! # 置备 bundle catalog 变更
 //!
 //! 提供 provisioning bundle 和 step 的增删改查事务入口。
 //! 每个 mutation 执行 load-patch-validate-save 事务。

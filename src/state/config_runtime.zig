@@ -74,7 +74,7 @@ pub const ConfigRuntime = struct {
     /// 校验、序列化、持久化并发布一个新 config 世代。
     /// 所有分配发生在 disk/publish 临界区之前，以缩短 mutex 持有时间。
     pub fn publish(self: *ConfigRuntime, candidate: model.AppConfig, new_revision: u64) !void {
-        // All allocations happen before the disk/publish critical section.
+        // 所有分配发生在 disk/publish 临界区之前。
         const next = try self.prepare(candidate, new_revision);
         errdefer next.release();
         self.publishPrepared(next);

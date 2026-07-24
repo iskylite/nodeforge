@@ -1,4 +1,4 @@
-//! Ownership schema v3 migration planning and typed candidate materialization.
+//! 所有权 schema v3 迁移规划与类型化候选物化。
 const std = @import("std");
 const model = @import("../model.zig");
 const lookup = @import("../catalog.zig");
@@ -104,8 +104,8 @@ pub fn candidates(allocator: std.mem.Allocator, config: *const model.AppConfig, 
     result.catalog.value.discovery_policy.unknown_action = .record;
     try migrateProfiles(result.catalog.arena.allocator(), &result.catalog.value);
     try migrateNodes(result.catalog.arena.allocator(), &result.catalog.value);
-    // Legacy schema-1 config may still embed entities. Project migrated catalog
-    // values so validation sees one ownership generation before serialization.
+    // 旧版 schema-1 config 可能仍内嵌实体。投影迁移后的 catalog
+    // 值，使校验在序列化前看到唯一的所有权世代。
     result.config.value.profiles = result.catalog.value.profiles;
     result.config.value.nodes = result.catalog.value.nodes;
     result.config.value.provisioning_bundles = result.catalog.value.provisioning_bundles;

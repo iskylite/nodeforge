@@ -301,9 +301,9 @@ pub const Store = struct {
         for (&self.sessions) |*session| {
             if (!session.active() or sessionExpired(session, mono_now)) continue;
             const plan = session.install_plan orelse continue;
-            // The owned canonical plan contains several names. Pair the exact
-            // name with the install_source object prefix to avoid matching an
-            // unrelated asset suffix.
+            // 持有的规范计划包含多个名称。将精确
+            // 名称与 install_source 对象前缀配对，避免匹配
+            // 无关的资产后缀。
             const marker = "\"install_source\":";
             const start = std.mem.indexOf(u8, plan.json, marker) orelse continue;
             const tail = plan.json[start + marker.len ..];
@@ -625,10 +625,10 @@ pub const Store = struct {
         }
     }
 
-    /// Terminal installer events must release the in-memory capability
-    /// immediately: otherwise a failed attempt blocks `install retry` for the
-    /// two-hour delivery TTL. Terminal history remains in the durable event
-    /// and node-status stores.
+    /// 终止性安装器事件必须立即释放内存中的能力：
+    /// 否则一次失败尝试会在两小时投递 TTL 内阻塞 `install retry`。
+    /// 终止历史保留在持久的事件
+    /// 和 node-status store 中。
     pub fn finishDelivery(self: *Store, session_id: []const u8, reason: TerminalReason, mono_now: i64, utc_now: i64) void {
         lock(&self.mutex);
         defer self.mutex.unlock();

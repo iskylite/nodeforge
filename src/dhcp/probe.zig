@@ -43,7 +43,7 @@ pub fn ping(io: std.Io, ip: u32, timeout_ms: u16) Result {
     // sequence 从候选 IP 派生，使不同地址的探测不可互换
     const sequence: u16 = @truncate(ip);
     // ICMP Echo Request：type=8, code=0, checksum=0（后续计算）,
-    // identifier + sequence
+    // identifier + sequence（标识符与序列号）
     var request = [_]u8{ 8, 0, 0, 0, 0x4e, 0x46, @truncate(sequence >> 8), @truncate(sequence) };
     const sum = checksum(&request);
     request[2] = @truncate(sum >> 8);
@@ -72,7 +72,7 @@ pub fn ping(io: std.Io, ip: u32, timeout_ms: u16) Result {
 ///
 /// 匹配条件：
 /// - ICMP type = 0（Echo Reply）
-/// - ICMP code = 0
+/// - ICMP code = 0（码值为 0）
 /// - identifier 和 sequence 与发送时一致
 ///
 /// Raw IPv4 socket 收到的数据包含 IP 头部，需要先跳过 IP 头部。
@@ -115,7 +115,7 @@ test "ICMP checksum matches RFC 1071 example" {
 test "recognizes matching ICMP echo reply after IPv4 header" {
     var reply = [_]u8{0} ** 28;
     reply[0] = 0x45; // IPv4, IHL = 5 words（20 字节头）
-    reply[20] = 0; // Echo Reply
+    reply[20] = 0; // Echo Reply（回显应答）
     reply[21] = 0;
     std.mem.writeInt(u16, reply[24..26], 0x4e46, .big);
     std.mem.writeInt(u16, reply[26..28], 0x1234, .big);

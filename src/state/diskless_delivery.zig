@@ -1,4 +1,4 @@
-//! # v0.2 diskless delivery session + scoped token store
+//! # v0.2 无盘投递会话 + 作用域令牌存储
 //!
 //! 自包含的 diskless 交付子系统：按 session 持有节点/profile/rootfs 定位器、
 //! 固定的 AgentPlan（immutable bytes + digest）以及 config/agent/event 三类
@@ -192,7 +192,7 @@ pub const Store = struct {
         s.safety_margin_bytes = safety_margin_bytes;
         s.kernel_len = @intCast(@min(kernel_release.len, kernel_cap));
         @memcpy(s.kernel_buf[0..s.kernel_len], kernel_release[0..s.kernel_len]);
-        // config token expires with the session; bind content to rootfs sha512.
+        // config token 随会话过期；将内容绑定到 rootfs sha512。
         s.config_token = .{ .issued = false, .scope = .config_read, .expires_mono = now_mono + default_ttl_seconds };
         const cd_len = @min(sh_len, sha512_len);
         @memcpy(s.config_token.content_digest[0..cd_len], rootfs_sha512[0..cd_len]);
@@ -425,6 +425,7 @@ const PersistedFile = struct {
     sessions: []const PersistedSession = &.{},
 };
 
+/// 将内存中的 token slot 投影为可持久化形式（只存 hash+claim，不含 raw token）。
 fn persistedSlot(slot: *const TokenSlot) PersistedSlot {
     return .{
         .issued = slot.issued,
@@ -435,6 +436,8 @@ fn persistedSlot(slot: *const TokenSlot) PersistedSlot {
     };
 }
 
+/// 将内存中的 session 投影为可持久化形式：四类 capability 只存 hash+claim，
+/// raw token 从不落盘。
 fn persistedSession(session: *const Session) PersistedSession {
     return .{
         .session_id = &session.session_id,
@@ -459,6 +462,10 @@ fn persistedSession(session: *const Session) PersistedSession {
     };
 }
 
+/// 从持久化 JSON 恢复单个 session：逐字段校验长度，任一越界即 fail-closed
+/// （`InvalidDisklessDeliveryStore`）。按剩余 TTL（`expires_at - now_utc`）重算
+/// monotonic 过期时间。raw token 不在持久化文件中，由 `reconstructAndVerifyRaw`
+/// 在校验时按需重构。
 fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session {
     if (item.session_id.len != id_len or item.rootfs_input_digest.len != digest_len or
         item.rootfs_sha512.len != sha512_len or item.agent_plan_digest.len != digest_len or
@@ -495,6 +502,7 @@ fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session 
     return session;
 }
 
+/// 从持久化 hash+claim 恢复 token slot（不含 raw token）；过期时间由调用方按 TTL 重算。
 fn restoreSlot(item: PersistedSlot, expires_mono: i64) !TokenSlot {
     if (item.hash.len != hash_len or item.content_digest.len > sha512_len) return error.InvalidDisklessDeliveryStore;
     var slot: TokenSlot = .{
@@ -509,6 +517,10 @@ fn restoreSlot(item: PersistedSlot, expires_mono: i64) !TokenSlot {
     return slot;
 }
 
+/// 从 master secret + session_id + capability kind 确定性派生 raw token
+/// （HMAC-SHA256 -> 64 位 hex）。确定性是 session 跨 daemon 重启可恢复的关键：
+/// 重启后用同一 secret+session_id+kind 重构出与签发时完全相同的 raw token。
+/// raw token 本身从不持久化，内存只存 `cred.hashOf(raw, secret)`。
 fn deriveToken(secret: []const u8, session_id: []const u8, kind: Store.SlotKind, destination: *[token_len]u8) void {
     var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(secret);
     hmac.update("nodeforge-diskless-capability-v1\x00");
@@ -524,6 +536,10 @@ fn deriveToken(secret: []const u8, session_id: []const u8, kind: Store.SlotKind,
     _ = std.fmt.bufPrint(destination, "{x}", .{mac}) catch unreachable;
 }
 
+/// 重启恢复：用 `deriveToken` 重构 raw token，再与持久化 hash 比对验证。
+/// 这是 session 跨 daemon 重启可恢复的依据；hash 不匹配即 fail-closed
+/// （防持久化文件被篡改或换密钥后误判为有效）。对应设计 §9.1：capsule 交付
+/// 前/中重启且客户端无完整 token 时，必须 `recovery_incomplete`，不能重建 secret。
 fn reconstructAndVerifyRaw(secret: []const u8, session: *Session, kind: Store.SlotKind) !void {
     const slot = switch (kind) {
         .config => &session.config_token,
@@ -543,6 +559,7 @@ fn reconstructAndVerifyRaw(secret: []const u8, session: *Session, kind: Store.Sl
     if (!std.mem.eql(u8, &computed, &slot.hash)) return error.InvalidDisklessDeliveryStore;
 }
 
+/// 用 `chmod` 子进程设置文件权限；失败即返回错误（secret 文件必须 0600）。
 fn chmod(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, path: []const u8) !void {
     const result = try std.process.run(allocator, io, .{
         .argv = &.{ "chmod", mode, path },
@@ -557,6 +574,7 @@ fn chmod(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, path: []con
     }
 }
 
+/// 生成 32-byte 随机 session_id（安全随机源）。
 fn generateId(io: std.Io, destination: *[id_len]u8) !void {
     var random: [16]u8 = undefined;
     try io.randomSecure(&random);

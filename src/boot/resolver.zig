@@ -34,7 +34,7 @@ pub const Decision = struct {
     /// 安装 profile 被有意暂停在 PXE gate，因为没有待执行的 generation
     ///（或其请求针对的是旧计划）。
     install_not_armed: bool = false,
-    /// M4.2 F2: node has deploy=false; PXE denied but diagnostic lease still served.
+    /// M4.2 F2：node 的 deploy=false；PXE 被拒但仍提供诊断 lease。
     deploy_disabled: bool = false,
 };
 
@@ -108,7 +108,7 @@ test "deploy=false suppresses PXE bootfile but keeps diagnostic lease" {
     const decision = resolve(&config, &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee }, .aarch64);
     try std.testing.expect(decision.bootfile == null);
     try std.testing.expect(decision.known);
-    try std.testing.expect(decision.mode == null); // generation gate bypassed
+    try std.testing.expect(decision.mode == null); // generation gate 被绕过
 }
 
 test "deploy=true (default) still gets bootfile" {

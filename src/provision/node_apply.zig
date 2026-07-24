@@ -1,4 +1,4 @@
-//! v0.2 diskless AgentPlan node-apply renderer.
+//! v0.2 无盘 AgentPlan node-apply 渲染器。
 //!
 //! 只消费服务端编译好的 typed projection，生成一次性、`set -eu` 的目标系统
 //! finalizer。所有动态值均作 shell quoting 或逐字节 `printf %b` 编码；不读取

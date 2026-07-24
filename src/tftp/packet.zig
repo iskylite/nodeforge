@@ -7,7 +7,7 @@
 //! - RFC 1350: The TFTP Protocol (Revision 2) — 定义 RRQ/WRQ/DATA/ACK/ERROR
 //! - RFC 2347: TFTP Option Extension — 定义 OACK 和 option 协商
 //! - RFC 2348: TFTP Blocksize Option — `blksize` 协商
-//! - RFC 2349: TFTP Timeout Interval and Transfer Size Options — `timeout`/`tsize`
+//! - RFC 2349：TFTP 超时间隔与传输大小选项 - `timeout`/`tsize`
 //!
 //! 字节序：所有 opcode 和 block number 均为大端序（网络字节序）。
 //! 字符串字段以单个 `\0` 结尾，不允许内部嵌入 `\0`。

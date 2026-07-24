@@ -1423,21 +1423,21 @@ fn setupFlagError(ctx: zli.CommandContext, message: []const u8) void {
     setExitCode(ctx, 2);
 }
 
-/// Remove every history-bearing path covered by `--purge-all`.
+/// 移除 `--purge-all` 覆盖的每个承载历史的路径。
 ///
-/// Binary/marker/config/unit survive. Managed work files do not: imports are
-/// temporary, may be several GiB, and must not cross a fresh-reset boundary.
-/// `repairDirectories` recreates the empty canonical work/import layout.
+/// 二进制/marker/config/unit 保留。受管工作文件不保留：导入是
+/// 临时的，可能达数 GiB，且不得跨越全新重置边界。
+/// `repairDirectories` 重建空的规范工作/导入布局。
 fn purgeSetupHistory(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !void {
     const backups_dir = try std.fmt.allocPrint(ctx.allocator, "{s}/backups", .{p.install_root});
     defer ctx.allocator.free(backups_dir);
     std.Io.Dir.cwd().deleteTree(ctx.io, backups_dir) catch {};
     std.Io.Dir.cwd().deleteTree(ctx.io, p.logs_dir) catch {};
-    // Interrupted ISO imports can contain read-only directory trees copied from
-    // installation media. Native deletion is preferred. If traversal is denied,
-    // restore owner permissions only under the validated, derived work path and
-    // retry with a bounded argv; command failure propagates instead of reporting
-    // a successful purge with stale data left behind.
+    // 中断的 ISO 导入可能包含从安装介质复制的只读目录树。
+    // 优先使用原生删除。若遍历被拒绝，
+    // 仅在已校验、已派生的工作路径下恢复属主权限，并
+    // 用有界 argv 重试；命令失败会向上传播，而不是报告
+    // 清除成功却留下陈旧数据。
     std.Io.Dir.cwd().deleteTree(ctx.io, p.work_dir) catch {
         try runRequired(ctx, &.{ "chmod", "-R", "u+rwx", p.work_dir });
         try runRequired(ctx, &.{ "rm", "-rf", "--", p.work_dir });
@@ -1450,9 +1450,9 @@ fn purgeSetupHistory(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !
     try nodeforge.setup.repairDirectories(ctx.io, ctx.allocator, p);
 }
 
-/// Publish and activate the unit as one recoverable lifecycle operation. The
-/// previous link and enabled/active state are restored if systemctl, model
-/// loading, or the loopback health probe fails.
+/// 将单元的发布与激活作为单个可恢复的生命周期操作。若
+/// systemctl、模型加载或 loopback 健康探测失败，则恢复
+/// 之前的链接与 enabled/active 状态。
 fn installSystemd(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !void {
     const link = "/etc/systemd/system/nodeforged.service";
     const backup = "/etc/systemd/system/nodeforged.service.nodeforge-backup";
@@ -1494,8 +1494,8 @@ fn waitForSystemdHealth(io: std.Io, port: u16) bool {
 
 fn rollbackSystemd(ctx: zli.CommandContext, link: []const u8, backup: []const u8, existed: bool, was_enabled: bool, was_active: bool) void {
     _ = commandSucceeded(ctx, &.{ "rm", "-f", link }) catch false;
-    // Copy back instead of moving so the failed activation retains a unit
-    // backup for diagnosis after the previous service state is restored.
+    // 改为拷贝而非移动，使失败激活在之前的服务状态恢复后
+    // 仍保留单元备份供诊断。
     if (existed) _ = commandSucceeded(ctx, &.{ "cp", "-P", backup, link }) catch false;
     _ = commandSucceeded(ctx, &.{ "systemctl", "daemon-reload" }) catch false;
     _ = commandSucceeded(ctx, if (was_enabled) &.{ "systemctl", "enable", "nodeforged.service" } else &.{ "systemctl", "disable", "nodeforged.service" }) catch false;
@@ -1745,8 +1745,8 @@ fn catalogMigrateHandler(ctx: zli.CommandContext) !void {
         try renderOutputDocument(ctx, .{ .human = .{ .text = "catalog migration applied" }, .json = body });
         return;
     }
-    // The daemon response is the canonical diagnostic artifact. Human mode is
-    // intentionally concise until apply adds an operation lifecycle view.
+    // daemon 响应是规范的诊断产物。human 模式
+    // 在 apply 增加操作生命周期视图前刻意保持简洁。
     const Response = struct { result: struct { plan_digest: []const u8, applicable: bool, plan: struct { renames: []const std.json.Value, blockers: []const std.json.Value } } };
     const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch {
         try writeCommandError(ctx, "catalog.invalid_response", "invalid migration plan response", 1);
@@ -2460,10 +2460,10 @@ fn contentAssetImportHandler(ctx: zli.CommandContext, kind: nodeforge.model.Asse
     };
     const relative = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}/{d}", .{ directory, name, revision });
     defer ctx.allocator.free(relative);
-    // `--config` may target an alternate install root (tests, recovery, side-by-side
-    // administration). Use the loaded config's canonical HTTP asset root instead of
-    // the CLI process-global default paths, otherwise bytes are copied under /opt
-    // while the selected daemon validates a different root.
+    // `--config` 可能指向备用安装根（测试、恢复、并行管理）。
+    // 使用已加载配置的规范 HTTP 资产根，而非
+    // CLI 进程全局默认路径，否则字节会被复制到 /opt 下，
+    // 而选中的 daemon 校验的是另一个根。
     const assets_root = std.fs.path.dirname(config.value.http.asset_root) orelse return itemUsageError(ctx, "configured HTTP asset root has no assets parent");
     const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ assets_root, relative });
     defer ctx.allocator.free(destination);
@@ -3178,8 +3178,8 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    // Both output modes own pagination. JSON is one complete collection
-    // envelope; human rendering keeps its documented 256-row display bound.
+    // 两种输出模式各自处理分页。JSON 是一个完整集合
+    // 信封；human 渲染保持其文档约定的 256 行显示上限。
     var response: [128 * 1024]u8 = undefined;
     const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", null, &response) catch {
         try cli_output.writeError(errorWriter(ctx), output, "node.unavailable", "local daemon management API unavailable");
@@ -3376,8 +3376,8 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
         return;
     }
 
-    // M4.5 keeps the HTTP DTO machine-oriented while the CLI renders a stable,
-    // scannable human view. Never dump the compact wire JSON in human mode.
+    // M4.5 让 HTTP DTO 面向机器，而 CLI 渲染稳定、
+    // 易扫描的 human 视图。切勿在 human 模式转储紧凑的 wire JSON。
     const Response = struct {
         result: struct {
             model_revision: struct { config: u64, catalog: u64 },
@@ -3808,7 +3808,7 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     try renderCommandResult(ctx, human, .{ .node_id = node_id });
 }
 
-// ── M4.2 node CRUD handlers ───────────────────────────────────────
+// ── M4.2 节点 CRUD 处理器 ───────────────────────────────────────
 
 /// M4.5：把管理写请求的失败结果映射为 CLI 结构化错误。`result.reason` 非空时
 /// 直接输出服务端错误信封（code/message/request_id），否则（连接失败）输出
@@ -4490,9 +4490,9 @@ fn addDebugFlag(command: *zli.Command) !void {
     });
 }
 
-/// M4.11 canonical readiness probe. A healthy `/healthz` alone is insufficient:
-/// operators need proof that the configured advertised listener and each
-/// management plane needed for provisioning are usable in the running daemon.
+/// M4.11 规范就绪探测。仅 `/healthz` 健康是不够的：
+/// 运维人员需要证据，证明配置的对外监听器以及置备所需的
+/// 每个管理平面在运行中的 daemon 内可用。
 fn statusProbe(
     io: std.Io,
     allocator: std.mem.Allocator,

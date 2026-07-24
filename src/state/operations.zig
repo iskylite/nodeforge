@@ -75,9 +75,9 @@ pub const Store = struct {
         return self.beginRequest(io, key, "", kind, now);
     }
 
-    /// Begin an idempotent operation for one canonical request. A key can only
-    /// identify one request digest. An interrupted attempt is exceptional: the
-    /// same key/request creates a successor so retry can safely resume work.
+    /// 为单个规范请求开启幂等操作。一个 key 只能
+    /// 标识一个请求摘要。被中断的尝试是异常情况：
+    /// 相同 key/请求创建后继，使重试可安全恢复工作。
     pub fn beginRequest(self: *Store, io: std.Io, key: []const u8, request_digest: []const u8, kind: Kind, now: i64) !BeginResult {
         if (key.len == 0 or key.len > 128) return error.InvalidIdempotencyKey;
         if (request_digest.len > 64) return error.InvalidRequestDigest;
@@ -87,7 +87,7 @@ pub const Store = struct {
             if (!std.mem.eql(u8, entry.requestDigestSlice(), request_digest)) return error.IdempotencyConflict;
             if (!(entry.state == .failed and std.mem.eql(u8, entry.errorSlice(), "operation.interrupted")))
                 return .{ .entry = entry.*, .reused = true };
-            entry.* = .{}; // interrupted terminal is replaced by its durable successor
+            entry.* = .{}; // 被中断的终态由其持久后继替换
             break;
         };
         var target: ?*Entry = null;
@@ -197,8 +197,8 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     }
 }
 
-/// Rebuild catalog-migration terminal state from transaction recovery records.
-/// Records are only removed after the operation store has been persisted by the caller.
+/// 从事务恢复记录重建 catalog 迁移终止状态。
+/// 记录仅在调用方持久化操作 store 后才被移除。
 pub fn reconcileMigrationRecovery(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, store: *Store, now: i64) !usize {
     var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return 0,

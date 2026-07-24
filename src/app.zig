@@ -278,9 +278,8 @@ pub fn run(
     dhcp_thread.join();
     tftp_thread.join();
 
-    // M3.1: The checkpoint worker must complete its final flush after the DHCP
-    // worker has stopped.  It is the sole writer of leases.json; no other
-    // thread may write that file while the worker is alive.
+    // M3.1：checkpoint worker 必须在 DHCP worker 停止后完成最终 flush。它是
+    // leases.json 的唯一写者；worker 存活期间无其他线程可写该文件。
     observe_log.info("shutdown: flushing lease checkpoint worker", .{});
     checkpoint_flush_stop.store(true, .release);
     checkpoint_thread.join();
@@ -296,7 +295,7 @@ pub fn run(
     const terminated_count = sessions.terminateAll(boot_session.monotonicNow(), now(), &terminated);
     statuses.deactivateAll();
 
-    // M3.1: final save of node-status.json with all sessions marked inactive.
+    // M3.1：最终保存 node-status.json，所有 session 标记为 inactive。
     {
         var status_snapshot: [node_status.max_statuses]node_status.Status = undefined;
         statuses.snapshot(&status_snapshot);
@@ -338,12 +337,12 @@ fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.Dhc
     };
 }
 
-/// M3.1: Load node statuses from `node-status.json`.  If the new file does not
-/// exist, attempt to migrate from the legacy `runtime.json`.
+/// M3.1：从 `node-status.json` 加载 node 状态。若新文件不存在，则尝试从遗留
+/// `runtime.json` 迁移。
 fn loadStatuses(io: std.Io, allocator: std.mem.Allocator, store: *node_status.Store) void {
     status_store.load(io, allocator, paths.require().node_status_path, store) catch |err| switch (err) {
         error.FileNotFound => {
-            // New file missing: try legacy runtime.json migration for statuses.
+            // 新文件缺失：尝试从遗留 runtime.json 迁移状态。
             status_store.migrateLegacy(io, allocator, paths.require().runtime_path, store) catch |legacy_err| switch (legacy_err) {
                 error.FileNotFound => {},
                 else => observe_log.err("status: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),
@@ -376,14 +375,13 @@ fn runCheckpoint(
     var leases: [runtime_state.DhcpState.max_leases]runtime_state.DhcpLease = undefined;
 
     while (true) {
-        // Throttle: at most one save attempt per second.
+        // 限流：每秒至多一次保存尝试。
         std.Io.sleep(io, .fromSeconds(1), .awake) catch {};
 
         if (flush_stop.load(.acquire)) {
-            // Final flush: the DHCP worker has already stopped, so no new
-            // mutations can occur.  Save unconditionally if there are unsaved
-            // changes.  If the final save fails, log the error and exit without
-            // faking success or blocking the orderly shutdown indefinitely.
+            // 最终 flush：DHCP worker 已停止，不会再有新 mutation。若有未保存
+            // 变更则无条件保存。若最终保存失败则记录错误并退出，既不伪造成功也不
+            // 无限阻塞有序关闭。
             const gen = dhcp.snapshotWithGeneration(&leases);
             if (gen > saved_generation) {
                 dhcp_store.save(io, allocator, leases_path, &leases, now(), boot_session.monotonicNow()) catch |err| {
@@ -393,13 +391,12 @@ fn runCheckpoint(
             return;
         }
 
-        // Normal checkpoint: save only if the generation advanced.
+        // 普通检查点：仅当 generation 前进时才保存。
         const gen = dhcp.snapshotWithGeneration(&leases);
         if (gen > saved_generation) {
             dhcp_store.save(io, allocator, leases_path, &leases, now(), boot_session.monotonicNow()) catch |err| {
                 observe_log.err("dhcp: checkpoint save failed: {t}", .{err});
-                // Do not update saved_generation on failure; the unsaved
-                // changes remain pending for the next iteration.
+                // 失败时不更新 saved_generation；未保存变更留待下次迭代。
                 continue;
             };
             saved_generation = gen;

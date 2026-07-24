@@ -1103,7 +1103,7 @@ test "TFTP block number: expected_ack equals last sent block (window=2)" {
 //
 // 以下测试覆盖纯决策逻辑（不涉及 socket）：
 //   - retryAction：根据「是否末尾块 / 已重传次数 / 上限」决定 retransmit /
-//     optimistic_complete / fail
+//     optimistic_complete / fail（乐观完成 / 失败）
 //   - retryLimit：末尾块用更小的重传预算（≈7s）以尽快释放 worker
 //   - backoffSeconds：指数退避（每次翻倍，封顶 255）
 test "TFTP retry: retransmit while attempts below limit" {

@@ -157,10 +157,10 @@ fn resolveInstall(
         // - rd.neednet=1：强制 dracut 在 initramfs 阶段初始化网络
         // - inst.repo=<url>：Anaconda 从此 DNF repository URL 下载安装树
         // M4 会追加 `inst.ks=<answer_url>` 以实现无人值守 Kickstart 安装。
-        // `repository.base_url` is the DNF package root (for example
-        // `/artifacts/repositories/<source>/Minimal`).  Anaconda's `inst.repo` instead needs
-        // the media tree root so it can read `.treeinfo`, `images/install.img`
-        // and follow the treeinfo repository pointer itself.
+        // `repository.base_url` 是 DNF 包根（例如
+        // `/artifacts/repositories/<source>/Minimal`）。而 Anaconda 的 `inst.repo` 需要
+        // 介质树根，以便读取 `.treeinfo`、`images/install.img`
+        // 并自行跟随 treeinfo 仓库指针。
         var install_root_buf: [256]u8 = undefined;
         const install_root = std.fmt.bufPrint(&install_root_buf, "http://{s}:{d}/artifacts/repositories/{s}", .{ server_ip, http_port, source.name }) catch return null;
         const base = std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s} inst.ks=http://{s}:{d}/api/v1/nodes/{s}/install-config/kickstart", .{ install_root, server_ip, http_port, identity.node_id }) catch return null;
@@ -258,7 +258,7 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
     try std.testing.expectEqualStrings("install/rocky/initrd.img", target.initrd_path);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "ip=dhcp") != null);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.repo=http://192.168.27.128:18080/artifacts/repositories/rocky-9.7-iso") != null);
-    // M4 appends the authenticated node-specific Kickstart endpoint.
+    // M4 追加经认证的 node 专属 Kickstart 端点。
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "inst.ks=http://") != null);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "install-config/kickstart") != null);
     try std.testing.expect(std.mem.endsWith(u8, target.cmdline, " iommu=pt hugepages=4"));
@@ -286,8 +286,8 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     // 必须包含 url= 参数指向已发布的 ISO HTTP URL。
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "url=http://192.168.27.128:18080/artifacts/images/ubuntu-iso.iso") != null);
-    // Ubuntu live initramfs must explicitly select casper; otherwise it can
-    // fall back to scanning a missing local CD-ROM device.
+    // Ubuntu live initramfs 必须显式选择 casper；否则可能回退到扫描缺失的
+    // 本地 CD-ROM 设备。
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "boot=casper") != null);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "ds=nocloud-net\\;s=http://192.168.27.128:18080/api/v1/nodes/node-ubuntu/install-config/nocloud/") != null);
     try std.testing.expect(std.mem.indexOf(u8, target.cmdline, "cloud-config-url=/dev/null") != null);

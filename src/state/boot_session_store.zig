@@ -120,7 +120,7 @@ fn chmod(io: std.Io, allocator: std.mem.Allocator, mode: []const u8, path: []con
 ///
 /// 返回成功恢复的 session 数。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: *const model.AppConfig, catalog: *const model.Catalog, deployments: *deployment_control.Store, store: *boot_session.Store, utc_now: i64, mono_now: i64) !usize {
-    _ = config; // retained in the public signature for checkpoint schema compatibility
+    _ = config; // 为 checkpoint schema 兼容性而保留在公共签名中
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(bytes);
     const Header = struct { schema_version: u32 };

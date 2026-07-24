@@ -312,8 +312,8 @@ pub const EventsConfig = struct {
 /// 首期支持的处理器架构；生产优先 x86_64，开发验证优先 aarch64。
 ///
 /// 枚举标签与 RFC 4578 PXE 架构类型对应：
-/// - `x86_64` → PXE arch type 7 (x86_64 UEFI)
-/// - `aarch64` → PXE arch type 11 (aarch64 UEFI)
+/// - `x86_64` -> PXE 架构类型 7（x86_64 UEFI）
+/// - `aarch64` -> PXE 架构类型 11（aarch64 UEFI）
 pub const Arch = enum { x86_64, aarch64 };
 
 /// 发行版家族决定安装器和标准包管理器。

@@ -1,4 +1,4 @@
-//! # Canonical scalar property mutations
+//! # 规范标量属性变更
 //!
 //! 提供 `profile set <name> <key>=<value>` 和 `node set <id> <key>=<value>` 的
 //! 标量属性写入口。每个 mutation 执行 load-patch-validate-save 事务。

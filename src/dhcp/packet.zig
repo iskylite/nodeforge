@@ -139,15 +139,15 @@ pub fn parse(bytes: []const u8) ParseError!Packet {
                 if (len != 4) return error.InvalidOption;
                 p.server_identifier = readIp(value);
             },
-            60 => p.vendor_class = value, // Vendor Class Identifier
-            61 => p.client_identifier = value, // Client Identifier
+            60 => p.vendor_class = value, // Vendor Class Identifier（厂商类标识）
+            61 => p.client_identifier = value, // Client Identifier（客户端标识）
             93 => {
                 // Client System Architecture Type（option 93, RFC 4578）：2 字节
                 if (len < 2) return error.InvalidOption;
                 p.architecture = architecture(std.mem.readInt(u16, value[0..2], .big));
             },
-            97 => p.client_uuid = value, // Client UUID (option 97, RFC 4578)
-            82 => p.link_selection = parseRelay(value), // Relay Agent Information
+            97 => p.client_uuid = value, // Client UUID（option 97, RFC 4578）
+            82 => p.link_selection = parseRelay(value), // Relay Agent Information（中继代理信息）
             else => {},
         }
     }
@@ -231,40 +231,40 @@ pub fn encodeReply(buffer: []u8, request: *const Packet, reply: Reply) ![]const 
     writeIp(buffer[24..28], request.giaddr);
     // chaddr：复制客户端硬件地址
     @memcpy(buffer[28..44], &request.chaddr);
-    // magic cookie
+    // magic cookie（DHCP 魔数）
     @memcpy(buffer[236..240], &magic_cookie);
     var i: usize = 240;
-    // option 53: DHCP Message Type
+    // option 53：DHCP 消息类型
     try put(&i, buffer, 53, &.{@intFromEnum(reply.kind)});
     var ip: [4]u8 = undefined;
-    // option 1: Subnet Mask
+    // option 1：子网掩码
     writeIp(&ip, reply.subnet_mask);
     try put(&i, buffer, 1, &ip);
-    // option 3: Router (可选)
+    // option 3：路由器（可选）
     if (reply.router) |router| {
         writeIp(&ip, router);
         try put(&i, buffer, 3, &ip);
     }
-    // option 6: DNS Servers (可选，最多 8 个)
+    // option 6：DNS 服务器（可选，最多 8 个）
     if (reply.dns_len != 0) {
         var values: [32]u8 = undefined;
         const dns_slice = reply.dns[0..reply.dns_len];
         for (dns_slice, 0..) |dns, n| writeIp(values[n * 4 ..][0..4], dns);
         try put(&i, buffer, 6, values[0 .. @as(usize, reply.dns_len) * 4]);
     }
-    // option 51: IP Address Lease Time
+    // option 51：IP 地址租约时长
     var seconds: [4]u8 = undefined;
     std.mem.writeInt(u32, &seconds, reply.lease_seconds, .big);
     try put(&i, buffer, 51, &seconds);
-    // option 54: Server Identifier
+    // option 54：服务器标识
     writeIp(&ip, reply.server_ip);
     try put(&i, buffer, 54, &ip);
-    // option 67: Bootfile Name (可选)
+    // option 67：启动文件名（可选）
     if (reply.bootfile) |bootfile| {
         if (bootfile.len > 128) return error.BufferTooSmall;
         try put(&i, buffer, 67, bootfile);
     }
-    // option 255: End
+    // option 255：结束（End）
     if (i == buffer.len) return error.BufferTooSmall;
     buffer[i] = 255;
     return buffer[0 .. i + 1];

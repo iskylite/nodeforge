@@ -259,9 +259,9 @@ fn route(request: zap.Request) !void {
 
     observe_log.debug("http: request received {s} {s}", .{ method, path });
 
-    // M4.5 request contract: every non-empty JSON API body must declare its
-    // media type. Subiquity's curtin webhook is the single form-urlencoded
-    // exception mandated by the installer protocol.
+    // M4.5 请求契约：每个非空 JSON API body 必须声明其
+    // 媒体类型。Subiquity 的 curtin webhook 是安装器协议
+    // 规定的唯一 form-urlencoded 例外。
     if (request.body) |body| if (body.len != 0 and
         !std.mem.endsWith(u8, path, "/installer-hooks/subiquity") and
         (std.mem.startsWith(u8, path, "/api/v1/") and !jsonRequest(request)))
@@ -790,9 +790,9 @@ fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const 
     var duration_text: [20]u8 = undefined;
     // M4.3-06 §8.3：按请求路径前缀分类流量，写入审计事件。
     // M4.4: 静态制品路径从旧前缀切换到 /artifacts/** canonical URL。
-    //   repository -> /artifacts/repositories/**
-    //   image      -> /artifacts/images/**
-    //   boot       -> /artifacts/boot/**
+    //   repository -> /artifacts/repositories/**（仓库制品）
+    //   image      -> /artifacts/images/**（镜像制品）
+    //   boot       -> /artifacts/boot/**（启动制品）
     //   api        -> 管理端点、安装 install-config、事件上报等控制面请求
     const traffic_class: []const u8 = if (std.mem.startsWith(u8, path, "/artifacts/repositories/")) "repository" else if (std.mem.startsWith(u8, path, "/artifacts/images/")) "image" else if (std.mem.startsWith(u8, path, "/artifacts/boot/")) "boot" else "api";
     var fields: [11]events.Field = undefined;
@@ -900,7 +900,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
 
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    // M4.4 canonical URL: boot-config replaces config.
+    // M4.4 canonical URL：boot-config 取代 config。
     const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
     defer context.allocator.free(base);
     const config_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/boot-config", .{ base, node_id });
@@ -1040,9 +1040,9 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     const system = effective_plan.system;
     const bundle = if (install.post_install.bundle orelse install.bundle) |name| findProvisioningBundleIn(plan.provisioning_bundles, name) else null;
     var password_scope_buffer: [96]u8 = undefined;
-    // Salt scope must survive daemon restart. The session id is random and the
-    // captured model revision is immutable for this delivery; daemon instance
-    // identity would make the same checkpoint render different password hashes.
+    // salt scope 必须能经受 daemon 重启。session id 是随机的，且
+    // 捕获的模型 revision 对本次投递不可变；daemon 实例
+    // 身份会让同一 checkpoint 渲染出不同的 password 哈希。
     const password_scope = try std.fmt.bufPrint(&password_scope_buffer, "{s}:{d}", .{ session.boot_session_id[0..], session.model_revision });
     // APT 源 URL 解析：Ubuntu ISO 导入时始终创建 repository 条目
     //（即使 ISO 不含完整 APT metadata），因此 findRepository 应总能找到。
@@ -1611,11 +1611,11 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
         .media_type = value.media_type,
     };
     if (revisioned_content) context.catalog.publishContentAsset(context.io, context.config, asset) catch |err| return assetInputError(request, @errorName(err), meta) else context.catalog.addAsset(context.io, context.config, asset) catch |err| return assetInputError(request, @errorName(err), meta);
-    // Asset publication changes the catalog generation and therefore the
-    // projected AppConfig generation as well. Re-publish the pair under the
-    // already-held model gate; leaving only CatalogRuntime advanced lets the
-    // next profile/bundle mutation start from a stale paired snapshot and can
-    // overwrite the just-published asset on disk.
+    // 资产发布改变了 catalog 世代，因此也改变了
+    // 投影出的 AppConfig 世代。在已持有的 model gate 下重新发布该配对；
+    // 若仅推进 CatalogRuntime，则下一次 profile/bundle 变更会
+    // 从陈旧的配对快照开始，可能
+    // 覆盖刚发布到磁盘的资产。
     applyCatalogFromDisk(@constCast(context)) catch
         return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"asset persisted but paired model publication failed\"}}\n", meta);
     var location: [320]u8 = undefined;
@@ -2334,8 +2334,8 @@ fn catalogMigrationApply(request: zap.Request, context: *RouteContext, meta: Req
         observe_log.err("catalog migration transaction failed: {t}", .{err});
         return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.transaction_failed\",\"message\":\"migration transaction did not commit\"}}\n", meta);
     };
-    // All fallible snapshot allocation is complete before the durable commit.
-    // From here publication only swaps pointers while the model gate is held.
+    // 所有可失败的快照分配都在持久化提交前完成。
+    // 此后发布仅在持有 model gate 期间交换指针。
     context.configs.publishPrepared(prepared_config);
     context.catalog.lock();
     context.catalog.publishPreparedLocked(prepared_catalog);
@@ -2961,8 +2961,8 @@ fn applyCatalogFromDisk(context: *RouteContext) !void {
     defer parsed.deinit();
     const effective = model.projectCatalog(context.config.*, &parsed.value);
     try config_validate.validate(&effective, &parsed.value);
-    // Allocate both generations before publishing either one. The caller holds
-    // the model gate, so readers observe the old pair or the fully prepared pair.
+    // 在发布任一世代前先分配两个世代。调用方持有
+    // model gate，因此读者看到的是旧配对或完整准备好的配对。
     const config_next = try context.configs.prepare(effective, context.config_revision);
     errdefer config_next.release();
     const catalog_revision = if (parsed.value.revision == 0) context.catalog_snapshot.revision + 1 else parsed.value.revision;
@@ -4508,9 +4508,9 @@ fn tftpSessions(request: zap.Request, runtime: *const runtime_state.RuntimeState
 fn dhcpLeases(request: zap.Request, allocator: std.mem.Allocator, runtime: *const runtime_state.RuntimeState, unknown_only: bool, meta: RequestMeta) !void {
     var leases: [runtime_state.DhcpState.max_leases]runtime_state.DhcpLease = undefined;
     @constCast(&runtime.dhcp).snapshot(&leases);
-    // Runtime lease deadlines use MONOTONIC, but `expires_at` is a public Unix
-    // timestamp. Sample both clocks once so every row in this response shares
-    // the same conversion basis.
+    // 运行时租约截止时间用 MONOTONIC，但 `expires_at` 是公共 Unix
+    // 时间戳。两个时钟各采样一次，使本响应的每一行共享
+    // 相同的换算基准。
     const realtime_now = unixNow();
     const monotonic_now = boot_session.monotonicNow();
     var output: std.Io.Writer.Allocating = .init(allocator);

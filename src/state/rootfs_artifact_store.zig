@@ -1,4 +1,4 @@
-//! # v0.2 rootfs artifact store
+//! # v0.2 rootfs 制品存储
 //!
 //! 持久化已构建 rootfs 制品记录，按 `rootfs_input_digest` 内容寻址。bootConfig
 //! v2 交付据此解析节点 diskless Profile 的 rootfs locator（url/sha512/size）。
@@ -135,7 +135,7 @@ test "register is idempotent and rejects digest drift" {
     try std.testing.expectEqual(RegisterResult.registered, try store.register(std.testing.io, a));
     try std.testing.expectEqual(RegisterResult.already_present, try store.register(std.testing.io, a));
     try std.testing.expect(store.find("d1") != null);
-    // digest drift rejected
+    // digest 漂移被拒绝
     const drifted = Artifact{ .rootfs_input_digest = "d1", .profile = "p", .content_sha512 = "cd", .compressed_size = 10, .uncompressed_size = 40, .kernel_release = "5.14.0", .file = "d1.squashfs", .created_at = 1 };
     try std.testing.expectError(error.RootfsDigestDrift, store.register(std.testing.io, drifted));
 }

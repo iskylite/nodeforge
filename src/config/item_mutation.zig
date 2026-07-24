@@ -1,4 +1,4 @@
-//! # Typed structured-item catalog mutations
+//! # 类型化结构化条目 catalog 变更
 //!
 //! 处理 partitions/users/routes 等结构化列表项的增删改查。
 //! 每个 item 使用 stable id 定位，支持 add/set/remove/move 四种操作。

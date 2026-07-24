@@ -177,9 +177,9 @@ pub fn success(writer: *std.Io.Writer, summary: []const u8, fields: []const Fiel
 /// 成功摘要的键值对字段。`label` 为人类可读标签，`value` 为预格式化字符串。
 pub const Field = struct { label: []const u8, value: []const u8 };
 
-/// M4.11: render mutable node facts as the exact `node set` key=value
-/// vocabulary. Optional absent values are described as unset instead of
-/// emitting an invalid assignment such as `ip=-`.
+/// M4.11：将可变节点事实渲染为精确的 `node set` key=value
+/// 词汇表。可选的缺失值描述为未设置，而非
+/// 输出无效赋值（例如 `ip=-`）。
 pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
     try writer.print("Node {s}\n", .{node.id});
     try writer.writeAll("\nSettable properties (nodeforge node set ");
@@ -268,9 +268,9 @@ pub const StatusView = struct {
     tftp_failed: u64,
 };
 
-/// Render the single M4.11 operational-readiness view. Every required plane is
-/// explicit so a green summary means nodeforged can actually serve provisioning
-/// traffic, not merely that one HTTP route answered.
+/// 渲染单一的 M4.11 运行就绪视图。每个必需平面都
+/// 显式列出，因此绿色摘要意味着 nodeforged 确实能对外提供
+/// 置备流量，而非仅某个 HTTP 路由能应答。
 pub fn status(writer: *std.Io.Writer, value: StatusView) !void {
     try writer.writeAll("NodeForge status\n");
     try statusField(writer, "Overall", if (value.ok) "OK nodeforged operational" else "FAIL nodeforged unavailable");
@@ -304,9 +304,9 @@ pub fn formatTimestamp(buffer: *[20]u8, epoch: i64) []const u8 {
 
 /// 所有详情/状态块的 label 统一缩进和对齐宽度。使用 display-width-aware 填充，
 /// 确保包含 CJK 字符的 label 也能正确对齐。
-// 16 columns covers the longest human-readable detail labels (for example
-// "Network override" and "Prefix length") while keeping every key/value
-// block aligned across commands.
+// 16 列可容纳最长的人可读详情标签（例如
+// "Network override" 和 "Prefix length"），同时保持每个 key/value
+// 块在各命令间对齐。
 const label_width: usize = 16;
 
 /// 写入 label 并用空格填充到 `label_width`，末尾留一个分隔空格。

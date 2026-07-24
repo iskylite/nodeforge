@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var args_iter = init.minimal.args.iterate();
-    _ = args_iter.next(); // argv[0]
+    _ = args_iter.next(); // argv[0]（跳过程序名）
     const arg1 = args_iter.next();
     const pre_init = arg1 != null and std.mem.eql(u8, arg1.?, "--pre-init");
     if (pre_init) {

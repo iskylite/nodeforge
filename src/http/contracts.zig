@@ -27,8 +27,8 @@ pub const authorization_header = "authorization";
 /// session ID 传输 header 名称。
 pub const session_header = "x-nodeforge-session";
 
-/// M4.5 stable management envelopes. Resource payloads remain endpoint
-/// specific; these common shapes are pinned by golden fixtures.
+/// M4.5 稳定的管理端信封。资源载荷仍是端点
+/// 特定的；这些公共形态由 golden fixture 固定。
 pub fn Success(comptime T: type) type {
     return struct { ok: bool, result: T };
 }

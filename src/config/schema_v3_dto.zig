@@ -1,6 +1,6 @@
-//! Strict startup configuration DTO for schema 3 and 4. The persisted config
-//! shape is identical for both versions; only the schema_version stamp differs
-//! (v4 carries the diskless catalog, which lives in the catalog directory).
+//! schema 3 和 4 的严格启动配置 DTO。持久化的配置
+//! 形态两版一致；只有 schema_version 标记不同
+//! （v4 携带 diskless catalog，位于 catalog 目录中）。
 const std = @import("std");
 const model = @import("../model.zig");
 

@@ -1,4 +1,4 @@
-//! # Reproducible M4.3 catalog migration planning
+//! # 可复现的 M4.3 catalog 迁移规划
 //!
 //! 生成可复现的 catalog 迁移计划：检测需要重命名的实体和迁移阻碍。
 //! 计划的 canonical JSON 和 SHA-256 摘要用于乐观并发控制和审计追溯。
@@ -77,8 +77,8 @@ pub const Candidates = struct {
     }
 };
 
-/// Materialize fully-owned typed candidates. Every relationship is updated
-/// explicitly; no global text replacement is used.
+/// 物化完全持有的类型化候选。每个关系都显式更新，
+/// 不使用全局文本替换。
 pub fn candidates(allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *const model.Catalog, plan: *const Plan) !Candidates {
     if (!plan.applicable()) return error.MigrationBlocked;
     const config_json = try std.json.Stringify.valueAlloc(allocator, config.*, .{});

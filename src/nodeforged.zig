@@ -189,8 +189,8 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         .err => .err,
     });
 
-    // Only the discovered default model is auto-migrated. Explicit overrides
-    // are diagnostic inputs and must never be rewritten as a side effect.
+    // 仅对发现的默认模型进行自动迁移。显式覆盖
+    // 是诊断输入，绝不能作为副作用被改写。
     if (parsed.value.schema_version == 1 and
         std.mem.eql(u8, config_path, nodeforge.paths.require().config_path) and
         std.mem.eql(u8, catalog_path, nodeforge.paths.require().catalog_dir))
@@ -204,8 +204,8 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
 
     var parsed_catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path) catch |err| switch (err) {
         error.FileNotFound => blk: {
-            // A missing manifest is only initialized for the discovered catalog
-            // directory. Explicit legacy `.json` diagnostics remain read-only.
+            // 缺失的 manifest 仅对发现的 catalog 目录进行初始化。
+            // 显式旧版 `.json` 诊断保持只读。
             if (std.mem.endsWith(u8, catalog_path, ".json")) {
                 const initial = nodeforge.catalog_store.empty();
                 try nodeforge.catalog_store.save(ctx.io, ctx.allocator, catalog_path, &initial);
@@ -222,9 +222,9 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed_catalog.deinit();
     const stored_catalog = &parsed_catalog.value;
-    // schema 1 inputs retain managed entities in config. They are projected
-    // into an in-memory Catalog for validation; setup/migration publishes the
-    // durable manifest layout before production startup.
+    // schema 1 输入在 config 中保留受管实体。它们被投影
+    // 到内存中的 Catalog 用于校验；setup/migration 在生产启动前
+    // 发布持久的 manifest 布局。
     var catalog_value = stored_catalog.*;
     if (catalog_value.distros.len == 0) catalog_value.distros = parsed.value.distros;
     if (catalog_value.profiles.len == 0) catalog_value.profiles = parsed.value.profiles;

@@ -1,4 +1,4 @@
-//! # v0.2 diskless scoped capability tokens
+//! # v0.2 无盘作用域能力令牌
 //!
 //! `V0_2_DESIGN.md` §2.3 / `V0_2_IMPL_DETAILS.md` §1.5 的分域、有界、一次性能力 token。
 //! raw token 只驻内存且不落盘；服务端只持 [`hashOf`]（HMAC-SHA256）与对应的 [`Claim`]。
@@ -108,7 +108,7 @@ fn contains(values: []const []const u8, needle: []const u8) bool {
 test "valid token with matching claim verifies ok" {
     const claim: Claim = .{ .scope = .rootfs_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .content_digest = "c", .path_allowlist = &.{"rootfs.squashfs"}, .expires_mono = 100 };
     const secret = "server-secret";
-    const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"; // 64 hex
+    const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"; // 64 位十六进制
     const stored = hashOf(raw, secret);
     try std.testing.expectEqual(Decision.ok, verify(raw, secret, &stored, &claim, .rootfs_read, "n1", "rootfs.squashfs", "c", 0, 50));
 }
@@ -116,7 +116,7 @@ test "valid token with matching claim verifies ok" {
 test "invalid token does not match stored hash" {
     const claim: Claim = .{ .scope = .config_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .expires_mono = 100 };
     const stored = hashOf("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", "s");
-    // wrong raw token -> hash mismatch -> invalid_token (no victim)
+    // 错误的 raw token -> hash 不匹配 -> invalid_token（无受害方）
     const wrong = "0000000000000000000000000000000000000000000000000000000000000000";
     try std.testing.expectEqual(Decision.invalid_token, verify(wrong, "s", &stored, &claim, .config_read, "n1", "", "", 0, 50));
 }
@@ -132,9 +132,9 @@ test "scope mismatch and cross-node rootfs access are rejected" {
     const claim: Claim = .{ .scope = .rootfs_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .content_digest = "c", .path_allowlist = &.{"rootfs.squashfs"}, .expires_mono = 100 };
     const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
     const stored = hashOf(raw, "s");
-    // config token reused for rootfs scope
+    // config token 被复用于 rootfs scope
     try std.testing.expectEqual(Decision.scope_mismatch, verify(raw, "s", &stored, &claim, .config_read, "n1", "rootfs.squashfs", "c", 0, 50));
-    // rootfs accessed for a different node
+    // rootfs 被不同节点访问
     try std.testing.expectEqual(Decision.node_mismatch, verify(raw, "s", &stored, &claim, .rootfs_read, "n2", "rootfs.squashfs", "c", 0, 50));
 }
 

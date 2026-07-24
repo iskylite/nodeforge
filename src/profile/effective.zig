@@ -1,4 +1,4 @@
-//! # Canonical effective-plan compiler
+//! # 规范生效计划编译器
 //!
 //! 将 Node + Profile + InstallSource + Catalog 合并为唯一可执行的部署计划。
 //! 校验器、plan digest 和安装器渲染器共享同一编译结果，确保三者看到一致的配置。

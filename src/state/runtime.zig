@@ -541,18 +541,18 @@ test "boot-gate suppressor tracks multiple nodes independently" {
     var suppressor: BootGateSuppressor = .{};
 
     try std.testing.expect(suppressor.shouldEmit("node-a", true, false));
-    // node-b is also not armed, but independent → emit
+    // node-b 同样未 armed，但相互独立 -> emit
     try std.testing.expect(suppressor.shouldEmit("node-b", true, false));
-    // node-a still not armed → suppress
+    // node-a 仍未 armed -> suppress
     try std.testing.expect(!suppressor.shouldEmit("node-a", true, false));
-    // node-b still not armed → suppress
+    // node-b 仍未 armed -> suppress
     try std.testing.expect(!suppressor.shouldEmit("node-b", true, false));
 }
 
 test "boot-gate suppressor fails closed for an oversized node id" {
     var suppressor: BootGateSuppressor = .{};
     try std.testing.expect(!suppressor.shouldEmit("n" ** 97, true, false));
-    // Invalid input must not consume or mutate the first real node's slot.
+    // 非法输入不得占用或修改首个真实节点的槽位。
     try std.testing.expect(suppressor.shouldEmit("node-a", true, false));
     try std.testing.expect(!suppressor.shouldEmit("node-a", true, false));
 }

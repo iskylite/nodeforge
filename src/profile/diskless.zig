@@ -1,4 +1,4 @@
-//! # Diskless effective-plan compiler (v0.2)
+//! # 无盘生效计划编译器（v0.2）
 //!
 //! 将 diskless Profile + Node + InstallSource + BootBundle + Catalog 编译为三个
 //! 投影和两个摘要，对应 `V0_2_IMPL_DETAILS.md` §3.1 的控制流根：
@@ -351,14 +351,14 @@ test "node override changes desired digest but not rootfs input digest" {
     var baseline = try compile(std.testing.allocator, &config, &catalog, &nodes[0]);
     defer baseline.deinit();
     const rootfs_before = baseline.rootfs_input_digest;
-    // Node-only change: hostname + software delta. Must NOT change rootfs input digest.
+    // 仅节点变更：hostname + software delta。不得改变 rootfs input digest。
     nodes[0].hostname = "node-a";
     nodes[0].overrides.software.packages_include = .{ .add = &.{"curl"} };
     var after = try compile(std.testing.allocator, &config, &catalog, &nodes[0]);
     defer after.deinit();
     try std.testing.expectEqualSlices(u8, &rootfs_before, &after.rootfs_input_digest);
     try std.testing.expect(!std.mem.eql(u8, &baseline.desired_plan_digest, &after.desired_plan_digest));
-    // Profile-fixed change: software baseline. Must change rootfs input digest.
+    // profile 固定项变更：software baseline。必须改变 rootfs input digest。
     profiles[0].software.packages.include = &.{ "vim", "tmux" };
     var rebuilt = try compile(std.testing.allocator, &config, &catalog, &nodes[0]);
     defer rebuilt.deinit();
@@ -408,7 +408,7 @@ test "rootfsBuildSteps returns pinned profile-fixed rootfs-build steps" {
     try std.testing.expect(build[0].content_url != null);
     try std.testing.expectEqualStrings("managed/motd/3", build[0].content_url.?);
     try std.testing.expectEqualStrings("abc", build[0].content_sha256.?);
-    // content_asset name preserved for builder staging.
+    // content_asset 名称保留，供 builder 暂存使用。
     try std.testing.expectEqualStrings("motd", build[0].content_asset.?);
 }
 

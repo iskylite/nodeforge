@@ -1,9 +1,8 @@
-//! M4.7 deployment initialization and offline reset primitives.
+//! M4.7 部署初始化与离线重置原语。
 //!
-//! CLI owns prompting/confirmation; this module owns path-bounded filesystem
-//! effects. All generated paths come from runtime `Paths`, configuration is
-//! validated before publication, and legacy config/catalog are backed up before
-//! the manifest becomes visible.
+//! CLI 负责提示/确认；本模块负责路径受限的文件系统副作用。所有生成的路径
+//! 来自运行时 `Paths`，配置在发布前校验，遗留 config/catalog 在 manifest 对外
+//! 可见前先备份。
 
 const std = @import("std");
 const paths_mod = @import("paths.zig");
@@ -66,9 +65,8 @@ pub fn repairDirectories(io: std.Io, allocator: std.mem.Allocator, p: *const pat
         try chmod(io, allocator, "700", directory);
 }
 
-/// Copy the same-bundle CLI/daemon pair atomically. The caller creates the
-/// marker only after both copies succeed, so interrupted installs never pass
-/// normal bootstrap validation.
+/// 原子地拷贝同 bundle 的 CLI/daemon 对。调用方在两次拷贝都成功后才创建
+/// marker，故中断的安装无法通过正常 bootstrap 校验。
 pub fn installBundle(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) !void {
     const executable = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(executable);
@@ -103,8 +101,8 @@ pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     try atomicWrite(io, p.service_path, unit);
 }
 
-/// Upgrade schema 1 in place. Backups and a marker remain if a later step
-/// fails; rerunning is idempotent because manifest commits are digest checked.
+/// 原地升级 schema 1。若后续步骤失败则备份与 marker 保留；因 manifest 提交
+/// 经 digest 校验，重跑幂等。
 pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) !bool {
     var parsed = try config_load.load(io, allocator, p.config_path);
     defer parsed.deinit();
@@ -112,10 +110,9 @@ pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
     defer allocator.free(marker);
     if (parsed.value.schema_version == 3) return false;
     if (parsed.value.schema_version == 2) {
-        // A crash after publishing config.json can leave a valid manifest beside
-        // legacy catalog.json. The migration marker is the proof that this mixed
-        // layout belongs to one known transaction; finish its cleanup instead of
-        // letting the normal catalog loader guess which generation is authoritative.
+        // 发布 config.json 后崩溃可能留下合法 manifest 与遗留 catalog.json 并存。
+        // migration marker 是该混合布局属于一个已知事务的证明；完成其清理，而不是
+        // 让普通 catalog 加载器猜测哪一代为权威。
         if (!regularFile(io, marker)) return false;
         const backup = try std.fmt.allocPrint(allocator, "{s}.m4.7.bak", .{p.legacy_catalog_path});
         defer allocator.free(backup);
@@ -178,8 +175,8 @@ pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
 ///
 /// 返回备份目录路径，由调用方展示给操作员。
 pub fn resetState(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) ![]u8 {
-    // Reset may archive completed evidence, but never deletes an unresolved
-    // catalog/model journal. Both coordinators must reach a proven generation.
+    // Reset 可归档已完成证据，但绝不删除未决的 catalog/model journal。两个
+    // coordinator 都必须到达已证实的 generation。
     if (exists(io, p.catalog_dir)) {
         var catalog = catalog_store.load(io, allocator, p.catalog_dir) catch |err| switch (err) {
             error.FileNotFound => null,

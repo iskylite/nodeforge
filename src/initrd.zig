@@ -131,6 +131,7 @@ pub fn main(init: std.process.Init) !void {
     return std.process.replace(io, .{ .argv = &.{ "switch_root", merged_mnt, "/sbin/nodeforge-agent", "--pre-init" } });
 }
 
+/// up 第一个非 lo 网卡并 DHCP（dracut 环境提供 `ip`/`dhclient`）。
 fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator) !void {
     // 找到第一个非 lo 的网卡并 up，再 DHCP。dracut 环境提供 ip/dhclient。
     try runIgnore(io, allocator, &.{ "ip", "link", "set", "lo", "up" });
@@ -138,6 +139,8 @@ fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator) !void {
     try runIgnore(io, allocator, &.{ "dhclient", "-v" });
 }
 
+/// 把 AgentPlan locator + agent/event token 写入新根 `/var/lib/nodeforge`（boot.json +
+/// 0400 credential 文件），交给 agent pre-init；切根后持久可读。
 fn writeHandoff(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfig, session: ?[]const u8, node: ?[]const u8, agent_token: []const u8, event_token: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, handoff_dir);
     try std.Io.Dir.cwd().createDirPath(io, event_token_dir);
@@ -156,19 +159,27 @@ fn writeHandoff(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfig,
     try mustRun(io, allocator, &.{ "chmod", "0400", event_token_path });
 }
 
+/// 服务端 BootConfig v2 解析结果（per-Node 短时 DTO）。字符串字段由 `parseBootConfig`
+/// dupe 到 arena 之外，必须经 `freeBootConfig` 释放。
 const BootConfig = struct {
     rootfs_url: []u8,
     rootfs_sha512: []u8,
     agent_plan_url: []u8,
     agent_plan_digest: []u8,
     event_url: []u8,
+    /// rootfs 字节大小，HEAD 与最终落盘大小都须与之精确相等。
     rootfs_size: u64,
+    /// tmpfs upper 占 MemAvailable 的百分比上限。
     tmpfs_percent: u8,
+    /// 内存闸保留的最小空闲字节（低于即 fail-closed，见 memory.upperLimit）。
     minimum_free_bytes: u64,
+    /// squashfs + upper + payload 之外再扣减的额外安全余量。
     safety_margin_bytes: u64,
+    /// Node 级 payload 预算（纳入 upper limit 扣减，防 first-boot 写爆 tmpfs）。
     node_payload_size: u64,
 };
 
+/// 从 BootConfig v2 JSON 解析 rootfs/overlay/agent_plan/event 定位与内存预算字段。
 fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
     const Parsed = struct {
         rootfs: struct { url: []const u8, sha512: []const u8, size: u64 },
@@ -197,6 +208,7 @@ fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
     };
 }
 
+/// 释放 `parseBootConfig` dupe 的字符串字段（URL/digest 等）。
 fn freeBootConfig(allocator: std.mem.Allocator, bc: *const BootConfig) void {
     allocator.free(bc.rootfs_url);
     allocator.free(bc.rootfs_sha512);
@@ -205,6 +217,8 @@ fn freeBootConfig(allocator: std.mem.Allocator, bc: *const BootConfig) void {
     allocator.free(bc.event_url);
 }
 
+/// 读取并校验 capsule 中的 capability token：必须为 64 位十六进制，校验通过后删除
+/// capsule 文件（单次消费，防重放）。任一校验失败即 fail-closed 返回错误。
 fn readToken(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const bytes = try readFile(io, allocator, path);
     defer allocator.free(bytes);
@@ -215,6 +229,8 @@ fn readToken(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return allocator.dupe(u8, token);
 }
 
+/// 向服务端 event_url 上报 lifecycle 事件（带 event_seq 与 expected_phase 做单调序校验）。
+/// best-effort：`main` 的 errdefer 用它上报 `diskless.failed`，网络失败不阻塞切根。
 fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, seq: u64, expected: []const u8, phase: []const u8) !void {
     const body = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"session_id\":\"{s}\",\"event_seq\":{d},\"expected_phase\":\"{s}\",\"phase\":\"{s}\"}}\n", .{ session, seq, expected, phase });
     defer allocator.free(body);
@@ -227,6 +243,8 @@ fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, toke
     try mustRun(io, allocator, &.{ "curl", "-fsS", "-H", auth, "-H", session_header, "-H", "Content-Type: application/json", "--data-binary", "@/tmp/nodeforge-event.json", url });
 }
 
+/// 用 `sha512sum` 子进程校验下载产物的整体哈希。逐块头合法不代表字节未损坏，
+/// 故下载完成后仍须整段校验（与逐块 Range 校验互为冗余闸）。
 fn verifySha512(io: std.Io, allocator: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
     const result = try std.process.run(allocator, io, .{ .argv = &.{ "sha512sum", path } });
     defer allocator.free(result.stdout);
@@ -240,16 +258,21 @@ fn verifySha512(io: std.Io, allocator: std.mem.Allocator, path: []const u8, expe
     if (!std.mem.eql(u8, digest, expected)) return error.HashMismatch;
 }
 
+/// 以 config token GET BootConfig JSON 并读入内存。
 fn curlGet(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: ?[]const u8) ![]u8 {
     const tmp = "/tmp/bootconfig.json";
     try curlToFile(io, allocator, url, token, session, tmp);
     return readFile(io, allocator, tmp);
 }
 
+/// 以对应 capability token 下载到指定路径（透传 `curlToFile`）。
 fn curlDownload(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: ?[]const u8, dest: []const u8) !void {
     try curlToFile(io, allocator, url, token, session, dest);
 }
 
+/// 严格 HEAD + 分块 Range 下载 rootfs（4 MiB/块）。支持断点续传（从 `.part` 已有
+/// 大小恢复）与有界重试（指数退避，最多 5 次）。逐块经 `download.validateRange`
+/// fail-closed 校验；全部块就绪后重命名为最终 blob，并清理临时文件。
 fn downloadRootfs(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfig, token: []const u8, session: []const u8) !void {
     const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
     defer allocator.free(auth);
@@ -300,6 +323,8 @@ fn downloadRootfs(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfi
     cwd.deleteFile(io, rootfs_headers) catch {};
 }
 
+/// 下载单块 Range：以 `If-Range` 绑定 HEAD 的 ETag，校验 206/Content-Range/ETag/
+/// Content-Length，并校验落盘块大小等于 `end-start+1`。
 fn rangeOnce(io: std.Io, allocator: std.mem.Allocator, url: []const u8, auth: []const u8, session_header: []const u8, etag: []const u8, start: u64, end: u64, total: u64) !void {
     const range_header = try std.fmt.allocPrint(allocator, "Range: bytes={d}-{d}", .{ start, end });
     defer allocator.free(range_header);
@@ -318,6 +343,7 @@ fn rangeOnce(io: std.Io, allocator: std.mem.Allocator, url: []const u8, auth: []
     if (stat.size != end - start + 1) return error.RootfsChunkSizeMismatch;
 }
 
+/// `curl` GET 到文件，注入 `Authorization` 与可选 `X-NodeForge-Session` 头。
 fn curlToFile(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: ?[]const u8, dest: []const u8) !void {
     const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
     defer allocator.free(auth);
@@ -330,6 +356,7 @@ fn curlToFile(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: 
     }
 }
 
+/// 解析 `/proc/cmdline` 中的 `nodeforge.*` 参数（config_url/node/session/kernel_args）。
 fn readCmdline(io: std.Io, allocator: std.mem.Allocator) !Cmdline {
     // /proc/cmdline 是 procfs 文件：用 `cat` 子进程读取（Io 流式读取对 procfs 不可靠）。
     const bytes = try captureRun(io, allocator, &.{ "cat", cmdline_path });
@@ -345,6 +372,7 @@ fn readCmdline(io: std.Io, allocator: std.mem.Allocator) !Cmdline {
     return c;
 }
 
+/// 释放 `readCmdline` dupe 的各参数字符串。
 fn freeCmdline(allocator: std.mem.Allocator, c: Cmdline) void {
     if (c.config_url) |s| allocator.free(s);
     if (c.node) |s| allocator.free(s);
@@ -352,6 +380,7 @@ fn freeCmdline(allocator: std.mem.Allocator, c: Cmdline) void {
     if (c.kernel_args) |s| allocator.free(s);
 }
 
+/// 运行子进程并返回 stdout；退出码非 0 即失败。
 fn captureRun(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     const result = try std.process.run(allocator, io, .{ .argv = argv });
     defer allocator.free(result.stderr);
@@ -362,10 +391,12 @@ fn captureRun(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8
     return result.stdout;
 }
 
+/// 读取文件到分配的缓冲（上限 8 MiB，用于 header/cmdline 等小文件）。
 fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(8 * 1024 * 1024));
 }
 
+/// 运行子进程，退出码非 0 即返回 `SubprocessFailed`（initrd 关键步骤不容忍失败）。
 fn mustRun(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const result = std.process.run(allocator, io, .{ .argv = argv }) catch return error.SubprocessFailed;
     defer allocator.free(result.stdout);
@@ -376,6 +407,7 @@ fn mustRun(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !
     }
 }
 
+/// 运行子进程但忽略其退出码（用于 best-effort 的网络 up 等幂等步骤）。
 fn runIgnore(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const result = std.process.run(allocator, io, .{ .argv = argv }) catch return;
     defer allocator.free(result.stdout);

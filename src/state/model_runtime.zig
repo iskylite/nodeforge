@@ -53,7 +53,7 @@ pub const ModelRuntime = struct {
     pub fn acquire(self: *ModelRuntime) Pair {
         self.lock();
         defer self.unlock();
-        // Fixed order: model gate -> ConfigRuntime reader -> CatalogRuntime reader.
+        // 固定顺序：model gate -> ConfigRuntime reader -> CatalogRuntime reader。
         return .{ .config = self.configs.acquire(), .catalog = self.catalogs.acquire() };
     }
 };

@@ -1,14 +1,13 @@
-//! Schema v4 migration: tagged `ProfileKind = install | diskless` plus the
-//! canonical `rootfs_build | first_boot` phase and `managed_file | archive |
-//! script | package` action set.
+//! Schema v4 迁移：带标签 `ProfileKind = install | diskless`，以及规范的
+//! `rootfs_build | first_boot` phase 与 `managed_file | archive | script | package`
+//! action 集合。
 //!
-//! v3 install Profiles wrap losslessly into `ProfileKind.install` without
-//! moving any frozen v0.1 owner. The forward plan only changes the Profile's
-//! outer discriminated shape (`kind` defaults to `.install` for v3 input) and
-//! stamps `schema_version = 4`. v0.2-only features (diskless kind, boot bundle,
-//! `rootfs_build`/`first_boot` phase, `archive`/`script`/`package` action,
-//! `runtime_kernel`/`archive`/`script` asset) are representable in v4 but not
-//! downgradable to v3: they surface as `migration.non_representable` blockers.
+//! v3 install Profile 无损包装为 `ProfileKind.install`，不移动任何冻结的 v0.1
+//! owner。前向计划只改变 Profile 的外层判别形状（v3 输入时 `kind` 默认为
+//! `.install`）并盖戳 `schema_version = 4`。v0.2 专有特性（diskless kind、boot
+//! bundle、`rootfs_build`/`first_boot` phase、`archive`/`script`/`package`
+//! action、`runtime_kernel`/`archive`/`script` asset）在 v4 可表示但不可降级到
+//! v3：以 `migration.non_representable` 阻断项暴露。
 const std = @import("std");
 const model = @import("../model.zig");
 const lookup = @import("../catalog.zig");
@@ -52,11 +51,10 @@ pub const Candidates = struct {
     }
 };
 
-/// Build a side-effect-free v3 -> v4 migration plan.
+/// 构建无副作用的 v3 -> v4 迁移计划。
 ///
-/// The plan is deterministic for a given (config, catalog, revisions) tuple;
-/// `applicable()` is true iff no blocker prevents wrapping every Profile into
-/// `ProfileKind.install`.
+/// 计划对给定 (config, catalog, revisions) 元组确定；当无阻断项阻止把每个
+/// Profile 包装为 `ProfileKind.install` 时 `applicable()` 为真。
 pub fn build(allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *const model.Catalog, config_revision: u64, catalog_revision: u64) !Plan {
     var affected_profiles: std.ArrayList([]const u8) = .empty;
     defer affected_profiles.deinit(allocator);
@@ -105,11 +103,11 @@ pub fn build(allocator: std.mem.Allocator, config: *const model.AppConfig, catal
     return .{ .allocator = allocator, .canonical_json = canonical_json, .digest = digest, .affected_profiles = profile_names, .affected_nodes = node_names, .blockers = blocker_values };
 }
 
-/// Materialize the migrated v4 model from an applicable plan.
+/// 从可应用的计划物化迁移后的 v4 模型。
 ///
-/// Deep-copies config/catalog via JSON so the caller owns the result. Every
-/// Profile is explicitly wrapped as `ProfileKind.install` (idempotent for v3
-/// input) and `schema_version` is stamped to 4. No frozen v0.1 owner is moved.
+/// 经 JSON 深拷贝 config/catalog，结果归调用方所有。每个 Profile 显式包装为
+/// `ProfileKind.install`（对 v3 输入幂等）并盖戳 `schema_version = 4`。不移动
+/// 任何冻结的 v0.1 owner。
 pub fn candidates(allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *const model.Catalog, plan: *const Plan) !Candidates {
     if (!plan.applicable()) return error.MigrationBlocked;
     const config_json = try std.json.Stringify.valueAlloc(allocator, config.*, .{});
@@ -137,13 +135,13 @@ fn migrateProfiles(allocator: std.mem.Allocator, catalog: *model.Catalog) !void 
     catalog.profiles = profiles;
 }
 
-/// v4 -> v3 representability preflight.
+/// v4 -> v3 可表示性预检。
 ///
-/// Returns blockers (code `migration.non_representable`) for any v0.2-only
-/// feature that cannot be expressed in schema v3: diskless Profile kind,
-/// `boot_bundle`, `rootfs_build`/`first_boot` phase, `archive`/`script`/
-/// `package` action, and `runtime_kernel`/`archive`/`script` asset kind. A
-/// clean forward-migrated v4 catalog yields zero blockers and may downgrade.
+/// 对任何无法用 schema v3 表达的 v0.2 专有特性返回阻断项（code
+/// `migration.non_representable`）：diskless Profile kind、`boot_bundle`、
+/// `rootfs_build`/`first_boot` phase、`archive`/`script`/`package` action，以及
+/// `runtime_kernel`/`archive`/`script` asset kind。干净的前向迁移 v4 catalog 产生
+/// 零阻断项，可降级。
 pub fn downgradeBlockers(allocator: std.mem.Allocator, catalog: *const model.Catalog) ![]const Blocker {
     var blockers: std.ArrayList(Blocker) = .empty;
     defer blockers.deinit(allocator);
@@ -224,7 +222,7 @@ test "v0.2-only features are non-representable on downgrade" {
     const catalog: model.Catalog = .{ .schema_version = 4, .profiles = &.{diskless}, .boot_bundles = &.{bundle}, .provisioning_bundles = &.{prov_bundle}, .assets = &.{asset} };
     const blockers = try downgradeBlockers(std.testing.allocator, &catalog);
     defer std.testing.allocator.free(blockers);
-    // diskless kind + boot_bundle (profile d) + rootfs_build phase + package action (pb) + runtime_kernel asset (rk)
+    // diskless kind + boot_bundle（profile d）+ rootfs_build 阶段 + package 动作（pb）+ runtime_kernel 资产（rk）
     try std.testing.expectEqual(@as(usize, 5), blockers.len);
     for (blockers) |b| try std.testing.expectEqualStrings("migration.non_representable", b.code);
 }

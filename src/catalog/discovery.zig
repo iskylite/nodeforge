@@ -1,4 +1,4 @@
-//! # Persistent unknown-client observation and atomic claim operations
+//! # 持久化未知客户端观察与原子认领操作
 //!
 //! 管理未知 DHCP 客户端的观察记录和原子认领操作。
 //! 认领将观察记录转换为 Node，使用乐观并发控制防止竞争。
@@ -70,7 +70,7 @@ pub fn claim(allocator: std.mem.Allocator, catalog: *model.Catalog, request: Cla
         };
     }
 
-    // Publish both arrays together to the caller's catalog transaction.
+    // 将两个数组一起发布到调用方的 catalog 事务中。
     catalog.nodes = nodes;
     catalog.unknown_client_observations = observations;
 }

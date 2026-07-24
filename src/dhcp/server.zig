@@ -248,8 +248,8 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
         }
         var reply = processWithDeployment(config, runtime, request, if (persistence) |p| p.deployments else null, digest) orelse return null;
         if (unknown_action == .record) {
-            // Unknown clients receive a diagnostic lease only. Catalog policy
-            // never permits the legacy startup discovery profile to leak a PXE bootfile.
+            // 未知客户端仅获得一个诊断性租约。catalog 策略
+            // 绝不允许旧版启动 discovery profile 泄漏 PXE bootfile。
             reply.bootfile = null;
             recordUnknownObservation(io, persistence, request, reply.yiaddr);
         }

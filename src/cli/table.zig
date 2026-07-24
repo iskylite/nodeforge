@@ -173,7 +173,7 @@ pub fn displayWidth(value: []const u8) usize {
 }
 
 fn codepointWidth(codepoint: u21) usize {
-    if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint < 0xa0)) return 4; // rendered as \xNN (4 visible chars)
+    if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint < 0xa0)) return 4; // 渲染为 \xNN（4 个可见字符）
     if ((codepoint >= 0x300 and codepoint <= 0x36f) or (codepoint >= 0x1ab0 and codepoint <= 0x1aff)) return 0;
     // NodeForge 中文操作界面使用的东亚宽/全角字符范围。
     if ((codepoint >= 0x1100 and codepoint <= 0x115f) or (codepoint >= 0x2e80 and codepoint <= 0xa4cf) or

@@ -1,4 +1,4 @@
-//! # v0.2 rootfs builder core
+//! # v0.2 rootfs 构建器核心
 //!
 //! `V0_2_DESIGN.md` §4.1/§4.4 与 `DISKLESS_FINAL.md` §4 的共享 rootfs 构建管线。
 //! rootfs 是由 Profile build projection 派生、按 `rootfs_input_digest` 缓存的只读

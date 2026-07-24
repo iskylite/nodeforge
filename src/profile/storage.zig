@@ -1,4 +1,4 @@
-//! # Adapter-independent schema v3 storage compiler
+//! # 适配器无关的 schema v3 存储编译器
 //!
 //! 将 Node 物理设备和 Profile 存储策略合并为有效的存储计划。
 //! 物理设备（boot_disk + additional_disks）从 Node 直接属性编译，

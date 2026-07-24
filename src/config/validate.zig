@@ -10,8 +10,8 @@ const asset_validate = @import("../assets/validate.zig");
 const profile_install = @import("../profile/install.zig");
 const capacity = @import("../state/capacity.zig");
 
-/// Node IDs are copied into several fixed-size runtime projections
-/// (`boot_session`, `deployment_control`, and `node_status`).
+/// 节点 ID 被复制到若干固定大小的运行时投影
+/// （`boot_session`、`deployment_control` 和 `node_status`）。
 pub const node_id_max_len = 96;
 
 /// 配置校验错误码。
@@ -323,8 +323,8 @@ pub fn validLogicalId(value: []const u8) bool {
     return !std.mem.eql(u8, value, ".") and !std.mem.eql(u8, value, "..");
 }
 
-/// Node IDs use the canonical logical-ID alphabet but have a smaller bound
-/// because they are retained in fixed-size hot-path and persisted state.
+/// 节点 ID 使用规范 logical-ID 字母表，但上界更小，
+/// 因为它们保留在固定大小的热路径和持久化状态中。
 /// 判断字符串是否为合法节点 ID：长度 ≤ 96，匹配 logical-id 规则。
 /// 长度上限来自固定大小运行态投影（boot_session/deployment_control/node_status）。
 pub fn validNodeId(value: []const u8) bool {

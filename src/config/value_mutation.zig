@@ -1,4 +1,4 @@
-//! # Registry-addressed scalar collection mutations
+//! # registry 寻址的标量集合变更
 //!
 //! 处理 `software.packages.include`、`system.connectivity.ntp_servers` 等
 //! 字符串集合的 add/remove/replace/clear 操作。与 item_mutation 不同，

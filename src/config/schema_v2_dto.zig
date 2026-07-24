@@ -1,4 +1,4 @@
-//! Read-only startup schema 1/2 DTO used to enter the schema-v3 migration.
+//! 只读启动 schema 1/2 DTO，用于进入 schema-v3 迁移。
 const std = @import("std");
 const model = @import("../model.zig");
 const catalog_v2 = @import("../catalog/schema_v2_dto.zig");

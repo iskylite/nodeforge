@@ -1,4 +1,4 @@
-//! Explicit read-only schema-v2 migration DTO.
+//! 显式只读 schema-v2 迁移 DTO。
 const std = @import("std");
 const model = @import("../model.zig");
 

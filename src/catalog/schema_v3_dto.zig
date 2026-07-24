@@ -1,5 +1,5 @@
-//! Strict persisted DTOs for catalog schema 3. Runtime compatibility fields
-//! are derived after parsing and never written back to the v3 fact source.
+//! catalog schema 3 的严格持久化 DTO。运行时兼容字段
+//! 在解析后派生，从不回写到 v3 事实源。
 const std = @import("std");
 const model = @import("../model.zig");
 
@@ -371,7 +371,7 @@ test "strict profile and node render omit legacy ownership keys" {
     defer std.testing.allocator.free(profiles);
     const nodes = try renderNodes(std.testing.allocator, &.{node});
     defer std.testing.allocator.free(nodes);
-    try std.testing.expect(std.mem.indexOf(u8, profiles, "\"mode\"") != null); // storage.mode remains canonical
+    try std.testing.expect(std.mem.indexOf(u8, profiles, "\"mode\"") != null); // storage.mode 保持为 canonical
     try std.testing.expect(std.mem.indexOf(u8, profiles, "\"distro\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, profiles, "install_disks") == null);
     try std.testing.expect(std.mem.indexOf(u8, nodes, "\"ip\"") == null);

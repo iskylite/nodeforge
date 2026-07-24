@@ -1,4 +1,4 @@
-//! # Canonical diskless BootSession state machine (v0.2)
+//! # 规范无盘 BootSession 状态机（v0.2）
 //!
 //! `V0_2_IMPL_DETAILS.md` §1.1 的 canonical 状态迁移与 §10 的 fail-closed 断言。
 //! reducer 是纯函数：输入当前 canonical phase 与目标 phase，按唯一有序迁移图判定，

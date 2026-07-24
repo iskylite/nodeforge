@@ -1,4 +1,4 @@
-//! # Repository software capability indexing
+//! # 仓库软件能力索引
 //!
 //! 从 dnf repodata 或 apt Packages 索引提取软件能力条目。
 //! 生成 `SoftwareIndex` 对象，包含能力列表和 SHA-256 revision digest。

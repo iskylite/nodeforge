@@ -5,10 +5,10 @@
 //! NodeForge 管控的目录中。
 //!
 //! 现行完整责任链：
-//! `CLI fstat → atomic staging copy → daemon constrained open/hash →
-//! readonly loop mount → family/layout validation + tuple detection/optional override →
-//! bootloader/kernel/initrd/repo staging → checksums → catalog candidate validation +
-//! atomic replacement → stage cleanup`
+//! `CLI fstat -> 原子暂存拷贝 -> daemon 受限 open/hash ->
+//! 只读 loop mount -> family/layout 校验 + tuple 探测/可选覆盖 ->
+//! bootloader/kernel/initrd/repo 暂存 -> checksums -> catalog 候选校验 +
+//! 原子替换 -> 暂存清理`
 //!
 //! catalog 是对 HTTP/TFTP 可见性的唯一提交点；任何未发布文件都不能经 resolver 访问。
 //! 导入不会实现后台 job：CLI 等待本地 daemon 的有界 worker 结果。
@@ -457,8 +457,8 @@ fn ubuntuRepositoryComplete(io: std.Io, allocator: std.mem.Allocator, mount_poin
     defer dists.close(io);
     var iterator = dists.iterate();
     while (try iterator.next(io)) |entry| {
-        // ISO9660 directory iteration is permitted to report `unknown` kind;
-        // the confined `Release` open below is the authoritative check.
+        // ISO9660 目录迭代允许报告 `unknown` 类型；
+        // 下方受限的 `Release` 打开操作才是权威校验。
         const release_relative = try std.fmt.allocPrint(allocator, "dists/{s}/Release", .{entry.name});
         defer allocator.free(release_relative);
         _ = assets.verifyRegularFile(io, mount_point, release_relative) catch continue;

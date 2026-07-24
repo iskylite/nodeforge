@@ -1,4 +1,4 @@
-//! # v0.2 diskless delivery DTOs
+//! # v0.2 diskless 投递 DTO
 //!
 //! `V0_2_DESIGN.md` §2.3 / §4.3 的 BootConfig v2 与 AgentPlan v1。两者均为独立
 //! 命名空间（`schema_version` 各自计数，见 `V0_2_IMPL_DETAILS.md` §5）。

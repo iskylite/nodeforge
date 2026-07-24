@@ -1,4 +1,4 @@
-//! # v0.2 diskless first-boot provision executor (Phase 8)
+//! # v0.2 无盘首启置备执行器（Phase 8）
 //!
 //! 切根+systemd 后由 `nodeforge-agent`（无参数，作为 systemd unit）调用。读取
 //! pre-init 持久化的 AgentPlan（`/var/lib/nodeforge/agent-plan.json`），按八步执行
@@ -199,7 +199,14 @@ fn sleepSeconds(io: std.Io, allocator: std.mem.Allocator, seconds: u32) void {
     allocator.free(result.stderr);
 }
 
-/// 渲染单个步骤为一条 `/bin/sh -c` 命令字符串。
+/// 渲染单个步骤为一条 `/bin/sh -c` 命令字符串。first-boot 与 rootfs-build 共用本函数：
+///   - `nogpgcheck`：rootfs-build 构建期为 true（本地 `file://` 源未签名，跳过 GPG）；
+///     first-boot 运行期为 false（强制 GPG 校验）。
+///   - `installroot`：非 null（rootfs-build）时为 dnf 注入 `--installroot=<staging>`，
+///     在 host 上下文安装到 staging，不进 chroot、不 bind-mount `/dev/proc/sys`，
+///     规避单 worker daemon 自死锁与 bind-mount 清理风险；first-boot 传 null（chroot 到真根）。
+///   - package 段以 `--disablerepo='*'` + `--repofrompath/--enablerepo` 把包安装
+///     限制到 nodeforged 受管源，禁止访问系统/自由源。
 pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?dto.FirstBootPackageManager, repository_urls: []const []const u8, nogpgcheck: bool, installroot: ?[]const u8) !void {
     switch (step.action) {
         .managed_file => {
@@ -231,13 +238,16 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
             switch (package_manager orelse return error.NoPackageManager) {
                 .dnf => {
                     try w.writeAll("dnf -y");
+                    // rootfs-build：在 host 上下文安装到 staging（--installroot），不进 chroot；first-boot 此处为 null。
                     if (installroot) |root| try w.print(" --installroot={s}", .{root});
+                    // 禁用系统所有源，只允许下面声明的 nodeforged 受管源（local-only 保真）。
                     try w.writeAll(" --disablerepo='*'");
                     for (repository_urls, 0..) |url, index| {
                         try w.print(" --repofrompath=nodeforge-{d},", .{index});
                         try writeQuoted(w, url);
                         try w.print(" --enablerepo=nodeforge-{d}", .{index});
                     }
+                    // 构建期本地 file:// 源未签名才跳过 GPG；运行期强制校验。
                     if (nogpgcheck) try w.writeAll(" --nogpgcheck");
                     try w.writeAll(" install");
                     for (step.packages) |pkg| {

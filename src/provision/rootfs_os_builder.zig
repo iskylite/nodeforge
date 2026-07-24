@@ -1,4 +1,4 @@
-//! # v0.2 rootfs OS-layer builder
+//! # v0.2 rootfs OS 层构建器
 //!
 //! `V0_2_DESIGN.md` §5.2 / `DISKLESS_FINAL.md` §4。rootfs 的 OS 层由发行版原生
 //! install-root 工具从 install source 受管 repository 构建到只读 lower：

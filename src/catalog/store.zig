@@ -68,9 +68,9 @@ pub fn loadLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !s
     const Header = struct { schema_version: u32 };
     const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer header.deinit();
-    // schema 4 stores the full model shape directly (preserves diskless kind,
-    // boot_bundle, rootfs_build/first_boot steps and runtime_kernel assets that
-    // the strict v3 DTO omits); schema 3 uses the strict v3 DTO; else legacy v2.
+    // schema 4 直接存储完整模型形态（保留 diskless kind、
+    // boot_bundle、rootfs_build/first_boot 步骤和 runtime_kernel 资产，
+    // 严格 v3 DTO 会省略这些）；schema 3 使用严格 v3 DTO；其余为旧版 v2。
     if (header.value.schema_version == 3) return schema_v3_dto.parse(allocator, bytes);
     if (header.value.schema_version == 4) return std.json.parseFromSlice(model.Catalog, allocator, bytes, .{ .allocate = .alloc_always });
     return schema_v2_dto.parse(allocator, bytes);
@@ -110,7 +110,7 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     var parsed_manifest = try std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{ .allocate = .alloc_always });
     defer parsed_manifest.deinit();
     const manifest = parsed_manifest.value;
-    // schema 3 and 4 persist the full 10-entity set; legacy v2 only 8.
+    // schema 3 和 4 持久化完整 10 实体集；旧版 v2 仅 8 个。
     const entity_names = if (manifest.catalog_schema_version >= 3) names[0..] else names[0..8];
     if (manifest.layout_schema_version != layout_schema_version or (manifest.catalog_schema_version < 2 or manifest.catalog_schema_version > 4) or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != entity_names.len)
         return error.InvalidCatalogManifest;
@@ -137,7 +137,7 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
         try combined.writer.writeAll(bytes);
     }
     try combined.writer.writeByte('}');
-    // schema 4 entities are direct model serialization; parse as model.Catalog.
+    // schema 4 实体为直接模型序列化；按 model.Catalog 解析。
     return if (manifest.catalog_schema_version == 3)
         schema_v3_dto.parse(allocator, combined.written())
     else if (manifest.catalog_schema_version == 4)
@@ -196,7 +196,7 @@ fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     contents[9] = try content(allocator, names[9], catalog.unknown_client_observations);
     initialized += 1;
 
-    // schema 3 and 4 persist all 10 entities; legacy v2 only 8.
+    // schema 3 和 4 持久化全部 10 个实体；旧版 v2 仅 8 个。
     const content_count: usize = if (catalog.schema_version >= 3) names.len else 8;
     const selected_contents = contents[0..content_count];
     var entities: [names.len]ManifestEntity = undefined;
@@ -417,9 +417,9 @@ test "manifest load rejects entity digest mismatch" {
 }
 
 test "v4 catalog round-trips diskless profile, boot bundle and rootfs_build step" {
-    // v4 uses direct model serialization, so diskless-only fields (kind=diskless,
-    // boot_bundle, rootfs_build phase, package action, runtime_kernel asset) must
-    // survive save/load exactly. A v3 DTO round-trip would silently drop them.
+    // v4 使用直接模型序列化，因此 diskless 专属字段（kind=diskless、
+    // boot_bundle、rootfs_build 阶段、package 动作、runtime_kernel 资产）必须
+    // 在 save/load 后完整保留。v3 DTO 往返会静默丢弃它们。
     var temp = std.testing.tmpDir(.{});
     defer temp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -441,7 +441,7 @@ test "v4 catalog round-trips diskless profile, boot bundle and rootfs_build step
     try std.testing.expectEqual(model.ProvisionPhase.rootfs_build, loaded.value.provisioning_bundles[0].steps[0].phase);
     try std.testing.expectEqual(model.ProvisionAction.@"package", loaded.value.provisioning_bundles[0].steps[0].action);
     try std.testing.expectEqual(model.AssetKind.runtime_kernel, loaded.value.assets[0].kind);
-    // idempotent re-save keeps the manifest stable at schema 4 with 10 entities.
+    // 幂等再次保存使 manifest 在 schema 4 下保持稳定（10 个实体）。
     try save(std.testing.io, std.testing.allocator, root, &loaded.value);
     var reloaded = try load(std.testing.io, std.testing.allocator, root);
     defer reloaded.deinit();
