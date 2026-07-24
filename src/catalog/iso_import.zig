@@ -654,10 +654,11 @@ fn canonicalBootloaderName(arch: model.Arch) []const u8 {
 }
 
 /// RHEL-family 与 Ubuntu Server ISO 通常都把 GRUB 放在 EFI/BOOT。
-/// 同时接受 ISO9660 上可能出现的全大写文件名。
+/// ISO9660 使用全大写路径；UDF（部分新版 Ubuntu）保留原始小写路径。
+/// 四种大小写组合全部覆盖，确保两种文件系统都能命中。
 fn findBootloaderMediaPath(io: std.Io, root: []const u8, arch: model.Arch) ?[]const u8 {
-    const aarch64 = [_][]const u8{ "EFI/BOOT/grubaa64.efi", "EFI/BOOT/GRUBAA64.EFI" };
-    const x86_64 = [_][]const u8{ "EFI/BOOT/grubx64.efi", "EFI/BOOT/GRUBX64.EFI" };
+    const aarch64 = [_][]const u8{ "EFI/BOOT/grubaa64.efi", "EFI/BOOT/GRUBAA64.EFI", "efi/boot/grubaa64.efi", "efi/boot/GRUBAA64.EFI" };
+    const x86_64 = [_][]const u8{ "EFI/BOOT/grubx64.efi", "EFI/BOOT/GRUBX64.EFI", "efi/boot/grubx64.efi", "efi/boot/GRUBX64.EFI" };
     const candidates: []const []const u8 = switch (arch) {
         .aarch64 => &aarch64,
         .x86_64 => &x86_64,
