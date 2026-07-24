@@ -79,6 +79,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(agent);
+    // Rootfs/image builder installs this unit together with nodeforge-agent.
+    // Keeping the unit in the product artifact avoids relying on host-specific
+    // validation scripts to reconstruct the first-boot runtime contract.
+    b.installFile("packaging/systemd/nodeforge-firstboot.service", "share/nodeforge/systemd/nodeforge-firstboot.service");
 
     const run_daemon = b.addRunArtifact(daemon);
     if (b.args) |args| run_daemon.addArgs(args);

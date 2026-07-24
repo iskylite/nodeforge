@@ -430,12 +430,18 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_rootfs_register);
     try addOutputFlag(profile_rootfs_register);
     try addDebugFlag(profile_rootfs_register);
+    const profile_rootfs_build = try zli.Command.init(init_options, .{ .name = "build", .description = "Build a content-addressed rootfs artifact for a diskless profile from its build projection", .usage = "nodeforge profile rootfs build <profile> [--if-input-digest <hex>] [options]" }, profileRootfsBuildHandler);
+    try profile_rootfs_build.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try profile_rootfs_build.addFlag(.{ .name = "if-input-digest", .description = "Only build if the current rootfs input digest matches (anti-drift)", .type = .String, .default_value = .{ .String = "" } });
+    try addConfigPathFlag(profile_rootfs_build);
+    try addOutputFlag(profile_rootfs_build);
+    try addDebugFlag(profile_rootfs_build);
     const profile_rootfs_status = try zli.Command.init(init_options, .{ .name = "status", .description = "Show the registered rootfs artifact for a diskless profile", .usage = "nodeforge profile rootfs status <profile> [options]" }, profileRootfsStatusHandler);
     try profile_rootfs_status.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
     try addConfigPathFlag(profile_rootfs_status);
     try addOutputFlag(profile_rootfs_status);
     try addDebugFlag(profile_rootfs_status);
-    try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_register, profile_rootfs_status });
+    try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_build, profile_rootfs_register, profile_rootfs_status });
     try profile.addCommands(&.{ profile_create, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
     try addValuesCommands(profile, init_options, "profile");
     try addItemCommands(profile, init_options, "profile");
@@ -472,6 +478,14 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(managed_file_remove);
     try addDebugFlag(managed_file_remove);
     try managed_file.addCommands(&.{ managed_file_list, managed_file_show, managed_file_import, managed_file_remove });
+    const archive = try zli.Command.init(init_options, .{ .name = "archive", .description = "Manage immutable archive assets" }, showCurrentHelp);
+    const archive_import = try zli.Command.init(init_options, .{ .name = "import", .description = "Atomically import an archive revision" }, archiveImportHandler);
+    try addContentAssetImportArgs(archive_import, "Archive");
+    try archive.addCommands(&.{archive_import});
+    const script = try zli.Command.init(init_options, .{ .name = "script", .description = "Manage immutable script assets" }, showCurrentHelp);
+    const script_import = try zli.Command.init(init_options, .{ .name = "import", .description = "Atomically import a script revision" }, scriptImportHandler);
+    try addContentAssetImportArgs(script_import, "Script");
+    try script.addCommands(&.{script_import});
     try assets.addCommands(&.{
         try installSourceImportCommand(init_options),
         try assetListCommand(init_options),
@@ -483,6 +497,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         try assetKeyShowCommand(init_options),
         try assetKeyListCommand(init_options),
         managed_file,
+        archive,
+        script,
     });
     try addProvisionBundleCommands(assets, init_options);
     try addAssetCatalogCommands(assets, init_options);
@@ -600,6 +616,16 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         setup,
     });
     return root;
+}
+
+fn addContentAssetImportArgs(command: *zli.Command, label: []const u8) !void {
+    try command.addPositionalArg(.{ .name = "name", .description = label, .required = true });
+    try command.addFlag(.{ .name = "from-file", .description = "Source file path", .type = .String, .default_value = .{ .String = "" } });
+    try command.addFlag(.{ .name = "media-type", .description = "IANA media type", .type = .String, .default_value = .{ .String = "application/octet-stream" } });
+    try addConfigPathFlag(command);
+    try addCatalogPathFlag(command);
+    try addOutputFlag(command);
+    try addDebugFlag(command);
 }
 
 fn addNodeSoftwareCommands(node: *zli.Command, init_options: zli.InitOptions) !void {
@@ -2390,6 +2416,18 @@ fn managedFileShowHandler(ctx: zli.CommandContext) !void {
 }
 
 fn managedFileImportHandler(ctx: zli.CommandContext) !void {
+    return contentAssetImportHandler(ctx, .managed_file, 16 * 1024 * 1024);
+}
+
+fn archiveImportHandler(ctx: zli.CommandContext) !void {
+    return contentAssetImportHandler(ctx, .archive, 256 * 1024 * 1024);
+}
+
+fn scriptImportHandler(ctx: zli.CommandContext) !void {
+    return contentAssetImportHandler(ctx, .script, 16 * 1024 * 1024);
+}
+
+fn contentAssetImportHandler(ctx: zli.CommandContext, kind: nodeforge.model.AssetKind, max_size: u64) !void {
     _ = outputFromContext(ctx) orelse return;
     const name = ctx.getArg("name") orelse return;
     const source = ctx.flag("from-file", []const u8);
@@ -2407,22 +2445,33 @@ fn managedFileImportHandler(ctx: zli.CommandContext) !void {
     defer catalog.deinit();
     var revision: u64 = 1;
     for (catalog.value().assets) |asset| if (std.mem.eql(u8, asset.name, name)) {
-        if (asset.kind != .managed_file) return itemUsageError(ctx, "name belongs to a different asset kind");
+        if (asset.kind != kind) return itemUsageError(ctx, "name belongs to a different asset kind");
         revision = asset.revision + 1;
     };
     var input = std.Io.Dir.cwd().openFile(ctx.io, source, .{ .follow_symlinks = false }) catch return itemUsageError(ctx, "managed-file source is unreadable");
     defer input.close(ctx.io);
     const stat = input.stat(ctx.io) catch return itemUsageError(ctx, "managed-file source cannot be inspected");
-    if (stat.kind != .file or stat.size > 16 * 1024 * 1024) return itemUsageError(ctx, "managed-file source must be a regular file up to 16 MiB");
-    const relative = try std.fmt.allocPrint(ctx.allocator, "managed-files/{s}/{d}", .{ name, revision });
+    if (stat.kind != .file or stat.size > max_size) return itemUsageError(ctx, "content asset source is not a regular file or exceeds its size limit");
+    const directory: []const u8 = switch (kind) {
+        .managed_file => "managed-files",
+        .archive => "archives",
+        .script => "scripts",
+        else => unreachable,
+    };
+    const relative = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}/{d}", .{ directory, name, revision });
     defer ctx.allocator.free(relative);
-    const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ nodeforge.paths.require().assets_dir, relative });
+    // `--config` may target an alternate install root (tests, recovery, side-by-side
+    // administration). Use the loaded config's canonical HTTP asset root instead of
+    // the CLI process-global default paths, otherwise bytes are copied under /opt
+    // while the selected daemon validates a different root.
+    const assets_root = std.fs.path.dirname(config.value.http.asset_root) orelse return itemUsageError(ctx, "configured HTTP asset root has no assets parent");
+    const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ assets_root, relative });
     defer ctx.allocator.free(destination);
     try std.Io.Dir.cwd().createDirPath(ctx.io, std.fs.path.dirname(destination) orelse return error.InvalidPath);
     std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, ctx.io, .{ .permissions = .default_file, .replace = false }) catch return itemUsageError(ctx, "managed-file immutable revision already exists");
     var published = false;
     defer if (!published) std.Io.Dir.cwd().deleteFile(ctx.io, destination) catch {};
-    const ok = nodeforge.management_client.importAsset(ctx.io, config.value.server.http_port, .{ .name = name, .kind = "managed_file", .path = relative, .revision = revision, .size = stat.size, .media_type = media_type }) catch false;
+    const ok = nodeforge.management_client.importAsset(ctx.io, config.value.server.http_port, .{ .name = name, .kind = @tagName(kind), .path = relative, .revision = revision, .size = stat.size, .media_type = media_type }) catch false;
     if (!ok) {
         try writeCommandError(ctx, "managed-file.publish_failed", "managed-file publication failed", 1);
         return;
@@ -2552,6 +2601,8 @@ fn provisionBundleItemHandler(ctx: zli.CommandContext) !void {
         return;
     }
     var patch: nodeforge.provision_bundle_mutation.Patch = .{ .operation = if (std.mem.eql(u8, command, "add")) .add else if (std.mem.eql(u8, command, "set")) .set else if (std.mem.eql(u8, command, "remove")) .remove else .move, .identity = if (std.mem.eql(u8, command, "add")) "" else ctx.positional_args[2] };
+    var package_values: std.ArrayList([]const u8) = .empty;
+    defer package_values.deinit(ctx.allocator);
     if (patch.operation == .move) {
         const before = ctx.flag("before", []const u8);
         const after = ctx.flag("after", []const u8);
@@ -2572,7 +2623,14 @@ fn provisionBundleItemHandler(ctx: zli.CommandContext) !void {
         const equal = std.mem.indexOfScalar(u8, assignment, '=') orelse return itemUsageError(ctx, "step fields require field=value");
         const field = assignment[0..equal];
         const value = assignment[equal + 1 ..];
-        if (std.mem.eql(u8, field, "name")) patch.name = value else if (std.mem.eql(u8, field, "action")) patch.action = value else if (std.mem.eql(u8, field, "destination")) patch.destination = value else if (std.mem.eql(u8, field, "content_asset")) patch.content_asset = value else if (std.mem.eql(u8, field, "mode")) patch.mode = std.fmt.parseInt(u16, std.mem.trimStart(u8, value, "0o"), 8) catch return itemUsageError(ctx, "mode must be octal") else if (std.mem.eql(u8, field, "owner")) patch.owner = value else if (std.mem.eql(u8, field, "group")) patch.group = value else return itemUsageError(ctx, "unknown managed-file step field");
+        if (std.mem.eql(u8, field, "name")) patch.name = value else if (std.mem.eql(u8, field, "action")) patch.action = value else if (std.mem.eql(u8, field, "phase")) patch.phase = value else if (std.mem.eql(u8, field, "idempotency_key")) patch.idempotency_key = value else if (std.mem.eql(u8, field, "timeout_s")) patch.timeout_s = std.fmt.parseInt(u32, value, 10) catch return itemUsageError(ctx, "timeout_s must be an integer") else if (std.mem.eql(u8, field, "retryable")) patch.retryable = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return itemUsageError(ctx, "retryable must be true or false") else if (std.mem.eql(u8, field, "packages")) {
+            var parts = std.mem.splitScalar(u8, value, ',');
+            while (parts.next()) |package| {
+                if (package.len == 0) return itemUsageError(ctx, "packages must be a non-empty comma-separated list");
+                try package_values.append(ctx.allocator, package);
+            }
+            patch.packages = package_values.items;
+        } else if (std.mem.eql(u8, field, "destination")) patch.destination = value else if (std.mem.eql(u8, field, "content_asset")) patch.content_asset = value else if (std.mem.eql(u8, field, "mode")) patch.mode = std.fmt.parseInt(u16, std.mem.trimStart(u8, value, "0o"), 8) catch return itemUsageError(ctx, "mode must be octal") else if (std.mem.eql(u8, field, "owner")) patch.owner = value else if (std.mem.eql(u8, field, "group")) patch.group = value else return itemUsageError(ctx, "unknown provision step field");
     };
     if (patch.operation == .add) patch.identity = patch.name orelse return itemUsageError(ctx, "step add requires name");
     const body = try std.json.Stringify.valueAlloc(ctx.allocator, patch, .{ .emit_null_optional_fields = false });
@@ -3431,6 +3489,41 @@ fn profileRootfsPlanHandler(ctx: zli.CommandContext) !void {
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
 }
 
+fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    const if_input_digest_raw = ctx.flag("if-input-digest", []const u8);
+    const if_input_digest: ?[]const u8 = if (if_input_digest_raw.len == 0) null else if_input_digest_raw;
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.rootfsBuild(ctx.io, config.value.server.http_port, name, if_input_digest, &reason);
+    if (!result.healthy) {
+        try reportMutationFailure(ctx, result, "rootfs build failed: daemon unreachable");
+        return;
+    }
+    var response: [64 * 1024]u8 = undefined;
+    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, &response) catch null;
+    if (body == null) {
+        const human = try std.fmt.allocPrint(ctx.allocator, "rootfs built for profile {s}", .{name});
+        try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = "{}" });
+        return;
+    }
+    const Resp = struct { ok: bool, result: struct { profile: []const u8, rootfs_input_digest: []const u8, state: []const u8, content_sha512: ?[]const u8 = null, compressed_bytes: ?u64 = null, kernel_release: ?[]const u8 = null, file: ?[]const u8 = null } };
+    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
+        try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
+        return;
+    };
+    defer parsed.deinit();
+    const r = parsed.value.result;
+    const human = try std.fmt.allocPrint(ctx.allocator, "profile: {s}\nrootfs_input_digest: {s}\nstate: {s}\ncontent_sha512: {s}\ncompressed_bytes: {d}\nkernel_release: {s}\nfile: {s}", .{ r.profile, r.rootfs_input_digest, r.state, r.content_sha512 orelse "-", r.compressed_bytes orelse 0, r.kernel_release orelse "-", r.file orelse "-" });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+}
+
 fn profileRootfsRegisterHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
@@ -3680,7 +3773,7 @@ fn nodeBootPrepareHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "diskless.unavailable", msg, 1);
         return;
     }
-    const Resp = struct { ok: bool, result: struct { node_id: []const u8, session_id: []const u8, config_token: []const u8, config_url: []const u8, agent_plan_digest: []const u8, rootfs_input_digest: []const u8 } };
+    const Resp = struct { ok: bool, result: struct { node_id: []const u8, session_id: []const u8, config_token: []const u8, rootfs_token: []const u8, agent_token: []const u8, event_token: []const u8, config_url: []const u8, agent_plan_digest: []const u8, rootfs_input_digest: []const u8 } };
     const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
         const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
         try writeCommandError(ctx, "diskless.invalid_response", message, 1);
@@ -3688,7 +3781,7 @@ fn nodeBootPrepareHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     const r = parsed.value.result;
-    const human = try std.fmt.allocPrint(ctx.allocator, "node: {s}\nsession_id: {s}\nconfig_token: {s}\nconfig_url: {s}\nagent_plan_digest: {s}\nrootfs_input_digest: {s}", .{ r.node_id, r.session_id, r.config_token, r.config_url, r.agent_plan_digest, r.rootfs_input_digest });
+    const human = try std.fmt.allocPrint(ctx.allocator, "node: {s}\nsession_id: {s}\nconfig_token: {s}\nrootfs_token: {s}\nagent_token: {s}\nevent_token: {s}\nconfig_url: {s}\nagent_plan_digest: {s}\nrootfs_input_digest: {s}", .{ r.node_id, r.session_id, r.config_token, r.rootfs_token, r.agent_token, r.event_token, r.config_url, r.agent_plan_digest, r.rootfs_input_digest });
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
 }
 

@@ -97,6 +97,8 @@ pub const properties = [_]PropertySpec{
     .{ .owner = .node, .path = "overrides.install.proxy.url", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "overrides.install.reinstall_policy", .kind = .enumeration, .optional = true },
     .{ .owner = .node, .path = "overrides.install.post_install.bundle", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "overrides.diskless.overlay.tmpfs_percent", .kind = .positive_integer, .optional = true },
+    .{ .owner = .node, .path = "overrides.diskless.provision.bundle", .kind = .string, .optional = true },
     .{ .owner = .profile, .path = "install_source", .kind = .string },
     .{ .owner = .profile, .path = "install.storage.mode", .kind = .enumeration },
     .{ .owner = .profile, .path = "install.storage.wipe", .kind = .boolean },
@@ -120,6 +122,12 @@ pub const properties = [_]PropertySpec{
     .{ .owner = .profile, .path = "install.proxy.url", .kind = .string, .optional = true },
     .{ .owner = .profile, .path = "install.reinstall_policy", .kind = .enumeration },
     .{ .owner = .profile, .path = "install.post_install.bundle", .kind = .string, .optional = true },
+    .{ .owner = .profile, .path = "diskless.overlay.tmpfs_percent", .kind = .positive_integer },
+    .{ .owner = .profile, .path = "diskless.overlay.minimum_free_bytes", .kind = .positive_integer },
+    .{ .owner = .profile, .path = "diskless.overlay.safety_margin_bytes", .kind = .positive_integer },
+    .{ .owner = .profile, .path = "diskless.failure.max_attempts", .kind = .positive_integer },
+    .{ .owner = .profile, .path = "diskless.failure.backoff_seconds", .kind = .positive_integer },
+    .{ .owner = .profile, .path = "diskless.provision.bundle", .kind = .string, .optional = true },
 };
 
 pub const collections = [_]CollectionSpec{

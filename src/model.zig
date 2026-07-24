@@ -603,6 +603,8 @@ pub const ProfileConfig = struct {
     /// builder 把 `rootfs_build` 步骤烤入只读 lower，把 `first_boot` 步骤作为固定
     /// payload 预置但不执行；install Profile 忽略此字段。
     bundle: ?[]const u8 = null,
+    /// v0.2 diskless 启动预算与失败策略；install Profile 忽略。
+    diskless: DisklessConfig = .{},
     /// M4.1 的跨发行版目标系统事实。安装和后续无盘链路都消费此字段。
     /// 包含 locale/timezone/keyboard、SSH、用户、安全和包配置。
     system: TargetSystemConfig = .{},
@@ -831,6 +833,27 @@ pub const NodeOverrideConfig = struct {
 pub const DisklessOverrideConfig = struct {
     /// first-boot provision override。Node 可完整替换自身从 Profile 继承的 first-boot。
     provision: DisklessProvisionOverride = .{},
+    /// per-Node tmpfs upper 百分比 override；null 继承 Profile。
+    overlay_tmpfs_percent: ?u8 = null,
+};
+
+pub const DisklessConfig = struct {
+    overlay: DisklessOverlayConfig = .{},
+    failure: DisklessFailureConfig = .{},
+};
+
+pub const DisklessOverlayConfig = struct {
+    /// MemAvailable 中预留给 overlay upper 的比例，校验范围 10-80。
+    tmpfs_percent: u8 = 50,
+    /// upper 至少可增长到的字节数。
+    minimum_free_bytes: u64 = 256 * 1024 * 1024,
+    /// 下载/挂载之外保留给内核与用户态峰值的安全余量。
+    safety_margin_bytes: u64 = 128 * 1024 * 1024,
+};
+
+pub const DisklessFailureConfig = struct {
+    max_attempts: u8 = 3,
+    backoff_seconds: u32 = 30,
 };
 
 /// diskless Node first-boot provision override。
@@ -1274,7 +1297,8 @@ pub const ProvisionAction = enum {
     archive,
     /// 执行受管脚本资产（v0.2）。`script` 动作，来源必须是 catalog 受管 asset。
     script,
-    /// 安装预解析的离线包闭包（v0.2）。`package` 动作，缺依赖在 build 阶段失败。
+    /// 安装预解析并固定的包闭包（v0.2）。只允许访问 AgentPlan 指定的 nodeforged
+    /// 受管 HTTP Yum/APT 源；缺依赖在 build/readiness 阶段失败。
     @"package",
     /// 添加软件仓库（dnf config-manager 或 apt sources.list）。
     repository,
@@ -1287,6 +1311,12 @@ pub const ProvisionAction = enum {
 pub const ProvisionStep = struct {
     /// 步骤名称；用于日志和审计，不进入生成的 shell 脚本。
     name: []const u8,
+    /// 同一 session/plan 内的稳定幂等键；first-boot journal 以此跳过已成功步骤。
+    idempotency_key: []const u8 = "",
+    /// 单次执行超时秒数。
+    timeout_s: u32 = 300,
+    /// 基础设施失败是否可在本次启动内按 failure policy 重试。
+    retryable: bool = false,
     /// 执行阶段；M4 只支持 `install_post`。
     phase: ProvisionPhase = .install_post,
     /// 动作类型；决定使用哪些字段以及生成何种 shell 命令。

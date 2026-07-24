@@ -115,12 +115,19 @@ pub fn run(
         },
         else => return err,
     };
-    // v0.2 diskless delivery：进程内 session + scoped token store。HMAC secret 进程内
-    // 随机生成（v0.2 不持久化 diskless session；跨重启需重新 prepare，见 V0_2 阶段说明）。
+    // v0.2 diskless delivery：master secret 与 session/claim checkpoint 持久化，
+    // raw capability 不落盘，而是由 secret + session/scope 确定性重建。
     var diskless_secret: [32]u8 = undefined;
-    io.randomSecure(&diskless_secret) catch return error.DisklessSecretUnavailable;
-    var diskless_store = diskless_delivery.Store.init(allocator, &diskless_secret, "");
+    diskless_delivery.loadOrCreateSecret(io, allocator, paths.require().diskless_secret_path, &diskless_secret) catch
+        return error.DisklessSecretUnavailable;
+    var diskless_store = diskless_delivery.Store.init(allocator, &diskless_secret, paths.require().diskless_delivery_path);
     defer diskless_store.deinit();
+    const restored_diskless = diskless_store.load(io, boot_session.monotonicNow(), current_time) catch |err| {
+        observe_log.err("diskless-delivery: refusing startup with invalid checkpoint: {t}", .{err});
+        return err;
+    };
+    if (restored_diskless != 0)
+        observe_log.info("diskless-delivery: resumed {d} session(s)", .{restored_diskless});
     const model_revision = try deployment_control.revisionForModel(allocator, config, catalog);
     const config_revision = model_revision.config;
     var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);

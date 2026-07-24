@@ -96,6 +96,11 @@ pub const Paths = struct {
     /// rootfs 制品登记文件路径（`<root>/state/rootfs-artifacts.json`）。
     /// 记录已构建 diskless rootfs 的内容寻址制品（digest/sha512/size）。
     rootfs_artifacts_path: []const u8,
+    /// Diskless delivery session checkpoint。只保存 capability hash/claim，
+    /// 不保存可直接使用的 raw token。
+    diskless_delivery_path: []const u8,
+    /// Diskless capability 派生主密钥（0600，32-byte hex）。
+    diskless_secret_path: []const u8,
     /// 模型事务目录（`<root>/state/model-transactions`）。
     /// 存放 schema v3 迁移等大事务的 before/after 快照。
     model_transactions_dir: []const u8,
@@ -292,6 +297,8 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .node_inventory_path = try join(allocator, root, "state/node-inventory.json"),
         .operations_path = try join(allocator, root, "state/operations.json"),
         .rootfs_artifacts_path = try join(allocator, root, "state/rootfs-artifacts.json"),
+        .diskless_delivery_path = try join(allocator, root, "state/diskless-delivery.json"),
+        .diskless_secret_path = try join(allocator, root, "state/diskless-secret"),
         .model_transactions_dir = try join(allocator, root, "state/model-transactions"),
         .events_path = try join(allocator, root, "logs/events.jsonl"),
         .service_log_path = try join(allocator, root, "logs/nodeforged.log"),

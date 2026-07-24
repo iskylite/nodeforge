@@ -172,13 +172,20 @@ pub const CatalogRuntime = struct {
     /// `managed_file` 类型且 `asset.revision` 恰好为 `existing.revision + 1`；
     /// 否则返回 `AssetRevisionConflict`。新 asset 的 `revision` 必须为 1。
     pub fn publishManagedFile(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, asset: model.AssetConfig) !void {
+        return self.publishContentAsset(io, config, asset);
+    }
+
+    /// 发布 managed_file/archive/script 的 immutable revision。
+    pub fn publishContentAsset(self: *CatalogRuntime, io: std.Io, config: *const model.AppConfig, asset: model.AssetConfig) !void {
+        if (asset.kind != .managed_file and asset.kind != .archive and asset.kind != .script)
+            return error.AssetKindMismatch;
         self.lock();
         defer self.unlock();
         const old = self.acquireLocked();
         defer old.release();
         var found: ?usize = null;
         for (old.value().assets, 0..) |existing, index| if (std.mem.eql(u8, existing.name, asset.name)) {
-            if (existing.kind != .managed_file or asset.revision != existing.revision + 1) return error.AssetRevisionConflict;
+            if (existing.kind != asset.kind or asset.revision != existing.revision + 1) return error.AssetRevisionConflict;
             found = index;
         };
         if (found == null and asset.revision != 1) return error.AssetRevisionConflict;

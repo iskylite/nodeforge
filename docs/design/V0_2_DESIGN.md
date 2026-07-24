@@ -505,11 +505,14 @@ chroot/staging 上下文使步骤以 `/` 为目标写入 lower，步骤作者不
 rootfs-build inputs + first-boot fixed payload + Profile system/software + builder ABI 共同决定
 `rootfs_input_digest`；构建输出另以 content SHA-512 标识。
 
-**first-boot payload 固定**。builder 解析 Profile first-boot package closure，并把 manifest、RPM/DEB、managed-file、
-archive、script 以内容寻址形式写入 `/usr/lib/nodeforge/firstboot/<bundle-digest>/`，但不在 build 期执行。
-Node 未 override 时 agent 只消费该只读本地 payload。Node override bundle 不进入公共 rootfs，其完整 immutable closure
-由 agent pre-init 使用 `agent:read` 一次性预取；first-boot 阶段不再联网读取配置/artifact。任何缺包、asset digest
-不匹配或 payload 超预算都在 build/readiness 或 agent pre-init 阶段 fail closed，不能启动后再临时解析依赖。
+**first-boot 输入固定**。builder/boot-prepare 预先解析 package closure，并把固定包列表、包管理器、nodeforged
+受管 HTTP Yum/APT repository URL 与 revision/GPG policy 写入 immutable AgentPlan。first-boot 允许访问这些
+local-only 受管软件源安装 RPM/DEB，但必须显式禁用系统其他源，禁止公网 mirror、metalink 和运行时依赖漂移。
+默认仓库集合继承 Profile 当前 InstallSource 在导入时由 nodeforged 建立并发布的 Yum/APT 源；操作员通过 CLI
+明确增加的仓库在该默认集合上合并、去重并进入同一 pinned AgentPlan，未显式配置的其他系统源不得被使用。
+managed-file、archive、script 以内容寻址形式写入 Profile 本地 payload，或由 Node override 的 agent pre-init 使用
+`agent:read` 一次性预取；first-boot 不再联网读取配置或 artifact。任何缺包、asset digest 不匹配或 payload
+超预算都在 build/readiness 或 agent pre-init 阶段 fail closed。
 
 **构建环境保真**。rootfs-build phase 执行 package/script 时按动作所需提供构建环境：纯 userspace 动作（写文件、装普通包、
 配置）只需 chroot；触及硬件/内核的动作（装驱动、dkms、重生成 initramfs、装载内核模块）须 bind-mount `/dev`/`/proc`/

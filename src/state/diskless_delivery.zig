@@ -11,6 +11,7 @@
 //! 到单一 boot_session 是后续设计收敛项（见 V0_2_V0_5_DESIGN_REVIEW §5）。
 const std = @import("std");
 const cred = @import("diskless_credential.zig");
+const lifecycle = @import("diskless_session.zig");
 const atomicWrite = @import("dhcp_store.zig").atomicWrite;
 
 pub const id_len = 32;
@@ -23,6 +24,29 @@ pub const name_cap = 128;
 pub const kernel_cap = 64;
 pub const agent_plan_cap = 16384;
 pub const default_ttl_seconds: i64 = 2 * 60 * 60;
+pub const persistence_schema_version: u32 = 1;
+
+/// 加载或首次创建 diskless capability master secret。文件保存 32-byte secret
+/// 的 64 位小写 hex，权限固定 0600；格式损坏时拒绝启动，绝不静默换密钥使活动
+/// session 全部变成不可恢复状态。
+pub fn loadOrCreateSecret(io: std.Io, allocator: std.mem.Allocator, path: []const u8, secret: *[32]u8) !void {
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(65)) catch |err| switch (err) {
+        error.FileNotFound => {
+            try io.randomSecure(secret);
+            var encoded: [64]u8 = undefined;
+            _ = std.fmt.bufPrint(&encoded, "{x}", .{secret.*}) catch unreachable;
+            try atomicWrite(io, path, &encoded);
+            try chmod(allocator, io, "600", path);
+            return;
+        },
+        else => return err,
+    };
+    defer allocator.free(existing);
+    const value = std.mem.trim(u8, existing, " \t\r\n");
+    if (value.len != 64) return error.InvalidDisklessSecret;
+    _ = std.fmt.hexToBytes(secret, value) catch return error.InvalidDisklessSecret;
+    try chmod(allocator, io, "600", path);
+}
 
 pub const TokenSlot = struct {
     issued: bool = false,
@@ -44,6 +68,9 @@ pub const Session = struct {
     rootfs_input_digest: [digest_len]u8 = [_]u8{0} ** digest_len,
     rootfs_sha512: [sha512_len]u8 = [_]u8{0} ** sha512_len,
     rootfs_size: u64 = 0,
+    tmpfs_percent: u8 = 50,
+    minimum_free_bytes: u64 = 0,
+    safety_margin_bytes: u64 = 0,
     kernel_buf: [kernel_cap]u8 = [_]u8{0} ** kernel_cap,
     kernel_len: u8 = 0,
     agent_plan_buf: [agent_plan_cap]u8 = [_]u8{0} ** agent_plan_cap,
@@ -51,11 +78,14 @@ pub const Session = struct {
     agent_plan_digest: [digest_len]u8 = [_]u8{0} ** digest_len,
     created_at: i64 = 0,
     expires_at: i64 = 0,
+    phase: lifecycle.Phase = .boot_tftp_complete,
     config_token: TokenSlot = .{},
+    rootfs_token: TokenSlot = .{ .scope = .rootfs_read },
     agent_token: TokenSlot = .{ .scope = .agent_read },
     event_token: TokenSlot = .{ .scope = .event_append },
     /// raw token 只驻内存（不落盘）；boot-config 响应重放时返回相同 bytes。
     config_token_raw: [token_len]u8 = [_]u8{0} ** token_len,
+    rootfs_token_raw: [token_len]u8 = [_]u8{0} ** token_len,
     agent_token_raw: [token_len]u8 = [_]u8{0} ** token_len,
     event_token_raw: [token_len]u8 = [_]u8{0} ** token_len,
 
@@ -94,9 +124,57 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void { _ = self; }
 
+    /// 从 checkpoint 恢复尚未过期的 delivery session。raw capability 不在 JSON
+    /// 中；它由持久 master secret + session/scope 确定性重建，并再次核对保存的
+    /// HMAC hash，避免损坏 checkpoint 静默扩大权限。
+    pub fn load(self: *Store, io: std.Io, now_mono: i64, now_utc: i64) !usize {
+        if (self.path.len == 0) return 0;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, self.path, self.allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer self.allocator.free(bytes);
+        const parsed = try std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (parsed.value.schema_version != persistence_schema_version) return error.InvalidDisklessDeliveryStore;
+        if (parsed.value.sessions.len > max_sessions) return error.InvalidDisklessDeliveryStore;
+        var restored: usize = 0;
+        for (parsed.value.sessions) |item| {
+            if (item.expires_at <= now_utc) continue;
+            const slot_index = self.findFree() orelse return error.DisklessSessionCapacity;
+            var session = try restoreSession(item, now_mono, now_utc);
+            try reconstructAndVerifyRaw(self.secret, &session, .config);
+            try reconstructAndVerifyRaw(self.secret, &session, .rootfs);
+            try reconstructAndVerifyRaw(self.secret, &session, .agent);
+            try reconstructAndVerifyRaw(self.secret, &session, .event);
+            self.sessions[slot_index] = session;
+            restored += 1;
+        }
+        return restored;
+    }
+
+    /// 原子 checkpoint。只序列化 active session 的 immutable snapshot、claim 和
+    /// token HMAC；raw token 永不落盘。
+    pub fn persist(self: *Store, io: std.Io) !void {
+        if (self.path.len == 0) return;
+        var compact: [max_sessions]PersistedSession = undefined;
+        var count: usize = 0;
+        for (&self.sessions) |*session| {
+            if (!session.active) continue;
+            compact[count] = persistedSession(session);
+            count += 1;
+        }
+        const bytes = try std.json.Stringify.valueAlloc(self.allocator, PersistedFile{
+            .sessions = compact[0..count],
+        }, .{ .whitespace = .indent_2 });
+        defer self.allocator.free(bytes);
+        try atomicWrite(io, self.path, bytes);
+        try chmod(self.allocator, io, "600", self.path);
+    }
+
     /// 创建一个 diskless session（不签发 token）。返回新 session 的只读引用；
     /// config/agent/event token 由 prepare/boot-config 分别签发。
-    pub fn begin(self: *Store, io: std.Io, node_id: []const u8, profile: []const u8, rootfs_input_digest: []const u8, rootfs_sha512: []const u8, rootfs_size: u64, kernel_release: []const u8, now_mono: i64, now_utc: i64) !*Session {
+    pub fn begin(self: *Store, io: std.Io, node_id: []const u8, profile: []const u8, rootfs_input_digest: []const u8, rootfs_sha512: []const u8, rootfs_size: u64, kernel_release: []const u8, tmpfs_percent: u8, minimum_free_bytes: u64, safety_margin_bytes: u64, now_mono: i64, now_utc: i64) !*Session {
         const slot = self.findFree() orelse return error.DisklessSessionCapacity;
         var s: Session = .{ .active = true, .created_at = now_utc, .expires_at = now_utc + default_ttl_seconds };
         try generateId(io, &s.session_id);
@@ -109,6 +187,9 @@ pub const Store = struct {
         const sh_len = @min(rootfs_sha512.len, sha512_len);
         @memcpy(s.rootfs_sha512[0..sh_len], rootfs_sha512[0..sh_len]);
         s.rootfs_size = rootfs_size;
+        s.tmpfs_percent = tmpfs_percent;
+        s.minimum_free_bytes = minimum_free_bytes;
+        s.safety_margin_bytes = safety_margin_bytes;
         s.kernel_len = @intCast(@min(kernel_release.len, kernel_cap));
         @memcpy(s.kernel_buf[0..s.kernel_len], kernel_release[0..s.kernel_len]);
         // config token expires with the session; bind content to rootfs sha512.
@@ -116,15 +197,22 @@ pub const Store = struct {
         const cd_len = @min(sh_len, sha512_len);
         @memcpy(s.config_token.content_digest[0..cd_len], rootfs_sha512[0..cd_len]);
         s.config_token.content_len = @intCast(cd_len);
+        s.rootfs_token = .{ .issued = false, .scope = .rootfs_read, .expires_mono = now_mono + default_ttl_seconds };
+        @memcpy(s.rootfs_token.content_digest[0..cd_len], rootfs_sha512[0..cd_len]);
+        s.rootfs_token.content_len = @intCast(cd_len);
         s.agent_token = .{ .issued = false, .scope = .agent_read, .expires_mono = now_mono + default_ttl_seconds };
         s.event_token = .{ .issued = false, .scope = .event_append, .expires_mono = now_mono + default_ttl_seconds };
         self.sessions[slot] = s;
+        self.persist(io) catch {
+            self.sessions[slot] = .{};
+            return error.DisklessSessionPersistFailed;
+        };
         return &self.sessions[slot];
     }
 
     /// 固定 immutable AgentPlan JSON（boot-config 首次签发时写入），并计算其
     /// canonical SHA-256 作为 agent_plan_digest。后续 agent-plan GET 返回相同 bytes。
-    pub fn pinAgentPlan(self: *Store, session_id: []const u8, json: []const u8) !void {
+    pub fn pinAgentPlan(self: *Store, io: std.Io, session_id: []const u8, json: []const u8) !void {
         const s = self.find(session_id) orelse return error.DisklessSessionNotFound;
         if (json.len > agent_plan_cap) return error.AgentPlanTooLarge;
         @memcpy(s.agent_plan_buf[0..json.len], json);
@@ -132,6 +220,7 @@ pub const Store = struct {
         var raw: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(json, &raw, .{});
         _ = std.fmt.bufPrint(&s.agent_plan_digest, "{x}", .{raw}) catch unreachable;
+        try self.persist(io);
     }
 
     /// 签发一个 scoped token（32 字节随机 -> 64 hex）。持久 HMAC hash + claim，
@@ -139,12 +228,20 @@ pub const Store = struct {
     pub fn issue(self: *Store, io: std.Io, session_id: []const u8, slot_kind: SlotKind) !void {
         const s = self.find(session_id) orelse return error.DisklessSessionNotFound;
         const slot = self.slotOf(s, slot_kind);
+        const previous_slot = slot.*;
+        const previous_raw = switch (slot_kind) {
+            .config => s.config_token_raw,
+            .rootfs => s.rootfs_token_raw,
+            .agent => s.agent_token_raw,
+            .event => s.event_token_raw,
+        };
         var raw: [token_len]u8 = undefined;
-        try generateToken(io, &raw);
+        deriveToken(self.secret, &s.session_id, slot_kind, &raw);
         slot.hash = cred.hashOf(&raw, self.secret);
         slot.issued = true;
         switch (slot_kind) {
             .config => @memcpy(&s.config_token_raw, &raw),
+            .rootfs => @memcpy(&s.rootfs_token_raw, &raw),
             .agent => @memcpy(&s.agent_token_raw, &raw),
             .event => @memcpy(&s.event_token_raw, &raw),
         }
@@ -153,23 +250,35 @@ pub const Store = struct {
             @memcpy(slot.content_digest[0..cd_len], s.agent_plan_digest[0..cd_len]);
             slot.content_len = @intCast(cd_len);
         }
+        self.persist(io) catch |err| {
+            slot.* = previous_slot;
+            switch (slot_kind) {
+                .config => s.config_token_raw = previous_raw,
+                .rootfs => s.rootfs_token_raw = previous_raw,
+                .agent => s.agent_token_raw = previous_raw,
+                .event => s.event_token_raw = previous_raw,
+            }
+            return err;
+        };
     }
 
     pub fn rawToken(self: *Store, s: *const Session, kind: SlotKind) []const u8 {
         _ = self;
         return switch (kind) {
             .config => &s.config_token_raw,
+            .rootfs => &s.rootfs_token_raw,
             .agent => &s.agent_token_raw,
             .event => &s.event_token_raw,
         };
     }
 
-    pub const SlotKind = enum { config, agent, event };
+    pub const SlotKind = enum { config, rootfs, agent, event };
 
     fn slotOf(self: *Store, s: *Session, kind: SlotKind) *TokenSlot {
         _ = self;
         return switch (kind) {
             .config => &s.config_token,
+            .rootfs => &s.rootfs_token,
             .agent => &s.agent_token,
             .event => &s.event_token,
         };
@@ -188,7 +297,12 @@ pub const Store = struct {
             .plan_digest = s.rootfsInputDigest(),
             .content_digest = self.contentDigestOf(slot),
             .expires_mono = slot.expires_mono,
-            .event_seq = slot.event_seq,
+            // 允许仅上一次 seq 进入 reducer，以便 reducer 对“相同 seq + 相同
+            // phase”作幂等确认；任何不同 payload 仍由 advanceEvent 拒绝。
+            .event_seq = if (kind == .event and request_event_seq != std.math.maxInt(u64) and request_event_seq + 1 == slot.event_seq)
+                request_event_seq
+            else
+                slot.event_seq,
         };
         return cred.verify(raw_token, self.secret, &slot.hash, &claim, slot.scope, request_node, request_path, request_content, request_event_seq, now_mono);
     }
@@ -208,11 +322,240 @@ pub const Store = struct {
         return null;
     }
 
+    pub fn markBootConfigFetched(self: *Store, io: std.Io, session_id: []const u8) !void {
+        const session = self.find(session_id) orelse return error.DisklessSessionNotFound;
+        const previous = session.phase;
+        session.phase = try lifecycle.advance(session.phase, .boot_config_fetched);
+        self.persist(io) catch |err| {
+            session.phase = previous;
+            return err;
+        };
+    }
+
+    /// 校验 canonical lifecycle 的单步推进与 event_seq，并在同一 checkpoint
+    /// 中提交新 phase/next sequence。重复/跳步/回退均由 reducer fail closed。
+    pub const EventAdvanceResult = enum { applied, idempotent };
+
+    pub fn advanceEvent(self: *Store, io: std.Io, session_id: []const u8, expected: lifecycle.Phase, target: lifecycle.Phase, event_seq: u64) !EventAdvanceResult {
+        const session = self.find(session_id) orelse return error.DisklessSessionNotFound;
+        if (event_seq != std.math.maxInt(u64) and event_seq + 1 == session.event_token.event_seq and target == session.phase)
+            return .idempotent;
+        if (event_seq != session.event_token.event_seq) return error.DisklessEventSequenceMismatch;
+        if (expected != session.phase) return error.DisklessExpectedPhaseMismatch;
+        const previous_phase = session.phase;
+        const previous_seq = session.event_token.event_seq;
+        session.phase = try lifecycle.advance(session.phase, target);
+        session.event_token.event_seq = std.math.add(u64, previous_seq, 1) catch return error.DisklessEventSequenceOverflow;
+        self.persist(io) catch |err| {
+            session.phase = previous_phase;
+            session.event_token.event_seq = previous_seq;
+            return err;
+        };
+        return .applied;
+    }
+
+    pub fn revoke(self: *Store, io: std.Io, session_id: []const u8, kind: SlotKind) !void {
+        const session = self.find(session_id) orelse return error.DisklessSessionNotFound;
+        const slot = self.slotOf(session, kind);
+        const previous_slot = slot.*;
+        const previous_raw = switch (kind) {
+            .config => session.config_token_raw,
+            .rootfs => session.rootfs_token_raw,
+            .agent => session.agent_token_raw,
+            .event => session.event_token_raw,
+        };
+        slot.issued = false;
+        @memset(&slot.hash, 0);
+        switch (kind) {
+            .config => @memset(&session.config_token_raw, 0),
+            .rootfs => @memset(&session.rootfs_token_raw, 0),
+            .agent => @memset(&session.agent_token_raw, 0),
+            .event => @memset(&session.event_token_raw, 0),
+        }
+        self.persist(io) catch |err| {
+            slot.* = previous_slot;
+            switch (kind) {
+                .config => session.config_token_raw = previous_raw,
+                .rootfs => session.rootfs_token_raw = previous_raw,
+                .agent => session.agent_token_raw = previous_raw,
+                .event => session.event_token_raw = previous_raw,
+            }
+            return err;
+        };
+    }
+
     fn findFree(self: *Store) ?usize {
         for (&self.sessions, 0..) |*s, i| if (!s.active) return i;
         return null;
     }
 };
+
+const PersistedSlot = struct {
+    issued: bool,
+    hash: []const u8,
+    scope: cred.Scope,
+    content_digest: []const u8,
+    event_seq: u64,
+};
+
+const PersistedSession = struct {
+    session_id: []const u8,
+    node_id: []const u8,
+    profile: []const u8,
+    rootfs_input_digest: []const u8,
+    rootfs_sha512: []const u8,
+    rootfs_size: u64,
+    tmpfs_percent: u8,
+    minimum_free_bytes: u64,
+    safety_margin_bytes: u64,
+    kernel_release: []const u8,
+    agent_plan_json: []const u8,
+    agent_plan_digest: []const u8,
+    created_at: i64,
+    expires_at: i64,
+    phase: lifecycle.Phase,
+    config_token: PersistedSlot,
+    rootfs_token: PersistedSlot,
+    agent_token: PersistedSlot,
+    event_token: PersistedSlot,
+};
+
+const PersistedFile = struct {
+    schema_version: u32 = persistence_schema_version,
+    sessions: []const PersistedSession = &.{},
+};
+
+fn persistedSlot(slot: *const TokenSlot) PersistedSlot {
+    return .{
+        .issued = slot.issued,
+        .hash = &slot.hash,
+        .scope = slot.scope,
+        .content_digest = slot.content_digest[0..slot.content_len],
+        .event_seq = slot.event_seq,
+    };
+}
+
+fn persistedSession(session: *const Session) PersistedSession {
+    return .{
+        .session_id = &session.session_id,
+        .node_id = session.nodeId(),
+        .profile = session.profileName(),
+        .rootfs_input_digest = session.rootfsInputDigest(),
+        .rootfs_sha512 = session.rootfsSha512(),
+        .rootfs_size = session.rootfs_size,
+        .tmpfs_percent = session.tmpfs_percent,
+        .minimum_free_bytes = session.minimum_free_bytes,
+        .safety_margin_bytes = session.safety_margin_bytes,
+        .kernel_release = session.kernelRelease(),
+        .agent_plan_json = session.agentPlanJson(),
+        .agent_plan_digest = session.agentPlanDigest(),
+        .created_at = session.created_at,
+        .expires_at = session.expires_at,
+        .phase = session.phase,
+        .config_token = persistedSlot(&session.config_token),
+        .rootfs_token = persistedSlot(&session.rootfs_token),
+        .agent_token = persistedSlot(&session.agent_token),
+        .event_token = persistedSlot(&session.event_token),
+    };
+}
+
+fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session {
+    if (item.session_id.len != id_len or item.rootfs_input_digest.len != digest_len or
+        item.rootfs_sha512.len != sha512_len or item.agent_plan_digest.len != digest_len or
+        item.node_id.len > name_cap or item.profile.len > name_cap or
+        item.kernel_release.len > kernel_cap or item.agent_plan_json.len > agent_plan_cap)
+        return error.InvalidDisklessDeliveryStore;
+    var session: Session = .{
+        .active = true,
+        .rootfs_size = item.rootfs_size,
+        .tmpfs_percent = item.tmpfs_percent,
+        .minimum_free_bytes = item.minimum_free_bytes,
+        .safety_margin_bytes = item.safety_margin_bytes,
+        .created_at = item.created_at,
+        .expires_at = item.expires_at,
+        .phase = item.phase,
+    };
+    @memcpy(&session.session_id, item.session_id);
+    session.node_len = @intCast(item.node_id.len);
+    @memcpy(session.node_buf[0..session.node_len], item.node_id);
+    session.profile_len = @intCast(item.profile.len);
+    @memcpy(session.profile_buf[0..session.profile_len], item.profile);
+    @memcpy(&session.rootfs_input_digest, item.rootfs_input_digest);
+    @memcpy(&session.rootfs_sha512, item.rootfs_sha512);
+    session.kernel_len = @intCast(item.kernel_release.len);
+    @memcpy(session.kernel_buf[0..session.kernel_len], item.kernel_release);
+    session.agent_plan_len = @intCast(item.agent_plan_json.len);
+    @memcpy(session.agent_plan_buf[0..session.agent_plan_len], item.agent_plan_json);
+    @memcpy(&session.agent_plan_digest, item.agent_plan_digest);
+    const remaining = item.expires_at - now_utc;
+    session.config_token = try restoreSlot(item.config_token, now_mono + remaining);
+    session.rootfs_token = try restoreSlot(item.rootfs_token, now_mono + remaining);
+    session.agent_token = try restoreSlot(item.agent_token, now_mono + remaining);
+    session.event_token = try restoreSlot(item.event_token, now_mono + remaining);
+    return session;
+}
+
+fn restoreSlot(item: PersistedSlot, expires_mono: i64) !TokenSlot {
+    if (item.hash.len != hash_len or item.content_digest.len > sha512_len) return error.InvalidDisklessDeliveryStore;
+    var slot: TokenSlot = .{
+        .issued = item.issued,
+        .scope = item.scope,
+        .content_len = @intCast(item.content_digest.len),
+        .expires_mono = expires_mono,
+        .event_seq = item.event_seq,
+    };
+    @memcpy(&slot.hash, item.hash);
+    @memcpy(slot.content_digest[0..item.content_digest.len], item.content_digest);
+    return slot;
+}
+
+fn deriveToken(secret: []const u8, session_id: []const u8, kind: Store.SlotKind, destination: *[token_len]u8) void {
+    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(secret);
+    hmac.update("nodeforge-diskless-capability-v1\x00");
+    hmac.update(session_id);
+    hmac.update(switch (kind) {
+        .config => "\x00config",
+        .rootfs => "\x00rootfs",
+        .agent => "\x00agent",
+        .event => "\x00event",
+    });
+    var mac: [32]u8 = undefined;
+    hmac.final(&mac);
+    _ = std.fmt.bufPrint(destination, "{x}", .{mac}) catch unreachable;
+}
+
+fn reconstructAndVerifyRaw(secret: []const u8, session: *Session, kind: Store.SlotKind) !void {
+    const slot = switch (kind) {
+        .config => &session.config_token,
+        .rootfs => &session.rootfs_token,
+        .agent => &session.agent_token,
+        .event => &session.event_token,
+    };
+    if (!slot.issued) return;
+    const raw = switch (kind) {
+        .config => &session.config_token_raw,
+        .rootfs => &session.rootfs_token_raw,
+        .agent => &session.agent_token_raw,
+        .event => &session.event_token_raw,
+    };
+    deriveToken(secret, &session.session_id, kind, raw);
+    const computed = cred.hashOf(raw, secret);
+    if (!std.mem.eql(u8, &computed, &slot.hash)) return error.InvalidDisklessDeliveryStore;
+}
+
+fn chmod(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, path: []const u8) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "chmod", mode, path },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.PermissionUpdateFailed,
+        else => return error.PermissionUpdateFailed,
+    }
+}
 
 fn generateId(io: std.Io, destination: *[id_len]u8) !void {
     var random: [16]u8 = undefined;
@@ -223,15 +566,117 @@ fn generateId(io: std.Io, destination: *[id_len]u8) !void {
     }
 }
 
-fn generateToken(io: std.Io, destination: *[token_len]u8) !void {
-    var random: [32]u8 = undefined;
-    try io.randomSecure(&random);
-    for (random, 0..) |byte, index| {
-        destination[index * 2] = hex(byte >> 4);
-        destination[index * 2 + 1] = hex(byte & 0x0f);
-    }
-}
-
 fn hex(nibble: u8) u8 {
     return if (nibble < 10) '0' + nibble else 'a' + (nibble - 10);
+}
+
+test "delivery checkpoint restores session and reconstructs raw capabilities" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/diskless-delivery.json", .{path});
+    defer std.testing.allocator.free(checkpoint);
+    const secret = [_]u8{0x5a} ** 32;
+
+    var before = Store.init(std.testing.allocator, &secret, checkpoint);
+    const session = try before.begin(
+        std.testing.io,
+        "node-1",
+        "profile-1",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        4096,
+        "5.14.0",
+        50,
+        64,
+        32,
+        100,
+        1000,
+    );
+    const session_id = session.session_id;
+    try before.pinAgentPlan(std.testing.io, &session_id, "{\"schema_version\":1}");
+    try before.issue(std.testing.io, &session_id, .config);
+    try before.issue(std.testing.io, &session_id, .rootfs);
+    try before.issue(std.testing.io, &session_id, .agent);
+    try before.issue(std.testing.io, &session_id, .event);
+    const config_raw = session.config_token_raw;
+    const rootfs_raw = session.rootfs_token_raw;
+    const agent_raw = session.agent_token_raw;
+    const event_raw = session.event_token_raw;
+
+    const persisted = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(persisted);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, &config_raw) == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, &rootfs_raw) == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, &agent_raw) == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, &event_raw) == null);
+
+    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1010));
+    const restored = after.find(&session_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualSlices(u8, &config_raw, &restored.config_token_raw);
+    try std.testing.expectEqualSlices(u8, &rootfs_raw, &restored.rootfs_token_raw);
+    try std.testing.expectEqualSlices(u8, &agent_raw, &restored.agent_token_raw);
+    try std.testing.expectEqualSlices(u8, &event_raw, &restored.event_token_raw);
+    try std.testing.expectEqual(cred.Decision.ok, after.verify(
+        &session_id,
+        &restored.config_token_raw,
+        .config,
+        "node-1",
+        "",
+        restored.rootfsSha512(),
+        0,
+        11,
+    ));
+}
+
+test "diskless event CAS is ordered and exact retry is idempotent" {
+    const secret = [_]u8{0x33} ** 32;
+    var store = Store.init(std.testing.allocator, &secret, "");
+    const session = try store.begin(
+        std.testing.io,
+        "n1",
+        "p1",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        1,
+        "k",
+        50,
+        64,
+        32,
+        0,
+        0,
+    );
+    const id = session.session_id;
+    try store.markBootConfigFetched(std.testing.io, &id);
+    try store.issue(std.testing.io, &id, .event);
+    try std.testing.expectEqual(Store.EventAdvanceResult.applied, try store.advanceEvent(
+        std.testing.io,
+        &id,
+        .boot_config_fetched,
+        .diskless_initrd_started,
+        0,
+    ));
+    try std.testing.expectEqual(Store.EventAdvanceResult.idempotent, try store.advanceEvent(
+        std.testing.io,
+        &id,
+        .boot_config_fetched,
+        .diskless_initrd_started,
+        0,
+    ));
+    try std.testing.expectError(error.DisklessEventSequenceMismatch, store.advanceEvent(
+        std.testing.io,
+        &id,
+        .diskless_initrd_started,
+        .diskless_rootfs_downloading,
+        4,
+    ));
+    try std.testing.expectError(error.JumpRejected, store.advanceEvent(
+        std.testing.io,
+        &id,
+        .diskless_initrd_started,
+        .diskless_rootfs_verified,
+        1,
+    ));
 }

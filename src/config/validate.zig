@@ -85,6 +85,8 @@ pub const ValidationError = error{
     InvalidTftpConcurrency,
     InvalidTftpBlksize,
     InvalidKernelArgs,
+    InvalidDisklessOverlay,
+    InvalidDisklessFailure,
     KernelArgsRequiresBootloader,
     MissingSoftwareIndex,
     SoftwareCapabilityMissing,
@@ -415,7 +417,9 @@ fn validateAssets(config: *const model.AppConfig, catalog: *const model.Catalog)
         } else if (asset.version != null or asset.arch != null) {
             return error.UnsupportedDistroTuple;
         }
-        if (asset.kind == .managed_file and (asset.revision == 0 or asset.sha256 == null or asset.size == null or asset.media_type == null)) return error.InvalidProvisioningStep;
+        if ((asset.kind == .managed_file or asset.kind == .archive or asset.kind == .script) and
+            (asset.revision == 0 or asset.sha256 == null or asset.size == null or asset.media_type == null))
+            return error.InvalidProvisioningStep;
     }
 }
 
@@ -547,6 +551,15 @@ fn validateProfiles(config: *const model.AppConfig, catalog: *const model.Catalo
             if (distro.family == .rhel and system.security.apparmor != .disabled) return error.PropertyNotApplicable;
             if (distro.family == .ubuntu and system.security.selinux != .disabled) return error.PropertyNotApplicable;
         }
+        if (profile.kind == .diskless) {
+            const overlay = profile.diskless.overlay;
+            if (overlay.tmpfs_percent < 10 or overlay.tmpfs_percent > 80 or
+                overlay.minimum_free_bytes == 0 or overlay.safety_margin_bytes == 0)
+                return error.InvalidDisklessOverlay;
+            const failure = profile.diskless.failure;
+            if (failure.max_attempts < 1 or failure.max_attempts > 10 or failure.backoff_seconds > 3600)
+                return error.InvalidDisklessFailure;
+        }
     }
 }
 
@@ -628,6 +641,17 @@ fn validateNodes(config: *const model.AppConfig, catalog: *const model.Catalog) 
         const source = lookup.findInstallSource(catalog, profile.install_source) orelse return error.InvalidProfileSource;
         if (source.arch != node.arch) return error.InvalidProfileSource;
         try validateKernelDelta(catalog, profile, node.overrides.kernel_args);
+        if (node.overrides.diskless.overlay_tmpfs_percent) |percent|
+            if (percent < 10 or percent > 80) return error.InvalidDisklessOverlay;
+        if (node.overrides.diskless.provision.bundle) |bundle_name| {
+            var found_bundle: ?*const model.ProvisioningBundle = null;
+            for (catalog.provisioning_bundles) |*bundle| if (std.mem.eql(u8, bundle.name, bundle_name)) {
+                found_bundle = bundle;
+                break;
+            };
+            const bundle = found_bundle orelse return error.MissingProvisioningBundle;
+            for (bundle.steps) |step| if (step.phase != .first_boot) return error.InvalidProvisioningStep;
+        }
         if (node.pxe.ip_reservation orelse node.ip) |ip| {
             const parsed_ip = std.Io.net.IpAddress.parseIp4(ip, 0) catch return error.InvalidNodeIpv4;
             if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed_ip))) return error.NodeOutsideDhcpSubnet;

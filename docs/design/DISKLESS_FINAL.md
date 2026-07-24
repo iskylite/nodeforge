@@ -257,21 +257,26 @@ switch_root。renderer/账号/SSH 等最终语义由 agent pre-init 校验，ini
 `/var/lib` handoff：initrd 把 session handoff 与 payload 直接写到 merged 根的 `/var/lib/nodeforge/`（overlay upper）；systemd 不会像 `/run` 那样重建 tmpfs 覆盖 `/var/lib`，故切根前后同一文件，pre-init 与 first-boot 均可读。目录布局固定：
 
 ```text
-/var/lib/nodeforge/boot.json             0600 root:root，session handoff（node/session + AgentPlan locator + agent/event token）
+/var/lib/nodeforge/boot.json             0600 root:root，session handoff（node/session + AgentPlan locator；不含 token）
+/var/lib/nodeforge/credentials/agent.token  0400 root:root，pre-init 读取后立即 unlink
+/var/lib/nodeforge/credentials/event.token  0400 root:root，first-boot 最终事件后 unlink
 /var/lib/nodeforge/payload/              root:root，agent pre-init 预取、校验后的 content-addressed payload
 ```
 
 > **实现现状**：当前实现把 handoff 与 payload 直接写在 merged 根的 `/var/lib/nodeforge/`（overlay upper）。
 > systemd 不会像 `/run` 那样重建 tmpfs 覆盖 `/var/lib`，故切根前后同一文件，pre-init 与 first-boot 均可读。
-> `agent_token`/`event_token` 直接放在 `boot.json`（一次性、session 绑定、RAM-only overlay，无重放风险）。
-> 设计文档原描述的 `/run` move-mount + 多文件（`journal`/`agent-handoff`/`node-apply`/`credentials/`）安全模型为后续演进目标，
+> `agent_token`/`event_token` 已从 `boot.json` 分离到 0400 credential 文件；agent token 在
+> pre-init 读取时 unlink，并在服务端 `agent-consumed` 后撤销，event token 在 running/failed 后撤销。
+> first-boot 已实现与 session/plan digest 绑定的原子 journal、成功步骤跳过、timeout
+> 及 retryable attempt/backoff；initrd `/run` move-mount 与逐阶段 journal 仍为后续演进目标，
 > 当前未实现；initrd 阶段的 rootfs 下载等仍用 initramfs `/run`（切根前释放，不涉及）。
 > **Phase 8（first-boot 八步重放）**：pre-init 拉取并校验 AgentPlan 后，把整份 plan 覆盖写回
 > `boot.json`（AgentPlan v1 现内联 `steps`，固定顺序 managed_file -> package -> archive ->
 > script）。first-boot unit 读 `boot.json` 内联步骤一次性重放，无远程控制、无 reconciliation；
-> 失败只记 `/var/lib/nodeforge/firstboot.log`，不阻断启动。覆盖写同时移除盘上 agent/event token
-> （旧 `clearToken` 仅清内存副本，未清盘上 `boot.json`）。步骤内容当前为内联 `content`；
-> content-addressed payload blob 下发（步骤内容引用 `payload/`）为后续增强。
+> 失败只记 `/var/lib/nodeforge/firstboot.log`，不阻断启动。步骤内容支持内联 `content` 与
+> content-addressed payload blob（步骤引用 `payload/{name}/{revision}`，由 pre-init 下载并
+> 校验 size/SHA-256 后写入 `/var/lib/nodeforge/payload`，first-boot 以 `cp` 消费，不内联字节）；
+> 该 payload 下发已在 QEMU 全量验证中端到端验证（`NODEFORGE_PAYLOAD_PROOF`）。
 
 这样新系统看到的是同一个 tmpfs/loop backing，loop lower 不因旧 initrd root 被回收而失效，agent 也能取得同一
 session 的 handoff 事实。agent pre-init 自身在应用任何差量前验证目录不是 symlink、owner/mode/digest/session
@@ -288,8 +293,10 @@ v0.2 的接管不是重新配网，而是保持启动 NIC、MAC、IPv4 地址、
 - 静态模式：BootConfig 的 bootstrap 地址必须等于 PXE reservation，AgentPlan 的目标静态地址必须等于同一地址；
   agent pre-init 校验后写 renderer 配置但不 apply，真正 init 后 renderer
   adopt 同一地址。地址冲突探测失败在下载前终止。
-- first-boot agent unit 必须 `After=network-online.target nodeforge-handoff.service`，但网络超时只影响远端事件，
-  不阻止本地 first-boot。renderer 接管后连续 ping 服务端不是成功判据；成功判据是地址/route 未出现空窗、
+- first-boot agent unit 必须 `After=network-online.target nodeforge-handoff.service`。package action 可访问且只能访问
+  AgentPlan 固定的仓库：默认是当前 InstallSource 由 nodeforged 发布的 HTTP Yum/APT 源，并合并 CLI 明确增加的
+  仓库；DNF/APT 必须禁用未进入该集合的系统其他源。受管源不可达时该 step
+  按 first-boot 失败策略记录/重试；远端事件仍为 best-effort。renderer 接管后连续 ping 服务端不是成功判据；成功判据是地址/route 未出现空窗、
   默认路由未漂移，且服务端 event 可 best-effort 到达。
 
 ### 5.4 服务重启与断点续传

@@ -49,9 +49,13 @@ const node_inventory = @import("../state/node_inventory.zig");
 const operations = @import("../state/operations.zig");
 const rootfs_artifact_store = @import("../state/rootfs_artifact_store.zig");
 const diskless_delivery = @import("../state/diskless_delivery.zig");
+const diskless_lifecycle = @import("../state/diskless_session.zig");
 const dhcp_store = @import("../state/dhcp_store.zig");
 const diskless = @import("../profile/diskless.zig");
 const diskless_dto = @import("diskless_dto.zig");
+const rootfs_build_executor = @import("../provision/rootfs_build_executor.zig");
+const rootfs_os_builder = @import("../provision/rootfs_os_builder.zig");
+const password_hash = @import("../profile/password_hash.zig");
 const routes = @import("routes.zig");
 const log = std.log.scoped(.http);
 
@@ -303,8 +307,14 @@ fn route(request: zap.Request) !void {
         if (artifactBootRoute(path)) |relative| return bootFile(request, context, relative, meta);
     }
     if (std.mem.eql(u8, method, "POST")) {
+        if (agentConsumedSession(path)) |session_id| return disklessAgentConsumed(request, context, session_id, meta);
         if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
-            if (std.mem.eql(u8, node_route.suffix, "/events")) return nodeEvent(request, context, node_route.node_id, meta);
+            if (std.mem.eql(u8, node_route.suffix, "/events")) {
+                if (request.getHeader("x-nodeforge-session")) |session_id|
+                    if (context.diskless_store.find(session_id) != null)
+                        return disklessEvent(request, context, node_route.node_id, meta);
+                return nodeEvent(request, context, node_route.node_id, meta);
+            }
             if (std.mem.eql(u8, node_route.suffix, "/logs")) return nodeLog(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/facts")) return nodeFacts(request, context, node_route.node_id, meta);
             if (std.mem.eql(u8, node_route.suffix, "/installer-hooks/subiquity")) return subiquityReport(request, context, node_route.node_id, meta);
@@ -351,6 +361,7 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/software/available")) |name| return managementProfileSoftware(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/plan")) |name| return managementRootfsPlan(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/register")) |name| return managementRootfsRegister(request, context, name, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/build")) |name| return managementRootfsBuild(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs")) |name| return managementRootfsStatus(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfileCreate(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfile(request, context, name, meta);
@@ -489,6 +500,16 @@ fn splitBootSessionRoute(tail: []const u8) ?BootSessionRoute {
     return null;
 }
 
+fn agentConsumedSession(path: []const u8) ?[]const u8 {
+    const prefix = "/api/v1/boot-sessions/";
+    const suffix = "/agent-consumed";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const session = path[prefix.len .. path.len - suffix.len];
+    if (session.len != diskless_delivery.id_len) return null;
+    for (session) |byte| if (!std.ascii.isHex(byte)) return null;
+    return session;
+}
+
 /// v0.2: 从 `Authorization: Bearer <token>` 提取 raw token。
 fn parseBearer(header: ?[]const u8) ?[]const u8 {
     const value = header orelse return null;
@@ -496,6 +517,19 @@ fn parseBearer(header: ?[]const u8) ?[]const u8 {
     const token = value["Bearer ".len..];
     if (token.len == 0) return null;
     return token;
+}
+
+fn passwordSalt(plan_digest: []const u8, account: []const u8) [16]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("nodeforge-diskless-password-v1\x00");
+    hasher.update(plan_digest);
+    hasher.update("\x00");
+    hasher.update(account);
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    var encoded: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&encoded, "{x}", .{raw}) catch unreachable;
+    return encoded[0..16].*;
 }
 
 fn assetRoute(path: []const u8, prefix: []const u8) ?[]const u8 {
@@ -1552,14 +1586,15 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
         observe_log.err("asset: import failed for {s}: {t}", .{ value.path, err });
         return assetInputError(request, "unreadable asset", meta);
     };
-    if (lookup.findAsset(context.catalog_snapshot.value(), value.name)) |existing| if (value.kind != .managed_file) {
+    const revisioned_content = value.kind == .managed_file or value.kind == .archive or value.kind == .script;
+    if (lookup.findAsset(context.catalog_snapshot.value(), value.name)) |existing| if (!revisioned_content) {
         const same = existing.kind == value.kind and std.mem.eql(u8, existing.path, value.path) and optionalEqual(existing.distro, value.distro) and optionalEqual(existing.version, value.version) and existing.arch == value.arch and optionalEqual(existing.kernel_release, value.kernel_release) and optionalEqual(existing.sha256, &checksum);
         if (!same) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"asset.name_conflict\",\"message\":\"asset name already identifies different canonical metadata\"}}\n", meta);
         var reused: [384]u8 = undefined;
         const response = try std.fmt.bufPrint(&reused, "{{\"ok\":true,\"result\":{{\"name\":{f},\"kind\":{f},\"sha256\":{f}}}}}\n", .{ std.json.fmt(existing.name, .{}), std.json.fmt(@tagName(existing.kind), .{}), std.json.fmt(existing.sha256.?, .{}) });
         return json(request, .ok, response, meta);
     };
-    if (value.kind == .managed_file and (value.revision == 0 or value.size == null or value.media_type == null)) return assetInputError(request, "managed-file metadata incomplete", meta);
+    if (revisioned_content and (value.revision == 0 or value.size == null or value.media_type == null)) return assetInputError(request, "content asset metadata incomplete", meta);
     context.models.lock();
     defer context.models.unlock();
     const asset: model.AssetConfig = .{
@@ -1575,7 +1610,14 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
         .size = value.size,
         .media_type = value.media_type,
     };
-    if (value.kind == .managed_file) context.catalog.publishManagedFile(context.io, context.config, asset) catch |err| return assetInputError(request, @errorName(err), meta) else context.catalog.addAsset(context.io, context.config, asset) catch |err| return assetInputError(request, @errorName(err), meta);
+    if (revisioned_content) context.catalog.publishContentAsset(context.io, context.config, asset) catch |err| return assetInputError(request, @errorName(err), meta) else context.catalog.addAsset(context.io, context.config, asset) catch |err| return assetInputError(request, @errorName(err), meta);
+    // Asset publication changes the catalog generation and therefore the
+    // projected AppConfig generation as well. Re-publish the pair under the
+    // already-held model gate; leaving only CatalogRuntime advanced lets the
+    // next profile/bundle mutation start from a stale paired snapshot and can
+    // overwrite the just-published asset on disk.
+    applyCatalogFromDisk(@constCast(context)) catch
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"asset persisted but paired model publication failed\"}}\n", meta);
     var location: [320]u8 = undefined;
     const location_value = try std.fmt.bufPrint(&location, "/api/v1/management/assets/{s}", .{value.name});
     try request.setHeader("location", location_value);
@@ -2888,8 +2930,7 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
     if (!config_validate.validLogicalId(parsed.value.name) or !config_validate.validLogicalId(parsed.value.install_source))
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"name and install_source must be canonical logical identifiers\"}}\n", meta);
     const kind: model.ProfileKind = if (parsed.value.kind) |k| std.meta.stringToEnum(model.ProfileKind, k) orelse
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"--kind must be install or diskless\"}}\n", meta)
-    else .install;
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"--kind must be install or diskless\"}}\n", meta) else .install;
     const boot_bundle = parsed.value.boot_bundle;
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
@@ -2931,6 +2972,278 @@ fn applyCatalogFromDisk(context: *RouteContext) !void {
     context.catalog.lock();
     defer context.catalog.unlock();
     context.catalog.publishPreparedLocked(catalog_next);
+}
+
+const RootfsBuildRequest = struct { if_input_digest: ?[]const u8 = null };
+
+/// `profile rootfs build`：从 Profile build projection 构建内容寻址 rootfs 制品。
+/// daemon 用发行版原生 install-root 工具从 install source 受管 repository 构建
+/// OS 层 lower，叠加 rootfs-build phase 步骤（managed_file/archive/script/package），
+/// 再 mksquashfs 压缩，按 `rootfs_input_digest` 内容寻址登记。fail-closed：OS 层、
+/// 任一 rootfs-build 步骤或 squashfs 压缩失败即放弃整次构建，不发布半成品。
+///
+/// rootfs 按 `rootfs_input_digest` 缓存：若该 digest 已有 ready 制品则直接命中
+/// （幂等），不重复重构建。OS 层/chroot/squashfs 属环境相关执行边界（仅
+/// Linux/root 构建主机可用，与 initrd/first_boot 一致）。
+fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const body = request.body orelse "";
+    var if_input_digest: ?[]const u8 = null;
+    if (body.len != 0) {
+        const parsed = std.json.parseFromSlice(RootfsBuildRequest, context.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
+            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"invalid request body\"}}\n", meta);
+        defer parsed.deinit();
+        if_input_digest = parsed.value.if_input_digest;
+    }
+
+    const catalog = context.catalog_snapshot.value();
+    const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
+    if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs build is only available for diskless profiles\"}}\n", meta);
+
+    const digest = diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile) catch |err| return validationError(request, err, meta);
+    const digest_hex: []const u8 = digest[0..];
+
+    // 防漂移：调用方锁定预期 digest，不匹配则拒绝（readiness 不暗中触发漂移构建）。
+    if (if_input_digest) |expected| if (!std.mem.eql(u8, expected, digest_hex))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.digest_drift\",\"message\":\"current rootfs input digest does not match if_input_digest\"}}\n", meta);
+
+    const bundle_name = profile.boot_bundle orelse return validationError(request, error.MissingBootBundle, meta);
+    const boot_bundle = lookup.findBootBundle(catalog, bundle_name) orelse return validationError(request, error.MissingBootBundle, meta);
+
+    // 缓存命中：该 digest 已有 ready 制品，幂等返回，不重构建。
+    if (context.rootfs_artifacts.find(digest_hex)) |existing| {
+        var output: std.Io.Writer.Allocating = .init(context.allocator);
+        defer output.deinit();
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":\"already_present\",\"content_sha512\":{f},\"compressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(existing.content_sha512, .{}), existing.compressed_size, std.json.fmt(boot_bundle.kernel_release, .{}), std.json.fmt(existing.file, .{}) });
+        try output.writer.writeAll("}}\n");
+        return json(request, .ok, output.written(), meta);
+    }
+
+    const install_source = lookup.findInstallSource(catalog, profile.install_source) orelse return validationError(request, error.MissingInstallSource, meta);
+    const build_steps = diskless.rootfsBuildSteps(context.allocator, context.config, catalog, profile) catch |err| return validationError(request, err, meta);
+    defer if (build_steps.len != 0) context.allocator.free(build_steps);
+
+    const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
+    defer context.allocator.free(base);
+    var repo_closure = buildRepositoryClosure(context.allocator, catalog, profile, install_source, base) catch |err| return validationError(request, err, meta);
+    defer repo_closure.deinit(context.allocator);
+    const dto_manager = repo_closure.package_manager orelse return validationError(request, error.NoPackageManager, meta);
+    const os_package_manager: model.PackageManager = switch (dto_manager) {
+        .dnf => .dnf,
+        .apt => .apt,
+    };
+
+    // staging 目录（digest 命名）：OS 层构建 + rootfs-build 步骤叠加。
+    const work_dir = paths.require().work_dir;
+    const staging = try std.fmt.allocPrint(context.allocator, "{s}/rootfs-build-{s}", .{ work_dir, digest_hex });
+    defer context.allocator.free(staging);
+    std.Io.Dir.cwd().deleteTree(context.io, staging) catch {};
+    std.Io.Dir.cwd().createDirPath(context.io, staging) catch |err| return validationError(request, err, meta);
+    defer std.Io.Dir.cwd().deleteTree(context.io, staging) catch {};
+
+    // 1. OS 层：发行版原生 install-root 工具从受管 repository 构建 chroot-able 基线。
+    rootfs_os_builder.buildOsLayer(context.io, context.allocator, staging, os_package_manager, install_source.version, repo_closure.file_urls) catch |err| return buildError(request, err, "os-layer", meta);
+
+    // 2. 物化 rootfs-build content_asset 到 chroot 内 payload 目录。
+    var payload_paths = context.allocator.alloc(?[]const u8, build_steps.len) catch return validationError(request, error.OutOfMemory, meta);
+    defer context.allocator.free(payload_paths);
+    for (payload_paths) |*p| p.* = null;
+    var owned_payload_rel: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned_payload_rel.items) |str| context.allocator.free(str);
+        owned_payload_rel.deinit(context.allocator);
+    }
+    for (build_steps, 0..) |step, i| {
+        const asset_name = step.content_asset orelse continue;
+        const asset = lookup.findAsset(catalog, asset_name) orelse return validationError(request, error.MissingAsset, meta);
+        const rel = std.fmt.allocPrint(context.allocator, "{s}/{d}", .{ asset.name, asset.revision }) catch return validationError(request, error.OutOfMemory, meta);
+        try owned_payload_rel.append(context.allocator, rel);
+        payload_paths[i] = rel;
+        const src = std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ paths.require().assets_dir, asset.path }) catch return validationError(request, error.OutOfMemory, meta);
+        defer context.allocator.free(src);
+        const dest = std.fmt.allocPrint(context.allocator, "{s}/var/lib/nodeforge/payload/{s}", .{ staging, rel }) catch return validationError(request, error.OutOfMemory, meta);
+        defer context.allocator.free(dest);
+        const parent = std.fs.path.dirname(dest) orelse dest;
+        std.Io.Dir.cwd().createDirPath(context.io, parent) catch |err| return validationError(request, err, meta);
+        streamCopy(context.io, src, dest) catch |err| return validationError(request, err, meta);
+    }
+
+    // 3. rootfs-build phase：编译固定顺序命令并执行（fail-closed）。
+    //    package action 与 OS 层一致以 `dnf --installroot` 从本地 file:// 受管源
+    //    安装到 staging（host 上下文，不进入 chroot），避免单 worker daemon 回连
+    //    自死锁，也无需 bind-mount /dev/proc/sys；managed_file/archive/script 仍
+    //    chroot 执行（写绝对路径到 staging lower）。两者都不接触公网。
+    const plan = rootfs_build_executor.buildPlan(context.allocator, build_steps, dto_manager, repo_closure.file_urls, payload_paths, staging) catch |err| return validationError(request, err, meta);
+    defer plan.deinit(context.allocator);
+    rootfs_build_executor.execute(context.io, context.allocator, staging, plan) catch |err| return buildError(request, err, "rootfs-build", meta);
+
+    // 4. mksquashfs 压缩到内容寻址 .part 文件（rootfs_dir），再校验 SHA-512 后原子发布。
+    const rootfs_dir = paths.require().rootfs_dir;
+    std.Io.Dir.cwd().createDirPath(context.io, rootfs_dir) catch {};
+    const file_name = try std.fmt.allocPrint(context.allocator, "{s}.squashfs", .{digest_hex});
+    defer context.allocator.free(file_name);
+    const dest = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ rootfs_dir, file_name });
+    defer context.allocator.free(dest);
+    const part = try std.fmt.allocPrint(context.allocator, "{s}.part", .{dest});
+    defer context.allocator.free(part);
+    std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
+    errdefer std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
+    runBuildCmd(context.io, context.allocator, &.{ "mksquashfs", staging, part, "-noappend", "-no-progress", "-comp", "zstd" }) catch |err| return buildError(request, err, "mksquashfs", meta);
+
+    // 5. 流式 SHA-512（rootfs 可能数 GB，固定缓冲）。
+    var sha = std.crypto.hash.sha2.Sha512.init(.{});
+    var total_size: u64 = 0;
+    {
+        var f = std.Io.Dir.cwd().openFile(context.io, part, .{ .follow_symlinks = false }) catch |err| return validationError(request, err, meta);
+        defer f.close(context.io);
+        var buf: [256 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (true) {
+            const n = f.readPositionalAll(context.io, &buf, offset) catch |err| return validationError(request, err, meta);
+            if (n == 0) break;
+            sha.update(buf[0..n]);
+            offset += n;
+            total_size += n;
+        }
+    }
+    var sha512_raw: [64]u8 = undefined;
+    sha.final(&sha512_raw);
+    var content_sha512: [128]u8 = undefined;
+    _ = std.fmt.bufPrint(&content_sha512, "{x}", .{sha512_raw}) catch unreachable;
+    std.Io.Dir.rename(std.Io.Dir.cwd(), part, std.Io.Dir.cwd(), dest, context.io) catch |err| return validationError(request, err, meta);
+
+    // 6. 登记制品（同 register：digest sha512 一致则幂等，漂移则拒绝）。
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    const artifact: rootfs_artifact_store.Artifact = .{
+        .rootfs_input_digest = digest_hex,
+        .profile = profile.name,
+        .content_sha512 = content_sha512[0..],
+        .compressed_size = total_size,
+        .uncompressed_size = total_size,
+        .kernel_release = boot_bundle.kernel_release,
+        .file = file_name,
+        .created_at = unixNow(),
+    };
+    const result = context.rootfs_artifacts.register(context.io, artifact) catch |err| switch (err) {
+        error.RootfsDigestDrift => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.digest_drift\",\"message\":\"a different rootfs is already registered for this profile build\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    const state_str: []const u8 = if (result == .registered) "registered" else "already_present";
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":{f},\"content_sha512\":{f},\"compressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(state_str, .{}), std.json.fmt(content_sha512[0..], .{}), total_size, std.json.fmt(boot_bundle.kernel_release, .{}), std.json.fmt(file_name, .{}) });
+    try output.writer.writeAll("}}\n");
+    return json(request, .created, output.written(), meta);
+}
+
+const RepoClosure = struct {
+    package_manager: ?diskless_dto.FirstBootPackageManager,
+    /// nodeforged HTTP repo URLs（chroot 内 rootfs-build package action 用，v1）。
+    repository_urls: []const []const u8,
+    /// `file://` 指向构建主机本地 `repos_dir` 的受管源路径（OS 层 install-root
+    /// 构建用）。避免构建期 dnf 回连本 daemon 造成自死锁；与设计 file:// at build
+    /// time 一致。
+    file_urls: []const []const u8,
+
+    pub fn deinit(self: RepoClosure, allocator: std.mem.Allocator) void {
+        for (self.repository_urls) |url| allocator.free(url);
+        allocator.free(self.repository_urls);
+        for (self.file_urls) |url| allocator.free(url);
+        allocator.free(self.file_urls);
+    }
+};
+
+/// 合并 install source 与 Profile software 的受管 repository 引用，去重后把每个
+/// repository 的 `/artifacts/repositories/**` 路径重新绑定到当前 nodeforged
+/// endpoint（与 boot-prepare session 流程一致，避免 catalog 中过期的 authority）。
+fn buildRepositoryClosure(allocator: std.mem.Allocator, catalog: *const model.Catalog, profile: *const model.ProfileConfig, install_source: *const model.InstallSourceConfig, base: []const u8) !RepoClosure {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    for (install_source.repositories) |repository_name| try names.append(allocator, repository_name);
+    for (profile.software.repositories) |repository_name| {
+        var found = false;
+        for (names.items) |existing| if (std.mem.eql(u8, existing, repository_name)) {
+            found = true;
+            break;
+        };
+        if (!found) try names.append(allocator, repository_name);
+    }
+    var urls: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (urls.items) |url| allocator.free(url);
+        urls.deinit(allocator);
+    }
+    var file_urls: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (file_urls.items) |url| allocator.free(url);
+        file_urls.deinit(allocator);
+    }
+    var package_manager: ?diskless_dto.FirstBootPackageManager = null;
+    const repository_marker = "/artifacts/repositories/";
+    const repos_dir = paths.require().repos_dir;
+    for (names.items) |repository_name| {
+        const repository = lookup.findRepository(catalog, repository_name) orelse return error.MissingRepository;
+        const manager: diskless_dto.FirstBootPackageManager = switch (repository.manager) {
+            .dnf => .dnf,
+            .apt => .apt,
+        };
+        if (package_manager != null and package_manager.? != manager) return error.RepositoryManagerMismatch;
+        package_manager = manager;
+        const marker_index = std.mem.indexOf(u8, repository.base_url, repository_marker) orelse return error.ExternalEndpointForbidden;
+        const managed_path = repository.base_url[marker_index..];
+        // HTTP URL（chroot package action）；本地 file:// URL（OS 层构建，避免回连）。
+        try urls.append(allocator, try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, managed_path }));
+        try file_urls.append(allocator, try std.fmt.allocPrint(allocator, "file://{s}/{s}", .{ repos_dir, managed_path[repository_marker.len..] }));
+    }
+    return .{
+        .package_manager = package_manager,
+        .repository_urls = try urls.toOwnedSlice(allocator),
+        .file_urls = try file_urls.toOwnedSlice(allocator),
+    };
+}
+
+/// 流式拷贝文件（固定缓冲，不整块读入内存）。
+fn streamCopy(io: std.Io, src: []const u8, dest: []const u8) !void {
+    var in_file = std.Io.Dir.cwd().openFile(io, src, .{ .follow_symlinks = false }) catch |err| return err;
+    defer in_file.close(io);
+    var out_file = std.Io.Dir.cwd().createFile(io, dest, .{ .truncate = true }) catch |err| return err;
+    defer out_file.close(io);
+    var buf: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const n = try in_file.readPositionalAll(io, &buf, offset);
+        if (n == 0) break;
+        try out_file.writeStreamingAll(io, buf[0..n]);
+        offset += n;
+    }
+    try out_file.sync(io);
+}
+
+/// 运行构建期 OS 命令，退出码非 0 返回 BuildStepFailed。
+fn runBuildCmd(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    const result = try std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(65536), .stderr_limit = .limited(65536) });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.log.scoped(.rootfs_build).err("build cmd failed ({s}): {s}", .{ argv[0], result.stderr });
+                return error.BuildStepFailed;
+            }
+        },
+        else => {
+            std.log.scoped(.rootfs_build).err("build cmd did not exit cleanly ({s})", .{argv[0]});
+            return error.BuildStepFailed;
+        },
+    }
+}
+
+/// rootfs build 失败的稳定错误信封（fail-closed，不发布半成品）。
+fn buildError(request: zap.Request, err: anyerror, stage: []const u8, meta: RequestMeta) !void {
+    var buf: [320]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"ok\":false,\"error\":{{\"code\":\"rootfs.build_failed\",\"message\":\"rootfs build failed at stage: {s} ({s})\"}}}}\n", .{ stage, @errorName(err) }) catch
+        "{\"ok\":false,\"error\":{\"code\":\"rootfs.build_failed\",\"message\":\"rootfs build failed\"}}\n";
+    return json(request, .internal_server_error, body, meta);
 }
 
 const RootfsRegisterRequest = struct { path: []const u8 };
@@ -3056,8 +3369,8 @@ fn managementRootfsStatus(request: zap.Request, context: *RouteContext, name: []
 }
 
 /// v0.2 diskless BootConfig v2 交付。initrd 用 capsule 交付的 config-token +
-/// X-NodeForge-Session 认证后，首次 GET 签发 agent/event token 并返回 immutable
-/// rootfs + AgentPlan 定位器。
+/// X-NodeForge-Session 认证后返回 immutable rootfs + AgentPlan 定位器。四类
+/// capability 已由 boot-prepare 签发并通过 capsule 分离交付，BootConfig 不含 token。
 fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const config_token = parseBearer(request.getHeader("authorization")) orelse
         return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <config-token> is required\"}}\n", meta);
@@ -3070,13 +3383,8 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
     const decision = context.diskless_store.verify(session_hdr, config_token, .config, node_id, "", session.rootfsSha512(), 0, boot_session.monotonicNow());
     if (decision != .ok)
         return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n", meta);
-    // 首次 GET 签发 agent + event token（幂等：已签发则跳过，保持 raw token 不变）。
-    if (!session.agent_token.issued) {
-        context.diskless_store.issue(context.io, session_hdr, .agent) catch
-            return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_issue_failed\",\"message\":\"cannot issue agent token\"}}\n", meta);
-        context.diskless_store.issue(context.io, session_hdr, .event) catch
-            return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_issue_failed\",\"message\":\"cannot issue event token\"}}\n", meta);
-    }
+    context.diskless_store.markBootConfigFetched(context.io, session_hdr) catch
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_persist_failed\",\"message\":\"cannot persist boot-config lifecycle\"}}\n", meta);
     const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
     defer context.allocator.free(base);
     const config_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/boot-config", .{ base, node_id });
@@ -3088,6 +3396,14 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
     defer context.allocator.free(agent_plan_url);
     const event_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/events", .{ base, node_id });
     defer context.allocator.free(event_url);
+    const PayloadProjection = struct { payload: []const diskless_dto.PayloadEntry = &.{} };
+    const payload_projection = std.json.parseFromSlice(PayloadProjection, context.allocator, session.agentPlanJson(), .{ .ignore_unknown_fields = true }) catch
+        return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.plan_invalid\",\"message\":\"pinned AgentPlan is invalid\"}}\n", meta);
+    defer payload_projection.deinit();
+    var node_payload_size: u64 = 0;
+    for (payload_projection.value.payload) |entry|
+        node_payload_size = std.math.add(u64, node_payload_size, entry.size) catch
+            return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.payload_size_overflow\",\"message\":\"payload closure size overflow\"}}\n", meta);
     const bc: diskless_dto.BootConfig = .{
         .node_id = node_id,
         .session_id = session_id_slice,
@@ -3095,9 +3411,14 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
         .kernel_release = session.kernelRelease(),
         .config_url = config_url,
         .rootfs = .{ .url = rootfs_url, .sha512 = session.rootfsSha512(), .size = session.rootfs_size, .uncompressed_size = session.rootfs_size },
+        .overlay = .{
+            .tmpfs_percent = session.tmpfs_percent,
+            .minimum_free_bytes = session.minimum_free_bytes,
+            .safety_margin_bytes = session.safety_margin_bytes,
+            .node_payload_size = node_payload_size,
+        },
         .agent_plan = .{ .url = agent_plan_url, .digest = session.agentPlanDigest(), .size = @intCast(session.agent_plan_len) },
         .event_url = event_url,
-        .access = .{ .agent_token = context.diskless_store.rawToken(session, .agent), .event_token = context.diskless_store.rawToken(session, .event) },
         .expires_at = session.expires_at,
     };
     const body = try diskless_dto.renderBootConfig(context.allocator, bc);
@@ -3107,18 +3428,18 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
     return json(request, .ok, body, meta);
 }
 
-/// v0.2 diskless rootfs 下载。initrd 用 config-token（与 boot-config 相同）认证，
+/// v0.2 diskless rootfs 下载。initrd 用独立 rootfs:read token 认证，
 /// 通过 rootfs_artifact_store 定位已注册的 squashfs 制品并经 staticFile 交付。
 fn disklessRootfs(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
-    const config_token = parseBearer(request.getHeader("authorization")) orelse
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <config-token> is required\"}}\n", meta);
+    const rootfs_token = parseBearer(request.getHeader("authorization")) orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <rootfs-token> is required\"}}\n", meta);
     const session_hdr = request.getHeader("x-nodeforge-session") orelse
         return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_required\",\"message\":\"X-NodeForge-Session header is required\"}}\n", meta);
     const session = context.diskless_store.find(session_hdr) orelse
         return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
     if (!std.mem.eql(u8, session.nodeId(), node_id))
         return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.node_mismatch\",\"message\":\"session does not belong to this node\"}}\n", meta);
-    const decision = context.diskless_store.verify(session_hdr, config_token, .config, node_id, "", session.rootfsSha512(), 0, boot_session.monotonicNow());
+    const decision = context.diskless_store.verify(session_hdr, rootfs_token, .rootfs, node_id, "", session.rootfsSha512(), 0, boot_session.monotonicNow());
     if (decision != .ok)
         return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n", meta);
     const artifact = context.rootfs_artifacts.find(session.rootfsInputDigest()) orelse
@@ -3141,6 +3462,19 @@ fn disklessAgentPlan(request: zap.Request, context: *const RouteContext, session
     return json(request, .ok, session.agentPlanJson(), meta);
 }
 
+/// agent 已把 AgentPlan 与完整 payload closure 校验到本地后主动撤销读能力。
+fn disklessAgentConsumed(request: zap.Request, context: *const RouteContext, session_id: []const u8, meta: RequestMeta) !void {
+    const token = parseBearer(request.getHeader("authorization")) orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"agent token is required\"}}\n", meta);
+    const session = context.diskless_store.find(session_id) orelse return notFound(request, meta);
+    const decision = context.diskless_store.verify(session_id, token, .agent, session.nodeId(), "", session.agentPlanDigest(), 0, boot_session.monotonicNow());
+    if (decision != .ok)
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"agent credential verification failed\"}}\n", meta);
+    context.diskless_store.revoke(context.io, session_id, .agent) catch
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_revoke_failed\",\"message\":\"cannot persist agent token revocation\"}}\n", meta);
+    return json(request, .ok, "{\"ok\":true}\n", meta);
+}
+
 /// v0.2 diskless payload 交付。agent 用 agent:read token 认证后下载 content-addressed
 /// payload。v0.2 smoke test 的 AgentPlan payload 为空，此路由 fail-closed（404）。
 fn disklessPayload(request: zap.Request, context: *const RouteContext, session_id: []const u8, file_path: []const u8, meta: RequestMeta) !void {
@@ -3151,7 +3485,112 @@ fn disklessPayload(request: zap.Request, context: *const RouteContext, session_i
     const decision = context.diskless_store.verify(session_id, agent_token, .agent, session.nodeId(), file_path, session.agentPlanDigest(), 0, boot_session.monotonicNow());
     if (decision != .ok)
         return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n", meta);
-    return notFound(request, meta);
+    const P = struct { payload: []const diskless_dto.PayloadEntry = &.{} };
+    const parsed = std.json.parseFromSlice(P, context.allocator, session.agentPlanJson(), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
+        return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.plan_invalid\",\"message\":\"pinned AgentPlan is invalid\"}}\n", meta);
+    defer parsed.deinit();
+    var entry: ?diskless_dto.PayloadEntry = null;
+    for (parsed.value.payload) |candidate| if (std.mem.eql(u8, candidate.path, file_path)) {
+        entry = candidate;
+        break;
+    };
+    const payload = entry orelse return notFound(request, meta);
+    const slash = std.mem.indexOfScalar(u8, file_path, '/') orelse return notFound(request, meta);
+    const name = file_path[0..slash];
+    const revision = std.fmt.parseInt(u64, file_path[slash + 1 ..], 10) catch return notFound(request, meta);
+    const asset = lookup.findAsset(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    if (asset.revision != revision or asset.sha256 == null or !std.mem.eql(u8, asset.sha256.?, payload.digest))
+        return notFound(request, meta);
+    const full_path = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ paths.require().assets_dir, asset.path });
+    defer context.allocator.free(full_path);
+    const stat = std.Io.Dir.cwd().statFile(context.io, full_path, .{}) catch return notFound(request, meta);
+    if (stat.size != payload.size) return notFound(request, meta);
+    return staticFile(request, context, paths.require().assets_dir, asset.path, asset.sha256, meta);
+}
+
+const DisklessEventEnvelope = struct {
+    schema_version: u32,
+    session_id: []const u8,
+    event_seq: u64,
+    expected_phase: []const u8,
+    phase: []const u8,
+    message: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+};
+
+fn parseDisklessPhase(name: []const u8) ?diskless_lifecycle.Phase {
+    const candidates = [_]diskless_lifecycle.Phase{
+        .boot_config_fetched,
+        .diskless_initrd_started,
+        .diskless_rootfs_downloading,
+        .diskless_rootfs_verified,
+        .diskless_rootfs_mounted,
+        .diskless_switching_root,
+        .diskless_agent_configuring,
+        .diskless_running,
+        .failed,
+    };
+    for (candidates) |phase| if (std.mem.eql(u8, name, phase.canonicalName())) return phase;
+    return null;
+}
+
+/// v0.2 diskless lifecycle event append。event token 只能推进自身 session；
+/// expected_phase + event_seq 提供 CAS，完全相同的上一次请求可安全重放。
+fn disklessEvent(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const token = parseBearer(request.getHeader("authorization")) orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"event token is required\"}}\n", meta);
+    const session_id = request.getHeader("x-nodeforge-session") orelse
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_required\",\"message\":\"session header is required\"}}\n", meta);
+    const session = context.diskless_store.find(session_id) orelse return notFound(request, meta);
+    if (!std.mem.eql(u8, session.nodeId(), node_id))
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.node_mismatch\",\"message\":\"session does not belong to this node\"}}\n", meta);
+    if (!bodyWithin(request, 4 * 1024))
+        return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"diskless event body too large\"}}\n", meta);
+    const body = request.body orelse
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"diskless.event_invalid\",\"message\":\"missing event body\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(DisklessEventEnvelope, context.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"diskless.event_invalid\",\"message\":\"invalid event envelope\"}}\n", meta);
+    defer parsed.deinit();
+    const event = parsed.value;
+    if (event.schema_version != 1 or !std.mem.eql(u8, event.session_id, session_id))
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"diskless.event_invalid\",\"message\":\"event schema/session mismatch\"}}\n", meta);
+    const expected = parseDisklessPhase(event.expected_phase) orelse
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"diskless.phase_invalid\",\"message\":\"unknown expected phase\"}}\n", meta);
+    const target = parseDisklessPhase(event.phase) orelse
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"diskless.phase_invalid\",\"message\":\"unknown target phase\"}}\n", meta);
+    const decision = context.diskless_store.verify(session_id, token, .event, node_id, "", "", event.event_seq, boot_session.monotonicNow());
+    if (decision != .ok)
+        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless event credential verification failed\"}}\n", meta);
+
+    const result = context.diskless_store.advanceEvent(context.io, session_id, expected, target, event.event_seq) catch |err| switch (err) {
+        error.DisklessEventSequenceMismatch, error.DisklessExpectedPhaseMismatch, error.JumpRejected, error.BackwardRejected, error.AlreadyTerminal => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.event_conflict\",\"message\":\"event sequence or lifecycle transition rejected\"}}\n", meta),
+        else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_persist_failed\",\"message\":\"cannot persist diskless lifecycle\"}}\n", meta),
+    };
+    if (result == .applied) {
+        const revoke_kinds: []const diskless_delivery.Store.SlotKind = switch (target) {
+            .diskless_initrd_started => &.{.config},
+            .diskless_rootfs_verified => &.{.rootfs},
+            .diskless_running => &.{ .agent, .event },
+            .failed => &.{ .config, .rootfs, .agent, .event },
+            else => &.{},
+        };
+        for (revoke_kinds) |kind| context.diskless_store.revoke(context.io, session_id, kind) catch
+            return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_revoke_failed\",\"message\":\"cannot persist capability revocation\"}}\n", meta);
+        var fields: [5]events.Field = .{
+            .{ .key = "node_id", .value = node_id },
+            .{ .key = "boot_session_id", .value = session_id },
+            .{ .key = "phase", .value = event.phase },
+            .{ .key = "event_seq", .value = try std.fmt.allocPrint(context.allocator, "{d}", .{event.event_seq}) },
+            .{ .key = "reason", .value = event.reason orelse "" },
+        };
+        defer context.allocator.free(fields[3].value);
+        const field_count: usize = if (event.reason == null) 4 else 5;
+        context.event_writer.appendWithFields(context.io, context.allocator, paths.require().events_path, event.phase, event.message orelse "diskless lifecycle advanced", fields[0..field_count]) catch |err| {
+            observe_log.err("diskless event audit append failed after checkpoint: {t}", .{err});
+            return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"events.unavailable\",\"message\":\"event writer unavailable\"}}\n", meta);
+        };
+    }
+    return json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
 /// `node boot-prepare`：为 diskless 节点创建交付 session。编译 diskless plan 得到
@@ -3173,60 +3612,240 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.rootfs_not_registered\",\"message\":\"no rootfs artifact registered for this profile build; run 'profile rootfs register' first\"}}\n", meta);
     const bundle_name = profile.boot_bundle orelse return validationError(request, error.MissingBootBundle, meta);
     const boot_bundle = lookup.findBootBundle(catalog, bundle_name) orelse return validationError(request, error.MissingBootBundle, meta);
-    const session = context.diskless_store.begin(context.io, node_id, profile.name, rootfs_input_digest, artifact.content_sha512, artifact.compressed_size, boot_bundle.kernel_release, boot_session.monotonicNow(), unixNow()) catch |err| return validationError(request, err, meta);
+    const session = context.diskless_store.begin(
+        context.io,
+        node_id,
+        profile.name,
+        rootfs_input_digest,
+        artifact.content_sha512,
+        artifact.compressed_size,
+        boot_bundle.kernel_release,
+        plan.node_boot.tmpfs_percent,
+        plan.node_boot.minimum_free_bytes,
+        plan.node_boot.safety_margin_bytes,
+        boot_session.monotonicNow(),
+        unixNow(),
+    ) catch |err| return validationError(request, err, meta);
     const session_id_slice: []const u8 = session.session_id[0..];
     const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
     defer context.allocator.free(base);
     const event_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/events", .{ base, node_id });
     defer context.allocator.free(event_url);
-    // Phase 8：把 Profile-fixed first-boot 步骤内联进 AgentPlan（仅八步契约的四类动作，
-    // 跳过 repository/standard_packages）。步骤字符串引用 catalog/plan 内存，
-    // 仅外层数组由 context.allocator 拥有，render 后即释放。
+    // AgentPlan 禁止明文密码。按 immutable desired plan + account 派生稳定 salt，
+    // 服务端只把 `$6$` hash 投影给 agent。
+    var owned_password_hashes: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned_password_hashes.items) |value| context.allocator.free(value);
+        owned_password_hashes.deinit(context.allocator);
+    }
+    const agent_users = try context.allocator.alloc(diskless_dto.AgentUser, plan.node_apply.system.users.len);
+    defer context.allocator.free(agent_users);
+    for (plan.node_apply.system.users, 0..) |user, index| {
+        const hash: ?[]const u8 = if (user.password) |plain| blk: {
+            const salt = passwordSalt(desired_plan_digest, user.name);
+            const value = try password_hash.sha512Crypt(context.allocator, plain, &salt);
+            try owned_password_hashes.append(context.allocator, value);
+            break :blk value;
+        } else null;
+        agent_users[index] = .{
+            .name = user.name,
+            .uid = user.uid,
+            .shell = user.shell,
+            .locked = user.locked,
+            .password_hash = hash,
+            .sudo = user.sudo,
+            .groups = user.groups,
+            .ssh_authorized_keys = user.ssh_authorized_keys,
+        };
+    }
+    const root_password_hash: ?[]const u8 = if (plan.node_apply.system.ssh.root_password) |plain| blk: {
+        const salt = passwordSalt(desired_plan_digest, "root");
+        const value = try password_hash.sha512Crypt(context.allocator, plain, &salt);
+        try owned_password_hashes.append(context.allocator, value);
+        break :blk value;
+    } else null;
+    // Phase 8：把 Profile-fixed first-boot 步骤与完整 content-addressed payload
+    // closure 固定进 AgentPlan。小型 inline content 仍可直接携带；content_asset
+    // 只投影 payload path/digest/size，节点不再按 catalog 的 latest 名称取文件。
     var fb_steps: std.ArrayList(diskless_dto.FirstBootStep) = .empty;
     defer fb_steps.deinit(context.allocator);
-    for (plan.profile_build.first_boot_fixed_steps) |ps| {
+    var payload_entries: std.ArrayList(diskless_dto.PayloadEntry) = .empty;
+    defer payload_entries.deinit(context.allocator);
+    var owned_payload_paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned_payload_paths.items) |value| context.allocator.free(value);
+        owned_payload_paths.deinit(context.allocator);
+    }
+    const effective_first_boot_bundle = if (plan.node_apply.first_boot_bundle) |name|
+        findProvisioningBundleIn(catalog.provisioning_bundles, name) orelse return validationError(request, error.MissingProvisioningBundle, meta)
+    else
+        null;
+    const effective_first_boot_steps = if (effective_first_boot_bundle) |bundle_value| bundle_value.steps else &.{};
+    for (effective_first_boot_steps) |ps| {
+        if (ps.phase != .first_boot) continue;
         const act: ?diskless_dto.FirstBootAction = switch (ps.action) {
             .managed_file => .managed_file,
             .archive => .archive,
             .script => .script,
-            .@"package" => .@"package",
+            .package => .package,
             else => null,
         };
-        if (act) |a| try fb_steps.append(context.allocator, .{
-            .id = ps.name,
-            .action = a,
-            .content = ps.content,
-            .destination = ps.destination,
-            .mode = ps.mode,
-            .owner = ps.owner,
-            .group = ps.group,
-            .packages = ps.packages,
-        });
+        if (act) |a| {
+            var payload_path: ?[]const u8 = null;
+            if (ps.content_asset) |asset_name| {
+                const asset = lookup.findAsset(catalog, asset_name) orelse return validationError(request, error.MissingAsset, meta);
+                const digest = asset.sha256 orelse return validationError(request, error.InvalidProvisioningStep, meta);
+                const relative = try std.fmt.allocPrint(context.allocator, "{s}/{d}", .{ asset.name, asset.revision });
+                try owned_payload_paths.append(context.allocator, relative);
+                const full_path = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ paths.require().assets_dir, asset.path });
+                defer context.allocator.free(full_path);
+                const stat = std.Io.Dir.cwd().statFile(context.io, full_path, .{ .follow_symlinks = false }) catch |err|
+                    return validationError(request, err, meta);
+                if (stat.kind != .file) return validationError(request, error.InvalidProvisioningStep, meta);
+                var already_pinned = false;
+                for (payload_entries.items) |entry| if (std.mem.eql(u8, entry.path, relative)) {
+                    already_pinned = true;
+                    break;
+                };
+                if (!already_pinned)
+                    try payload_entries.append(context.allocator, .{ .path = relative, .digest = digest, .size = stat.size });
+                payload_path = relative;
+            }
+            try fb_steps.append(context.allocator, .{
+                .id = ps.name,
+                .idempotency_key = if (ps.idempotency_key.len == 0) ps.name else ps.idempotency_key,
+                .timeout_s = ps.timeout_s,
+                .retryable = ps.retryable,
+                .action = a,
+                .content = if (payload_path == null) ps.content else null,
+                .payload_path = payload_path,
+                .destination = ps.destination,
+                .mode = ps.mode,
+                .owner = ps.owner,
+                .group = ps.group,
+                .packages = ps.packages,
+            });
+        }
     }
     const fb_steps_slice = try fb_steps.toOwnedSlice(context.allocator);
     defer context.allocator.free(fb_steps_slice);
+    var repository_urls: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (repository_urls.items) |url| context.allocator.free(url);
+        repository_urls.deinit(context.allocator);
+    }
+    var package_manager: ?diskless_dto.FirstBootPackageManager = null;
+    // 默认源来自当前 InstallSource：ISO 导入时由 nodeforged 建立并通过
+    // /artifacts/repositories/** 发布。effective software.repositories 是操作员
+    // 通过 CLI 明确增加/删除后的附加选择；两者合并去重后 pin 进 AgentPlan。
+    const install_source = lookup.findInstallSource(catalog, plan.profile_build.install_source) orelse
+        return validationError(request, error.MissingInstallSource, meta);
+    var repository_names: std.ArrayList([]const u8) = .empty;
+    defer repository_names.deinit(context.allocator);
+    for (install_source.repositories) |repository_name|
+        try repository_names.append(context.allocator, repository_name);
+    for (plan.node_apply.software.repositories) |repository_name| {
+        var found = false;
+        for (repository_names.items) |existing| {
+            if (std.mem.eql(u8, existing, repository_name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) try repository_names.append(context.allocator, repository_name);
+    }
+    for (repository_names.items) |repository_name| {
+        const repository = lookup.findRepository(catalog, repository_name) orelse return validationError(request, error.MissingRepository, meta);
+        const manager: diskless_dto.FirstBootPackageManager = switch (repository.manager) {
+            .dnf => .dnf,
+            .apt => .apt,
+        };
+        if (package_manager != null and package_manager.? != manager)
+            return validationError(request, error.RepositoryManagerMismatch, meta);
+        package_manager = manager;
+        // Catalog 保存受管 repository 的路径身份；会话交付必须使用当前
+        // nodeforged endpoint。这样 setup/migration 后 server_ip 或 port 改变时，
+        // AgentPlan 不会把节点引向 catalog 中已经过期的 authority，同时仍保留
+        // ISO repository 的子路径（例如 /Minimal）。
+        const repository_marker = "/artifacts/repositories/";
+        const marker_index = std.mem.indexOf(u8, repository.base_url, repository_marker) orelse
+            return validationError(request, error.ExternalEndpointForbidden, meta);
+        const managed_path = repository.base_url[marker_index..];
+        const session_repository_url = try std.fmt.allocPrint(context.allocator, "{s}{s}", .{ base, managed_path });
+        try repository_urls.append(context.allocator, session_repository_url);
+    }
+    var packages_remove: std.ArrayList([]const u8) = .empty;
+    defer packages_remove.deinit(context.allocator);
+    for (node.overrides.software.packages_include.remove) |package|
+        try packages_remove.append(context.allocator, package);
+    for (node.overrides.software.packages_exclude.add) |package| {
+        var duplicate = false;
+        for (packages_remove.items) |existing| if (std.mem.eql(u8, existing, package)) {
+            duplicate = true;
+            break;
+        };
+        if (!duplicate) try packages_remove.append(context.allocator, package);
+    }
     const ap: diskless_dto.AgentPlan = .{
         .node_id = node_id,
         .session_id = session_id_slice,
         .plan_digest = desired_plan_digest,
         .rootfs_input_digest = rootfs_input_digest,
+        .node_apply_projection = .{
+            .node_id = plan.node_apply.node_id,
+            .mac = plan.node_apply.mac,
+            .arch = plan.node_apply.arch,
+            .hostname = plan.node_apply.hostname,
+            .network = plan.node_apply.network,
+            .system = .{
+                .localization = plan.node_apply.system.localization,
+                .connectivity = plan.node_apply.system.connectivity,
+                .ssh = .{
+                    .enabled = plan.node_apply.system.ssh.enabled,
+                    .password_authentication = plan.node_apply.system.ssh.password_authentication,
+                    .root_login = plan.node_apply.system.ssh.root_login,
+                    .root_password_hash = root_password_hash,
+                    .root_authorized_keys = plan.node_apply.system.ssh.root_authorized_keys,
+                },
+                .security = plan.node_apply.system.security,
+                .users = agent_users,
+                .packages = plan.node_apply.system.packages,
+            },
+            .software = plan.node_apply.software,
+            .software_transaction = .{
+                .manager = package_manager,
+                .repository_urls = repository_urls.items,
+                .install = node.overrides.software.packages_include.add,
+                .remove = packages_remove.items,
+            },
+        },
         .first_boot_bundle = profile.boot_bundle,
-        .payload = &.{},
+        .payload = payload_entries.items,
         .steps = fb_steps_slice,
+        .package_manager = package_manager,
+        .repository_urls = repository_urls.items,
+        .first_boot_max_attempts = profile.diskless.failure.max_attempts,
+        .first_boot_backoff_seconds = profile.diskless.failure.backoff_seconds,
         .event_url = event_url,
         .expires_at = session.expires_at,
     };
     const plan_json = try diskless_dto.renderAgentPlan(context.allocator, ap);
     defer context.allocator.free(plan_json);
-    context.diskless_store.pinAgentPlan(session_id_slice, plan_json) catch |err| return validationError(request, err, meta);
+    context.diskless_store.pinAgentPlan(context.io, session_id_slice, plan_json) catch |err| return validationError(request, err, meta);
     context.diskless_store.issue(context.io, session_id_slice, .config) catch |err| return validationError(request, err, meta);
+    context.diskless_store.issue(context.io, session_id_slice, .rootfs) catch |err| return validationError(request, err, meta);
+    context.diskless_store.issue(context.io, session_id_slice, .agent) catch |err| return validationError(request, err, meta);
+    context.diskless_store.issue(context.io, session_id_slice, .event) catch |err| return validationError(request, err, meta);
     const config_token = context.diskless_store.rawToken(session, .config);
+    const rootfs_token = context.diskless_store.rawToken(session, .rootfs);
+    const agent_token = context.diskless_store.rawToken(session, .agent);
+    const event_token = context.diskless_store.rawToken(session, .event);
     const config_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/boot-config", .{ base, node_id });
     defer context.allocator.free(config_url);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"config_token\":{f},\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
-        std.json.fmt(node_id, .{}), std.json.fmt(session_id_slice, .{}), std.json.fmt(config_token, .{}), std.json.fmt(config_url, .{}), std.json.fmt(session.agentPlanDigest(), .{}), std.json.fmt(rootfs_input_digest, .{}),
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"config_token\":{f},\"rootfs_token\":{f},\"agent_token\":{f},\"event_token\":{f},\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
+        std.json.fmt(node_id, .{}), std.json.fmt(session_id_slice, .{}), std.json.fmt(config_token, .{}), std.json.fmt(rootfs_token, .{}), std.json.fmt(agent_token, .{}), std.json.fmt(event_token, .{}), std.json.fmt(config_url, .{}), std.json.fmt(session.agentPlanDigest(), .{}), std.json.fmt(rootfs_input_digest, .{}),
     });
     return json(request, .ok, output.written(), meta);
 }

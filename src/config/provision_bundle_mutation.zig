@@ -34,6 +34,12 @@ pub const Patch = struct {
     name: ?[]const u8 = null,
     /// step 动作类型（`repository`/`standard_packages`/`managed_file`）。
     action: ?[]const u8 = null,
+    /// 执行阶段：install-post/rootfs-build/first-boot。
+    phase: ?[]const u8 = null,
+    idempotency_key: ?[]const u8 = null,
+    timeout_s: ?u32 = null,
+    retryable: ?bool = null,
+    packages: ?[]const []const u8 = null,
     /// `managed_file` 目标路径。
     destination: ?[]const u8 = null,
     /// `managed_file` 内容资产引用。
@@ -124,15 +130,20 @@ fn mutateSteps(allocator: std.mem.Allocator, current: []const model.ProvisionSte
     return switch (patch.operation) {
         .add => blk: {
             if (found != null or patch.name == null or !std.mem.eql(u8, patch.name.?, patch.identity)) return error.InvalidStepIdentity;
-            if (patch.action != null and !std.mem.eql(u8, patch.action.?, "managed-file")) return error.InvalidStepAction;
+            const action = try parseAction(patch.action orelse "managed-file");
             const values = try allocator.alloc(model.ProvisionStep, current.len + 1); @memcpy(values[0..current.len], current);
-            values[current.len] = .{ .name = patch.name.?, .action = .managed_file, .destination = patch.destination, .content_asset = patch.content_asset, .mode = patch.mode orelse 0o644, .owner = patch.owner orelse "root", .group = patch.group orelse "root" };
+            values[current.len] = .{ .name = patch.name.?, .idempotency_key = patch.idempotency_key orelse patch.name.?, .timeout_s = patch.timeout_s orelse 300, .retryable = patch.retryable orelse false, .phase = try parsePhase(patch.phase orelse "install-post"), .action = action, .destination = patch.destination, .content_asset = patch.content_asset, .packages = patch.packages orelse &.{}, .mode = patch.mode orelse 0o644, .owner = patch.owner orelse "root", .group = patch.group orelse "root" };
             break :blk values;
         },
         .set => blk: {
             const index = found orelse return error.StepNotFound;
             const values = try allocator.dupe(model.ProvisionStep, current); var value = values[index];
-            if (patch.action) |action| if (!std.mem.eql(u8, action, "managed-file")) return error.InvalidStepAction;
+            if (patch.action) |action| value.action = try parseAction(action);
+            if (patch.phase) |phase| value.phase = try parsePhase(phase);
+            if (patch.idempotency_key) |key| value.idempotency_key = key;
+            if (patch.timeout_s) |seconds| value.timeout_s = seconds;
+            if (patch.retryable) |enabled| value.retryable = enabled;
+            if (patch.packages) |packages| value.packages = packages;
             if (patch.destination) |field| value.destination = field;
             if (patch.content_asset) |field| value.content_asset = field;
             if (patch.mode) |field| value.mode = field;
@@ -146,6 +157,21 @@ fn mutateSteps(allocator: std.mem.Allocator, current: []const model.ProvisionSte
         .remove => removeAt(allocator, current, found orelse return error.StepNotFound),
         .move => moveAt(allocator, current, found orelse return error.StepNotFound, try destinationIndex(current, patch)),
     };
+}
+
+fn parsePhase(value: []const u8) !model.ProvisionPhase {
+    if (std.mem.eql(u8, value, "install-post")) return .install_post;
+    if (std.mem.eql(u8, value, "rootfs-build")) return .rootfs_build;
+    if (std.mem.eql(u8, value, "first-boot")) return .first_boot;
+    return error.InvalidProvisionPhase;
+}
+
+fn parseAction(value: []const u8) !model.ProvisionAction {
+    if (std.mem.eql(u8, value, "managed-file")) return .managed_file;
+    if (std.mem.eql(u8, value, "archive")) return .archive;
+    if (std.mem.eql(u8, value, "script")) return .script;
+    if (std.mem.eql(u8, value, "package")) return .@"package";
+    return error.InvalidStepAction;
 }
 
 fn stepIndex(values: []const model.ProvisionStep, identity: []const u8) ?usize { for (values, 0..) |value, index| if (std.mem.eql(u8, value.name, identity)) return index; return null; }

@@ -425,6 +425,24 @@ pub fn rootfsRegister(io: std.Io, port: u16, name: []const u8, file_path: []cons
     return managementMutation(io, port, "POST", route, rendered, revision, reason_buf);
 }
 
+/// `profile rootfs build`：从 Profile build projection 构建内容寻址 rootfs 制品
+/// （OS 层 + rootfs-build phase 步骤 + mksquashfs + 登记）。`if_input_digest` 非空时
+/// 作为防漂移约束（仅当当前 rootfs input digest 匹配才构建）。
+pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
+    var body: [1024]u8 = undefined;
+    const rendered = if (if_input_digest) |digest|
+        std.fmt.bufPrint(&body, "{{\"if_input_digest\":{f}}}", .{std.json.fmt(digest, .{})}) catch
+            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs build request is too large") }
+    else
+        std.fmt.bufPrint(&body, "{{}}", .{}) catch
+            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs build request is too large") };
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name}) catch return .{ .reachable = false, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", route, rendered, revision, reason_buf);
+}
+
 /// v0.2: 为 diskless 节点创建交付 session（POST boot-prepare）。
 /// 返回 capsule 交付所需的 config_token、session_id、agent_plan_digest 等。
 pub fn bootPrepareJson(io: std.Io, port: u16, node_id: []const u8, output: []u8, reason_buf: []u8) !?[]const u8 {

@@ -76,6 +76,22 @@ pub const diskless_credential = @import("state/diskless_credential.zig");
 pub const http_diskless_dto = @import("http/diskless_dto.zig");
 /// v0.2 rootfs builder core：制品记录、构建状态机、DeliveryManifest、local-only 检查。
 pub const provision_rootfs_build = @import("provision/rootfs_build.zig");
+/// v0.2 agent pre-init typed TargetSystem finalizer。
+pub const provision_node_apply = @import("provision/node_apply.zig");
+/// v0.2 rootfs-build phase 执行器：把 Profile rootfs-build 步骤编译为 chroot 构建命令（复用 first_boot 渲染）。
+pub const provision_rootfs_build_executor = @import("provision/rootfs_build_executor.zig");
+/// v0.2 rootfs OS-layer builder：用发行版原生 install-root 工具从受管 repository 构建 OS 层 lower。
+pub const provision_rootfs_os_builder = @import("provision/rootfs_os_builder.zig");
+pub const initrd_memory = @import("initrd/memory.zig");
+pub const initrd_download = @import("initrd/download.zig");
+
+test {
+    _ = provision_node_apply;
+    _ = provision_rootfs_build_executor;
+    _ = provision_rootfs_os_builder;
+    _ = initrd_memory;
+    _ = initrd_download;
+}
 pub const node_inventory = @import("state/node_inventory.zig");
 /// v0.2 rootfs artifact store：已构建 rootfs 制品按 rootfs_input_digest 内容寻址登记。
 pub const state_rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");

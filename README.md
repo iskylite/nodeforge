@@ -60,7 +60,7 @@ NodeForge/
 详细设计、审计和验证记录位于 [`docs/`](docs/)，入口见 [文档导航](docs/README.md)：
 
 - [v0.1 设计与修复计划](docs/design/V0_1_DESIGN.md)：当前权威设计，定义所有权模型和完成标准。
-- [v0.2 设计范围](docs/design/V0_2_DESIGN.md)：尚未实现的内存无盘启动（M5-M7）。
+- [v0.2 设计范围](docs/design/V0_2_DESIGN.md)：正在实现的内存无盘启动与节点一次性配置。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
 - [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录。
 
@@ -114,13 +114,15 @@ IPv4 PXE 无人值守安装产品，M0-M4 的基础服务和安装链路已完�
 | M4.12 | 存储 fallback/override | 历史实现，所有权方案已被取代 |
 | M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 进行中 |
 
-### v0.2（未开始）
+### v0.2（进行中）
 
-v0.1 冻结后才可启动，主要包括：
+当前已落地 schema v4、diskless Profile、rootfs 制品登记、BootConfig v2 /
+AgentPlan v1、分域 capability、严格 HEAD + Range 下载、tmpfs overlay、node-apply
+与 aarch64 Rocky 9.7 完整 OS QEMU 启动闭环。尚未达到 v0.2 完成标准，主要剩余
+content-addressed first-boot payload、失败恢复/负向矩阵、x86_64/UEFI 与实机验证。
 
-- **M5**：内存无盘启动（squashfs overlay / ram rootfs）
-- **M6**：支持矩阵增强（BIOS PXELINUX、更多发行版版本、生产容量压测）
-- **M7**：补充包和后处理增强（archive/script/first-boot/runtime provision）
+- **v0.2**：内存无盘启动（固定 squashfs overlay）及 node-apply/first-boot
+- **v0.3+**：BIOS PXELINUX、更多发行版和后续 rootfs 形态，详见各版本设计
 
 IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是项目永久非目标。
 
