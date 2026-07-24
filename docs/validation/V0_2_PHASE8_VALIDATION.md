@@ -1,12 +1,23 @@
 # v0.2 Phase 8 r97n0 QEMU 验证
 
-日期：2026-07-23  
+日期：2026-07-23（2026-07-24 复验：同步已提交源码并改用本地交叉编译+同步工作流）  
 主机：`r97n0`（aarch64，Rocky Linux 9.7）  
 验证脚本：`tests/v0_2_qemu_full.sh`
 
+## 构建与验证工作流
+
+验证用二进制在开发机本地交叉编译后同步到 r97n0，**不在 r97n0 上编译**，确保 r97n0
+始终运行与本地仓库一致的已提交构建（杜绝验证机源码漂移）：
+
+- 本地（macOS arm64）：`zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe`
+- 同步到 r97n0：`rsync -az --delete zig-out/bin/ root@r97n0:/root/NodeForge/zig-out/bin/`
+- `tests/v0_2_qemu_full.sh`、`tests/v0_2_rootfs_build.sh` 不再 `zig build`，改为校验
+  `zig-out/bin/{nodeforge,nodeforged,nodeforge-agent,nodeforge-initrd}` 已存在（缺失即 fail
+  并提示本地交叉编译+同步）。
+
 ## 已验证
 
-- 本机 `zig build test --summary all` 为 342/342。
+- 本机 `zig build test --summary all` 为 344/344（11/11 build steps succeeded）。
 - r97n0 上从保留的 Rocky Linux 9.7 基线派生 1,203,974,144 byte squashfs，
   注入当前 `nodeforge-agent`；从保留的 initramfs fixture 注入当前
   `nodeforge-initrd`，不修改基线 fixture。
@@ -55,14 +66,17 @@ action=archive|script|package` 已实现。
 - r97n0 验证：对真实 Rocky 9.7 Minimal 受管源构建 109,146,112 byte squashfs，managed_file/archive/script
   三类 rootfs-build 步骤经 chroot 烘入 lower 后在产物内逐项校验
   （`NODEFORGE_BUILD_PROOF/ARCHIVE/SCRIPT`）；二次构建命中缓存返回 `already_present`（不重构建）。
-  package action（`--installroot` + `tree`）已实现，待 r97n0 恢复后随 `tests/v0_2_rootfs_build.sh` 验证。
+  package action（`--installroot` + `tree`）于 2026-07-24 在 r97n0 端到端验证通过（`tests/v0_2_rootfs_build.sh`）：以 `dnf --installroot` 从本地 `file://` 源安装 `tree` 到 staging，产物内 `/usr/bin/tree` 可执行校验通过；二次构建命中缓存返回 `already_present`。
 - `tests/v0_2_rootfs_build.sh` 为可复现夹具（catalog 注入 + 仓库 symlink + 验证）。
 
 QEMU 全量验证重跑通过（`tests/v0_2_qemu_full.sh`，2026-07-23）：修复夹具中仓库 `base_url` 丢失
 `/Minimal` 子路径与缺失仓库文件两项问题（first-boot package action 因此可刷新元数据），并使
 first-boot agent 追加写 `firstboot.log`（diskless 下位于 volatile tmpfs，每次启动为空），保留验证
-二次执行的首次运行证据。仍待收口：rootfs-build package action `--installroot` 端到端验证（待 r97n0 恢复）、
-x86_64 UEFI 与实机矩阵（传输断流/ETag 漂移/内容损坏已由 `tests/v0_2_transfer_fault.sh` 验证）。
+二次执行的首次运行证据。rootfs-build package action `--installroot` 端到端已于 2026-07-24 验证通过（见上）；
+x86_64 UEFI smoke 与 VMware（compute_use）实机矩阵因当前环境不具备（r97n0 仅有 aarch64 QEMU、无
+OVMF/qemu-system-x86_64；当前上下文无 compute_use 能力），整体推迟到 v0.2.1，见
+`docs/validation/V0_2_1_RESERVED.md`（传输断流/ETag 漂移/内容损坏已由
+`tests/v0_2_transfer_fault.sh` 验证）。
 
 ## 传输故障注入负测
 
@@ -90,7 +104,7 @@ x86_64 UEFI 与实机矩阵（传输断流/ETag 漂移/内容损坏已由 `tests
 3. rootfs-build package action：以 `dnf --installroot` 从本地 `file://` 受管源安装到 staging（不回连 daemon、
    不 bind-mount `/dev/proc/sys`），与 OS 层一致的本地源保真。
 4. 传输断流/ETag 漂移/内容损坏已验证（见上）；越权、过期、重启恢复和内存不足已在 QEMU 全量验证覆盖；
-   剩余 x86_64 UEFI 与实机矩阵。
+   剩余 x86_64 UEFI smoke 与 VMware（compute_use）实机矩阵，已推迟到 v0.2.1（见 `docs/validation/V0_2_1_RESERVED.md`）。
 
 本次使用的 catalog 注入、initramfs 重打包和 QEMU 启动脚本均是验证夹具，不是
 nodeforged 或 diskless guest 的运行时依赖。

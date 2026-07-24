@@ -29,7 +29,13 @@ rm -rf "$work" "$install_root"
 mkdir -p "$work"
 
 cd "$repo"
-zig build -Doptimize=ReleaseSafe
+# Binaries are cross-compiled on the dev host and synced here; do NOT compile
+# on the verification host, so r97n0 always runs the exact committed build.
+#   Local build : zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
+#   Sync to host: rsync -az --delete zig-out/bin/ root@r97n0:/root/NodeForge/zig-out/bin/
+for b in nodeforge nodeforged nodeforge-agent nodeforge-initrd; do
+    [[ -x "zig-out/bin/$b" ]] || { echo "missing prebuilt $b: cross-compile locally and sync zig-out/bin/ (see docs/validation/V0_2_PHASE8_VALIDATION.md)" >&2; exit 1; }
+done
 
 # Produce derived fixtures; preserve the historical base rootfs/initramfs.
 unsquashfs -d "$work/rootfs" "$base_rootfs" >/dev/null

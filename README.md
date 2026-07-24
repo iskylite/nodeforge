@@ -60,9 +60,10 @@ NodeForge/
 详细设计、审计和验证记录位于 [`docs/`](docs/)，入口见 [文档导航](docs/README.md)：
 
 - [v0.1 设计与修复计划](docs/design/V0_1_DESIGN.md)：当前权威设计，定义所有权模型和完成标准。
-- [v0.2 设计范围](docs/design/V0_2_DESIGN.md)：正在实现的内存无盘启动与节点一次性配置。
+- [v0.2 设计总纲](docs/design/V0_2_DESIGN.md)：diskless 无盘启动主流程，已实现并通过 aarch64 QEMU 完整闭环验证。
+- [v0.2.1 保留项](docs/validation/V0_2_1_RESERVED.md)：异架构/实机验证矩阵（x86_64 UEFI smoke、VMware compute_use），当前暂不验证。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
-- [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录。
+- [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录（含 [Phase 8 QEMU 全量验证](docs/validation/V0_2_PHASE8_VALIDATION.md)）。
 
 文档冲突时的优先级：现行版本设计 > 当前代码与审计证据 > 验证记录 > 历史归档。
 
