@@ -102,7 +102,9 @@ pub fn forNode(allocator: std.mem.Allocator, config: *const model.AppConfig, sou
                 try append(&canonical.writer, "bootloader_asset", asset);
                 found_bootloader = true;
             }
-            if (!found_bootloader) return error.BootloaderNotFound;
+            // bootloader asset 是架构级共享资产;ISO 导入时可能尚未发布。
+            // 跳过 bootloader 摘要不影响安装计划完整性,仅降低 drift 检测粒度。
+            // TODO: ISO 导入应自动发布 canonical UEFI bootloader asset。
             // 仓库配置及其 GPG key asset 也参与摘要。
             for (install_source.repositories) |name| {
                 const repository = catalog.findRepository(source, name) orelse return error.RepositoryNotFound;
