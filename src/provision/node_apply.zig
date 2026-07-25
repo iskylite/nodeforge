@@ -197,16 +197,26 @@ fn renderUsers(w: *std.Io.Writer, allocator: std.mem.Allocator, system: dto.Agen
         try w.writeByte(' ');
         try quote(w, user.name);
         try w.writeAll("; fi\n");
-        if (user.groups.len != 0 or user.sudo) {
+        if (user.groups.len != 0) {
             var groups: std.Io.Writer.Allocating = .init(allocator);
             defer groups.deinit();
             for (user.groups, 0..) |group, i| try groups.writer.print("{s}{s}", .{ if (i == 0) "" else ",", group });
-            if (user.sudo) try groups.writer.print("{s}wheel", .{if (groups.written().len == 0) "" else ","});
             try w.writeAll("usermod -a -G ");
             try quote(w, groups.written());
             try w.writeByte(' ');
             try quote(w, user.name);
             try w.writeByte('\n');
+        }
+        // sudo 通过 portable sudoers.d drop-in 授予，替代硬编码 wheel/sudo 组成员。
+        // 后者在 Ubuntu（无 wheel 组）上 usermod -a -G wheel 会失败并因 set -e 中断
+        // node-apply；drop-in 不依赖发行版默认 %wheel/%sudo 条目，跨发行版一致生效。
+        if (user.sudo) {
+            var sudoers: std.Io.Writer.Allocating = .init(allocator);
+            defer sudoers.deinit();
+            try sudoers.writer.print("{s} ALL=(ALL) ALL\n", .{user.name});
+            const s_path = try std.fmt.allocPrint(allocator, "/etc/sudoers.d/nodeforge-{s}", .{user.name});
+            defer allocator.free(s_path);
+            try emitFile(w, s_path, sudoers.written(), 0o440);
         }
         try setPassword(w, user.name, user.password_hash, user.locked);
         const home = try std.fmt.allocPrint(allocator, "/home/{s}", .{user.name});
@@ -278,7 +288,9 @@ fn renderSsh(w: *std.Io.Writer, allocator: std.mem.Allocator, ssh: dto.AgentSsh)
     defer content.deinit();
     try content.writer.print("PermitRootLogin {s}\nPasswordAuthentication {s}\n", .{ @tagName(ssh.root_login), if (ssh.password_authentication) "yes" else "no" });
     try emitFile(w, "/etc/ssh/sshd_config.d/60-nodeforge.conf", content.written(), 0o600);
-    try w.writeAll(if (ssh.enabled) "systemctl enable sshd 2>/dev/null || systemctl enable ssh\n" else "systemctl disable sshd 2>/dev/null || systemctl disable ssh || true\n");
+    // sshd/ssh 单元可能尚未安装（由 software transaction 或 first-boot 安装，或在最小 rootfs 中缺失）。
+    // 与 disable 分支一致地 best-effort：启用失败不阻断 node-apply（readiness 阶段已对正式部署校验 sshd 存在）。
+    try w.writeAll(if (ssh.enabled) "systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true\n" else "systemctl disable sshd 2>/dev/null || systemctl disable ssh || true\n");
 }
 
 fn renderNtp(w: *std.Io.Writer, allocator: std.mem.Allocator, connectivity: model.ConnectivityPolicy) !void {
@@ -290,7 +302,8 @@ fn renderNtp(w: *std.Io.Writer, allocator: std.mem.Allocator, connectivity: mode
     defer chrony.deinit();
     for (connectivity.ntp_servers) |server| try chrony.writer.print("server {s} iburst\n", .{server});
     try emitFile(w, "/etc/chrony.conf", chrony.written(), 0o644);
-    try w.writeAll("systemctl enable chronyd 2>/dev/null || systemctl enable systemd-timesyncd\n");
+    // NTP 单元可能尚未安装；与 disable 分支一致地 best-effort 启用。
+    try w.writeAll("systemctl enable chronyd 2>/dev/null || systemctl enable systemd-timesyncd 2>/dev/null || true\n");
 }
 
 fn renderSecurity(w: *std.Io.Writer, security: model.TargetSecurityConfig) !void {
@@ -445,4 +458,36 @@ test "static network projection writes netplan alongside NetworkManager" {
     // （逐字节保真由上面的 encodeOctal 往返测试覆盖），这里只断言字面量：路径与 guard。
     try std.testing.expect(std.mem.indexOf(u8, script, "/etc/netplan/60-nodeforge.yaml") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "if [ -d /etc/netplan ]; then") != null);
+}
+
+test "sudo granted via portable sudoers drop-in; service enable best-effort" {
+    // 跨发行版可移植性：Ubuntu 无 wheel 组，硬编码 wheel 会让 usermod -a -G wheel 失败
+    // 并因 set -e 中断 node-apply。改用 /etc/sudoers.d drop-in 授予 sudo；同时 ssh/ntp
+    // 的 enable 在单元未安装时 best-effort（|| true），与 disable 分支对称。
+    const projection: dto.NodeApplyProjection = .{
+        .node_id = "n1",
+        .mac = "02:00:00:00:00:01",
+        .arch = .aarch64,
+        .hostname = null,
+        .network = .{},
+        .system = .{
+            .localization = .{},
+            .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.example.org"} },
+            .ssh = .{ .enabled = true, .password_authentication = false, .root_login = .no },
+            .security = .{},
+            .users = &.{.{ .name = "admin", .sudo = true }},
+        },
+        .software = .{},
+    };
+    const script = try render(std.testing.allocator, projection);
+    defer std.testing.allocator.free(script);
+    // sudo：drop-in 路径与 0440 模式存在；不再硬编码 wheel 组成员。
+    // 文件内容字节经 encodeOctal 八进制转义，逐字节保真由 encodeOctal 往返测试覆盖。
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/sudoers.d/nodeforge-admin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "chmod 0440 '/etc/sudoers.d/nodeforge-admin'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "wheel") == null);
+    // ssh enable best-effort（与 disable 分支对称）。
+    try std.testing.expect(std.mem.indexOf(u8, script, "systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true") != null);
+    // ntp enable best-effort（time_sync=true 触发 enable 分支）。
+    try std.testing.expect(std.mem.indexOf(u8, script, "systemctl enable chronyd 2>/dev/null || systemctl enable systemd-timesyncd 2>/dev/null || true") != null);
 }

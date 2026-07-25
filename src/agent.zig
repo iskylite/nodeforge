@@ -261,7 +261,15 @@ fn runChecked(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     switch (result.term) {
-        .exited => |code| if (code != 0) return error.SubprocessFailed,
-        else => return error.SubprocessFailed,
+        // 失败时把退出码与 stderr 打到控制台：agent 作为 PID 1 此前静默 panic，无任何
+        // 诊断，难以定位 node-apply 脚本究竟哪条命令失败（如 Ubuntu 上 usermod/enable）。
+        .exited => |code| if (code != 0) {
+            std.debug.print("nodeforge-agent: 命令失败 exit={d}: {s}\n", .{ code, result.stderr });
+            return error.SubprocessFailed;
+        },
+        else => {
+            std.debug.print("nodeforge-agent: 子进程异常终止: {s}\n", .{result.stderr });
+            return error.SubprocessFailed;
+        },
     }
 }
