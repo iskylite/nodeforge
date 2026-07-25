@@ -51,9 +51,10 @@
   package action 以 `dnf --installroot` 在 host 上下文从本地 `file://` 受管源安装
   （不 chroot、不 bind-mount /dev/proc/sys、不回连 daemon），`tree` RPM 烤入 lower 校验；
   managed_file/archive/script 三类步骤烤入校验；二次构建命中缓存 `already_present`。
+- **Ubuntu 22.04 aarch64 diskless smoke**（`tests/v0_2_ubuntu_qemu_smoke.sh`，r97n0，2026-07-25）：复用 ISO casper squashfs 作为 diskless lower，验证 diskless 启动主循环 + first-boot 在 Ubuntu 用户态下正确（`switch_root` -> `nodeApply` -> `diskless.running`，first-boot 0 失败）。详见 `V0_2_PHASE8_VALIDATION.md`。注意：Ubuntu OS 层 rootfs-build（apt/debootstrap）在 v0.2 仍不支持（`AptOsLayerUnsupported`），属 v0.2.1 功能项，非本验证矩阵保留项。
 - **传输故障负测**（`tests/v0_2_transfer_fault.sh`，r97n0）：clean / ETag 漂移 / 内容损坏 / 断流
   四场景均 fail-closed。
-- **单元测试**：本机 `zig build test` = 344/344 通过（11/11 build steps succeeded）。
+- **单元测试**：本机 `zig build test` = 345/345 通过（11/11 build steps succeeded）。
 
 ## 5. v0.2.1 闭环路径
 

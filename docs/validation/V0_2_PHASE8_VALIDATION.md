@@ -17,7 +17,7 @@
 
 ## 已验证
 
-- 本机 `zig build test --summary all` 为 344/344（11/11 build steps succeeded）。
+- 本机 `zig build test --summary all` 为 345/345（11/11 build steps succeeded）。
 - r97n0 上从保留的 Rocky Linux 9.7 基线派生 1,203,974,144 byte squashfs，
   注入当前 `nodeforge-agent`；从保留的 initramfs fixture 注入当前
   `nodeforge-initrd`，不修改基线 fixture。
@@ -94,6 +94,68 @@ OVMF/qemu-system-x86_64；当前上下文无 compute_use 能力），整体推�
   下载被拒绝。
 
 该校验逻辑精确复刻 `download.zig`；Zig 单测覆盖 `parseHead`/`validateRange` 的确切代码。
+
+## Ubuntu 22.04 aarch64 diskless QEMU smoke（2026-07-25）
+
+验证脚本：`tests/v0_2_ubuntu_qemu_smoke.sh`（r97n0）。在已发布 Ubuntu 安装源的 catalog
+（`nodeforge assets import /root/ubuntu-22.04.5-live-server-arm64.iso`）上，复用 ISO casper
+`ubuntu-server-minimal.squashfs` 作为 diskless lower rootfs，验证 diskless 启动主循环与
+first-boot 在 Ubuntu 用户态下的正确性。
+
+### 暴露并修复的跨发行版可移植性缺陷
+
+v0.2 的 diskless node-apply 渲染器（`src/provision/node_apply.zig`）最初按 Rocky
+（dnf / `wheel` 组）假设编写。Ubuntu 验证暴露两处缺陷，导致 agent pre-init 的 `nodeApply`
+在 `set -eu` 脚本中失败、`diskless.failed`、PID 1 退出 1 触发 kernel panic：
+
+1. **sshd/ssh 单元启用未 best-effort**：`renderSsh` 的 enable 分支
+   `systemctl enable sshd 2>/dev/null || systemctl enable ssh` 缺少 `|| true`（disable 分支有）。
+   Ubuntu 最小 casper rootfs 未预装 openssh-server，两个单元均不存在，`||` 末条命令失败，
+   `set -e` 中断 node-apply。
+2. **sudo 硬编码 wheel 组**：`renderUsers` 对 sudo 用户无条件 `usermod -a -G wheel`。
+   Ubuntu 无 `wheel` 组（用 `sudo` 组），`usermod` 返回 `group 'wheel' does not exist`，
+   中断 node-apply。diskful 的 kickstart/ubuntu adapter 已按发行版区分（wheel/sudo），
+   但 diskless 渲染器作为“只消费服务端 typed projection 的 dumb consumer”不应感知发行版。
+
+修复（`src/provision/node_apply.zig`、`src/agent.zig`）：
+
+- `renderSsh`/`renderNtp` 的 enable 分支补 `|| true`，与各自 disable 分支对称：单元未安装
+  （由 software transaction / first-boot 后续安装，或在最小 rootfs 中缺失）时不中断 node-apply。
+  正式部署的 sshd 存在性仍由 readiness 阶段校验（设计：SSH enabled 但无 sshd 时拒绝启用 PXE）。
+- `renderUsers` 的 sudo 改用 portable `/etc/sudoers.d/nodeforge-<user>`（0440，
+  `<user> ALL=(ALL) ALL`）drop-in 授予，替代硬编码 wheel/sudo 组成员。drop-in 不依赖
+  发行版默认 `%wheel`/`%sudo` sudoers 条目，跨发行版一致生效；显式 `user.groups` 成员保持不变。
+- `src/agent.zig` `runChecked` 在子进程失败时把退出码与 stderr 打到控制台：agent 作为
+  PID 1 此前静默 panic、无任何诊断，难以定位 node-apply 脚本究竟哪条命令失败。
+
+### 验证结果（r97n0，2026-07-25）
+
+- 本地交叉编译 `zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe`，同步
+  `zig-out/bin/` 到 r97n0（**不在 r97n0 上编译**）。
+- `nodeforge assets import`：catalog 正确填充 distro=ubuntu / version=22.04 / arch=aarch64、
+  casper `vmlinuz`+`initrd`、apt 仓库与全量软件索引、grub bootloader、默认 profile；
+  `ubuntuRepositoryComplete` 为 true。
+- smoke 从 ISO casper `ubuntu-server-minimal.squashfs` 派生 diskless lower rootfs
+  （补 `/sbin/init` -> systemd 符号链接、注入 agent + firstboot unit + validation drop-in），
+  注入 boot_bundle/profile/node 到已有 Ubuntu catalog，QEMU aarch64（3 GiB）启动。
+- 生命周期：initrd -> `switch_root` -> `agent_configuring` -> 拉取 AgentPlan（2569 B）->
+  `agent-consumed` -> `nodeApply` 成功（不再 `diskless.failed`）-> `exec /sbin/init` ->
+  Ubuntu 22.04 systemd 启动 -> firstboot unit 执行 -> `diskless.running`。
+- first-boot `[first-boot] done: 0 failure(s)`；串口出现 `NODEFORGE_UBUNTU_VALIDATION_DONE`。
+- smoke 三项断言全 PASS：`validation done` / `diskless.running` / `ubuntu boot evidence`。
+- 本机 `zig build test` = 345/345 通过（新增 `sudo granted via portable sudoers drop-in;
+  service enable best-effort` 用例）。
+
+### 范围与限制
+
+- 该 smoke 复用 ISO 的 casper squashfs 作为 diskless lower rootfs，**不是** nodeforge 构建的
+  Ubuntu rootfs。Ubuntu OS 层 rootfs-build（apt/debootstrap，
+  `src/provision/rootfs_os_builder.zig` `AptOsLayerUnsupported`）在 v0.2 不支持，整体推迟到
+  v0.2.1（见 `V0_2_1_RESERVED.md`）。因此该 smoke 验证的是 diskless 启动主循环 + first-boot
+  在 Ubuntu 用户态下的正确性，非 nodeforge-built Ubuntu rootfs。
+- x86_64 UEFI smoke 同样推迟到 v0.2.1（r97n0 仅有 aarch64 QEMU，无 OVMF/qemu-system-x86_64）。
+- catalog 注入、initramfs 重打包、QEMU 启动脚本均为验证夹具，非 nodeforged / diskless guest
+  运行时依赖。
 
 ## 后续验收
 
