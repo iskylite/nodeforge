@@ -60,6 +60,7 @@ fn buildInternal(
     const a = arena.allocator();
 
     const work_dir = try std.fmt.allocPrint(a, "{s}/initrd-build-{s}", .{ paths.require().work_dir, kernel_release });
+    std.log.scoped(.initrd_build).info("initrd build: stage 1/7 - preparing work directory (kver={s})", .{kernel_release});
     std.Io.Dir.cwd().deleteTree(io, work_dir) catch {};
     try std.Io.Dir.cwd().createDirPath(io, work_dir);
     defer std.Io.Dir.cwd().deleteTree(io, work_dir) catch {};
@@ -70,6 +71,7 @@ fn buildInternal(
     const initrd_root = try std.fmt.allocPrint(a, "{s}/root", .{work_dir});
     try std.Io.Dir.cwd().createDirPath(io, initrd_root);
     if (base_initrd == null) {
+        std.log.scoped(.initrd_build).info("initrd build: stage 2/7 - dracut fallback (no vendor initrd)", .{});
         const base_img = try std.fmt.allocPrint(a, "{s}/initrd-base.img", .{work_dir});
         runCmd(io, allocator, &.{
             "dracut", "--no-hostonly",
@@ -97,6 +99,7 @@ fn buildInternal(
         // companions (plus dynamic dependencies); all kernel modules and
         // firmware still come untouched from the ISO initrd. The build host
         // must match the target distro/architecture.
+        std.log.scoped(.initrd_build).info("initrd build: stage 2/7 - vendor initrd overlay mode", .{});
         runCmd(io, allocator, &.{
             "/usr/lib/dracut/dracut-install",
             "-D", initrd_root,
@@ -110,6 +113,7 @@ fn buildInternal(
     }
 
     // 3. 注入 nodeforge-initrd 二进制
+    std.log.scoped(.initrd_build).info("initrd build: stage 3/7 - injecting nodeforge-initrd + agent binaries", .{});
     const initrd_bin_dest = try std.fmt.allocPrint(a, "{s}/usr/sbin", .{initrd_root});
     std.Io.Dir.cwd().createDirPath(io, initrd_bin_dest) catch {};
     const initrd_bin_path = try std.fmt.allocPrint(a, "{s}/nodeforge-initrd", .{initrd_bin_dest});
@@ -129,6 +133,7 @@ fn buildInternal(
     try runCmd(io, allocator, &.{ "chmod", "0755", agent_dest });
 
     // 4. 注入不依赖 NetworkManager/systemd 的最小 DHCP hook。
+    std.log.scoped(.initrd_build).info("initrd build: stage 4/7 - creating dhclient hook", .{});
     const dhclient_script = try std.fmt.allocPrint(a, "{s}/usr/sbin/nodeforge-dhclient-script", .{initrd_root});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dhclient_script, .data =
         \\#!/bin/sh
@@ -145,7 +150,8 @@ fn buildInternal(
     });
     try runCmd(io, allocator, &.{ "chmod", "0755", dhclient_script });
 
-    // 5. 创建 /init 脚本
+    // 5. 创建 /init 脚本（PID 1 入口，exec nodeforge-initrd）
+    std.log.scoped(.initrd_build).info("initrd build: stage 5/7 - creating /init PID 1 script", .{});
     const init_script = try std.fmt.allocPrint(a, "{s}/init", .{initrd_root});
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = init_script, .data = "#!/bin/sh\nexec /usr/sbin/nodeforge-initrd\n" }) catch |err| {
         std.log.scoped(.initrd_build).err("create /init failed: {t}", .{err});
@@ -154,20 +160,22 @@ fn buildInternal(
     runCmd(io, allocator, &.{ "chmod", "+x", init_script }) catch {};
 
     // 6. 创建 /capsule 目录（boot-prepare 注入 token 文件）
+    std.log.scoped(.initrd_build).info("initrd build: stage 6/7 - creating /capsule directory", .{});
     const capsule_dir = try std.fmt.allocPrint(a, "{s}/capsule", .{initrd_root});
     std.Io.Dir.cwd().createDirPath(io, capsule_dir) catch {};
 
     // 7. 发布。Vendor member 保持逐字节不变，NodeForge overlay 追加在后；
     // fallback 则重包成单一 gzip member。
+    std.log.scoped(.initrd_build).info("initrd build: stage 7/7 - repacking initramfs (mode={s})", .{if (base_initrd != null) "vendor-overlay" else "dracut-fallback"});
     if (base_initrd) |base| try std.Io.Dir.copyFileAbsolute(base, output_path, io, .{ .replace = false, .make_path = true });
     const redirect = if (base_initrd == null) ">" else ">>";
     const repack_cmd = try std.fmt.allocPrint(a, "(cd {s} && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 {s} {s})", .{ initrd_root, redirect, output_path });
     runShell(io, allocator, repack_cmd) catch |err| {
-        std.log.scoped(.initrd_build).err("repack initramfs failed: {t}", .{err});
+        std.log.scoped(.initrd_build).err("initrd build: stage 7 FAILED - repack ({t})", .{err});
         return error.RepackFailed;
     };
 
-    std.log.scoped(.initrd_build).info("initrd built at {s}", .{output_path});
+    std.log.scoped(.initrd_build).info("initrd build: DONE - output={s}", .{output_path});
 }
 
 fn runCmd(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {

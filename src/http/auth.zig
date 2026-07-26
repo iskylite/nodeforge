@@ -60,13 +60,16 @@ pub fn nodeIdSafe(value: []const u8) bool {
 ///
 /// 接受格式：`Bearer <64位十六进制token>`。
 /// token 长度必须与 `boot_session.capability_len` 一致（64 字符）。
+/// 仅接受小写十六进制（`[0-9a-f]`），与 `generateCapability` 的输出编码一致。
 /// 返回 null 表示格式不匹配；调用方应将其视为缺少认证。
 pub fn bearer(value: []const u8) ?[]const u8 {
     const prefix = "Bearer ";
     if (!std.mem.startsWith(u8, value, prefix)) return null;
     const token = value[prefix.len..];
     if (token.len != boot_session.capability_len) return null;
-    for (token) |byte| if (!std.ascii.isHex(byte)) return null;
+    // 仅接受小写十六进制，与 generateCapability 生成的编码一致。
+    // 大写十六进制 token 会在此处被拒绝，避免在认证阶段返回模糊的 ProofMismatch。
+    for (token) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return null;
     return token;
 }
 

@@ -76,6 +76,10 @@ pub fn hashOf(raw_token: []const u8, secret: []const u8) Hash {
 /// `stored_hash` 是服务端为该 token 保存的 [`hashOf`]；`claim` 是签发时绑定的授权范围。
 /// 请求侧参数（scope/node/path/content/event_seq/now）任一不符按其错误返回；
 /// hash 不匹配返回 `invalid_token`（不归责任何 session）。
+///
+/// 安全说明：hash 比较使用 `timing_safe.eql` 而非 `mem.eql`，避免短路比较
+/// 引入的时序侧信道。虽然 HMAC 输出是伪随机的（攻击者难以控制前缀来利用
+/// 时序差异），但安全令牌验证路径应始终遵循常量时间比较的最佳实践。
 pub fn verify(
     raw_token: []const u8,
     secret: []const u8,
@@ -90,7 +94,8 @@ pub fn verify(
 ) Decision {
     if (raw_token.len != token_len) return .invalid_token;
     const computed = hashOf(raw_token, secret);
-    if (!std.mem.eql(u8, &computed, stored_hash)) return .invalid_token;
+    // 使用常量时间比较 hash，防止时序侧信道攻击。
+    if (!std.crypto.timing_safe.eql([hash_len]u8, computed, stored_hash[0..hash_len].*)) return .invalid_token;
     if (now_mono > claim.expires_mono) return .expired;
     if (claim.scope != request_scope) return .scope_mismatch;
     if (!std.mem.eql(u8, claim.node_id, request_node)) return .node_mismatch;

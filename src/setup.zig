@@ -231,7 +231,9 @@ pub fn resetState(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
         sha256(bytes, &digest);
         if (!first) try manifest.writer.writeByte(',');
         first = false;
-        try manifest.writer.print("{{\"file\":{f},\"sha256\":{f}}}", .{ std.json.fmt(std.fs.path.basename(state_path), .{}), std.json.fmt(&digest, .{}) });
+        // digest 是 [64]u8 十六进制 ASCII 字节；必须以切片（[]const u8）序列化，
+        // 否则 `&digest`（*[64]u8）会被 JSON 序列化为整数数组而非字符串。
+        try manifest.writer.print("{{\"file\":{f},\"sha256\":{f}}}", .{ std.json.fmt(std.fs.path.basename(state_path), .{}), std.json.fmt(digest[0..], .{}) });
         try std.Io.Dir.cwd().deleteFile(io, state_path);
     }
     try manifest.writer.writeAll("]}\n");

@@ -9,6 +9,36 @@
 //! -> archive -> script 重放。package 只访问计划固定的 nodeforged HTTP Yum/APT 源并禁用
 //! 系统其他源；失败只记日志不阻断启动。
 //!
+//! ## 启动时机（R9 修订）
+//!
+//! agent 有两个执行阶段，均使用同一 binary：
+//!
+//! 1. **pre-init 阶段**（`--pre-init` 参数）：由 nodeforge-initrd 在 switch_root 后以
+//!    `execve` 替换 PID 1 执行。此阶段无 systemd、无日志服务，日志直接输出到 console
+//!    （串口）。pre-init 完成后 agent 调用 `exec /sbin/init` 将 PID 1 交给真正 init
+//!    （systemd）。
+//!
+//! 2. **first-boot 阶段**（无参数）：由 systemd unit `nodeforge-firstboot.service` 执行。
+//!    R9 修订后该 unit 配置为 `Before=rc-local.service`，确保 agent 在 rc.local 之前
+//!    完成。unit 的 `StandardOutput` 和 `StandardError` 配置为
+//!    `journal+file:/var/lib/nodeforge/firstboot.log`，因此 first-boot 日志同时写入
+//!    systemd journal 和文件 `/var/lib/nodeforge/firstboot.log`。
+//!
+//! ## 日志位置
+//!
+//! - **initrd 阶段**：`/var/lib/nodeforge/initrd.log`（R11：switch_root 前从 /run 复制到
+//!   overlay upper，切根后可查看）+ `/var/lib/nodeforge/initrd-dmesg.log`（内核 dmesg）
+//! - **pre-init 阶段**：console（串口）输出，无持久化（PID 1 在 systemd 之前运行）
+//! - **first-boot 阶段**：`/var/lib/nodeforge/firstboot.log` + systemd journal
+//!   (`journalctl -u nodeforge-firstboot.service`)
+//!
+//! ## /sbin/init 是什么
+//!
+//! 无盘系统中 `/sbin/init` 是发行版原生的 systemd（如 Rocky 的 `/usr/lib/systemd/systemd`）。
+//! 它是 squashfs rootfs 中的标准组件，由 `dnf --installroot` 在 rootfs 构建时安装。
+//! agent pre-init 完成后 `exec /sbin/init` 启动 systemd，systemd 再拉起
+//! `nodeforge-firstboot.service` 等服务。
+//!
 //! agent 不取得/解释 BootConfig 字段，不写 Profile 共享基线（已烤入 lower）；只重放
 //! Node 运行根差量。payload digest/size 不符或拉取失败时真正 init 不启动，不使用本地旧
 //! plan fallback（§10 fail-closed）。

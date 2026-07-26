@@ -17,6 +17,17 @@
 const std = @import("std");
 const model = @import("../model.zig");
 
+/// 检查路径是否包含 `..` 路径组件（而非子串），用于防止路径逃逸。
+/// 以 `/` 为分隔符逐段检查，只有完整的 `..` 组件才返回 true。
+/// 例如 `/opt/app..backup/file` 返回 false（合法），`/opt/../etc` 返回 true（逃逸）。
+fn containsDotDotComponent(path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return true;
+    }
+    return false;
+}
+
 /// 将字符串用单引号包裹以安全嵌入 shell 命令。字符串内的单引号通过
 /// `'\''` 转义，这是 POSIX shell 中在单引号字符串中嵌入单引号的标准方法。
 fn writeShellQuoted(writer: *std.Io.Writer, value: []const u8) !void {
@@ -81,8 +92,10 @@ pub fn renderInstallPost(allocator: std.mem.Allocator, bundle: *const model.Prov
             // 换行折叠后把终止标记当成命令执行。
             .managed_file => {
                 const destination = step.destination orelse return error.InvalidStep;
-                // 路径安全校验：必须是绝对路径且不含 `..`，防止路径逃逸
-                if (!std.mem.startsWith(u8, destination, "/") or std.mem.indexOf(u8, destination, "..") != null) return error.InvalidStep;
+                // 路径安全校验：必须是绝对路径且不含 `..` 路径组件，防止路径逃逸。
+                // 使用组件级检查而非子串匹配，避免误拒包含 ".." 子串的合法路径
+                //（如 `/opt/app..backup/file`）。
+                if (!std.mem.startsWith(u8, destination, "/") or containsDotDotComponent(destination)) return error.InvalidStep;
                 try w.writeAll("install -d -m 0755 \"$(dirname -- ");
                 try writeShellQuoted(w, destination);
                 try w.writeAll(")\" && ");

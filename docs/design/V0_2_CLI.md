@@ -401,6 +401,11 @@ note: deploy=false blocks new PXE boots; it does not terminate the active sessio
 绕过，也不为换 kind 远程停止节点。JSON error 固定包含 `code/from_kind/to_kind/blockers/active_session/
 recoverable_until/next_commands`。
 
+> **注意**：上述 `--force` 限制仅适用于 Profile kind 换绑（diskless ↔ install）。普通属性变更命令
+>（`node set`、`node unset`、`node add-values` 等）支持 `--force` 标志，用于在活动 session 期间
+> 强制终止目标节点的 session（install PXE session 和/或 diskless delivery session）后执行变更。
+> 详见 `V0_2_DESIGN.md` R13 和 `V0_1_DESIGN.md` §13。
+
 ## 7. 阶段 6：build plan 与 rootfs 构建
 
 ```text

@@ -119,10 +119,17 @@ pub const Session = struct {
 /// 节点侧授权结果的唯一类型，由 M3 handler 消费。它是值拷贝，
 /// 因此没有请求会在渲染或 I/O 期间持有 session mutex。
 /// 包含 node_id/boot_session_id/profile/mode/lease_ip/capability 等身份字段。
+///
+/// Low-4 修复：`node_id` 和 `profile` 原为借用切片（指向 Store 内 session 的
+/// 固定缓冲区），在 mutex 释放后若 session 槽位被并发清零或复用，切片会
+/// 指向被修改的数据。现改为固定缓冲区 + 长度字段，在锁内完成值拷贝，
+/// 确保 I/O 期间身份快照不可变。
 pub const Authenticated = struct {
-    node_id: []const u8,
+    node_id_buf: [node_id_capacity]u8 = [_]u8{0} ** node_id_capacity,
+    node_id_len: u8 = 0,
     boot_session_id: [id_len]u8,
-    profile: []const u8,
+    profile_buf: [profile_capacity]u8 = [_]u8{0} ** profile_capacity,
+    profile_len: u8 = 0,
     mode: model.BootKind,
     lease_ip: u32,
     capability: [capability_len]u8,
@@ -132,18 +139,40 @@ pub const Authenticated = struct {
     deployment_generation: u64,
     session_created_at: i64,
     plan_digest: ?[32]u8,
+
+    pub fn nodeId(self: *const Authenticated) []const u8 {
+        return self.node_id_buf[0..self.node_id_len];
+    }
+
+    pub fn profileName(self: *const Authenticated) []const u8 {
+        return self.profile_buf[0..self.profile_len];
+    }
 };
 
 /// M3.5 只读 TFTP boot 身份。由 `resolveTftpBoot` 返回的安全值拷贝，
 /// 使 TFTP handler 能在不持有 session mutex 的情况下渲染虚拟 GRUB 配置。
 /// 所有字段都是从活动 session 复制的快照，不会在 I/O 期间被并发修改。
+///
+/// Low-4 修复：`node_id` 和 `profile` 原为借用切片（指向 Store 内 session 的
+/// 固定缓冲区），在 mutex 释放后存在被并发修改的风险。现改为固定缓冲区 +
+/// 长度字段，在锁内完成值拷贝。
 pub const TftpBootIdentity = struct {
     boot_session_id: [id_len]u8,
-    node_id: []const u8,
-    profile: []const u8,
+    node_id_buf: [node_id_capacity]u8 = [_]u8{0} ** node_id_capacity,
+    node_id_len: u8 = 0,
+    profile_buf: [profile_capacity]u8 = [_]u8{0} ** profile_capacity,
+    profile_len: u8 = 0,
     mode: model.BootKind,
     mac: [6]u8,
     lease_ip: u32,
+
+    pub fn nodeId(self: *const TftpBootIdentity) []const u8 {
+        return self.node_id_buf[0..self.node_id_len];
+    }
+
+    pub fn profileName(self: *const TftpBootIdentity) []const u8 {
+        return self.profile_buf[0..self.profile_len];
+    }
 };
 
 /// 协议事件到 session 的关联结果。
@@ -287,6 +316,33 @@ pub const Store = struct {
         for (&self.sessions) |*session| {
             if (!session.active() or session.nodeId() == null or !std.mem.eql(u8, session.nodeId().?, node_id)) continue;
             _ = terminateLocked(session, .superseded, mono_now, utc_now);
+            session.* = .{};
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// 按节点 ID 终止所有活动 session，使用指定的终态原因。
+    ///
+    /// 与 `supersedeNode` 不同，本方法允许调用方指定 `completed`/`failed` 等
+    /// 语义准确的终态原因，而非固定使用 `superseded`。
+    ///
+    /// **主要使用场景**：v0.2 diskless 生命周期终态同步。diskless 节点 PXE
+    /// 启动时，DHCP server 会在 `boot_session.Store` 中创建 session（用于
+    /// DHCP/TFTP 阶段的协议关联）。diskless 生命周期状态由独立的
+    /// `diskless_delivery.Store` 跟踪，当后者到达 `diskless_running`（成功终态）
+    /// 或 `failed`（失败终态）时，必须同步终止 `boot_session.Store` 中的对应
+    /// session。否则该 session 会保持 active 直到 2 小时 delivery TTL 自然过期，
+    /// 期间 `hasActive()` 全局检查会阻塞所有节点的属性修改（参见 R9 bug）。
+    ///
+    /// 返回是否有 session 被终止。
+    pub fn finishNodeDelivery(self: *Store, node_id: []const u8, reason: TerminalReason, mono_now: i64, utc_now: i64) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var changed = false;
+        for (&self.sessions) |*session| {
+            if (!session.active() or session.nodeId() == null or !std.mem.eql(u8, session.nodeId().?, node_id)) continue;
+            _ = terminateLocked(session, reason, mono_now, utc_now);
             session.* = .{};
             changed = true;
         }
@@ -474,14 +530,19 @@ pub const Store = struct {
         const session = found orelse return null;
         if (sessionExpired(session, mono_now)) return null;
         if (session.nodeId() == null or session.profileName() == null or session.mode == null) return null;
-        return .{
+        var identity: TftpBootIdentity = .{
             .boot_session_id = session.id,
-            .node_id = session.nodeId().?,
-            .profile = session.profileName().?,
             .mode = session.mode.?,
             .mac = session.mac,
             .lease_ip = session.lease_ip,
         };
+        const node_id = session.nodeId().?;
+        @memcpy(identity.node_id_buf[0..node_id.len], node_id);
+        identity.node_id_len = @intCast(node_id.len);
+        const profile = session.profileName().?;
+        @memcpy(identity.profile_buf[0..profile.len], profile);
+        identity.profile_len = @intCast(profile.len);
+        return identity;
     }
 
     /// 推进已关联的 TFTP session 阶段。委托给 `updateDhcp`，但不更新 lease_ip
@@ -814,10 +875,8 @@ fn terminateLocked(session: *Session, reason: TerminalReason, mono_now: i64, utc
 /// 从已验证的活动 session 构造 Authenticated 值拷贝。
 /// 调用方获得的是快照，在 I/O 期间不持有 mutex。
 fn authenticated(session: *const Session) Authenticated {
-    return .{
-        .node_id = session.nodeId().?,
+    var result: Authenticated = .{
         .boot_session_id = session.id,
-        .profile = session.profileName().?,
         .mode = session.mode.?,
         .lease_ip = session.lease_ip,
         .capability = session.capability,
@@ -828,6 +887,17 @@ fn authenticated(session: *const Session) Authenticated {
         .session_created_at = session.created_at,
         .plan_digest = if (session.install_plan) |plan| plan.digest else null,
     };
+    // Low-4：在 mutex 持有期间将 node_id/profile 复制到固定缓冲区，
+    // 避免返回借用指针在锁释放后被并发修改。
+    if (session.nodeId()) |node_id| {
+        @memcpy(result.node_id_buf[0..node_id.len], node_id);
+        result.node_id_len = @intCast(node_id.len);
+    }
+    if (session.profileName()) |profile| {
+        @memcpy(result.profile_buf[0..profile.len], profile);
+        result.profile_len = @intCast(profile.len);
+    }
+    return result;
 }
 
 /// 判断 session 是否已过期。已获得 capability 的 session 使用 delivery TTL（2 小时），
@@ -900,8 +970,8 @@ test "resolveTftpBoot returns identity for a unique ACK'd session" {
     }, 10, 10);
     store.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bc8, 11, 11);
     const identity = store.resolveTftpBoot(0xc0a81bc8, 12).?;
-    try std.testing.expectEqualStrings("m3-node", identity.node_id);
-    try std.testing.expectEqualStrings("rocky-install", identity.profile);
+    try std.testing.expectEqualStrings("m3-node", identity.nodeId());
+    try std.testing.expectEqualStrings("rocky-install", identity.profileName());
     try std.testing.expectEqual(model.BootKind.install, identity.mode);
     try std.testing.expectEqual(@as(u32, 0xc0a81bc8), identity.lease_ip);
 }
@@ -1028,7 +1098,7 @@ test "M3 bootstrap and capability proofs remain bound to one active lease" {
     };
     try copyIdentity(&store.sessions[0], "node-01", "rocky-install");
     const bootstrap = try store.authenticateBootstrap("node-01", 0xc0a81b0a, 101);
-    try std.testing.expectEqualStrings("node-01", bootstrap.node_id);
+    try std.testing.expectEqualStrings("node-01", bootstrap.nodeId());
     try std.testing.expectError(error.ProofMismatch, store.authenticateBootstrap("node-01", 0xc0a81b0b, 101));
     _ = try store.authenticateCapability("node-01", &session_id, &token, 101);
     try std.testing.expectError(error.ProofMismatch, store.authenticateCapability("node-02", &session_id, &token, 101));
@@ -1054,7 +1124,7 @@ test "M4.3 restored plaintext capability authenticates in constant time" {
     try copyIdentity(&restored_session, "node-01", "install");
     try store.restore(restored_session);
     const checked = try store.authenticateCapability("node-01", &id, token, 101);
-    try std.testing.expectEqualStrings("node-01", checked.node_id);
+    try std.testing.expectEqualStrings("node-01", checked.nodeId());
     try std.testing.expectError(error.ProofMismatch, store.authenticateCapability("node-01", &id, "0000000000000000000000000000000000000000000000000000000000000000", 101));
 }
 

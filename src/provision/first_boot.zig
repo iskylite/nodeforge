@@ -288,7 +288,13 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
                 try w.writeAll(" && tar -xf /tmp/.nodeforge-arc -C ");
             }
             try writeQuoted(w, dest);
-            if (step.payload_path == null) try w.writeAll(" ; rm -f /tmp/.nodeforge-arc");
+            // BUG 修复：原代码使用 ` ; rm -f /tmp/.nodeforge-arc`，分号使 rm 无条件执行
+            // 且其退出码（0）成为整条命令的最终退出码，掩盖了 tar 解压失败。
+            // 改为 `&& rm` 确保仅解压成功后才删除临时文件；解压失败时退出码正确传播，
+            // runShTimeout 才能检测到 SubprocessFailed 并计入 failures。
+            // 临时文件在失败时不会被清理，但 first-boot 在 tmpfs upper 中运行，
+            // 重启后自动清空，不存在持久泄漏风险。
+            if (step.payload_path == null) try w.writeAll(" && rm -f /tmp/.nodeforge-arc");
         },
         .script => {
             if (step.payload_path) |relative| {
@@ -297,7 +303,10 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
             } else {
                 try w.writeAll("printf '%b' '");
                 try writeBytes(w, step.content orelse "");
-                try w.writeAll("' > /tmp/.nodeforge-script && sh /tmp/.nodeforge-script ; rm -f /tmp/.nodeforge-script");
+                // BUG 修复：原代码使用 ` ; rm -f /tmp/.nodeforge-script`，分号使 rm 的
+                // 退出码（0）掩盖了 sh 脚本执行失败。改为 `&& rm` 确保仅脚本成功后才
+                // 删除临时文件；脚本失败时退出码正确传播。
+                try w.writeAll("' > /tmp/.nodeforge-script && sh /tmp/.nodeforge-script && rm -f /tmp/.nodeforge-script");
             }
         },
     }

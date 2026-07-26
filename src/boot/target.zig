@@ -74,7 +74,7 @@ pub fn resolve(
     http_port: u16,
     cmdline_buf: []u8,
 ) ?BootTarget {
-    const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
+    const profile = lookup.findProfile(catalog, identity.profileName()) orelse lookup.findProfile(config, identity.profileName()) orelse return null;
     return switch (profile.kind) {
         .install => resolveInstall(identity, config, catalog, server_ip, http_port, cmdline_buf),
         .diskless => resolveDiskless(identity, config, catalog, server_ip, http_port, cmdline_buf),
@@ -109,7 +109,7 @@ fn resolveInstall(
     _ = identity.mac;
     _ = identity.lease_ip;
     // 按 profile 名称查找启动配置中的 profile 定义。
-    const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
+    const profile = lookup.findProfile(catalog, identity.profileName()) orelse lookup.findProfile(config, identity.profileName()) orelse return null;
     // install profile 必须引用一个 install source。
     const source_name = profile.install_source;
     // 在 catalog 中查找已发布的 install source（由 ISO 导入流程创建）。
@@ -154,10 +154,10 @@ fn resolveInstall(
         const base = std.fmt.bufPrint(
             cmdline_buf,
             "boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=dhcp url=http://{s}:{d}/artifacts/images/{s}.iso cloud-config-url=/dev/null autoinstall ds=nocloud-net\\;s=http://{s}:{d}/api/v1/nodes/{s}/install-config/nocloud/",
-            .{ config.server.server_ip, config.server.http_port, source.source_asset, server_ip, http_port, identity.node_id },
+            .{ config.server.server_ip, config.server.http_port, source.source_asset, server_ip, http_port, identity.nodeId() },
         ) catch return null;
         break :blk appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
-            log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.node_id, profile.kernel_args.?.len });
+            log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.nodeId(), profile.kernel_args.?.len });
             return null;
         };
     } else blk: {
@@ -172,9 +172,9 @@ fn resolveInstall(
         // 并自行跟随 treeinfo 仓库指针。
         var install_root_buf: [256]u8 = undefined;
         const install_root = std.fmt.bufPrint(&install_root_buf, "http://{s}:{d}/artifacts/repositories/{s}", .{ server_ip, http_port, source.name }) catch return null;
-        const base = std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s} inst.ks=http://{s}:{d}/api/v1/nodes/{s}/install-config/kickstart", .{ install_root, server_ip, http_port, identity.node_id }) catch return null;
+        const base = std.fmt.bufPrint(cmdline_buf, "ip=dhcp rd.neednet=1 inst.repo={s} inst.ks=http://{s}:{d}/api/v1/nodes/{s}/install-config/kickstart", .{ install_root, server_ip, http_port, identity.nodeId() }) catch return null;
         break :blk appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
-            log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.node_id, profile.kernel_args.?.len });
+            log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.nodeId(), profile.kernel_args.?.len });
             return null;
         };
     };
@@ -211,7 +211,7 @@ fn resolveDiskless(
     _ = identity.mac;
     _ = identity.lease_ip;
 
-    const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
+    const profile = lookup.findProfile(catalog, identity.profileName()) orelse lookup.findProfile(config, identity.profileName()) orelse return null;
     if (profile.kind != .diskless) return null;
 
     const bundle_name = profile.boot_bundle orelse return null;
@@ -229,11 +229,11 @@ fn resolveDiskless(
     const base = std.fmt.bufPrint(
         cmdline_buf,
         "nodeforge.config_url=http://{s}:{d}/api/v1/nodes/{s}/boot-config nodeforge.node={s} console=ttyAMA0 console=tty0",
-        .{ server_ip, http_port, identity.node_id, identity.node_id },
+        .{ server_ip, http_port, identity.nodeId(), identity.nodeId() },
     ) catch return null;
 
     const cmdline = appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
-        log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.node_id, profile.kernel_args.?.len });
+        log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.nodeId(), profile.kernel_args.?.len });
         return null;
     };
 
@@ -309,14 +309,16 @@ test "resolve install target returns kernel/initrd/repo cmdline" {
             .base_url = "http://192.168.27.128:18080/artifacts/repositories/rocky-9.7-iso",
         }},
     };
-    const identity: TftpBootIdentity = .{
+    var identity: TftpBootIdentity = .{
         .boot_session_id = "0123456789abcdef0123456789abcdef".*,
-        .node_id = "node-01",
-        .profile = "rocky-install",
         .mode = .install,
         .mac = .{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xef },
         .lease_ip = 0xc0a81bc8,
     };
+    @memcpy(identity.node_id_buf[0.."node-01".len], "node-01");
+    identity.node_id_len = "node-01".len;
+    @memcpy(identity.profile_buf[0.."rocky-install".len], "rocky-install");
+    identity.profile_len = "rocky-install".len;
     var cmdline_buf: [1024]u8 = undefined;
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     try std.testing.expectEqualStrings("install/rocky/vmlinuz", target.kernel_path);
@@ -346,7 +348,11 @@ test "resolve Ubuntu install target uses the ISO URL, never inst.repo" {
         },
         .install_sources = &.{.{ .name = "ubuntu-22.04-aarch64-iso", .distro = "ubuntu", .version = "22.04", .arch = .aarch64, .source_asset = "ubuntu-iso", .installer_kernel = "ubuntu-kernel", .installer_initrd = "ubuntu-initrd" }},
     };
-    const identity: TftpBootIdentity = .{ .boot_session_id = "0123456789abcdef0123456789abcdef".*, .node_id = "node-ubuntu", .profile = "ubuntu-install", .mode = .install, .mac = .{ 2, 170, 187, 204, 221, 1 }, .lease_ip = 0xc0a81bc8 };
+    var identity: TftpBootIdentity = .{ .boot_session_id = "0123456789abcdef0123456789abcdef".*, .mode = .install, .mac = .{ 2, 170, 187, 204, 221, 1 }, .lease_ip = 0xc0a81bc8 };
+    @memcpy(identity.node_id_buf[0.."node-ubuntu".len], "node-ubuntu");
+    identity.node_id_len = "node-ubuntu".len;
+    @memcpy(identity.profile_buf[0.."ubuntu-install".len], "ubuntu-install");
+    identity.profile_len = "ubuntu-install".len;
     var cmdline_buf: [1024]u8 = undefined;
     const target = resolve(identity, &config, &catalog, "192.168.27.128", 18080, &cmdline_buf).?;
     // 必须包含 url= 参数指向已发布的 ISO HTTP URL。

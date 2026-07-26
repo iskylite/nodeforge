@@ -304,6 +304,7 @@ pub fn run(
     {
         var status_snapshot: [node_status.max_statuses]node_status.Status = undefined;
         statuses.snapshot(&status_snapshot);
+        // 自旋等待 status I/O mutex；确保最终保存不被并发 HTTP 线程打断。
         while (!status_io_mutex.tryLock()) std.Thread.yield() catch {};
         defer status_io_mutex.unlock();
         status_store.save(io, allocator, paths.require().node_status_path, &status_snapshot, statuses.currentRevision(), now()) catch |err|

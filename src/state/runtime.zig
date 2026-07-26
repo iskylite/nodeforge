@@ -424,6 +424,7 @@ fn copyLabel(destination: *[128]u8, source: []const u8) void {
     const len = @min(destination.len, source.len);
     @memcpy(destination[0..len], source[0..len]);
 }
+/// 自旋等待获取 mutex。DHCP/TFTP 运行时状态操作时间极短，自旋比系统 futex 更高效。
 fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }

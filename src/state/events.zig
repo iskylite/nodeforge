@@ -94,6 +94,7 @@ pub const Writer = struct {
         try output.writer.writeByte('\n');
         if (output.written().len > max_line_bytes) return error.EventTooLarge;
 
+        // 自旋等待 mutex；事件追加是短临界区（序列化已完成），自旋比 futex 更高效。
         while (!self.mutex.tryLock()) std.Thread.yield() catch {};
         defer self.mutex.unlock();
         try rotateBeforeAppend(io, allocator, path, self.max_size_bytes, self.keep, output.written().len);

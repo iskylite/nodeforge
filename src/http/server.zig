@@ -793,9 +793,9 @@ fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const 
     const peer_ip = auth.parsePeerIpv4(meta.client_ip) catch 0;
     const identity = if (peer_ip != 0) context.sessions.resolveTftpBoot(peer_ip, boot_session.monotonicNow()) else null;
     if (std.mem.startsWith(u8, path, "/artifacts/repositories/"))
-        log.debug("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, node={s}, asset={s}, object_bytes={d}, response_state={s})", .{ method, path, status, bytes_sent, duration_us, meta.client_ip, if (identity) |value| value.node_id else "-", relative, object_size, response_state })
+        log.debug("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, node={s}, asset={s}, object_bytes={d}, response_state={s})", .{ method, path, status, bytes_sent, duration_us, meta.client_ip, if (identity) |value| value.nodeId() else "-", relative, object_size, response_state })
     else
-        log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, node={s}, asset={s}, object_bytes={d}, response_state={s})", .{ method, path, status, bytes_sent, duration_us, meta.client_ip, if (identity) |value| value.node_id else "-", relative, object_size, response_state });
+        log.info("{s} {s} -> {d} ({d} bytes, {d}us, client={s}, node={s}, asset={s}, object_bytes={d}, response_state={s})", .{ method, path, status, bytes_sent, duration_us, meta.client_ip, if (identity) |value| value.nodeId() else "-", relative, object_size, response_state });
 
     var status_text: [4]u8 = undefined;
     var bytes_text: [20]u8 = undefined;
@@ -817,7 +817,7 @@ fn recordStaticCompletion(method: []const u8, path: []const u8, context: *const 
         count += 1;
     }
     if (identity) |value| {
-        fields[count] = .{ .key = "node_id", .value = value.node_id };
+        fields[count] = .{ .key = "node_id", .value = value.nodeId() };
         count += 1;
         fields[count] = .{ .key = "boot_session_id", .value = value.boot_session_id[0..] };
         count += 1;
@@ -885,7 +885,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
         const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
         const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
         if (!deployment_control.digestEqual(checked.session.model_plan_digest, desired_digest)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"node plan changed after PXE authorization; retry is required\"}}\n", meta);
-        const plan_json = buildInstallPlan(context, node_id, checked.session.profile, desired_revision, desired_digest) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
+        const plan_json = buildInstallPlan(context, node_id, checked.session.profileName(), desired_revision, desired_digest) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
         defer context.allocator.free(plan_json);
         context.sessions.captureInstallPlan(context.allocator, checked.session.boot_session_id[0..], plan_json, desired_revision) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"boot session plan is already pinned to different inputs\"}}\n", meta);
     }
@@ -904,7 +904,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
     const fields = [_]events.Field{
         .{ .key = "node_id", .value = node_id },
         .{ .key = "boot_session_id", .value = session.boot_session_id[0..] },
-        .{ .key = "profile", .value = session.profile },
+        .{ .key = "profile", .value = session.profileName() },
     };
     context.event_writer.appendWithFields(context.io, context.allocator, paths.require().events_path, "boot.config.fetched", "authenticated boot config issued", &fields) catch |err| {
         observe_log.err("boot config event append failed: {t}", .{err});
@@ -921,7 +921,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
     const event_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/events", .{ base, node_id });
     defer context.allocator.free(event_url);
     try output.writer.print("{{\"schema_version\":1,\"node_id\":{f},\"boot_session_id\":{f},\"profile\":{f},\"mode\":{f},\"config_url\":{f},\"event_url\":{f}", .{
-        std.json.fmt(node_id, .{}),    std.json.fmt(session.boot_session_id[0..], .{}), std.json.fmt(session.profile, .{}), std.json.fmt(@tagName(session.mode), .{}),
+        std.json.fmt(node_id, .{}),    std.json.fmt(session.boot_session_id[0..], .{}), std.json.fmt(session.profileName(), .{}), std.json.fmt(@tagName(session.mode), .{}),
         std.json.fmt(config_url, .{}), std.json.fmt(event_url, .{}),
     });
     // M4.4 安全响应头：boot-config 和 install-config 响应可能包含 capability、
@@ -997,7 +997,7 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
         const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
         const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
         if (!deployment_control.digestEqual(checked.session.model_plan_digest, desired_digest)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"node plan changed after PXE authorization; retry is required\"}}\n", meta);
-        const plan_json = buildInstallPlan(context, node_id, checked.session.profile, desired_revision, desired_digest) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
+        const plan_json = buildInstallPlan(context, node_id, checked.session.profileName(), desired_revision, desired_digest) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_invalid\",\"message\":\"cannot compile immutable install plan\"}}\n", meta);
         defer context.allocator.free(plan_json);
         context.sessions.captureInstallPlan(context.allocator, checked.session.boot_session_id[0..], plan_json, desired_revision) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.plan_changed\",\"message\":\"boot session plan is already pinned to different inputs\"}}\n", meta);
     }
@@ -1300,7 +1300,7 @@ fn nodeFacts(request: zap.Request, context: *const RouteContext, node_id: []cons
 
 fn pinSessionGeneration(context: *const RouteContext, session: boot_session.Authenticated) !void {
     const generation: u64 = if (session.mode == .install) blk: {
-        const deployment = context.deployments.view(session.node_id) orelse return error.DeploymentGenerationUnavailable;
+        const deployment = context.deployments.view(session.nodeId()) orelse return error.DeploymentGenerationUnavailable;
         break :blk deployment.armed_generation orelse deployment.consumed_generation orelse deployment.terminal_generation orelse return error.DeploymentGenerationUnavailable;
     } else 0;
     try context.sessions.setDeploymentGeneration(session.boot_session_id[0..], generation);
@@ -1548,6 +1548,7 @@ fn unixNow() i64 {
 fn persistStatus(context: *const RouteContext) bool {
     var snapshot: [node_status.max_statuses]node_status.Status = undefined;
     context.statuses.snapshot(&snapshot);
+    // 自旋等待 status I/O mutex；序列化磁盘写入，避免并发 HTTP 线程交错。
     while (!context.status_io_mutex.tryLock()) std.Thread.yield() catch {};
     defer context.status_io_mutex.unlock();
     status_store.save(context.io, context.allocator, context.node_status_path, &snapshot, context.statuses.currentRevision(), unixNow()) catch |err| {
@@ -1562,6 +1563,63 @@ fn checkpointSessions(context: *const RouteContext) bool {
         observe_log.err("boot-session: persistence failed: {t}", .{err});
         return false;
     };
+    return true;
+}
+
+/// 解析 `?force=true` 查询参数，用于属性变更的强制模式。
+///
+/// 当操作员使用 `node set --force` 等 CLI 命令时，客户端会在请求 URL
+/// 上附加 `?force=true`。此函数从 zap 请求中提取该参数并返回是否启用
+/// 强制模式。任何非 `"true"` 的值（包括缺省）均视为 false。
+fn parseForceFlag(request: zap.Request) bool {
+    const raw = request.getParamSlice("force") orelse return false;
+    return std.mem.eql(u8, raw, "true");
+}
+
+/// 强制终止目标节点的所有活动 session（`boot_session.Store` + `diskless_delivery.Store`）。
+///
+/// 当操作员使用 `--force` 标志执行属性变更时，此函数确保目标节点的活动
+/// session 被终止，使属性变更可以安全进行。这适用于以下场景：
+///
+/// 1. **install 模式**：节点正在 PXE 安装过程中，操作员需要修改属性。
+///    `supersedeNode` 会终止 `boot_session.Store` 中的 install session，
+///    终态原因为 `superseded`（与 `node retry --force` 语义一致）。
+///
+/// 2. **diskless 模式**：节点正在 diskless 启动过程中（尚未到达终态），
+///    操作员需要修改属性。`supersedeNode` 终止 `boot_session.Store` 中的
+///    DHCP session；同时 `diskless_store.cancel` 终止 `diskless_delivery.Store`
+///    中的交付 session（撤销全部 capability 并从 checkpoint 中移除）。
+///
+/// **安全保证**：
+/// - install plan 在 PXE bootstrap 时已固定为不可变快照，终止 session 不会
+///   影响正在运行的 installer（它已获取所需的 kickstart/answer 文件）。
+/// - diskless AgentPlan 在 boot-config 首次签发时已固定为不可变快照，终止
+///   delivery session 不会影响正在运行的 diskless 节点（它已获取 rootfs
+///   和 agent plan）。
+/// - `supersedeNode` 和 `diskless_store.cancel` 均在同一调用中完成持久化，
+///   保证 daemon 重启后不会从 checkpoint 复活已终止的 session。
+/// - 持久化失败时返回 false，调用方应返回 503 错误。
+///
+/// 返回 true 表示所有 session 已成功终止并持久化。
+fn forceTerminateNodeSessions(context: *RouteContext, node_id: []const u8) bool {
+    const mono_now = boot_session.monotonicNow();
+    const utc_now = unixNow();
+
+    // 1. 终止 boot_session.Store 中该节点的所有活动 session。
+    //    这包括 install 模式的 PXE session 和 diskless 模式的 DHCP session。
+    //    后者由 DHCP server 在 PXE DISCOVER 时创建，用于 DHCP/TFTP 阶段的
+    //    节点身份关联和 capability 认证。
+    _ = context.sessions.supersedeNode(node_id, mono_now, utc_now);
+    if (!checkpointSessions(context)) return false;
+
+    // 2. 终止 diskless_delivery.Store 中该节点的活动交付 session。
+    //    `cancel` 会撤销全部 capability（config/rootfs/agent/event token），
+    //    并从持久化 checkpoint 中移除该 session。如果节点没有 diskless
+    //    session（例如 install 模式节点），此步骤为 no-op。
+    if (context.diskless_store.findByNode(node_id)) |session| {
+        context.diskless_store.cancel(context.io, session.session_id[0..]) catch return false;
+    }
+
     return true;
 }
 
@@ -1861,6 +1919,7 @@ fn managementBootBundleCreate(request: zap.Request, context: *RouteContext, meta
     defer parsed.deinit();
     if (parsed.value.name.len == 0 or parsed.value.distro.len == 0 or parsed.value.version.len == 0 or parsed.value.kernel_release.len == 0 or parsed.value.kernel.len == 0 or parsed.value.initrd.len == 0) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.invalid\",\"message\":\"all fields except runtime_kernel are required\"}}\n", meta);
     const arch = std.meta.stringToEnum(model.Arch, parsed.value.arch) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.invalid\",\"message\":\"arch must be aarch64 or x86_64\"}}\n", meta);
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -1903,6 +1962,7 @@ fn managementBootBundles(request: zap.Request, context: *const RouteContext, met
 fn managementProvisionBundleCreate(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
     const parsed = std.json.parseFromSlice(struct { name: []const u8 }, context.allocator, request.body orelse return assetInputError(request, "missing body", meta), .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid bundle request", meta);
     defer parsed.deinit();
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -1914,6 +1974,7 @@ fn managementProvisionBundleCreate(request: zap.Request, context: *RouteContext,
 }
 
 fn managementProvisionBundleRemove(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -1925,6 +1986,7 @@ fn managementProvisionBundleRemove(request: zap.Request, context: *RouteContext,
 }
 
 fn managementManagedFileRemove(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -1939,6 +2001,7 @@ fn managementProvisionBundleItemMutation(request: zap.Request, context: *RouteCo
     const raw = std.json.parseFromSlice(std.json.Value, context.allocator, body, .{}) catch return assetInputError(request, "invalid item request", meta);
     defer raw.deinit();
     const operation = if (raw.value == .object) raw.value.object.get("operation") else null;
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -2646,12 +2709,20 @@ fn managementValuesMutation(request: zap.Request, context: *RouteContext, owner:
     const parsed = std.json.parseFromSlice(ValuesMutationRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_request\",\"message\":\"operation, key, and values are required\"}}\n", meta);
     defer parsed.deinit();
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.active_session\",\"message\":\"collection mutation is blocked by an active boot session\"}}\n", meta);
+    // ── force 模式：终止目标节点 session 后绕过全局 hasActive() 检查 ──
+    // node 变更：终止目标节点的 boot_session + diskless_delivery session。
+    // profile 变更：仅绕过检查（profile 变更不影响活动 session 的不可变 plan）。
+    if (parseForceFlag(request)) {
+        if (owner == .node) {
+            if (!forceTerminateNodeSessions(context, identity)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced session termination\"}}\n", meta);
+        }
+    } else if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.active_session\",\"message\":\"collection mutation is blocked by an active boot session; use --force to override\"}}\n", meta);
     const mutation = switch (owner) {
         .profile => if (parsed.value.mutations.len == 0) value_mutation.profile(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value.key, parsed.value.operation, parsed.value.values) else error.UnsupportedProperty,
         .node => value_mutation.node(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value.key, parsed.value.operation, parsed.value.values, parsed.value.mutations),
@@ -2747,12 +2818,18 @@ fn managementItemMutation(request: zap.Request, context: *RouteContext, owner: c
     defer parsed.deinit();
     const spec = cli_properties.collection(owner, parsed.value.key) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown structured collection\"}}\n", meta);
     if (spec.item_spec == null or spec.mutability != .mutable) return json(request, .unprocessable_content, "{\"ok\":false,\"error\":{\"code\":\"property.unsupported\",\"message\":\"collection does not support item mutation\"}}\n", meta);
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item mutation is blocked by an active boot session\"}}\n", meta);
+    // ── force 模式：终止目标节点 session 后绕过全局 hasActive() 检查 ──
+    if (parseForceFlag(request)) {
+        if (owner == .node) {
+            if (!forceTerminateNodeSessions(context, identity)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced session termination\"}}\n", meta);
+        }
+    } else if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item mutation is blocked by an active boot session; use --force to override\"}}\n", meta);
     const mutation = switch (owner) {
         .profile => item_mutation.profile(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value),
         .node => item_mutation.node(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value),
@@ -2775,12 +2852,18 @@ fn managementItemValuesMutation(request: zap.Request, context: *RouteContext, ow
     defer parsed.deinit();
     const expected_key = if (owner == .profile) "system.users" else "overrides.system.users";
     if (!std.mem.eql(u8, parsed.value.key, expected_key) or (!std.mem.eql(u8, parsed.value.field, "groups") and !std.mem.eql(u8, parsed.value.field, "ssh_authorized_keys"))) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"item.unknown_field\",\"message\":\"unknown item collection field\"}}\n", meta);
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item mutation is blocked by an active boot session\"}}\n", meta);
+    // ── force 模式：终止目标节点 session 后绕过全局 hasActive() 检查 ──
+    if (parseForceFlag(request)) {
+        if (owner == .node) {
+            if (!forceTerminateNodeSessions(context, resource_identity)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced session termination\"}}\n", meta);
+        }
+    } else if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item mutation is blocked by an active boot session; use --force to override\"}}\n", meta);
     const mutation = switch (owner) {
         .profile => item_mutation.profileUserValues(context.io, context.allocator, context.config, context.catalog.path, resource_identity, parsed.value.identity, parsed.value.field, parsed.value.operation, parsed.value.values),
         .node => item_mutation.nodeUserValues(context.io, context.allocator, context.config, context.catalog.path, resource_identity, parsed.value.identity, parsed.value.field, parsed.value.operation, parsed.value.values),
@@ -2801,12 +2884,18 @@ fn managementItemReplacement(request: zap.Request, context: *RouteContext, owner
     defer parsed.deinit();
     const spec = cli_properties.collection(owner, parsed.value.key) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown structured collection\"}}\n", meta);
     if (spec.item_spec == null or spec.mutability != .mutable) return json(request, .unprocessable_content, "{\"ok\":false,\"error\":{\"code\":\"property.unsupported\",\"message\":\"collection does not support replacement\"}}\n", meta);
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item replacement is blocked by an active boot session\"}}\n", meta);
+    // ── force 模式：终止目标节点 session 后绕过全局 hasActive() 检查 ──
+    if (parseForceFlag(request)) {
+        if (owner == .node) {
+            if (!forceTerminateNodeSessions(context, identity)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced session termination\"}}\n", meta);
+        }
+    } else if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"item.active_session\",\"message\":\"item replacement is blocked by an active boot session; use --force to override\"}}\n", meta);
     const mutation = switch (owner) {
         .profile => item_mutation.replaceProfile(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value),
         .node => item_mutation.replaceNode(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value),
@@ -2834,12 +2923,20 @@ fn managementScalarMutation(request: zap.Request, context: *RouteContext, owner:
         if (spec.mutability != .mutable or (mutation.value == null and !spec.optional)) return json(request, .unprocessable_content, "{\"ok\":false,\"error\":{\"code\":\"property.required\",\"message\":\"required scalar cannot be unset\"}}\n", meta);
         for (parsed.value.mutations[0..index]) |prior| if (std.mem.eql(u8, prior.key, mutation.key)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.duplicate\",\"message\":\"a scalar key may appear only once per atomic request\"}}\n", meta);
     }
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.active_session\",\"message\":\"property mutation is blocked by an active boot session\"}}\n", meta);
+    // ── force 模式：终止目标节点 session 后绕过全局 hasActive() 检查 ──
+    // node 变更：终止目标节点的 boot_session + diskless_delivery session。
+    // profile 变更：仅绕过检查（profile 变更不影响活动 session 的不可变 plan）。
+    if (parseForceFlag(request)) {
+        if (owner == .node) {
+            if (!forceTerminateNodeSessions(context, identity)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced session termination\"}}\n", meta);
+        }
+    } else if (context.sessions.hasActive(boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"property.active_session\",\"message\":\"property mutation is blocked by an active boot session; use --force to override\"}}\n", meta);
     const mutation = switch (owner) {
         .profile => scalar_mutation.profileBatch(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value.mutations),
         .node => scalar_mutation.nodeBatch(context.io, context.allocator, context.config, context.catalog.path, identity, parsed.value.mutations),
@@ -3002,6 +3099,7 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
     const kind: model.ProfileKind = if (parsed.value.kind) |k| std.meta.stringToEnum(model.ProfileKind, k) orelse
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.invalid\",\"message\":\"--kind must be install or diskless\"}}\n", meta) else .install;
     const boot_bundle = parsed.value.boot_bundle;
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -3111,9 +3209,15 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     defer std.Io.Dir.cwd().deleteTree(context.io, staging) catch {};
 
     // 1. OS 层：发行版原生 install-root 工具从受管 repository 构建 chroot-able 基线。
-    rootfs_os_builder.buildOsLayer(context.io, context.allocator, staging, os_package_manager, install_source.version, repo_closure.file_urls) catch |err| return buildError(request, err, "os-layer", meta);
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 1/5 - building OS layer (staging={s})", .{ name, staging });
+    rootfs_os_builder.buildOsLayer(context.io, context.allocator, staging, os_package_manager, install_source.version, repo_closure.file_urls) catch |err| {
+        std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 1 FAILED - OS layer ({t})", .{ name, err });
+        return buildError(request, err, "os-layer", meta);
+    };
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 1/5 - OS layer done", .{name});
 
     // 2. 物化 rootfs-build content_asset 到 chroot 内 payload 目录。
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 2/5 - materializing payload assets ({d} step(s))", .{ name, build_steps.len });
     var payload_paths = context.allocator.alloc(?[]const u8, build_steps.len) catch return validationError(request, error.OutOfMemory, meta);
     defer context.allocator.free(payload_paths);
     for (payload_paths) |*p| p.* = null;
@@ -3142,12 +3246,19 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     //    安装到 staging（host 上下文，不进入 chroot），避免单 worker daemon 回连
     //    自死锁，也无需 bind-mount /dev/proc/sys；managed_file/archive/script 仍
     //    chroot 执行（写绝对路径到 staging lower）。两者都不接触公网。
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 3/5 - executing rootfs-build steps ({d} step(s))", .{ name, build_steps.len });
     const plan = rootfs_build_executor.buildPlan(context.allocator, build_steps, dto_manager, repo_closure.file_urls, payload_paths, staging) catch |err| return validationError(request, err, meta);
     defer plan.deinit(context.allocator);
-    rootfs_build_executor.execute(context.io, context.allocator, staging, plan) catch |err| return buildError(request, err, "rootfs-build", meta);
+    rootfs_build_executor.execute(context.io, context.allocator, staging, plan) catch |err| {
+        std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 3 FAILED - rootfs-build steps ({t})", .{ name, err });
+        return buildError(request, err, "rootfs-build", meta);
+    };
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 3/5 - rootfs-build steps done", .{name});
 
-    // nodeforge-agent is the first program executed after switch_root and is
-    // therefore part of every rootfs baseline, independent of Profile steps.
+    // 4a. 注入 nodeforge-agent 和 firstboot systemd unit。
+    //     agent 是 switch_root 后第一个执行的程序，因此是每个 rootfs 基线的必要组件，
+    //     与 Profile 步骤无关。
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 4/5 - injecting agent + firstboot unit", .{name});
     const agent_source = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-agent", .{paths.require().bin_dir});
     defer context.allocator.free(agent_source);
     const agent_dest = try std.fmt.allocPrint(context.allocator, "{s}/usr/sbin/nodeforge-agent", .{staging});
@@ -3160,6 +3271,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
         \\[Unit]
         \\Description=NodeForge diskless first-boot provisioning
         \\After=local-fs.target network-online.target
+        \\Before=rc-local.service
         \\Wants=network-online.target
         \\ConditionPathExists=/var/lib/nodeforge/boot.json
         \\
@@ -3167,6 +3279,8 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
         \\Type=oneshot
         \\ExecStart=/usr/sbin/nodeforge-agent
         \\RemainAfterExit=yes
+        \\StandardOutput=journal+file:/var/lib/nodeforge/firstboot.log
+        \\StandardError=journal+file:/var/lib/nodeforge/firstboot.log
         \\
         \\[Install]
         \\WantedBy=multi-user.target
@@ -3178,8 +3292,25 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     const firstboot_link = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-firstboot.service", .{firstboot_wants});
     defer context.allocator.free(firstboot_link);
     runBuildCmd(context.io, context.allocator, &.{ "ln", "-sfn", "../nodeforge-firstboot.service", firstboot_link }) catch |err| return buildError(request, err, "agent-inject", meta);
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 4/5 - agent + firstboot unit injected", .{name});
 
-    // 4. mksquashfs 压缩到内容寻址 .part 文件（rootfs_dir），再校验 SHA-512 后原子发布。
+    // R9: 默认确保 /etc/rc.d/rc.local 可执行。Rocky/RHEL 系默认 rc.local 无执行权限，
+    //     导致 install/diskless 后处理中写入的 rc.local 指令不会被执行。
+    //     在 rootfs staging 中创建目录并 chmod +x，使节点启动后 rc-local.service 能正确执行。
+    const rc_local_dir = try std.fmt.allocPrint(context.allocator, "{s}/etc/rc.d", .{staging});
+    defer context.allocator.free(rc_local_dir);
+    std.Io.Dir.cwd().createDirPath(context.io, rc_local_dir) catch {};
+    const rc_local_path = try std.fmt.allocPrint(context.allocator, "{s}/etc/rc.d/rc.local", .{staging});
+    defer context.allocator.free(rc_local_path);
+    if (std.Io.Dir.cwd().openFile(context.io, rc_local_path, .{})) |f| {
+        f.close(context.io);
+    } else |_| {
+        std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = rc_local_path, .data = "#!/bin/sh\n" }) catch {};
+    }
+    runBuildCmd(context.io, context.allocator, &.{ "chmod", "0755", rc_local_path }) catch |err| return buildError(request, err, "rc-local-chmod", meta);
+
+    // 5. mksquashfs 压缩到内容寻址 .part 文件（rootfs_dir），再校验 SHA-512 后原子发布。
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 5/5 - compressing squashfs + SHA-512", .{name});
     const rootfs_dir = paths.require().rootfs_dir;
     std.Io.Dir.cwd().createDirPath(context.io, rootfs_dir) catch {};
     const file_name = try std.fmt.allocPrint(context.allocator, "{s}.squashfs", .{digest_hex});
@@ -3190,9 +3321,12 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     defer context.allocator.free(part);
     std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
     errdefer std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
-    runBuildCmd(context.io, context.allocator, &.{ "mksquashfs", staging, part, "-noappend", "-no-progress", "-comp", "zstd" }) catch |err| return buildError(request, err, "mksquashfs", meta);
+    runBuildCmd(context.io, context.allocator, &.{ "mksquashfs", staging, part, "-noappend", "-no-progress", "-comp", "zstd" }) catch |err| {
+        std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 5 FAILED - mksquashfs ({t})", .{ name, err });
+        return buildError(request, err, "mksquashfs", meta);
+    };
 
-    // 5. 流式 SHA-512（rootfs 可能数 GB，固定缓冲）。
+    // 5b. 流式 SHA-512（rootfs 可能数 GB，固定缓冲）。
     var sha = std.crypto.hash.sha2.Sha512.init(.{});
     var total_size: u64 = 0;
     {
@@ -3215,6 +3349,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     std.Io.Dir.rename(std.Io.Dir.cwd(), part, std.Io.Dir.cwd(), dest, context.io) catch |err| return validationError(request, err, meta);
 
     // 6. 登记制品（同 register：digest sha512 一致则幂等，漂移则拒绝）。
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     const artifact: rootfs_artifact_store.Artifact = .{
@@ -3232,6 +3367,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
         else => return validationError(request, err, meta),
     };
     const state_str: []const u8 = if (result == .registered) "registered" else "already_present";
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: DONE - state={s} file={s} size={d} bytes sha512={s}", .{ name, state_str, file_name, total_size, content_sha512[0..16] });
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":{f},\"content_sha512\":{f},\"compressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(state_str, .{}), std.json.fmt(content_sha512[0..], .{}), total_size, std.json.fmt(boot_bundle.kernel_release, .{}), std.json.fmt(file_name, .{}) });
@@ -3428,6 +3564,7 @@ fn managementRootfsRegister(request: zap.Request, context: *RouteContext, name: 
     _ = std.fmt.bufPrint(&content_sha512, "{x}", .{sha512_raw}) catch unreachable;
     std.Io.Dir.rename(cwd, tmp, cwd, dest, context.io) catch |err| return validationError(request, err, meta);
 
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     const artifact: rootfs_artifact_store.Artifact = .{
@@ -3692,6 +3829,49 @@ fn disklessEvent(request: zap.Request, context: *const RouteContext, node_id: []
             observe_log.err("diskless event audit append failed after checkpoint: {t}", .{err});
             return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"events.unavailable\",\"message\":\"event writer unavailable\"}}\n", meta);
         };
+
+        // ── boot_session.Store 终态同步（R9 bug 修复）──────────────────────
+        //
+        // v0.2 有两套独立的 session 存储：
+        //
+        // 1. `boot_session.Store`（M2/M3）：DHCP/TFTP 阶段的协议关联注册表。
+        //    DHCP DISCOVER 时由 `dhcp/server.zig:acquireSession` 创建，用于
+        //    DHCP/TFTP/boot_config 阶段的节点身份关联和 capability 认证。
+        //    `hasActive()` 全局检查用于阻止活动 session 期间的属性修改。
+        //
+        // 2. `diskless_delivery.Store`（v0.2）：diskless 交付 session，由
+        //    `managementBootPrepare` 创建，跟踪完整的 diskless 生命周期
+        //    （boot_config_fetched → rootfs_downloading → ... → diskless_running）。
+        //    `node session cancel` 操作的是这个 store。
+        //
+        // 两套 store 的 session ID 不同，但都绑定到同一个 node_id。diskless
+        // 节点 PXE 启动时，DHCP 会在 `boot_session.Store` 中创建 session；
+        // 当 diskless 生命周期到达终态（`diskless_running` 或 `failed`）时，
+        // 必须同步终止 `boot_session.Store` 中的对应 session。
+        //
+        // BUG 历史：此处曾缺少终态同步逻辑。diskless 节点进入 `diskless_running`
+        // 后，`diskless_delivery.Store` 正确到达终态，但 `boot_session.Store`
+        // 中的 DHCP session 仍保持 active，直到 2 小时 delivery TTL 自然过期。
+        // 期间 `hasActive()` 返回 true，导致所有节点的 `node set`/`node unset`
+        // 等属性修改操作被 409 `property.active_session` 拒绝。
+        //
+        // 对比 install 模式：install terminal event（completed/failed）由
+        // `nodeEvent`/`nodeLog`/`subiquityReport` 处理，这些 handler 通过
+        // `context.sessions.finishDelivery(session_id, reason, ...)` 正确终止了
+        // `boot_session.Store` session。diskless 路径遗漏了这一步。
+        //
+        // 修复：在 diskless 终态时按 node_id 终止 `boot_session.Store` session。
+        // 使用 `finishNodeDelivery` 而非 `supersedeNode`，以传入语义准确的
+        // 终态原因（`completed`/`failed` 而非 `superseded`）。
+        if (target == .diskless_running or target == .failed) {
+            const terminal_reason: boot_session.TerminalReason = if (target == .diskless_running) .completed else .failed;
+            _ = context.sessions.finishNodeDelivery(node_id, terminal_reason, boot_session.monotonicNow(), unixNow());
+            // 同步持久化 capability 删除，避免 daemon 重启后从 checkpoint 复活。
+            // 注意：`boot_session_store.load()` 只恢复 install 模式 session
+            // （`if (record.mode != .install) continue`），diskless session 不会
+            // 被恢复，但保持 checkpoint 一致性仍是必要的。
+            if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist terminal delivery session\"}}\n", meta);
+        }
     }
     return json(request, .ok, "{\"ok\":true}\n", meta);
 }
@@ -4098,6 +4278,7 @@ fn managementDiscoveryPolicySet(request: zap.Request, context: *RouteContext, me
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.policy.invalid\",\"message\":\"at least one policy property is required\"}}\n", meta);
     if (parsed.value.observation_retention_days) |days| if (days == 0)
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.policy.invalid_retention\",\"message\":\"observation_retention_days must be positive\"}}\n", meta);
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -4157,6 +4338,7 @@ fn managementNodeClaim(request: zap.Request, context: *RouteContext, node_id: []
     const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.claim.invalid\",\"message\":\"missing request body\"}}\n", meta);
     var parsed = std.json.parseFromSlice(NodeClaimRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.claim.invalid\",\"message\":\"invalid claim properties\"}}\n", meta);
     defer parsed.deinit();
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -4193,6 +4375,7 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
     const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"missing request body\"}}\n", meta);
     var parsed = std.json.parseFromSlice(NodeAddRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid\",\"message\":\"invalid node properties\"}}\n", meta);
     defer parsed.deinit();
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
@@ -4236,6 +4419,7 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
 
 fn managementNodeRemove(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     if (context.sessions.hasActiveNode(node_id, boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.active_session_conflict\",\"message\":\"node is pinned by an active boot session\"}}\n", meta);
+    // 自旋等待 config_mutation_mutex（短临界区，自旋比 futex 更高效）。
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();

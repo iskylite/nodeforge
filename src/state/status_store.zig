@@ -44,12 +44,13 @@ const LegacyStatusFile = struct {
     statuses: []const node_status.Status,
 };
 
-/// `node-status.json` 的 I/O mutex。有意与 DHCP checkpoint 锁分离，
-/// 使 HTTP 状态保存永远不会阻塞或被 DHCP lease 持久化阻塞。
-io_mutex: std.atomic.Mutex = .unlocked,
-
 /// 原子保存节点状态快照到 `node-status.json`。
 /// 调用方必须已在 node_status.Store mutex 下获取一致快照（通过 `snapshot`）。
+///
+/// I/O 互斥说明：本模块的 `save`/`load` 不自带 I/O 锁。实际的 I/O 互斥由
+/// 调用方（`app.zig` 中的 `status_io_mutex`）通过 `RouteContext` 传入 HTTP
+/// server，确保 HTTP 状态保存不会与 DHCP lease 持久化争用。此前此处曾有一个
+/// 模块级 `io_mutex` 声明但从未被 `save`/`load` 使用——它是误导性死代码，已移除。
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, statuses: *const [node_status.max_statuses]node_status.Status, revision: u64, now: i64) !void {
     var compact: [node_status.max_statuses]DiskStatus = undefined;
     const used = compactStatuses(statuses, &compact);

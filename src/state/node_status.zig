@@ -210,15 +210,46 @@ pub const Store = struct {
 ///
 /// 返回 true 表示 phase 可以从 current 推进到 next；false 表示应跳过更新
 ///（重传或回退）。
+///
+/// 跨路径保护：安装器路径和无盘路径各自有独立的 rank 序列，但共享
+/// `boot_config_fetched` 初始阶段。为防止跨路径 "推进"（如从
+/// `install_packages` rank 4 "推进"到 `rootfs_verified` rank 4），
+/// 只有同路径或从公共 `boot` 阶段推进才允许 rank 比较。
 fn phaseAdvances(current: Phase, next: Phase) bool {
     if (current == next) return true;
     if (current == .failed or current == .completed or current == .running) return next == .failed;
     if (next == .failed) return true;
+    // 不同路径之间不允许通过 rank 比较 "推进"。
+    // `boot` 是公共初始阶段，允许向任一路径推进；
+    // `terminal` 可从任一路径进入（completed/running/failed）。
+    const current_path = phasePath(current);
+    const next_path = phasePath(next);
+    if (current_path != next_path and current_path != .boot and next_path != .terminal) return false;
     return phaseRank(next) >= phaseRank(current);
 }
 
-/// 将 phase 映射为单调递增的 rank 值，用于判断安装/无盘路径的进度推进。
-/// 安装器路径和无盘路径各自有独立的 rank 序列，但共享公共的初始阶段。
+/// 将 phase 映射为 (路径, rank) 二元组，用于判断同路径内的进度推进。
+///
+/// 路径分类：
+/// - `boot`：公共初始阶段（boot_config_fetched），两条路径共享。
+/// - `install`：安装器路径（installer_started 到 install_rebooting）。
+/// - `diskless`：无盘路径（initrd_started 到 switching_root）。
+/// - `terminal`：终态阶段（completed/running/failed）。
+///
+/// rank 在各路径内单调递增；不同路径的 rank **不可**相互比较。
+/// `phaseAdvances` 通过 `sameOrSharedPath` 确保只有同路径或从公共
+/// `boot` 阶段推进才允许 rank 比较。
+const PathTag = enum { boot, install, diskless, terminal };
+
+fn phasePath(phase: Phase) PathTag {
+    return switch (phase) {
+        .boot_config_fetched => .boot,
+        .installer_started, .install_config_fetched, .install_started, .install_partitioning, .install_packages, .install_bootloader, .install_post, .install_rebooting => .install,
+        .initrd_started, .rootfs_downloading, .rootfs_verified, .rootfs_mounted, .switching_root => .diskless,
+        .completed, .running, .failed => .terminal,
+    };
+}
+
 fn phaseRank(phase: Phase) u8 {
     return switch (phase) {
         .boot_config_fetched => 1,

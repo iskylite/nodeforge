@@ -120,21 +120,24 @@ pub const Store = struct {
     pub fn fail(self: *Store, id: []const u8, code: []const u8, now: i64) !Entry {
         return self.finish(id, .failed, code, now);
     }
-    /// 内部终态写入函数。succeeded 写入 `result`，failed 写入 `error_code`。
+    /// 内部终态写入函数。succeeded 写入 `result`（<=128），failed 写入 `error_code`（<=96）。
+    /// 两个缓冲区长度不同，按状态分别校验上限，避免静默截断。
     fn finish(self: *Store, id: []const u8, state: State, text: []const u8, now: i64) !Entry {
         lock(&self.mutex);
         defer self.mutex.unlock();
         for (&self.entries) |*entry| if (entry.used() and std.mem.eql(u8, entry.idSlice(), id)) {
-            if (text.len > 128) return error.OperationResultTooLong;
+            // result 缓冲区 128 字节，error_code 缓冲区仅 96 字节；
+            // 按状态分别校验上限，防止 97-128 范围的 error_code 被静默截断。
+            const max_len = if (state == .succeeded) entry.result.len else entry.error_code.len;
+            if (text.len > max_len) return error.OperationResultTooLong;
             entry.state = state;
             entry.updated_at = now;
             if (state == .succeeded) {
                 @memcpy(entry.result[0..text.len], text);
                 entry.result_len = @intCast(text.len);
             } else {
-                const len = @min(text.len, entry.error_code.len);
-                @memcpy(entry.error_code[0..len], text[0..len]);
-                entry.error_len = @intCast(len);
+                @memcpy(entry.error_code[0..text.len], text);
+                entry.error_len = @intCast(text.len);
             }
             return entry.*;
         };

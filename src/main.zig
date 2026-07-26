@@ -299,6 +299,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(node_set);
     try addOutputFlag(node_set);
     try addDebugFlag(node_set);
+    try node_set.addFlag(.{ .name = "force", .description = "Terminate active sessions (install/diskless) on the target node before mutation", .type = .Bool, .default_value = .{ .Bool = false } });
 
     const node_unset = try zli.Command.init(init_options, .{
         .name = "unset",
@@ -311,6 +312,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(node_unset);
     try addOutputFlag(node_unset);
     try addDebugFlag(node_unset);
+    try node_unset.addFlag(.{ .name = "force", .description = "Terminate active sessions (install/diskless) on the target node before mutation", .type = .Bool, .default_value = .{ .Bool = false } });
 
     const node_remove = try zli.Command.init(init_options, .{ .name = "remove", .description = "Remove a registered node" }, nodeRemoveHandler);
     try node_remove.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
@@ -806,6 +808,12 @@ fn addValuesCommands(parent: *zli.Command, init_options: zli.InitOptions, owner:
         .type = .String,
         .default_value = .{ .String = "" },
     });
+    for ([_]*zli.Command{ add, remove, replace, clear }) |command| try command.addFlag(.{
+        .name = "force",
+        .description = "Terminate active sessions (install/diskless) on the target node before mutation",
+        .type = .Bool,
+        .default_value = .{ .Bool = false },
+    });
     try parent.addCommands(&.{ list, add, remove, replace, clear });
 }
 
@@ -836,6 +844,12 @@ fn addItemCommands(parent: *zli.Command, init_options: zli.InitOptions, owner: [
         try addItemValuesPositionals(command, owner, command == add_values or command == remove_values);
     }
     try replace_values.addFlag(.{ .name = "from-file", .description = "UTF-8 text file with one value per line, or - for stdin", .type = .String, .default_value = .{ .String = "" } });
+    for ([_]*zli.Command{ add, set, remove, move, add_values, remove_values, replace_values, clear_values }) |command| try command.addFlag(.{
+        .name = "force",
+        .description = "Terminate active sessions (install/diskless) on the target node before mutation",
+        .type = .Bool,
+        .default_value = .{ .Bool = false },
+    });
     try item.addCommands(&.{ list, show, add, set, remove, move, list_values, add_values, remove_values, replace_values, clear_values });
     try parent.addCommand(item);
     const replace = try zli.Command.init(init_options, .{ .name = "replace-items", .description = "Atomically replace structured items from a file" }, replaceItemsHandler);
@@ -844,6 +858,12 @@ fn addItemCommands(parent: *zli.Command, init_options: zli.InitOptions, owner: [
     try replace.addFlag(.{ .name = "input", .description = "Input format: yaml or json", .type = .String, .default_value = .{ .String = "yaml" } });
     const clear = try zli.Command.init(init_options, .{ .name = "clear-items", .description = "Clear a structured collection or local replacement" }, replaceItemsHandler);
     try addItemBase(clear, owner, false);
+    for ([_]*zli.Command{ replace, clear }) |command| try command.addFlag(.{
+        .name = "force",
+        .description = "Terminate active sessions (install/diskless) on the target node before mutation",
+        .type = .Bool,
+        .default_value = .{ .Bool = false },
+    });
     try parent.addCommands(&.{ replace, clear });
 }
 
@@ -1025,7 +1045,7 @@ fn valuesHandler(ctx: zli.CommandContext) !void {
         }
     }
     var reason: [512]u8 = undefined;
-    const result = nodeforge.management_client.valuesMutation(ctx.io, config.value.server.http_port, owner_text, identity, operation, key, values, scalar_mutations[0..scalar_count], &reason);
+    const result = nodeforge.management_client.valuesMutation(ctx.io, config.value.server.http_port, owner_text, identity, operation, key, values, scalar_mutations[0..scalar_count], ctx.flag("force", bool), &reason);
     if (!result.healthy) return reportMutationFailure(ctx, result, "collection mutation failed");
     const human = try std.fmt.allocPrint(ctx.allocator, "{s} {s} on {s}", .{ operation, key, identity });
     try renderCommandResult(ctx, human, .{ .resource = identity, .key = key, .operation = operation, .values = values });
@@ -1128,7 +1148,7 @@ fn itemHandler(ctx: zli.CommandContext) !void {
     };
     if (patch.operation == .add) patch.identity = patch.id orelse patch.name orelse return itemUsageError(ctx, "add requires the ItemSpec identity field");
     var reason: [512]u8 = undefined;
-    const result = nodeforge.management_client.itemMutation(ctx.io, config.value.server.http_port, owner_text, resource, patch, &reason);
+    const result = nodeforge.management_client.itemMutation(ctx.io, config.value.server.http_port, owner_text, resource, patch, ctx.flag("force", bool), &reason);
     if (!result.healthy) return reportMutationFailure(ctx, result, "item mutation failed");
     const human = try std.fmt.allocPrint(ctx.allocator, "{s} {s}:{s}", .{ command_name, key, patch.identity });
     try renderCommandResult(ctx, human, .{ .resource = resource, .key = key, .operation = command_name, .identity = patch.identity });
@@ -1204,7 +1224,7 @@ fn itemValuesHandler(ctx: zli.CommandContext) !void {
         }
     }
     var reason: [512]u8 = undefined;
-    const mutation = nodeforge.management_client.itemValuesMutation(ctx.io, config.value.server.http_port, owner_text, resource_identity, item_identity, operation, key, field, values, &reason);
+    const mutation = nodeforge.management_client.itemValuesMutation(ctx.io, config.value.server.http_port, owner_text, resource_identity, item_identity, operation, key, field, values, ctx.flag("force", bool), &reason);
     if (!mutation.healthy) {
         try writeCommandError(ctx, "item.values_mutation_failed", if (mutation.reason.len == 0) "item values mutation failed" else mutation.reason, 1);
         return;
@@ -1334,7 +1354,7 @@ fn sendItemReplacement(ctx: zli.CommandContext, owner: []const u8, resource: []c
     };
     defer config.deinit();
     var reason: [512]u8 = undefined;
-    const result = nodeforge.management_client.itemReplacement(ctx.io, config.value.server.http_port, owner, resource, replacement, &reason);
+    const result = nodeforge.management_client.itemReplacement(ctx.io, config.value.server.http_port, owner, resource, replacement, ctx.flag("force", bool), &reason);
     if (!result.healthy) return reportMutationFailure(ctx, result, "item replacement failed");
     const human = try std.fmt.allocPrint(ctx.allocator, "{s} {s} on {s}", .{ @tagName(replacement.operation), replacement.key, resource });
     try renderCommandResult(ctx, human, .{ .resource = resource, .key = replacement.key, .operation = replacement.operation });
@@ -2079,6 +2099,7 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
     var published = false;
     defer if (!published) std.Io.Dir.cwd().deleteFile(ctx.io, part) catch {};
     const initrd_binary = try std.fmt.allocPrint(ctx.allocator, "{s}/nodeforge-initrd", .{nodeforge.paths.require().bin_dir});
+    try errorWriter(ctx).print("Building initrd {s} (kver={s}, arch={s}, mode={s})...\n", .{ name, kernel_release, @tagName(arch), if (base_initrd != null) "vendor-overlay" else "dracut-fallback" });
     const build_result = if (base_initrd) |base|
         nodeforge.provision_initrd_build_executor.buildFromInstaller(ctx.io, ctx.allocator, kernel_release, initrd_binary, base, part)
     else
@@ -2088,6 +2109,7 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "initrd.build_failed", message, 1);
         return;
     };
+    try errorWriter(ctx).print("Build complete, publishing to {s}...\n", .{relative});
     std.Io.Dir.rename(std.Io.Dir.cwd(), part, std.Io.Dir.cwd(), destination, ctx.io) catch |err| {
         const message = try std.fmt.allocPrint(ctx.allocator, "cannot atomically publish initrd ({t})", .{err});
         try writeCommandError(ctx, "initrd.publish_failed", message, 1);
@@ -2095,6 +2117,7 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
     };
     published = true;
 
+    try errorWriter(ctx).print("Registering with daemon...\n", .{});
     const imported = nodeforge.management_client.importAsset(ctx.io, config.value.server.http_port, .{
         .name = name,
         .kind = @tagName(nodeforge.model.AssetKind.nodeforge_initrd),
@@ -2109,6 +2132,7 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "initrd.register_failed", "daemon rejected the built initrd; unpublished file was removed", 1);
         return;
     }
+    try errorWriter(ctx).print("Initrd registered successfully.\n", .{});
     const human = try std.fmt.allocPrint(ctx.allocator, "initrd built and registered: {s} ({s})", .{ name, relative });
     try renderCommandResult(ctx, human, .{ .name = name, .path = relative, .arch = @tagName(arch), .kernel_release = kernel_release });
 }
@@ -3655,7 +3679,16 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     defer parsed.deinit();
     const result = parsed.value.result;
     const install = result.install;
-    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "stored", .title = "Stored" }, .{ .key = "effective", .title = "Effective" }, .{ .key = "capabilities", .title = "Capabilities" }, .{ .key = "runtime", .title = "Runtime" } };
+    // R10: 格式化资产路径列表，使 profile show 能直接看到 kernel/initrd/rootfs 等受管文件路径。
+    var assets_buf: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer assets_buf.deinit();
+    for (result.assets) |asset| {
+        assets_buf.writer.print("{s} [{s}] -> {s}", .{ asset.name, asset.kind, asset.path }) catch {};
+        if (asset.sha256) |sha| assets_buf.writer.print(" (sha256:{s})", .{sha[0..16]}) catch {};
+        assets_buf.writer.writeByte('\n') catch {};
+    }
+    if (result.assets.len == 0) assets_buf.writer.writeAll("(none)\n") catch {};
+    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "stored", .title = "Stored" }, .{ .key = "effective", .title = "Effective" }, .{ .key = "capabilities", .title = "Capabilities" }, .{ .key = "assets", .title = "Assets" }, .{ .key = "runtime", .title = "Runtime" } };
     const fields = [_]nodeforge.cli_document.Field{
         .{ .key = "name", .value = result.name, .section = "stored" },                                                                                                                     .{ .key = "install_source", .value = result.install_source.name, .section = "stored", .json_path = "install_source.name" },                                                                                .{ .key = "kernel_args", .value = result.kernel_args orelse "-", .section = "stored" },                                                                                    .{ .key = "platform.distro", .value = result.platform.distro, .section = "capabilities" },                                                                                                                                .{ .key = "platform.version", .value = result.platform.version, .section = "capabilities" },                                                                                 .{ .key = "platform.arch", .value = result.platform.arch, .section = "capabilities" },
         .{ .key = "install.storage.mode", .value = @tagName(install.storage.mode), .section = "effective", .json_path = "install.storage.mode" },                                          .{ .key = "install.storage.wipe", .value = if (install.storage.wipe) "yes" else "no", .section = "effective", .json_path = "install.storage.wipe" },                                                       .{ .key = "install.storage.partition_table", .value = @tagName(install.storage.partition_table), .section = "effective", .json_path = "install.storage.partition_table" }, .{ .key = "install.bootloader.install", .value = if (install.bootloader.install) "yes" else "no", .section = "effective", .json_path = "install.bootloader.install" },                                                    .{ .key = "system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" }, .{ .key = "system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },
@@ -3663,6 +3696,7 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
         .{ .key = "system.security.firewall", .value = result.effective_system.security.firewall, .section = "effective", .json_path = "effective_system.security.firewall" },             .{ .key = "system.security.selinux", .value = result.effective_system.security.selinux, .section = "effective", .json_path = "effective_system.security.selinux" },                                        .{ .key = "system.security.apparmor", .value = result.effective_system.security.apparmor, .section = "effective", .json_path = "effective_system.security.apparmor" },     .{ .key = "install.apt.fallback", .value = @tagName(install.apt.fallback), .section = "effective", .json_path = "install.apt.fallback" },                                                                                 .{ .key = "install.completion.action", .value = @tagName(install.completion.action), .section = "effective", .json_path = "install.completion.action" },                     .{ .key = "install.updates.mode", .value = @tagName(install.updates.mode), .section = "effective", .json_path = "install.updates.mode" },
         .{ .key = "install.proxy.url", .value = install.proxy.url orelse "<unset>", .section = "effective", .json_path = "install.proxy.url" },                                            .{ .key = "install.reinstall_policy", .value = @tagName(install.reinstall_policy), .section = "effective", .json_path = "install.reinstall_policy" },                                                      .{ .key = "install.post_install.bundle", .value = install.post_install.bundle orelse "<unset>", .section = "effective", .json_path = "install.post_install.bundle" },      .{ .key = "capability.family", .value = result.capability.family, .section = "capabilities" },                                                                                                                            .{ .key = "capability.install_adapter", .value = result.capability.install_adapter, .section = "capabilities" },                                                             .{ .key = "capability.package_manager", .value = result.capability.package_manager, .section = "capabilities" },
         .{ .key = "validation.valid", .value = if (result.validation.valid) "yes" else "no", .section = "runtime" },                                                                       .{ .key = "model_revision.config", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.config}), .section = "runtime" },                                                         .{ .key = "model_revision.catalog", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.catalog}), .section = "runtime" },                       .{ .key = "nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.nodes.len}), .section = "runtime" },                                                                                                    .{ .key = "assets", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.assets.len}), .section = "runtime" },
+        .{ .key = "assets.paths", .value = assets_buf.written(), .section = "assets" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Profile {s}", .{result.name});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
@@ -3762,8 +3796,14 @@ fn profileRootfsPlanHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     const r = parsed.value.result;
-    const human = try std.fmt.allocPrint(ctx.allocator, "profile: {s}\nrootfs_input_digest: {s}\ncache_state: {s}", .{ r.profile, r.rootfs_input_digest, r.cache_state });
-    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+    const sections = [_]nodeforge.cli_document.Section{.{ .key = "plan", .title = "Plan" }};
+    const fields = [_]nodeforge.cli_document.Field{
+        .{ .key = "profile", .value = r.profile, .section = "plan" },
+        .{ .key = "rootfs_input_digest", .value = r.rootfs_input_digest, .section = "plan" },
+        .{ .key = "cache_state", .value = r.cache_state, .section = "plan" },
+    };
+    const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Plan {s}", .{r.profile});
+    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
 }
 
 fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
@@ -3776,6 +3816,8 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     const name = ctx.getArg("name") orelse return;
     const if_input_digest_raw = ctx.flag("if-input-digest", []const u8);
     const if_input_digest: ?[]const u8 = if (if_input_digest_raw.len == 0) null else if_input_digest_raw;
+    try errorWriter(ctx).print("Requesting rootfs build for profile {s}...\n", .{name});
+    if (if_input_digest) |d| try errorWriter(ctx).print("Anti-drift digest: {s}\n", .{d});
     var reason: [256]u8 = undefined;
     const result = nodeforge.management_client.rootfsBuild(ctx.io, config.value.server.http_port, name, if_input_digest, &reason);
     if (!result.healthy) {
@@ -3797,8 +3839,19 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     const r = parsed.value.result;
-    const human = try std.fmt.allocPrint(ctx.allocator, "profile: {s}\nrootfs_input_digest: {s}\nstate: {s}\ncontent_sha512: {s}\ncompressed_bytes: {d}\nkernel_release: {s}\nfile: {s}", .{ r.profile, r.rootfs_input_digest, r.state, r.content_sha512 orelse "-", r.compressed_bytes orelse 0, r.kernel_release orelse "-", r.file orelse "-" });
-    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+    try errorWriter(ctx).print("Rootfs build complete: state={s} file={s}\n", .{ r.state, r.file orelse "-" });
+    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" } };
+    const fields = [_]nodeforge.cli_document.Field{
+        .{ .key = "profile", .value = r.profile, .section = "artifact" },
+        .{ .key = "rootfs_input_digest", .value = r.rootfs_input_digest, .section = "artifact" },
+        .{ .key = "state", .value = r.state, .section = "artifact" },
+        .{ .key = "content_sha512", .value = r.content_sha512 orelse "-", .section = "artifact" },
+        .{ .key = "compressed_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.compressed_bytes orelse 0}), .section = "artifact" },
+        .{ .key = "kernel_release", .value = r.kernel_release orelse "-", .section = "runtime" },
+        .{ .key = "file", .value = r.file orelse "-", .section = "runtime" },
+    };
+    const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Build {s}", .{r.profile});
+    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
 }
 
 fn profileRootfsRegisterHandler(ctx: zli.CommandContext) !void {
@@ -3835,8 +3888,18 @@ fn profileRootfsRegisterHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     const r = parsed.value.result;
-    const human = try std.fmt.allocPrint(ctx.allocator, "profile: {s}\nrootfs_input_digest: {s}\nstate: {s}\ncontent_sha512: {s}\ncompressed_bytes: {d}\nkernel_release: {s}\nfile: {s}", .{ r.profile, r.rootfs_input_digest, r.state, r.content_sha512 orelse "-", r.compressed_bytes orelse 0, r.kernel_release orelse "-", r.file orelse "-" });
-    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" } };
+    const fields = [_]nodeforge.cli_document.Field{
+        .{ .key = "profile", .value = r.profile, .section = "artifact" },
+        .{ .key = "rootfs_input_digest", .value = r.rootfs_input_digest, .section = "artifact" },
+        .{ .key = "state", .value = r.state, .section = "artifact" },
+        .{ .key = "content_sha512", .value = r.content_sha512 orelse "-", .section = "artifact" },
+        .{ .key = "compressed_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.compressed_bytes orelse 0}), .section = "artifact" },
+        .{ .key = "kernel_release", .value = r.kernel_release orelse "-", .section = "runtime" },
+        .{ .key = "file", .value = r.file orelse "-", .section = "runtime" },
+    };
+    const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Register {s}", .{r.profile});
+    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
 }
 
 fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
@@ -3861,8 +3924,19 @@ fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     const r = parsed.value.result;
-    const human = try std.fmt.allocPrint(ctx.allocator, "profile: {s}\nrootfs_input_digest: {s}\nstate: {s}\ncontent_sha512: {s}\ncompressed_bytes: {d}\nkernel_release: {s}\nfile: {s}", .{ r.profile, r.rootfs_input_digest, r.state, r.content_sha512 orelse "-", r.compressed_bytes orelse 0, r.kernel_release orelse "-", r.file orelse "-" });
-    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" } };
+    const fields = [_]nodeforge.cli_document.Field{
+        .{ .key = "profile", .value = r.profile, .section = "artifact" },
+        .{ .key = "rootfs_input_digest", .value = r.rootfs_input_digest, .section = "artifact" },
+        .{ .key = "state", .value = r.state, .section = "artifact" },
+        .{ .key = "content_sha512", .value = r.content_sha512 orelse "-", .section = "artifact" },
+        .{ .key = "compressed_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.compressed_bytes orelse 0}), .section = "artifact" },
+        .{ .key = "uncompressed_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.uncompressed_bytes orelse 0}), .section = "artifact" },
+        .{ .key = "kernel_release", .value = r.kernel_release orelse "-", .section = "runtime" },
+        .{ .key = "file", .value = r.file orelse "-", .section = "runtime" },
+    };
+    const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Status {s}", .{r.profile});
+    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
 }
 
 fn profileSetHandler(ctx: zli.CommandContext) !void {
@@ -3889,10 +3963,10 @@ fn profileUnsetHandler(ctx: zli.CommandContext) !void {
 }
 
 fn mutateScalarCli(ctx: zli.CommandContext, owner: []const u8, identity: []const u8, key: []const u8, value: ?[]const u8) !void {
-    return mutateScalarBatchCli(ctx, owner, identity, &.{.{ .key = key, .value = value }});
+    return mutateScalarBatchCli(ctx, owner, identity, &.{.{ .key = key, .value = value }}, false);
 }
 
-fn mutateScalarBatchCli(ctx: zli.CommandContext, owner: []const u8, identity: []const u8, mutations: []const nodeforge.scalar_mutation.Mutation) !void {
+fn mutateScalarBatchCli(ctx: zli.CommandContext, owner: []const u8, identity: []const u8, mutations: []const nodeforge.scalar_mutation.Mutation, force: bool) !void {
     _ = outputFromContext(ctx) orelse return;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
@@ -3900,7 +3974,7 @@ fn mutateScalarBatchCli(ctx: zli.CommandContext, owner: []const u8, identity: []
     };
     defer config.deinit();
     var reason: [512]u8 = undefined;
-    const result = nodeforge.management_client.scalarMutations(ctx.io, config.value.server.http_port, owner, identity, mutations, &reason);
+    const result = nodeforge.management_client.scalarMutations(ctx.io, config.value.server.http_port, owner, identity, mutations, force, &reason);
     if (!result.healthy) return reportMutationFailure(ctx, result, "scalar mutation failed");
     const human = try std.fmt.allocPrint(ctx.allocator, "updated {d} properties on {s}", .{ mutations.len, identity });
     try renderCommandResult(ctx, human, .{ .owner = owner, .resource = identity, .mutations = mutations });
@@ -4277,7 +4351,7 @@ fn nodeSetHandler(ctx: zli.CommandContext) !void {
         if (nodeforge.cli_properties.property(.node, key) == null) return nodePropertyError(ctx, error.UnknownAttribute);
         try mutations.append(ctx.allocator, .{ .key = key, .value = value });
     }
-    try mutateScalarBatchCli(ctx, "node", node_id, mutations.items);
+    try mutateScalarBatchCli(ctx, "node", node_id, mutations.items, ctx.flag("force", bool));
 }
 
 fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
@@ -4289,7 +4363,7 @@ fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
         if (!spec.optional) return nodePropertyError(ctx, error.AttributeNotOptional);
         try mutations.append(ctx.allocator, .{ .key = key });
     }
-    try mutateScalarBatchCli(ctx, "node", node_id, mutations.items);
+    try mutateScalarBatchCli(ctx, "node", node_id, mutations.items, ctx.flag("force", bool));
 }
 
 const NodeProperties = struct { mac: ?[]const u8 = null, arch: ?model.Arch = null, profile: ?[]const u8 = null, pxe_ip_reservation: ?[]const u8 = null, hostname: ?[]const u8 = null, deploy: ?bool = null, http_accel: ?bool = null, storage_boot_disk: ?[]const u8 = null, network_mode: ?model.NetworkMode = null, network_interface: ?[]const u8 = null, network_address: ?[]const u8 = null, network_prefix_len: ?u8 = null, network_gateway: ?[]const u8 = null };

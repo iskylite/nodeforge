@@ -106,6 +106,181 @@ Result），但 `bootloader_rel` 错误地多了 defer free。对比 `bootloader
 仍然存在，只是表现为随机字节而非确定的 `0xAA`）。已导入的 catalog 数据需手动修复 bootloader
 资产的 `path` 字段。
 
+### R9. diskless agent 启动时机、日志留存与 rc.local 权限
+
+**问题**：
+1. `nodeforge-firstboot.service` 的 systemd unit 缺少 `Before=rc-local.service`，无法保证
+   agent first-boot 在 rc.local 之前完成。如果 rc.local 中的脚本依赖 agent 写入的配置
+   （如网络、hostname），可能因时序不确定而失败。
+2. agent first-boot 的 `StandardOutput`/`StandardError` 未配置文件输出，日志只写入 systemd
+   journal，在无盘系统（volatile tmpfs upper）中 journal 可能丢失，导致事后无法分析。
+3. Rocky/RHEL 系默认 `/etc/rc.d/rc.local` 无执行权限（0644），rc-local.service 不会执行
+   其中的指令。install/diskless 后处理写入的 rc.local 内容因此被静默跳过。
+
+**修订**：
+1. `nodeforge-firstboot.service` unit 增加 `Before=rc-local.service`，确保 agent 在 rc.local
+   之前完成 first-boot 步骤。
+2. unit 增加 `StandardOutput=journal+file:/var/lib/nodeforge/firstboot.log` 和
+   `StandardError=journal+file:/var/lib/nodeforge/firstboot.log`，使日志同时写入 journal
+   和持久文件。日志位置：`/var/lib/nodeforge/firstboot.log`。
+3. rootfs build 在 staging 中默认创建 `/etc/rc.d/rc.local`（如不存在）并 `chmod 0755`，
+   确保节点启动后 rc-local.service 能正确执行 rc.local 内容。
+
+**影响范围**：`src/http/server.zig`（rootfs build + systemd unit 模板）。
+
+### R10. profile show 资产路径展示与 show 指令输出格式统一
+
+**问题**：
+1. `profile show` 只显示资产数量（`assets: 3`），不显示具体路径。操作员无法直接从
+   profile show 看到 kernel/initrd/rootfs 等受管文件路径，需要额外执行 `assets list` 或
+   查看 catalog JSON。
+2. `profile rootfs build`、`profile rootfs plan`、`profile rootfs status`、
+   `profile rootfs register` 四个子命令的 human 输出使用原始文本（`profile: xxx\nstate: xxx`），
+   与 `node show`、`profile show` 使用的 detail document 格式（带 section 对齐）不一致。
+
+**修订**：
+1. `profile show` 新增 "Assets" section，列出每个资产的 `name [kind] -> path (sha256:prefix)`。
+2. `profile rootfs build/plan/status/register` 统一改为 detail document 格式，使用
+   `cli_document.Section` + `cli_document.Field` 结构化输出，与 `node show`、`profile show`
+   对齐。
+3. rootfs build CLI handler 在 stderr 输出构建进度（"Requesting rootfs build..."），
+   initrd build CLI handler 同样在 stderr 输出分阶段进度。
+4. daemon 端 rootfs build 添加 `std.log.scoped(.rootfs_build)` 分阶段进度日志
+   （stage 1/5 ~ 5/5 + DONE/FAILED），initrd build executor 同样添加 7 阶段进度日志。
+   日志可通过 `journalctl -u nodeforged` 或 daemon 日志文件查看。
+
+**影响范围**：`src/main.zig`（profile show / rootfs build / rootfs plan / rootfs status /
+rootfs register / initrd build handler）、`src/http/server.zig`（rootfs build 进度日志）、
+`src/provision/initrd_build_executor.zig`（initrd build 进度日志）。
+
+### R11. initrd 日志留存到无盘系统
+
+**问题**：nodeforge-initrd 作为 PID 1 在 dracut initramfs 中运行，日志只输出到 console
+（串口）。switch_root 后 initramfs 被丢弃，initrd 阶段的启动日志（网络配置、rootfs 下载、
+overlay 挂载、handoff 写入等）在切根后无法查看，事后排障困难。
+
+**修订**：
+1. initrd `log()` 函数增加全局文件 fd `initrd_log_fd`，在 `/run`（tmpfs）挂载后打开
+   `/run/initrd.log`。每次 `log()` 调用同时写入 stderr（console）和文件。
+2. switch_root 前，将 `/run/initrd.log` 复制到 overlay upper 的
+   `/var/lib/nodeforge/initrd.log`，同时执行 `dmesg` 捕获内核日志到
+   `/var/lib/nodeforge/initrd-dmesg.log`。
+3. 切根后日志位置：
+   - initrd 阶段：`/var/lib/nodeforge/initrd.log` + `/var/lib/nodeforge/initrd-dmesg.log`
+   - pre-init 阶段：console（串口），无持久化
+   - first-boot 阶段：`/var/lib/nodeforge/firstboot.log` + systemd journal
+
+**影响范围**：`src/initrd.zig`（log 函数 + main switch_root 前日志复制）、`src/agent.zig`
+（文档注释更新日志位置说明）。
+
+### R12. diskless 终态未同步终止 boot_session.Store 的 DHCP session
+
+**问题**：diskless 节点 PXE 启动并成功进入 `diskless_running` 后，执行 `node set` 修改
+节点属性时返回 409 `property.active_session`，错误信息为 "property mutation is blocked by
+an active boot session"。
+
+**根因**：v0.2 有两套独立的 session 存储，职责不同但都绑定到同一个 node_id：
+
+1. `boot_session.Store`（M2/M3，`src/state/boot_session.zig`）：DHCP/TFTP 阶段的协议关联
+   注册表。DHCP DISCOVER 时由 `dhcp/server.zig:acquireSession` 创建，用于 DHCP/TFTP/
+   boot_config 阶段的节点身份关联和 capability 认证。`hasActive()` 全局检查用于阻止活动
+   session 期间的属性修改（`server.zig` 标量/集合/item mutation handler）。
+
+2. `diskless_delivery.Store`（v0.2，`src/state/diskless_delivery.zig`）：diskless 交付
+   session，由 `managementBootPrepare`（`node boot-prepare`）创建，跟踪完整的 diskless
+   生命周期（`boot_config_fetched` → `rootfs_downloading` → ... → `diskless_running`）。
+   `node session cancel` 操作的是这个 store。
+
+两套 store 的 session ID 不同（DHCP session 使用 128-bit 随机 ID，diskless delivery session
+使用独立的 128-bit 随机 ID），但都绑定到同一个 node_id。diskless 节点 PXE 启动时，DHCP
+会在 `boot_session.Store` 中创建 session（`resolver.resolveWithDeployment` 的
+`install_not_armed` gate 只对 `.install` 模式生效，diskless 模式不阻止 session 创建）。
+
+`disklessEvent` handler（`server.zig`）在处理 diskless 生命周期事件时，只操作
+`diskless_delivery.Store`（`advanceEvent` + `revoke`），**未同步终止** `boot_session.Store`
+中的 DHCP session。当 diskless 生命周期到达终态（`diskless_running` 或 `failed`）后，
+`diskless_delivery.Store` 正确到达终态，但 `boot_session.Store` 中的 session 仍保持 active，
+直到 2 小时 delivery TTL 自然过期。期间 `hasActive()` 返回 true，导致所有节点（不仅仅是
+该 diskless 节点）的 `node set`/`node unset` 等属性修改操作被 409 拒绝。
+
+对比 install 模式：install terminal event（`completed`/`failed`）由 `nodeEvent`/
+`nodeLog`/`subiquityReport` handler 处理，这些 handler 通过
+`context.sessions.finishDelivery(session_id, reason, ...)` 正确终止了
+`boot_session.Store` session。diskless 路径遗漏了这一步。
+
+**修订**：
+
+1. `boot_session.Store` 新增 `finishNodeDelivery(node_id, reason, mono_now, utc_now)` 方法。
+   与 `supersedeNode` 类似按 node_id 终止所有活动 session，但允许调用方指定语义准确的
+   终态原因（`completed`/`failed`），而非固定使用 `superseded`。
+
+2. `disklessEvent` handler 在 `result == .applied` 且 target 为终态（`diskless_running`
+   或 `failed`）时，调用 `finishNodeDelivery` 终止 `boot_session.Store` 中的 DHCP session，
+   并通过 `checkpointSessions` 同步持久化。终态原因：`diskless_running` → `.completed`，
+   `failed` → `.failed`。
+
+3. `boot_session_store.load()` 已有 `if (record.mode != .install) continue` 保护，
+   diskless session 不会从 checkpoint 恢复。但保持 checkpoint 一致性仍是必要的，
+   避免当前 daemon 实例中 session 残留。
+
+**影响范围**：`src/state/boot_session.zig`（新增 `finishNodeDelivery` 方法）、
+`src/http/server.zig`（`disklessEvent` handler 终态同步）。
+
+### R13. 属性变更强制模式（--force）支持 install 和 diskless session
+
+**问题**：v0.1 的全局 `hasActive()` 检查在存在任何活动 boot session 时阻塞所有节点的属性变更
+（`node set`/`node unset` 等），返回 409 `property.active_session`。这在以下场景下过于保守：
+
+1. diskless 节点正在启动过程中（尚未到达 `diskless_running` 终态），操作员需要修改该节点属性。
+2. install 节点正在安装过程中，操作员需要修改该节点属性。
+3. 其他节点有活动 session，但操作员需要修改一个无活动 session 的节点属性。
+
+R12 修复了 diskless 终态未同步终止 `boot_session.Store` 的问题，但无法覆盖所有场景（例如节点
+卡在非终态阶段、操作员需要紧急修改属性等）。
+
+**修订**：
+
+1. **新增 `--force` CLI 标志**：所有 node 属性变更命令新增 `--force` 布尔标志，包括
+   `node set`、`node unset`、`node add-values`/`remove-values`/`replace-values`/`clear-values`、
+   `node item add`/`set`/`remove`/`move`、`node item add-values`/`remove-values`/`replace-values`/
+   `clear-values`、`node replace-items`/`clear-items`。Profile 属性变更命令同样支持。
+
+2. **新增 `forceTerminateNodeSessions` 服务端辅助函数**（`server.zig`）：
+   - 调用 `boot_session.Store.supersedeNode(node_id, ...)` 终止目标节点的 install PXE session
+     或 diskless DHCP session，并通过 `checkpointSessions` 持久化。
+   - 调用 `diskless_delivery.Store.findByNode(node_id)` 查找活动 diskless 交付 session；
+     若存在，调用 `diskless_store.cancel(io, session_id)` 撤销全部 capability 并从 checkpoint 移除。
+   - 持久化失败时返回 false，调用方返回 503 `session.persist_failed`。
+
+3. **修改 5 个 mutation handler**（`managementScalarMutation`、`managementValuesMutation`、
+   `managementItemMutation`、`managementItemValuesMutation`、`managementItemReplacement`）：
+   - 解析 `?force=true` 查询参数（`parseForceFlag`）
+   - `force=true` 且 owner 为 `node`：调用 `forceTerminateNodeSessions` 终止目标节点 session，
+     然后跳过全局 `hasActive()` 检查
+   - `force=true` 且 owner 为 `profile`：仅跳过全局 `hasActive()` 检查
+   - `force=false`：保持原有行为
+   - 错误信息更新为包含 "use --force to override" 提示
+
+4. **客户端函数签名变更**：`scalarMutations`、`valuesMutation`、`itemMutation`、
+   `itemValuesMutation`、`itemReplacement` 新增 `force: bool` 参数，`force=true` 时在 URL
+   附加 `?force=true` 查询参数。
+
+**安全保证**：
+- install plan 在 PXE bootstrap 时已固定为不可变快照（`captureInstallPlan`），终止 session
+  不影响正在运行的 installer。
+- diskless AgentPlan 在 boot-config 首次签发时已固定（`pinAgentPlan`），终止 delivery session
+  不影响已获取 rootfs 和 agent plan 的 diskless 节点。
+- Profile 变更只影响下一次 session（install plan / diskless AgentPlan 均为不可变快照），
+  不影响正在运行的 session。
+
+**与 `node retry --force` 的关系**：`node retry --force`（v0.1 已有）使用相同的 `supersedeNode`
+机制，但仅用于 install 模式的重新 arm，不涉及 diskless delivery session。`node set --force` 等
+是新增功能，扩展到所有属性变更操作并支持 diskless session 终止。
+
+**影响范围**：`src/http/server.zig`（`parseForceFlag`、`forceTerminateNodeSessions`、5 个
+mutation handler）、`src/http/client.zig`（5 个 mutation client 函数新增 `force` 参数）、
+`src/main.zig`（CLI 命令定义新增 `--force` 标志、handler 函数传递 `force` 参数）。
+
 ## 0. 文档结构与阅读路径
 
 ### 0.1 总分职责

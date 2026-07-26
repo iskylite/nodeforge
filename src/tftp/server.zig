@@ -72,6 +72,9 @@ const capsule_max_bytes = 2048;
 const capsule_slots = 256;
 
 pub const CapsuleStore = struct {
+    /// CapsuleStore 使用自旋锁（tryLock + Thread.yield）保护所有方法。
+    /// 临界区极短（固定数组遍历 + memcpy），自旋比系统 futex 更高效。
+    /// yield 让出 CPU 时间片，非纯忙等。
     mutex: std.atomic.Mutex = .unlocked,
     /// Serializes pending-check + boot-prepare + put, preventing duplicate
     /// delivery sessions when firmware asks for the same per-MAC config twice.
@@ -194,6 +197,7 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
     var socket = owned_socket;
     defer socket.close(io);
     var active_transfers = std.atomic.Value(u16).init(0);
+    // 排水模式：自旋等待所有活动 TFTP 传输完成后再退出，防止 socket 提前关闭。
     defer while (active_transfers.load(.acquire) != 0) std.Thread.yield() catch {};
     // M4.8: max_concurrent_transfers 省略时按 max(128, 2×核) 自动派生；config 显式给出则覆盖。
     const auto_concurrency: u16 = capmod.tftpConcurrency(std.Thread.getCpuCount() catch 1, null);
@@ -470,7 +474,7 @@ fn transferVirtualConfig(
         // 渲染结果写入栈缓冲区，在 TFTP I/O 开始前就已完成自包含，
         // 因此慢速客户端不会长时间持有 catalog mutex。
         const target = boot_target.resolve(identity, config, catalog.value(), config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
-        const node = lookup.findNode(catalog.value(), identity.node_id) orelse return error.BootTargetUnavailable;
+        const node = lookup.findNode(catalog.value(), identity.nodeId()) orelse return error.BootTargetUnavailable;
         // M4.2 F4：node.http_accel 是实验性功能（默认 false）。
         // 启用时，initrd 路径渲染为 GRUB HTTP URL
         // `(http,server:port)/artifacts/boot/<path>` 而非 TFTP `/<path>`。
@@ -501,16 +505,16 @@ fn transferVirtualConfig(
             std.fmt.bufPrint(&initrd_grub, "(http,{s}:{d})/artifacts/boot/{s}", .{ config.server.server_ip, config.server.http_port, target.initrd_path }) catch return error.BootTargetUnavailable
         else
             std.fmt.bufPrint(&initrd_grub, "/{s}", .{target.initrd_path}) catch return error.BootTargetUnavailable;
-        const additional_initrd_path: ?[]const u8 = if (profileIsDiskless(catalog.value(), identity.profile)) cap: {
+        const additional_initrd_path: ?[]const u8 = if (profileIsDiskless(catalog.value(), identity.profileName())) cap: {
             const capsule_store = capsules orelse return error.BootTargetUnavailable;
-            const delivery_session = try prepareDisklessCapsule(io, allocator, config.server.http_port, identity.node_id, capsule_store, &delivery_session_buf);
+            const delivery_session = try prepareDisklessCapsule(io, allocator, config.server.http_port, identity.nodeId(), capsule_store, &delivery_session_buf);
             break :cap std.fmt.bufPrint(&capsule_grub, "/{s}{s}{s}", .{ capsule_prefix, delivery_session, capsule_suffix }) catch return error.BootTargetUnavailable;
         } else null;
         break :blk grub.render(&config_buf, .{
-            .node_id = identity.node_id,
+            .node_id = identity.nodeId(),
             .hostname = node.hostname orelse node.id,
             .lease_ip = identity.lease_ip,
-            .profile = identity.profile,
+            .profile = identity.profileName(),
             .kernel_path = kernel_path,
             .initrd_path = initrd_path,
             .additional_initrd_path = additional_initrd_path,
@@ -547,6 +551,7 @@ fn prepareDisklessCapsule(
     store: *CapsuleStore,
     session_out: *[32]u8,
 ) ![]const u8 {
+    // 自旋等待 prepare_mutex；防止固件重传导致重复 boot-prepare。
     while (!store.prepare_mutex.tryLock()) std.Thread.yield() catch {};
     defer store.prepare_mutex.unlock();
     if (store.pendingSession(node_id, session_out)) |existing| return existing;
@@ -625,9 +630,9 @@ fn transferVirtualCapsule(
     const client_ip = clientIpv4(remote) orelse return error.BootAccessDenied;
     const identity = (sessions orelse return error.BootAccessDenied).resolveTftpBoot(client_ip, boot_session.monotonicNow()) orelse return error.BootAccessDenied;
     var archive_buffer: [capsule_max_bytes]u8 = undefined;
-    const archive = (capsules orelse return error.BootAccessDenied).copy(identity.node_id, session_id, &archive_buffer) orelse return error.BootAccessDenied;
+    const archive = (capsules orelse return error.BootAccessDenied).copy(identity.nodeId(), session_id, &archive_buffer) orelse return error.BootAccessDenied;
     const sent = try transferFromMemory(io, remote, request, archive, config.tftp.max_blksize);
-    capsules.?.markDelivered(identity.node_id, session_id);
+    capsules.?.markDelivered(identity.nodeId(), session_id);
     return sent;
 }
 

@@ -1299,3 +1299,73 @@ deployment generation、IPv4 parser、table 的 UTF-8 显示宽度和 JSON succe
 - Rocky/Ubuntu 完整 PXE 安装、登录、事件、retry/drift 和 daemon restart-resume 全部回归。
 
 完成并冻结上述契约后，才允许按 `V0_2_DESIGN.md` 启动 M5。
+
+## 13. 设计修订：属性变更强制模式（--force）
+
+### 13.1 背景
+
+v0.1 的属性变更 API（`node set`/`node unset`/`node add-values` 等）在存在活动 boot session 时
+被全局 `hasActive()` 检查阻塞，返回 409 `property.active_session`。这一保护机制防止了在 PXE
+安装过程中修改节点属性可能导致的不一致（例如修改 MAC/IP 会影响 DHCP 分配，修改 Profile 会
+影响 install plan）。
+
+然而，在某些运维场景下，操作员需要在活动 session 期间修改节点属性：
+
+1. **install 模式**：节点正在安装过程中，但操作员需要修改属性（如 `pxe.ip_reservation`）。
+   install plan 在 PXE bootstrap 时已固定为不可变快照，修改属性不会影响正在运行的 installer。
+
+2. **diskless 模式**：节点正在 diskless 启动过程中（尚未到达终态），操作员需要修改属性。
+   diskless AgentPlan 在 boot-config 首次签发时已固定为不可变快照，修改属性不会影响正在
+   运行的 diskless 节点。
+
+### 13.2 设计
+
+**CLI 层面**：所有 node 属性变更命令（`node set`、`node unset`、`node add-values`、
+`node remove-values`、`node replace-values`、`node clear-values`、`node item add/set/remove/move`、
+`node item add-values/remove-values/replace-values/clear-values`、`node replace-items`、
+`node clear-items`）新增 `--force` 布尔标志。Profile 属性变更命令同样支持 `--force`。
+
+**API 层面**：客户端通过在请求 URL 上附加 `?force=true` 查询参数传递强制模式。服务端通过
+`parseForceFlag(request)` 解析该参数。
+
+**服务端逻辑**：
+
+- `force=true` 且 owner 为 `node`：
+  1. 调用 `forceTerminateNodeSessions(context, node_id)` 终止目标节点的所有活动 session：
+     - `boot_session.Store.supersedeNode(node_id, ...)` 终止 install PXE session 或 diskless DHCP session
+     - `diskless_delivery.Store.cancel(io, session_id)` 终止 diskless 交付 session（如存在）
+  2. 两个 store 均在同一调用中完成持久化（checkpoint）
+  3. 持久化失败时返回 503 `session.persist_failed`
+  4. 跳过全局 `hasActive()` 检查，继续执行属性变更
+
+- `force=true` 且 owner 为 `profile`：
+  - 仅跳过全局 `hasActive()` 检查（不终止任何 session）
+  - 安全性保证：活动 session 的 install plan / diskless AgentPlan 均为不可变快照，
+    Profile 变更只影响下一次 session，不影响正在运行的 session
+
+- `force=false`：保持原有行为（全局 `hasActive()` 检查）
+
+### 13.3 安全保证
+
+- **install plan 不可变性**：install plan 在 PXE bootstrap 时由 `buildInstallPlan` 生成并固定
+  到 `boot_session.Store` 的 session 中（`captureInstallPlan`）。终止 session 不会影响已获取
+  kickstart/answer 文件的 installer。
+
+- **diskless AgentPlan 不可变性**：diskless AgentPlan 在 boot-config 首次签发时由 `pinAgentPlan`
+  固定为不可变 JSON。终止 delivery session 不会影响已获取 rootfs 和 agent plan 的 diskless 节点。
+
+- **持久化原子性**：`supersedeNode` 和 `diskless_store.cancel` 均在各自调用中完成持久化。
+  daemon 重启后不会从 checkpoint 复活已终止的 session。
+
+### 13.4 与 `node retry --force` 的关系
+
+`node retry --force`（`installGenerations` handler）是 v0.1 已有的功能，用于强制重新 arm
+install generation。它使用相同的 `supersedeNode` 机制终止目标节点的 boot session，但不涉及
+diskless delivery session。
+
+`node set --force` 等 CLI 命令是新增功能，扩展了强制模式到所有属性变更操作，并增加了
+对 diskless delivery session 的终止支持。
+
+**影响范围**：`src/http/server.zig`（`parseForceFlag`、`forceTerminateNodeSessions`、5 个
+mutation handler）、`src/http/client.zig`（5 个 mutation client 函数）、`src/main.zig`（CLI
+命令定义和 handler 函数）。

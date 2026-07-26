@@ -60,10 +60,15 @@ const initrd_path = "/usr/bin:/usr/sbin:/bin:/sbin";
 
 /// 向 stderr（console）输出一行日志。在 initrd 中 stderr 连接到串口控制台。
 /// 与 `http.zig` 中的 log 函数一致，使用 write(2) 直接输出。
+/// R11: 同时追加写入 /run/initrd.log，用于 switch_root 前复制到无盘 overlay，
+/// 使 initrd 阶段的启动日志在切根后仍然可用用于后续分析。
+var initrd_log_fd: i32 = -1;
+
 fn log(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
     _ = std.c.write(2, msg.ptr, msg.len);
+    if (initrd_log_fd >= 0) _ = std.c.write(initrd_log_fd, msg.ptr, msg.len);
 }
 
 const capsule_config_token_path = "/capsule/config.token";
@@ -123,6 +128,11 @@ pub fn main(init: std.process.Init) !void {
     // initramfs 根可能是只读的（取决于 dracut 配置），必须显式挂载 tmpfs。
     try mustRun(io, allocator, &.{ "mkdir", "-p", "/run" });
     mountBootstrap("tmpfs", "/run", "tmpfs", "mode=0755") catch {};
+    // R11: 打开 initrd 日志文件，用于 switch_root 前复制到无盘系统。
+    // Zig 0.16 的 std.c.O 使用 ACCMODE 枚举（.WRONLY）+ CREAT/TRUNC 布尔字段，
+    // 而非传统 POSIX 的 O_WRONLY/O_CREAT/O_TRUNC 前缀名。
+    initrd_log_fd = std.c.open("/run/initrd.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+    log("[nodeforge-initrd] initrd log retention enabled (/run/initrd.log)\n", .{});
     // 加载 squashfs/loop/overlay 内核模块（这些在 Rocky 内核中是模块而非内置）。
     // 在挂载 squashfs rootfs 和 overlay 合并前必须已加载。
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "squashfs" });
@@ -251,6 +261,12 @@ pub fn main(init: std.process.Init) !void {
     // token 已分别撤销或复制到 0400 handoff credential，清零 initrd 副本。
     @memset(agent_token, 0);
     @memset(event_token, 0);
+
+    // R11: 将 initrd 日志留存到无盘 overlay，使切根后可查看完整启动链日志。
+    // /run/initrd.log 由 log() 函数在每次调用时追加写入；此处复制到 overlay
+    // upper 的 /var/lib/nodeforge/initrd.log，同时捕获 dmesg 用于内核层诊断。
+    log("[nodeforge-initrd] retaining logs to overlay...\n", .{});
+    runIgnore(io, allocator, &.{ "sh", "-c", "mkdir -p /merged/var/lib/nodeforge && cp /run/initrd.log /merged/var/lib/nodeforge/initrd.log 2>/dev/null; dmesg > /merged/var/lib/nodeforge/initrd-dmesg.log 2>/dev/null" }) catch {};
 
     // switch_root -> nodeforge-agent --pre-init（agent 校验 plan/payload、node-apply 后 exec /sbin/init）。
     // 必须 by PID 1 执行：用 replace（execve）替换当前进程，而非 spawn 子进程。

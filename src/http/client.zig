@@ -263,10 +263,13 @@ pub fn schemaV4RollbackJson(io: std.Io, port: u16, digest: []const u8, output: [
     return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v4/rollbacks", digest, output);
 }
 
-pub fn valuesMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, operation: []const u8, key: []const u8, values: []const []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, reason_buf: []u8) Mutation {
+pub fn valuesMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, operation: []const u8, key: []const u8, values: []const []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, force: bool, reason_buf: []u8) Mutation {
     if (!querySafe(owner) or !querySafe(identity) or !querySafe(key)) return .{ .reachable = false, .healthy = false };
-    var path_buffer: [320]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/values", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
+    var path_buffer: [336]u8 = undefined;
+    const path = if (force)
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/values?force=true", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false }
+    else
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/values", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
     var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer body.deinit();
     std.json.Stringify.value(.{ .operation = operation, .key = key, .values = values, .mutations = mutations }, .{ .emit_null_optional_fields = true }, &body.writer) catch return .{ .reachable = true, .healthy = false };
@@ -281,10 +284,13 @@ pub fn valuesJson(io: std.Io, port: u16, owner: []const u8, identity: []const u8
     return managementJson(io, port, rendered, output);
 }
 
-pub fn itemMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, patch: @import("../config/item_mutation.zig").Patch, reason_buf: []u8) Mutation {
+pub fn itemMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, patch: @import("../config/item_mutation.zig").Patch, force: bool, reason_buf: []u8) Mutation {
     if (!querySafe(owner) or !querySafe(identity)) return .{ .reachable = false, .healthy = false };
-    var path_buffer: [320]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
+    var path_buffer: [336]u8 = undefined;
+    const path = if (force)
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items?force=true", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false }
+    else
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
     var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer body.deinit();
     std.json.Stringify.value(patch, .{}, &body.writer) catch return .{ .reachable = true, .healthy = false };
@@ -292,10 +298,13 @@ pub fn itemMutation(io: std.Io, port: u16, owner: []const u8, identity: []const 
     return managementMutation(io, port, "POST", path, body.written(), revision, reason_buf);
 }
 
-pub fn itemReplacement(io: std.Io, port: u16, owner: []const u8, identity: []const u8, replacement: @import("../config/item_mutation.zig").Replacement, reason_buf: []u8) Mutation {
+pub fn itemReplacement(io: std.Io, port: u16, owner: []const u8, identity: []const u8, replacement: @import("../config/item_mutation.zig").Replacement, force: bool, reason_buf: []u8) Mutation {
     if (!querySafe(owner) or !querySafe(identity)) return .{ .reachable = false, .healthy = false };
-    var path_buffer: [320]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
+    var path_buffer: [336]u8 = undefined;
+    const path = if (force)
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items?force=true", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false }
+    else
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
     var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer body.deinit();
     std.json.Stringify.value(replacement, .{}, &body.writer) catch return .{ .reachable = true, .healthy = false };
@@ -325,14 +334,17 @@ pub fn managedFileRemove(io: std.Io, port: u16, name: []const u8, reason_buf: []
 }
 
 pub fn scalarMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, key: []const u8, value: ?[]const u8, reason_buf: []u8) Mutation {
-    return scalarMutations(io, port, owner, identity, &.{.{ .key = key, .value = value }}, reason_buf);
+    return scalarMutations(io, port, owner, identity, &.{.{ .key = key, .value = value }}, false, reason_buf);
 }
 
-pub fn scalarMutations(io: std.Io, port: u16, owner: []const u8, identity: []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, reason_buf: []u8) Mutation {
+pub fn scalarMutations(io: std.Io, port: u16, owner: []const u8, identity: []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, force: bool, reason_buf: []u8) Mutation {
     if (!querySafe(owner) or !querySafe(identity) or mutations.len == 0) return .{ .reachable = false, .healthy = false };
     for (mutations) |mutation| if (!querySafe(mutation.key)) return .{ .reachable = false, .healthy = false };
-    var path_buffer: [320]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/properties", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
+    var path_buffer: [336]u8 = undefined;
+    const path = if (force)
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/properties?force=true", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false }
+    else
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/properties", .{ owner, identity }) catch return .{ .reachable = false, .healthy = false };
     var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer body.deinit();
     std.json.Stringify.value(.{ .mutations = mutations }, .{ .emit_null_optional_fields = true }, &body.writer) catch return .{ .reachable = true, .healthy = false };
@@ -347,10 +359,13 @@ pub fn itemsJson(io: std.Io, port: u16, owner: []const u8, identity: []const u8,
     return managementJson(io, port, rendered, output);
 }
 
-pub fn itemValuesMutation(io: std.Io, port: u16, owner: []const u8, resource_identity: []const u8, item_identity: []const u8, operation: []const u8, key: []const u8, field: []const u8, values: []const []const u8, reason_buf: []u8) Mutation {
+pub fn itemValuesMutation(io: std.Io, port: u16, owner: []const u8, resource_identity: []const u8, item_identity: []const u8, operation: []const u8, key: []const u8, field: []const u8, values: []const []const u8, force: bool, reason_buf: []u8) Mutation {
     if (!querySafe(owner) or !querySafe(resource_identity) or !querySafe(item_identity) or !querySafe(key) or !querySafe(field)) return .{ .reachable = false, .healthy = false };
-    var path_buffer: [320]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, resource_identity }) catch return .{ .reachable = false, .healthy = false };
+    var path_buffer: [336]u8 = undefined;
+    const path = if (force)
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items?force=true", .{ owner, resource_identity }) catch return .{ .reachable = false, .healthy = false }
+    else
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/{s}s/{s}/items", .{ owner, resource_identity }) catch return .{ .reachable = false, .healthy = false };
     var body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer body.deinit();
     std.json.Stringify.value(.{ .operation = operation, .key = key, .identity = item_identity, .field = field, .values = values }, .{}, &body.writer) catch return .{ .reachable = true, .healthy = false };
