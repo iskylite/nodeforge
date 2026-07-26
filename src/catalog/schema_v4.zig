@@ -215,7 +215,7 @@ test "clean forward-migrated v4 catalog is downgrade-representable" {
 
 test "v0.2-only features are non-representable on downgrade" {
     const diskless: model.ProfileConfig = .{ .name = "d", .install_source = "s", .kind = .diskless, .boot_bundle = "b" };
-    const bundle = model.BootBundleConfig{ .name = "b", .distro = "rocky", .version = "9", .arch = .x86_64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i", .rootfs = "r" };
+    const bundle = model.BootBundleConfig{ .name = "b", .distro = "rocky", .version = "9", .arch = .x86_64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i" };
     const step: model.ProvisionStep = .{ .name = "x", .phase = .rootfs_build, .action = .@"package" };
     const prov_bundle = model.ProvisioningBundle{ .name = "pb", .steps = &.{step} };
     const asset: model.AssetConfig = .{ .name = "rk", .kind = .runtime_kernel, .path = "/rk" };

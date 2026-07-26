@@ -325,6 +325,12 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/status")) {
         return managementStatus(request, context, meta);
     }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/diskless-sessions"))
+        return managementDisklessSessions(request, context, meta);
+    if (logicalPath(path, "/api/v1/management/diskless-sessions/")) |session_id| {
+        if (std.mem.eql(u8, method, "GET")) return managementDisklessSession(request, context, session_id, meta);
+        if (std.mem.eql(u8, method, "DELETE")) return managementDisklessSessionCancel(request, context, session_id, meta);
+    }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/config")) {
         return managementConfigGet(request, context, meta);
     }
@@ -346,6 +352,7 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/properties")) |name| return managementScalarMutation(request, context, .profile, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (installGenerationsPath(path)) |node_id| return installGenerations(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/boot-prepare")) |node_id| return managementBootPrepare(request, context, node_id, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/readiness")) |node_id| return managementNodeReadiness(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime")) {
         return runtimeSummary(request, context, meta);
     }
@@ -388,7 +395,7 @@ fn route(request: zap.Request) !void {
         return importAsset(request, context, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/assets")) return managementAssets(request, context, meta);
-    // v0.2 boot-bundle 管理 API：diskless profile 引用的 kernel/initrd/rootfs 组合。
+    // v0.2 boot-bundle 管理 API：diskless profile 引用的 kernel/initrd 组合。
     // POST /api/v1/management/boot-bundles — 创建 boot bundle（校验资产类型匹配后原子写入 catalog）
     // GET  /api/v1/management/boot-bundles — 列出所有 boot bundles
     // 这是 diskless 全流程 CLI 的关键环节，使操作员无需手动编辑 catalog JSON。
@@ -1836,23 +1843,23 @@ fn provisionMutationGuard(request: zap.Request, context: *RouteContext, meta: Re
     return true;
 }
 
-/// v0.2 boot-bundle 创建：将已注册的 kernel、nodeforge_initrd 和 rootfs 三个资产
-/// 绑定为不可拆分的版本组合。diskless profile 通过 `--boot-bundle` 引用此对象。
+/// v0.2 boot-bundle 创建：将已注册的 kernel 与 nodeforge_initrd 绑定为
+/// 不可拆分的版本组合。rootfs 由 Profile build projection 独立派生。
 ///
-/// 请求体 JSON 字段：name, distro, version, arch, kernel_release, kernel, initrd, rootfs,
-/// 可选 runtime_kernel。其中 kernel/initrd/rootfs 是已注册的 catalog 资产名称。
+/// 请求体 JSON 字段：name, distro, version, arch, kernel_release, kernel, initrd,
+/// 可选 runtime_kernel。
 ///
 /// 校验链：必填字段非空 → arch 枚举有效 → 名称不重复 → kernel 资产 kind=kernel →
-/// initrd 资产 kind=nodeforge_initrd → rootfs 资产 kind=rootfs → catalog 原子写入。
+/// initrd 资产 kind=nodeforge_initrd → catalog 原子写入。
 ///
 /// 该 API 是 diskless 全流程 CLI 的关键环节。`nodeforge assets boot-bundle create`
 /// 调用此 API，使操作员无需手动编辑 catalog JSON 文件。
 fn managementBootBundleCreate(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
     const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.invalid\",\"message\":\"missing request body\"}}\n", meta);
-    const Req = struct { name: []const u8, distro: []const u8, version: []const u8, arch: []const u8, kernel_release: []const u8, kernel: []const u8, initrd: []const u8, rootfs: []const u8, runtime_kernel: ?[]const u8 = null };
+    const Req = struct { name: []const u8, distro: []const u8, version: []const u8, arch: []const u8, kernel_release: []const u8, kernel: []const u8, initrd: []const u8, runtime_kernel: ?[]const u8 = null };
     const parsed = std.json.parseFromSlice(Req, context.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.invalid\",\"message\":\"invalid boot bundle request\"}}\n", meta);
     defer parsed.deinit();
-    if (parsed.value.name.len == 0 or parsed.value.distro.len == 0 or parsed.value.version.len == 0 or parsed.value.kernel_release.len == 0 or parsed.value.kernel.len == 0 or parsed.value.initrd.len == 0 or parsed.value.rootfs.len == 0) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.invalid\",\"message\":\"all fields except runtime_kernel are required\"}}\n", meta);
+    if (parsed.value.name.len == 0 or parsed.value.distro.len == 0 or parsed.value.version.len == 0 or parsed.value.kernel_release.len == 0 or parsed.value.kernel.len == 0 or parsed.value.initrd.len == 0) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.invalid\",\"message\":\"all fields except runtime_kernel are required\"}}\n", meta);
     const arch = std.meta.stringToEnum(model.Arch, parsed.value.arch) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.invalid\",\"message\":\"arch must be aarch64 or x86_64\"}}\n", meta);
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
@@ -1865,9 +1872,7 @@ fn managementBootBundleCreate(request: zap.Request, context: *RouteContext, meta
     if (kernel_asset.kind != .kernel) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.asset_kind_mismatch\",\"message\":\"kernel asset must have kind=kernel\"}}\n", meta);
     const initrd_asset = lookup.findAsset(catalog, parsed.value.initrd) orelse return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.asset_not_found\",\"message\":\"initrd asset not found\"}}\n", meta);
     if (initrd_asset.kind != .nodeforge_initrd) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.asset_kind_mismatch\",\"message\":\"initrd asset must have kind=nodeforge_initrd\"}}\n", meta);
-    const rootfs_asset = lookup.findAsset(catalog, parsed.value.rootfs) orelse return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.asset_not_found\",\"message\":\"rootfs asset not found\"}}\n", meta);
-    if (rootfs_asset.kind != .rootfs) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.asset_kind_mismatch\",\"message\":\"rootfs asset must have kind=rootfs\"}}\n", meta);
-    const new_bundle = model.BootBundleConfig{ .name = parsed.value.name, .distro = parsed.value.distro, .version = parsed.value.version, .arch = arch, .kernel_release = parsed.value.kernel_release, .kernel = parsed.value.kernel, .runtime_kernel = parsed.value.runtime_kernel, .initrd = parsed.value.initrd, .rootfs = parsed.value.rootfs };
+    const new_bundle = model.BootBundleConfig{ .name = parsed.value.name, .distro = parsed.value.distro, .version = parsed.value.version, .arch = arch, .kernel_release = parsed.value.kernel_release, .kernel = parsed.value.kernel, .runtime_kernel = parsed.value.runtime_kernel, .initrd = parsed.value.initrd };
     // 加载当前 catalog、追加 boot bundle、原子保存。
     var loaded = @import("../catalog/store.zig").load(context.io, context.allocator, context.catalog.path) catch |err| return assetInputError(request, @errorName(err), meta);
     defer loaded.deinit();
@@ -1879,7 +1884,7 @@ fn managementBootBundleCreate(request: zap.Request, context: *RouteContext, meta
     @import("../catalog/store.zig").save(context.io, context.allocator, context.catalog.path, &loaded.value) catch |err| return assetInputError(request, @errorName(err), meta);
     applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"boot bundle persisted but snapshot publish failed\"}}\n", meta);
     var response: [512]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"name\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"kernel_release\":{f},\"kernel\":{f},\"initrd\":{f},\"rootfs\":{f}}}}}\n", .{ std.json.fmt(new_bundle.name, .{}), std.json.fmt(new_bundle.distro, .{}), std.json.fmt(new_bundle.version, .{}), std.json.fmt(@tagName(new_bundle.arch), .{}), std.json.fmt(new_bundle.kernel_release, .{}), std.json.fmt(new_bundle.kernel, .{}), std.json.fmt(new_bundle.initrd, .{}), std.json.fmt(new_bundle.rootfs, .{}) });
+    const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"name\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"kernel_release\":{f},\"kernel\":{f},\"initrd\":{f}}}}}\n", .{ std.json.fmt(new_bundle.name, .{}), std.json.fmt(new_bundle.distro, .{}), std.json.fmt(new_bundle.version, .{}), std.json.fmt(@tagName(new_bundle.arch), .{}), std.json.fmt(new_bundle.kernel_release, .{}), std.json.fmt(new_bundle.kernel, .{}), std.json.fmt(new_bundle.initrd, .{}) });
     return json(request, .created, rendered, meta);
 }
 
@@ -3141,6 +3146,39 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     defer plan.deinit(context.allocator);
     rootfs_build_executor.execute(context.io, context.allocator, staging, plan) catch |err| return buildError(request, err, "rootfs-build", meta);
 
+    // nodeforge-agent is the first program executed after switch_root and is
+    // therefore part of every rootfs baseline, independent of Profile steps.
+    const agent_source = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-agent", .{paths.require().bin_dir});
+    defer context.allocator.free(agent_source);
+    const agent_dest = try std.fmt.allocPrint(context.allocator, "{s}/usr/sbin/nodeforge-agent", .{staging});
+    defer context.allocator.free(agent_dest);
+    std.Io.Dir.copyFileAbsolute(agent_source, agent_dest, context.io, .{ .replace = true, .make_path = true }) catch |err| return buildError(request, err, "agent-inject", meta);
+    runBuildCmd(context.io, context.allocator, &.{ "chmod", "0755", agent_dest }) catch |err| return buildError(request, err, "agent-inject", meta);
+    const firstboot_unit = try std.fmt.allocPrint(context.allocator, "{s}/etc/systemd/system/nodeforge-firstboot.service", .{staging});
+    defer context.allocator.free(firstboot_unit);
+    std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = firstboot_unit, .data =
+        \\[Unit]
+        \\Description=NodeForge diskless first-boot provisioning
+        \\After=local-fs.target network-online.target
+        \\Wants=network-online.target
+        \\ConditionPathExists=/var/lib/nodeforge/boot.json
+        \\
+        \\[Service]
+        \\Type=oneshot
+        \\ExecStart=/usr/sbin/nodeforge-agent
+        \\RemainAfterExit=yes
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+        \\
+    }) catch |err| return buildError(request, err, "agent-inject", meta);
+    const firstboot_wants = try std.fmt.allocPrint(context.allocator, "{s}/etc/systemd/system/multi-user.target.wants", .{staging});
+    defer context.allocator.free(firstboot_wants);
+    std.Io.Dir.cwd().createDirPath(context.io, firstboot_wants) catch |err| return buildError(request, err, "agent-inject", meta);
+    const firstboot_link = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-firstboot.service", .{firstboot_wants});
+    defer context.allocator.free(firstboot_link);
+    runBuildCmd(context.io, context.allocator, &.{ "ln", "-sfn", "../nodeforge-firstboot.service", firstboot_link }) catch |err| return buildError(request, err, "agent-inject", meta);
+
     // 4. mksquashfs 压缩到内容寻址 .part 文件（rootfs_dir），再校验 SHA-512 后原子发布。
     const rootfs_dir = paths.require().rootfs_dir;
     std.Io.Dir.cwd().createDirPath(context.io, rootfs_dir) catch {};
@@ -3658,6 +3696,122 @@ fn disklessEvent(request: zap.Request, context: *const RouteContext, node_id: []
     return json(request, .ok, "{\"ok\":true}\n", meta);
 }
 
+const NodeReadinessRequest = struct {
+    stage: enum { build, boot } = .boot,
+};
+
+fn writeDisklessSession(writer: *std.Io.Writer, session: *const diskless_delivery.Session) !void {
+    try writer.print("{{\"session_id\":{f},\"node_id\":{f},\"profile\":{f},\"phase\":{f},\"rootfs_input_digest\":{f},\"agent_plan_digest\":{f},\"kernel_release\":{f},\"rootfs_size\":{d},\"created_at\":{d},\"expires_at\":{d},\"capabilities\":{{\"config\":{s},\"rootfs\":{s},\"agent\":{s},\"event\":{s}}}}}", .{
+        std.json.fmt(session.session_id[0..], .{}),
+        std.json.fmt(session.nodeId(), .{}),
+        std.json.fmt(session.profileName(), .{}),
+        std.json.fmt(@tagName(session.phase), .{}),
+        std.json.fmt(session.rootfsInputDigest(), .{}),
+        std.json.fmt(session.agentPlanDigest(), .{}),
+        std.json.fmt(session.kernelRelease(), .{}),
+        session.rootfs_size,
+        session.created_at,
+        session.expires_at,
+        if (session.config_token.issued) "true" else "false",
+        if (session.rootfs_token.issued) "true" else "false",
+        if (session.agent_token.issued) "true" else "false",
+        if (session.event_token.issued) "true" else "false",
+    });
+}
+
+fn managementDisklessSessions(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    var snapshot: [diskless_delivery.max_sessions]diskless_delivery.Session = undefined;
+    const sessions = context.diskless_store.snapshot(&snapshot);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
+    for (sessions, 0..) |*session, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try writeDisklessSession(&output.writer, session);
+    }
+    try output.writer.writeAll("]}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementDisklessSession(request: zap.Request, context: *RouteContext, session_id: []const u8, meta: RequestMeta) !void {
+    const session = context.diskless_store.find(session_id) orelse return notFound(request, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":");
+    try writeDisklessSession(&output.writer, session);
+    try output.writer.writeAll("}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementDisklessSessionCancel(request: zap.Request, context: *RouteContext, session_id: []const u8, meta: RequestMeta) !void {
+    context.diskless_store.cancel(context.io, session_id) catch |err| switch (err) {
+        error.DisklessSessionNotFound => return notFound(request, meta),
+        else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"diskless.cancel_failed\",\"message\":\"cannot persist session cancellation\"}}\n", meta),
+    };
+    var output: [192]u8 = undefined;
+    const body = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"session_id\":{f},\"state\":\"cancelled\"}}}}\n", .{std.json.fmt(session_id, .{})});
+    return json(request, .ok, body, meta);
+}
+
+fn managementNodeReadiness(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
+    const body = request.body orelse "{}";
+    const parsed = std.json.parseFromSlice(NodeReadinessRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"readiness.invalid\",\"message\":\"stage must be build or boot\"}}\n", meta);
+    defer parsed.deinit();
+    const catalog = context.catalog_snapshot.value();
+    const node = lookup.findNode(catalog, node_id) orelse return notFound(request, meta);
+    const profile_name = node.profile orelse
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.profile_missing\",\"message\":\"node has no profile assigned\"}}\n", meta);
+    const profile = lookup.findProfile(catalog, profile_name) orelse return notFound(request, meta);
+    if (profile.kind != .diskless)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"readiness is only available for diskless profiles\"}}\n", meta);
+    var plan = diskless.compile(context.allocator, context.config, catalog, node) catch |err| return validationError(request, err, meta);
+    defer plan.deinit();
+    const rootfs_digest: []const u8 = plan.rootfs_input_digest[0..];
+    const desired_digest: []const u8 = plan.desired_plan_digest[0..];
+
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    if (parsed.value.stage == .build) {
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"stage\":\"build\",\"ready\":true,\"rootfs_input_digest\":{f},\"desired_plan_digest\":{f},\"issues\":[],\"warnings\":[]}}}}\n", .{
+            std.json.fmt(node_id, .{}), std.json.fmt(rootfs_digest, .{}), std.json.fmt(desired_digest, .{}),
+        });
+        return json(request, .ok, output.written(), meta);
+    }
+
+    const artifact = context.rootfs_artifacts.find(rootfs_digest) orelse
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_missing\",\"message\":\"rootfs is not ready for the current build projection\"}}\n", meta);
+    const bundle_name = profile.boot_bundle orelse return validationError(request, error.MissingBootBundle, meta);
+    const bundle = lookup.findBootBundle(catalog, bundle_name) orelse return validationError(request, error.MissingBootBundle, meta);
+    const kernel = lookup.findAsset(catalog, bundle.kernel) orelse return validationError(request, error.MissingAsset, meta);
+    const initrd_asset = lookup.findAsset(catalog, bundle.initrd) orelse return validationError(request, error.MissingAsset, meta);
+    if (kernel.kind != .kernel or initrd_asset.kind != .nodeforge_initrd or kernel.sha256 == null or initrd_asset.sha256 == null)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.boot_assets_invalid\",\"message\":\"boot bundle assets are incomplete or have invalid kinds\"}}\n", meta);
+    const kernel_path = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ context.config.tftp.asset_root, kernel.path });
+    defer context.allocator.free(kernel_path);
+    const initrd_path = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ paths.require().initrd_dir, initrd_asset.path });
+    defer context.allocator.free(initrd_path);
+    const rootfs_path = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ paths.require().rootfs_dir, artifact.file });
+    defer context.allocator.free(rootfs_path);
+    const kernel_stat = std.Io.Dir.cwd().statFile(context.io, kernel_path, .{ .follow_symlinks = false }) catch
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.kernel_missing\",\"message\":\"registered kernel file is missing\"}}\n", meta);
+    const initrd_stat = std.Io.Dir.cwd().statFile(context.io, initrd_path, .{ .follow_symlinks = false }) catch
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.initrd_missing\",\"message\":\"registered initrd file is missing\"}}\n", meta);
+    const rootfs_stat = std.Io.Dir.cwd().statFile(context.io, rootfs_path, .{ .follow_symlinks = false }) catch
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_file_missing\",\"message\":\"registered rootfs file is missing\"}}\n", meta);
+    if (kernel_stat.kind != .file or initrd_stat.kind != .file or rootfs_stat.kind != .file or rootfs_stat.size != artifact.compressed_size)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.artifact_drift\",\"message\":\"registered artifact metadata does not match managed files\"}}\n", meta);
+    const required_memory = std.math.add(u64, artifact.compressed_size, plan.node_boot.minimum_free_bytes) catch
+        return validationError(request, error.Overflow, meta);
+    const required_with_margin = std.math.add(u64, required_memory, plan.node_boot.safety_margin_bytes) catch
+        return validationError(request, error.Overflow, meta);
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"stage\":\"boot\",\"ready\":true,\"rootfs_input_digest\":{f},\"desired_plan_digest\":{f},\"kernel_path\":{f},\"initrd_path\":{f},\"rootfs_file\":{f},\"compressed_bytes\":{d},\"initrd_bytes\":{d},\"kernel_bytes\":{d},\"required_min_memory_bytes\":{d},\"memory\":\"unknown\",\"issues\":[],\"warnings\":[{{\"code\":\"readiness.memory_unknown\",\"message\":\"node inventory memory is unknown; initrd will enforce the hard memory gate\"}}]}}}}\n", .{
+        std.json.fmt(node_id, .{}), std.json.fmt(rootfs_digest, .{}), std.json.fmt(desired_digest, .{}), std.json.fmt(kernel.path, .{}), std.json.fmt(initrd_asset.path, .{}), std.json.fmt(artifact.file, .{}), artifact.compressed_size, initrd_stat.size, kernel_stat.size, required_with_margin,
+    });
+    return json(request, .ok, output.written(), meta);
+}
+
 /// `node boot-prepare`：为 diskless 节点创建交付 session。编译 diskless plan 得到
 /// rootfs_input_digest + desired_plan_digest，定位已注册 rootfs 制品，创建 session，
 /// 渲染并 pin immutable AgentPlan，签发 config-token。返回 capsule 交付所需的全部门票。
@@ -3909,9 +4063,15 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
     defer context.allocator.free(config_url);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"config_token\":{f},\"rootfs_token\":{f},\"agent_token\":{f},\"event_token\":{f},\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
-        std.json.fmt(node_id, .{}), std.json.fmt(session_id_slice, .{}), std.json.fmt(config_token, .{}), std.json.fmt(rootfs_token, .{}), std.json.fmt(agent_token, .{}), std.json.fmt(event_token, .{}), std.json.fmt(config_url, .{}), std.json.fmt(session.agentPlanDigest(), .{}), std.json.fmt(rootfs_input_digest, .{}),
-    });
+    const internal_capsule = if (request.getHeader("x-nodeforge-internal-capsule")) |value| std.mem.eql(u8, value, "1") else false;
+    if (internal_capsule)
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"config_token\":{f},\"rootfs_token\":{f},\"agent_token\":{f},\"event_token\":{f},\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
+            std.json.fmt(node_id, .{}), std.json.fmt(session_id_slice, .{}), std.json.fmt(config_token, .{}), std.json.fmt(rootfs_token, .{}), std.json.fmt(agent_token, .{}), std.json.fmt(event_token, .{}), std.json.fmt(config_url, .{}), std.json.fmt(session.agentPlanDigest(), .{}), std.json.fmt(rootfs_input_digest, .{}),
+        })
+    else
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"state\":\"prepared\",\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
+            std.json.fmt(node_id, .{}), std.json.fmt(session_id_slice, .{}), std.json.fmt(config_url, .{}), std.json.fmt(session.agentPlanDigest(), .{}), std.json.fmt(rootfs_input_digest, .{}),
+        });
     return json(request, .ok, output.written(), meta);
 }
 

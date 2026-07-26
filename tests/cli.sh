@@ -123,6 +123,27 @@ grep -Fq 'Distro name, used with --version and --arch; e.g. rocky' "$tmp/asset-r
 grep -Fq 'Distro version, used with --distro and --arch; e.g. 9.7' "$tmp/asset-register-help"
 grep -Fq 'Architecture, used with --distro and --version; e.g. aarch64' "$tmp/asset-register-help"
 
+# v0.2 diskless leaves must be present in the installed command tree. These
+# checks intentionally use generated help so a handler that exists in source
+# but was not attached to its parent command cannot silently pass.
+"$cli" assets boot-bundle create --help >"$tmp/boot-bundle-create-help"
+grep -Fq -- '--kernel' "$tmp/boot-bundle-create-help"
+grep -Fq -- '--initrd' "$tmp/boot-bundle-create-help"
+if grep -Fq -- '--rootfs' "$tmp/boot-bundle-create-help"; then
+    echo "boot bundle must not own a Profile-derived rootfs artifact" >&2
+    exit 1
+fi
+"$cli" profile rootfs plan --help >"$tmp/profile-rootfs-plan-help"
+grep -Fq 'rootfs input digest and cache state' "$tmp/profile-rootfs-plan-help"
+"$cli" profile rootfs build --help >"$tmp/profile-rootfs-build-help"
+grep -Fq -- '--if-input-digest' "$tmp/profile-rootfs-build-help"
+"$cli" profile rootfs register --help >"$tmp/profile-rootfs-register-help"
+grep -Fq -- '--path' "$tmp/profile-rootfs-register-help"
+"$cli" profile rootfs status --help >"$tmp/profile-rootfs-status-help"
+grep -Fq 'registered rootfs artifact' "$tmp/profile-rootfs-status-help"
+"$cli" node boot-prepare --help >"$tmp/node-boot-prepare-help"
+grep -Fq 'diskless boot session' "$tmp/node-boot-prepare-help"
+
 "$cli" assets import --help >"$tmp/assets-import-help"
 grep -Fq 'Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso' "$tmp/assets-import-help"
 "$cli" assets install-source --help >"$tmp/install-source-help"

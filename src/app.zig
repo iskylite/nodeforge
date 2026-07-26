@@ -54,17 +54,21 @@ pub fn run(
     catalog: *const model.Catalog,
     catalog_path: []const u8,
 ) !void {
-    var runtime: runtime_state.RuntimeState = .{
+    const runtime = try allocator.create(runtime_state.RuntimeState);
+    defer allocator.destroy(runtime);
+    runtime.* = .{
         .service = .running,
         .config_generation = 1,
     };
-    var statuses: node_status.Store = .{};
+    const statuses = try allocator.create(node_status.Store);
+    defer allocator.destroy(statuses);
+    statuses.* = .{};
     var clock: std.posix.timespec = undefined;
     const current_time: i64 = if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &clock)) == .SUCCESS) @intCast(clock.sec) else 0;
 
     // M3.1：优先从新文件加载；每个域独立回退到旧版 runtime.json 迁移。
     loadLeases(io, allocator, &runtime.dhcp, current_time, boot_session.monotonicNow());
-    loadStatuses(io, allocator, &statuses);
+    loadStatuses(io, allocator, statuses);
 
     var event_writer: events.Writer = .{};
     event_writer.configure(config.events.max_size_mb, config.events.keep);
@@ -218,10 +222,11 @@ pub fn run(
     // PXE NIC 作为 Linux socket 级别的边界；TFTP 保持绑定在广告的 unicast 地址。
     const dhcp_socket = try dhcp_server.bind(io, config.server.server_ip, config.server.bind_interface);
     var stop_workers = std.atomic.Value(bool).init(false);
-    var dhcp_thread = try std.Thread.spawn(.{}, runDhcp, .{ io, dhcp_socket, &live_config, &runtime, &persistence, &stop_workers });
+    var dhcp_thread = try std.Thread.spawn(.{}, runDhcp, .{ io, dhcp_socket, &live_config, runtime, &persistence, &stop_workers });
     observe_log.info("dhcp: listening on udp://{s}:{d}", .{ config.server.server_ip, dhcp_server.port });
     const tftp_socket = try tftp_server.bind(io, config.server.server_ip);
-    var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, allocator, tftp_socket, &live_models, &runtime, &event_writer, &sessions, &stop_workers });
+    var capsule_store: tftp_server.CapsuleStore = .{};
+    var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, allocator, tftp_socket, &live_models, runtime, &event_writer, &sessions, &capsule_store, &stop_workers });
     observe_log.info("tftp: listening on udp://{s}:{d}", .{ config.server.server_ip, tftp_server.port });
 
     // M3.1：启动 DHCP lease checkpoint worker。它是 leases.json 的唯一写入者，
@@ -243,10 +248,10 @@ pub fn run(
         &live_config,
         &live_catalog,
         &live_models,
-        &runtime,
+        runtime,
         &event_writer,
         &sessions,
-        &statuses,
+        statuses,
         &deployments,
         &inventories,
         &operation_store,
@@ -420,8 +425,9 @@ fn runTftp(
     runtime: *runtime_state.RuntimeState,
     event_writer: *events.Writer,
     sessions: *boot_session.Store,
+    capsules: *tftp_server.CapsuleStore,
     stop: *const std.atomic.Value(bool),
 ) void {
-    tftp_server.serveSocket(io, allocator, socket, models, runtime, event_writer, sessions, stop) catch |err|
+    tftp_server.serveSocket(io, allocator, socket, models, runtime, event_writer, sessions, capsules, stop) catch |err|
         observe_log.err("tftp: stopped: {t}", .{err});
 }

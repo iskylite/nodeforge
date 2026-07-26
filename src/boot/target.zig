@@ -6,9 +6,12 @@
 //!
 //! 渲染规则：
 //! - install：profile.install_source → InstallSourceConfig → installer kernel/initrd
-//!   assets，并读取已发布 repository URL。M3 不追加 inst.ks=（M4 完成后追加）。
-//!   PXE target scaffold；完整 initrd、rootfs 下载和 diskless BootConfig payload
-//!   仍待 M5 落地。cmdline 包含 nodeforge.config=http://…/api/v1/nodes/<id>/boot-config。
+//!   assets，并读取已发布 repository URL。cmdline 包含 `ip=dhcp`、`inst.repo=<url>`
+//!   和 `inst.ks=http://…/api/v1/nodes/<id>/install-config/kickstart`（RHEL）或
+//!   `boot=casper url=<iso_url>` + NoCloud-Net autoinstall（Ubuntu）。
+//! - diskless：profile.boot_bundle → kernel/initrd assets，cmdline 携带
+//!   `nodeforge.config_url` 和 `nodeforge.node`。session 由 capsule 文件提供
+//!   （initrd 从 `/capsule/session` 读取），不放入 GRUB cmdline。
 //! - discovery：不提供 kernel/initrd，返回 null。
 //!
 //! M3.6 安全要点：
@@ -193,7 +196,8 @@ fn resolveInstall(
 /// kind 必须为 `.kernel`，initrd asset kind 必须为 `.nodeforge_initrd`。
 ///
 /// cmdline 生成：`nodeforge.config_url=http://<server>:<port>/api/v1/nodes/<node>/boot-config`
-/// `nodeforge.node=<node_id>` `console=ttyAMA0`（aarch64 串口）。session 由
+/// `nodeforge.node=<node_id>`；aarch64 同时启用 `ttyAMA0`（QEMU/串口）和
+/// `tty0`（VMware/物理显示控制台）。session 由
 /// capsule 文件提供，不在 cmdline 中（initrd 从 `/capsule/session` 读取 fallback）。
 /// Profile 级 `kernel_args` 追加到末尾。
 fn resolveDiskless(
@@ -224,7 +228,7 @@ fn resolveDiskless(
 
     const base = std.fmt.bufPrint(
         cmdline_buf,
-        "nodeforge.config_url=http://{s}:{d}/api/v1/nodes/{s}/boot-config nodeforge.node={s} console=ttyAMA0",
+        "nodeforge.config_url=http://{s}:{d}/api/v1/nodes/{s}/boot-config nodeforge.node={s} console=ttyAMA0 console=tty0",
         .{ server_ip, http_port, identity.node_id, identity.node_id },
     ) catch return null;
 

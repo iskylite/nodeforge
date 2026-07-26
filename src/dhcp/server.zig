@@ -131,9 +131,22 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, configs: *config_ru
         if (request_kind == .release or request_kind == .decline) {
             if (persistence) |p| p.sessions.clearLease(request.mac(), request.xid, boot_session.monotonicNow(), now());
         }
-        const reply = offerAfterProbe(io, config, runtime, &request, persistence, if (session_link) |*link| link else null) orelse {
+        var reply = offerAfterProbe(io, config, runtime, &request, persistence, if (session_link) |*link| link else null) orelse {
             continue;
         };
+        // ISO import publishes content-addressed UEFI bootloaders. Resolve the
+        // concrete catalog path for this node/architecture immediately before
+        // encoding, copying it into this stack frame so a concurrent catalog
+        // swap cannot leave Reply holding a retired snapshot string.
+        var bootfile_storage: [128]u8 = undefined;
+        if (reply.bootfile != null) {
+            if (catalogBootfile(persistence, request.architecture, &bootfile_storage)) |managed_bootfile| {
+                reply.bootfile = managed_bootfile;
+            } else {
+                observe_log.err("dhcp: no managed bootloader for requested architecture", .{});
+                reply.bootfile = null;
+            }
+        }
         var output: [1500]u8 = undefined;
         const encoded = packet.encodeReply(&output, &request, reply) catch |err| {
             observe_log.err("dhcp: response encoding failed: {t}", .{err});
@@ -166,6 +179,39 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, configs: *config_ru
         }, request_kind, reply.kind, request.mac(), reply.yiaddr, request.xid, request.architecture, if (session_link) |*link| link else null);
         logReply(config, &request, reply, session_link);
     }
+}
+
+fn catalogBootfile(persistence: ?*const Persistence, architecture: packet.Architecture, buffer: *[128]u8) ?[]const u8 {
+    const expected: model.Arch = switch (architecture) {
+        .aarch64 => .aarch64,
+        .x86_64 => .x86_64,
+        .unknown => return null,
+    };
+    const p = persistence orelse return null;
+    const pair = p.models.acquire();
+    defer pair.release();
+    // Prefer the newest matching revision. Import-generated bootloader names
+    // are content addressed, so distinct bytes coexist without canonical-path
+    // conflicts; any same-architecture GRUB can load NodeForge's virtual cfg.
+    var selected: ?model.AssetConfig = null;
+    for (pair.catalog.value().assets) |asset| {
+        if (asset.kind != .bootloader or !bootloaderMatchesArch(asset, expected)) continue;
+        if (selected == null or asset.revision > selected.?.revision) selected = asset;
+    }
+    const path = (selected orelse return null).path;
+    if (path.len == 0 or path.len > buffer.len) return null;
+    @memcpy(buffer[0..path.len], path);
+    return buffer[0..path.len];
+}
+
+fn bootloaderMatchesArch(asset: model.AssetConfig, expected: model.Arch) bool {
+    if (asset.arch) |arch| return arch == expected;
+    // Early v0.2 imports omitted bootloader tuple metadata. Their
+    // content-addressed filename remains an unambiguous migration hint.
+    return switch (expected) {
+        .aarch64 => std.mem.endsWith(u8, asset.path, "grubaa64.efi"),
+        .x86_64 => std.mem.endsWith(u8, asset.path, "grubx64.efi"),
+    };
 }
 
 fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config: *const model.AppConfig, request: *const packet.Packet) void {

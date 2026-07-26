@@ -12,7 +12,10 @@ pub fn render(allocator: std.mem.Allocator, projection: dto.NodeApplyProjection)
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.writeAll("set -eu\n");
+    // `switch_root` preserves the minimal initramfs environment, whose PATH is
+    // not a target-OS contract. Pin the standard administrative paths before
+    // invoking usermod/systemctl and the distro package manager.
+    try w.writeAll("set -eu\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nexport PATH\n");
 
     try renderSoftware(w, projection.software_transaction);
     try emitFile(w, "/etc/hostname", projection.hostname orelse projection.node_id, 0o644);
@@ -186,9 +189,9 @@ fn renderUsers(w: *std.Io.Writer, allocator: std.mem.Allocator, system: dto.Agen
     try setPassword(w, "root", system.ssh.root_password_hash, false);
     try authorizedKeys(w, allocator, "root", "/root", system.ssh.root_authorized_keys);
     for (system.users) |user| {
-        try w.writeAll("if ! getent passwd ");
+        try w.writeAll("if ! /usr/bin/getent passwd ");
         try quote(w, user.name);
-        try w.writeAll(" >/dev/null; then useradd -m");
+        try w.writeAll(" >/dev/null; then /usr/sbin/useradd -m");
         if (user.uid) |uid| try w.print(" -u {d}", .{uid});
         if (user.shell) |shell| {
             try w.writeAll(" -s ");
@@ -201,7 +204,7 @@ fn renderUsers(w: *std.Io.Writer, allocator: std.mem.Allocator, system: dto.Agen
             var groups: std.Io.Writer.Allocating = .init(allocator);
             defer groups.deinit();
             for (user.groups, 0..) |group, i| try groups.writer.print("{s}{s}", .{ if (i == 0) "" else ",", group });
-            try w.writeAll("usermod -a -G ");
+            try w.writeAll("/usr/sbin/usermod -a -G ");
             try quote(w, groups.written());
             try w.writeByte(' ');
             try quote(w, user.name);
@@ -227,18 +230,18 @@ fn renderUsers(w: *std.Io.Writer, allocator: std.mem.Allocator, system: dto.Agen
 
 fn setPassword(w: *std.Io.Writer, account: []const u8, hash: ?[]const u8, locked: bool) !void {
     if (hash) |value| {
-        try w.writeAll("usermod -p ");
+        try w.writeAll("/usr/sbin/usermod -p ");
         try quote(w, value);
         try w.writeByte(' ');
         try quote(w, account);
         try w.writeByte('\n');
     }
     if (locked or hash == null) {
-        try w.writeAll("usermod -L ");
+        try w.writeAll("/usr/sbin/usermod -L ");
         try quote(w, account);
         try w.writeByte('\n');
     } else {
-        try w.writeAll("usermod -U ");
+        try w.writeAll("/usr/sbin/usermod -U ");
         try quote(w, account);
         try w.writeByte('\n');
     }

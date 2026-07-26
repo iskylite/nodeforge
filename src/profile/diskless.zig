@@ -33,6 +33,9 @@ pub const RepositoryRevision = struct {
 
 /// Profile-fixed rootfs 构建输入。Node-independent。
 pub const ProfileBuildProjection = struct {
+    /// Bump whenever the built-in OS-layer baseline or materialization logic
+    /// changes, so stale rootfs objects cannot be returned as cache hits.
+    builder_revision: []const u8 = "rootfs-os-v4",
     profile_name: []const u8,
     kind: model.ProfileKind,
     install_source: []const u8,
@@ -325,7 +328,7 @@ fn sha256Hex(bytes: []const u8) Digest {
 test "rootfs input digest is shared across nodes; desired digest is per-node" {
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .http_port = 18080 } };
     const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
-    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i", .rootfs = "r" };
+    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i" };
     const profile: model.ProfileConfig = .{ .name = "p", .install_source = "s", .kind = .diskless, .boot_bundle = "bb" };
     const nodes = [_]model.NodeConfig{
         .{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "p" },
@@ -343,7 +346,7 @@ test "rootfs input digest is shared across nodes; desired digest is per-node" {
 test "node override changes desired digest but not rootfs input digest" {
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .http_port = 18080 } };
     const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
-    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i", .rootfs = "r" };
+    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i" };
     // 使用具名数组，使后续对 Profile 基线的修改对 catalog 可见（`&.{profile}` 会拷贝）。
     var profiles = [_]model.ProfileConfig{.{ .name = "p", .install_source = "s", .kind = .diskless, .boot_bundle = "bb", .software = .{ .packages = .{ .include = &.{"vim"} } } }};
     var nodes = [_]model.NodeConfig{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "p" }};
@@ -377,7 +380,7 @@ test "non-diskless profile is rejected" {
 test "rootfsInputDigest matches compile without a node" {
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .http_port = 18080 } };
     const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
-    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i", .rootfs = "r" };
+    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i" };
     const profile: model.ProfileConfig = .{ .name = "p", .install_source = "s", .kind = .diskless, .boot_bundle = "bb" };
     const nodes = [_]model.NodeConfig{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "p" }};
     const catalog: model.Catalog = .{ .profiles = &.{profile}, .nodes = &nodes, .install_sources = &.{source}, .boot_bundles = &.{bundle} };
@@ -390,7 +393,7 @@ test "rootfsInputDigest matches compile without a node" {
 test "rootfsBuildSteps returns pinned profile-fixed rootfs-build steps" {
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .http_port = 18080 } };
     const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
-    const boot = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i", .rootfs = "r" };
+    const boot = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i" };
     const asset = model.AssetConfig{ .name = "motd", .kind = .managed_file, .path = "managed/motd/3", .sha256 = "abc", .revision = 3 };
     const steps = [_]model.ProvisionStep{
         .{ .name = "build-a", .phase = .rootfs_build, .action = .managed_file, .content_asset = "motd", .destination = "/etc/motd" },

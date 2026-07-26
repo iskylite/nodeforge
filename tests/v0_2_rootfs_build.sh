@@ -50,9 +50,8 @@ zig-out/bin/nodeforge setup --install-root "$install_root" --non-interactive --y
 mkdir -p "$install_root/assets/repos"
 ln -sfn "$src_catalog/../assets/repos/rocky-9.7-aarch64-iso" "$install_root/assets/repos/rocky-9.7-aarch64-iso"
 
-# Inject a diskless-capable catalog: copy distros/install_sources/repositories/assets
-# from production, rebind repo base_url to the test daemon, append a boot bundle
-# sharing one kernel_release (asset files need not exist for the build path).
+# Copy the existing install-source facts and rebind repository URLs. Diskless
+# assets and the boot bundle are created through CLI after the daemon starts.
 python3 - "$install_root/catalog" "$src_catalog" "$server_ip" "$port" <<'PY'
 import json, hashlib, sys, shutil
 dst, src, ip, port = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -68,17 +67,6 @@ for r in repos:
     r["base_url"] = f"http://{ip}:{port}{path}"
 with open(f"{dst}/repositories.json", "w") as f: json.dump(repos, f, indent=2)
 with open(f"{dst}/assets.json") as f: assets = json.load(f)
-def A(name, kind):
-    return {"name": name, "kind": kind, "path": f"rootfs-test/{name}", "distro": "rocky",
-            "version": "9.7", "arch": "aarch64", "kernel_release": RELEASE,
-            "sha256": None, "revision": 1, "size": None, "media_type": None}
-for nm, k in [(f"{P}-kernel", "kernel"), (f"{P}-initrd", "nodeforge_initrd"), (f"{P}-rootfs", "rootfs")]:
-    if not any(a["name"] == nm for a in assets): assets.append(A(nm, k))
-with open(f"{dst}/assets.json", "w") as f: json.dump(assets, f, indent=2)
-b = [{"name": "nf-test-bundle", "distro": "rocky", "version": "9.7", "arch": "aarch64",
-      "kernel_release": RELEASE, "kernel": f"{P}-kernel", "runtime_kernel": f"{P}-kernel",
-      "initrd": f"{P}-initrd", "rootfs": f"{P}-rootfs"}]
-with open(f"{dst}/boot_bundles.json", "w") as f: json.dump(b, f, indent=2)
 names = ["distros", "profiles", "nodes", "provisioning_bundles", "repositories", "assets",
          "install_sources", "boot_bundles", "discovery_policy", "unknown_client_observations"]
 entities = []
@@ -90,8 +78,12 @@ for e in entities: h.update(e["name"].encode() + e["sha256"].encode())
 manifest = {"layout_schema_version": 1, "catalog_schema_version": 4, "catalog_revision": 1,
             "transaction_id": h.hexdigest(), "entities": entities}
 with open(f"{dst}/manifest.json", "w") as f: json.dump(manifest, f, indent=2)
-print(f"catalog injected: assets={len(assets)} boot_bundles=1 repos={len(repos)}")
+print(f"install-source fixture prepared: assets={len(assets)} repos={len(repos)}")
 PY
+
+mkdir -p "$install_root/assets/boot/rootfs-test" "$install_root/assets/initrd/rootfs-test"
+cp /boot/vmlinuz-5.14.0-611.5.1.el9_7.aarch64 "$install_root/assets/boot/rootfs-test/nf-test-kernel"
+cp zig-out/bin/nodeforge-initrd "$install_root/assets/initrd/rootfs-test/nf-test-initrd"
 
 setsid zig-out/bin/nodeforged --install-root "$install_root" </dev/null >"$work/daemon.log" 2>&1 &
 test_daemon_pid=$!
@@ -102,7 +94,18 @@ if ! kill -0 "$test_daemon_pid" 2>/dev/null; then
 fi
 
 config="$install_root/config/config.json"
-cli() { zig-out/bin/nodeforge "$@" --config "$config" --output json; }
+cli() { zig-out/bin/nodeforge --install-root "$install_root" "$@" --config "$config" --output json; }
+
+cli assets register --type kernel --name nf-test-kernel \
+    --path rootfs-test/nf-test-kernel --distro rocky --version 9.7 --arch aarch64 \
+    --kernel-release 5.14.0-362.13.1.el9.aarch64 >/dev/null
+cli assets register --type nodeforge_initrd --name nf-test-initrd \
+    --path rootfs-test/nf-test-initrd --distro rocky --version 9.7 --arch aarch64 \
+    --kernel-release 5.14.0-362.13.1.el9.aarch64 >/dev/null
+cli assets boot-bundle create nf-test-bundle \
+    --kernel nf-test-kernel --initrd nf-test-initrd \
+    --distro rocky --version 9.7 --arch aarch64 \
+    --kernel-release 5.14.0-362.13.1.el9.aarch64 >/dev/null
 
 # rootfs-build proof assets + provision bundle.
 printf 'NODEFORGE_BUILD_PROOF\n' >"$work/motd"

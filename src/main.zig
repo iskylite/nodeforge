@@ -157,6 +157,20 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(status);
     try addDebugFlag(status);
 
+    const operation = try zli.Command.init(init_options, .{ .name = "operation", .description = "Inspect and wait for durable management operations" }, showCurrentHelp);
+    const operation_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show one durable operation", .usage = "nodeforge operation show <id> [options]" }, operationShowHandler);
+    try operation_show.addPositionalArg(.{ .name = "id", .description = "Opaque operation identifier", .required = true });
+    try addConfigPathFlag(operation_show);
+    try addOutputFlag(operation_show);
+    try addDebugFlag(operation_show);
+    const operation_wait = try zli.Command.init(init_options, .{ .name = "wait", .description = "Wait for one durable operation to reach a terminal state", .usage = "nodeforge operation wait <id> [--timeout <seconds>] [options]" }, operationWaitHandler);
+    try operation_wait.addPositionalArg(.{ .name = "id", .description = "Opaque operation identifier", .required = true });
+    try operation_wait.addFlag(.{ .name = "timeout", .description = "Maximum seconds to wait without cancelling the operation", .type = .Int, .default_value = .{ .Int = 300 } });
+    try addConfigPathFlag(operation_wait);
+    try addOutputFlag(operation_wait);
+    try addDebugFlag(operation_wait);
+    try operation.addCommands(&.{ operation_show, operation_wait });
+
     const config = try zli.Command.init(init_options, .{
         .name = "config",
         .description = "Validate or export startup configuration",
@@ -352,7 +366,35 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(node_boot_prepare);
     try addDebugFlag(node_boot_prepare);
 
-    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_trace, node_boot_prepare });
+    const node_readiness = try zli.Command.init(init_options, .{
+        .name = "readiness",
+        .description = "Verify diskless build or boot readiness without creating a session",
+        .usage = "nodeforge node readiness <node_id> --stage <build|boot> [options]",
+    }, nodeReadinessHandler);
+    try node_readiness.addPositionalArg(.{ .name = "node_id", .description = "Registered diskless node identifier", .required = true });
+    try node_readiness.addFlag(.{ .name = "stage", .description = "Readiness stage: build or boot", .type = .String, .default_value = .{ .String = "boot" } });
+    try addConfigPathFlag(node_readiness);
+    try addOutputFlag(node_readiness);
+    try addDebugFlag(node_readiness);
+
+    const node_session = try zli.Command.init(init_options, .{ .name = "session", .description = "Inspect and cancel diskless delivery sessions" }, showCurrentHelp);
+    const node_session_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List active diskless delivery sessions" }, disklessSessionListHandler);
+    try addConfigPathFlag(node_session_list);
+    try addOutputFlag(node_session_list);
+    try addDebugFlag(node_session_list);
+    const node_session_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show an active diskless delivery session" }, disklessSessionShowHandler);
+    try node_session_show.addPositionalArg(.{ .name = "session_id", .description = "32-character delivery session identifier", .required = true });
+    try addConfigPathFlag(node_session_show);
+    try addOutputFlag(node_session_show);
+    try addDebugFlag(node_session_show);
+    const node_session_cancel = try zli.Command.init(init_options, .{ .name = "cancel", .description = "Cancel a delivery session and revoke all of its capabilities" }, disklessSessionCancelHandler);
+    try node_session_cancel.addPositionalArg(.{ .name = "session_id", .description = "32-character delivery session identifier", .required = true });
+    try addConfigPathFlag(node_session_cancel);
+    try addOutputFlag(node_session_cancel);
+    try addDebugFlag(node_session_cancel);
+    try node_session.addCommands(&.{ node_session_list, node_session_show, node_session_cancel });
+
+    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_trace, node_boot_prepare, node_readiness, node_session });
     try addValuesCommands(node, init_options, "node");
     try addItemCommands(node, init_options, "node");
     try addNodeSoftwareCommands(node, init_options);
@@ -471,6 +513,25 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const script_import = try zli.Command.init(init_options, .{ .name = "import", .description = "Atomically import a script revision" }, scriptImportHandler);
     try addContentAssetImportArgs(script_import, "Script");
     try script.addCommands(&.{script_import});
+    const initrd_assets = try zli.Command.init(init_options, .{ .name = "initrd", .description = "Build and register NodeForge diskless initrds" }, showCurrentHelp);
+    const initrd_build = try zli.Command.init(init_options, .{
+        .name = "build",
+        .description = "Build, publish, and register a NodeForge diskless initrd",
+        .usage = "nodeforge assets initrd build <name> --from-install-source <source> --kernel-release <r> [options]",
+        .help = "Prefer --from-install-source: preserves the ISO vendor initrd (including distro patches, firmware, and kernel modules) and appends a NodeForge overlay. Without it, --distro/--version/--arch select the generic dracut fallback. Publishes atomically to the managed initrd store and registers the result.",
+    }, initrdBuildHandler);
+    try initrd_build.addPositionalArg(.{ .name = "name", .description = "Canonical initrd asset name", .required = true });
+    try initrd_build.addFlags(&.{
+        .{ .name = "distro", .description = "Distro name (for example rocky)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "version", .description = "Distro version (for example 9.7)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "kernel-release", .description = "Installed kernel uname release used by dracut", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "from-install-source", .description = "Derive from this ISO install source's vendor installer initrd (recommended)", .type = .String, .default_value = .{ .String = "" } },
+    });
+    try addConfigPathFlag(initrd_build);
+    try addOutputFlag(initrd_build);
+    try addDebugFlag(initrd_build);
+    try initrd_assets.addCommands(&.{initrd_build});
     try assets.addCommands(&.{
         try installSourceImportCommand(init_options),
         try assetListCommand(init_options),
@@ -484,27 +545,27 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         managed_file,
         archive,
         script,
+        initrd_assets,
     });
     try addProvisionBundleCommands(assets, init_options);
     try addAssetCatalogCommands(assets, init_options);
-    // v0.2 boot-bundle 命令：创建 diskless profile 引用的 kernel/initrd/rootfs 组合。
+    // v0.2 boot-bundle 命令：创建 diskless profile 引用的 kernel/initrd 组合。
     // 这是 diskless 全流程 CLI 的关键环节。操作员通过 CLI 完成全部操作，
     // 无需手动编辑 catalog JSON 文件。
-    const boot_bundle = try zli.Command.init(init_options, .{ .name = "boot-bundle", .description = "Manage diskless boot bundles (kernel/initrd/rootfs combinations)" }, showCurrentHelp);
+    const boot_bundle = try zli.Command.init(init_options, .{ .name = "boot-bundle", .description = "Manage diskless boot bundles (kernel/initrd combinations)" }, showCurrentHelp);
     const boot_bundle_create = try zli.Command.init(init_options, .{
         .name = "create",
-        .description = "Create a boot bundle linking kernel, initrd and rootfs assets",
-        .usage = "nodeforge assets boot-bundle create <name> --kernel <asset> --initrd <asset> --rootfs <asset> --distro <d> --version <v> --arch <a> --kernel-release <r> [options]",
-        .help = "Links three registered assets (kernel, nodeforge_initrd, rootfs) into an immutable boot bundle. " ++
+        .description = "Create a boot bundle linking kernel and initrd assets",
+        .usage = "nodeforge assets boot-bundle create <name> --kernel <asset> --initrd <asset> --distro <d> --version <v> --arch <a> --kernel-release <r> [options]",
+        .help = "Links registered kernel and nodeforge_initrd assets into an immutable boot bundle. " ++
             "The bundle is referenced by diskless profiles via --boot-bundle. " ++
-            "Prerequisites: kernel/initrd/rootfs assets must already be registered via 'nodeforge assets register'. " ++
-            "This command is part of the diskless CLI flow: setup -> import-iso -> register -> rootfs build -> boot-bundle create -> profile create -> node add -> boot-prepare.",
+            "The Profile-derived rootfs is built or registered after the Profile exists. " ++
+            "This command is part of the diskless CLI flow: setup -> assets import -> register initrd -> boot-bundle create -> profile create -> rootfs build -> node add.",
     }, bootBundleCreateHandler);
     try boot_bundle_create.addPositionalArg(.{ .name = "name", .description = "Canonical boot bundle name", .required = true });
     try boot_bundle_create.addFlags(&.{
         .{ .name = "kernel", .description = "Kernel asset name (kind=kernel)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "initrd", .description = "NodeForge initrd asset name (kind=nodeforge_initrd)", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "rootfs", .description = "Rootfs asset name (kind=rootfs)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "distro", .description = "Distro name (e.g. rocky, ubuntu)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Distro version (e.g. 9.7, 24.04)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "arch", .description = "Architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
@@ -618,6 +679,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     try root.addCommands(&.{
         status,
+        operation,
         config,
         catalog,
         node,
@@ -1340,8 +1402,8 @@ fn setupHandler(ctx: zli.CommandContext) !void {
             setExitCode(ctx, 1);
             return;
         };
-        if (imported_config.?.value.schema_version != 3 or imported_config.?.value.distros.len != 0 or imported_config.?.value.profiles.len != 0 or imported_config.?.value.nodes.len != 0 or imported_config.?.value.provisioning_bundles.len != 0) {
-            try errorWriter(ctx).writeAll("error: config: imported startup config must use schema 3 and must not embed catalog entities\n");
+        if ((imported_config.?.value.schema_version != 3 and imported_config.?.value.schema_version != 4) or imported_config.?.value.distros.len != 0 or imported_config.?.value.profiles.len != 0 or imported_config.?.value.nodes.len != 0 or imported_config.?.value.provisioning_bundles.len != 0) {
+            try errorWriter(ctx).writeAll("error: config: imported startup config must use schema 3 or 4 and must not embed catalog entities\n");
             imported_config.?.deinit();
             setExitCode(ctx, 1);
             return;
@@ -1425,10 +1487,12 @@ fn setupHandler(ctx: zli.CommandContext) !void {
     // 配置导入不得改写。运行中的 daemon 只在重启后加载新 pair。
     if (imported_config != null) try nodeforge.config_store.save(ctx.io, ctx.allocator, p.config_path, startup_config);
     try nodeforge.dhcp_store.atomicWrite(ctx.io, p.service_path, unit);
+    const schema_text = try std.fmt.allocPrint(ctx.allocator, "{d}", .{startup_config.schema_version});
+    defer ctx.allocator.free(schema_text);
     if (imported_config != null)
-        try views.success(ctx.writer, "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config source", .value = import_config_path }, .{ .label = "Config schema", .value = "2" }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } })
+        try views.success(ctx.writer, "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config source", .value = import_config_path }, .{ .label = "Config schema", .value = schema_text }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } })
     else
-        try views.success(ctx.writer, if (migrated) "legacy deployment migrated" else "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config schema", .value = "2" }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } });
+        try views.success(ctx.writer, if (migrated) "legacy deployment migrated" else "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config schema", .value = schema_text }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } });
 }
 
 fn setupFlagError(ctx: zli.CommandContext, message: []const u8) void {
@@ -1650,6 +1714,66 @@ fn statusHandler(ctx: zli.CommandContext) !void {
     const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = view.ok, .result = view }, .{});
     try renderOutputDocument(ctx, .{ .human = .{ .text = std.mem.trimEnd(u8, human.written(), "\n") }, .json = json });
     setExitCode(ctx, if (view.ok) 0 else 1);
+}
+
+const OperationEnvelope = struct {
+    ok: bool,
+    result: struct {
+        id: []const u8,
+        kind: []const u8,
+        state: []const u8,
+        created_at: i64,
+        updated_at: i64,
+        result: []const u8,
+        error_code: []const u8,
+    },
+};
+
+fn operationShowHandler(ctx: zli.CommandContext) !void {
+    try operationRead(ctx, false);
+}
+
+fn operationWaitHandler(ctx: zli.CommandContext) !void {
+    try operationRead(ctx, true);
+}
+
+fn operationRead(ctx: zli.CommandContext, wait: bool) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 6);
+        return;
+    };
+    defer config.deinit();
+    const id = ctx.getArg("id") orelse return;
+    const timeout_seconds: i64 = if (wait) ctx.flag("timeout", i64) else 0;
+    if (wait and (timeout_seconds <= 0 or timeout_seconds > 86_400)) {
+        try writeCommandError(ctx, "operation.invalid_timeout", "--timeout must be between 1 and 86400 seconds", 2);
+        return;
+    }
+    const attempts: usize = if (wait) @intCast(timeout_seconds * 4) else 1;
+    var response: [64 * 1024]u8 = undefined;
+    var attempt: usize = 0;
+    while (attempt < attempts) : (attempt += 1) {
+        const body = nodeforge.management_client.operationJson(ctx.io, config.value.server.http_port, id, &response) catch null orelse {
+            try writeCommandError(ctx, "operation.unavailable", "operation is not found or daemon is unavailable", 6);
+            return;
+        };
+        const parsed = std.json.parseFromSlice(OperationEnvelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+            try writeCommandError(ctx, "operation.invalid_response", "daemon returned a malformed operation", 1);
+            return;
+        };
+        defer parsed.deinit();
+        const op = parsed.value.result;
+        const terminal = std.mem.eql(u8, op.state, "succeeded") or std.mem.eql(u8, op.state, "failed");
+        if (!wait or terminal) {
+            const human = try std.fmt.allocPrint(ctx.allocator, "id: {s}\nkind: {s}\nstate: {s}\nresult: {s}\nerror_code: {s}\ncreated_at: {d}\nupdated_at: {d}", .{ op.id, op.kind, op.state, op.result, op.error_code, op.created_at, op.updated_at });
+            try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
+            if (std.mem.eql(u8, op.state, "failed")) setExitCode(ctx, 5);
+            return;
+        }
+        std.Io.sleep(ctx.io, .fromMilliseconds(250), .awake) catch {};
+    }
+    try writeCommandError(ctx, "operation.wait_timeout", "operation is still running; it was not cancelled", 6);
 }
 
 /// 加载并联合校验启动配置与 catalog，不修改任何文件。
@@ -1879,6 +2003,116 @@ fn schemaV4MutationHandler(ctx: zli.CommandContext, rollback: bool) !void {
 /// 文件打开、SHA-256 计算、候选模型校验及 catalog 原子发布均由 daemon
 /// 管理 API 完成。因此本命令要求 daemon 可达，不是 fresh setup 的离线写入口。
 /// daemon 拒绝或不可达时返回退出码 1，CLI 参数错误返回退出码 2。
+fn initrdBuildHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const name = ctx.getArg("name") orelse return;
+    var distro = ctx.flag("distro", []const u8);
+    var version = ctx.flag("version", []const u8);
+    var arch_text = ctx.flag("arch", []const u8);
+    const kernel_release = ctx.flag("kernel-release", []const u8);
+    const source_name = ctx.flag("from-install-source", []const u8);
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var catalog: ?std.json.Parsed(nodeforge.model.Catalog) = null;
+    defer if (catalog) |*value| value.deinit();
+    var base_initrd: ?[]const u8 = null;
+    if (source_name.len != 0) {
+        catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, nodeforge.paths.require().catalog_dir) catch {
+            try writeCommandError(ctx, "initrd.catalog_unavailable", "cannot load the installed catalog", 1);
+            return;
+        };
+        const source = nodeforge.catalog.findInstallSource(&catalog.?.value, source_name) orelse {
+            try writeCommandError(ctx, "initrd.install_source_not_found", "--from-install-source does not exist", 2);
+            return;
+        };
+        const installer = nodeforge.catalog.findAsset(&catalog.?.value, source.installer_initrd) orelse {
+            try writeCommandError(ctx, "initrd.installer_initrd_missing", "install source has no registered installer initrd", 1);
+            return;
+        };
+        if (installer.kind != .installer_initrd) {
+            try writeCommandError(ctx, "initrd.installer_initrd_invalid", "install source initrd has the wrong asset kind", 1);
+            return;
+        }
+        if ((distro.len != 0 and !std.mem.eql(u8, distro, source.distro)) or
+            (version.len != 0 and !std.mem.eql(u8, version, source.version)) or
+            (arch_text.len != 0 and !std.mem.eql(u8, arch_text, @tagName(source.arch))))
+        {
+            try writeCommandError(ctx, "initrd.source_tuple_mismatch", "explicit distro/version/arch conflicts with the install source", 2);
+            return;
+        }
+        distro = source.distro;
+        version = source.version;
+        arch_text = @tagName(source.arch);
+        base_initrd = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ config.value.tftp.asset_root, installer.path });
+    }
+    if (!nodeforge.config_validate.validLogicalId(name) or
+        !nodeforge.config_validate.validLogicalId(distro) or
+        !nodeforge.config_validate.validLogicalId(version) or
+        kernel_release.len == 0 or kernel_release.len > 160 or
+        std.mem.indexOfAny(u8, kernel_release, "/\\\x00") != null)
+    {
+        try writeCommandError(ctx, "initrd.invalid_input", "name, tuple (or --from-install-source), and kernel-release must be safe non-empty values", 2);
+        return;
+    }
+    const arch = std.meta.stringToEnum(nodeforge.model.Arch, arch_text) orelse {
+        try writeCommandError(ctx, "initrd.invalid_arch", "unsupported --arch", 2);
+        return;
+    };
+    if (!nodeforge.management_client.health(ctx.io, config.value.server.http_port).healthy) {
+        try writeCommandError(ctx, "initrd.daemon_unavailable", "local daemon must be healthy before building and registering an initrd", 1);
+        return;
+    }
+
+    const relative = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}/{s}/{s}.img", .{ distro, version, @tagName(arch), name });
+    const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ nodeforge.paths.require().initrd_dir, relative });
+    const part = try std.fmt.allocPrint(ctx.allocator, "{s}.part", .{destination});
+    const parent = std.fs.path.dirname(destination) orelse unreachable;
+    try std.Io.Dir.cwd().createDirPath(ctx.io, parent);
+    if (std.Io.Dir.cwd().statFile(ctx.io, destination, .{ .follow_symlinks = false })) |_| {
+        try writeCommandError(ctx, "initrd.already_exists", "managed initrd destination already exists", 1);
+        return;
+    } else |err| if (err != error.FileNotFound) return err;
+    std.Io.Dir.cwd().deleteFile(ctx.io, part) catch {};
+    var published = false;
+    defer if (!published) std.Io.Dir.cwd().deleteFile(ctx.io, part) catch {};
+    const initrd_binary = try std.fmt.allocPrint(ctx.allocator, "{s}/nodeforge-initrd", .{nodeforge.paths.require().bin_dir});
+    const build_result = if (base_initrd) |base|
+        nodeforge.provision_initrd_build_executor.buildFromInstaller(ctx.io, ctx.allocator, kernel_release, initrd_binary, base, part)
+    else
+        nodeforge.provision_initrd_build_executor.build(ctx.io, ctx.allocator, kernel_release, initrd_binary, part);
+    build_result catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "initrd build failed ({t})", .{err});
+        try writeCommandError(ctx, "initrd.build_failed", message, 1);
+        return;
+    };
+    std.Io.Dir.rename(std.Io.Dir.cwd(), part, std.Io.Dir.cwd(), destination, ctx.io) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "cannot atomically publish initrd ({t})", .{err});
+        try writeCommandError(ctx, "initrd.publish_failed", message, 1);
+        return;
+    };
+    published = true;
+
+    const imported = nodeforge.management_client.importAsset(ctx.io, config.value.server.http_port, .{
+        .name = name,
+        .kind = @tagName(nodeforge.model.AssetKind.nodeforge_initrd),
+        .path = relative,
+        .distro = distro,
+        .version = version,
+        .arch = @tagName(arch),
+        .kernel_release = kernel_release,
+    }) catch false;
+    if (!imported) {
+        std.Io.Dir.cwd().deleteFile(ctx.io, destination) catch {};
+        try writeCommandError(ctx, "initrd.register_failed", "daemon rejected the built initrd; unpublished file was removed", 1);
+        return;
+    }
+    const human = try std.fmt.allocPrint(ctx.allocator, "initrd built and registered: {s} ({s})", .{ name, relative });
+    try renderCommandResult(ctx, human, .{ .name = name, .path = relative, .arch = @tagName(arch), .kernel_release = kernel_release });
+}
+
 fn assetImportHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     const debug = ctx.flag("debug", bool);
@@ -3423,14 +3657,12 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     const install = result.install;
     const sections = [_]nodeforge.cli_document.Section{ .{ .key = "stored", .title = "Stored" }, .{ .key = "effective", .title = "Effective" }, .{ .key = "capabilities", .title = "Capabilities" }, .{ .key = "runtime", .title = "Runtime" } };
     const fields = [_]nodeforge.cli_document.Field{
-        .{ .key = "name", .value = result.name, .section = "stored" },                                                                                                                                             .{ .key = "install_source", .value = result.install_source.name, .section = "stored", .json_path = "install_source.name" },                                                  .{ .key = "kernel_args", .value = result.kernel_args orelse "-", .section = "stored" },                                                                                   .{ .key = "platform.distro", .value = result.platform.distro, .section = "capabilities" },                                                                                                                                   .{ .key = "platform.version", .value = result.platform.version, .section = "capabilities" },                                                                                                         .{ .key = "platform.arch", .value = result.platform.arch, .section = "capabilities" },
-        .{ .key = "install.storage.mode", .value = @tagName(install.storage.mode), .section = "effective", .json_path = "install.storage.mode" },                                          .{ .key = "install.storage.wipe", .value = if (install.storage.wipe) "yes" else "no", .section = "effective", .json_path = "install.storage.wipe" },
-        .{ .key = "install.storage.partition_table", .value = @tagName(install.storage.partition_table), .section = "effective", .json_path = "install.storage.partition_table" },                                 .{ .key = "install.bootloader.install", .value = if (install.bootloader.install) "yes" else "no", .section = "effective", .json_path = "install.bootloader.install" },    .{ .key = "system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },                                              .{ .key = "system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" }, .{ .key = "system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
-        .{ .key = "system.connectivity.time_sync", .value = if (result.effective_system.connectivity.time_sync) "yes" else "no", .section = "effective", .json_path = "effective_system.connectivity.time_sync" }, .{ .key = "system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.enabled" }, .{ .key = "system.ssh.password_authentication", .value = if (result.effective_system.ssh.password_authentication) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.password_authentication" }, .{ .key = "system.ssh.root_login", .value = result.effective_system.ssh.root_login, .section = "effective", .json_path = "effective_system.ssh.root_login" },                      .{ .key = "system.ssh.root_password", .value = if (result.effective_system.ssh.root_password != null) "<redacted>" else "<unset>", .section = "effective", .json_path = "effective_system.ssh.root_password" },
-        .{ .key = "system.security.firewall", .value = result.effective_system.security.firewall, .section = "effective", .json_path = "effective_system.security.firewall" },                                     .{ .key = "system.security.selinux", .value = result.effective_system.security.selinux, .section = "effective", .json_path = "effective_system.security.selinux" },       .{ .key = "system.security.apparmor", .value = result.effective_system.security.apparmor, .section = "effective", .json_path = "effective_system.security.apparmor" },                                                    .{ .key = "install.apt.fallback", .value = @tagName(install.apt.fallback), .section = "effective", .json_path = "install.apt.fallback" },                                          .{ .key = "install.completion.action", .value = @tagName(install.completion.action), .section = "effective", .json_path = "install.completion.action" },
-        .{ .key = "install.updates.mode", .value = @tagName(install.updates.mode), .section = "effective", .json_path = "install.updates.mode" },                                                                  .{ .key = "install.proxy.url", .value = install.proxy.url orelse "<unset>", .section = "effective", .json_path = "install.proxy.url" },                                   .{ .key = "install.reinstall_policy", .value = @tagName(install.reinstall_policy), .section = "effective", .json_path = "install.reinstall_policy" },                                                                     .{ .key = "install.post_install.bundle", .value = install.post_install.bundle orelse "<unset>", .section = "effective", .json_path = "install.post_install.bundle" },              .{ .key = "capability.family", .value = result.capability.family, .section = "capabilities" },
-        .{ .key = "capability.install_adapter", .value = result.capability.install_adapter, .section = "capabilities" },                                                                                           .{ .key = "capability.package_manager", .value = result.capability.package_manager, .section = "capabilities" },                                                          .{ .key = "validation.valid", .value = if (result.validation.valid) "yes" else "no", .section = "runtime" },                                                                                                              .{ .key = "model_revision.config", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.config}), .section = "runtime" },                                 .{ .key = "model_revision.catalog", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.catalog}), .section = "runtime" },
-        .{ .key = "nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.nodes.len}), .section = "runtime" },                                                                                     .{ .key = "assets", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.assets.len}), .section = "runtime" },
+        .{ .key = "name", .value = result.name, .section = "stored" },                                                                                                                     .{ .key = "install_source", .value = result.install_source.name, .section = "stored", .json_path = "install_source.name" },                                                                                .{ .key = "kernel_args", .value = result.kernel_args orelse "-", .section = "stored" },                                                                                    .{ .key = "platform.distro", .value = result.platform.distro, .section = "capabilities" },                                                                                                                                .{ .key = "platform.version", .value = result.platform.version, .section = "capabilities" },                                                                                 .{ .key = "platform.arch", .value = result.platform.arch, .section = "capabilities" },
+        .{ .key = "install.storage.mode", .value = @tagName(install.storage.mode), .section = "effective", .json_path = "install.storage.mode" },                                          .{ .key = "install.storage.wipe", .value = if (install.storage.wipe) "yes" else "no", .section = "effective", .json_path = "install.storage.wipe" },                                                       .{ .key = "install.storage.partition_table", .value = @tagName(install.storage.partition_table), .section = "effective", .json_path = "install.storage.partition_table" }, .{ .key = "install.bootloader.install", .value = if (install.bootloader.install) "yes" else "no", .section = "effective", .json_path = "install.bootloader.install" },                                                    .{ .key = "system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" }, .{ .key = "system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },
+        .{ .key = "system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" }, .{ .key = "system.connectivity.time_sync", .value = if (result.effective_system.connectivity.time_sync) "yes" else "no", .section = "effective", .json_path = "effective_system.connectivity.time_sync" }, .{ .key = "system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.enabled" },  .{ .key = "system.ssh.password_authentication", .value = if (result.effective_system.ssh.password_authentication) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.password_authentication" }, .{ .key = "system.ssh.root_login", .value = result.effective_system.ssh.root_login, .section = "effective", .json_path = "effective_system.ssh.root_login" },                .{ .key = "system.ssh.root_password", .value = if (result.effective_system.ssh.root_password != null) "<redacted>" else "<unset>", .section = "effective", .json_path = "effective_system.ssh.root_password" },
+        .{ .key = "system.security.firewall", .value = result.effective_system.security.firewall, .section = "effective", .json_path = "effective_system.security.firewall" },             .{ .key = "system.security.selinux", .value = result.effective_system.security.selinux, .section = "effective", .json_path = "effective_system.security.selinux" },                                        .{ .key = "system.security.apparmor", .value = result.effective_system.security.apparmor, .section = "effective", .json_path = "effective_system.security.apparmor" },     .{ .key = "install.apt.fallback", .value = @tagName(install.apt.fallback), .section = "effective", .json_path = "install.apt.fallback" },                                                                                 .{ .key = "install.completion.action", .value = @tagName(install.completion.action), .section = "effective", .json_path = "install.completion.action" },                     .{ .key = "install.updates.mode", .value = @tagName(install.updates.mode), .section = "effective", .json_path = "install.updates.mode" },
+        .{ .key = "install.proxy.url", .value = install.proxy.url orelse "<unset>", .section = "effective", .json_path = "install.proxy.url" },                                            .{ .key = "install.reinstall_policy", .value = @tagName(install.reinstall_policy), .section = "effective", .json_path = "install.reinstall_policy" },                                                      .{ .key = "install.post_install.bundle", .value = install.post_install.bundle orelse "<unset>", .section = "effective", .json_path = "install.post_install.bundle" },      .{ .key = "capability.family", .value = result.capability.family, .section = "capabilities" },                                                                                                                            .{ .key = "capability.install_adapter", .value = result.capability.install_adapter, .section = "capabilities" },                                                             .{ .key = "capability.package_manager", .value = result.capability.package_manager, .section = "capabilities" },
+        .{ .key = "validation.valid", .value = if (result.validation.valid) "yes" else "no", .section = "runtime" },                                                                       .{ .key = "model_revision.config", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.config}), .section = "runtime" },                                                         .{ .key = "model_revision.catalog", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.catalog}), .section = "runtime" },                       .{ .key = "nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.nodes.len}), .section = "runtime" },                                                                                                    .{ .key = "assets", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.assets.len}), .section = "runtime" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Profile {s}", .{result.name});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
@@ -3478,20 +3710,19 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
 
 fn bootBundleCreateHandler(ctx: zli.CommandContext) !void {
     // v0.2 diskless CLI 流程：boot-bundle create
-    // 将已注册的 kernel/initrd/rootfs 资产绑定为一个不可拆分的 boot bundle。
+    // 将已注册的 kernel/initrd 资产绑定为一个不可拆分的 boot bundle。
     // 调用 management API POST /api/v1/management/boot-bundles，daemon 校验
     // 资产类型匹配后原子写入 catalog。操作员无需手动编辑 catalog JSON。
     _ = outputFromContext(ctx) orelse return;
     const name = ctx.getArg("name") orelse return;
     const kernel = ctx.flag("kernel", []const u8);
     const initrd = ctx.flag("initrd", []const u8);
-    const rootfs = ctx.flag("rootfs", []const u8);
     const distro = ctx.flag("distro", []const u8);
     const version = ctx.flag("version", []const u8);
     const arch = ctx.flag("arch", []const u8);
     const kernel_release = ctx.flag("kernel-release", []const u8);
-    if (kernel.len == 0 or initrd.len == 0 or rootfs.len == 0 or distro.len == 0 or version.len == 0 or arch.len == 0 or kernel_release.len == 0) {
-        try writeCommandError(ctx, "boot_bundle.invalid", "boot-bundle create: all flags --kernel, --initrd, --rootfs, --distro, --version, --arch, --kernel-release are required", 2);
+    if (kernel.len == 0 or initrd.len == 0 or distro.len == 0 or version.len == 0 or arch.len == 0 or kernel_release.len == 0) {
+        try writeCommandError(ctx, "boot_bundle.invalid", "boot-bundle create: all flags --kernel, --initrd, --distro, --version, --arch, --kernel-release are required", 2);
         return;
     }
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
@@ -3500,13 +3731,13 @@ fn bootBundleCreateHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     var reason: [256]u8 = undefined;
-    const result = nodeforge.management_client.bootBundleCreate(ctx.io, config.value.server.http_port, name, distro, version, arch, kernel_release, kernel, initrd, rootfs, &reason);
+    const result = nodeforge.management_client.bootBundleCreate(ctx.io, config.value.server.http_port, name, distro, version, arch, kernel_release, kernel, initrd, &reason);
     if (!result.healthy) {
         try reportMutationFailure(ctx, result, "boot-bundle create failed: daemon unreachable");
         return;
     }
-    const human = try std.fmt.allocPrint(ctx.allocator, "boot bundle created: {s} (kernel={s}, initrd={s}, rootfs={s})", .{ name, kernel, initrd, rootfs });
-    try renderCommandResult(ctx, human, .{ .name = name, .kernel = kernel, .initrd = initrd, .rootfs = rootfs });
+    const human = try std.fmt.allocPrint(ctx.allocator, "boot bundle created: {s} (kernel={s}, initrd={s})", .{ name, kernel, initrd });
+    try renderCommandResult(ctx, human, .{ .name = name, .kernel = kernel, .initrd = initrd });
 }
 
 fn profileRootfsPlanHandler(ctx: zli.CommandContext) !void {
@@ -3819,7 +4050,7 @@ fn nodeBootPrepareHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "diskless.unavailable", msg, 1);
         return;
     }
-    const Resp = struct { ok: bool, result: struct { node_id: []const u8, session_id: []const u8, config_token: []const u8, rootfs_token: []const u8, agent_token: []const u8, event_token: []const u8, config_url: []const u8, agent_plan_digest: []const u8, rootfs_input_digest: []const u8 } };
+    const Resp = struct { ok: bool, result: struct { node_id: []const u8, session_id: []const u8, state: []const u8, config_url: []const u8, agent_plan_digest: []const u8, rootfs_input_digest: []const u8 } };
     const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
         const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
         try writeCommandError(ctx, "diskless.invalid_response", message, 1);
@@ -3827,7 +4058,145 @@ fn nodeBootPrepareHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     const r = parsed.value.result;
-    const human = try std.fmt.allocPrint(ctx.allocator, "node: {s}\nsession_id: {s}\nconfig_token: {s}\nrootfs_token: {s}\nagent_token: {s}\nevent_token: {s}\nconfig_url: {s}\nagent_plan_digest: {s}\nrootfs_input_digest: {s}", .{ r.node_id, r.session_id, r.config_token, r.rootfs_token, r.agent_token, r.event_token, r.config_url, r.agent_plan_digest, r.rootfs_input_digest });
+    const human = try std.fmt.allocPrint(ctx.allocator, "node: {s}\nsession_id: {s}\nstate: {s}\nconfig_url: {s}\nagent_plan_digest: {s}\nrootfs_input_digest: {s}", .{ r.node_id, r.session_id, r.state, r.config_url, r.agent_plan_digest, r.rootfs_input_digest });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+}
+
+fn nodeReadinessHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const stage = ctx.flag("stage", []const u8);
+    if (!(std.mem.eql(u8, stage, "build") or std.mem.eql(u8, stage, "boot"))) {
+        try writeCommandError(ctx, "readiness.invalid_stage", "--stage must be build or boot", 2);
+        return;
+    }
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const node_id = ctx.getArg("node_id") orelse return;
+    var response: [64 * 1024]u8 = undefined;
+    var reason: [256]u8 = [_]u8{0} ** 256;
+    const body = nodeforge.management_client.nodeReadinessJson(ctx.io, config.value.server.http_port, node_id, stage, &response, &reason) catch null;
+    if (body == null) {
+        const reason_slice = std.mem.sliceTo(&reason, 0);
+        try writeCommandError(ctx, "readiness.not_ready", if (reason_slice.len > 0) reason_slice else "readiness check failed", 4);
+        return;
+    }
+    const Resp = struct {
+        ok: bool,
+        result: struct {
+            node_id: []const u8,
+            stage: []const u8,
+            ready: bool,
+            rootfs_input_digest: []const u8,
+            desired_plan_digest: []const u8,
+            memory: ?[]const u8 = null,
+            required_min_memory_bytes: ?u64 = null,
+        },
+    };
+    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
+        try writeCommandError(ctx, "readiness.invalid_response", message, 1);
+        return;
+    };
+    defer parsed.deinit();
+    const result = parsed.value.result;
+    const human = if (result.required_min_memory_bytes) |required|
+        try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}\nmemory: {s}\nrequired_min_memory_bytes: {d}", .{ result.node_id, result.stage, if (result.ready) "yes" else "no", result.rootfs_input_digest, result.desired_plan_digest, result.memory orelse "unknown", required })
+    else
+        try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}", .{ result.node_id, result.stage, if (result.ready) "yes" else "no", result.rootfs_input_digest, result.desired_plan_digest });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+}
+
+const DisklessSessionView = struct {
+    session_id: []const u8,
+    node_id: []const u8,
+    profile: []const u8,
+    phase: []const u8,
+    expires_at: i64,
+};
+
+fn validDeliverySessionId(value: []const u8) bool {
+    if (value.len != 32) return false;
+    for (value) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}
+
+fn disklessSessionListHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var response: [64 * 1024]u8 = undefined;
+    const body = nodeforge.management_client.disklessSessionsJson(ctx.io, config.value.server.http_port, null, &response) catch null orelse {
+        try writeCommandError(ctx, "diskless.session_unavailable", "cannot list delivery sessions", 1);
+        return;
+    };
+    const Envelope = struct { ok: bool, result: struct { items: []const DisklessSessionView } };
+    const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try writeCommandError(ctx, "diskless.invalid_response", "daemon returned malformed session data", 1);
+        return;
+    };
+    defer parsed.deinit();
+    var human: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer human.deinit();
+    if (parsed.value.result.items.len == 0) {
+        try human.writer.writeAll("No active diskless delivery sessions.");
+    } else {
+        try human.writer.writeAll("SESSION                          NODE  PROFILE  PHASE  EXPIRES_AT\n");
+        for (parsed.value.result.items) |item|
+            try human.writer.print("{s}  {s}  {s}  {s}  {d}\n", .{ item.session_id, item.node_id, item.profile, item.phase, item.expires_at });
+    }
+    try renderOutputDocument(ctx, .{ .human = .{ .text = std.mem.trimEnd(u8, human.written(), "\n") }, .json = body });
+}
+
+fn disklessSessionShowHandler(ctx: zli.CommandContext) !void {
+    try disklessSessionOne(ctx, false);
+}
+
+fn disklessSessionCancelHandler(ctx: zli.CommandContext) !void {
+    try disklessSessionOne(ctx, true);
+}
+
+fn disklessSessionOne(ctx: zli.CommandContext, cancel: bool) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const session_id = ctx.getArg("session_id") orelse return;
+    if (!validDeliverySessionId(session_id)) {
+        try writeCommandError(ctx, "diskless.invalid_session", "session id must be 32 hexadecimal characters", 2);
+        return;
+    }
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var response: [64 * 1024]u8 = undefined;
+    var reason: [256]u8 = [_]u8{0} ** 256;
+    const body = if (cancel)
+        nodeforge.management_client.cancelDisklessSession(ctx.io, config.value.server.http_port, session_id, &response, &reason) catch null
+    else
+        nodeforge.management_client.disklessSessionsJson(ctx.io, config.value.server.http_port, session_id, &response) catch null;
+    if (body == null) {
+        const detail = std.mem.sliceTo(&reason, 0);
+        try writeCommandError(ctx, "diskless.session_unavailable", if (detail.len > 0) detail else "delivery session not found or daemon unavailable", 1);
+        return;
+    }
+    if (cancel) {
+        const human = try std.fmt.allocPrint(ctx.allocator, "diskless delivery session cancelled: {s}", .{session_id});
+        try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
+        return;
+    }
+    const Envelope = struct { ok: bool, result: DisklessSessionView };
+    const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try writeCommandError(ctx, "diskless.invalid_response", "daemon returned malformed session data", 1);
+        return;
+    };
+    defer parsed.deinit();
+    const item = parsed.value.result;
+    const human = try std.fmt.allocPrint(ctx.allocator, "session_id: {s}\nnode: {s}\nprofile: {s}\nphase: {s}\nexpires_at: {d}", .{ item.session_id, item.node_id, item.profile, item.phase, item.expires_at });
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
 }
 
@@ -3879,7 +4248,8 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .id = node_id, .mac = mac, .arch = arch, .profile = profile, .pxe = model.PxeConfig{ .ip_reservation = patch.pxe_ip_reservation }, .hostname = patch.hostname, .deploy = patch.deploy orelse true, .http_accel = patch.http_accel orelse false, .storage = model.NodeStorageConfig{ .boot_disk = patch.storage_boot_disk orelse "/dev/sda" }, .network = model.TargetNetworkConfig{ .mode = patch.network_mode orelse .dhcp, .interface = patch.network_interface, .address = patch.network_address, .prefix_len = patch.network_prefix_len, .gateway = patch.network_gateway } }, .{ .emit_null_optional_fields = false });
+    // hostname 未显式指定时默认使用 node_id，使 kickstart/answer 渲染无需特殊回退逻辑。
+    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .id = node_id, .mac = mac, .arch = arch, .profile = profile, .pxe = model.PxeConfig{ .ip_reservation = patch.pxe_ip_reservation }, .hostname = patch.hostname orelse node_id, .deploy = patch.deploy orelse true, .http_accel = patch.http_accel orelse false, .storage = model.NodeStorageConfig{ .boot_disk = patch.storage_boot_disk orelse "/dev/sda" }, .network = model.TargetNetworkConfig{ .mode = patch.network_mode orelse .dhcp, .interface = patch.network_interface, .address = patch.network_address, .prefix_len = patch.network_prefix_len, .gateway = patch.network_gateway } }, .{ .emit_null_optional_fields = false });
     defer ctx.allocator.free(body);
     var reason: [256]u8 = undefined;
     const node_result = nodeforge.management_client.nodeAdd(ctx.io, config.value.server.http_port, body, &reason);

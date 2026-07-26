@@ -533,8 +533,9 @@ pub const InstallSourceConfig = struct {
 
 /// 无盘启动的不可拆分版本组合（v0.2 范围）。
 ///
-/// kernel、initrd 和 rootfs 三者必须来自同一发行版版本和架构，
-/// kernel_release 必须一致。profile 通过 `boot_bundle` 字段引用此对象。
+/// kernel 与 initrd 必须来自同一发行版版本和架构，kernel_release 必须一致。
+/// rootfs 是由 Profile build projection 派生的内容寻址制品，不能放进 bundle，
+/// 否则会形成「创建 Profile 需要 bundle、构建 rootfs 又需要 Profile」的环。
 pub const BootBundleConfig = struct {
     /// 稳定短名称，用于 diskless profile 的 `boot_bundle` 引用。
     name: []const u8,
@@ -544,7 +545,7 @@ pub const BootBundleConfig = struct {
     version: []const u8,
     /// 目标架构。
     arch: Arch,
-    /// 内核 release 字符串，kernel/initrd/rootfs 三者必须一致。
+    /// 内核 release 字符串，kernel/initrd 必须一致。
     kernel_release: []const u8,
     /// 内核资产名称；必须指向 kind 为 `kernel` 的资产。
     kernel: []const u8,
@@ -553,8 +554,9 @@ pub const BootBundleConfig = struct {
     runtime_kernel: ?[]const u8 = null,
     /// NodeForge 小 initrd 资产名称；必须指向 kind 为 `nodeforge_initrd` 的资产。
     initrd: []const u8,
-    /// rootfs 资产名称；必须指向 kind 为 `rootfs` 的资产。
-    rootfs: []const u8,
+    /// v0.2 早期 catalog 的只读兼容字段。新写入流程永远保持 null，解析、
+    /// readiness 和 rootfs 构建均不得消费它，避免重新引入 Profile/bundle 创建环。
+    rootfs: ?[]const u8 = null,
 };
 
 /// profile 的安全元数据，供未知节点策略做静态判断。
@@ -1384,7 +1386,8 @@ pub const NodeConfig = struct {
     /// Schema v3 canonical PXE lease 保留配置。
     pxe: PxeConfig = .{},
     /// 节点主机名；用于渲染安装配置中的 hostname。
-    /// null 时回退到 `node.id`。
+    /// CLI `node add` 未显式指定时默认使用 `node.id`；
+    /// API 直接创建时 null 表示由渲染层回退到 `node.id`。
     hostname: ?[]const u8 = null,
     /// 节点 override 配置。表达共享 Profile 策略在单个节点上的例外。
     /// 不含物理设备选择器——那些是 Node 直接属性。

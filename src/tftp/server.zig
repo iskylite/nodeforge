@@ -25,6 +25,9 @@ const events = @import("../state/events.zig");
 const boot_session = @import("../state/boot_session.zig");
 const boot_target = @import("../boot/target.zig");
 const grub = @import("../boot/grub.zig");
+const capsule = @import("../boot/capsule.zig");
+const internal_http = @import("../initrd/http.zig");
+const paths = @import("../paths.zig");
 const observe_log = @import("../observe/log.zig");
 const capmod = @import("../state/capacity.zig");
 const log = std.log.scoped(.tftp);
@@ -61,6 +64,87 @@ const RetryAction = enum {
 /// per-request 进程隔离，缩短末尾等待可避免不可确认请求长期占用全局 worker。
 const final_block_retries: u8 = 2;
 
+const capsule_prefix = "nodeforge/capsules/";
+const capsule_suffix = ".cpio";
+const capsule_max_bytes = 2048;
+// Must exceed the maximum supported concurrent TFTP transfers (128). A slot
+// may remain pending while GRUB downloads the much larger kernel/base initrd.
+const capsule_slots = 256;
+
+pub const CapsuleStore = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    /// Serializes pending-check + boot-prepare + put, preventing duplicate
+    /// delivery sessions when firmware asks for the same per-MAC config twice.
+    prepare_mutex: std.atomic.Mutex = .unlocked,
+    entries: [capsule_slots]Entry = [_]Entry{.{}} ** capsule_slots,
+    next: usize = 0,
+
+    const Entry = struct {
+        active: bool = false,
+        delivered: bool = false,
+        session: [32]u8 = [_]u8{0} ** 32,
+        node: [128]u8 = [_]u8{0} ** 128,
+        node_len: u8 = 0,
+        archive: [capsule_max_bytes]u8 = [_]u8{0} ** capsule_max_bytes,
+        archive_len: u16 = 0,
+    };
+
+    fn put(self: *CapsuleStore, node_id: []const u8, session: []const u8, archive: []const u8) !void {
+        if (session.len != 32 or node_id.len > 128 or archive.len > capsule_max_bytes) return error.InvalidCapsule;
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        var selected: ?usize = null;
+        for (0..capsule_slots) |offset| {
+            const index = (self.next + offset) % capsule_slots;
+            if (!self.entries[index].active or self.entries[index].delivered) {
+                selected = index;
+                break;
+            }
+        }
+        const index = selected orelse return error.CapsuleCapacityExceeded;
+        self.next = (index + 1) % capsule_slots;
+        var entry: Entry = .{ .active = true, .node_len = @intCast(node_id.len), .archive_len = @intCast(archive.len) };
+        @memcpy(&entry.session, session);
+        @memcpy(entry.node[0..node_id.len], node_id);
+        @memcpy(entry.archive[0..archive.len], archive);
+        self.entries[index] = entry;
+    }
+
+    fn copy(self: *CapsuleStore, node_id: []const u8, session: []const u8, out: *[capsule_max_bytes]u8) ?[]const u8 {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (!entry.active or !std.mem.eql(u8, &entry.session, session) or !std.mem.eql(u8, entry.node[0..entry.node_len], node_id)) continue;
+            const len = entry.archive_len;
+            @memcpy(out[0..len], entry.archive[0..len]);
+            return out[0..len];
+        }
+        return null;
+    }
+
+    fn pendingSession(self: *CapsuleStore, node_id: []const u8, out: *[32]u8) ?[]const u8 {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (!entry.active or entry.delivered or !std.mem.eql(u8, entry.node[0..entry.node_len], node_id)) continue;
+            @memcpy(out, &entry.session);
+            return out;
+        }
+        return null;
+    }
+
+    fn markDelivered(self: *CapsuleStore, node_id: []const u8, session: []const u8) void {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.active and std.mem.eql(u8, &entry.session, session) and std.mem.eql(u8, entry.node[0..entry.node_len], node_id)) {
+                entry.delivered = true;
+                return;
+            }
+        }
+    }
+};
+
 /// 根据是否末尾块返回重传上限。非末尾块用 `max_retries`（对齐 tftpd-hpa
 /// TRIES=6，即 1 首次 + 5 重传，1s 基线 + 指数退避累计 ~63s）；末尾块用
 /// `final_block_retries`（~7s 后乐观完成）。
@@ -87,11 +171,11 @@ fn backoffSeconds(base: u8, attempt: usize) u8 {
 ///
 /// `config` 提供 TFTP asset root 路径；`catalog` 提供资产白名单快照；
 /// `runtime` 记录会话计数和活动列表。三者必须在 `serve` 的整个生命周期内保持有效。
-pub fn serve(io: std.Io, allocator: std.mem.Allocator, models: *model_runtime.ModelRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
+pub fn serve(io: std.Io, allocator: std.mem.Allocator, models: *model_runtime.ModelRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, capsules: ?*CapsuleStore, stop: ?*const std.atomic.Value(bool)) !void {
     const pair = models.acquire();
     defer pair.release();
     const socket = try bind(io, pair.config.value().server.server_ip);
-    try serveSocket(io, allocator, socket, models, runtime, event_writer, sessions, stop);
+    try serveSocket(io, allocator, socket, models, runtime, event_writer, sessions, capsules, stop);
 }
 
 /// 绑定固定 UDP 69；供 daemon 在启动其他 listener 前确认 TFTP 可用。
@@ -106,7 +190,7 @@ pub fn bind(io: std.Io, server_ip: []const u8) !std.Io.net.Socket {
 /// 主循环只负责接收和分发。`max_concurrent_transfers <= 1` 保留串行模式；
 /// 大于 1 时为每个 RRQ 启动有界 worker，worker 使用复制后的 datagram，绝不
 /// 借用下一轮 receive 会覆盖的栈缓冲区。
-pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, models: *model_runtime.ModelRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, stop: ?*const std.atomic.Value(bool)) !void {
+pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.Io.net.Socket, models: *model_runtime.ModelRuntime, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, capsules: ?*CapsuleStore, stop: ?*const std.atomic.Value(bool)) !void {
     var socket = owned_socket;
     defer socket.close(io);
     var active_transfers = std.atomic.Value(u16).init(0);
@@ -133,7 +217,7 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
                 const limit: u16 = config.tftp.max_concurrent_transfers orelse auto_concurrency;
                 if (limit <= 1) {
                     defer pair.release();
-                    try handleRrq(io, allocator, incoming.from, request, config, pair.catalog, runtime, event_writer, sessions);
+                    try handleRrq(io, allocator, incoming.from, request, config, pair.catalog, runtime, event_writer, sessions, capsules);
                     continue;
                 }
                 if (!reserveTransferSlot(&active_transfers, limit)) {
@@ -156,7 +240,7 @@ pub fn serveSocket(io: std.Io, allocator: std.mem.Allocator, owned_socket: std.I
                     try sendError(&socket, io, &incoming.from, .undefined, "server busy, retry later");
                     continue;
                 };
-                context.* = .{ .io = io, .allocator = allocator, .datagram = datagram, .remote = incoming.from, .pair = pair, .runtime = runtime, .event_writer = event_writer, .sessions = sessions, .active = &active_transfers };
+                context.* = .{ .io = io, .allocator = allocator, .datagram = datagram, .remote = incoming.from, .pair = pair, .runtime = runtime, .event_writer = event_writer, .sessions = sessions, .capsules = capsules, .active = &active_transfers };
                 const thread = std.Thread.spawn(.{}, runTransferWorker, .{context}) catch |err| {
                     pair.release();
                     _ = active_transfers.fetchSub(1, .acq_rel);
@@ -191,6 +275,7 @@ const TransferWorker = struct {
     runtime: *runtime_state.RuntimeState,
     event_writer: ?*events.Writer,
     sessions: ?*boot_session.Store,
+    capsules: ?*CapsuleStore,
     active: *std.atomic.Value(u16),
 };
 
@@ -209,11 +294,11 @@ fn runTransferWorker(context: *TransferWorker) void {
         .rrq => |value| value,
         else => return,
     };
-    handleRrq(context.io, context.allocator, context.remote, request, context.pair.config.value(), context.pair.catalog, context.runtime, context.event_writer, context.sessions) catch |err|
+    handleRrq(context.io, context.allocator, context.remote, request, context.pair.config.value(), context.pair.catalog, context.runtime, context.event_writer, context.sessions, context.capsules) catch |err|
         observe_log.err("tftp: worker failed: {t}", .{err});
 }
 
-fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddress, request: packet.Request, config: *const model.AppConfig, catalog: *const catalog_runtime.Snapshot, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store) !void {
+fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddress, request: packet.Request, config: *const model.AppConfig, catalog: *const catalog_runtime.Snapshot, runtime: *runtime_state.RuntimeState, event_writer: ?*events.Writer, sessions: ?*boot_session.Store, capsules: ?*CapsuleStore) !void {
     const session = runtime.tftp.begin(request.filename);
     var session_link: ?boot_session.Link = null;
     if (sessions) |store| session_link = store.associateTftp(clientIpv4(&remote) orelse 0, boot_session.monotonicNow(), now());
@@ -225,9 +310,10 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
     const started = std.Io.Clock.awake.now(io);
     emit(event_writer, io, allocator, &remote, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, linked_node_id, if (session_link) |*link| link else null);
 
-    const is_virtual = isVirtualGrubConfig(request.filename);
-    const bytes_sent = if (is_virtual)
-        transferVirtualConfig(io, &remote, request, config, catalog, sessions) catch |err| {
+    const is_virtual_config = isVirtualGrubConfig(request.filename);
+    const is_virtual_capsule = capsuleSessionFromPath(request.filename) != null;
+    const bytes_sent = if (is_virtual_config)
+        transferVirtualConfig(io, allocator, &remote, request, config, catalog, sessions, capsules) catch |err| {
             runtime.tftp.finish(session, false);
             if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
             switch (err) {
@@ -235,6 +321,14 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
                 else => observe_log.err("tftp: virtual config transfer failed for {s}: {t}", .{ request.filename, err }),
             }
             emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
+            if (initialErrorResponse(err)) |response| try sendEphemeralError(io, &remote, response.code, response.message);
+            return;
+        }
+    else if (is_virtual_capsule)
+        transferVirtualCapsule(io, &remote, request, config, sessions, capsules) catch |err| {
+            runtime.tftp.finish(session, false);
+            if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
+            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "credential capsule transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
             if (initialErrorResponse(err)) |response| try sendEphemeralError(io, &remote, response.code, response.message);
             return;
         }
@@ -351,11 +445,13 @@ fn trimLeadingSlash(filename: []const u8) []const u8 {
 /// 或传输失败，返回对应错误。
 fn transferVirtualConfig(
     io: std.Io,
+    allocator: std.mem.Allocator,
     remote: *const std.Io.net.IpAddress,
     request: packet.Request,
     config: *const model.AppConfig,
     catalog: *const catalog_runtime.Snapshot,
     sessions: ?*boot_session.Store,
+    capsules: ?*CapsuleStore,
 ) !u64 {
     if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
 
@@ -367,6 +463,8 @@ fn transferVirtualConfig(
     var config_buf: [2048]u8 = undefined;
     var kernel_grub: [256]u8 = undefined;
     var initrd_grub: [256]u8 = undefined;
+    var capsule_grub: [128]u8 = undefined;
+    var delivery_session_buf: [32]u8 = undefined;
     const rendered = blk: {
         // 在 catalog 锁内解析 boot target 并渲染 GRUB 配置。
         // 渲染结果写入栈缓冲区，在 TFTP I/O 开始前就已完成自包含，
@@ -403,6 +501,11 @@ fn transferVirtualConfig(
             std.fmt.bufPrint(&initrd_grub, "(http,{s}:{d})/artifacts/boot/{s}", .{ config.server.server_ip, config.server.http_port, target.initrd_path }) catch return error.BootTargetUnavailable
         else
             std.fmt.bufPrint(&initrd_grub, "/{s}", .{target.initrd_path}) catch return error.BootTargetUnavailable;
+        const additional_initrd_path: ?[]const u8 = if (profileIsDiskless(catalog.value(), identity.profile)) cap: {
+            const capsule_store = capsules orelse return error.BootTargetUnavailable;
+            const delivery_session = try prepareDisklessCapsule(io, allocator, config.server.http_port, identity.node_id, capsule_store, &delivery_session_buf);
+            break :cap std.fmt.bufPrint(&capsule_grub, "/{s}{s}{s}", .{ capsule_prefix, delivery_session, capsule_suffix }) catch return error.BootTargetUnavailable;
+        } else null;
         break :blk grub.render(&config_buf, .{
             .node_id = identity.node_id,
             .hostname = node.hostname orelse node.id,
@@ -410,12 +513,122 @@ fn transferVirtualConfig(
             .profile = identity.profile,
             .kernel_path = kernel_path,
             .initrd_path = initrd_path,
+            .additional_initrd_path = additional_initrd_path,
             .cmdline = target.cmdline,
             .arch = target.arch,
         }) catch return error.BootTargetUnavailable;
     };
 
     return transferFromMemory(io, remote, request, rendered, config.tftp.max_blksize);
+}
+
+fn profileIsDiskless(catalog: *const model.Catalog, profile_name: []const u8) bool {
+    const profile = lookup.findProfile(catalog, profile_name) orelse return false;
+    return profile.kind == .diskless;
+}
+
+const BootPrepareResponse = struct {
+    ok: bool,
+    result: struct {
+        node_id: []const u8,
+        session_id: []const u8,
+        config_token: []const u8,
+        rootfs_token: []const u8,
+        agent_token: []const u8,
+        event_token: []const u8,
+    },
+};
+
+fn prepareDisklessCapsule(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    http_port: u16,
+    node_id: []const u8,
+    store: *CapsuleStore,
+    session_out: *[32]u8,
+) ![]const u8 {
+    while (!store.prepare_mutex.tryLock()) std.Thread.yield() catch {};
+    defer store.prepare_mutex.unlock();
+    if (store.pendingSession(node_id, session_out)) |existing| return existing;
+    const url_text = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/v1/management/nodes/{s}/boot-prepare", .{ http_port, node_id });
+    defer allocator.free(url_text);
+    const body = try internal_http.postForBody(io, allocator, try internal_http.Url.parse(url_text), &.{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "X-NodeForge-Internal-Capsule", .value = "1" },
+    }, "{}");
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(BootPrepareResponse, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const result = parsed.value.result;
+    if (!parsed.value.ok or !std.mem.eql(u8, result.node_id, node_id) or result.session_id.len != session_out.len)
+        return error.InvalidCapsule;
+    const archive = try capsule.render(allocator, .{
+        .session = result.session_id,
+        .config_token = result.config_token,
+        .rootfs_token = result.rootfs_token,
+        .agent_token = result.agent_token,
+        .event_token = result.event_token,
+    });
+    defer allocator.free(archive);
+    try store.put(node_id, result.session_id, archive);
+    @memcpy(session_out, result.session_id);
+    return session_out;
+}
+
+fn capsuleSessionFromPath(path: []const u8) ?[]const u8 {
+    // GRUB emits absolute-looking TFTP paths (for example
+    // `/nodeforge/capsules/<session>.cpio`). Static asset handling already
+    // normalizes that leading slash in `transfer`; virtual paths must follow
+    // the same rule or they are misclassified as catalog files. When GRUB
+    // requests multiple initrds, rejecting the capsule also makes it cancel
+    // the in-flight base initrd request, leaving the kernel with no `/init`.
+    const normalized = trimLeadingSlash(path);
+    if (!std.mem.startsWith(u8, normalized, capsule_prefix) or !std.mem.endsWith(u8, normalized, capsule_suffix)) return null;
+    const session = normalized[capsule_prefix.len .. normalized.len - capsule_suffix.len];
+    if (session.len != 32) return null;
+    for (session) |byte| if (!std.ascii.isHex(byte)) return null;
+    return session;
+}
+
+test "credential capsule path accepts GRUB leading slash" {
+    const id = "c107a1039ff51ba52b9e81a04b7d1f18";
+    try std.testing.expectEqualStrings(id, capsuleSessionFromPath("/nodeforge/capsules/" ++ id ++ ".cpio").?);
+    try std.testing.expectEqualStrings(id, capsuleSessionFromPath("nodeforge/capsules/" ++ id ++ ".cpio").?);
+    try std.testing.expect(capsuleSessionFromPath("/nodeforge/capsules/not-a-session.cpio") == null);
+}
+
+test "capsule store never overwrites an undelivered session at capacity" {
+    var store: CapsuleStore = .{};
+    const archive = "070701";
+    var ids: [capsule_slots][32]u8 = undefined;
+    for (&ids, 0..) |*id, index| {
+        _ = try std.fmt.bufPrint(id, "{x:0>32}", .{index});
+        try store.put("node", id, archive);
+    }
+    try std.testing.expectError(error.CapsuleCapacityExceeded, store.put("node", "ffffffffffffffffffffffffffffffff", archive));
+    store.markDelivered("node", &ids[0]);
+    try store.put("node", "ffffffffffffffffffffffffffffffff", archive);
+    var out: [capsule_max_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(archive, store.copy("node", "ffffffffffffffffffffffffffffffff", &out).?);
+}
+
+fn transferVirtualCapsule(
+    io: std.Io,
+    remote: *const std.Io.net.IpAddress,
+    request: packet.Request,
+    config: *const model.AppConfig,
+    sessions: ?*boot_session.Store,
+    capsules: ?*CapsuleStore,
+) !u64 {
+    if (!std.ascii.eqlIgnoreCase(request.mode, "octet")) return error.UnsupportedMode;
+    const session_id = capsuleSessionFromPath(request.filename) orelse return error.BootAccessDenied;
+    const client_ip = clientIpv4(remote) orelse return error.BootAccessDenied;
+    const identity = (sessions orelse return error.BootAccessDenied).resolveTftpBoot(client_ip, boot_session.monotonicNow()) orelse return error.BootAccessDenied;
+    var archive_buffer: [capsule_max_bytes]u8 = undefined;
+    const archive = (capsules orelse return error.BootAccessDenied).copy(identity.node_id, session_id, &archive_buffer) orelse return error.BootAccessDenied;
+    const sent = try transferFromMemory(io, remote, request, archive, config.tftp.max_blksize);
+    capsules.?.markDelivered(identity.node_id, session_id);
+    return sent;
 }
 
 /// 使用与文件传输相同的 TFTP OACK/DATA/ACK 逻辑传输内存缓冲区。
@@ -510,10 +723,15 @@ fn transfer(
     // PXE 客户端（GRUB、PXELINUX）经常发送以 `/` 开头的路径；
     // 去除后使路径相对于 TFTP asset root。
     const filename = trimLeadingSlash(request.filename);
-    if (!isSafeRelativePath(filename) or !isManifestPath(catalog, filename))
-        return error.FileNotAllowed;
+    if (!isSafeRelativePath(filename)) return error.FileNotAllowed;
+    const asset = manifestAsset(catalog, filename) orelse return error.FileNotAllowed;
+    // nodeforge_initrd assets intentionally live in the dedicated, daemon-owned
+    // initrd store. Other PXE assets live below tftp.asset_root. Selecting the
+    // root from the catalog kind closes the old build/register/serve mismatch
+    // that otherwise required an operator-created symlink in assets/boot.
+    const resolved_root = if (asset.kind == .nodeforge_initrd) paths.require().initrd_dir else asset_root;
 
-    var root = try std.Io.Dir.openDirAbsolute(io, asset_root, .{ .access_sub_paths = true });
+    var root = try std.Io.Dir.openDirAbsolute(io, resolved_root, .{ .access_sub_paths = true });
     defer root.close(io);
     var file = try root.openFile(io, filename, .{
         .follow_symlinks = false,
@@ -882,9 +1100,9 @@ pub fn isSafeRelativePath(path: []const u8) bool {
 /// 检查路径是否在当前 catalog 的资产清单中。
 /// 只有同时通过路径安全检查和 catalog 白名单的文件才可被 TFTP 提供。
 /// catalog 的锁在 `containsAssetPath` 内部获取和释放。
-fn isManifestPath(catalog: *const catalog_runtime.Snapshot, path: []const u8) bool {
-    for (catalog.value().assets) |asset| if (std.mem.eql(u8, asset.path, path)) return true;
-    return false;
+fn manifestAsset(catalog: *const catalog_runtime.Snapshot, path: []const u8) ?*const model.AssetConfig {
+    for (catalog.value().assets) |*asset| if (std.mem.eql(u8, asset.path, path)) return asset;
+    return null;
 }
 
 test "rejects unsafe TFTP paths" {
@@ -1211,6 +1429,7 @@ test "TFTP worker retries a lost final ACK and releases its global slot" {
         .runtime = &runtime,
         .event_writer = null,
         .sessions = null,
+        .capsules = null,
         .active = &active,
     };
     const started_at = boot_session.monotonicNow();

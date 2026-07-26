@@ -516,9 +516,8 @@ fn validateBootBundles(config: *const model.AppConfig, catalog: *const model.Cat
             return error.UnsupportedDistroTuple;
         const kernel = try requireAssetKind(catalog, bundle.kernel, .kernel);
         const initrd = try requireAssetKind(catalog, bundle.initrd, .nodeforge_initrd);
-        const rootfs = try requireAssetKind(catalog, bundle.rootfs, .rootfs);
 
-        for ([_]*const model.AssetConfig{ kernel, initrd, rootfs }) |asset| {
+        for ([_]*const model.AssetConfig{ kernel, initrd }) |asset| {
             if (!optionalEqual(asset.distro, bundle.distro) or
                 !optionalEqual(asset.version, bundle.version) or
                 asset.arch == null or asset.arch.? != bundle.arch or

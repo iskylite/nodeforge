@@ -122,6 +122,7 @@ pub const properties = [_]PropertySpec{
     .{ .owner = .profile, .path = "install.proxy.url", .kind = .string, .optional = true },
     .{ .owner = .profile, .path = "install.reinstall_policy", .kind = .enumeration },
     .{ .owner = .profile, .path = "install.post_install.bundle", .kind = .string, .optional = true },
+    .{ .owner = .profile, .path = "diskless.boot_bundle", .kind = .string },
     .{ .owner = .profile, .path = "diskless.overlay.tmpfs_percent", .kind = .positive_integer },
     .{ .owner = .profile, .path = "diskless.overlay.minimum_free_bytes", .kind = .positive_integer },
     .{ .owner = .profile, .path = "diskless.overlay.safety_margin_bytes", .kind = .positive_integer },

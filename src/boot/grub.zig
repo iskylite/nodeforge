@@ -32,6 +32,7 @@ pub const Entry = struct {
     profile: []const u8,
     kernel_path: []const u8,
     initrd_path: []const u8,
+    additional_initrd_path: ?[]const u8 = null,
     cmdline: []const u8,
     arch: model.Arch,
 };
@@ -55,6 +56,11 @@ pub const Entry = struct {
 ///
 /// `buffer` 由调用方提供，渲染结果写入其中并返回有效切片。
 pub fn render(buffer: []u8, entry: Entry) ![]const u8 {
+    var initrd_line: [640]u8 = undefined;
+    const initrd = if (entry.additional_initrd_path) |capsule_path|
+        try std.fmt.bufPrint(&initrd_line, "{s} {s}", .{ entry.initrd_path, capsule_path })
+    else
+        entry.initrd_path;
     return std.fmt.bufPrint(
         buffer,
         "set timeout=5\n" ++
@@ -62,8 +68,24 @@ pub fn render(buffer: []u8, entry: Entry) ![]const u8 {
             "  linux {s} {s}\n" ++
             "  initrd {s}\n" ++
             "}}\n",
-        .{ entry.node_id, (entry.lease_ip >> 24) & 0xFF, (entry.lease_ip >> 16) & 0xFF, (entry.lease_ip >> 8) & 0xFF, entry.lease_ip & 0xFF, entry.profile, entry.kernel_path, entry.cmdline, entry.initrd_path },
+        .{ entry.node_id, (entry.lease_ip >> 24) & 0xFF, (entry.lease_ip >> 16) & 0xFF, (entry.lease_ip >> 8) & 0xFF, entry.lease_ip & 0xFF, entry.profile, entry.kernel_path, entry.cmdline, initrd },
     );
+}
+
+test "renders base and credential capsule as multiple initrds" {
+    var buffer: [768]u8 = undefined;
+    const value = try render(&buffer, .{
+        .node_id = "n",
+        .hostname = "n",
+        .lease_ip = 0xC0000201,
+        .profile = "p",
+        .kernel_path = "/vmlinuz",
+        .initrd_path = "/initrd.img",
+        .additional_initrd_path = "/nodeforge/capsules/11111111111111111111111111111111.cpio",
+        .cmdline = "ip=dhcp",
+        .arch = .aarch64,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, value, "initrd /initrd.img /nodeforge/capsules/11111111111111111111111111111111.cpio") != null);
 }
 
 // 测试：ARM64 GRUB 条目使用标准 linux/initrd 指令，不含 linuxefi/initrdefi。

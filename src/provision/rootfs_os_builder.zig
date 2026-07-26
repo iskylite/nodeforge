@@ -58,15 +58,29 @@ fn buildDnf(
     try argv.append(a, "install");
     try argv.append(a, "-y");
     try argv.append(a, "--nogpgcheck");
-    // 最小可 chroot 基线：sh/cp/chmod/chown/printf/tar（coreutils+bash+tar）与
-    // rootfs-build package action 所需的 dnf。
-    const baseline = [_][]const u8{ "bash", "coreutils", "tar", "dnf" };
+    // 可启动且可由 nodeforge-agent 收敛的基线。不能只满足 chroot：node-apply
+    // 固定使用 usermod/systemctl，切根后的系统还需要 init、网络与 SSH 服务。
+    const baseline = [_][]const u8{
+        "bash",
+        "coreutils",
+        "tar",
+        "dnf",
+        "systemd",
+        "shadow-utils",
+        "util-linux",
+        "iproute",
+        "NetworkManager",
+        "openssh-server",
+        "procps-ng",
+    };
     for (baseline) |pkg| try argv.append(a, pkg);
 
     const result = try std.process.run(allocator, io, .{
         .argv = argv.items,
-        .stdout_limit = .limited(65536),
-        .stderr_limit = .limited(65536),
+        // A real bootable baseline pulls substantially more packages than the
+        // old chroot-only baseline; dnf progress can exceed 64 KiB.
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(4 * 1024 * 1024),
     });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);

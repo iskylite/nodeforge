@@ -70,8 +70,9 @@ pub fn repairDirectories(io: std.Io, allocator: std.mem.Allocator, p: *const pat
         try chmod(io, allocator, "700", directory);
 }
 
-/// 原子地拷贝同 bundle 的 CLI/daemon 对。调用方在两次拷贝都成功后才创建
-/// marker，故中断的安装无法通过正常 bootstrap 校验。
+/// 拷贝同 bundle 的 CLI/daemon 对，以及可选但必须成对出现的 diskless
+/// initrd/agent 构建器。调用方在全部拷贝成功后才创建 marker，故中断的安装
+/// 无法通过正常 bootstrap 校验。
 pub fn installBundle(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) !void {
     const executable = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(executable);
@@ -80,11 +81,26 @@ pub fn installBundle(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
     defer allocator.free(cli_source);
     const daemon_source = try std.fmt.allocPrint(allocator, "{s}/nodeforged", .{source_dir});
     defer allocator.free(daemon_source);
+    const initrd_source = try std.fmt.allocPrint(allocator, "{s}/nodeforge-initrd", .{source_dir});
+    defer allocator.free(initrd_source);
+    const agent_source = try std.fmt.allocPrint(allocator, "{s}/nodeforge-agent", .{source_dir});
+    defer allocator.free(agent_source);
     if (!regularFile(io, cli_source) or !regularFile(io, daemon_source)) return error.IncompleteInstallBundle;
+    const has_initrd = regularFile(io, initrd_source);
+    const has_agent = regularFile(io, agent_source);
+    if (has_initrd != has_agent) return error.IncompleteInstallBundle;
     try verifyCompanion(io, allocator, daemon_source);
     try repairDirectories(io, allocator, p);
     if (!samePath(io, allocator, cli_source, p.nodeforge_path)) try std.Io.Dir.copyFileAbsolute(cli_source, p.nodeforge_path, io, .{ .replace = true, .make_path = true });
     if (!samePath(io, allocator, daemon_source, p.nodeforged_path)) try std.Io.Dir.copyFileAbsolute(daemon_source, p.nodeforged_path, io, .{ .replace = true, .make_path = true });
+    if (has_initrd) {
+        const initrd_destination = try std.fmt.allocPrint(allocator, "{s}/nodeforge-initrd", .{p.bin_dir});
+        defer allocator.free(initrd_destination);
+        const agent_destination = try std.fmt.allocPrint(allocator, "{s}/nodeforge-agent", .{p.bin_dir});
+        defer allocator.free(agent_destination);
+        if (!samePath(io, allocator, initrd_source, initrd_destination)) try std.Io.Dir.copyFileAbsolute(initrd_source, initrd_destination, io, .{ .replace = true, .make_path = true });
+        if (!samePath(io, allocator, agent_source, agent_destination)) try std.Io.Dir.copyFileAbsolute(agent_source, agent_destination, io, .{ .replace = true, .make_path = true });
+    }
     try atomicWrite(io, p.marker_path, "nodeforge-root-v1\n");
 }
 
@@ -115,7 +131,11 @@ pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
     defer parsed.deinit();
     const marker = try std.fmt.allocPrint(allocator, "{s}/m4.7-migration.json", .{p.state_dir});
     defer allocator.free(marker);
-    if (parsed.value.schema_version == 3) return false;
+    // Schema 3 and 4 already use the split catalog layout. `setup
+    // --reconfigure` must be idempotent for a freshly initialized current
+    // deployment; only schema 1/2 participate in the legacy M4.7 recovery
+    // transaction below.
+    if (parsed.value.schema_version == 3 or parsed.value.schema_version == 4) return false;
     if (parsed.value.schema_version == 2) {
         // 发布 config.json 后崩溃可能留下合法 manifest 与遗留 catalog.json 并存。
         // migration marker 是该混合布局属于一个已知事务的证明；完成其清理，而不是
@@ -229,6 +249,8 @@ pub fn resetState(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
 /// `CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT`。
 /// `CAP_SYS_CHROOT` 是 v0.2 rootfs build 所需：`dnf --installroot` 在事务
 /// 测试阶段调用 `chroot(2)`，缺少该 capability 会报 `Operation not permitted`。
+/// `CAP_SETFCAP` 允许 RPM 安装带 file capabilities 的基础包（例如 iputils）；
+/// 缺少它会在 unpack 阶段以 Transaction failed 结束。
 /// `PrivateMounts` 不使用：rootfs build 需要在 daemon 的 mount namespace
 /// 中创建 loop/tmpfs/overlay 挂载，PrivateMounts 会隔离 mount namespace
 /// 导致 rootfs build 后的挂载清理复杂化。
@@ -252,8 +274,8 @@ pub fn renderSystemd(allocator: std.mem.Allocator, p: *const paths_mod.Paths) ![
         \\# setuid/setgid binaries and manage file ownership, which NoNewPrivileges
         \\# blocks. The expanded capability set below provides the necessary ambient
         \\# capabilities instead.
-        \\CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
-        \\AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
+        \\CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_SETFCAP CAP_DAC_OVERRIDE
+        \\AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_SETFCAP CAP_DAC_OVERRIDE
         \\
         \\[Install]
         \\WantedBy=multi-user.target

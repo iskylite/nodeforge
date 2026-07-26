@@ -20,15 +20,19 @@ install="$tmp/custom-nodeforge"
 mkdir -p "$bundle"
 cp "$cli" "$bundle/nodeforge"
 cp "$daemon" "$bundle/nodeforged"
+cp "$cli" "$bundle/nodeforge-initrd"
+cp "$cli" "$bundle/nodeforge-agent"
 
 "$bundle/nodeforge" setup --install-root "$install" --non-interactive --yes >"$tmp/init.out"
 grep -Fq 'NodeForge initialized' "$tmp/init.out"
 test -f "$install/.nodeforge-root"
 test -x "$install/bin/nodeforge"
 test -x "$install/bin/nodeforged"
-test "$(jq -r .schema_version "$install/config/config.json")" = 3
+test -x "$install/bin/nodeforge-initrd"
+test -x "$install/bin/nodeforge-agent"
+test "$(jq -r .schema_version "$install/config/config.json")" = 4
 test "$(jq -r .layout_schema_version "$install/catalog/manifest.json")" = 1
-test "$(jq -r .catalog_schema_version "$install/catalog/manifest.json")" = 3
+test "$(jq -r .catalog_schema_version "$install/catalog/manifest.json")" = 4
 test "$(mode "$install/config/config.json")" = 600
 test "$(mode "$install/catalog/manifest.json")" = 600
 test "$(mode "$install/config")" = 700
@@ -131,6 +135,20 @@ if "$partial/nodeforge" setup --install-root "$broken" --non-interactive --yes >
     echo "partial bundle unexpectedly initialized" >&2
     exit 1
 fi
+
+# The diskless builder companions are optional for a control-plane-only
+# bundle, but a half-pair must fail closed.
+half_bundle="$tmp/half-bundle"
+half_install="$tmp/half-install"
+mkdir -p "$half_bundle"
+cp "$cli" "$half_bundle/nodeforge"
+cp "$daemon" "$half_bundle/nodeforged"
+cp "$cli" "$half_bundle/nodeforge-initrd"
+if "$half_bundle/nodeforge" setup --install-root "$half_install" --non-interactive --yes >"$tmp/half.out" 2>&1; then
+    echo "half diskless companion pair unexpectedly initialized" >&2
+    exit 1
+fi
+test ! -f "$half_install/.nodeforge-root"
 test ! -e "$broken/.nodeforge-root"
 
 # Schema-1 config + monolithic catalog migrate without losing catalog facts.

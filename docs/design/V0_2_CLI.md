@@ -105,31 +105,36 @@ nodeforge assets import <iso-path>
 
 # 3. 注册 diskless 资产
 #    a) kernel — 已由 ISO 导入自动注册（<source>-kernel, kind=kernel），可直接用于 boot bundle
-#    b) nodeforge initrd（通过 daemon 构建）
-#    initrd_build_executor 模块: dracut + 注入 nodeforge-initrd + /init 脚本 + /capsule 目录
-nodeforge assets initrd build --source <install-source> [--kver <release>] [--wait]
-#    c) rootfs（通过 daemon 构建）
-nodeforge profile rootfs build <diskless-profile> [--wait]
-#    d) rootfs 注册（如果 rootfs 是外部构建的）
-nodeforge profile rootfs register <diskless-profile> --path <squashfs-path>
-
-# 4. 创建 boot bundle + diskless profile
+#    b) nodeforge initrd：由受支持的同步 builder 构建并原子注册
+nodeforge assets initrd build <name> \
+  --from-install-source <source> --kernel-release <r>
+# 无可用 ISO/install source 时才使用通用 fallback：
+nodeforge assets initrd build <name> \
+  --distro <d> --version <v> --arch <a> --kernel-release <r>
+#    已有外部制品仍可通过受管路径 register
+nodeforge assets register --type nodeforge_initrd --name <i> --path <p> \
+  --distro <d> --version <v> --arch <a> --kernel-release <r>
+# 4. 创建 boot bundle + diskless profile（bundle 不含派生 rootfs，避免创建环）
 nodeforge assets boot-bundle create <name> \
-  --kernel <k> --initrd <i> --rootfs <r> \
+  --kernel <k> --initrd <i> \
   --distro <d> --version <v> --arch <a> --kernel-release <r>
 nodeforge profile create <name> <install-source> --kind diskless --boot-bundle <bundle>
 
-# 5. 添加节点 + boot-prepare
+# 5. 构建 Profile 派生 rootfs；外部构建时改用 register
+nodeforge profile rootfs build <diskless-profile> [--wait]
+nodeforge profile rootfs register <diskless-profile> --path <squashfs-path>
+
+# 6. 添加节点（保持 deploy=false）
 nodeforge node add <id> mac=<mac> arch=<a> profile=<diskless-profile>
 nodeforge node set <id> deploy=false
-nodeforge node boot-prepare <id>  # 返回 session + tokens
 
-# 6. 启用部署
+# 7. readiness 后启用部署；真实 session/capsule 在 PXE 请求时原子创建
+nodeforge node readiness <id> --stage boot
 nodeforge node set <id> deploy=true
 ```
 
 **已实现**（见 V0_2_DESIGN.md 实现修订记录）：
-- R5: `initrd_build_executor` 模块已实现（dracut + nodeforge-initrd 注入）
+- R5: `assets initrd build` 已接线为同步 CLI；异步 durable operation 是 v0.2.2 增强
 - R4: `profile rootfs build` capability 已在 `setup.zig` 中修复
 - R6: ISO 导入自动注册 kernel（`<source>-kernel`），无需手动 `assets register`
 - R1: `catalog schema-v4` CLI 命令已移除，setup 始终生成最新 schema 版本
@@ -321,6 +326,7 @@ collection 时不要在 clone 上同时传 `--build`，先完成 target mutation
 
 ```text
 nodeforge node add <id> mac=<mac> arch=<arch> profile=<diskless-profile> deploy=false
+# hostname 未显式指定时默认使用 node_id；network.mode 默认 dhcp
 nodeforge node set <id> pxe.ip_reservation=<ip> hostname=<fqdn>
 nodeforge node set <id> network.mode=dhcp network.interface=<nic>
 nodeforge node set <id> network.mode=static network.interface=<nic> \
@@ -624,38 +630,39 @@ nodeforge setup --install-root /opt/nodeforge --server-ip <ip> --subnet <cidr> \
 
 # 2. 导入安装介质（自动提取 bootloader/kernel/initrd/repository）
 #    bootloader 使用内容寻址路径，不同发行版不冲突
-nodeforge assets import-iso <iso-file>
+nodeforge assets import <iso-file>
 
 # 3. 注册 diskless 专用资产
 #    kernel：从 ISO 提取或单独提供（kind=kernel）
 nodeforge assets register --type kernel --name <k> --path <p> \
   --distro <d> --version <v> --arch <a> --kernel-release <r>
-#    nodeforge-initrd：交叉编译的 Zig 二进制打包到 initramfs（kind=nodeforge_initrd）
-nodeforge assets register --type nodeforge_initrd --name <i> --path <p>
+#    nodeforge-initrd：dracut 构建、原子发布并注册（kind=nodeforge_initrd）
+nodeforge assets initrd build <i> \
+  --from-install-source <source> --kernel-release <r>
 
-# 4. 构建并注册 rootfs（从 install source 派生 diskless rootfs squashfs）
-nodeforge profile rootfs build <diskless-profile>
-
-# 5. 创建 boot bundle（绑定 kernel/initrd/rootfs 为不可拆分组合）
+# 4. 创建 boot bundle（仅绑定 kernel/initrd；派生 rootfs 不进入 bundle）
 #    这是 diskless 全流程 CLI 的关键环节，替代手动编辑 catalog JSON
 nodeforge assets boot-bundle create <name> \
-  --kernel <k> --initrd <i> --rootfs <r> \
+  --kernel <k> --initrd <i> \
   --distro <d> --version <v> --arch <a> --kernel-release <r>
 
-# 6. 创建 diskless profile（引用 boot bundle）
+# 5. 创建 diskless profile（引用 boot bundle）
 nodeforge profile create <name> <install-source> --kind diskless --boot-bundle <name>
+# 后续切换不可变 bundle：
+nodeforge profile set <name> diskless.boot_bundle=<new-bundle>
 
-# 7. 注册节点
+# 6. 构建并注册 Profile 派生 rootfs
+nodeforge profile rootfs build <diskless-profile>
+
+# 7. 注册节点并启用；session/capsule 由 PXE 请求创建
 nodeforge node add <id> --mac <mac> --arch <a> --profile <name>
-
-# 8. 准备 diskless 启动会话（签发 token capsule、生成 BootConfig）
-nodeforge node boot-prepare <id>
+nodeforge node set <id> deploy=true
 ```
 
 ### 8.2 `assets boot-bundle create` 命令
 
 ```text
-nodeforge assets boot-bundle create <name> --kernel <asset> --initrd <asset> --rootfs <asset> \
+nodeforge assets boot-bundle create <name> --kernel <asset> --initrd <asset> \
   --distro <d> --version <v> --arch <a> --kernel-release <r> [options]
 ```
 
@@ -666,18 +673,17 @@ nodeforge assets boot-bundle create <name> --kernel <asset> --initrd <asset> --r
 | `name` | 是 | Canonical boot bundle name（逻辑标识符） |
 | `--kernel` | 是 | Kernel 资产名称（必须 kind=kernel） |
 | `--initrd` | 是 | NodeForge initrd 资产名称（必须 kind=nodeforge_initrd） |
-| `--rootfs` | 是 | Rootfs 资产名称（必须 kind=rootfs） |
 | `--distro` | 是 | 发行版名称（如 rocky, ubuntu） |
 | `--version` | 是 | 发行版版本（如 9.7, 24.04） |
 | `--arch` | 是 | 架构：aarch64 或 x86_64 |
 | `--kernel-release` | 是 | 内核 uname release（如 5.14.0-611.5.1.el9_7.aarch64） |
 
-**前置条件**：kernel/initrd/rootfs 资产必须已通过 `nodeforge assets register` 注册到 catalog。
+**前置条件**：kernel/initrd 资产必须已通过 `nodeforge assets register` 注册到 catalog。
 
 **API**：`POST /api/v1/management/boot-bundles`
 
 **校验链**：必填字段非空 → arch 枚举有效 → 名称不重复 → kernel 资产 kind=kernel →
-initrd 资产 kind=nodeforge_initrd → rootfs 资产 kind=rootfs → catalog 原子写入。
+initrd 资产 kind=nodeforge_initrd → catalog 原子写入。
 
 **错误码**：
 

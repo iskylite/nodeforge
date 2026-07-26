@@ -7,6 +7,7 @@ node=ub-mkinit2-node
 profile=ub-mkinit2
 KREL="5.15.0-186-generic"
 config="$install_root/config/config.json"
+port=$(jq -r '.server.http_port' "$config")
 
 cleanup() { [[ -n "${qemu_pid:-}" ]] && { kill "$qemu_pid" 2>/dev/null || true; wait "$qemu_pid" 2>/dev/null || true; }; }
 trap cleanup EXIT
@@ -35,7 +36,7 @@ echo "daemon started"
 zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" --path "$work/rootfs.squashfs" --config "$config" --output json >/dev/null 2>&1 || true
 
 # Prepare boot
-prepare=$(zig-out/bin/nodeforge --install-root "$install_root" node boot-prepare "$node" --config "$config" --output json)
+prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")
 python3 - "$prepare" "$work/initrd-root/capsule" <<'PY'
 import json, pathlib, sys
 r = json.loads(sys.argv[1])["result"]

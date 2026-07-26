@@ -149,6 +149,7 @@ pub const asset_validate = @import("assets/validate.zig");
 pub const grub = @import("boot/grub.zig");
 /// 内核命令行渲染器：根据发行版和 profile 生成 install/diskless 启动参数。
 pub const boot_target = @import("boot/target.zig");
+pub const boot_capsule = @import("boot/capsule.zig");
 /// M4 安装器适配器和共享 answer 渲染辅助工具。
 pub const profile_render = @import("profile/render.zig");
 pub const password_hash = @import("profile/password_hash.zig");
@@ -247,6 +248,7 @@ test {
     _ = asset_validate;
     _ = grub;
     _ = boot_target;
+    _ = boot_capsule;
     _ = profile_render;
     _ = profile_storage;
     _ = profile_effective;

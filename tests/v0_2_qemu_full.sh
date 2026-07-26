@@ -4,7 +4,8 @@ set -euo pipefail
 
 repo=${NODEFORGE_REPO:-/root/NodeForge}
 fixture=${NODEFORGE_QEMU_FIXTURE:-/root/nf-smoke}
-base_rootfs=${NODEFORGE_BASE_ROOTFS:-/root/nf-full/rootfs.squashfs}
+base_rootfs=${NODEFORGE_BASE_ROOTFS:-/opt/nodeforge/assets/rootfs/2c6893dd3f2d6c5129cdface5f76591dcacce2c5b7c0466b4bba446825239d7b.squashfs}
+base_initrd=${NODEFORGE_BASE_INITRD:-/opt/nodeforge/assets/initrd/diskless/rocky-9.7/aarch64/initrd.img}
 kernel=${NODEFORGE_QEMU_KERNEL:-/boot/vmlinuz-5.14.0-611.5.1.el9_7.aarch64}
 work=/tmp/nodeforge-v02-qemu
 install_root=/tmp/nodeforge-v02-install
@@ -54,8 +55,22 @@ printf '%s\n' \
     >"$work/rootfs/etc/systemd/system/nodeforge-firstboot.service.d/validation.conf"
 mksquashfs "$work/rootfs" "$work/rootfs.squashfs" -noappend -comp zstd >/dev/null
 
-cp -a "$fixture/initrd-root" "$work/initrd-root"
+if [[ -d "$fixture/initrd-root" ]]; then
+    cp -a "$fixture/initrd-root" "$work/initrd-root"
+else
+    mkdir -p "$work/initrd-root"
+    (cd "$work/initrd-root" && zcat "$base_initrd" | cpio -idmu 2>/dev/null)
+fi
 install -m 0755 zig-out/bin/nodeforge-initrd "$work/initrd-root/usr/sbin/nodeforge-initrd"
+install -m 0755 zig-out/bin/nodeforge-agent "$work/initrd-root/usr/sbin/nodeforge-agent"
+install -m 0755 packaging/initrd/nodeforge-dhclient-script "$work/initrd-root/usr/sbin/nodeforge-dhclient-script"
+install -m 0755 /usr/sbin/switch_root "$work/initrd-root/usr/sbin/switch_root"
+# The historical fixture predates loop-backed squashfs validation. Keep its
+# kernel modules aligned with the kernel used for this direct boot.
+module_root="$work/initrd-root/lib/modules/${kernel##*/vmlinuz-}"
+install -D -m 0644 "/lib/modules/${kernel##*/vmlinuz-}/kernel/drivers/block/loop.ko.xz" \
+    "$module_root/kernel/drivers/block/loop.ko.xz"
+depmod -b "$work/initrd-root" "${kernel##*/vmlinuz-}"
 mkdir -p "$work/initrd-root/capsule"
 rm -f "$work/initrd-root/capsule/"*
 
@@ -63,8 +78,9 @@ zig-out/bin/nodeforge setup --install-root "$install_root" --non-interactive --y
     --bind-interface lo --server-ip 10.0.2.2 --http-port "$port" \
     --subnet 127.0.0.0/24 --pool-start 127.0.0.100 --pool-end 127.0.0.200 >/dev/null
 # Reuse the production Rocky repository files on disk so the guest's first-boot
-# package action can refresh metadata, and inject a diskless catalog whose repo
-# base_url is rebound to the test daemon (preserving the /Minimal subpath).
+# package action can refresh metadata. Only the existing install-source facts
+# are copied into this isolated fixture; diskless assets, bundle, Profile and
+# Node are created through the public CLI below.
 mkdir -p "$install_root/assets/repos"
 ln -sfn /opt/nodeforge/assets/repos/rocky-9.7-aarch64-iso "$install_root/assets/repos/rocky-9.7-aarch64-iso"
 python3 - "$install_root/catalog" /opt/nodeforge/catalog 10.0.2.2 "$port" <<'PYINJ'
@@ -82,17 +98,6 @@ for r in repos:
     r["base_url"] = f"http://{ip}:{port}{path}"
 with open(f"{dst}/repositories.json", "w") as f: json.dump(repos, f, indent=2)
 with open(f"{dst}/assets.json") as f: assets = json.load(f)
-def A(name, kind):
-    return {"name": name, "kind": kind, "path": f"rootfs-test/{name}", "distro": "rocky",
-            "version": "9.7", "arch": "aarch64", "kernel_release": RELEASE,
-            "sha256": None, "revision": 1, "size": None, "media_type": None}
-for nm, k in [(f"{P}-kernel", "kernel"), (f"{P}-initrd", "nodeforge_initrd"), (f"{P}-rootfs", "rootfs")]:
-    if not any(a["name"] == nm for a in assets): assets.append(A(nm, k))
-with open(f"{dst}/assets.json", "w") as f: json.dump(assets, f, indent=2)
-bundle = [{"name": "nf-test-bundle", "distro": "rocky", "version": "9.7", "arch": "aarch64",
-           "kernel_release": RELEASE, "kernel": f"{P}-kernel", "runtime_kernel": f"{P}-kernel",
-           "initrd": f"{P}-initrd", "rootfs": f"{P}-rootfs"}]
-with open(f"{dst}/boot_bundles.json", "w") as f: json.dump(bundle, f, indent=2)
 names = ["distros", "profiles", "nodes", "provisioning_bundles", "repositories", "assets",
          "install_sources", "boot_bundles", "discovery_policy", "unknown_client_observations"]
 entities = []
@@ -104,8 +109,14 @@ for e in entities: h.update(e["name"].encode() + e["sha256"].encode())
 manifest = {"layout_schema_version": 1, "catalog_schema_version": 4, "catalog_revision": 1,
             "transaction_id": h.hexdigest(), "entities": entities}
 with open(f"{dst}/manifest.json", "w") as f: json.dump(manifest, f, indent=2)
-print(f"v4 catalog injected; assets={len(assets)} boot_bundles={len(bundle)} repos={len(repos)}")
+print(f"install-source fixture prepared; assets={len(assets)} repos={len(repos)}")
 PYINJ
+
+# `assets register` consumes files below the configured TFTP asset root.
+mkdir -p "$install_root/assets/boot/rootfs-test" "$install_root/assets/initrd/rootfs-test"
+cp "$kernel" "$install_root/assets/boot/rootfs-test/nf-test-kernel"
+(cd "$work/initrd-root" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 \
+    >"$install_root/assets/initrd/rootfs-test/nf-test-initrd")
 
 systemctl stop nodeforged
 for _ in {1..50}; do
@@ -128,56 +139,87 @@ if ! kill -0 "$test_daemon_pid" 2>/dev/null; then
 fi
 
 config="$install_root/config/config.json"
+cli() { zig-out/bin/nodeforge --install-root "$install_root" "$@"; }
+cli assets register --type kernel --name nf-test-kernel \
+    --path rootfs-test/nf-test-kernel --distro rocky --version 9.7 --arch aarch64 \
+    --kernel-release 5.14.0-362.13.1.el9.aarch64 --config "$config" --output json >/dev/null
+cli assets register --type nodeforge_initrd --name nf-test-initrd \
+    --path rootfs-test/nf-test-initrd --distro rocky --version 9.7 --arch aarch64 \
+    --kernel-release 5.14.0-362.13.1.el9.aarch64 --config "$config" --output json >/dev/null
+cli assets boot-bundle create nf-test-bundle \
+    --kernel nf-test-kernel --initrd nf-test-initrd \
+    --distro rocky --version 9.7 --arch aarch64 \
+    --kernel-release 5.14.0-362.13.1.el9.aarch64 --config "$config" --output json >/dev/null
 printf 'NODEFORGE_PAYLOAD_PROOF\n' >"$work/payload-proof"
 mkdir -p "$work/archive-root/etc/issue.d"
 printf 'NODEFORGE_ARCHIVE_PROOF\n' >"$work/archive-root/etc/issue.d/nodeforge-archive.issue"
 tar -C "$work/archive-root" -cf "$work/proof.tar" .
 printf '%s\n' '#!/bin/sh' "printf 'NODEFORGE_SCRIPT_PROOF\\n' > /etc/issue.d/nodeforge-script.issue" >"$work/proof.sh"
-zig-out/bin/nodeforge assets managed-file import nf-v02-proof --from-file "$work/payload-proof" \
+cli assets managed-file import nf-v02-proof --from-file "$work/payload-proof" \
     --media-type text/plain --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge assets archive import nf-v02-archive --from-file "$work/proof.tar" \
+cli assets archive import nf-v02-archive --from-file "$work/proof.tar" \
     --media-type application/x-tar --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge assets script import nf-v02-script --from-file "$work/proof.sh" \
+cli assets script import nf-v02-script --from-file "$work/proof.sh" \
     --media-type text/x-shellscript --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge assets provision-bundle create nf-v02-firstboot \
+cli assets provision-bundle create nf-v02-firstboot \
     --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge assets provision-bundle item add nf-v02-firstboot steps \
+cli assets provision-bundle item add nf-v02-firstboot steps \
     name=qemu-proof action=managed-file phase=first-boot \
     idempotency_key=qemu-proof-v1 timeout_s=30 retryable=true \
     destination=/etc/issue.d/nodeforge-proof.issue content_asset=nf-v02-proof \
     mode=0644 owner=root group=root --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge assets provision-bundle item add nf-v02-firstboot steps \
+cli assets provision-bundle item add nf-v02-firstboot steps \
     name=qemu-archive action=archive phase=first-boot \
     idempotency_key=qemu-archive-v1 timeout_s=30 retryable=true \
     destination=/ content_asset=nf-v02-archive \
     --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge assets provision-bundle item add nf-v02-firstboot steps \
+cli assets provision-bundle item add nf-v02-firstboot steps \
     name=qemu-script action=script phase=first-boot \
     idempotency_key=qemu-script-v1 timeout_s=30 retryable=false \
     content_asset=nf-v02-script --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge assets provision-bundle item add nf-v02-firstboot steps \
+cli assets provision-bundle item add nf-v02-firstboot steps \
     name=qemu-package action=package phase=first-boot \
     idempotency_key=qemu-package-v1 timeout_s=180 retryable=true \
-    packages=bash --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge assets provision-bundle item add nf-v02-firstboot steps \
+    packages=bash,tar --config "$config" --output json >/dev/null
+cli assets provision-bundle item add nf-v02-firstboot steps \
     name=qemu-degraded action=managed-file phase=first-boot \
     idempotency_key=qemu-degraded-v1 timeout_s=30 retryable=true \
     destination=/nodeforge-parent-does-not-exist/proof content_asset=nf-v02-proof \
     mode=0644 owner=root group=root --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge profile create "$profile" rocky-9.7-aarch64-iso \
+cli profile create "$profile" rocky-9.7-aarch64-iso \
     --kind diskless --boot-bundle nf-test-bundle --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge profile set "$profile" diskless.provision.bundle=nf-v02-firstboot \
+cli profile set "$profile" diskless.provision.bundle=nf-v02-firstboot \
     --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge profile set "$profile" diskless.failure.max_attempts=3 \
+cli profile set "$profile" diskless.failure.max_attempts=3 \
     --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge profile set "$profile" diskless.failure.backoff_seconds=1 \
+cli profile set "$profile" diskless.failure.backoff_seconds=1 \
     --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge profile rootfs register "$profile" --path "$work/rootfs.squashfs" \
+cli profile rootfs register "$profile" --path "$work/rootfs.squashfs" \
     --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge node add "$node" mac=52:54:00:12:34:57 arch=aarch64 \
+cli node add "$node" mac=52:54:00:12:34:57 arch=aarch64 \
     profile="$profile" --config "$config" --output json >/dev/null
 
-prepare=$(zig-out/bin/nodeforge node boot-prepare "$node" --config "$config" --output json)
+# CLI readiness must prove the current boot projection without minting or
+# exposing credentials. A public prepare response is deliberately sanitized;
+# cancel it through the supported lifecycle command before the internal
+# capsule fixture creates the session used by QEMU.
+readiness=$(cli node readiness "$node" --stage boot --config "$config" --output json)
+test "$(printf '%s' "$readiness" | jq -r '.result.ready')" = true
+public_prepare=$(cli node boot-prepare "$node" --config "$config" --output json)
+test "$(printf '%s' "$public_prepare" | jq -r '.result.state')" = prepared
+if printf '%s' "$public_prepare" | grep -Eq '"(config|rootfs|agent|event)_token"'; then
+    echo "public boot-prepare leaked a capability token" >&2
+    exit 1
+fi
+public_session=$(printf '%s' "$public_prepare" | jq -r '.result.session_id')
+cli node session show "$public_session" --config "$config" --output json >/dev/null
+cli node session cancel "$public_session" --config "$config" --output json >/dev/null
+if cli node session show "$public_session" --config "$config" --output json >/dev/null 2>&1; then
+    echo "cancelled diskless session remained active" >&2
+    exit 1
+fi
+
+prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")
 python3 - "$prepare" "$work/initrd-root/capsule" <<'PY'
 import json, pathlib, sys
 r = json.loads(sys.argv[1])["result"]
@@ -262,9 +304,9 @@ host_agent_plan_url=${agent_plan_url/http:\/\/10.0.2.2/http:\/\/127.0.0.1}
 test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $agent_token" -H "X-NodeForge-Session: $session" "$host_agent_plan_url")" = 401
 test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $event_token" -H "X-NodeForge-Session: $session" -H 'Content-Type: application/json' --data "{\"schema_version\":1,\"session_id\":\"$session\",\"event_seq\":7,\"expected_phase\":\"diskless.running\",\"phase\":\"diskless.running\"}" "${host_config_url%/boot-config}/events")" = 401
 
-# A fresh session with only 1.5 GiB must fail the checked memory budget before
-# attempting the 1.2 GiB rootfs transfer, and must report a terminal lifecycle.
-lowmem_prepare=$(zig-out/bin/nodeforge node boot-prepare "$node" --config "$config" --output json)
+# A fresh session with only 384 MiB must fail the checked memory budget before
+# attempting the rootfs transfer, and must report a terminal lifecycle.
+lowmem_prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")
 python3 - "$lowmem_prepare" "$work/initrd-root/capsule" <<'PY'
 import json, pathlib, sys
 r = json.loads(sys.argv[1])["result"]
@@ -283,7 +325,7 @@ print(json.loads(sys.argv[1])["result"]["config_url"])
 PY
 )
 (cd "$work/initrd-root" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 >"$work/initramfs-lowmem.img")
-/usr/libexec/qemu-kvm -cpu max -M virt -m 1536 \
+/usr/libexec/qemu-kvm -cpu max -M virt -m 384 \
     -kernel "$kernel" -initrd "$work/initramfs-lowmem.img" \
     -append "nodeforge.config_url=$lowmem_config_url nodeforge.session=$lowmem_session nodeforge.node=$node console=ttyAMA0" \
     -netdev user,id=n1 -device virtio-net-pci,netdev=n1 \
@@ -303,7 +345,7 @@ wait "$qemu_pid" 2>/dev/null || true
 qemu_pid=
 grep -F "\"boot_session_id\",\"value\":\"$lowmem_session\"" "$install_root/logs/events.jsonl" |
     grep -q '"type":"diskless.failed"'
-grep -q 'InsufficientMemory' "$work/console-lowmem.log"
+grep -qE 'MinimumFreeBudgetUnsatisfied|InsufficientMemory' "$work/console-lowmem.log"
 
 echo "v0.2 full OS QEMU validation passed"
 echo "console=$work/console.log"

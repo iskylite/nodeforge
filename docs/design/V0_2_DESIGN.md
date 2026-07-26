@@ -7,14 +7,15 @@
 
 以下修订基于 v0.2 开发验证中的实际发现，直接修改设计而非创建独立验证文档：
 
-### R1. setup 默认 schema v4
+### R1. setup 永远写当前最新 schema
 
 **问题**：`generatedConfig` 和 `initialize` 生成 schema v3 配置和 catalog，导致 diskless profile 创建前必须手动执行
 `catalog schema-v4 plan/apply` 迁移。
 
-**修订**：schema 版本只是开发过程中的变动记录，不应影响主流程。CLI 始终按照最新 schema 执行，
-每次 schema 版本变动时代码同步更新版本号。`setup.zig` 的 `generatedConfig()` 和 `initialize()`
-始终生成当前最新 schema 版本（v4），`setup --reconfigure` 也生成 v4，不需要手动迁移。
+**修订**：schema 版本只是持久化格式的迁移历史，不是操作员选择项。CLI 始终按照
+当前最新 schema 执行，每次 shape 变动时代码同步更新版本号。`setup.zig` 的
+`generatedConfig()`、`initialize()` 和 `setup --reconfigure` 始终生成当前最新
+schema，不需要也不允许 runbook 指示用户手动选择 schema。
 `catalog schema-v4 plan/apply/rollback` CLI 命令已从命令树移除；schema-v3 迁移保留用于从 v0.1 升级已有数据。
 
 ### R2. resolveDiskless — diskless PXE boot target
@@ -26,16 +27,21 @@
 生成 cmdline：`nodeforge.config_url=http://<server>:<port>/api/v1/nodes/<node>/boot-config `
 `nodeforge.node=<node_id>` `console=ttyAMA0`。
 
-**设计决策**：`nodeforge.session` 不放入 GRUB cmdline，因为 TFTP 层无法获知 diskless session ID
-（该 session 由 `node boot-prepare` 创建，与 DHCP session 独立）。initrd 从 `/capsule/session` 文件读取 session（见 R3）。
+**设计决策**：`nodeforge.session` 和 capability token 不放入 GRUB cmdline。TFTP
+渲染虚拟 per-MAC GRUB 配置时通过同进程内部管理请求原子创建 delivery session，
+并把 session/token 写入只存在内存中的 per-boot cpio capsule；initrd 从
+`/capsule/session` 与 token 文件读取（见 R3）。
 
 ### R3. initrd capsule session fallback
 
 **问题**：`initrd.zig` 只从 kernel cmdline 读取 `nodeforge.session`。PXE boot 模式下 GRUB cmdline 不含 session
 （TFTP 层无法获知 diskless session ID），initrd 会因 `MissingSession` 而 panic。
 
-**修订**：`initrd.zig` 增加 `capsule_session_path = "/capsule/session"` 常量。当 cmdline 中无 `nodeforge.session`
-时，initrd 从 `/capsule/session` capsule 文件读取。两种来源统一由 allocator 持有，避免 cmdline buffer 双重 free。
+**修订**：`initrd.zig` 增加 `capsule_session_path = "/capsule/session"` 常量。当
+cmdline 中无 `nodeforge.session` 时，initrd 从自动追加的 per-boot capsule 读取。
+TFTP 的虚拟 capsule 路径绑定 node/session，传输后不落盘；普通 CLI prepare 响应
+不包含 raw token。两种 session 来源统一由 allocator 持有，避免 cmdline buffer
+双重 free。
 
 ### R4. setup capabilities — rootfs build 兼容
 
@@ -56,6 +62,8 @@
 （network + base 模块，squashfs/overlay 文件系统），注入 `nodeforge-initrd` 二进制到
 `/usr/sbin/`，创建 `/init` 脚本和 `/capsule` 目录，重包为 gzip cpio initramfs。
 与 `rootfs_os_builder` 一致，使用外部命令（dracut/cpio/gzip），属环境相关执行边界。
+`nodeforge assets initrd build` 已接线为同步 CLI：输出先写 `.part`，成功后原子
+rename 到专用 initrd store 并注册 catalog；异步 durable operation 属 v0.2.2。
 
 ### R6. ISO 导入自动注册 diskless 可复用资产
 
@@ -67,6 +75,11 @@ kernel 字段。命名去掉了 `-installer-` 前缀，明确表示 kernel 通�
 **仍需单独构建的资产**：
 - `nodeforge_initrd`（kind=nodeforge_initrd）：需要 `nodeforge-initrd` 二进制 + dracut 构建（见 R5）
 - `rootfs`（kind=rootfs）：需要 `dnf --installroot` + mksquashfs 构建（`profile rootfs build`）
+
+### R7. node hostname 默认使用 node_id
+
+**修订**：`nodeAddHandler`（`main.zig`）在创建节点时，hostname 未显式指定则默认使用 `node.id`。
+`model.zig` `NodeConfig.hostname` 注释同步更新：CLI 默认 node_id，API 直接创建时 null 由渲染层回退。
 
 ## 0. 文档结构与阅读路径
 
@@ -100,27 +113,28 @@ kernel 字段。命名去掉了 `-installer-` 前缀，明确表示 kernel 通�
 
 ## 1. 进入条件
 
-v0.2 必须基于 `V0_1_DESIGN.md` 冻结后的 schema v3 和 effective plan，至少满足（**注**：v0.2 开发阶段 `setup` 直接生成 schema v4，无需手动迁移）：
+v0.2 必须基于 `V0_1_DESIGN.md` 的 effective plan，至少满足：
 
 - M0-M4 与 M4.13 全部自动化和双发行版 PXE 回归通过。
 - Node/Profile/Resource/Override/Effective/Runtime 所有权不再存在兼容 fallback。
 - typed PropertySpec/CollectionSpec/ItemSpec、exact-key CLI/API 和软件 capability index 已经落地。
 - Node direct `storage.boot_disk/additional_disks`、默认 `/dev/sda`、单主 ESP 和全部 v0.1 native
   single/LVM/RAID/RAID-LVM mode 已完成双 adapter 渲染与可复现安装验证。
-- schema v3 迁移工具经过 plan/apply/rollback 验收。
+- 历史 schema 数据可迁移到当前最新 schema；CLI、setup、runbook 与全部新写入
+  永远只使用当前最新 schema，不要求操作员选择或手动升级到某个版本号。
 - 所有普通 CLI handler 已使用统一 OutputDocument，所有资源 mutation 均不要求 Shell 内嵌 JSON。
 
 任何一项未完成时，M5 只能做隔离 spike，不能合入主产品路径或标记里程碑完成。
 
 ## 2. v0.2 范围
 
-v0.2 聚焦 diskless 主流程。原 M5-M7 拆分到三个版本，避免把 VMware 难以验证或非 diskless 主流程的内容混入 v0.2：
+v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不再作为保留项：
 
 | 版本 | 范围 | 对应里程碑 |
 |---|---|---|
 | v0.2 | diskless only | M5 内存无盘启动 + M7 diskless 后处理（`rootfs-build`/`first-boot`） |
 | v0.2.1 | Ubuntu diskless | Ubuntu casper squashfs 叠加方案，支持 Rocky/RHEL 宿主构建 Ubuntu 无盘系统，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
-| v0.2.2 | 异架构/实机验证 | x86_64 UEFI smoke + VMware compute_use 实机 PXE 验证矩阵，见 [`V0_2_2_RESERVED.md`](../validation/V0_2_2_RESERVED.md) |
+| v0.2.2 | 验证矩阵和可运营性 | Computer Use/VMware 实机闭环纳入每轮验收；继续扩展 x86_64 UEFI、故障恢复与并发矩阵 |
 | v0.3 | PXELINUX/BIOS install | M6 BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v5 + M7 `install-post`，见 `V0_3_DESIGN.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 | v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
@@ -217,10 +231,9 @@ repository（无公网 mirror/metalink/GeoIP/vendor NTP），标准包经本地 
 且 runtime 禁止隐式下载，initrd 全部 URL 用 `server_ip` 字面地址，HTTP bearer 仅在隔离网络内提供认证、不提供链路
 机密性（须以 VLAN/ACL 防旁路窃听）。
 
-v0.2 使用唯一的 catalog schema v4，同时包含 M5 diskless tagged Profile 与本版本交付的 M7
-`rootfs-build|first-boot` action/phase；不能把 v0.2 必需 shape 延后到未来 schema v6，也不能让 schema v3 parser
-长期接受 nullable 半成品。v0.3 的 `firmware.mode` 与 `install-post` 使用 schema v5；v0.4 使用 schema v6；
-v0.5 rootfs 形态使用 schema v7。不能在已经发布的 schema 号下静默改变 shape。每次迁移都需
+产品在任一时刻只使用代码声明的当前最新 catalog schema。文中的 v3/v4/v5 等
+仅标识历史持久化 shape 与迁移测试，不构成 CLI 选项或并行运行模式。不能在
+已经发布的 schema 号下静默改变 shape；每次迁移都需
 plan/digest/apply/rollback、活动 session 保护和 manifest transaction。v0.1 install
 Profile 在 v4 映射到 `ProfileKind.install`；install/diskless Profile 都必须引用唯一 InstallSource，diskless Profile
 另引用与该 source 一致的完整 boot bundle（source + kernel + nodeforge-initrd，明确不含 rootfs）。build readiness
@@ -407,7 +420,7 @@ v0.2 延伸 v0.1 的 Assets tree，不新增顶级 `rootfs`、`initrd` 或 `boot
 ```text
 nodeforge assets rootfs list|show|validate
 nodeforge assets runtime-kernel prepare|list|show|validate
-nodeforge assets nodeforge-initrd config show|set|modules-values|firmware-values|build|show|list|validate
+nodeforge assets initrd build <name> --from-install-source <source> --kernel-release <release>
 nodeforge assets boot-bundle create|set|list|show|validate
 nodeforge profile capabilities show <profile>
 nodeforge node capabilities show <node>
@@ -431,10 +444,52 @@ Resource name 不是内容身份；内容或 builder 输入变化必须发布新
 pin source/kernel/initrd revision 并派生 joint boot digest。rootfs 是 `rootfs_input_digest` 对应的只读派生缓存；
 DeliveryManifest 固定 boot bundle revisions + rootfs SHA-512，不能把交付输出反写 Profile。
 
+### 4.3 ISO、Profile 与 diskless 制品关系
+
+ISO import 一次原子生成：
+
+- ISO asset；
+- 内容寻址 UEFI bootloader（媒体存在时）；
+- vendor installer kernel（通用 `kernel` asset）；
+- vendor installer initrd（仅安装器使用的 `installer_initrd` asset）；
+- repository/media tree；
+- InstallSource；
+- 一个引用该 InstallSource 的默认 install Profile。
+
+ISO import 不生成 rootfs、NodeForge initrd、boot bundle 或 diskless Profile：
+
+- `assets initrd build --from-install-source` 以 InstallSource 的 vendor initrd 为
+  字节级不变基底，追加 NodeForge init/agent/DHCP overlay，发布新的不可变
+  `nodeforge_initrd` asset；
+- `assets boot-bundle create` 固定同一 tuple/kernel release 的 kernel 与
+  NodeForge initrd；多个 bundle/发行版/版本/架构可同时存在；
+- `profile create --kind diskless --boot-bundle` 创建 diskless Profile，并仍
+  引用 InstallSource 以取得 repository/software capability；
+- `profile rootfs build` 从 diskless Profile build projection 构建共享、
+  内容寻址 rootfs。rootfs 不属于 boot bundle，启动时由 DeliveryManifest
+  将选定 bundle revision 与 rootfs digest 固定为同一 session snapshot。
+
+```text
+ISO
+ └─ InstallSource ── default install Profile
+     ├─ vendor kernel ───────────────┐
+     ├─ vendor installer initrd      │
+     │    └─ initrd build overlay ── NodeForge initrd
+     └─ repositories                 │
+                                      └─ BootBundle
+InstallSource + BootBundle ── diskless Profile ── rootfs build ── rootfs
+Node + diskless Profile ── DeliveryManifest(bundle revision + rootfs digest)
+```
+
 Rootfs/initrd 构建的工具链和驱动放置属于 M5 的显式实现边界，而非未说明的 builder 自由度：
 
-- NodeForge initrd 使用与目标发行版、版本、架构和 kernel release 匹配的 `dracut` 环境构建；MVP 不手工拼 cpio。
-  build manifest 固定 builder image/environment digest、dracut 版本、命令、module/firmware 清单和输出 digest。
+- NodeForge initrd 首选保留 ISO vendor installer initrd 的完整第一个 member，
+  仅追加 NodeForge gzip/newc overlay；因此发行版专用 patch、firmware 和 `.ko`
+  不会因 server host 的 dracut 环境而丢失。没有 InstallSource 时才允许通用
+  dracut fallback。
+- fallback 的通用 NIC 闭包为 `virtio_net`、`e1000e`；`vmxnet3` 只服务使用
+  VMware paravirtual vmxnet3 NIC 的目标，不是物理机或当前 e1000e VMware VM
+  的必需项。vendor initrd 已携带时保留，不主动删除。
 - 获取 BootConfig/rootfs、校验并挂载 lower/upper、完成 `switch_root` 前必需的 NIC、firmware、HTTP、SHA-256、
   squashfs、tmpfs 和 overlay 能力必须放入 initrd；缺一项即 bundle not ready。
 - 只在切根后使用的 GPU、RDMA、监控、额外存储或业务驱动放入 rootfs，并与同一 kernel release 的 modules manifest
@@ -1048,27 +1103,25 @@ Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或�
    nodeforge setup --install-root /opt/nodeforge --server-ip <ip> --subnet <cidr> ...
 
    # 2. 导入安装介质（自动提取 bootloader/kernel/initrd/repository）
-   nodeforge assets import-iso <iso-file>
+   nodeforge assets import <iso-file>
 
    # 3. 注册 diskless 专用资产（kernel 和 nodeforge-initrd 从 ISO 或单独构建）
    nodeforge assets register --type kernel --name <k> --path <p> --distro <d> --version <v> --arch <a> --kernel-release <r>
    nodeforge assets register --type nodeforge_initrd --name <i> --path <p>
 
-   # 4. 构建并注册 rootfs（从 install source 派生 diskless rootfs squashfs）
-   nodeforge profile rootfs build <diskless-profile>
-
-   # 5. 创建 boot bundle（绑定 kernel/initrd/rootfs 为不可拆分组合）
-   nodeforge assets boot-bundle create <name> --kernel <k> --initrd <i> --rootfs <r> \
+   # 4. 创建 boot bundle（仅绑定 kernel/initrd，派生 rootfs 不进入 bundle）
+   nodeforge assets boot-bundle create <name> --kernel <k> --initrd <i> \
      --distro <d> --version <v> --arch <a> --kernel-release <r>
 
-   # 6. 创建 diskless profile（引用 boot bundle）
+   # 5. 创建 diskless profile（引用 boot bundle）
    nodeforge profile create <name> <install-source> --kind diskless --boot-bundle <name>
 
-   # 7. 注册节点
-   nodeforge node add <id> --mac <mac> --arch <a> --profile <name>
+   # 6. 构建 Profile 派生 rootfs
+   nodeforge profile rootfs build <diskless-profile>
 
-   # 8. 准备 diskless 启动会话（签发 token capsule、生成 BootConfig）
-   nodeforge node boot-prepare <id>
+   # 7. 注册并启用节点
+   nodeforge node add <id> --mac <mac> --arch <a> --profile <name>
+   nodeforge node set <id> deploy=true
 
    # 节点网络启动后自动执行：
    #   DHCP → TFTP bootloader → kernel + nodeforge-initrd →

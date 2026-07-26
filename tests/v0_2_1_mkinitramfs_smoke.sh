@@ -251,7 +251,7 @@ dump("assets", assets)
 bundles = load("boot_bundles")
 b = {"name": f"{P}-bundle", "distro": "ubuntu", "version": "22.04", "arch": "aarch64",
      "kernel_release": krel, "kernel": f"{P}-kernel", "runtime_kernel": f"{P}-kernel",
-     "initrd": f"{P}-initrd", "rootfs": f"{P}-rootfs"}
+     "initrd": f"{P}-initrd"}
 if not any(x["name"] == b["name"] for x in bundles): bundles.append(b)
 dump("boot_bundles", bundles)
 nodes = load("nodes")
@@ -296,7 +296,7 @@ zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" disk
 zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" --path "$work/rootfs.squashfs" --config "$config" --output json >/dev/null
 
 # Prepare boot
-prepare=$(zig-out/bin/nodeforge --install-root "$install_root" node boot-prepare "$node" --config "$config" --output json)
+prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")
 python3 - "$prepare" "$work/initrd-root/capsule" <<'PY'
 import json, pathlib, sys
 r = json.loads(sys.argv[1])["result"]

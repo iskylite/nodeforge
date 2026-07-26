@@ -1,0 +1,17 @@
+#!/bin/sh
+# Minimal DHCP hook for the NodeForge PID-1 initramfs. It deliberately avoids
+# NetworkManager/systemd helpers and only establishes the bootstrap IPv4 path.
+case "${reason:-}" in
+    PREINIT)
+        /sbin/ip link set "$interface" up
+        ;;
+    BOUND|RENEW|REBIND|REBOOT)
+        /sbin/ip addr flush dev "$interface"
+        /sbin/ip addr add "$new_ip_address/$new_subnet_mask" dev "$interface"
+        for router in ${new_routers:-}; do
+            /sbin/ip route replace default via "$router" dev "$interface"
+            break
+        done
+        ;;
+esac
+exit 0

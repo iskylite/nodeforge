@@ -97,8 +97,8 @@ def load(n):
 def dump(n, d):
     with open(f"{dst}/{n}.json","w") as f: json.dump(d, f, indent=2)
 assets = load("assets")
-# validateBootBundles requires kernel/initrd/rootfs assets to share the
-# bundle kernel_release; set it on all three (update existing stale entries).
+# Boot bundle validation requires kernel/initrd to share the bundle tuple and
+# kernel_release. The rootfs is Profile-derived and registered separately.
 def A(name, kind, path):
     return {"name": name, "kind": kind, "path": path, "distro": "ubuntu",
             "version": "22.04", "arch": "aarch64", "kernel_release": krel,
@@ -113,7 +113,7 @@ dump("assets", assets)
 bundles = load("boot_bundles")
 b = {"name": f"{P}-bundle", "distro": "ubuntu", "version": "22.04", "arch": "aarch64",
      "kernel_release": krel, "kernel": f"{P}-kernel", "runtime_kernel": f"{P}-kernel",
-     "initrd": f"{P}-initrd", "rootfs": f"{P}-rootfs"}
+     "initrd": f"{P}-initrd"}
 if not any(x["name"] == b["name"] for x in bundles): bundles.append(b)
 dump("boot_bundles", bundles)
 nodes = load("nodes")
@@ -159,7 +159,7 @@ zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" disk
 zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" diskless.failure.backoff_seconds=1 --config "$config" --output json >/dev/null
 zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" --path "$work/rootfs.squashfs" --config "$config" --output json >/dev/null
 
-prepare=$(zig-out/bin/nodeforge --install-root "$install_root" node boot-prepare "$node" --config "$config" --output json)
+prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")
 python3 - "$prepare" "$work/initrd-root/capsule" <<'PY'
 import json, pathlib, sys
 r = json.loads(sys.argv[1])["result"]

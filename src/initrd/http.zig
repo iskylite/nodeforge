@@ -254,6 +254,34 @@ pub fn post(
     return resp.status;
 }
 
+/// POST 并返回 2xx 响应体。daemon 的 TFTP worker 用它调用 loopback
+/// management boot-prepare；独立于 lifecycle `post` 的“丢弃 body”契约。
+pub fn postForBody(io: std.Io, allocator: std.mem.Allocator, url: Url, headers: []const Header, body: []const u8) ![]u8 {
+    const address = std.Io.net.IpAddress.parseIp4(url.host, url.port) catch return error.InvalidHost;
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return error.ConnectionFailed;
+    defer stream.close(io);
+    {
+        var send_buf: [8192]u8 = undefined;
+        var writer = stream.writer(io, &send_buf);
+        try writer.interface.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\n", .{ url.path, url.host, url.port });
+        for (headers) |hdr| try writer.interface.print("{s}: {s}\r\n", .{ hdr.name, hdr.value });
+        try writer.interface.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len});
+        try writer.interface.writeAll(body);
+        try writer.interface.flush();
+    }
+    var recv_buf: [16 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &recv_buf);
+    const resp = try readResponseHeaders(allocator, &reader.interface);
+    defer allocator.free(resp.raw);
+    if (resp.status < 200 or resp.status >= 300) return error.HttpError;
+    const len = resp.content_length orelse return error.MissingContentLength;
+    if (len > 1024 * 1024) return error.ResponseTooLarge;
+    const response = try allocator.alloc(u8, len);
+    errdefer allocator.free(response);
+    reader.interface.readSliceAll(response) catch return error.TruncatedResponse;
+    return response;
+}
+
 /// GET 请求，响应体写入文件。返回原始响应头文本（供 `download.validateRange` 校验）。
 /// 调用方负责释放返回的 headers。
 pub fn getToFile(

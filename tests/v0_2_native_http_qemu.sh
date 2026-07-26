@@ -121,7 +121,7 @@ zig-out/bin/nodeforge node add "$node" mac=52:54:00:12:34:57 arch=aarch64 \
     profile="$profile" --config "$config" --output json >/dev/null
 
 # 8. Boot-prepare
-prepare=$(zig-out/bin/nodeforge node boot-prepare "$node" --config "$config" --output json)
+prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")
 echo "Boot-prepare result: $prepare" | head -1
 
 # 9. Create capsule

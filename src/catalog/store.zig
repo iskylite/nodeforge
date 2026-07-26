@@ -427,7 +427,7 @@ test "v4 catalog round-trips diskless profile, boot bundle and rootfs_build step
     const root = root_buf[0..n];
     try initializeEmpty(std.testing.io, std.testing.allocator, root);
     const profiles = [_]model.ProfileConfig{.{ .name = "diskless-9", .install_source = "s", .kind = .diskless, .boot_bundle = "bb", .software = .{ .packages = .{ .include = &.{"curl"} } } }};
-    const bundles = [_]model.BootBundleConfig{.{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i", .rootfs = "r" }};
+    const bundles = [_]model.BootBundleConfig{.{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i" }};
     const steps = [_]model.ProvisionStep{.{ .name = "pkgs", .phase = .rootfs_build, .action = .@"package", .packages = &.{"vim"} }};
     const prov_bundles = [_]model.ProvisioningBundle{.{ .name = "pb", .steps = &steps }};
     const assets = [_]model.AssetConfig{.{ .name = "rk", .kind = .runtime_kernel, .path = "/rk" }};

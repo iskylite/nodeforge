@@ -389,21 +389,21 @@ pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []
     var body: [640]u8 = undefined;
     const rendered = if (boot_bundle) |bb|
         std.fmt.bufPrint(&body, "{{\"name\":{f},\"install_source\":{f},\"kind\":{f},\"boot_bundle\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}), std.json.fmt(kind, .{}), std.json.fmt(bb, .{}) }) catch
-        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.invalid", "profile request is too large") }
+            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.invalid", "profile request is too large") }
     else
         std.fmt.bufPrint(&body, "{{\"name\":{f},\"install_source\":{f},\"kind\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}), std.json.fmt(kind, .{}) }) catch
-        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.invalid", "profile request is too large") };
+            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.invalid", "profile request is too large") };
     const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "POST", "/api/v1/management/profiles", rendered, revision, reason_buf);
 }
 
-/// v0.2 boot-bundle 创建：diskless profile 引用的 kernel/initrd/rootfs 组合。
+/// v0.2 boot-bundle 创建：diskless profile 引用的 kernel/initrd 组合。
 /// CLI 命令 `nodeforge assets boot-bundle create` 调用此函数。
 /// 三个资产必须已通过 `nodeforge assets register` 注册到 catalog 中。
-pub fn bootBundleCreate(io: std.Io, port: u16, name: []const u8, distro: []const u8, version: []const u8, arch: []const u8, kernel_release: []const u8, kernel: []const u8, initrd: []const u8, rootfs: []const u8, reason_buf: []u8) Mutation {
-    if (!querySafe(name) or !querySafe(distro) or !querySafe(version) or !querySafe(kernel) or !querySafe(initrd) or !querySafe(rootfs)) return .{ .reachable = false, .healthy = false };
+pub fn bootBundleCreate(io: std.Io, port: u16, name: []const u8, distro: []const u8, version: []const u8, arch: []const u8, kernel_release: []const u8, kernel: []const u8, initrd: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name) or !querySafe(distro) or !querySafe(version) or !querySafe(kernel) or !querySafe(initrd)) return .{ .reachable = false, .healthy = false };
     var body: [1024]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&body, "{{\"name\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"kernel_release\":{f},\"kernel\":{f},\"initrd\":{f},\"rootfs\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(distro, .{}), std.json.fmt(version, .{}), std.json.fmt(arch, .{}), std.json.fmt(kernel_release, .{}), std.json.fmt(kernel, .{}), std.json.fmt(initrd, .{}), std.json.fmt(rootfs, .{}) }) catch
+    const rendered = std.fmt.bufPrint(&body, "{{\"name\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"kernel_release\":{f},\"kernel\":{f},\"initrd\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(distro, .{}), std.json.fmt(version, .{}), std.json.fmt(arch, .{}), std.json.fmt(kernel_release, .{}), std.json.fmt(kernel, .{}), std.json.fmt(initrd, .{}) }) catch
         return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "boot_bundle.invalid", "boot bundle request is too large") };
     const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
     return managementMutation(io, port, "POST", "/api/v1/management/boot-bundles", rendered, revision, reason_buf);
@@ -467,6 +467,51 @@ pub fn bootPrepareJson(io: std.Io, port: u16, node_id: []const u8, output: []u8,
             _ = formatErrorReason(reason_buf, err_body)
         else
             _ = formatHttpStatus(reason_buf, reply.status);
+        return null;
+    }
+    return reply.body;
+}
+
+pub fn nodeReadinessJson(io: std.Io, port: u16, node_id: []const u8, stage: []const u8, output: []u8, reason_buf: []u8) !?[]const u8 {
+    if (!querySafe(node_id) or !(std.mem.eql(u8, stage, "build") or std.mem.eql(u8, stage, "boot"))) return null;
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/readiness", .{node_id}) catch return null;
+    var body: [64]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&body, "{{\"stage\":{f}}}", .{std.json.fmt(stage, .{})}) catch return null;
+    const reply = try managementPostJson(io, port, route, rendered, null, output, null);
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body|
+            _ = formatErrorReason(reason_buf, err_body)
+        else
+            _ = formatHttpStatus(reason_buf, reply.status);
+        return null;
+    }
+    return reply.body;
+}
+
+pub fn operationJson(io: std.Io, port: u16, operation_id: []const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(operation_id)) return null;
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/operations/{s}", .{operation_id}) catch return null;
+    return managementJson(io, port, route, output);
+}
+
+pub fn disklessSessionsJson(io: std.Io, port: u16, session_id: ?[]const u8, output: []u8) !?[]const u8 {
+    var path: [256]u8 = undefined;
+    const route = if (session_id) |id| blk: {
+        if (!querySafe(id)) return null;
+        break :blk std.fmt.bufPrint(&path, "/api/v1/management/diskless-sessions/{s}", .{id}) catch return null;
+    } else "/api/v1/management/diskless-sessions";
+    return managementJson(io, port, route, output);
+}
+
+pub fn cancelDisklessSession(io: std.Io, port: u16, session_id: []const u8, output: []u8, reason_buf: []u8) !?[]const u8 {
+    if (!querySafe(session_id)) return null;
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/diskless-sessions/{s}", .{session_id}) catch return null;
+    const reply = try managementDeleteJson(io, port, route, output);
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body| _ = formatErrorReason(reason_buf, err_body);
         return null;
     }
     return reply.body;
@@ -596,6 +641,19 @@ fn managementPostJson(io: std.Io, port: u16, path: []const u8, body: []const u8,
     var recv_buffer: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
     return try readHttpResponse(&reader.interface, output, location_out);
+}
+
+fn managementDeleteJson(io: std.Io, port: u16, path: []const u8, output: []u8) !HttpReply {
+    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return no_reply;
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return no_reply;
+    defer stream.close(io);
+    var send_buffer: [512]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    try writer.interface.print("DELETE {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{path});
+    try writer.interface.flush();
+    var recv_buffer: [16 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    return try readHttpResponse(&reader.interface, output, null);
 }
 
 /// M4.5：GET 管理 JSON 请求并返回完整响应。与 `managementPostJson` 共享

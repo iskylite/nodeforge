@@ -122,7 +122,9 @@ pub const Store = struct {
         return .{ .allocator = allocator, .secret = secret, .path = path };
     }
 
-    pub fn deinit(self: *Store) void { _ = self; }
+    pub fn deinit(self: *Store) void {
+        _ = self;
+    }
 
     /// 从 checkpoint 恢复尚未过期的 delivery session。raw capability 不在 JSON
     /// 中；它由持久 master secret + session/scope 确定性重建，并再次核对保存的
@@ -320,6 +322,30 @@ pub const Store = struct {
     pub fn findByNode(self: *Store, node_id: []const u8) ?*Session {
         for (&self.sessions) |*s| if (s.active and std.mem.eql(u8, s.nodeId(), node_id)) return s;
         return null;
+    }
+
+    pub fn snapshot(self: *Store, out: *[max_sessions]Session) []const Session {
+        var count: usize = 0;
+        for (self.sessions) |session| {
+            if (!session.active) continue;
+            out[count] = session;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    /// Operator cancellation invalidates every capability and removes the
+    /// session from the durable active set in one checkpoint. If persistence
+    /// fails, restore the complete prior session so cancellation is never
+    /// reported while usable credentials remain durable.
+    pub fn cancel(self: *Store, io: std.Io, session_id: []const u8) !void {
+        const session = self.find(session_id) orelse return error.DisklessSessionNotFound;
+        const previous = session.*;
+        session.* = .{};
+        self.persist(io) catch |err| {
+            session.* = previous;
+            return err;
+        };
     }
 
     pub fn markBootConfigFetched(self: *Store, io: std.Io, session_id: []const u8) !void {

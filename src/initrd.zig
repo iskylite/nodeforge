@@ -42,6 +42,7 @@
 //! 引入 libpthread 依赖（glibc < 2.34 的 `libpthread.so.0` 在最小 initrd 中
 //! 可能不存在）。`strip = true` 减小二进制体积。
 const std = @import("std");
+const builtin = @import("builtin");
 const memory = @import("initrd/memory.zig");
 const download = @import("initrd/download.zig");
 const http = @import("initrd/http.zig");
@@ -83,6 +84,18 @@ const lower_mnt = "/lower";
 const rw_mnt = "/rw";
 const merged_mnt = "/merged";
 
+fn mountBootstrap(
+    comptime source: [:0]const u8,
+    comptime target: [:0]const u8,
+    comptime fs_type: [:0]const u8,
+    comptime data: ?[:0]const u8,
+) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    const data_ptr: usize = if (data) |value| @intFromPtr(value.ptr) else 0;
+    const rc = std.os.linux.mount(source.ptr, target.ptr, fs_type.ptr, 0, data_ptr);
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.MountFailed;
+}
+
 const Cmdline = struct {
     config_url: ?[]const u8 = null,
     node: ?[]const u8 = null,
@@ -99,18 +112,27 @@ pub fn main(init: std.process.Init) !void {
     _ = setenv("PATH", initrd_path, 1);
 
     log("[nodeforge-initrd] mounting /proc /sys /dev /run...\n", .{});
-    try mustRun(io, allocator, &.{ "mount", "-t", "proc", "proc", "/proc" });
-    try mustRun(io, allocator, &.{ "mount", "-t", "sysfs", "sysfs", "/sys" });
-    try mustRun(io, allocator, &.{ "mount", "-t", "devtmpfs", "devtmpfs", "/dev" });
+    // PID 1 must not depend on the vendor initrd's userspace loader before
+    // /proc, /sys and /dev exist. Some installer initrds ship a dynamically
+    // linked mount(8) whose early exec can fail even though its archive entry
+    // is present. Use the kernel mount syscall for the bootstrap filesystems.
+    try mountBootstrap("proc", "/proc", "proc", null);
+    try mountBootstrap("sysfs", "/sys", "sysfs", null);
+    try mountBootstrap("devtmpfs", "/dev", "devtmpfs", null);
     // /run 需要 tmpfs 挂载：rootfs 下载的 .part/.chunk 文件写入此处。
     // initramfs 根可能是只读的（取决于 dracut 配置），必须显式挂载 tmpfs。
     try mustRun(io, allocator, &.{ "mkdir", "-p", "/run" });
-    try runIgnore(io, allocator, &.{ "mount", "-t", "tmpfs", "-o", "mode=0755", "tmpfs", "/run" });
+    mountBootstrap("tmpfs", "/run", "tmpfs", "mode=0755") catch {};
     // 加载 squashfs/loop/overlay 内核模块（这些在 Rocky 内核中是模块而非内置）。
     // 在挂载 squashfs rootfs 和 overlay 合并前必须已加载。
-    try runIgnore(io, allocator, &.{ "modprobe", "squashfs" });
-    try runIgnore(io, allocator, &.{ "modprobe", "loop" });
-    try runIgnore(io, allocator, &.{ "modprobe", "overlay" });
+    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "squashfs" });
+    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "loop" });
+    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "overlay" });
+    // QEMU/VMware 常见的 virtio NIC 在最小 initramfs 中不会由 udev 自动加载；
+    // 无网卡时 dhclient 可能仍以 0 退出，因此必须在枚举接口前显式尝试。
+    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "virtio_net" });
+    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "vmxnet3" });
+    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "e1000e" });
 
     const cmdline = try readCmdline(io, allocator);
     defer freeCmdline(allocator, cmdline);
@@ -136,7 +158,7 @@ pub fn main(init: std.process.Init) !void {
     // 无论来源，统一由 allocator 持有，避免 cmdline buffer 与独立 free 冲突。
     const session = blk: {
         if (cmdline.session) |s| break :blk try allocator.dupe(u8, s);
-        break :blk readToken(io, allocator, capsule_session_path) catch {
+        break :blk readCapsuleHex(io, allocator, capsule_session_path, 32) catch {
             log("[nodeforge-initrd] error: missing nodeforge.session in cmdline and no /capsule/session file\n", .{});
             return error.MissingSession;
         };
@@ -179,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
     });
     try downloadRootfs(io, allocator, &bc, rootfs_token, session);
     log("[nodeforge-initrd] rootfs downloaded, verifying SHA-512...\n", .{});
-    verifySha512(io, allocator, rootfs_blob, bc.rootfs_sha512) catch return error.RootfsHashMismatch;
+    verifySha512(io, rootfs_blob, bc.rootfs_sha512) catch return error.RootfsHashMismatch;
     log("[nodeforge-initrd] rootfs verified, mounting...\n", .{});
     try postLifecycle(io, allocator, bc.event_url, event_token, session, next_event_seq, current_phase, "diskless.rootfs_verified");
     @memset(rootfs_token, 0);
@@ -209,6 +231,13 @@ pub fn main(init: std.process.Init) !void {
     log("[nodeforge-initrd] mounting overlay (lowerdir={s})...\n", .{lower_mnt});
     // overlay 模块已在 main() 开头加载。
     try mustRun(io, allocator, &.{ "mount", "-t", "overlay", "overlay", "-o", overlay_opts, merged_mnt });
+    // initrd 与 pre-init agent 是同一个 boot closure。rootfs 是可复用的
+    // Node-independent lower，不能让其中构建时固化的旧 agent 覆盖当前 initrd
+    // 协议实现；写入 overlay upper 后 switch_root 必然执行配套版本。
+    const target_agent = try std.fmt.allocPrint(allocator, "{s}/usr/sbin/nodeforge-agent", .{merged_mnt});
+    defer allocator.free(target_agent);
+    try mustRun(io, allocator, &.{ "/usr/bin/cp", "-f", "/usr/sbin/nodeforge-agent", target_agent });
+    try mustRun(io, allocator, &.{ "/usr/bin/chmod", "0755", target_agent });
     log("[nodeforge-initrd] overlay mounted, writing handoff...\n", .{});
     try postLifecycle(io, allocator, bc.event_url, event_token, session, next_event_seq, current_phase, "diskless.rootfs_mounted");
     next_event_seq += 1;
@@ -229,7 +258,7 @@ pub fn main(init: std.process.Init) !void {
     // nodeforge-agent 在 rootfs 中的路径是 /usr/sbin/nodeforge-agent
     // （由 `nodeforge profile rootfs build` 安装到 rootfs squashfs 中）。
     log("[nodeforge-initrd] switch_root to {s}/usr/sbin/nodeforge-agent --pre-init\n", .{merged_mnt});
-    return std.process.replace(io, .{ .argv = &.{ "switch_root", merged_mnt, "/usr/sbin/nodeforge-agent", "--pre-init" } });
+    return std.process.replace(io, .{ .argv = &.{ "/usr/sbin/switch_root", merged_mnt, "/usr/sbin/nodeforge-agent", "--pre-init" } });
 }
 
 /// up 第一个非 lo 网卡并 DHCP（dracut 环境提供 `ip`/`dhclient`）。
@@ -240,10 +269,19 @@ fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator) !void {
     try runIgnore(io, allocator, &.{ "ip", "link", "set", "lo", "up" });
     // 用 ${i##*/} 取接口名，不依赖 basename。
     try runIgnore(io, allocator, &.{ "sh", "-c", "for i in /sys/class/net/*; do dev=${i##*/}; [ \"$dev\" != lo ] && ip link set \"$dev\" up && break; done" });
-    // dhclient 需要 /var/lib/dhclient/ 存放 lease 文件。
+    // dhclient 需要 /var/lib/dhclient/ 存放 lease 文件。DHCP 是后续所有
+    // capability 请求的硬前置条件，失败必须在这里暴露，不能吞掉错误后
+    // 误报 “network setup done”，再把根因伪装成 HTTP 连接失败。
     try runIgnore(io, allocator, &.{ "mkdir", "-p", "/var/lib/dhclient" });
-    // -1: try once, -v: verbose (output captured but won't block)
-    try runIgnore(io, allocator, &.{ "dhclient", "-v", "-1" });
+    // -1: try once, -v: verbose；非零退出由 mustRun fail closed。
+    // Use the canonical absolute path. PID 1 starts without a conventional
+    // environment and libc's spawnp lookup is not reliable across minimal
+    // initramfs layouts even after setting PATH.
+    try mustRun(io, allocator, &.{ "/sbin/dhclient", "-v", "-1", "-sf", "/usr/sbin/nodeforge-dhclient-script" });
+    const addresses = try captureRun(io, allocator, &.{ "/sbin/ip", "-4", "-o", "addr", "show", "scope", "global" });
+    defer allocator.free(addresses);
+    if (std.mem.trim(u8, addresses, " \t\r\n").len == 0) return error.DhcpAddressMissing;
+    log("[nodeforge-initrd] DHCP configured: {s}", .{addresses});
 }
 
 /// 把 AgentPlan locator + agent/event token 写入新根 `/var/lib/nodeforge`（boot.json +
@@ -327,10 +365,16 @@ fn freeBootConfig(allocator: std.mem.Allocator, bc: *const BootConfig) void {
 /// 读取并校验 capsule 中的 capability token：必须为 64 位十六进制，校验通过后删除
 /// capsule 文件（单次消费，防重放）。任一校验失败即 fail-closed 返回错误。
 fn readToken(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return readCapsuleHex(io, allocator, path, 64);
+}
+
+/// 读取固定长度的十六进制 capsule 值，并在成功后单次消费。delivery session
+/// ID 是 32 hex；capability token 是 64 hex，二者不可共用固定 64 位校验。
+fn readCapsuleHex(io: std.Io, allocator: std.mem.Allocator, path: []const u8, expected_len: usize) ![]u8 {
     const bytes = try readFile(io, allocator, path);
     defer allocator.free(bytes);
     const token = std.mem.trim(u8, bytes, " \t\r\n");
-    if (token.len != 64) return error.InvalidCapsuleToken;
+    if (token.len != expected_len) return error.InvalidCapsuleToken;
     for (token) |byte| if (!std.ascii.isHex(byte)) return error.InvalidCapsuleToken;
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
     return allocator.dupe(u8, token);
@@ -351,19 +395,29 @@ fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, toke
     }, body) catch {};
 }
 
-/// 用 `sha512sum` 子进程校验下载产物的整体哈希。逐块头合法不代表字节未损坏，
-/// 故下载完成后仍须整段校验（与逐块 Range 校验互为冗余闸）。
-fn verifySha512(io: std.Io, allocator: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
-    const result = try std.process.run(allocator, io, .{ .argv = &.{ "sha512sum", path } });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.SubprocessFailed,
-        else => return error.SubprocessFailed,
+/// 用内建 SHA-512 流式校验下载产物，不依赖最小 initramfs 未必携带的
+/// `sha512sum`。逐块头合法不代表字节未损坏，故下载完成后仍须整段校验
+/// （与逐块 Range 校验互为冗余闸）。
+fn verifySha512(io: std.Io, path: []const u8, expected: []const u8) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false });
+    defer file.close(io);
+    var sha = std.crypto.hash.sha2.Sha512.init(.{});
+    var buf: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const n = try file.readPositionalAll(io, &buf, offset);
+        if (n == 0) break;
+        sha.update(buf[0..n]);
+        offset += n;
     }
-    const actual = std.mem.trim(u8, result.stdout, " \t\r\n");
-    const digest = if (std.mem.indexOfScalar(u8, actual, ' ')) |sp| actual[0..sp] else actual;
-    if (!std.mem.eql(u8, digest, expected)) return error.HashMismatch;
+    var raw: [64]u8 = undefined;
+    sha.final(&raw);
+    var actual: [128]u8 = undefined;
+    _ = std.fmt.bufPrint(&actual, "{x}", .{raw}) catch unreachable;
+    if (!std.mem.eql(u8, &actual, expected)) {
+        log("[nodeforge-initrd] SHA-512 mismatch: expected={s}, actual={s}\n", .{ expected, actual });
+        return error.HashMismatch;
+    }
 }
 
 /// 严格 HEAD + 分块 Range 下载 rootfs（4 MiB/块）。支持断点续传（从 `.part` 已有
@@ -480,12 +534,21 @@ fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
 /// 运行子进程，退出码非 0 即返回 `SubprocessFailed`（initrd 关键步骤不容忍失败）。
 fn mustRun(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    const result = std.process.run(allocator, io, .{ .argv = argv }) catch return error.SubprocessFailed;
+    const result = std.process.run(allocator, io, .{ .argv = argv }) catch |err| {
+        log("[nodeforge-initrd] command exec failed: {s}: {t}\n", .{ argv[0], err });
+        return error.SubprocessFailed;
+    };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     switch (result.term) {
-        .exited => |code| if (code != 0) return error.SubprocessFailed,
-        else => return error.SubprocessFailed,
+        .exited => |code| if (code != 0) {
+            log("[nodeforge-initrd] command failed: {s} exit={d} stderr={s}\n", .{ argv[0], code, result.stderr });
+            return error.SubprocessFailed;
+        },
+        else => {
+            log("[nodeforge-initrd] command terminated abnormally: {s}\n", .{argv[0]});
+            return error.SubprocessFailed;
+        },
     }
 }
 
