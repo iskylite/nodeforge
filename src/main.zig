@@ -239,29 +239,14 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(schema_v3_rollback);
     try addDebugFlag(schema_v3_rollback);
     try schema_v3_command.addCommands(&.{ schema_v3_plan, schema_v3_apply, schema_v3_rollback });
-    const schema_v4_command = try zli.Command.init(init_options, .{ .name = "schema-v4", .description = "Plan, apply, or roll back the schema-v4 diskless migration" }, showCurrentHelp);
-    const schema_v4_plan = try zli.Command.init(init_options, .{ .name = "plan", .description = "Generate a side-effect-free schema-v4 migration plan" }, schemaV4PlanHandler);
-    try addConfigPathFlag(schema_v4_plan);
-    try addOutputFlag(schema_v4_plan);
-    try addDebugFlag(schema_v4_plan);
-    const schema_v4_apply = try zli.Command.init(init_options, .{ .name = "apply", .description = "Apply the exact current schema-v4 migration plan" }, schemaV4ApplyHandler);
-    try schema_v4_apply.addPositionalArg(.{ .name = "plan-digest", .description = "64-character digest returned by schema-v4 plan", .required = true });
-    try addConfigPathFlag(schema_v4_apply);
-    try addOutputFlag(schema_v4_apply);
-    try addDebugFlag(schema_v4_apply);
-    const schema_v4_rollback = try zli.Command.init(init_options, .{ .name = "rollback", .description = "Restore the retained pre-schema-v4 model generation" }, schemaV4RollbackHandler);
-    try schema_v4_rollback.addPositionalArg(.{ .name = "plan-digest", .description = "Digest of the applied schema-v4 migration", .required = true });
-    try addConfigPathFlag(schema_v4_rollback);
-    try addOutputFlag(schema_v4_rollback);
-    try addDebugFlag(schema_v4_rollback);
-    try schema_v4_command.addCommands(&.{ schema_v4_plan, schema_v4_apply, schema_v4_rollback });
+    // schema-v4 迁移命令已移除：开发阶段 setup 始终生成最新 schema 版本，
+    // 不需要手动迁移。schema-v3 迁移保留用于从 v0.1 升级已有数据。
     try catalog.addCommands(&.{
         catalog_validate,
         catalog_export,
         catalog_show,
         catalog_migrate,
         schema_v3_command,
-        schema_v4_command,
     });
 
     // ── node 资源（节点 CRUD + 部署生命周期）──────────────────────────
@@ -502,6 +487,34 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     });
     try addProvisionBundleCommands(assets, init_options);
     try addAssetCatalogCommands(assets, init_options);
+    // v0.2 boot-bundle 命令：创建 diskless profile 引用的 kernel/initrd/rootfs 组合。
+    // 这是 diskless 全流程 CLI 的关键环节。操作员通过 CLI 完成全部操作，
+    // 无需手动编辑 catalog JSON 文件。
+    const boot_bundle = try zli.Command.init(init_options, .{ .name = "boot-bundle", .description = "Manage diskless boot bundles (kernel/initrd/rootfs combinations)" }, showCurrentHelp);
+    const boot_bundle_create = try zli.Command.init(init_options, .{
+        .name = "create",
+        .description = "Create a boot bundle linking kernel, initrd and rootfs assets",
+        .usage = "nodeforge assets boot-bundle create <name> --kernel <asset> --initrd <asset> --rootfs <asset> --distro <d> --version <v> --arch <a> --kernel-release <r> [options]",
+        .help = "Links three registered assets (kernel, nodeforge_initrd, rootfs) into an immutable boot bundle. " ++
+            "The bundle is referenced by diskless profiles via --boot-bundle. " ++
+            "Prerequisites: kernel/initrd/rootfs assets must already be registered via 'nodeforge assets register'. " ++
+            "This command is part of the diskless CLI flow: setup -> import-iso -> register -> rootfs build -> boot-bundle create -> profile create -> node add -> boot-prepare.",
+    }, bootBundleCreateHandler);
+    try boot_bundle_create.addPositionalArg(.{ .name = "name", .description = "Canonical boot bundle name", .required = true });
+    try boot_bundle_create.addFlags(&.{
+        .{ .name = "kernel", .description = "Kernel asset name (kind=kernel)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "initrd", .description = "NodeForge initrd asset name (kind=nodeforge_initrd)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "rootfs", .description = "Rootfs asset name (kind=rootfs)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "distro", .description = "Distro name (e.g. rocky, ubuntu)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "version", .description = "Distro version (e.g. 9.7, 24.04)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "kernel-release", .description = "Kernel uname release string (e.g. 5.14.0-611.5.1.el9_7.aarch64)", .type = .String, .default_value = .{ .String = "" } },
+    });
+    try addConfigPathFlag(boot_bundle_create);
+    try addOutputFlag(boot_bundle_create);
+    try addDebugFlag(boot_bundle_create);
+    try boot_bundle.addCommands(&.{boot_bundle_create});
+    try assets.addCommands(&.{boot_bundle});
 
     // ── runtime 资源（DHCP/TFTP 运行态查看）──────────────────────────────
     const runtime = try zli.Command.init(init_options, .{
@@ -3461,6 +3474,39 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
     }
     const human = try std.fmt.allocPrint(ctx.allocator, "{s} profile created: {s}", .{ kind, name });
     try renderCommandResult(ctx, human, .{ .profile = name, .mode = kind, .install_source = install_source, .boot_bundle = bundle_opt });
+}
+
+fn bootBundleCreateHandler(ctx: zli.CommandContext) !void {
+    // v0.2 diskless CLI 流程：boot-bundle create
+    // 将已注册的 kernel/initrd/rootfs 资产绑定为一个不可拆分的 boot bundle。
+    // 调用 management API POST /api/v1/management/boot-bundles，daemon 校验
+    // 资产类型匹配后原子写入 catalog。操作员无需手动编辑 catalog JSON。
+    _ = outputFromContext(ctx) orelse return;
+    const name = ctx.getArg("name") orelse return;
+    const kernel = ctx.flag("kernel", []const u8);
+    const initrd = ctx.flag("initrd", []const u8);
+    const rootfs = ctx.flag("rootfs", []const u8);
+    const distro = ctx.flag("distro", []const u8);
+    const version = ctx.flag("version", []const u8);
+    const arch = ctx.flag("arch", []const u8);
+    const kernel_release = ctx.flag("kernel-release", []const u8);
+    if (kernel.len == 0 or initrd.len == 0 or rootfs.len == 0 or distro.len == 0 or version.len == 0 or arch.len == 0 or kernel_release.len == 0) {
+        try writeCommandError(ctx, "boot_bundle.invalid", "boot-bundle create: all flags --kernel, --initrd, --rootfs, --distro, --version, --arch, --kernel-release are required", 2);
+        return;
+    }
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.bootBundleCreate(ctx.io, config.value.server.http_port, name, distro, version, arch, kernel_release, kernel, initrd, rootfs, &reason);
+    if (!result.healthy) {
+        try reportMutationFailure(ctx, result, "boot-bundle create failed: daemon unreachable");
+        return;
+    }
+    const human = try std.fmt.allocPrint(ctx.allocator, "boot bundle created: {s} (kernel={s}, initrd={s}, rootfs={s})", .{ name, kernel, initrd, rootfs });
+    try renderCommandResult(ctx, human, .{ .name = name, .kernel = kernel, .initrd = initrd, .rootfs = rootfs });
 }
 
 fn profileRootfsPlanHandler(ctx: zli.CommandContext) !void {

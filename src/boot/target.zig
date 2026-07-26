@@ -51,9 +51,11 @@ pub const BootTarget = struct {
 ///   initrd 下载 ISO 并 loop mount 为 live 文件系统。M4 会追加
 ///   `autoinstall ds=nocloud-net;...`。
 ///
-/// diskless mode：从 boot bundle 取 kernel/initrd asset 路径并生成 M5 预留的
-/// config URL cmdline。此函数不构建 initrd、不提供 rootfs 下载，也不代表
-/// diskless 端到端链路已经完成。
+/// diskless mode：从 boot bundle 取 kernel/initrd asset 路径并生成 diskless
+/// config URL cmdline。cmdline 携带 `nodeforge.config_url` 和 `nodeforge.node`；
+/// `nodeforge.session` 由 capsule 文件提供（initrd 从 `/capsule/session` 读取），
+/// 不放入 GRUB cmdline，因为 TFTP 层无法获知 diskless session ID（该 session
+/// 由 `node boot-prepare` 或 daemon on-the-fly 创建，与 DHCP session 独立）。
 ///
 /// discovery mode：返回 null（不提供 kernel/initrd），节点只做网络诊断。
 ///
@@ -69,7 +71,11 @@ pub fn resolve(
     http_port: u16,
     cmdline_buf: []u8,
 ) ?BootTarget {
-    return resolveInstall(identity, config, catalog, server_ip, http_port, cmdline_buf);
+    const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
+    return switch (profile.kind) {
+        .install => resolveInstall(identity, config, catalog, server_ip, http_port, cmdline_buf),
+        .diskless => resolveDiskless(identity, config, catalog, server_ip, http_port, cmdline_buf),
+    };
 }
 
 /// 解析 install 模式的 boot target。
@@ -180,6 +186,61 @@ fn resolveInstall(
 
 /// 将 profile 的额外 kernel_args 追加到基础 cmdline 后面，以空格分隔。
 /// 返回拼接后的完整 cmdline 切片；缓冲区不足时返回 null（调用方记录警告日志）。
+/// 解析 diskless 模式的 boot target。
+///
+/// 责任链：profile → boot_bundle → kernel/initrd assets → cmdline。
+/// diskless profile 必须引用一个 boot bundle；bundle 中的 kernel asset
+/// kind 必须为 `.kernel`，initrd asset kind 必须为 `.nodeforge_initrd`。
+///
+/// cmdline 生成：`nodeforge.config_url=http://<server>:<port>/api/v1/nodes/<node>/boot-config`
+/// `nodeforge.node=<node_id>` `console=ttyAMA0`（aarch64 串口）。session 由
+/// capsule 文件提供，不在 cmdline 中（initrd 从 `/capsule/session` 读取 fallback）。
+/// Profile 级 `kernel_args` 追加到末尾。
+fn resolveDiskless(
+    identity: TftpBootIdentity,
+    config: *const model.AppConfig,
+    catalog: *const model.Catalog,
+    server_ip: []const u8,
+    http_port: u16,
+    cmdline_buf: []u8,
+) ?BootTarget {
+    _ = identity.mac;
+    _ = identity.lease_ip;
+
+    const profile = lookup.findProfile(catalog, identity.profile) orelse lookup.findProfile(config, identity.profile) orelse return null;
+    if (profile.kind != .diskless) return null;
+
+    const bundle_name = profile.boot_bundle orelse return null;
+    const bundle = lookup.findBootBundle(catalog, bundle_name) orelse return null;
+
+    const kernel_asset = lookup.findAsset(catalog, bundle.kernel) orelse return null;
+    const initrd_asset = lookup.findAsset(catalog, bundle.initrd) orelse return null;
+
+    if (kernel_asset.kind != .kernel) return null;
+    if (initrd_asset.kind != .nodeforge_initrd) return null;
+
+    const kernel_path = toGrubPath(kernel_asset.path) orelse return null;
+    const initrd_path = toGrubPath(initrd_asset.path) orelse return null;
+
+    const base = std.fmt.bufPrint(
+        cmdline_buf,
+        "nodeforge.config_url=http://{s}:{d}/api/v1/nodes/{s}/boot-config nodeforge.node={s} console=ttyAMA0",
+        .{ server_ip, http_port, identity.node_id, identity.node_id },
+    ) catch return null;
+
+    const cmdline = appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
+        log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.node_id, profile.kernel_args.?.len });
+        return null;
+    };
+
+    return .{
+        .kernel_path = kernel_path,
+        .initrd_path = initrd_path,
+        .cmdline = cmdline,
+        .arch = bundle.arch,
+    };
+}
+
 fn appendKernelArgs(buf: []u8, base: []const u8, kernel_args: ?[]const u8) ?[]const u8 {
     const extra = kernel_args orelse return base;
     if (extra.len == 0) return base;

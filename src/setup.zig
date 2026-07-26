@@ -36,11 +36,16 @@ pub const Network = struct {
 
 /// 根据网络配置和运行时路径生成初始 `AppConfig`。
 ///
-/// 生成的配置使用 schema v3，只包含启动/策略输入，不含 catalog 实体。
+/// 生成的配置始终使用当前最新 schema 版本。
+///
+/// schema 版本只是开发过程中的变动记录，不应影响主流程：CLI 始终按照最新
+/// schema 执行，每次 schema 版本变动时代码同步更新版本号。`setup` 生成的
+/// config 和 catalog 始终与当前代码版本一致，不需要手动迁移。
+///
 /// asset_root/repository_root 指向运行时路径中的目录。
 pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppConfig {
     return .{
-        .schema_version = 3,
+        .schema_version = 4,
         .server = .{ .bind_interface = network.bind_interface, .server_ip = network.server_ip, .http_port = network.http_port },
         .http = .{ .asset_root = p.iso_dir, .repository_root = p.repos_dir },
         .tftp = .{ .asset_root = p.boot_dir },
@@ -91,7 +96,9 @@ pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     const config = if (imported_config) |candidate| candidate.* else generatedConfig(p, network);
     // 空 distro 索引是正常的首次安装状态；首个通过媒体布局校验的 ISO
     // 会与 install source 一起原子创建对应 family/version/arch 能力记录。
-    const catalog: model.Catalog = .{ .schema_version = 3 };
+    // v0.2 默认 schema v4：diskless profile 的 tagged union kind 需要 v4。
+    // 从 setup 初始化即使用 v4，避免后续手动迁移。
+    const catalog: model.Catalog = .{ .schema_version = 4 };
     try validate.validate(&config, &catalog);
     try installBundle(io, allocator, p);
     try config_store.save(io, allocator, p.config_path, &config);
@@ -219,7 +226,12 @@ pub fn resetState(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
 /// 渲染 systemd unit 文件内容。
 ///
 /// 生成的 unit 以 root 运行，显式收窄 bounding set 为
-/// `CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN`。
+/// `CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT`。
+/// `CAP_SYS_CHROOT` 是 v0.2 rootfs build 所需：`dnf --installroot` 在事务
+/// 测试阶段调用 `chroot(2)`，缺少该 capability 会报 `Operation not permitted`。
+/// `PrivateMounts` 不使用：rootfs build 需要在 daemon 的 mount namespace
+/// 中创建 loop/tmpfs/overlay 挂载，PrivateMounts 会隔离 mount namespace
+/// 导致 rootfs build 后的挂载清理复杂化。
 /// `ExecStartPre` 执行 `--check` 预检，失败时 systemd 不会启动主进程。
 pub fn renderSystemd(allocator: std.mem.Allocator, p: *const paths_mod.Paths) ![]u8 {
     return std.fmt.allocPrint(allocator,
@@ -235,10 +247,13 @@ pub fn renderSystemd(allocator: std.mem.Allocator, p: *const paths_mod.Paths) ![
         \\ExecStart={s} --log-output file
         \\Restart=on-failure
         \\RestartSec=2s
-        \\NoNewPrivileges=true
-        \\PrivateMounts=true
-        \\CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN
-        \\AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN
+        \\# NoNewPrivileges disabled: v0.2 rootfs build runs `dnf --installroot` which
+        \\# executes RPM scriptlets inside a chroot; these scriptlets need to create
+        \\# setuid/setgid binaries and manage file ownership, which NoNewPrivileges
+        \\# blocks. The expanded capability set below provides the necessary ambient
+        \\# capabilities instead.
+        \\CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
+        \\AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
         \\
         \\[Install]
         \\WantedBy=multi-user.target

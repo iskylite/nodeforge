@@ -82,6 +82,8 @@ pub const provision_node_apply = @import("provision/node_apply.zig");
 pub const provision_rootfs_build_executor = @import("provision/rootfs_build_executor.zig");
 /// v0.2 rootfs OS-layer builder：用发行版原生 install-root 工具从受管 repository 构建 OS 层 lower。
 pub const provision_rootfs_os_builder = @import("provision/rootfs_os_builder.zig");
+/// v0.2 initrd builder：用 dracut 构建最小 initramfs，注入 nodeforge-initrd 二进制和 /init 脚本。
+pub const provision_initrd_build_executor = @import("provision/initrd_build_executor.zig");
 pub const initrd_memory = @import("initrd/memory.zig");
 pub const initrd_download = @import("initrd/download.zig");
 
@@ -89,6 +91,7 @@ test {
     _ = provision_node_apply;
     _ = provision_rootfs_build_executor;
     _ = provision_rootfs_os_builder;
+_ = provision_initrd_build_executor;
     _ = initrd_memory;
     _ = initrd_download;
 }

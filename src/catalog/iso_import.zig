@@ -1,4 +1,4 @@
-//! Linux 安装介质导入器（M3 基线，M4.9 fresh bootloader 自举）。
+//! Linux 安装介质导入器（M3 基线，v0.2 内容寻址 bootloader）。
 //!
 //! 导入器有意使用内核的只读 loop mount 而非 ISO 解析器或第三方提取工具。
 //! 它从不暴露 mount：所有发布的文件在 catalog 快照被原子替换之前都已复制到
@@ -12,6 +12,12 @@
 //!
 //! catalog 是对 HTTP/TFTP 可见性的唯一提交点；任何未发布文件都不能经 resolver 访问。
 //! 导入不会实现后台 job：CLI 等待本地 daemon 的有界 worker 结果。
+//!
+//! v0.2 bootloader 内容寻址：UEFI GRUB 二进制不再使用固定路径
+//! `efi/grubaa64.efi`，改为 `efi/<sha256[:16]>-grubaa64.efi`。不同发行版
+//! （如 Rocky vs Ubuntu）的 GRUB 内容不同时，各自获得独立路径，不再冲突；
+//! 同内容的 ISO 导入自动复用已发布文件。这消除了 M4.9 的
+//! BootloaderContentConstraint 和 copyFileIfMissing 逻辑。
 
 const std = @import("std");
 const model = @import("../model.zig");
@@ -124,15 +130,11 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     const iso_rel = try allocator.dupe(u8, request.filename);
     const kernel_rel = try std.fmt.allocPrint(allocator, "install/{s}/vmlinuz", .{source_name});
     const initrd_rel = try std.fmt.allocPrint(allocator, "install/{s}/initrd.img", .{source_name});
-    const bootloader_rel = canonicalBootloaderPath(detected.arch);
     const bootloader_media_rel = findBootloaderMediaPath(io, staged_repo, detected.arch);
+    // bootloader 路径在计算 SHA-256 后确定（内容寻址），见下方 bootloader_rel 赋值。
     const iso_destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.asset_root, iso_rel });
     defer allocator.free(iso_destination);
-    const bootloader_destination = if (bootloader_media_rel != null)
-        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tftp.asset_root, bootloader_rel })
-    else
-        null;
-    defer if (bootloader_destination) |path| allocator.free(path);
+    // bootloader_destination 在下方计算 SHA-256 后确定（内容寻址路径）。
     const kernel_destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tftp.asset_root, kernel_rel });
     defer allocator.free(kernel_destination);
     const initrd_destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tftp.asset_root, initrd_rel });
@@ -155,8 +157,7 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     var initrd_created = false;
     var repository_created = false;
     defer if (!retain_outputs) removeCreatedOutputPaths(io, allocator, iso_destination, kernel_destination, initrd_destination, repo_destination, iso_created, kernel_created, initrd_created, repository_created);
-    defer if (!retain_outputs and bootloader_created)
-        std.Io.Dir.cwd().deleteFile(io, bootloader_destination.?) catch {};
+    // bootloader_destination 的清理 defer 在下方定义后添加。
 
     const mounted_kernel = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staged_repo, media.kernel_path });
     defer allocator.free(mounted_kernel);
@@ -167,19 +168,48 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     else
         null;
     defer if (mounted_bootloader) |path| allocator.free(path);
+    // 计算 bootloader SHA-256 以确定内容寻址路径。
+    // 不同发行版（如 Rocky vs Ubuntu）可能携带不同版本的 GRUB 二进制；
+    // 使用内容寻址路径（efi/<sha256前缀>-grubaa64.efi）确保同内容复用、
+    // 不同内容共存，避免 BootloaderContentConflict。
+    var bootloader_hash: [64]u8 = undefined;
+    const bootloader_rel: []const u8 = if (bootloader_media_rel) |media_path| blk: {
+        const mounted_bootloader_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staged_repo, media_path });
+        defer allocator.free(mounted_bootloader_path);
+        // sha256Path 输出 [32]u8 原始字节，需转为 [64]u8 十六进制字符串。
+        var raw_hash: [32]u8 = undefined;
+        try sha256Path(io, mounted_bootloader_path, &raw_hash);
+        const hex_chars = "0123456789abcdef";
+        for (&raw_hash, 0..) |byte, i| {
+            bootloader_hash[i * 2] = hex_chars[byte >> 4];
+            bootloader_hash[i * 2 + 1] = hex_chars[byte & 0xf];
+        }
+        break :blk try contentAddressedBootloaderPath(allocator, detected.arch, &bootloader_hash);
+    } else "";
+    defer if (bootloader_rel.len > 0) allocator.free(bootloader_rel);
+
+    // 重新计算 bootloader_destination（依赖 bootloader_rel）
+    const bootloader_destination = if (bootloader_media_rel != null)
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.tftp.asset_root, bootloader_rel })
+    else
+        null;
+    defer if (bootloader_destination) |path| allocator.free(path);
+    defer if (!retain_outputs and bootloader_created)
+        std.Io.Dir.cwd().deleteFile(io, bootloader_destination.?) catch {};
+
     try copyFileNoClobber(io, allocator, input, iso_destination, &iso_created);
     if (mounted_bootloader) |source|
-        try copyFileIfMissing(io, allocator, source, bootloader_destination.?, &bootloader_created);
+        try copyFileNoClobber(io, allocator, source, bootloader_destination.?, &bootloader_created);
     try copyFileNoClobber(io, allocator, mounted_kernel, kernel_destination, &kernel_created);
     try copyFileNoClobber(io, allocator, mounted_initrd, initrd_destination, &initrd_created);
     // 媒体树始终发布；是否同时暴露为 package repository 由 metadata 完整性决定。
     try copyTreeNoClobber(io, allocator, staged_repo, repo_destination, &repository_created);
 
     var iso_hash: [64]u8 = undefined;
-    var bootloader_hash: [64]u8 = undefined;
     var kernel_hash: [64]u8 = undefined;
     var initrd_hash: [64]u8 = undefined;
     try assets.sha256File(io, config.http.asset_root, iso_rel, &iso_hash);
+    // bootloader_hash 已在上方计算（从 staged 文件），此处从已发布文件重新校验。
     if (bootloader_media_rel != null)
         try assets.sha256File(io, config.tftp.asset_root, bootloader_rel, &bootloader_hash);
     try assets.sha256File(io, config.tftp.asset_root, kernel_rel, &kernel_hash);
@@ -208,16 +238,19 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
         .source_label = detected.source_label,
         .iso_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .kind = .iso, .path = iso_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &iso_hash) },
         .bootloader_asset = if (bootloader_media_rel != null) .{
-            .name = canonicalBootloaderName(detected.arch),
+            .name = try contentAddressedBootloaderName(allocator, detected.arch, &bootloader_hash),
             .kind = .bootloader,
             .path = bootloader_rel,
             .sha256 = try allocator.dupe(u8, &bootloader_hash),
         } else null,
         .bootloader_created = bootloader_created,
-        .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
+        // kernel 资产名称使用 -kernel（而非 -installer-kernel），因为 kind=kernel 的
+// 资产既用于 install PXE boot 也用于 diskless PXE boot。boot bundle 的 kernel
+// 字段引用此资产。命名应反映通用性，不暗示仅限 installer 使用。
+.kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
         .initrd_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .kind = .installer_initrd, .path = initrd_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &initrd_hash) },
         .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = model.packageManagerForFamily(detected.family), .base_url = if (base.len == 0) try allocator.dupe(u8, media_tree_url) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base }), .software_index = repository_index } else null,
-        .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-installer-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names },
+        .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names },
     };
     retain_outputs = true;
     return result;
@@ -597,27 +630,22 @@ fn copyFileNoClobber(io: std.Io, allocator: std.mem.Allocator, source: []const u
     try run(io, allocator, &.{ "cp", "--no-dereference", "--no-clobber", source, destination });
 }
 
-/// M4.9 fresh-deployment 修复：UEFI bootloader 是每个架构共享的 canonical
-/// TFTP 对象。后续导入同架构 ISO 时只复用内容完全相同的已发布文件；
-/// 同一路径内容不同说明新介质试图替换正在使用的共享启动链，必须 fail
-/// closed，不能静默沿用旧文件或覆盖它。
-fn copyFileIfMissing(io: std.Io, allocator: std.mem.Allocator, source: []const u8, destination: []const u8, created: *bool) !void {
-    const parent = std.fs.path.dirname(destination) orelse return error.InvalidImportDestination;
-    try std.Io.Dir.cwd().createDirPath(io, parent);
-    if (std.Io.Dir.cwd().openFile(io, destination, .{})) |file| {
-        var opened = file;
-        opened.close(io);
-        var source_digest: [32]u8 = undefined;
-        var destination_digest: [32]u8 = undefined;
-        try sha256Path(io, source, &source_digest);
-        try sha256Path(io, destination, &destination_digest);
-        if (!std.crypto.timing_safe.eql([32]u8, source_digest, destination_digest))
-            return error.BootloaderContentConflict;
-        return;
-    } else |err| if (err != error.FileNotFound) return err;
-    created.* = true;
-    try run(io, allocator, &.{ "cp", "--no-dereference", "--no-clobber", source, destination });
-}
+/// v0.2 bootloader 内容寻址设计说明
+/// =================================
+/// M4.9 设计中 bootloader 使用固定路径 `efi/grubaa64.efi`，当不同发行版
+/// （如 Rocky 和 Ubuntu）的 GRUB 二进制内容不同时，第二个 ISO 导入触发
+/// `BootloaderContentConflict`，导致操作员无法在同一 NodeForge 实例中
+/// 同时管理多个发行版。
+///
+/// v0.2 改为内容寻址路径 `efi/<sha256[:16]>-grubaa64.efi`：
+/// - **同内容复用**：相同 GRUB 二进制得到相同路径，`copyFileNoClobber` 自动跳过
+/// - **不同内容共存**：不同 GRUB 二进制得到不同路径，互不干扰
+/// - **DHCP option 67**：boot resolver 从 catalog bootloader_asset.path 读取
+///   正确的内容寻址路径，在 per-node DHCP 响应中下发
+/// - **清理安全**：每个 bootloader 有唯一路径，导入回滚只删除本次创建的文件
+///
+/// 该设计消除了 `copyFileIfMissing`/`sha256Path` 的内容比较需求和
+/// `BootloaderContentConflict` 错误。`sha256Path` 仍用于计算内容寻址哈希。
 
 /// 对 importer 已约束出的普通文件路径计算原始 SHA-256。source 来自只读
 /// mount 的已验证 EFI 路径，destination 位于受管 TFTP root；调用方不得将
@@ -639,17 +667,29 @@ fn sha256Path(io: std.Io, path: []const u8, out: *[32]u8) !void {
     hash.final(out);
 }
 
-fn canonicalBootloaderPath(arch: model.Arch) []const u8 {
-    return switch (arch) {
-        .aarch64 => "efi/grubaa64.efi",
-        .x86_64 => "efi/grubx64.efi",
+/// 生成内容寻址的 bootloader TFTP 路径：`efi/<sha256[:16]>-grubaa64.efi`。
+/// 使用 SHA-256 前 16 个十六进制字符（8 字节）作为区分前缀，足以避免
+/// 实际碰撞。同内容 ISO 导入得到相同路径（复用），不同内容得到不同路径。
+fn contentAddressedBootloaderPath(allocator: std.mem.Allocator, arch: model.Arch, hash: *const [64]u8) ![]const u8 {
+    const prefix = hash[0..16]; // 8 字节 = 16 hex chars
+    const filename = switch (arch) {
+        .aarch64 => "grubaa64.efi",
+        .x86_64 => "grubx64.efi",
     };
+    return std.fmt.allocPrint(allocator, "efi/{s}-{s}", .{ prefix, filename });
 }
 
-fn canonicalBootloaderName(arch: model.Arch) []const u8 {
+/// 生成内容寻址的 bootloader catalog 名称：`grub-uefi-<arch>-<sha256[:16]>`。
+fn contentAddressedBootloaderName(allocator: std.mem.Allocator, arch: model.Arch, hash: *const [64]u8) ![]const u8 {
+    const prefix = hash[0..16];
+    return std.fmt.allocPrint(allocator, "grub-uefi-{s}-{s}", .{ @tagName(arch), prefix });
+}
+
+/// 返回 bootloader 文件名（不含路径），用于 TFTP path 构造。
+fn bootloaderFilename(arch: model.Arch) []const u8 {
     return switch (arch) {
-        .aarch64 => "grub-uefi-aarch64",
-        .x86_64 => "grub-uefi-x86-64",
+        .aarch64 => "grubaa64.efi",
+        .x86_64 => "grubx64.efi",
     };
 }
 
@@ -670,29 +710,29 @@ fn findBootloaderMediaPath(io: std.Io, root: []const u8, arch: model.Arch) ?[]co
     return null;
 }
 
-test "canonical UEFI bootloader paths match DHCP option 67" {
-    try std.testing.expectEqualStrings("efi/grubaa64.efi", canonicalBootloaderPath(.aarch64));
-    try std.testing.expectEqualStrings("efi/grubx64.efi", canonicalBootloaderPath(.x86_64));
-    try std.testing.expectEqualStrings("grub-uefi-aarch64", canonicalBootloaderName(.aarch64));
+test "content-addressed UEFI bootloader paths use SHA-256 prefix" {
+    const hash = "abcdef0123456789" ** 4; // 64 hex chars
+    const path_aarch64 = try contentAddressedBootloaderPath(std.testing.allocator, .aarch64, hash);
+    defer std.testing.allocator.free(path_aarch64);
+    try std.testing.expectEqualStrings("efi/abcdef0123456789-grubaa64.efi", path_aarch64);
+
+    const path_x86_64 = try contentAddressedBootloaderPath(std.testing.allocator, .x86_64, hash);
+    defer std.testing.allocator.free(path_x86_64);
+    try std.testing.expectEqualStrings("efi/abcdef0123456789-grubx64.efi", path_x86_64);
+
+    const name_aarch64 = try contentAddressedBootloaderName(std.testing.allocator, .aarch64, hash);
+    defer std.testing.allocator.free(name_aarch64);
+    try std.testing.expectEqualStrings("grub-uefi-aarch64-abcdef0123456789", name_aarch64);
 }
 
-test "shared UEFI bootloader reuse requires identical content" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer std.testing.allocator.free(root);
-    const source = try std.fmt.allocPrint(std.testing.allocator, "{s}/source.efi", .{root});
-    defer std.testing.allocator.free(source);
-    const destination = try std.fmt.allocPrint(std.testing.allocator, "{s}/efi/grubaa64.efi", .{root});
-    defer std.testing.allocator.free(destination);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, std.fs.path.dirname(destination).?);
-    try dhcp_store.atomicWrite(std.testing.io, source, "same bootloader");
-    try dhcp_store.atomicWrite(std.testing.io, destination, "same bootloader");
-    var created = false;
-    try copyFileIfMissing(std.testing.io, std.testing.allocator, source, destination, &created);
-    try std.testing.expect(!created);
-    try dhcp_store.atomicWrite(std.testing.io, source, "different bootloader");
-    try std.testing.expectError(error.BootloaderContentConflict, copyFileIfMissing(std.testing.io, std.testing.allocator, source, destination, &created));
+test "content-addressed paths differ for different content" {
+    const hash1 = "1111111111111111" ** 4;
+    const hash2 = "2222222222222222" ** 4;
+    const path1 = try contentAddressedBootloaderPath(std.testing.allocator, .aarch64, hash1);
+    defer std.testing.allocator.free(path1);
+    const path2 = try contentAddressedBootloaderPath(std.testing.allocator, .aarch64, hash2);
+    defer std.testing.allocator.free(path2);
+    try std.testing.expect(!std.mem.eql(u8, path1, path2));
 }
 
 fn runAt(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.process.Child.Cwd) !void {

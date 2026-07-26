@@ -1,8 +1,72 @@
 # NodeForge v0.2 设计范围
 
-状态：设计冻结，实现未开始。本文是 v0.2 的**唯一总纲入口**，负责版本边界、跨分册不变式、实现切片和完成标准；
-在 v0.1 完成前，不把这里的类型、命令或脚手架描述为已实现能力。具体架构、程序、实现、CLI 和操作细节由下列
-分册各自负责，本文不重复维护其完整细节。
+状态：开发中（实现进行中）。本文是 v0.2 的**唯一总纲入口**，负责版本边界、跨分册不变式、实现切片和完成标准。
+具体架构、程序、实现、CLI 和操作细节由下列分册各自负责，本文不重复维护其完整细节。
+
+## 实现修订记录
+
+以下修订基于 v0.2 开发验证中的实际发现，直接修改设计而非创建独立验证文档：
+
+### R1. setup 默认 schema v4
+
+**问题**：`generatedConfig` 和 `initialize` 生成 schema v3 配置和 catalog，导致 diskless profile 创建前必须手动执行
+`catalog schema-v4 plan/apply` 迁移。
+
+**修订**：schema 版本只是开发过程中的变动记录，不应影响主流程。CLI 始终按照最新 schema 执行，
+每次 schema 版本变动时代码同步更新版本号。`setup.zig` 的 `generatedConfig()` 和 `initialize()`
+始终生成当前最新 schema 版本（v4），`setup --reconfigure` 也生成 v4，不需要手动迁移。
+`catalog schema-v4 plan/apply/rollback` CLI 命令已从命令树移除；schema-v3 迁移保留用于从 v0.1 升级已有数据。
+
+### R2. resolveDiskless — diskless PXE boot target
+
+**问题**：`boot/target.zig` 的 `resolve()` 只调用 `resolveInstall()`，diskless profile 的 PXE boot 无法生成 GRUB 配置。
+
+**修订**：`resolve()` 按 profile kind 分发：install → `resolveInstall()`，diskless → `resolveDiskless()`。
+`resolveDiskless()` 从 boot bundle 取 kernel（kind=kernel）和 initrd（kind=nodeforge_initrd）路径，
+生成 cmdline：`nodeforge.config_url=http://<server>:<port>/api/v1/nodes/<node>/boot-config `
+`nodeforge.node=<node_id>` `console=ttyAMA0`。
+
+**设计决策**：`nodeforge.session` 不放入 GRUB cmdline，因为 TFTP 层无法获知 diskless session ID
+（该 session 由 `node boot-prepare` 创建，与 DHCP session 独立）。initrd 从 `/capsule/session` 文件读取 session（见 R3）。
+
+### R3. initrd capsule session fallback
+
+**问题**：`initrd.zig` 只从 kernel cmdline 读取 `nodeforge.session`。PXE boot 模式下 GRUB cmdline 不含 session
+（TFTP 层无法获知 diskless session ID），initrd 会因 `MissingSession` 而 panic。
+
+**修订**：`initrd.zig` 增加 `capsule_session_path = "/capsule/session"` 常量。当 cmdline 中无 `nodeforge.session`
+时，initrd 从 `/capsule/session` capsule 文件读取。两种来源统一由 allocator 持有，避免 cmdline buffer 双重 free。
+
+### R4. setup capabilities — rootfs build 兼容
+
+**问题**：`renderSystemd()` 生成的 systemd unit 使用 `NoNewPrivileges=true` 和 `PrivateMounts=true`，
+导致 daemon 内 `dnf --installroot`（profile rootfs build）失败：
+- `chroot(2)` 需要 `CAP_SYS_CHROOT`（原 bounding set 缺少）
+- RPM scriptlets 创建 setuid 二进制需要特权（`NoNewPrivileges` 阻止）
+- mount namespace 隔离导致 rootfs build 后挂载清理复杂化
+
+**修订**：
+- 移除 `PrivateMounts=true`
+- 禁用 `NoNewPrivileges`（注释说明根因）
+- 扩展 capability set：`CAP_SYS_CHROOT CAP_MKNOD CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE`
+
+### R5. initrd 构建
+
+**实现**：`src/provision/initrd_build_executor.zig` 模块通过 `dracut` 构建最小 initramfs
+（network + base 模块，squashfs/overlay 文件系统），注入 `nodeforge-initrd` 二进制到
+`/usr/sbin/`，创建 `/init` 脚本和 `/capsule` 目录，重包为 gzip cpio initramfs。
+与 `rootfs_os_builder` 一致，使用外部命令（dracut/cpio/gzip），属环境相关执行边界。
+
+### R6. ISO 导入自动注册 diskless 可复用资产
+
+**修订**：`iso_import.zig` 导入 ISO 时注册的 kernel 资产从 `<source>-installer-kernel` 改名为
+`<source>-kernel`。该资产 kind=kernel，既用于 install PXE boot 也用于 diskless boot bundle 的
+kernel 字段。命名去掉了 `-installer-` 前缀，明确表示 kernel 通用复用，不需要为 diskless
+单独注册 kernel 资产。
+
+**仍需单独构建的资产**：
+- `nodeforge_initrd`（kind=nodeforge_initrd）：需要 `nodeforge-initrd` 二进制 + dracut 构建（见 R5）
+- `rootfs`（kind=rootfs）：需要 `dnf --installroot` + mksquashfs 构建（`profile rootfs build`）
 
 ## 0. 文档结构与阅读路径
 
@@ -36,7 +100,7 @@
 
 ## 1. 进入条件
 
-v0.2 必须基于 `V0_1_DESIGN.md` 冻结后的 schema v3 和 effective plan，至少满足：
+v0.2 必须基于 `V0_1_DESIGN.md` 冻结后的 schema v3 和 effective plan，至少满足（**注**：v0.2 开发阶段 `setup` 直接生成 schema v4，无需手动迁移）：
 
 - M0-M4 与 M4.13 全部自动化和双发行版 PXE 回归通过。
 - Node/Profile/Resource/Override/Effective/Runtime 所有权不再存在兼容 fallback。
@@ -55,6 +119,8 @@ v0.2 聚焦 diskless 主流程。原 M5-M7 拆分到三个版本，避免把 VMw
 | 版本 | 范围 | 对应里程碑 |
 |---|---|---|
 | v0.2 | diskless only | M5 内存无盘启动 + M7 diskless 后处理（`rootfs-build`/`first-boot`） |
+| v0.2.1 | Ubuntu diskless | Ubuntu casper squashfs 叠加方案，支持 Rocky/RHEL 宿主构建 Ubuntu 无盘系统，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
+| v0.2.2 | 异架构/实机验证 | x86_64 UEFI smoke + VMware compute_use 实机 PXE 验证矩阵，见 [`V0_2_2_RESERVED.md`](../validation/V0_2_2_RESERVED.md) |
 | v0.3 | PXELINUX/BIOS install | M6 BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v5 + M7 `install-post`，见 `V0_3_DESIGN.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 | v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
@@ -960,3 +1026,70 @@ Node override，成功后在同一 PID `exec /sbin/init`；systemd 启动后的�
 `nodeforge-agent --pre-init` 定义为单次启动执行框架：继承 bootstrap 网络，从服务端拉取 session-pinned AgentPlan 和全部
 Node payload，校验 digest/feature 后清零 `agent:read` token，再按固定 stage 应用 Node override。initrd 不下载 AgentPlan/
 Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或远程命令，节点侧也不重新 merge Profile/Node。
+
+**第二十九轮（BootloaderContentConflict 修复 / diskless CLI 流程补全 / initrd 依赖清理）**：
+
+> **设计原则**：v0.2 diskless 全流程必须通过 CLI 完成，操作员不应手动编辑 catalog JSON 文件。
+> 手动编辑 catalog 只在故障恢复或紧急诊断时作为最后手段。正常操作流程中，所有 catalog 实体
+> （assets、boot-bundles、profiles、nodes 等）的创建和修改都通过 `nodeforge` CLI 命令完成，
+> CLI 通过 management API 调用 daemon，由 daemon 执行原子事务写入 catalog store。
+
+1. **Bootloader 内容寻址路径**：不同发行版（Rocky vs Ubuntu）的 UEFI GRUB 二进制内容不同，固定路径
+   `efi/grubaa64.efi` 导致第二个 ISO 导入时 `BootloaderContentConflict`。改为内容寻址路径
+   `efi/<sha256[:16]>-grubaa64.efi`：同内容复用（零浪费）、不同内容共存（无冲突）。DHCP option 67
+   在 per-node 配置中引用正确的 bootloader 路径。这消除了 M4.9 的 `copyFileIfMissing` 逻辑和
+   `BootloaderContentConflict` 错误，使不同发行版的 ISO 可以在同一 NodeForge 实例中无缝共存。
+
+2. **diskless CLI 完整流程**：v0.2 diskless 从初始化到节点启动的完整流程全部通过 CLI 实现。
+   补充 `nodeforge assets boot-bundle create` 命令和 `POST /api/v1/management/boot-bundles` API
+   作为流程中最后缺失的环节。完整流程如下：
+   ```
+   # 1. 初始化 NodeForge 实例
+   nodeforge setup --install-root /opt/nodeforge --server-ip <ip> --subnet <cidr> ...
+
+   # 2. 导入安装介质（自动提取 bootloader/kernel/initrd/repository）
+   nodeforge assets import-iso <iso-file>
+
+   # 3. 注册 diskless 专用资产（kernel 和 nodeforge-initrd 从 ISO 或单独构建）
+   nodeforge assets register --type kernel --name <k> --path <p> --distro <d> --version <v> --arch <a> --kernel-release <r>
+   nodeforge assets register --type nodeforge_initrd --name <i> --path <p>
+
+   # 4. 构建并注册 rootfs（从 install source 派生 diskless rootfs squashfs）
+   nodeforge profile rootfs build <diskless-profile>
+
+   # 5. 创建 boot bundle（绑定 kernel/initrd/rootfs 为不可拆分组合）
+   nodeforge assets boot-bundle create <name> --kernel <k> --initrd <i> --rootfs <r> \
+     --distro <d> --version <v> --arch <a> --kernel-release <r>
+
+   # 6. 创建 diskless profile（引用 boot bundle）
+   nodeforge profile create <name> <install-source> --kind diskless --boot-bundle <name>
+
+   # 7. 注册节点
+   nodeforge node add <id> --mac <mac> --arch <a> --profile <name>
+
+   # 8. 准备 diskless 启动会话（签发 token capsule、生成 BootConfig）
+   nodeforge node boot-prepare <id>
+
+   # 节点网络启动后自动执行：
+   #   DHCP → TFTP bootloader → kernel + nodeforge-initrd →
+   #   HTTP BootConfig → HTTP rootfs download → squashfs mount → overlay →
+   #   switch_root → nodeforge-agent --pre-init → /sbin/init
+   ```
+   上述每一步都通过 CLI → management API → daemon → catalog store 原子事务完成。
+   操作员不需要在任何步骤中手动编辑 `catalog/boot_bundles.json` 或其他 catalog JSON 文件。
+
+3. **nodeforge-initrd 依赖清理**：`build.zig` 中 initrd 和 agent 模块添加 `single_threaded = true`，
+   消除 Zig stdlib 引入的 libpthread 依赖。Zig stdlib 在 `link_libc = true` 时默认引用 pthread 符号
+   （如 `pthread_create`/`pthread_mutex_init`）。glibc >= 2.34 将 pthread 合并入 libc，但交叉编译
+   sysroot 可能使用 glibc < 2.34，导致链接产物包含 `NEEDED libpthread.so.0`。最小 initrd 环境中
+   不包含该库，二进制无法加载。`single_threaded = true` 阻止 stdlib 引入任何 pthread 符号。
+   同时添加 `strip = true`（ReleaseSafe/ReleaseFast 模式）减小二进制体积。
+
+4. **initrd 挂载修复**：在 `nodeforge-initrd` main() 开头：
+   - 显式挂载 `/run` 为 tmpfs（rootfs 下载的 .part/.chunk 文件写入此处，initramfs 根可能只读）
+   - 加载 `squashfs`/`loop`/`overlay` 内核模块（Rocky 内核中这些是模块而非内置，使用 `runIgnore`
+     容忍模块已内置时的非零返回）
+   - 使用 `dhclient -v -1`（尝试一次即退出）避免在无法获取租约时无限阻塞 PID 1
+   - 使用 shell 参数展开 `${i##*/}` 替代 `basename` 命令依赖
+   - 显式设置 `PATH=/usr/bin:/usr/sbin:/bin:/sbin`（内核启动 PID 1 时不携带环境变量）
+   - `switch_root` 使用 `/usr/sbin/nodeforge-agent`（rootfs 中的实际路径）

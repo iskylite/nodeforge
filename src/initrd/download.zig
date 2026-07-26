@@ -56,7 +56,9 @@ pub fn validateRange(headers: []const u8, start: u64, end: u64, total: u64, expe
 }
 
 fn finalHeaderBlock(headers: []const u8) []const u8 {
-    // curl -D 可能含 1xx 中间块；禁用重定向后，最终响应块是最后一个以 `HTTP/` 开头的块。
+    // 原生 HTTP 客户端（`initrd/http.zig`）不跟随重定向，正常情况只返回一个
+    // 响应块。但 1xx 中间响应理论上仍可能出现，最终有效块是最后一个以 `HTTP/`
+    // 开头的块。该函数从前往后逐次锚定 `HTTP/`，返回最后一次匹配的子串。
     //
     // 易错点：响应头里若出现子串 `HTTP/`（例如故障注入服务器默认的
     // `Server: BaseHTTP/0.6 Python/3.x`），会被误判为新块的起点而把真实块截短。

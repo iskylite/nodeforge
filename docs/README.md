@@ -37,7 +37,8 @@ v0.3（PXELINUX/BIOS install）与 v0.4（延后增强项）的设计在 v0.2 �
 - [`audits/`](audits/)：代码事实、设计对齐和缺口审计。
 - [`validation/`](validation/)：自动化、虚拟机和实机验证记录。v0.2 关键记录：
   - [Phase 8 r97n0 QEMU 全量验证](validation/V0_2_PHASE8_VALIDATION.md)：aarch64 完整闭环（switch_root/running/retry/内存闸）、rootfs-build `--installroot`、传输故障负测。
-  - [v0.2.1 保留项](validation/V0_2_1_RESERVED.md)：x86_64 UEFI smoke 与 VMware（compute_use）实机矩阵，当前环境暂不验证。
+  - [v0.2.1 Ubuntu diskless 设计](design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu casper squashfs 叠加方案，支持 Rocky/RHEL 宿主构建 Ubuntu 无盘系统。
+- [v0.2.2 保留项](validation/V0_2_2_RESERVED.md)：x86_64 UEFI smoke 与 VMware（compute_use）实机矩阵，当前环境暂不验证。
   - [Phase 1](validation/V0_2_PHASE1_VALIDATION.md)/[Phase 6](validation/V0_2_PHASE6_VALIDATION.md)：diskless 早期与 initramfs 构建验证。
 
 ## 历史归档

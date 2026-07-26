@@ -57,6 +57,15 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(cli);
 
     // nodeforge-initrd：v0.2 diskless 启动 init（PID 1），运行在 dracut userspace。
+    //
+    // single_threaded=true：Zig stdlib 在 link_libc=true 时默认引用 pthread 符号
+    // （如 pthread_create/pthread_mutex_init）。glibc >= 2.34 将 pthread 合并入 libc，
+    // 但 Rocky 9 / Ubuntu 22.04 等可能使用 glibc < 2.34 的 sysroot 交叉编译，
+    // 导致链接产物包含 NEEDED libpthread.so.0。最小 initrd 环境中不包含该库，
+    // 二进制无法加载。single_threaded=true 阻止 stdlib 引入任何 pthread 符号。
+    //
+    // strip=true：ReleaseSafe/ReleaseFast 时 strip 调试信息。initrd 二进制通过
+    // TFTP/HTTP 传输到节点，体积直接影响启动延迟。Debug 模式保留符号便于开发调试。
     const initrd = b.addExecutable(.{
         .name = "nodeforge-initrd",
         .root_module = b.createModule(.{
@@ -64,11 +73,15 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .single_threaded = true,
+            .strip = optimize == .ReleaseSafe or optimize == .ReleaseFast,
         }),
     });
     b.installArtifact(initrd);
 
     // nodeforge-agent：v0.2 切根后 pre-init / first-boot。
+    // single_threaded=true 和 strip=true 的理由与 nodeforge-initrd 相同
+    // （见上方注释）。agent 同样运行在最小 rootfs 环境中，避免 pthread 依赖。
     const agent = b.addExecutable(.{
         .name = "nodeforge-agent",
         .root_module = b.createModule(.{
@@ -76,6 +89,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .single_threaded = true,
+            .strip = optimize == .ReleaseSafe or optimize == .ReleaseFast,
         }),
     });
     b.installArtifact(agent);

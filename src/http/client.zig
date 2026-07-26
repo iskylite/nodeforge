@@ -397,6 +397,18 @@ pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []
     return managementMutation(io, port, "POST", "/api/v1/management/profiles", rendered, revision, reason_buf);
 }
 
+/// v0.2 boot-bundle 创建：diskless profile 引用的 kernel/initrd/rootfs 组合。
+/// CLI 命令 `nodeforge assets boot-bundle create` 调用此函数。
+/// 三个资产必须已通过 `nodeforge assets register` 注册到 catalog 中。
+pub fn bootBundleCreate(io: std.Io, port: u16, name: []const u8, distro: []const u8, version: []const u8, arch: []const u8, kernel_release: []const u8, kernel: []const u8, initrd: []const u8, rootfs: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name) or !querySafe(distro) or !querySafe(version) or !querySafe(kernel) or !querySafe(initrd) or !querySafe(rootfs)) return .{ .reachable = false, .healthy = false };
+    var body: [1024]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&body, "{{\"name\":{f},\"distro\":{f},\"version\":{f},\"arch\":{f},\"kernel_release\":{f},\"kernel\":{f},\"initrd\":{f},\"rootfs\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(distro, .{}), std.json.fmt(version, .{}), std.json.fmt(arch, .{}), std.json.fmt(kernel_release, .{}), std.json.fmt(kernel, .{}), std.json.fmt(initrd, .{}), std.json.fmt(rootfs, .{}) }) catch
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "boot_bundle.invalid", "boot bundle request is too large") };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", "/api/v1/management/boot-bundles", rendered, revision, reason_buf);
+}
+
 /// `profile rootfs plan`：编译 diskless Profile 的 rootfs_input_digest 与 cache_state。
 pub fn rootfsPlanJson(io: std.Io, port: u16, name: []const u8, output: []u8) !?[]const u8 {
     if (!querySafe(name)) return error.InvalidProfileName;

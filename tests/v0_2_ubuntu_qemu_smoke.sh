@@ -1,4 +1,19 @@
 #!/usr/bin/env bash
+# ⚠ DEPRECATED (v0.2.1 design correction):
+# This smoke test used Rocky kernel + Rocky dracut initrd + Ubuntu rootfs —
+# a cross-distro mix that is NOT the correct Ubuntu diskless approach.
+# While it proved that Ubuntu userspace can boot under a Rocky kernel in QEMU,
+# it does NOT validate a proper Ubuntu diskless stack.
+#
+# The correct v0.2.1 approach uses:
+#   - kernel: Ubuntu /casper/vmlinuz (5.15.0-119-generic, from ISO)
+#   - initrd: Ubuntu /casper/initrd (extract → inject nodeforge-initrd → repack)
+#   - rootfs: Ubuntu casper squashfs layers (unchanged)
+#
+# This script is retained as a historical reference. The proper smoke test
+# is tests/v0_2_1_ubuntu_casper_smoke.sh (to be implemented).
+#
+# Original description:
 # r97n0 Ubuntu (aarch64) diskless QEMU smoke. Mirrors v0_2_qemu_full.sh but
 # boots an Ubuntu 22.04 server rootfs derived from the live-server ISO's casper
 # squashfs, against a daemon catalog that already published the Ubuntu install
@@ -31,17 +46,24 @@ for b in nodeforge nodeforged nodeforge-agent nodeforge-initrd; do
 done
 [[ -r "$iso" ]] || { echo "missing ISO $iso" >&2; exit 1; }
 
-# 1. Derive an Ubuntu server rootfs from the ISO casper layers, inject agent +
-#    first-boot service (validation drop-in prints proof + DONE marker).
+# 1. Derive an Ubuntu server rootfs from the ISO casper layered squashfs,
+#    inject agent + first-boot service (validation drop-in prints proof + DONE).
+#
+# Ubuntu live-server ISO uses layered squashfs (see casper initrd setup_overlay):
+#   ubuntu-server-minimal.squashfs                    — base layer (systemd/bash, no sshd)
+#   ubuntu-server-minimal.ubuntu-server.squashfs      — server packages (apt-utils, etc.)
+#   ubuntu-server-minimal.ubuntu-server.installer.squashfs — installer layer (openssh-server,
+#                                                          /sbin/init symlink, Subiquity)
+# Only the 3-layer combination provides both /sbin/init and openssh-server; casper
+# itself mounts all layers as overlay lowerdirs. We replicate by unsquashfs -f overlay.
 m=/tmp/ub-mnt-$$; mkdir -p "$m"; mount -o loop,ro "$iso" "$m"
-# ubuntu-server-minimal.squashfs is a self-contained debootstrap-style base with
-# systemd + bash; the .ubuntu-server layer is overlay-only (no /sbin/init), so a
-# single layer suffices and avoids char-device merge collisions.
 unsquashfs -d "$work/rootfs" "$m/casper/ubuntu-server-minimal.squashfs" >/dev/null
+# Overlay layers share device nodes (e.g. lxd-installer char device) that cause
+# non-fatal "failed to create character device" errors; || true because file
+# content is correctly written despite device node collisions.
+unsquashfs -d "$work/rootfs" -f "$m/casper/ubuntu-server-minimal.ubuntu-server.squashfs" >/dev/null || true
+unsquashfs -d "$work/rootfs" -f "$m/casper/ubuntu-server-minimal.ubuntu-server.installer.squashfs" >/dev/null || true
 umount "$m"; rmdir "$m"
-# Ubuntu minimal base ships /usr/lib/systemd/systemd but no /sbin/init; the
-# nodeforge-agent --pre-init execs /sbin/init, so provide the canonical symlink.
-ln -sf /usr/lib/systemd/systemd "$work/rootfs/sbin/init" 2>/dev/null || ln -sf /usr/lib/systemd/systemd "$work/rootfs/usr/sbin/init"
 install -m 0755 zig-out/bin/nodeforge-agent "$work/rootfs/usr/sbin/nodeforge-agent"
 install -D -m 0644 packaging/systemd/nodeforge-firstboot.service "$work/rootfs/etc/systemd/system/nodeforge-firstboot.service"
 mkdir -p "$work/rootfs/etc/systemd/system/multi-user.target.wants"

@@ -74,8 +74,8 @@ QEMU 全量验证重跑通过（`tests/v0_2_qemu_full.sh`，2026-07-23）：修�
 first-boot agent 追加写 `firstboot.log`（diskless 下位于 volatile tmpfs，每次启动为空），保留验证
 二次执行的首次运行证据。rootfs-build package action `--installroot` 端到端已于 2026-07-24 验证通过（见上）；
 x86_64 UEFI smoke 与 VMware（compute_use）实机矩阵因当前环境不具备（r97n0 仅有 aarch64 QEMU、无
-OVMF/qemu-system-x86_64；当前上下文无 compute_use 能力），整体推迟到 v0.2.1，见
-`docs/validation/V0_2_1_RESERVED.md`（传输断流/ETag 漂移/内容损坏已由
+OVMF/qemu-system-x86_64；当前上下文无 compute_use 能力），整体推迟到 v0.2.2，见
+`docs/validation/V0_2_2_RESERVED.md`（传输断流/ETag 漂移/内容损坏已由
 `tests/v0_2_transfer_fault.sh` 验证）。
 
 ## 传输故障注入负测
@@ -151,9 +151,9 @@ v0.2 的 diskless node-apply 渲染器（`src/provision/node_apply.zig`）最初
 - 该 smoke 复用 ISO 的 casper squashfs 作为 diskless lower rootfs，**不是** nodeforge 构建的
   Ubuntu rootfs。Ubuntu OS 层 rootfs-build（apt/debootstrap，
   `src/provision/rootfs_os_builder.zig` `AptOsLayerUnsupported`）在 v0.2 不支持，整体推迟到
-  v0.2.1（见 `V0_2_1_RESERVED.md`）。因此该 smoke 验证的是 diskless 启动主循环 + first-boot
-  在 Ubuntu 用户态下的正确性，非 nodeforge-built Ubuntu rootfs。
-- x86_64 UEFI smoke 同样推迟到 v0.2.1（r97n0 仅有 aarch64 QEMU，无 OVMF/qemu-system-x86_64）。
+v0.2.2（见 `V0_2_2_RESERVED.md`）。因此该 smoke 验证的是 diskless 启动主循环 + first-boot
+在 Ubuntu 用户态下的正确性，非 nodeforge-built Ubuntu rootfs。
+- x86_64 UEFI smoke 同样推迟到 v0.2.2（r97n0 仅有 aarch64 QEMU，无 OVMF/qemu-system-x86_64）。
 - catalog 注入、initramfs 重打包、QEMU 启动脚本均为验证夹具，非 nodeforged / diskless guest
   运行时依赖。
 
@@ -166,7 +166,8 @@ v0.2 的 diskless node-apply 渲染器（`src/provision/node_apply.zig`）最初
 3. rootfs-build package action：以 `dnf --installroot` 从本地 `file://` 受管源安装到 staging（不回连 daemon、
    不 bind-mount `/dev/proc/sys`），与 OS 层一致的本地源保真。
 4. 传输断流/ETag 漂移/内容损坏已验证（见上）；越权、过期、重启恢复和内存不足已在 QEMU 全量验证覆盖；
-   剩余 x86_64 UEFI smoke 与 VMware（compute_use）实机矩阵，已推迟到 v0.2.1（见 `docs/validation/V0_2_1_RESERVED.md`）。
+   剩余 x86_64 UEFI smoke 与 VMware（compute_use）实机矩阵，已推迟到 v0.2.2（见 `docs/validation/V0_2_2_RESERVED.md`）。
+Ubuntu casper squashfs diskless 方案的设计和落地实现属 v0.2.1（见 `docs/design/V0_2_1_UBUNTU_DISKLESS.md`）。
 
 本次使用的 catalog 注入、initramfs 重打包和 QEMU 启动脚本均是验证夹具，不是
 nodeforged 或 diskless guest 的运行时依赖。

@@ -1,10 +1,10 @@
-# v0.2.1 保留项：异架构/实机 diskless 验证矩阵
+# v0.2.2 保留项：异架构/实机 diskless 验证矩阵
 
-状态：**保留（reserved）**——v0.2 当前环境不具备执行条件，整体推迟到 v0.2.1。v0.2.1 与 v0.2 范围分离：下列项**不计入 v0.2 完成标准**，v0.2 以已验证的 aarch64 闭环为准；本文件仅作为 v0.2 之后的后续单独闭环入口，当前**暂不验证**。
-本文件是 v0.2.1 的唯一入口，记录从 v0.2 推迟的验证项、环境约束、已满足项与闭环路径。
+状态：**保留（reserved）**——v0.2 当前环境不具备执行条件，整体推迟到 v0.2.2。v0.2.2 与 v0.2/v0.2.1 范围分离：下列项**不计入 v0.2 或 v0.2.1 完成标准**，v0.2 以已验证的 aarch64 闭环为准；本文件仅作为后续单独闭环入口，当前**暂不验证**。
+本文件是 v0.2.2 的唯一入口，记录从 v0.2 推迟的验证项、环境约束、已满足项与闭环路径。
 不涉及生产代码或 schema 契约变更；v0.2 实现已冻结，此处仅为验证缺口。
 
-日期：2026-07-24
+日期：2026-07-24（原 v0.2.1，版本重编号为 v0.2.2）
 
 ## 1. 来源与要求
 
@@ -15,9 +15,9 @@
 > running event 和 retry 闭环，覆盖真机 NIC/firmware/内存差异。
 
 其中“至少一架构完成…闭环”已在 v0.2 由 aarch64 满足（见 §4）。下列两项为尚未执行的
-异架构/实机验证，推迟到 v0.2.1。
+异架构/实机验证，推迟到 v0.2.2。
 
-## 2. 保留项（v0.2.1）
+## 2. 保留项（v0.2.2）
 
 ### 2.1 UEFI x86_64 QEMU smoke
 - 目标：在 UEFI（OVMF）x86_64 QEMU 中启动 nodeforge initrd + squashfs_overlay rootfs，
@@ -51,12 +51,12 @@
   package action 以 `dnf --installroot` 在 host 上下文从本地 `file://` 受管源安装
   （不 chroot、不 bind-mount /dev/proc/sys、不回连 daemon），`tree` RPM 烤入 lower 校验；
   managed_file/archive/script 三类步骤烤入校验；二次构建命中缓存 `already_present`。
-- **Ubuntu 22.04 aarch64 diskless smoke**（`tests/v0_2_ubuntu_qemu_smoke.sh`，r97n0，2026-07-25）：复用 ISO casper squashfs 作为 diskless lower，验证 diskless 启动主循环 + first-boot 在 Ubuntu 用户态下正确（`switch_root` -> `nodeApply` -> `diskless.running`，first-boot 0 失败）。详见 `V0_2_PHASE8_VALIDATION.md`。注意：Ubuntu OS 层 rootfs-build（apt/debootstrap）在 v0.2 仍不支持（`AptOsLayerUnsupported`），属 v0.2.1 功能项，非本验证矩阵保留项。
+- **Ubuntu 22.04 aarch64 diskless smoke**（`tests/v0_2_ubuntu_qemu_smoke.sh`，r97n0，2026-07-25）：复用 ISO casper squashfs 作为 diskless lower，验证 diskless 启动主循环 + first-boot 在 Ubuntu 用户态下正确（`switch_root` -> `nodeApply` -> `diskless.running`，first-boot 0 失败）。详见 `V0_2_PHASE8_VALIDATION.md`。注意：Ubuntu OS 层 rootfs-build（apt/debootstrap）在 v0.2 仍不支持（`AptOsLayerUnsupported`），属 v0.2.1 功能项（见 `docs/design/V0_2_1_UBUNTU_DISKLESS.md`），非本验证矩阵保留项。
 - **传输故障负测**（`tests/v0_2_transfer_fault.sh`，r97n0）：clean / ETag 漂移 / 内容损坏 / 断流
   四场景均 fail-closed。
 - **单元测试**：本机 `zig build test` = 345/345 通过（11/11 build steps succeeded）。
 
-## 5. v0.2.1 闭环路径
+## 5. v0.2.2 闭环路径
 
 满足 §2.1 与 §2.2 各一条，可任选实现路径：
 

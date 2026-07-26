@@ -61,7 +61,8 @@ NodeForge/
 
 - [v0.1 设计与修复计划](docs/design/V0_1_DESIGN.md)：当前权威设计，定义所有权模型和完成标准。
 - [v0.2 设计总纲](docs/design/V0_2_DESIGN.md)：diskless 无盘启动主流程，已实现并通过 aarch64 QEMU 完整闭环验证。
-- [v0.2.1 保留项](docs/validation/V0_2_1_RESERVED.md)：异架构/实机验证矩阵（x86_64 UEFI smoke、VMware compute_use），当前暂不验证。
+- [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu casper squashfs 叠加方案，支持 Rocky/RHEL 宿主构建 Ubuntu 无盘系统。
+- [v0.2.2 保留项](docs/validation/V0_2_2_RESERVED.md)：异架构/实机验证矩阵（x86_64 UEFI smoke、VMware compute_use），当前暂不验证。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
 - [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录（含 [Phase 8 QEMU 全量验证](docs/validation/V0_2_PHASE8_VALIDATION.md)）。
 
