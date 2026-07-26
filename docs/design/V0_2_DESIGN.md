@@ -81,6 +81,31 @@ kernel 字段。命名去掉了 `-installer-` 前缀，明确表示 kernel 通�
 **修订**：`nodeAddHandler`（`main.zig`）在创建节点时，hostname 未显式指定则默认使用 `node.id`。
 `model.zig` `NodeConfig.hostname` 注释同步更新：CLI 默认 node_id，API 直接创建时 null 由渲染层回退。
 
+### R8. ISO 导入 bootloader 路径 use-after-free 修复
+
+**问题**：`iso_import.zig` 的 `importMedia` 函数中，`bootloader_rel`（内容寻址 bootloader TFTP 路径，
+如 `efi/176c1c1da6fac219-grubaa64.efi`）在被赋给 `Result.bootloader_asset.path` 后，仍有一行
+`defer if (bootloader_rel.len > 0) allocator.free(bootloader_rel);`。该 defer 在函数返回时释放了
+这块内存，但所有权已转移给 Result 调用方，导致 use-after-free。
+
+Zig Debug allocator 用 `0xAA` 填充已释放内存，catalog 中 bootloader 资产的 `path` 字段变为
+33 字节的 `0xAA` 乱码。DHCP server 的 `catalogBootfile` 从 catalog 读取该乱码作为 TFTP bootfile
+下发给 PXE 客户端，PXE 客户端 TFTP 请求一个不存在的文件名，传输失败后回退到本地 disk 启动。
+表现为：已注册节点 PXE 启动时 DHCP 正常分配 IP 但 TFTP 传输失败，节点最终从本地磁盘启动
+而非进入 diskless/install 模式。
+
+**根因**：`iso_rel`、`kernel_rel`、`initrd_rel` 三个同类字符串均无 defer free（所有权转移给
+Result），但 `bootloader_rel` 错误地多了 defer free。对比 `bootloader_destination`（中间路径，
+不转移给 Result）的 defer free 是正确的。
+
+**修订**：删除 `bootloader_rel` 的 `defer free`。同步在 `Result` struct 和 `importMedia` 函数
+文档注释中明确所有权约定：Result 中所有 `[]const u8` 字段由 `allocator` 分配，所有权随 Result
+返回转移给调用方；函数内仅对不转移给 Result 的中间字符串执行 `defer free`。
+
+**影响范围**：仅 Debug 构建受影响（Release 构建下 allocator 不填充已释放内存，但 use-after-free
+仍然存在，只是表现为随机字节而非确定的 `0xAA`）。已导入的 catalog 数据需手动修复 bootloader
+资产的 `path` 字段。
+
 ## 0. 文档结构与阅读路径
 
 ### 0.1 总分职责

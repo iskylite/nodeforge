@@ -46,6 +46,14 @@ pub const Request = struct {
 /// - installer kernel/initrd assets（通过 TFTP 提供）
 /// - 可选的 repository（通过 HTTP /artifacts/repositories/ 提供）
 /// - install source（关联 ISO/kernel/initrd/repo 的 catalog 对象）
+///
+/// 所有权约定：Result 中所有 `[]const u8` 字段（source_name、各 asset 的
+/// name/path/sha256、install_source 的各引用字段、repository 的 base_url 等）
+/// 均由 `importMedia` 的 `allocator` 分配，所有权随 Result 返回转移给调用方。
+/// 调用方在 catalog 发布完成后负责释放这些字符串。`importMedia` 内部不得
+/// 对转移给 Result 的字符串执行 `defer free`，否则会导致 use-after-free
+/// （见 `bootloader_rel` BUG 历史注释）。
+///
 /// 调用方负责将这些对象原子发布到 catalog 快照。
 pub const Result = struct {
     source_name: []const u8,
@@ -78,7 +86,14 @@ pub const Result = struct {
 /// 9. 计算所有已发布文件的 SHA-256
 /// 10. 构造 catalog 对象（assets/install_source/repository）
 ///
-/// 调用方拥有返回字符串的 allocator 生命周期，并负责 catalog 发布。
+/// 所有权：Result 中所有 `[]const u8` 字段由 `allocator` 分配，所有权随
+/// Result 返回转移给调用方。函数内仅对 **不** 转移给 Result 的中间字符串
+/// （如 input、mount_point、staged_repo、各 destination 路径、version_slug
+/// 等）执行 `defer free`。转移给 Result 的字符串（source_name、iso_rel、
+/// kernel_rel、initrd_rel、bootloader_rel、distro_name、distro_version、
+/// media_tree_url 及各 allocPrint 生成的 name/sha256 字段）不得 defer free。
+///
+/// 调用方负责 catalog 发布和 Result 字符串释放。
 /// 临时工作目录在函数返回时通过 defer 清理（deleteTree）。
 pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, request: Request) !Result {
     if (!safeFilename(request.filename)) return error.UnsafeImportFilename;
@@ -186,7 +201,21 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
         }
         break :blk try contentAddressedBootloaderPath(allocator, detected.arch, &bootloader_hash);
     } else "";
-    defer if (bootloader_rel.len > 0) allocator.free(bootloader_rel);
+    // bootloader_rel 的所有权转移给 Result.bootloader_asset.path（见下方
+    // Result 构造），由调用方负责释放。此处不得 defer free。
+    //
+    // BUG 历史：此处曾有 `defer if (bootloader_rel.len > 0) allocator.free(bootloader_rel);`。
+    // 该 defer 在函数返回时执行，但 bootloader_rel 已被赋给 Result.bootloader_asset.path，
+    // 所有权已转移给调用方。defer free 释放了这块内存后，调用方拿到的 path 指针
+    // 指向已释放区域。Zig Debug allocator 用 0xAA 填充已释放内存，导致 catalog 中
+    // bootloader 资产的 path 变为 33 字节的 0xAA 乱码（而非 `efi/<hash>-grubaa64.efi`）。
+    // DHCP server 的 `catalogBootfile` 将该乱码作为 TFTP bootfile 下发给 PXE 客户端，
+    // PXE 客户端 TFTP 请求一个不存在的文件名，传输失败后回退到本地 disk 启动。
+    // 根因：`iso_rel`、`kernel_rel`、`initrd_rel` 均无 defer free（所有权转移给
+    // Result），但 `bootloader_rel` 错误地多了 defer free。修复：删除该 defer。
+    //
+    // 对比：`bootloader_destination`（第 198 行）的 defer free 是正确的——
+    // 它是中间路径，不转移给 Result，仅用于 copyFileNoClobber。
 
     // 重新计算 bootloader_destination（依赖 bootloader_rel）
     const bootloader_destination = if (bootloader_media_rel != null)
