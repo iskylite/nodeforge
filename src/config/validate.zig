@@ -517,13 +517,19 @@ fn validateBootBundles(config: *const model.AppConfig, catalog: *const model.Cat
         const kernel = try requireAssetKind(catalog, bundle.kernel, .kernel);
         const initrd = try requireAssetKind(catalog, bundle.initrd, .nodeforge_initrd);
 
+        // kernel 和 initrd 必须与 bundle 的 distro/version/arch 三元组匹配。
+        // kernel_release 仅对 initrd 强制校验：ISO 导入的 installer kernel 不携带
+        // kernel_release（该字段为 null），而 boot bundle 的 kernel_release 是
+        // 操作员提供的权威值。nodeforge_initrd 资产在构建时已固定 kernel_release，
+        // 因此必须与 bundle 完全匹配。kernel 资产的 kernel_release 允许为 null。
         for ([_]*const model.AssetConfig{ kernel, initrd }) |asset| {
             if (!optionalEqual(asset.distro, bundle.distro) or
                 !optionalEqual(asset.version, bundle.version) or
-                asset.arch == null or asset.arch.? != bundle.arch or
-                !optionalEqual(asset.kernel_release, bundle.kernel_release))
+                asset.arch == null or asset.arch.? != bundle.arch)
                 return error.KernelReleaseMismatch;
         }
+        if (!optionalEqual(initrd.kernel_release, bundle.kernel_release))
+            return error.KernelReleaseMismatch;
     }
 }
 
