@@ -56,8 +56,8 @@ const http = @import("initrd/http.zig");
 /// setenv 仍可用（它是 libc 函数，非 pthread 函数）。
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
-/// initrd 环境的 PATH：覆盖 /usr/bin、/usr/sbin、/bin、/sbin。
-const initrd_path = "/usr/bin:/usr/sbin:/bin:/sbin";
+/// initrd 环境的 PATH：覆盖常见 Linux、dracut 和管理员本地路径。
+const initrd_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin:/run/current-system/sw/sbin";
 
 /// 恢复 vendor installer initrd 的硬件自动发现流程。脚本只触发 udev
 /// subsystem/device coldplug，具体模块完全由 ISO 规则与内核 modalias 决定。
@@ -187,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer allocator.free(session);
     const node = cmdline.node orelse return error.MissingNode;
+    log("[nodeforge-initrd] session={s} node={s}\n", .{ session, node });
     log("[nodeforge-initrd] fetching BootConfig from {s}...\n", .{cmdline.config_url orelse "(none)"});
     const config_url_parsed = try http.Url.parse(cmdline.config_url orelse return error.MissingConfigUrl);
     const config_auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{config_token});
@@ -278,7 +279,9 @@ pub fn main(init: std.process.Init) !void {
     // /run/initrd.log 由 log() 函数在每次调用时追加写入；此处复制到 overlay
     // upper 的 /var/lib/nodeforge/initrd.log，同时捕获 dmesg 用于内核层诊断。
     log("[nodeforge-initrd] retaining logs to overlay...\n", .{});
-    runIgnore(io, allocator, &.{ "sh", "-c", "mkdir -p /merged/var/lib/nodeforge && cp /run/initrd.log /merged/var/lib/nodeforge/initrd.log 2>/dev/null; dmesg > /merged/var/lib/nodeforge/initrd-dmesg.log 2>/dev/null" }) catch {};
+    const retain_logs = try std.fmt.allocPrint(allocator, "mkdir -p /merged/var/lib/nodeforge && cp /run/initrd.log /merged/var/lib/nodeforge/initrd.log 2>/dev/null; dmesg > /merged/var/lib/nodeforge/initrd-dmesg.log 2>/dev/null; printf '%s\\n' '{s}' > /merged/var/lib/nodeforge/session-id 2>/dev/null", .{session});
+    defer allocator.free(retain_logs);
+    runIgnore(io, allocator, &.{ "sh", "-c", retain_logs }) catch {};
 
     // switch_root -> nodeforge-agent --pre-init（agent 校验 plan/payload、node-apply 后 exec /sbin/init）。
     // 必须 by PID 1 执行：用 replace（execve）替换当前进程，而非 spawn 子进程。

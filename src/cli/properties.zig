@@ -113,6 +113,8 @@ pub const properties = [_]PropertySpec{
     .{ .owner = .profile, .path = "system.ssh.password_authentication", .kind = .boolean },
     .{ .owner = .profile, .path = "system.ssh.root_login", .kind = .enumeration },
     .{ .owner = .profile, .path = "system.ssh.root_password", .kind = .string, .optional = true },
+    .{ .owner = .profile, .path = "system.import_host_hosts", .kind = .boolean },
+    .{ .owner = .profile, .path = "system.hosts_content", .kind = .string, .optional = true },
     .{ .owner = .profile, .path = "system.security.firewall", .kind = .enumeration },
     .{ .owner = .profile, .path = "system.security.selinux", .kind = .enumeration, .applicability = .kickstart },
     .{ .owner = .profile, .path = "system.security.apparmor", .kind = .enumeration, .applicability = .autoinstall },

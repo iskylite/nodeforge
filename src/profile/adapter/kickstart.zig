@@ -178,6 +178,7 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
         for (system.connectivity.ntp_servers) |server| try w.print(" 'server {s} iburst'", .{server});
         try w.writeAll(" > /etc/chrony.conf\nsystemctl enable chronyd\n");
     }
+    try renderHostsPost(w, system);
     if (bundle) |value| {
         const script = try runner.renderInstallPost(allocator, value, .dnf);
         defer allocator.free(script);
@@ -186,6 +187,15 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try w.print("curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"completed\"}}' {s} || true\n%end\n%onerror\nERRLOG=$(ls /tmp/anaconda-tb-*/anaconda-tb 2>/dev/null | head -1)\nSUMMARY=\"anaconda error\"\nif [ -n \"$ERRLOG\" ]; then\n  SUMMARY=\"anaconda error: $(head -c 1800 \"$ERRLOG\" 2>/dev/null | tr '\\n' ' ')\"\nfi\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' --data-urlencode 'v=1' --data-urlencode 'boot_session_id={s}' --data-urlencode 'reason=install.anaconda_error' --data-urlencode \"summary=$SUMMARY\" {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"failed\"}}' {s} || true\n%end\n", .{ token, session, session, event_url, token, session, session, event_url, token, session, session, log_url, token, session, session, event_url });
     try w.print("{s}\n", .{@tagName(install.completion.action)});
     return out.toOwnedSlice();
+}
+
+fn renderHostsPost(w: *std.Io.Writer, system: model.TargetSystemConfig) !void {
+    if (!system.import_host_hosts) return;
+    const content = system.hosts_content orelse return;
+    try w.writeAll("cat > /etc/hosts <<'NODEFORGE_HOSTS_EOF'\n");
+    try w.writeAll(content);
+    if (content.len == 0 or content[content.len - 1] != '\n') try w.writeByte('\n');
+    try w.writeAll("NODEFORGE_HOSTS_EOF\nchmod 0644 /etc/hosts\n");
 }
 
 fn renderAutomaticStorage(w: *std.Io.Writer, storage: model.StorageConfig) !void {
@@ -310,7 +320,7 @@ fn raidLevel(mode: model.StorageMode) []const u8 {
     };
 }
 
-test "schema v3 automatic storage renders all modes with native Kickstart actions" {
+test "automatic storage renders all modes with native Kickstart actions" {
     const modes = [_]model.StorageMode{ .single, .lvm, .raid0, .raid1, .raid5, .raid6, .raid10, .@"raid0-lvm", .@"raid1-lvm", .@"raid5-lvm", .@"raid6-lvm", .@"raid10-lvm" };
     const disks = [_][]const u8{ "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd" };
     for (modes) |mode| {
@@ -336,7 +346,7 @@ test "schema v3 automatic storage renders all modes with native Kickstart action
     }
 }
 
-test "schema v3 custom logical layout renders all modes natively in Kickstart" {
+test "custom logical layout renders all modes natively in Kickstart" {
     const modes = [_]model.StorageMode{ .single, .lvm, .raid0, .raid1, .raid5, .raid6, .raid10, .@"raid0-lvm", .@"raid1-lvm", .@"raid5-lvm", .@"raid6-lvm", .@"raid10-lvm" };
     const disks = [_][]const u8{ "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd" };
     const partitions = [_]model.PartitionConfig{ .{ .id = "esp", .mount = "/boot/efi", .filesystem = "efi", .size_mib = 1024, .kind = .esp }, .{ .id = "boot", .mount = "/boot", .filesystem = "ext4", .size_mib = 2048, .kind = .boot }, .{ .id = "var", .mount = "/var", .filesystem = "ext4", .size_mib = 8192 }, .{ .id = "root", .mount = "/", .filesystem = "ext4", .grow = true, .kind = .root } };

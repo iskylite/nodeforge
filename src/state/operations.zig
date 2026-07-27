@@ -7,9 +7,8 @@ const model_transaction = @import("model_transaction.zig");
 pub const max_operations = 128;
 /// 终态条目的保留时间（24 小时）。超过此时间的终态条目可被新操作复用槽位。
 pub const retention_seconds: i64 = 24 * 60 * 60;
-/// 操作类型。`install_source_import` 为 ISO 导入，`catalog_migration` 为
-/// schema 升级等需要 model_transaction 的批量变更。
-pub const Kind = enum { install_source_import, catalog_migration };
+/// 操作类型。`install_source_import` 为 ISO 导入。
+pub const Kind = enum { install_source_import };
 /// 操作状态机。
 pub const State = enum { queued, running, succeeded, failed };
 
@@ -201,71 +200,6 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     }
 }
 
-/// 从事务恢复记录重建 catalog 迁移终止状态。
-/// 记录仅在调用方持久化操作 store 后才被移除。
-pub fn reconcileMigrationRecovery(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, store: *Store, now: i64) !usize {
-    var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return 0,
-        else => return err,
-    };
-    defer dir.close(io);
-    var iterator = dir.iterate();
-    var count: usize = 0;
-    while (try iterator.next(io)) |item| {
-        if (item.kind != .file or !std.mem.endsWith(u8, item.name, ".json.recovered")) continue;
-        const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, item.name });
-        defer allocator.free(record_path);
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, record_path, allocator, .limited(4096));
-        defer allocator.free(bytes);
-        const Record = struct { schema_version: u32 = 1, plan_digest: []const u8, outcome: model_transaction.RecoveryOutcome };
-        const parsed = try std.json.parseFromSlice(Record, allocator, bytes, .{ .allocate = .alloc_always });
-        defer parsed.deinit();
-        if (parsed.value.schema_version != 1 or parsed.value.plan_digest.len != 64) return error.InvalidOperationsState;
-        lock(&store.mutex);
-        defer store.mutex.unlock();
-        var matched = false;
-        for (&store.entries) |*entry| if (entry.used() and entry.kind == .catalog_migration and std.mem.eql(u8, entry.requestDigestSlice(), parsed.value.plan_digest)) {
-            entry.state = if (parsed.value.outcome == .committed) .succeeded else .failed;
-            entry.updated_at = now;
-            entry.result_len = 0;
-            entry.error_len = 0;
-            const value = if (parsed.value.outcome == .committed) parsed.value.plan_digest else "migration.rolled_back";
-            if (parsed.value.outcome == .committed) {
-                @memcpy(entry.result[0..value.len], value);
-                entry.result_len = @intCast(value.len);
-            } else {
-                @memcpy(entry.error_code[0..value.len], value);
-                entry.error_len = @intCast(value.len);
-            }
-            matched = true;
-            break;
-        };
-        if (!matched) return error.MigrationOperationNotFound;
-        count += 1;
-    }
-    return count;
-}
-
-pub fn clearMigrationRecoveryRecords(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer dir.close(io);
-    var names = std.ArrayList([]u8).empty;
-    defer {
-        for (names.items) |name| allocator.free(name);
-        names.deinit(allocator);
-    }
-    var iterator = dir.iterate();
-    while (try iterator.next(io)) |item| if (item.kind == .file and std.mem.endsWith(u8, item.name, ".json.recovered")) try names.append(allocator, try allocator.dupe(u8, item.name));
-    for (names.items) |name| {
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, name });
-        defer allocator.free(path);
-        try std.Io.Dir.cwd().deleteFile(io, path);
-    }
-}
-
 /// 从磁盘记录重建内存 Entry。校验所有字段的长度不越界。
 fn fromDisk(disk: DiskEntry) !Entry {
     var entry: Entry = .{ .kind = disk.kind, .state = disk.state, .created_at = disk.created_at, .updated_at = disk.updated_at };
@@ -339,24 +273,4 @@ test "expired terminal operation is no longer queryable" {
     const begun = try store.begin(std.testing.io, "key", .install_source_import, 1);
     _ = try store.succeed(begun.entry.idSlice(), "done", 2);
     try std.testing.expect(store.get(begun.entry.idSlice(), 2 + retention_seconds) == null);
-}
-
-test "journal recovery rebuilds migration operation terminal state" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    defer std.testing.allocator.free(root);
-    const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const record_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}.json.recovered", .{ root, digest });
-    defer std.testing.allocator.free(record_path);
-    try dhcp_store.atomicWrite(std.testing.io, record_path, "{\"schema_version\":1,\"plan_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"outcome\":\"committed\"}");
-    var store: Store = .{};
-    const begun = try store.beginRequest(std.testing.io, "migration-key", digest, .catalog_migration, 10);
-    _ = try store.fail(begun.entry.idSlice(), "operation.interrupted", 20);
-    try std.testing.expectEqual(@as(usize, 1), try reconcileMigrationRecovery(std.testing.io, std.testing.allocator, root, &store, 30));
-    const restored = store.get(begun.entry.idSlice(), 30).?;
-    try std.testing.expectEqual(State.succeeded, restored.state);
-    try std.testing.expectEqualStrings(digest, restored.resultSlice());
-    try clearMigrationRecoveryRecords(std.testing.io, std.testing.allocator, root);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, record_path, .{}));
 }

@@ -170,11 +170,6 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         return err;
     };
     if (recovered != 0) nodeforge.observe_log.info("model: recovered {d} transaction journal(s) before validation", .{recovered});
-    const schema_recovered = nodeforge.schema_v3_transaction.recoverAll(ctx.io, ctx.allocator, transaction_dir) catch |err| {
-        nodeforge.observe_log.err("schema-v3: transaction recovery failed closed: {t}", .{err});
-        return err;
-    };
-    if (schema_recovered != 0) nodeforge.observe_log.info("schema-v3: recovered {d} transaction journal(s) before validation", .{schema_recovered});
 
     var parsed = nodeforge.config.load(ctx.io, ctx.allocator, config_path) catch |err| {
         nodeforge.observe_log.err("config: cannot load {s}", .{config_path});
@@ -191,26 +186,8 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
 
     // 仅对发现的默认模型进行自动迁移。显式覆盖
     // 是诊断输入，绝不能作为副作用被改写。
-    if (parsed.value.schema_version == 1 and
-        std.mem.eql(u8, config_path, nodeforge.paths.require().config_path) and
-        std.mem.eql(u8, catalog_path, nodeforge.paths.require().catalog_dir))
-    {
-        if (try nodeforge.setup.migrateLegacy(ctx.io, ctx.allocator, nodeforge.paths.require())) {
-            parsed.deinit();
-            parsed = try nodeforge.config.load(ctx.io, ctx.allocator, config_path);
-            nodeforge.observe_log.info("model: migrated schema-1 config/catalog to M4.7 manifest layout", .{});
-        }
-    }
-
     var parsed_catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path) catch |err| switch (err) {
         error.FileNotFound => blk: {
-            // 缺失的 manifest 仅对发现的 catalog 目录进行初始化。
-            // 显式旧版 `.json` 诊断保持只读。
-            if (std.mem.endsWith(u8, catalog_path, ".json")) {
-                const initial = nodeforge.catalog_store.empty();
-                try nodeforge.catalog_store.save(ctx.io, ctx.allocator, catalog_path, &initial);
-                break :blk try nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path);
-            }
             try nodeforge.catalog_store.initializeEmpty(ctx.io, ctx.allocator, catalog_path);
             break :blk try nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path);
         },
@@ -221,17 +198,7 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         },
     };
     defer parsed_catalog.deinit();
-    const stored_catalog = &parsed_catalog.value;
-    // schema 1 输入在 config 中保留受管实体。它们被投影
-    // 到内存中的 Catalog 用于校验；setup/migration 在生产启动前
-    // 发布持久的 manifest 布局。
-    var catalog_value = stored_catalog.*;
-    if (catalog_value.distros.len == 0) catalog_value.distros = parsed.value.distros;
-    if (catalog_value.profiles.len == 0) catalog_value.profiles = parsed.value.profiles;
-    if (catalog_value.nodes.len == 0) catalog_value.nodes = parsed.value.nodes;
-    if (catalog_value.provisioning_bundles.len == 0) catalog_value.provisioning_bundles = parsed.value.provisioning_bundles;
-    if (parsed.value.schema_version == 1 and std.mem.endsWith(u8, catalog_path, ".json"))
-        try nodeforge.catalog_store.save(ctx.io, ctx.allocator, catalog_path, &catalog_value);
+    var catalog_value = parsed_catalog.value;
     var effective_config = nodeforge.model.projectCatalog(parsed.value, &catalog_value);
     const catalog = &catalog_value;
 
@@ -248,7 +215,7 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
         return;
     }
     if (ctx.flag("check", bool)) {
-        nodeforge.preflight.checkPorts(ctx.io, &parsed.value) catch |err| {
+        nodeforge.preflight.checkPorts(ctx.io, &effective_config) catch |err| {
             nodeforge.observe_log.err("preflight: failed", .{});
             if (debug or parsed.value.logging.level == .debug)
                 nodeforge.observe_log.debug("preflight: cause={t}", .{err});
@@ -280,9 +247,6 @@ const LogOutput = enum {
 };
 
 /// 根据命令行 `--log-output` 参数和配置文件日志策略配置日志后端。
-///
-/// `auto` 模式根据 `logging.file` 是否为 null 决定输出目标；
-/// `file`/`both` 模式使用配置文件路径或 `--log-file` 覆盖路径。
 fn configureLogOutput(
     io: std.Io,
     requested: LogOutput,

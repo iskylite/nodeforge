@@ -187,13 +187,21 @@ make dist-linux-arm64   # 交叉编译并打包 Linux aarch64
 ### 安装初始化
 
 ```bash
-# 初始化安装根、写入配置并创建标记文件
+# 推荐从包含四个二进制的发布目录执行；setup 会把同目录的
+# nodeforge/nodeforged/nodeforge-initrd/nodeforge-agent 同步到 install root。
+mkdir -p /tmp/nodeforge-bundle
+install -m 0755 nodeforge nodeforged nodeforge-initrd nodeforge-agent /tmp/nodeforge-bundle/
+cd /tmp/nodeforge-bundle
+
+# 完全非交互式 fresh 初始化安装根、写入配置并创建标记文件。
+# bind-interface 是 nodeforged 监听 PXE/DHCP/TFTP 的服务端网卡，不是目标节点网卡。
 ./nodeforge setup --install-root /opt/nodeforge --non-interactive --yes \
   --bind-interface enp1s0 --server-ip 192.168.50.1 \
   --subnet 192.168.50.0/24 --pool-start 192.168.50.100 --pool-end 192.168.50.200
 
 # 生成并安装 systemd unit
-./nodeforge setup --install-root /opt/nodeforge --generate-systemd --install --yes
+./nodeforge setup --install-root /opt/nodeforge --generate-systemd --install \
+  --non-interactive --yes
 
 # 启动服务
 systemctl start nodeforged
@@ -208,8 +216,9 @@ systemctl start nodeforged
 ├── catalog/        # manifest.json + entity files
 ├── assets/
 │   ├── iso/        # ISO 镜像
-│   ├── boot/       # TFTP 启动文件（GRUB/kernel/initrd）
+│   ├── boot/       # TFTP 启动文件：efi/<iso>/、install/<iso>/、diskless/<distro>/<version>/<arch>/
 │   ├── repos/      # HTTP 发布的仓库
+│   ├── rootfs/     # HTTP 发布的 diskless squashfs
 │   └── keys/       # SSH 密钥
 ├── state/          # lease/status/session/provisioned
 ├── logs/           # 服务日志和事件审计流
@@ -223,52 +232,106 @@ systemd unit 授予最小特权集：`CAP_NET_BIND_SERVICE`（UDP 67/69）、`CA
 
 [`config.example.json`](config.example.json) 是启动配置示例，只包含 server/http/tftp/dhcp 等站点字段。节点、Profile 和资源由 Catalog 管理，通过 `nodeforge setup --reconfigure --import-config <path>` 导入。
 
-`server.bind_interface` 是 PXE 网卡占位值，部署前必须替换为实际接口名。
+`server.bind_interface` 是 PXE 网卡占位值，部署前必须替换为实际接口名。这里的
+PXE 网卡指 **NodeForge 服务器端** 连接 provisioning 二层网络的网卡；它用于
+DHCP `SO_BINDTODEVICE` 绑定、TFTP/HTTP 地址发布和避免误答其他生产网段。新机器
+自身从哪块网卡 PXE 启动由固件和交换网络决定，NodeForge 不需要知道目标机 Linux
+启动后的临时网卡名；只有在配置目标系统静态地址时才需要设置 Node 的
+`network.interface_name`。
 
-## 基本使用
+## CLI 流程示例
 
 ```bash
-# 查看帮助
+# 1. 查看帮助和运行面
 nodeforge -h
 nodeforge --help-full          # 详细帮助（含全部 canonical key）
+nodeforge status
+nodeforge config validate
+nodeforge catalog validate
 
-# 校验配置
-nodeforge config validate --config config.example.json --catalog catalog.example.json
-nodeforged --check --config config.example.json --catalog catalog.example.json
-
-# 导入 ISO（自动识别布局并创建 install profile）
+# 2. 导入 ISO。导入器会自动识别 .treeinfo/casper、安装 kernel/initrd、
+#    UEFI GRUB、repo 根目录（如 Minimal、BaseOS/AppStream、Packages 或 ISO 根）。
 nodeforge assets import /path/to/Rocky-9.7-aarch64-dvd.iso
-
-# 默认 source/profile 名来自完整 ISO 文件名，因此 SP、批次和日期天然隔离
-nodeforge assets import /path/to/Kylin-Server-V10-SP3-2403-Release-20240426-ARM64.iso
-
-# 必要时仍可覆盖 catalog 版本和 source/profile 名称
 nodeforge assets import /path/to/custom.iso \
   --distro kylin --version V10-SP3-2403-Release-20240426 --arch aarch64 \
   --name kylin-v10-sp3-2403-20240426-aarch64
+nodeforge assets install-source list
+nodeforge assets install-source show rocky-9.7-aarch64-dvd
 
-# 管理节点和 Profile
+# 3. 创建或调整 install Profile 与 Node。布尔值 canonical 输出为 true/false；
+#    set 同时接受 yes/no 作为兼容输入。绑定 pxe.ip_reservation 后，
+#    install/diskless 的目标网络默认按静态地址渲染。
 nodeforge node add node-01 mac=00:50:56:2a:23:db arch=aarch64 profile=rocky-9 \
-  pxe.ip_reservation=192.168.50.110 network.mode=dhcp
+  pxe.ip_reservation=192.168.50.110 deploy=false
 nodeforge node set node-01 storage.boot_disk=/dev/sda
 nodeforge profile set rocky-9 'kernel_args=iommu=pt hugepages=4'
-
-# 仅可删除没有 Node 引用的 Profile；有引用时返回 profile.in_use
-nodeforge profile remove unused-profile
-
-# 详情视图按 Stored / Overrides / Effective / Runtime 分区，并按点路径分层对齐
 nodeforge node show node-01
 nodeforge profile show rocky-9
 
-# 部署
-nodeforge install retry node-01     # 武装安装 generation
-
-# 运行面检查（退出码表示整体可用性）
-nodeforge status
-
-# 审计排障
-nodeforge events list --node node-01
+# 4. 控制部署开关并执行 install。
+#    retry 发现 deploy=false 时会提示确认；--force 会同时强制打开 deploy。
+nodeforge node deploy node-01 true
+nodeforge node retry node-01 --force
 nodeforge node trace node-01 --latest
+```
+
+Profile 创建时默认导入 nodeforged 宿主机的 `/etc/hosts`，并在 install `%post` /
+late-commands 和 diskless node-apply 阶段写入目标系统。可显式关闭或覆盖：
+
+```bash
+nodeforge profile set rocky-9 system.import_host_hosts=false
+nodeforge profile set rocky-9 $'system.hosts_content=127.0.0.1 localhost\n192.168.50.1 nodeforge.local\n'
+```
+
+### Diskless 流程
+
+```bash
+# 1. 基于已导入的 install source 构建 NodeForge diskless initrd。
+nodeforge assets initrd build rocky-9.7-nodeforge-initrd \
+  --from-install-source rocky-9.7-aarch64-dvd \
+  --kernel-release 5.14.0-611.5.1.el9_7.aarch64
+
+# 2. 创建 boot bundle，并创建 diskless profile。
+nodeforge assets boot-bundle create rocky-9.7-diskless \
+  --kernel rocky-9.7-aarch64-dvd-kernel \
+  --initrd rocky-9.7-nodeforge-initrd \
+  --distro rocky --version 9.7 --arch aarch64 \
+  --kernel-release 5.14.0-611.5.1.el9_7.aarch64
+nodeforge profile create rocky-9.7-diskless rocky-9.7-aarch64-dvd \
+  --kind diskless --boot-bundle rocky-9.7-diskless
+
+# 3. 构建并登记 rootfs。
+nodeforge profile rootfs plan rocky-9.7-diskless --output json
+nodeforge profile rootfs build rocky-9.7-diskless \
+  --if-input-digest <rootfs_input_digest>
+nodeforge profile rootfs status rocky-9.7-diskless
+
+# 4. 绑定节点、检查 readiness、打开 deploy gate。
+nodeforge node set node-01 profile=rocky-9.7-diskless
+nodeforge node readiness node-01 --stage boot
+nodeforge node deploy node-01 true
+
+# 5. PXE 启动节点。启动中 console 会输出 nodeforge session id；
+#    切根后也可在 /var/lib/nodeforge/session-id 和 initrd.log 中查看。
+nodeforge node session list
+nodeforge node trace node-01 --latest
+```
+
+Diskless rootfs 当前默认按最小化配置构建，保持现有行为：只包含启动、网络、
+SSH、包管理器、nodeforge agent 和 node-apply 必需组件。生产标准配置建议后续
+增加 `diskless.rootfs_profile=minimal|standard`：
+
+- `minimal`：默认值，继续服务快速验证和小规模实验。
+- `standard`：由 profile/bundle 驱动扩展包组与基线，纳入 chrony、日志与审计、
+  监控 agent、常用诊断工具、安全策略和站点 CA/SSH 策略。
+- 该字段应进入 rootfs input digest；同一个 ISO、架构和 package set 在不同
+  rootfs profile 下生成不同 rootfs 制品，避免最小化与生产标准混用。
+
+```bash
+# 常用排障
+nodeforge events list --node node-01 --limit 50
+nodeforge node show node-01
+nodeforge node deploy node-01 false
 ```
 
 ### 日志

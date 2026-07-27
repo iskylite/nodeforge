@@ -5,8 +5,6 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const paths = @import("../paths.zig");
-const schema_v3_dto = @import("schema_v3_dto.zig");
-const schema_v2_dto = @import("schema_v2_dto.zig");
 
 /// 默认启动配置路径。必须在进程路径自举完成后调用。
 pub fn defaultPath() []const u8 {
@@ -32,13 +30,7 @@ pub fn load(
     );
     defer allocator.free(bytes);
 
-    const Header = struct { schema_version: u32 };
-    const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
-    defer header.deinit();
-    var parsed = if (header.value.schema_version >= 3)
-        try schema_v3_dto.parse(allocator, bytes)
-    else
-        try schema_v2_dto.parse(allocator, bytes);
+    var parsed = try std.json.parseFromSlice(model.AppConfig, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     canonicalizeKernelArgs(&parsed.value);
     return parsed;
 }
@@ -74,7 +66,7 @@ test "load parses a minimal config" {
     const parsed = try std.json.parseFromSlice(
         model.AppConfig,
         std.testing.allocator,
-        \\{"schema_version":1,"server":{"server_ip":"192.168.50.1"}}
+        \\{"schema_version":4,"server":{"server_ip":"192.168.50.1"}}
     ,
         .{},
     );
@@ -87,7 +79,7 @@ test "load parses a minimal config" {
 test "parsed strings do not borrow the input buffer" {
     const allocator = std.testing.allocator;
     const source = try allocator.dupe(u8,
-        \\{"schema_version":1,"server":{"server_ip":"192.168.50.1"}}
+        \\{"schema_version":4,"server":{"server_ip":"192.168.50.1"}}
     );
     defer allocator.free(source);
 

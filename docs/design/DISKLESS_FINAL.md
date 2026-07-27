@@ -88,6 +88,22 @@ rootfs = OS 层 + rootfs-build phase 业务内容 + Profile target-system 骨架
   Profile system/software/target-system + builder ABI 共同决定；明确排除全部 Node 输入。它是 canonical 输入的
   确定性指纹，不是加密，也不是成品 squashfs 的内容校验和。
 
+**构建流水线（6 阶段）**。rootfs builder 按固定顺序执行，每阶段输出可审计日志：
+
+1. **Stage 1 — OS 层**：发行版原生 install-root 工具（RHEL/Rocky `dnf --installroot`，Ubuntu debootstrap）从受管
+   repository 构建 chroot-able 基线，安装 systemd/udev/网络 renderer/包管理器/SSH/nodeforge-agent/modules/firmware。
+2. **Stage 2 — Payload 物化**：将 rootfs-build phase 的 content_asset（managed-file/archive）物化到 chroot 内
+   payload 目录，为后续 step 执行准备输入。
+3. **Stage 3 — rootfs-build 步骤**：按 managed-file → package → archive → script 固定顺序执行 rootfs-build items，
+   把业务内容追加到只读 lower。同时预置 first-boot manifest/assets/package closure（不执行）。
+4. **Stage 4 — Target-system 骨架**：写入 Profile 级 target-system 基线（账号、hosts、sshd policy、locale/timezone/
+   keyboard），清除 machine-id/DHCP lease/缓存/临时文件/builder resolv.conf/随机种子。
+5. **Stage 5 — SSH 信任基线**：自动生成 ed25519 client keypair + sshd host key，合并 Profile `root_authorized_keys`
+   与自动生成的 client public key 到 `authorized_keys`，写入 `sshd_config.d/00-nodeforge.conf` 启用公钥认证。
+   密钥烤入只读 lower，同 Profile 节点共享同一信任域。
+6. **Stage 6 — squashfs 压缩 + SHA-512 + 原子发布**：`mksquashfs`（zstd 压缩）输出内容寻址 `.part` 文件，
+   流式 SHA-512 校验，原子 rename 发布 ready manifest。
+
 **构建环境保真**：纯 userspace 动作只需 chroot；触及硬件/内核的动作（装驱动、dkms、重生成
 initramfs、装载内核模块）须 bind-mount `/dev`/`/proc`/`/sys` 并使用与目标 distro/version/arch/
 `kernel_release` 一致的内核（内核与 OS 一致时加载完整内核态）。更高保真的临时 PXE rootfs 构建节点
@@ -109,6 +125,12 @@ initramfs、装载内核模块）须 bind-mount `/dev`/`/proc`/`/sys` 并使用�
   标准 Node `authorized_keys.remove` 不能删除它；Node hosts override 会以 effective hosts 和同一 host public key 重算
   该节点 `ssh_known_hosts`。若 Profile hosts 覆盖 100 个节点且没有显式后处理破坏 SSH 文件，这 100 个节点彼此均免密，
   并看到同一个 Profile host fingerprint。
+
+  > **实现现状**：rootfs builder 的 Stage 5/6 已实现自动生成 ed25519 client keypair 和 sshd host key，
+  > 合并 `system.ssh.root_authorized_keys` 与自动生成的 client public key 到 `authorized_keys`，
+  > 并写入 `sshd_config.d/00-nodeforge.conf` 启用 `PubkeyAuthentication`。
+  > `/etc/ssh/ssh_known_hosts` 的自动生成（绑定 Profile hosts 到共享 host public key）为后续完善点。
+  > `--new-ssh-keys` flag 的端到端流程尚在实现中；当前每次 rootfs build 均重新生成密钥。
 - **Profile 共享 password hash**：明文 password 仍按 v0.1 desired 契约配置，但 diskless Profile credential revision
   只生成一次带 CSPRNG salt 的 `$6$` hash 并安全持久化；普通重建复用同一 hash，避免同输入 rootfs 因 per-session salt
   失去可复现性。显式改密码才发布新 Profile revision/input digest；install Profile 的 v0.1 行为不变。
@@ -168,7 +190,7 @@ credential。`/var/lib/nodeforge/boot.json` 只保存 plan/config digest 与非 
 `event:append` token 单独保存于 `/var/lib/nodeforge/credentials/event.token`，mode 0400，不能进入 boot.json、
 日志或进程 argv。initrd 在 `switch_root` 前清零 config/rootfs-artifact token；agent 在预取并校验全部输入后、修改
 目标系统前清零 agent token，first-boot 结束后清零 event token。
-BootConfig DTO 自身 `schema_version` v2（与 catalog schema v3/v4 分属不同命名空间），
+BootConfig DTO 自身 `schema_version` v2（与 catalog schema v4 分属不同命名空间），
 使用 `kind` 判别字段（与 `ProfileKind` 一致），废弃 legacy `mode="diskless"`。
 
 `required_features` 按 consumer 分成 `initrd`/`agent` 两个排序去重集合。initrd 至少需要

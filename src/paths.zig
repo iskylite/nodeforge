@@ -56,7 +56,7 @@ pub const Paths = struct {
     bootstrap_private_key_temp_path: []const u8,
     /// 公钥临时写入路径，用于原子替换。
     bootstrap_public_key_temp_path: []const u8,
-    /// 小 initrd 目录（`<root>/assets/initrd`），v0.2 无盘启动用。
+    /// Diskless initrd 目录（`<root>/assets/boot/diskless`），v0.2 无盘启动用。
     initrd_dir: []const u8,
     /// rootfs 目录（`<root>/assets/rootfs`），v0.2 无盘启动用。
     rootfs_dir: []const u8,
@@ -73,10 +73,6 @@ pub const Paths = struct {
     import_dir: []const u8,
     /// 启动配置文件路径（`<root>/config/config.json`）。
     config_path: []const u8,
-    /// M4.7b 前兼容单文件 catalog 路径；完成 manifest 迁移后仅用于 legacy 检测。
-    legacy_catalog_path: []const u8,
-    /// Legacy 运行态文件路径（`<root>/state/runtime.json`）。M4.7 后拆分为多个独立文件。
-    runtime_path: []const u8,
     /// DHCP lease 持久化文件路径（`<root>/state/leases.json`）。
     leases_path: []const u8,
     /// 节点状态持久化文件路径（`<root>/state/node-status.json`）。
@@ -102,7 +98,7 @@ pub const Paths = struct {
     /// Diskless capability 派生主密钥（0600，32-byte hex）。
     diskless_secret_path: []const u8,
     /// 模型事务目录（`<root>/state/model-transactions`）。
-    /// 存放 schema v3 迁移等大事务的 before/after 快照。
+    /// 存放 catalog mutation 等大事务的 before/after 快照。
     model_transactions_dir: []const u8,
     /// 事件审计流文件路径（`<root>/logs/events.jsonl`）。追加型 JSONL。
     events_path: []const u8,
@@ -280,7 +276,7 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .bootstrap_public_key_path = try join(allocator, root, "assets/keys/id_ed25519.pub"),
         .bootstrap_private_key_temp_path = try join(allocator, root, "assets/keys/id_ed25519.tmp"),
         .bootstrap_public_key_temp_path = try join(allocator, root, "assets/keys/id_ed25519.tmp.pub"),
-        .initrd_dir = try join(allocator, root, "assets/initrd"),
+        .initrd_dir = try join(allocator, root, "assets/boot/diskless"),
         .rootfs_dir = try join(allocator, root, "assets/rootfs"),
         .bundles_dir = try join(allocator, root, "assets/bundles"),
         .provisioned_dir = try join(allocator, root, "state/provisioned"),
@@ -288,8 +284,6 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .work_dir = try join(allocator, root, "work"),
         .import_dir = try join(allocator, root, "work/import"),
         .config_path = try join(allocator, root, "config/config.json"),
-        .legacy_catalog_path = try join(allocator, root, "catalog/catalog.json"),
-        .runtime_path = try join(allocator, root, "state/runtime.json"),
         .leases_path = try join(allocator, root, "state/leases.json"),
         .node_status_path = try join(allocator, root, "state/node-status.json"),
         .deployment_control_path = try join(allocator, root, "state/deployment-control.json"),
@@ -344,7 +338,6 @@ test "runtime paths resolve a custom marked install root" {
     defer value.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(root, value.install_root);
     try std.testing.expectEqualStrings("config/config.json", value.config_path[root.len + 1 ..]);
-    try std.testing.expectEqualStrings("catalog/catalog.json", value.legacy_catalog_path[root.len + 1 ..]);
 }
 
 test "runtime paths fail closed without marker or paired binaries" {

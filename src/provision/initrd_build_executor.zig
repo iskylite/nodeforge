@@ -189,7 +189,12 @@ fn buildInternal(
     // 5. 创建 /init 脚本（PID 1 入口，exec nodeforge-initrd）
     std.log.scoped(.initrd_build).info("initrd build: stage 5/7 - creating /init PID 1 script", .{});
     const init_script = try std.fmt.allocPrint(a, "{s}/init", .{initrd_root});
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = init_script, .data = "#!/bin/sh\nexec /usr/sbin/nodeforge-initrd\n" }) catch |err| {
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = init_script, .data =
+        \\#!/bin/sh
+        \\export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin:/run/current-system/sw/sbin
+        \\exec /usr/sbin/nodeforge-initrd
+        \\
+    }) catch |err| {
         std.log.scoped(.initrd_build).err("create /init failed: {t}", .{err});
         return error.InitScriptFailed;
     };

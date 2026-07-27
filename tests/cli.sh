@@ -6,7 +6,7 @@ daemon=$2
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 direct_writes=$(grep -Ec 'ctx\.writer\.(writeAll|print|writeByte)\(' "$root/src/main.zig" || true)
-test "$direct_writes" -eq 7
+test "$direct_writes" -eq 8
 test "$(grep -Fc 'ctx.writer.print("This will permanently purge NodeForge state' "$root/src/main.zig")" -eq 1
 test "$(grep -Fc 'ctx.writer.print("This will back up and reset NodeForge startup configuration' "$root/src/main.zig")" -eq 1
 test "$(grep -Fc 'ctx.writer.print("This will modify {s}. Continue?' "$root/src/main.zig")" -eq 1
@@ -16,6 +16,45 @@ test "$(grep -Fc 'ctx.writer.writeAll(answer);' "$root/src/main.zig")" -eq 1
 tmp=${TMPDIR:-/tmp}/nodeforge-cli-test-$$
 mkdir -p "$tmp"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
+# 从 catalog.example.json 构建 manifest 布局 catalog 目录。
+# store.load 只接受目录路径（manifest 布局），单文件加载已移除。
+# 测试需要从 repo 内的示例文件构造完整目录布局：逐实体提取 JSON、
+# 计算 SHA-256 摘要、拼装 manifest 并生成 transaction_id。
+catalog_dir="$tmp/catalog"
+mkdir -p "$catalog_dir"
+names="distros profiles nodes provisioning_bundles repositories assets install_sources boot_bundles discovery_policy unknown_client_observations"
+for name in $names; do
+    if [ "$name" = "discovery_policy" ]; then
+        # discovery_policy 是 singleton struct，不是数组，需要输出对象而非 []。
+        printf '{"unknown_action":"record","observation_retention_days":30,"revision":1}\n' > "$catalog_dir/$name.json"
+    else
+        jq --arg name "$name" '.[$name] // []' "$root/catalog.example.json" > "$catalog_dir/$name.json"
+    fi
+done
+# 拼装 manifest entities 数组，同时累积 transaction_id 输入。
+# transaction_id = sha256(revision + 每个实体的 name + sha256)。
+entities_json="["
+tx_input=""
+first=1
+for name in $names; do
+    digest=$(sha256sum "$catalog_dir/$name.json" | cut -d ' ' -f 1)
+    if [ $first -eq 0 ]; then entities_json="$entities_json,"; fi
+    entities_json="$entities_json{\"name\":\"$name\",\"file\":\"$name.json\",\"sha256\":\"$digest\"}"
+    tx_input="${tx_input}${name}${digest}"
+    first=0
+done
+entities_json="$entities_json]"
+transaction_id=$(printf "1%s" "$tx_input" | sha256sum | cut -d ' ' -f 1)
+cat > "$catalog_dir/manifest.json" <<EOF
+{
+  "layout_schema_version": 1,
+  "catalog_schema_version": 4,
+  "catalog_revision": 1,
+  "transaction_id": "$transaction_id",
+  "entities": $entities_json
+}
+EOF
 
 # M4.7 bootstrap deliberately rejects build-cache binaries: a valid process
 # image must live in a marked install root with its same-build sibling. Copy
@@ -71,7 +110,7 @@ fi
 grep -q -- "--import-config" "$tmp/setup-help"
 grep -q -- "--purge-all" "$tmp/setup-help"
 "$cli" profile create --help >"$tmp/profile-create-help"
-grep -Fq 'Create an install profile from an imported install source' "$tmp/profile-create-help"
+grep -Fq 'Create an install or diskless profile from an imported install source' "$tmp/profile-create-help"
 grep -Fq 'Derives distro, version, and architecture' "$tmp/profile-create-help"
 "$cli" profile set --help >"$tmp/profile-set-help"
 grep -Fq 'exact mutable Profile PropertySpec key' "$tmp/profile-set-help"
@@ -193,8 +232,7 @@ for command in \
     "catalog" \
     "catalog validate" \
     "catalog export" \
-    "catalog show" \
-    "catalog migrate"; do
+    "catalog show"; do
     "$cli" $command --help >"$tmp/help-$(echo "$command" | tr ' ' '-')"
     if grep -q "Examples:" "$tmp/help-$(echo "$command" | tr ' ' '-')"; then
         echo "help must not embed examples: $command" >&2
@@ -240,7 +278,7 @@ done
 
 # Each business flag belongs to its leaf command. This avoids silently carrying
 # unrelated root flags into subcommands that do not read them.
-"$cli" config validate -c "$root/config.example.json" -C "$root/catalog.example.json" -o json >"$tmp/validate"
+"$cli" config validate -c "$root/config.example.json" -C "$catalog_dir" -o json >"$tmp/validate"
 grep -q '"ok":true' "$tmp/validate"
 grep -q "$root/config.example.json" "$tmp/validate"
 "$cli" catalog show --help >"$tmp/catalog-show-help"
@@ -253,26 +291,26 @@ fi
 # M1.5 human output is an aligned, headered table rather than tabs. The
 # contract runs with stdout redirected, so it also proves no ANSI bytes leak
 # into scripts and snapshots; JSON retains its machine-readable shape.
-"$cli" assets list -C "$root/catalog.example.json" >"$tmp/asset-list"
+"$cli" assets list -C "$catalog_dir" >"$tmp/asset-list"
 grep -Eq '^NAME[[:space:]]+KIND[[:space:]]+PATH[[:space:]]*$' "$tmp/asset-list"
 grep -F 'rocky-9.7-aarch64-installer-kernel' "$tmp/asset-list" | grep -Fq 'kernel'
 if LC_ALL=C grep -q "$(printf '\033')" "$tmp/asset-list"; then
     echo "human asset list must not emit ANSI outside a TTY" >&2
     exit 1
 fi
-"$cli" assets list -C "$root/catalog.example.json" --no-color >"$tmp/asset-list-no-color"
+"$cli" assets list -C "$catalog_dir" --no-color >"$tmp/asset-list-no-color"
 cmp "$tmp/asset-list" "$tmp/asset-list-no-color"
-"$cli" assets list -C "$root/catalog.example.json" -o json >"$tmp/asset-list-json"
+"$cli" assets list -C "$catalog_dir" -o json >"$tmp/asset-list-json"
 jq -e '.ok and (.result.assets | length > 0) and .result.assets[0].name' "$tmp/asset-list-json" >/dev/null
-"$cli" assets list -C "$root/catalog.example.json" -o jsonl >"$tmp/asset-list-jsonl"
+"$cli" assets list -C "$catalog_dir" -o jsonl >"$tmp/asset-list-jsonl"
 test "$(wc -l <"$tmp/asset-list-jsonl" | tr -d ' ')" = "$(jq '.assets | length' "$root/catalog.example.json")"
 jq -e '.ok and .result.name and .result.kind and .result.path' "$tmp/asset-list-jsonl" >/dev/null
-"$cli" assets list -C "$root/catalog.example.json" --columns name,path --no-header >"$tmp/asset-list-columns"
+"$cli" assets list -C "$catalog_dir" --columns name,path --no-header >"$tmp/asset-list-columns"
 if grep -Fq 'KIND' "$tmp/asset-list-columns"; then
     echo "filtered asset list unexpectedly retained KIND" >&2
     exit 1
 fi
-if "$cli" assets list -C "$root/catalog.example.json" --columns missing >"$tmp/asset-list-bad-column.out" 2>"$tmp/asset-list-bad-column.err"; then
+if "$cli" assets list -C "$catalog_dir" --columns missing >"$tmp/asset-list-bad-column.out" 2>"$tmp/asset-list-bad-column.err"; then
     echo "asset list accepted an unknown output column" >&2
     exit 1
 else
@@ -280,7 +318,7 @@ else
 fi
 test ! -s "$tmp/asset-list-bad-column.out"
 grep -Fq 'unknown key' "$tmp/asset-list-bad-column.err"
-if "$cli" assets list -C "$root/catalog.example.json" -o json --no-header >"$tmp/asset-list-json-header.out" 2>"$tmp/asset-list-json-header.err"; then
+if "$cli" assets list -C "$catalog_dir" -o json --no-header >"$tmp/asset-list-json-header.out" 2>"$tmp/asset-list-json-header.err"; then
     echo "JSON asset list accepted human-only --no-header" >&2
     exit 1
 else
@@ -337,13 +375,13 @@ grep -q -- "-k, --check" "$tmp/daemon-help"
 grep -q -- "-K, --check-config" "$tmp/daemon-help"
 "$daemon" --version | grep -Fq 'built '
 "$daemon" -v | grep -Fq 'commit '
-"$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" >"$tmp/daemon-check-config" 2>&1
+"$daemon" -K -c "$root/config.example.json" -C "$catalog_dir" >"$tmp/daemon-check-config" 2>&1
 grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* info \[nodeforge\] config: valid ' "$tmp/daemon-check-config"
 
 # Service log routing is selected per invocation. File mode keeps normal
 # terminal stderr quiet, while both mode duplicates the bounded service line.
 service_log="$tmp/nodeforged.log"
-"$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" --log-output file --log-file "$service_log" >"$tmp/daemon-file-out" 2>"$tmp/daemon-file-err"
+"$daemon" -K -c "$root/config.example.json" -C "$catalog_dir" --log-output file --log-file "$service_log" >"$tmp/daemon-file-out" 2>"$tmp/daemon-file-err"
 if grep -Fq '[nodeforge]' "$tmp/daemon-file-err"; then
     echo "file log mode unexpectedly wrote a service log to stderr" >&2
     exit 1
@@ -351,7 +389,7 @@ fi
 grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* info \[nodeforge\] config: valid ' "$service_log"
 
 failed_service_log="$tmp/nodeforged-failure.log"
-if "$daemon" -K -c "$tmp/missing-daemon-config.json" -C "$root/catalog.example.json" --log-output file --log-file "$failed_service_log" >"$tmp/daemon-failure-out" 2>"$tmp/daemon-failure-err"; then
+if "$daemon" -K -c "$tmp/missing-daemon-config.json" -C "$catalog_dir" --log-output file --log-file "$failed_service_log" >"$tmp/daemon-failure-out" 2>"$tmp/daemon-failure-err"; then
     echo "missing daemon config unexpectedly succeeded" >&2
     exit 1
 else
@@ -359,10 +397,10 @@ else
 fi
 grep -Fq 'err [nodeforge] config: cannot load' "$failed_service_log"
 
-"$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" --log-output both --log-file "$service_log" >"$tmp/daemon-both-out" 2>"$tmp/daemon-both-err"
+"$daemon" -K -c "$root/config.example.json" -C "$catalog_dir" --log-output both --log-file "$service_log" >"$tmp/daemon-both-out" 2>"$tmp/daemon-both-err"
 grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* info \[nodeforge\] config: valid ' "$tmp/daemon-both-err"
 
-if "$daemon" -K -c "$root/config.example.json" -C "$root/catalog.example.json" --log-output nowhere >"$tmp/daemon-invalid-log-output" 2>&1; then
+if "$daemon" -K -c "$root/config.example.json" -C "$catalog_dir" --log-output nowhere >"$tmp/daemon-invalid-log-output" 2>&1; then
     echo "invalid --log-output unexpectedly succeeded" >&2
     exit 1
 else

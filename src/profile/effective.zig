@@ -80,7 +80,7 @@ pub fn compileInputs(allocator: std.mem.Allocator, node: *const model.NodeConfig
         .storage = storage,
         .system = try install_compiler.effectiveSystem(profile),
         .software = profile.software,
-        .network = node.network,
+        .network = effectiveNetwork(node),
         .kernel_args = profile.kernel_args,
     };
     errdefer result.deinit();
@@ -149,9 +149,29 @@ fn mergeKernelArgs(plan: *Plan, delta: model.StringSetDelta) !void {
     plan.kernel_args = owned;
 }
 
-fn kernelName(value: []const u8) []const u8 { return value[0 .. std.mem.indexOfScalar(u8, value, '=') orelse value.len]; }
-fn kernelIndex(values: []const []const u8, name: []const u8) ?usize { for (values, 0..) |value, index| if (std.mem.eql(u8, kernelName(value), name)) return index; return null; }
-fn kernelContains(values: []const []const u8, name: []const u8) bool { return kernelIndex(values, name) != null; }
+fn effectiveNetwork(node: *const model.NodeConfig) model.TargetNetworkConfig {
+    var network = node.network;
+    if (network.mode == .dhcp) {
+        if (node.pxe.ip_reservation) |ip| {
+            network.mode = .static;
+            network.address = network.address orelse ip;
+            network.prefix_len = network.prefix_len orelse 24;
+            network.match_mac = network.match_mac orelse node.mac;
+        }
+    }
+    return network;
+}
+
+fn kernelName(value: []const u8) []const u8 {
+    return value[0 .. std.mem.indexOfScalar(u8, value, '=') orelse value.len];
+}
+fn kernelIndex(values: []const []const u8, name: []const u8) ?usize {
+    for (values, 0..) |value, index| if (std.mem.eql(u8, kernelName(value), name)) return index;
+    return null;
+}
+fn kernelContains(values: []const []const u8, name: []const u8) bool {
+    return kernelIndex(values, name) != null;
+}
 
 fn mergeSet(plan: *Plan, base: []const []const u8, delta: model.StringSetDelta) ![]const []const u8 {
     var values: std.ArrayList([]const u8) = .empty;
@@ -181,4 +201,16 @@ test "effective plan merges policy collections and direct node facts" {
     try std.testing.expectEqualStrings("c", plan.software.packages.include[1]);
     try std.testing.expectEqualStrings("console=ttyS0 iommu=pt", plan.kernel_args.?);
     try std.testing.expectEqual(model.NetworkMode.static, plan.network.mode);
+}
+
+test "pxe reservation defaults target network to static" {
+    const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .x86_64, .source_asset = "iso", .installer_kernel = "kernel", .installer_initrd = "initrd" };
+    const profile: model.ProfileConfig = .{ .name = "p", .install_source = "s" };
+    const node: model.NodeConfig = .{ .id = "n", .mac = "02:00:00:00:00:01", .arch = .x86_64, .profile = "p", .pxe = .{ .ip_reservation = "192.0.2.10" } };
+    const catalog: model.Catalog = .{ .profiles = &.{profile}, .nodes = &.{node}, .install_sources = &.{source} };
+    var plan = try compile(std.testing.allocator, &catalog, &node);
+    defer plan.deinit();
+    try std.testing.expectEqual(model.NetworkMode.static, plan.network.mode);
+    try std.testing.expectEqualStrings("192.0.2.10", plan.network.address.?);
+    try std.testing.expectEqual(@as(u8, 24), plan.network.prefix_len.?);
 }

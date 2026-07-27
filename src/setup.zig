@@ -7,11 +7,9 @@
 const std = @import("std");
 const paths_mod = @import("paths.zig");
 const model = @import("model.zig");
-const config_load = @import("config/load.zig");
 const config_store = @import("config/store.zig");
 const catalog_store = @import("catalog/store.zig");
 const validate = @import("config/validate.zig");
-const deployment_control = @import("state/deployment_control.zig");
 const model_transaction = @import("state/model_transaction.zig");
 const atomicWrite = @import("state/dhcp_store.zig").atomicWrite;
 
@@ -59,7 +57,7 @@ pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppCon
 /// 创建安装根下的全部子目录并设置安全权限。
 ///
 /// 目录权限策略：
-/// - `750`：安装根、bin、systemd、logs、assets 及其子目录（iso/boot/repos/initrd/rootfs/bundles）。
+/// - `750`：安装根、bin、systemd、logs、assets 及其子目录（iso/boot/repos/rootfs/bundles）。
 /// - `700`：config、catalog、state、keys、provisioned、run、work、import、model-transactions。
 ///
 /// 错误时部分目录可能已创建，但 `setup` 的幂等性保证重试可完成。
@@ -115,8 +113,7 @@ pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     const config = if (imported_config) |candidate| candidate.* else generatedConfig(p, network);
     // 空 distro 索引是正常的首次安装状态；首个通过媒体布局校验的 ISO
     // 会与 install source 一起原子创建对应 family/version/arch 能力记录。
-    // v0.2 默认 schema v4：diskless profile 的 tagged union kind 需要 v4。
-    // 从 setup 初始化即使用 v4，避免后续手动迁移。
+    // schema 永久为 v4；diskless profile 的 tagged union kind 需要 v4。
     const catalog: model.Catalog = .{ .schema_version = 4 };
     try validate.validate(&config, &catalog);
     try installBundle(io, allocator, p);
@@ -152,76 +149,6 @@ pub fn installEnvironment(io: std.Io, allocator: std.mem.Allocator, p: *const pa
     defer allocator.free(content);
     try atomicWrite(io, environment_path, content);
     try chmod(io, allocator, "644", environment_path);
-}
-
-/// 原地升级 schema 1。若后续步骤失败则备份与 marker 保留；因 manifest 提交
-/// 经 digest 校验，重跑幂等。
-pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) !bool {
-    var parsed = try config_load.load(io, allocator, p.config_path);
-    defer parsed.deinit();
-    const marker = try std.fmt.allocPrint(allocator, "{s}/m4.7-migration.json", .{p.state_dir});
-    defer allocator.free(marker);
-    // Schema 3 and 4 already use the split catalog layout. `setup
-    // --reconfigure` must be idempotent for a freshly initialized current
-    // deployment; only schema 1/2 participate in the legacy M4.7 recovery
-    // transaction below.
-    if (parsed.value.schema_version == 3 or parsed.value.schema_version == 4) return false;
-    if (parsed.value.schema_version == 2) {
-        // 发布 config.json 后崩溃可能留下合法 manifest 与遗留 catalog.json 并存。
-        // migration marker 是该混合布局属于一个已知事务的证明；完成其清理，而不是
-        // 让普通 catalog 加载器猜测哪一代为权威。
-        if (!regularFile(io, marker)) return false;
-        const backup = try std.fmt.allocPrint(allocator, "{s}.m4.7.bak", .{p.legacy_catalog_path});
-        defer allocator.free(backup);
-        const had_legacy = regularFile(io, p.legacy_catalog_path);
-        if (had_legacy) {
-            if (!regularFile(io, backup)) try std.Io.Dir.copyFileAbsolute(p.legacy_catalog_path, backup, io, .{ .replace = false, .make_path = true });
-            try std.Io.Dir.cwd().deleteFile(io, p.legacy_catalog_path);
-        }
-        var current_catalog = catalog_store.load(io, allocator, p.catalog_dir) catch |err| {
-            if (had_legacy) std.Io.Dir.copyFileAbsolute(backup, p.legacy_catalog_path, io, .{ .replace = true, .make_path = true }) catch {};
-            return err;
-        };
-        defer current_catalog.deinit();
-        const effective = model.projectCatalog(parsed.value, &current_catalog.value);
-        try validate.validate(&effective, &current_catalog.value);
-        try std.Io.Dir.cwd().deleteFile(io, marker);
-        return true;
-    }
-    if (parsed.value.schema_version != 1) return error.UnsupportedSchemaVersion;
-    var legacy_catalog: ?std.json.Parsed(model.Catalog) = catalog_store.loadLegacy(io, allocator, p.legacy_catalog_path) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-    defer if (legacy_catalog) |*loaded| loaded.deinit();
-    var catalog = if (legacy_catalog) |*loaded| loaded.value else model.Catalog{};
-    catalog.schema_version = 2;
-    catalog.distros = parsed.value.distros;
-    catalog.profiles = parsed.value.profiles;
-    catalog.nodes = parsed.value.nodes;
-    catalog.provisioning_bundles = parsed.value.provisioning_bundles;
-    var startup = parsed.value;
-    startup.schema_version = 2;
-    const projected = model.projectCatalog(startup, &catalog);
-    try validate.validate(&projected, &catalog);
-    try repairDirectories(io, allocator, p);
-    const config_backup = try std.fmt.allocPrint(allocator, "{s}.m4.7.bak", .{p.config_path});
-    defer allocator.free(config_backup);
-    if (!regularFile(io, config_backup)) try std.Io.Dir.copyFileAbsolute(p.config_path, config_backup, io, .{ .replace = false, .make_path = true });
-    const revision = try deployment_control.revisionForModel(allocator, &projected, &catalog);
-    const marker_bytes = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"state\":\"prepared\",\"request_digest\":\"{s}\"}}\n", .{revision.desired_digest});
-    defer allocator.free(marker_bytes);
-    try atomicWrite(io, marker, marker_bytes);
-    try catalog_store.save(io, allocator, p.catalog_dir, &catalog);
-    try config_store.save(io, allocator, p.config_path, &startup);
-    if (regularFile(io, p.legacy_catalog_path)) {
-        const backup = try std.fmt.allocPrint(allocator, "{s}.m4.7.bak", .{p.legacy_catalog_path});
-        defer allocator.free(backup);
-        if (!regularFile(io, backup)) try std.Io.Dir.copyFileAbsolute(p.legacy_catalog_path, backup, io, .{ .replace = false, .make_path = true });
-        try std.Io.Dir.cwd().deleteFile(io, p.legacy_catalog_path);
-    }
-    try std.Io.Dir.cwd().deleteFile(io, marker);
-    return true;
 }
 
 /// 重置运行态文件到干净状态，但保留 config/catalog。

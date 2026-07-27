@@ -241,8 +241,8 @@ for _ in {1..50}; do ! pgrep -f "nodeforged --install-root $install_root" >/dev/
 
 mkdir -p "$install_root/assets/boot"
 cp "$work/vmlinuz-$KREL" "$install_root/assets/boot/vmlinuz-$KREL"
-mkdir -p "$install_root/assets/initrd-ubuntu"
-cp "$work/initramfs.img" "$install_root/assets/initrd-ubuntu/ub-mkinit-initrd"
+mkdir -p "$install_root/assets/boot/diskless/ubuntu"
+cp "$work/initramfs.img" "$install_root/assets/boot/diskless/ubuntu/ub-mkinit-initrd"
 mkdir -p "$install_root/assets/rootfs-ubuntu"
 cp "$work/rootfs.squashfs" "$install_root/assets/rootfs-ubuntu/ub-mkinit-rootfs"
 
@@ -260,7 +260,7 @@ def A(name, kind, path):
             "version": "22.04", "arch": "aarch64", "kernel_release": krel,
             "sha256": None, "revision": 1, "size": None, "media_type": None}
 for nm, k, p in [(f"{P}-kernel","kernel",f"boot/vmlinuz-{krel}"),
-                 (f"{P}-initrd","nodeforge_initrd",f"initrd-ubuntu/{P}-initrd"),
+                 (f"{P}-initrd","nodeforge_initrd",f"diskless/ubuntu/{P}-initrd"),
                  (f"{P}-rootfs","rootfs",f"rootfs-ubuntu/{P}-rootfs")]:
     a = next((x for x in assets if x["name"] == nm), None)
     if a is None: assets.append(A(nm, k, p))

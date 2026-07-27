@@ -121,7 +121,7 @@ pub fn validateConfigShape(config: *const model.AppConfig) ValidationError!void 
 /// 校验 catalog 的结构形状：schema 版本、名称唯一性、节点 ID/MAC 格式和资产路径安全。
 /// 不校验跨文件引用关系——那由 `validate` 统一执行。
 pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version < 1 or catalog.schema_version > 4) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version != 4) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.DistroConfig, catalog.distros);
     try uniqueNamed(model.ProfileConfig, catalog.profiles);
     try uniqueNamed(model.ProvisioningBundle, catalog.provisioning_bundles);
@@ -145,7 +145,7 @@ pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void 
 }
 
 /// 完整模型校验入口：先校验 config/catalog 各自形状，再投影 catalog 后执行完整交叉校验。
-/// 用于 setup 初始化和 schema 迁移后的全量验证。
+/// 用于 setup 初始化后的全量验证。
 pub fn validateModel(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     try validateConfigShape(config);
     try validateCatalogShape(catalog);
@@ -158,7 +158,7 @@ pub fn validateModel(config: *const model.AppConfig, catalog: *const model.Catal
 /// 不检查 catalog 引用关系，适用于 CLI 在 catalog 尚未加载时
 /// 对 config 做快速预检。
 pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
-    if (config.schema_version < 1 or config.schema_version > 4) return error.UnsupportedSchemaVersion;
+    if (config.schema_version != 4) return error.UnsupportedSchemaVersion;
     if (config.server.name.len == 0) return error.EmptyServerName;
     if (config.server.bind_interface) |iface| {
         if (iface.len == 0) return error.EmptyBindInterface;
@@ -290,7 +290,7 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
 /// 检查 distros/profiles/nodes/assets/repositories/install_sources/boot_bundles/provisioning_bundles
 /// 的名称唯一性、引用有效性和语义不变量。
 pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version < 1 or catalog.schema_version > 4) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version != 4) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.RepositoryConfig, catalog.repositories);
     try uniqueNamed(model.AssetConfig, catalog.assets);
     try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
@@ -433,8 +433,7 @@ fn validateProvisioningBundles(catalog: *const model.Catalog) ValidationError!vo
                     try validateManagedFileStep(catalog, &step);
                 },
                 .rootfs_build, .first_boot => {
-                    // v0.2 build/first-boot 阶段仅 schema v4：允许 managed_file/archive/script/package。
-                    if (catalog.schema_version < 4) return error.InvalidProvisioningStep;
+                    // v0.2 build/first-boot 阶段：允许 managed_file/archive/script/package。
                     switch (step.action) {
                         .managed_file => try validateManagedFileStep(catalog, &step),
                         .archive => {
@@ -582,6 +581,11 @@ fn validateTargetSystem(system: model.TargetSystemConfig) ValidationError!void {
         for (user.ssh_authorized_keys) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
     }
     for (system.ssh.root_authorized_keys) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
+    if (system.hosts_content) |content| {
+        if (content.len == 0 or content.len > 64 * 1024) return error.InvalidTargetNetwork;
+        if (std.mem.indexOfScalar(u8, content, 0) != null) return error.InvalidTargetNetwork;
+        if (std.mem.indexOf(u8, content, "NODEFORGE_HOSTS_EOF") != null) return error.InvalidTargetNetwork;
+    }
 }
 
 fn validateInstallConfig(config: *const model.AppConfig, system: model.TargetSystemConfig, install: model.InstallConfig) ValidationError!void {
@@ -597,8 +601,8 @@ fn validateInstallConfig(config: *const model.AppConfig, system: model.TargetSys
     var root_count: usize = 0;
     var grow_count: usize = 0;
     for (storage.partitions, 0..) |part, index| {
-        if (config.schema_version >= 3 and (part.id == null or !validIdentifier(part.id.?))) return error.InvalidInstallStorage;
-        // install storage partition id 要求对 schema v3+ 生效（v4 install profile 同样要求）。
+        if (config.schema_version >= 4 and (part.id == null or !validIdentifier(part.id.?))) return error.InvalidInstallStorage;
+        // install storage partition id 为必填且必须为合法标识符。
         if (part.id) |id| for (storage.partitions[index + 1 ..]) |other| if (other.id != null and std.mem.eql(u8, id, other.id.?)) return error.InvalidInstallStorage;
         if (part.size_mib == 0 and !part.grow) return error.InvalidInstallStorage;
         if (part.grow) grow_count += 1;
@@ -938,8 +942,8 @@ test "最小配置和空 catalog 有效" {
     try validate(&config, &cat);
 }
 
-test "v4 forward-migrated config and catalog pass validateModel" {
-    // 回归：schema-v4 apply 经 validateModel 校验候选，schema_version=4 不得被拒。
+test "config and catalog pass validateModel" {
+    // 回归：apply 经 validateModel 校验候选，schema_version=4 不得被拒。
     const config: model.AppConfig = .{ .schema_version = 4, .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
     const cat: model.Catalog = .{ .schema_version = 4 };
     try validateModel(&config, &cat);

@@ -22,7 +22,7 @@ const std = @import("std");
 pub const model = @import("model.zig");
 /// 运行时受管路径：从已验证 install root 派生 import/work/events 等安全边界。
 pub const paths = @import("paths.zig");
-/// M4.7 安装初始化、legacy 迁移、reset 与 systemd unit 生成。
+/// 安装初始化、reset 与 systemd unit 生成。
 pub const setup = @import("setup.zig");
 /// 项目版本字符串，从 build.zon 注入。
 pub const version = @import("version.zig");
@@ -32,12 +32,8 @@ pub const catalog = @import("catalog.zig");
 pub const catalog_store = @import("catalog/store.zig");
 /// M3 ISO 导入器：通过只读 loop mount 从 DVD ISO 提取安装介质并发布到 catalog。
 pub const iso_import = @import("catalog/iso_import.zig");
-pub const catalog_migration = @import("catalog/migration.zig");
 pub const catalog_discovery = @import("catalog/discovery.zig");
-pub const catalog_schema_v3 = @import("catalog/schema_v3.zig");
-pub const catalog_schema_v4 = @import("catalog/schema_v4.zig");
-pub const catalog_schema_v3_dto = @import("catalog/schema_v3_dto.zig");
-pub const catalog_schema_v2_dto = @import("catalog/schema_v2_dto.zig");
+pub const catalog_dto = @import("catalog/dto.zig");
 pub const software_index = @import("catalog/software_index.zig");
 /// Daemon 应用入口：绑定端口、启动 DHCP/TFTP/HTTP 服务和管理信号处理。
 pub const app = @import("app.zig");
@@ -45,8 +41,6 @@ pub const app = @import("app.zig");
 pub const config = @import("config/load.zig");
 /// 启动配置存储器：原子写入和规范化渲染配置 JSON。
 pub const config_store = @import("config/store.zig");
-pub const config_schema_v3_dto = @import("config/schema_v3_dto.zig");
-pub const config_schema_v2_dto = @import("config/schema_v2_dto.zig");
 /// 配置和 catalog 校验器：纯函数校验所有不变量和跨文件引用关系。
 pub const config_validate = @import("config/validate.zig");
 /// 节点资源增删改：load-modify-validate-save 事务写回 catalog/nodes.json。
@@ -104,7 +98,6 @@ pub const operations = @import("state/operations.zig");
 pub const config_runtime = @import("state/config_runtime.zig");
 pub const model_runtime = @import("state/model_runtime.zig");
 pub const model_transaction = @import("state/model_transaction.zig");
-pub const schema_v3_transaction = @import("state/schema_v3_transaction.zig");
 /// 节点状态跟踪：记录已注册节点的当前启动阶段和终态。
 pub const node_status = @import("state/node_status.zig");
 /// Catalog 运行时快照：管理 catalog 的原子替换和只读引用计数。
@@ -188,18 +181,12 @@ test {
     _ = catalog;
     _ = catalog_store;
     _ = iso_import;
-    _ = catalog_migration;
     _ = catalog_discovery;
-    _ = catalog_schema_v3;
-    _ = catalog_schema_v4;
-    _ = catalog_schema_v3_dto;
-    _ = catalog_schema_v2_dto;
+    _ = catalog_dto;
     _ = software_index;
     _ = app;
     _ = config;
     _ = config_store;
-    _ = config_schema_v3_dto;
-    _ = config_schema_v2_dto;
     _ = config_validate;
     _ = node_mutation;
     _ = profile_mutation;
@@ -223,7 +210,6 @@ test {
     _ = config_runtime;
     _ = model_runtime;
     _ = model_transaction;
-    _ = schema_v3_transaction;
     _ = node_status;
     _ = catalog_runtime;
     _ = events;

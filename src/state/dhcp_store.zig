@@ -7,7 +7,6 @@
 
 const std = @import("std");
 const runtime = @import("runtime.zig");
-const node_status = @import("node_status.zig");
 
 /// M3.1 `leases.json` schema。只包含 DHCP lease 和显示时间戳。
 pub const LeasesFile = struct {
@@ -17,16 +16,6 @@ pub const LeasesFile = struct {
     saved_at: i64,
     /// DHCP lease 列表。
     leases: []const runtime.DhcpLease,
-};
-
-/// 旧版 `runtime.json` schema（schema 1/2），仅用于迁移时接受。
-/// 同时包含 lease 和 status；加载器只提取 lease 并忽略 status 部分
-///（status 由 `status_store.zig` 独立处理）。
-pub const LegacyRuntimeFile = struct {
-    schema_version: u32 = 2,
-    saved_at: i64 = 0,
-    leases: []const runtime.DhcpLease = &.{},
-    statuses: []const node_status.Status = &.{},
 };
 
 /// 原子保存 DHCP lease 快照到 `leases.json`。
@@ -60,24 +49,6 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, state: *
     for (parsed.value.leases, 0..) |lease, i| {
         // 持久化的 expires_at 是 Unix 绝对时间戳；与当前墙钟比较判断未过期，
         // 再换算回 MONOTONIC 基准供运行期 reapLocked 使用。
-        if (lease.used() and lease.expires_at > now) {
-            snapshot[i] = lease;
-            snapshot[i].expires_at = mono_now + (lease.expires_at - now);
-        }
-    }
-    state.restore(&snapshot);
-}
-
-/// 从旧版 `runtime.json` 文件迁移 lease。只提取 lease 部分；
-/// status 部分由 `status_store.zig` 处理。
-pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8, state: *runtime.DhcpState, now: i64, mono_now: i64) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-    defer allocator.free(bytes);
-    const parsed = try std.json.parseFromSlice(LegacyRuntimeFile, allocator, bytes, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 2) or parsed.value.leases.len > runtime.DhcpState.max_leases) return error.InvalidRuntimeState;
-    var snapshot = [_]runtime.DhcpLease{.{}} ** runtime.DhcpState.max_leases;
-    for (parsed.value.leases, 0..) |lease, i| {
         if (lease.used() and lease.expires_at > now) {
             snapshot[i] = lease;
             snapshot[i].expires_at = mono_now + (lease.expires_at - now);

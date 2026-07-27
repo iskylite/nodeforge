@@ -16,7 +16,7 @@
 当前最新 schema 执行，每次 shape 变动时代码同步更新版本号。`setup.zig` 的
 `generatedConfig()`、`initialize()` 和 `setup --reconfigure` 始终生成当前最新
 schema，不需要也不允许 runbook 指示用户手动选择 schema。
-`catalog schema-v4 plan/apply/rollback` CLI 命令已从命令树移除；schema-v3 迁移保留用于从 v0.1 升级已有数据。
+`catalog schema-v4` 和 `schema-v3` 迁移命令已从命令树移除；schema v4 是唯一标准，不存在版本迁移操作。
 
 ### R2. resolveDiskless — diskless PXE boot target
 
@@ -475,9 +475,9 @@ Profile 在 v4 映射到 `ProfileKind.install`；install/diskless Profile 都必
 通过后才允许构建派生 rootfs，boot readiness 通过后才允许
 `deploy=true`。
 v4-v7 复用 v0.1 已落地的 schema-v3 发布事务机制：plan/digest、journal、apply/rollback 与 daemon 启动崩溃恢复沿用
-同一套 `.schema-v3` 风格事务目录与活动 session snapshot，不为每个版本另起迁移原语。`catalog/schema_v3.zig` 现拒绝
-`schema_version > 3`，后续各版本新增对应 parser 校验分支并把 config 与 catalog 的 `schema_version` 同步提升；
-旧 parser 不得接受半成品 nullable v0.2 shape。
+同一套 `.schema-v3` 风格事务目录与活动 session snapshot，不为每个版本另起迁移原语。`catalog/dto.zig`（原 `schema_v3_dto.zig`）
+现拒绝 `schema_version != 4`，后续各版本新增对应 parser 校验分支并把 config 与 catalog 的 `schema_version` 同步提升；
+旧 parser 不得接受半成品 nullable v0.2 shape。v0.2 不提供迁移 CLI 命令，schema v4 是唯一标准。
 
 这里的 rollback 只表示 migration transaction finalize 前从 durable journal 恢复 pre-migration snapshot，不等于允许
 任意版本 downgrade。已写入目标旧 schema 无法表达的新 kind/field/item 后，downgrade preflight 必须返回
@@ -881,6 +881,12 @@ build 输入参与 digest 计算时必须先进入带字段域分离的 canonica
 自身的 capability route 下载（per-Node 鉴权），只由 `profile rootfs build <profile>` 显式触发；可选
 `--new-ssh-keys` 先生成并固定新 Profile client/host keys revision，再构建其新 input digest；
 readiness 只读、不暗中构建。`profile rootfs status <profile>` / `assets rootfs list|show` 查询（见 §4.1/§4.2）。
+
+> **实现现状**：rootfs builder 已实现 6 阶段固定流水线（`src/http/server.zig` `managementRootfsBuild`）：
+> Stage 1 OS 层 → Stage 2 payload 物化 → Stage 3 rootfs-build 步骤 → Stage 4 target-system 骨架 →
+> Stage 5 SSH 信任基线（ed25519 client keypair + sshd host key + authorized_keys + sshd_config.d drop-in）→
+> Stage 6 mksquashfs 压缩（zstd）+ 流式 SHA-512 + 原子发布。`--new-ssh-keys` 的端到端流程尚在实现中；
+> 当前每次 rootfs build 均在 Stage 5 重新生成密钥。`/etc/ssh/ssh_known_hosts` 的自动生成为后续完善点。
 
 **构建期与启动期边界**（只读 lower vs agent pre-init 写 per-boot overlay upper）：
 

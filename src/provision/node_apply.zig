@@ -19,10 +19,16 @@ pub fn render(allocator: std.mem.Allocator, projection: dto.NodeApplyProjection)
 
     try renderSoftware(w, projection.software_transaction);
     try emitFile(w, "/etc/hostname", projection.hostname orelse projection.node_id, 0o644);
-    var hosts: std.Io.Writer.Allocating = .init(allocator);
-    defer hosts.deinit();
-    try hosts.writer.print("127.0.0.1 localhost localhost.localdomain\n127.0.1.1 {s}\n::1 localhost localhost.localdomain\n", .{projection.hostname orelse projection.node_id});
-    try emitFile(w, "/etc/hosts", hosts.written(), 0o644);
+    var free_hosts_content = false;
+    const hosts_content = (if (projection.system.import_host_hosts) projection.system.hosts_content else null) orelse blk: {
+        var hosts: std.Io.Writer.Allocating = .init(allocator);
+        errdefer hosts.deinit();
+        try hosts.writer.print("127.0.0.1 localhost localhost.localdomain\n127.0.1.1 {s}\n::1 localhost localhost.localdomain\n", .{projection.hostname orelse projection.node_id});
+        free_hosts_content = true;
+        break :blk try hosts.toOwnedSlice();
+    };
+    defer if (free_hosts_content) allocator.free(hosts_content);
+    try emitFile(w, "/etc/hosts", hosts_content, 0o644);
 
     try renderNetwork(w, allocator, projection);
     try renderUsers(w, allocator, projection.system);
@@ -289,8 +295,12 @@ fn renderLocalization(w: *std.Io.Writer, system: dto.AgentSystem) !void {
 fn renderSsh(w: *std.Io.Writer, allocator: std.mem.Allocator, ssh: dto.AgentSsh) !void {
     var content: std.Io.Writer.Allocating = .init(allocator);
     defer content.deinit();
-    try content.writer.print("PermitRootLogin {s}\nPasswordAuthentication {s}\n", .{ @tagName(ssh.root_login), if (ssh.password_authentication) "yes" else "no" });
+    try content.writer.print("PermitRootLogin {s}\nPasswordAuthentication {s}\nPubkeyAuthentication yes\n", .{ @tagName(ssh.root_login), if (ssh.password_authentication) "yes" else "no" });
     try emitFile(w, "/etc/ssh/sshd_config.d/60-nodeforge.conf", content.written(), 0o600);
+    // rootfs 是共享只读 squashfs lower，不包含 per-node SSH host key。
+    // 切根后在 volatile overlay 上生成 host key（ssh-keygen -A）。
+    // 已存在时 ssh-keygen -A 跳过，幂等。
+    try w.writeAll("ssh-keygen -A 2>/dev/null || true\n");
     // sshd/ssh 单元可能尚未安装（由 software transaction 或 first-boot 安装，或在最小 rootfs 中缺失）。
     // 与 disable 分支一致地 best-effort：启用失败不阻断 node-apply（readiness 阶段已对正式部署校验 sshd 存在）。
     try w.writeAll(if (ssh.enabled) "systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true\n" else "systemctl disable sshd 2>/dev/null || systemctl disable ssh || true\n");

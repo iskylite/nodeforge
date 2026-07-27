@@ -7,7 +7,6 @@
 
 const std = @import("std");
 const node_status = @import("node_status.zig");
-const runtime = @import("runtime.zig");
 const dhcp_store = @import("dhcp_store.zig");
 const boot_session = @import("boot_session.zig");
 const deployment_control = @import("deployment_control.zig");
@@ -34,14 +33,6 @@ pub const StatusFile = struct {
     revision: u64 = 0,
     saved_at: i64,
     statuses: []const DiskStatus,
-};
-
-/// schema 3 使用运行时固定数组布局；仅用于一次性读取并迁移现有快照。
-const LegacyStatusFile = struct {
-    schema_version: u32 = 3,
-    revision: u64 = 0,
-    saved_at: i64,
-    statuses: []const node_status.Status,
 };
 
 /// 原子保存节点状态快照到 `node-status.json`。
@@ -95,50 +86,32 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     const Header = struct { schema_version: u32 };
     const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer header.deinit();
-    switch (header.value.schema_version) {
-        3 => {
-            const parsed = try std.json.parseFromSlice(LegacyStatusFile, allocator, bytes, .{ .allocate = .alloc_always });
-            defer parsed.deinit();
-            if (parsed.value.statuses.len > node_status.max_statuses) return error.InvalidStatusState;
-            var snapshot = [_]node_status.Status{.{}} ** node_status.max_statuses;
-            var count: usize = 0;
-            for (parsed.value.statuses) |status| {
-                if (!status.used()) continue;
-                if (!validRuntimeStatus(&status) or containsNode(snapshot[0..count], status.node())) return error.InvalidStatusState;
-                snapshot[count] = status;
-                count += 1;
-            }
-            store.restoreInactive(&snapshot, parsed.value.revision);
-        },
-        4, 5 => {
-            const parsed = try std.json.parseFromSlice(StatusFile, allocator, bytes, .{ .allocate = .alloc_always });
-            defer parsed.deinit();
-            if (parsed.value.statuses.len > node_status.max_statuses) return error.InvalidStatusState;
-            var snapshot = [_]node_status.Status{.{}} ** node_status.max_statuses;
-            for (parsed.value.statuses, 0..) |disk, index| {
-                if (!validDiskStatus(disk) or containsNode(snapshot[0..index], disk.node_id)) return error.InvalidStatusState;
-                var status: node_status.Status = .{
-                    .phase = disk.phase,
-                    .model_revision = disk.model_revision,
-                    .model_plan_digest = if (disk.plan_digest) |digest| try parseDigest(digest) else deployment_control.empty_digest,
-                    .deployment_generation = disk.deployment_generation,
-                    .last_event_at = disk.last_event_at,
-                    .last_error = disk.last_error,
-                    // capability/session 活性只存在于当前进程；磁盘值不可信。
-                    .session_active = false,
-                };
-                @memcpy(status.node_id[0..disk.node_id.len], disk.node_id);
-                status.node_id_len = @intCast(disk.node_id.len);
-                @memcpy(&status.boot_session_id, disk.boot_session_id);
-                @memcpy(&status.daemon_instance_id, disk.daemon_instance_id);
-                @memcpy(status.reason[0..disk.reason.len], disk.reason);
-                status.reason_len = @intCast(disk.reason.len);
-                snapshot[index] = status;
-            }
-            store.restoreInactive(&snapshot, parsed.value.revision);
-        },
-        else => return error.InvalidStatusState,
+    if (header.value.schema_version != 4 and header.value.schema_version != 5) return error.InvalidStatusState;
+    const parsed = try std.json.parseFromSlice(StatusFile, allocator, bytes, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value.statuses.len > node_status.max_statuses) return error.InvalidStatusState;
+    var snapshot = [_]node_status.Status{.{}} ** node_status.max_statuses;
+    for (parsed.value.statuses, 0..) |disk, index| {
+        if (!validDiskStatus(disk) or containsNode(snapshot[0..index], disk.node_id)) return error.InvalidStatusState;
+        var status: node_status.Status = .{
+            .phase = disk.phase,
+            .model_revision = disk.model_revision,
+            .model_plan_digest = if (disk.plan_digest) |digest| try parseDigest(digest) else deployment_control.empty_digest,
+            .deployment_generation = disk.deployment_generation,
+            .last_event_at = disk.last_event_at,
+            .last_error = disk.last_error,
+            // capability/session 活性只存在于当前进程；磁盘值不可信。
+            .session_active = false,
+        };
+        @memcpy(status.node_id[0..disk.node_id.len], disk.node_id);
+        status.node_id_len = @intCast(disk.node_id.len);
+        @memcpy(&status.boot_session_id, disk.boot_session_id);
+        @memcpy(&status.daemon_instance_id, disk.daemon_instance_id);
+        @memcpy(status.reason[0..disk.reason.len], disk.reason);
+        status.reason_len = @intCast(disk.reason.len);
+        snapshot[index] = status;
     }
+    store.restoreInactive(&snapshot, parsed.value.revision);
 }
 
 fn parseDigest(value: []const u8) !deployment_control.Digest {
@@ -157,27 +130,9 @@ fn validDiskStatus(status: DiskStatus) bool {
         boot_session.validId(status.daemon_instance_id) and status.reason.len <= 128;
 }
 
-fn validRuntimeStatus(status: *const node_status.Status) bool {
-    return status.node_id_len <= status.node_id.len and status.reason_len <= status.reason.len and
-        boot_session.validId(&status.boot_session_id) and boot_session.validId(&status.daemon_instance_id);
-}
-
 fn containsNode(statuses: []const node_status.Status, node_id: []const u8) bool {
     for (statuses) |status| if (std.mem.eql(u8, status.node(), node_id)) return true;
     return false;
-}
-
-/// 从旧版 `runtime.json` 文件迁移节点状态。只提取 status 部分；
-/// lease 部分由 `dhcp_store.zig` 处理。
-pub fn migrateLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *node_status.Store) !void {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-    defer allocator.free(bytes);
-    const parsed = try std.json.parseFromSlice(dhcp_store.LegacyRuntimeFile, allocator, bytes, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 2) or parsed.value.statuses.len > node_status.max_statuses) return error.InvalidRuntimeState;
-    var snapshot = [_]node_status.Status{.{}} ** node_status.max_statuses;
-    for (parsed.value.statuses, 0..) |status, i| snapshot[i] = status;
-    store.restoreInactive(&snapshot, 1);
 }
 
 test "schema 4 status snapshot serializes only used compact records" {
@@ -206,26 +161,4 @@ test "schema 4 status snapshot serializes only used compact records" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"deployment_generation\":5") != null);
 }
 
-test "schema 3 status snapshot remains loadable and is compacted in memory" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/node-status.json", .{tmp.sub_path});
-    defer std.testing.allocator.free(path);
-    const id = "0123456789abcdef0123456789abcdef";
-    var statuses = [_]node_status.Status{.{}} ** 2;
-    statuses[1].node_id_len = 2;
-    @memcpy(statuses[1].node_id[0..2], "n1");
-    @memcpy(&statuses[1].boot_session_id, id);
-    @memcpy(&statuses[1].daemon_instance_id, id);
-    statuses[1].session_active = true;
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    try std.json.Stringify.value(LegacyStatusFile{ .saved_at = 1, .revision = 7, .statuses = &statuses }, .{}, &output.writer);
-    try dhcp_store.atomicWrite(std.testing.io, path, output.written());
 
-    var store: node_status.Store = .{};
-    try load(std.testing.io, std.testing.allocator, path, &store);
-    const restored = store.get("n1").?;
-    try std.testing.expect(!restored.session_active);
-    try std.testing.expectEqual(@as(u64, 7), store.currentRevision());
-}

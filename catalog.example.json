@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "repositories": [
     {
       "name": "rocky-9.7-aarch64-dvd",

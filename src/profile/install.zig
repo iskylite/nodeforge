@@ -31,7 +31,7 @@ pub fn effectiveInstall(node: *const model.NodeConfig, profile: *const model.Pro
         .proxy = policy_install.proxy,
         .post_install = policy_install.post_install,
     };
-    // schema v3 物理设备始终为 Node 持有。调用方 scratch 为
+    // 物理设备始终为 Node 持有。调用方 scratch 为
     // 现有消费者保持默认单盘成员列表零分配。
     install.storage.boot_disk = node.storage.boot_disk;
     if (node.storage.additional_disks.len == 0) {

@@ -32,7 +32,7 @@ define package_dist
 	date=$$(date -u +%Y%m%d); \
 	pkg=nodeforge-v$$v-$$date+git$$commit-$(1); \
 	mkdir -p dist/$$pkg; \
-	cp zig-out/bin/nodeforge zig-out/bin/nodeforged README.md LICENSE dist/$$pkg/; \
+	cp zig-out/bin/nodeforge zig-out/bin/nodeforged zig-out/bin/nodeforge-initrd zig-out/bin/nodeforge-agent README.md LICENSE dist/$$pkg/; \
 	cd dist && zip -rq $$pkg.zip $$pkg && rm -rf $$pkg; \
 	echo "Packaged: dist/$$pkg.zip"
 endef

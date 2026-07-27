@@ -27,7 +27,6 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
     };
     const selected = source orelse return error.InstallSourceNotFound;
     if (kind == .diskless) {
-        if (parsed.value.schema_version < 4) return error.DisklessRequiresSchemaV4;
         if (boot_bundle == null) return error.DisklessBootBundleRequired;
     }
     const profiles = try allocator.alloc(model.ProfileConfig, parsed.value.profiles.len + 1);
@@ -35,17 +34,34 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
     @memcpy(profiles[0..parsed.value.profiles.len], parsed.value.profiles);
     // 与 ISO import 自动创建的默认 profile 使用同一安全基线。CLI 不接收
     // 任意 safety/storage JSON，避免形成绕过模型校验的第二套创建语义。
+    var system: model.TargetSystemConfig = .{};
+    system.hosts_content = readHostHosts(io, allocator) catch null;
     profiles[parsed.value.profiles.len] = .{
         .name = name,
         .install_source = selected.name,
         .kind = kind,
         .boot_bundle = boot_bundle,
+        .system = system,
     };
     var candidate = parsed.value;
     candidate.profiles = profiles;
     const projected = model.projectCatalog(config.*, &candidate);
     try validate.validate(&projected, &candidate);
     try catalog_store.save(io, allocator, catalog_path, &candidate);
+}
+
+fn readHostHosts(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, "/etc/hosts", .{ .follow_symlinks = true });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size == 0 or stat.size > 64 * 1024) return error.InvalidHostsFile;
+    const bytes = try allocator.alloc(u8, @intCast(stat.size));
+    errdefer allocator.free(bytes);
+    const read = try file.readPositionalAll(io, bytes, 0);
+    if (read != bytes.len) return error.InvalidHostsFile;
+    if (std.mem.indexOfScalar(u8, bytes, 0) != null) return error.InvalidHostsFile;
+    if (std.mem.indexOf(u8, bytes, "NODEFORGE_HOSTS_EOF") != null) return error.InvalidHostsFile;
+    return bytes;
 }
 
 /// 删除一个未被 Node 引用的 Profile。

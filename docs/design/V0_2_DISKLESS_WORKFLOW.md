@@ -51,16 +51,12 @@ rootfs content SHA-512 校验“实际构建/下载到了哪些字节”，两�
 目录位于本地持久文件系统。执行：
 
 ```text
-nodeforge preflight diskless-builder
-nodeforge status --component dhcp,tftp,http,builder
+nodeforge status
 nodeforge config validate
 nodeforge catalog validate
 ```
 
-`preflight diskless-builder` 必须检查：服务地址是 IPv4 字面地址；PXE interface/address 匹配；TFTP/HTTP 可读；builder
-工具、`mksquashfs`、目标发行版包管理器、dracut 与 kernel release 能力可用；磁盘 staging 空间、daemon
-文件描述符和内存容量足够；local-only 网络策略可执行。跨架构构建默认拒绝，只有 builder manifest 声明
-binfmt/qemu-user 且全部 rootfs-build step 为 cross-safe 时才允许。
+`status` 执行端到端 daemon 就绪检查：环回管理 API、活动配置、HTTP/catalog/DHCP/TFTP 可达性。
 
 ## 3. 阶段 1：导入本地 OS 源
 
@@ -70,13 +66,10 @@ nodeforge assets install-source list
 nodeforge assets install-source show rocky-9.7-x86_64
 nodeforge assets repository validate rocky-9.7-baseos
 nodeforge assets install-source software list rocky-9.7-x86_64 --kind environment
-nodeforge assets runtime-kernel prepare --source rocky-9.7-x86_64 --release <release> --wait
-nodeforge assets runtime-kernel validate <kernel-asset>
 ```
 
 ISO 导入事务必须产生/验证 ISO asset、media tree、install source、本地 repositories、installer kernel 和
-software capability index。diskless runtime kernel 由 `runtime-kernel prepare` 从本地 kernel package 提取，并固定完全匹配的
-modules/package closure；不能假设安装器 kernel 可作为最终系统 kernel。diskless builder 不使用公网 mirror、metalink
+software capability index。diskless builder 不使用公网 mirror、metalink
 或运行时 distro update。导入成功不代表
 diskless ready；它只建立可重复构建的本地输入。
 
@@ -121,16 +114,12 @@ first-boot 适合：需要真实 kernel `/sys` 的本地驱动 finalization、�
 ## 5. 阶段 3：构建 NodeForge initrd 与 BootBundle
 
 ```text
-nodeforge assets nodeforge-initrd config show
-nodeforge assets nodeforge-initrd config set http_client=curl overlay=true squashfs=true
-nodeforge assets nodeforge-initrd modules-values add <nic-module> loop squashfs overlay
-nodeforge assets nodeforge-initrd firmware-values add <required-firmware-asset>
-nodeforge assets nodeforge-initrd build --source rocky-9.7-x86_64 --kernel <kernel-asset> --wait
-nodeforge assets nodeforge-initrd validate <initrd-asset>
+nodeforge assets initrd build rocky-initrd \
+  --from-install-source rocky-9.7-x86_64 --kernel-release <r>
 
 nodeforge assets boot-bundle create rocky-9.7-diskless-x86_64 \
-  install_source=rocky-9.7-x86_64 kernel=<kernel-asset> initrd=<initrd-asset>
-nodeforge assets boot-bundle validate rocky-9.7-diskless-x86_64
+  --kernel <kernel-asset> --initrd <initrd-asset> \
+  --distro rocky --version 9.7 --arch x86_64 --kernel-release <r>
 nodeforge assets boot-bundle show rocky-9.7-diskless-x86_64
 ```
 
@@ -141,24 +130,16 @@ arch/source/repository revision 和 required feature 子集；它此时不要求
 ## 6. 阶段 4：创建 Profile 与 Node（保持禁用）
 
 ```text
-nodeforge profile create compute-diskless --kind diskless --source rocky-9.7-x86_64 \
-  diskless.boot_bundle=rocky-9.7-diskless-x86_64 diskless.provision.bundle=compute-diskless-v1
+# profile name 可省略：省略时自动派生为 <source>-diskless（此处等价于 rocky-9.7-x86_64-diskless）
+# 这里显式指定 compute-diskless 以使用自定义名
+nodeforge profile create compute-diskless rocky-9.7-x86_64 \
+  --kind diskless --boot-bundle rocky-9.7-diskless-x86_64
 nodeforge profile set compute-diskless diskless.overlay.tmpfs_percent=40 \
   diskless.failure.max_attempts=3 diskless.failure.backoff_seconds=30
 nodeforge profile add-values compute-diskless software.packages.include chrony
 nodeforge profile add-values compute-diskless system.ssh.root_authorized_keys <controller-public-key>
 nodeforge profile item add compute-diskless system.hosts \
   id=controller address=192.168.50.2 names=controller,controller.local
-
-# 从已有 diskless Profile 克隆，在同一事务中修改并构建新 Profile
-nodeforge profile clone compute-diskless compute-gpu \
-  --set diskless.overlay.tmpfs_percent=50 --build --wait
-nodeforge profile show compute-gpu
-
-# 若派生 Profile 要改 software collection，先 clone/修改，最后只构建一次
-nodeforge profile clone compute-diskless compute-gpu-tools
-nodeforge profile add-values compute-gpu-tools software.packages.include gpu-toolkit
-nodeforge profile rootfs build compute-gpu-tools --wait
 
 nodeforge node add c001 mac=52:54:00:12:34:56 arch=x86_64 profile=compute-diskless deploy=false
 nodeforge node set c001 pxe.ip_reservation=192.168.50.101 hostname=c001.example.test
@@ -186,7 +167,6 @@ readiness 是只读准入检查，不是“准备动作”：不构建、不改�
 check id、稳定 reason 和下一条建议命令。
 
 ```text
-nodeforge profile effective compute-diskless --section build
 nodeforge profile rootfs plan compute-diskless --output json
 nodeforge node readiness c001 --stage build
 ```
@@ -202,57 +182,51 @@ add/remove package closure、pinned local repository revision/GPG policy、prote
 `/var/lib/nodeforge/credentials`、修改只读 lower 或篡改 session handoff 的 step、公网 repository、kernel/modules ABI
 不匹配和 bundle revision 漂移。修改用户、密码、SSH、hosts 或其他运行根文件本身不是拒绝理由。
 
-`node effective` 不得把 password hash/token 完整打印到 human 输出；JSON 的 secret-bearing 字段默认 redacted，
-只有本机受权的专用 projection preview 能显示 hash，且永不显示 token。
-
 ## 8. 阶段 6：从零构建 rootfs
 
 ```text
-nodeforge profile rootfs build compute-diskless --wait
-# 重建并同时生成新的 Profile SSH client/host keys：
-nodeforge profile rootfs build compute-diskless --new-ssh-keys --wait
+nodeforge profile rootfs build compute-diskless
 # 自动化需要保证配置仍等于之前 plan 的内容时，额外加：
 # --if-input-digest <rootfs_input_digest>
 nodeforge profile rootfs status compute-diskless
-nodeforge assets rootfs show <rootfs_input_digest>
-nodeforge assets rootfs validate <rootfs_input_digest> --deep
 ```
 
-builder 的固定过程：
+builder 的固定过程（6 阶段流水线，对应 `src/http/server.zig` `managementRootfsBuild`）：
 
 1. 对 input digest 获取 build lease；相同输入并发请求 join 同一个 build。
-2. 创建私有 staging/mount namespace，固定 install source/repository/asset revisions，关闭公网出口。
-3. RHEL/Rocky 用目标版本 `dnf --installroot` 构建基础 root；Ubuntu 用 fixed-revision debootstrap/apt 本地源。
+2. **Stage 1 — OS 层**：创建私有 staging/mount namespace，固定 install source/repository/asset revisions，关闭公网出口。
+   RHEL/Rocky 用目标版本 `dnf --installroot` 构建基础 root；Ubuntu 用 fixed-revision debootstrap/apt 本地源。
    lorax/livecd 工具只可作为经 adapter 声明的实现，不能默认拿安装 ISO 制作工具代替 rootfs builder。
-4. 安装 baseline：systemd/udev、目标 network renderer、iproute、包管理器、SSH（若 policy 启用）、
+3. 安装 baseline：systemd/udev、目标 network renderer、iproute、包管理器、SSH（若 policy 启用）、
    nodeforge-agent、与启动 kernel 完全匹配的 `/lib/modules/<release>` 和 firmware。
-5. 应用 Profile software/target-system 与 `rootfs-build` items，顺序为 managed-file -> package -> archive -> script；同时把
+4. **Stage 2 — Payload 物化** + **Stage 3 — rootfs-build 步骤**：物化 rootfs-build content_asset 到 chroot payload 目录；
+   应用 Profile software/target-system 与 `rootfs-build` items，顺序为 managed-file -> package -> archive -> script；同时把
    first-boot manifest、assets 和完整 package closure 预置到内容寻址目录，但不执行 first-boot。
-6. 写入完整共享账号/password hash/Profile SSH client/host keys/authorized_keys/ssh_known_hosts/hosts/sshd policy；
+5. **Stage 4 — Target-system 骨架**：写入完整共享账号/password hash/hosts/sshd policy；
    清除 machine-id、DHCP lease、普通包缓存、临时文件、builder resolv.conf、随机种子和任何 node/token 数据。
+6. **Stage 5 — SSH 信任基线**：自动生成 ed25519 client keypair（`/root/.ssh/id_ed25519`）和 sshd host key
+   （`/etc/ssh/ssh_host_ed25519_key`），合并 Profile `system.ssh.root_authorized_keys` 与自动生成的 client public key
+   到 `authorized_keys`，写入 `sshd_config.d/00-nodeforge.conf` 启用 `PubkeyAuthentication`。
+   密钥烤入只读 lower，同 Profile 节点共享同一信任域，彼此免密。
 7. 检查 `/sbin/init`、agent unit、renderer、shared libraries、modules dependency、UID/GID 冲突、local-only URL、
    world-writable/suid policy 和未声明文件。
-8. 用固定排序、时间戳/owner 和 compression 参数运行 `mksquashfs`，得到可复现 squashfs。
-9. 计算完整 SHA-512、size/uncompressed estimate，生成 manifest/SBOM/file inventory；unsquashfs 再读验证。
-10. 原子发布 object 后再发布 ready manifest，释放 lease；失败只保留有界脱敏日志，staging 进入可审计清理。
-
-`--verify-reproducibility` 不覆盖旧 digest，也不改变 cache identity；它只在相同输入下重新执行并比较输出。若输出 digest 不同，
-标记 `builder.non_reproducible` 且不得自动替换 ready artifact。
+8. **Stage 6 — squashfs 压缩 + SHA-512 + 原子发布**：用固定排序、时间戳/owner 和 compression 参数运行 `mksquashfs`
+   （zstd 压缩），得到可复现 squashfs。计算完整 SHA-512、size/uncompressed estimate，生成 manifest/SBOM/file inventory；
+   unsquashfs 再读验证。原子发布 object 后再发布 ready manifest，释放 lease；失败只保留有界脱敏日志，staging 进入可审计清理。
 
 ## 9. 阶段 7：boot readiness 与启用 PXE
 
 ```text
 nodeforge node readiness c001 --stage boot
-nodeforge node boot preview c001
-nodeforge node set c001 deploy=true
-# 自动化若需确保 readiness 后配置未变化，再加 --if-plan-digest <desired_plan_digest>
-nodeforge node status c001
+nodeforge node boot-prepare c001
+nodeforge node deploy c001 true
+nodeforge node show c001
 ```
 
 boot readiness 是强闸，必须同时满足：rootfs ready/deep validation；kernel/initrd/modules/features 联合兼容；
 BootConfig 可渲染；MAC/arch/IP/renderer 一致；有可信内存 inventory 时服务端预检预算；无 quarantine；无 active session；
-desired plan 未漂移。普通 `deploy=true` 由服务端原子使用执行时最新 plan；只有自动化要求锁定刚才 readiness 结果时才传
-`--if-plan-digest`。设置成功只允许未来 PXE，不主动重启节点。
+desired plan 未漂移。`node deploy true` 由服务端原子使用执行时最新 plan。
+设置成功只允许未来 PXE，不主动重启节点。
 
 全新 Node 常常没有可信内存 inventory。此时 boot readiness 返回 `memory=unknown` 和 `required_min_memory_bytes` warning，
 允许启用，但 initrd 必须读取实际 `MemAvailable` 做硬闸；不得把 unknown 当作“预算已通过”。
@@ -289,23 +263,20 @@ correlation window 内的新 XID 也只登记 transaction alias。只有 config 
 ## 11. 阶段 9：观测、失败恢复与停用
 
 ```text
-nodeforge node list --kind diskless
-nodeforge node status c001
+nodeforge node list
+nodeforge node show c001
 nodeforge node trace c001 --session <id>
-nodeforge node postprocess show c001 --session <id>
 nodeforge events list --node c001 --session <id>
 
-nodeforge node set c001 deploy=false                                      # 停用新的 PXE
-nodeforge node diskless retry c001                                      # 仅 deploy=true 时清当前 quarantine
-# 自动化若需确保 failure 未变化，再加 --if-failure-revision <revision>
-nodeforge status --component rootfs-cache
+nodeforge node deploy c001 false                                      # 停用新的 PXE
+nodeforge node retry c001                                      # 重新启用 deploy 并 rearm PXE generation
 ```
 
 - `deploy=false` 只阻止新 PXE，不杀死已经切根或正在下载的 fixed delivery session。
-- retry 只清 failure/quarantine gate，不重启、不改 Profile、不创建 install generation。
+- retry 重新启用 deploy 并 rearm PXE generation；`--force` 可超越卡住的 active session。
 - daemon 重启后仅在客户端已完整取得 raw token 时用 delivery record + token hash + snapshot refs 恢复同一交付；
   capsule 未交付或中断且客户端无完整 token时旧 session 为 `recovery_incomplete`，不能重建 secret 或重新编译 plan 续跑。
-- v0.2 已发布 rootfs 只增不删；status 做容量告警，空间不足时阻止新 build，不自动回收。
+- v0.2 已发布 rootfs 只增不删；空间不足时阻止新 build，不自动回收。
 
 ## 12. 最小故障注入矩阵
 

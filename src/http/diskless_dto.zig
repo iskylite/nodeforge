@@ -64,7 +64,7 @@ pub const PayloadEntry = struct {
 };
 
 /// First-boot 步骤动作（八步契约固定顺序 managed_file -> package -> archive -> script）。
-pub const FirstBootAction = enum { managed_file, @"package", archive, script };
+pub const FirstBootAction = enum { managed_file, package, archive, script };
 pub const FirstBootPackageManager = enum { dnf, apt };
 
 pub const AgentUser = struct {
@@ -91,6 +91,8 @@ pub const AgentSystem = struct {
     connectivity: model.ConnectivityPolicy,
     ssh: AgentSsh,
     security: model.TargetSecurityConfig,
+    import_host_hosts: bool = true,
+    hosts_content: ?[]const u8 = null,
     users: []const AgentUser,
     packages: []const []const u8 = &.{},
 };
@@ -260,7 +262,7 @@ test "agent plan v1 lists payload entries" {
 test "agent plan v1 round-trips first-boot steps" {
     const steps = [_]FirstBootStep{
         .{ .id = "motd", .action = .managed_file, .content = "hello\n", .destination = "/etc/motd", .mode = 0o644 },
-        .{ .id = "pkgs", .action = .@"package", .packages = &.{ "tmux", "vim" } },
+        .{ .id = "pkgs", .action = .package, .packages = &.{ "tmux", "vim" } },
         .{ .id = "arc", .action = .archive, .content = "x", .destination = "/opt/app" },
         .{ .id = "scr", .action = .script, .content = "echo hi\n" },
     };
@@ -306,7 +308,7 @@ test "agent plan v1 round-trips first-boot steps" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 4), parsed.value.steps.len);
     try std.testing.expectEqual(FirstBootAction.managed_file, parsed.value.steps[0].action);
-    try std.testing.expectEqual(FirstBootAction.@"package", parsed.value.steps[1].action);
+    try std.testing.expectEqual(FirstBootAction.package, parsed.value.steps[1].action);
     try std.testing.expect(std.mem.eql(u8, parsed.value.steps[1].packages[1], "vim"));
     try std.testing.expect(std.mem.eql(u8, parsed.value.steps[0].destination.?, "/etc/motd"));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"package_manager\"") != null);

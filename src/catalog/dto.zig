@@ -1,5 +1,5 @@
-//! catalog schema 3 的严格持久化 DTO。运行时兼容字段
-//! 在解析后派生，从不回写到 v3 事实源。
+//! catalog 实体的严格持久化 DTO（API/CLI 渲染用）。
+//! setup 始终生成 schema 4；不存在版本迁移。
 const std = @import("std");
 const model = @import("../model.zig");
 
@@ -13,6 +13,8 @@ const System = struct {
     ssh: model.SshConfig = .{},
     security: model.TargetSecurityConfig = .{},
     users: []const model.TargetUserConfig = &model.default_target_users,
+    import_host_hosts: bool = true,
+    hosts_content: ?[]const u8 = null,
 };
 const Network = struct {
     mode: model.NetworkMode = .dhcp,
@@ -189,37 +191,6 @@ pub fn renderAssets(allocator: std.mem.Allocator, values: []const model.AssetCon
     return std.json.Stringify.valueAlloc(allocator, assets, .{ .whitespace = .indent_2 });
 }
 
-pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(model.Catalog) {
-    var source = try std.json.parseFromSlice(Catalog, allocator, bytes, .{ .allocate = .alloc_always });
-    defer source.deinit();
-    if (source.value.schema_version != 3) return error.InvalidSchemaV3Catalog;
-    const arena = source.arena.allocator();
-    const profiles = try arena.alloc(model.ProfileConfig, source.value.profiles.len);
-    for (source.value.profiles, 0..) |profile, index| {
-        const install_source = findSource(source.value.install_sources, profile.install_source) orelse return error.MissingInstallSource;
-        profiles[index] = try toProfile(arena, profile, install_source);
-    }
-    const nodes = try arena.alloc(model.NodeConfig, source.value.nodes.len);
-    for (source.value.nodes, 0..) |node, index| nodes[index] = toNode(node);
-    const runtime: model.Catalog = .{
-        .schema_version = 3,
-        .revision = source.value.revision,
-        .distros = source.value.distros,
-        .profiles = profiles,
-        .nodes = nodes,
-        .provisioning_bundles = try toBundles(arena, source.value.provisioning_bundles),
-        .repositories = source.value.repositories,
-        .assets = try toAssets(arena, source.value.assets),
-        .install_sources = source.value.install_sources,
-        .boot_bundles = source.value.boot_bundles,
-        .discovery_policy = source.value.discovery_policy,
-        .unknown_client_observations = source.value.unknown_client_observations,
-    };
-    const projected = try std.json.Stringify.valueAlloc(allocator, runtime, .{});
-    defer allocator.free(projected);
-    return std.json.parseFromSlice(model.Catalog, allocator, projected, .{ .allocate = .alloc_always });
-}
-
 fn fromProfile(value: model.ProfileConfig, kernel_args: []const []const u8) Profile {
     const install = value.install;
     return .{
@@ -231,6 +202,8 @@ fn fromProfile(value: model.ProfileConfig, kernel_args: []const []const u8) Prof
             .ssh = value.system.ssh,
             .security = value.system.security,
             .users = value.system.users,
+            .import_host_hosts = value.system.import_host_hosts,
+            .hosts_content = value.system.hosts_content,
         },
         .software = value.software,
         .install = .{
@@ -274,6 +247,8 @@ fn toProfile(allocator: std.mem.Allocator, value: Profile, source: *const model.
             .ssh = value.system.ssh,
             .security = value.system.security,
             .users = value.system.users,
+            .import_host_hosts = value.system.import_host_hosts,
+            .hosts_content = value.system.hosts_content,
         },
         .software = value.software,
         .install = .{
@@ -293,7 +268,10 @@ fn toProfile(allocator: std.mem.Allocator, value: Profile, source: *const model.
 fn splitKernelArgs(allocator: std.mem.Allocator, text: ?[]const u8) ![]const []const u8 {
     var values: std.ArrayList([]const u8) = .empty;
     defer values.deinit(allocator);
-    if (text) |raw| { var iterator = std.mem.tokenizeScalar(u8, raw, ' '); while (iterator.next()) |value| try values.append(allocator, value); }
+    if (text) |raw| {
+        var iterator = std.mem.tokenizeScalar(u8, raw, ' ');
+        while (iterator.next()) |value| try values.append(allocator, value);
+    }
     return values.toOwnedSlice(allocator);
 }
 
@@ -301,7 +279,10 @@ fn joinKernelArgs(allocator: std.mem.Allocator, values: []const []const u8) !?[]
     if (values.len == 0) return null;
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    for (values, 0..) |value, index| { if (index != 0) try output.writer.writeByte(' '); try output.writer.writeAll(value); }
+    for (values, 0..) |value, index| {
+        if (index != 0) try output.writer.writeByte(' ');
+        try output.writer.writeAll(value);
+    }
     return try output.toOwnedSlice();
 }
 

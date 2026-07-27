@@ -228,39 +228,11 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(catalog_show);
     try addOutputFlag(catalog_show);
     try addDebugFlag(catalog_show);
-    const catalog_migrate = try zli.Command.init(init_options, .{ .name = "migrate", .description = "Plan or apply canonical catalog migration" }, catalogMigrateHandler);
-    try catalog_migrate.addFlags(&.{
-        .{ .name = "dry-run", .description = "Generate a side-effect-free migration plan", .type = .Bool, .default_value = .{ .Bool = false } },
-        .{ .name = "apply", .description = "Apply a previously generated plan", .type = .Bool, .default_value = .{ .Bool = false } },
-        .{ .name = "plan-digest", .description = "SHA-256 digest returned by --dry-run", .type = .String, .default_value = .{ .String = "" } },
-    });
-    try addConfigPathFlag(catalog_migrate);
-    try addOutputFlag(catalog_migrate);
-    try addDebugFlag(catalog_migrate);
-    const schema_v3_command = try zli.Command.init(init_options, .{ .name = "schema-v3", .description = "Plan, apply, or roll back the ownership schema-v3 migration" }, showCurrentHelp);
-    const schema_v3_plan = try zli.Command.init(init_options, .{ .name = "plan", .description = "Generate a side-effect-free ownership migration plan" }, schemaV3PlanHandler);
-    try addConfigPathFlag(schema_v3_plan);
-    try addOutputFlag(schema_v3_plan);
-    try addDebugFlag(schema_v3_plan);
-    const schema_v3_apply = try zli.Command.init(init_options, .{ .name = "apply", .description = "Apply the exact current ownership migration plan" }, schemaV3ApplyHandler);
-    try schema_v3_apply.addPositionalArg(.{ .name = "plan-digest", .description = "64-character digest returned by schema-v3 plan", .required = true });
-    try addConfigPathFlag(schema_v3_apply);
-    try addOutputFlag(schema_v3_apply);
-    try addDebugFlag(schema_v3_apply);
-    const schema_v3_rollback = try zli.Command.init(init_options, .{ .name = "rollback", .description = "Restore the retained pre-migration model generation" }, schemaV3RollbackHandler);
-    try schema_v3_rollback.addPositionalArg(.{ .name = "plan-digest", .description = "Digest of the applied schema-v3 migration", .required = true });
-    try addConfigPathFlag(schema_v3_rollback);
-    try addOutputFlag(schema_v3_rollback);
-    try addDebugFlag(schema_v3_rollback);
-    try schema_v3_command.addCommands(&.{ schema_v3_plan, schema_v3_apply, schema_v3_rollback });
-    // schema-v4 迁移命令已移除：开发阶段 setup 始终生成最新 schema 版本，
-    // 不需要手动迁移。schema-v3 迁移保留用于从 v0.1 升级已有数据。
+    // 迁移命令已移除：开发阶段 setup 始终生成最新 schema 版本，不需要手动迁移。
     try catalog.addCommands(&.{
         catalog_validate,
         catalog_export,
         catalog_show,
-        catalog_migrate,
-        schema_v3_command,
     });
 
     // ── node 资源（节点 CRUD + 部署生命周期）──────────────────────────
@@ -328,10 +300,17 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
 
     const node_retry = try zli.Command.init(init_options, .{ .name = "retry", .description = "Rearm the next PXE install generation" }, installRetryHandler);
     try node_retry.addPositionalArg(.{ .name = "node_id", .description = "Registered install node", .required = true });
-    try node_retry.addFlag(.{ .name = "force", .description = "Supersede a stuck active session before rearming", .type = .Bool, .default_value = .{ .Bool = false } });
+    try node_retry.addFlag(.{ .name = "force", .description = "Supersede a stuck active session and enable deploy=true before rearming", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(node_retry);
     try addOutputFlag(node_retry);
     try addDebugFlag(node_retry);
+    const node_deploy = try zli.Command.init(init_options, .{ .name = "deploy", .description = "Enable or disable the node deployment gate", .usage = "nodeforge node deploy <node_id> <true|false> [options]" }, nodeDeployHandler);
+    try node_deploy.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try node_deploy.addPositionalArg(.{ .name = "enabled", .description = "Deployment gate value: true or false", .required = true });
+    try node_deploy.addFlag(.{ .name = "force", .description = "Terminate active sessions (install/diskless) on the target node before mutation", .type = .Bool, .default_value = .{ .Bool = false } });
+    try addConfigPathFlag(node_deploy);
+    try addOutputFlag(node_deploy);
+    try addDebugFlag(node_deploy);
 
     const node_claim = try zli.Command.init(init_options, .{
         .name = "claim",
@@ -396,7 +375,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addDebugFlag(node_session_cancel);
     try node_session.addCommands(&.{ node_session_list, node_session_show, node_session_cancel });
 
-    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_trace, node_boot_prepare, node_readiness, node_session });
+    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_deploy, node_trace, node_boot_prepare, node_readiness, node_session });
     try addValuesCommands(node, init_options, "node");
     try addItemCommands(node, init_options, "node");
     try addNodeSoftwareCommands(node, init_options);
@@ -405,11 +384,11 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const profile = try zli.Command.init(init_options, .{ .name = "profile", .description = "Create and inspect PXE profiles" }, showCurrentHelp);
     const profile_create = try zli.Command.init(init_options, .{
         .name = "create",
-        .description = "Create an install profile from an imported install source",
-        .usage = "nodeforge profile create <name> <install-source> [options]",
-        .help = "Derives distro, version, and architecture from the imported source. The profile is destructive, persistent, and explicit-retry by construction.",
+        .description = "Create an install or diskless profile from an imported install source",
+        .usage = "nodeforge profile create [name] <install-source> [options]",
+        .help = "Derives distro, version, and architecture from the imported source. When <name> is omitted, it defaults to the install-source name for install profiles, or <install-source>-diskless for diskless profiles. The profile is destructive, persistent, and explicit-retry by construction.",
     }, profileCreateHandler);
-    try profile_create.addPositionalArg(.{ .name = "name", .description = "Canonical profile name", .required = true });
+    try profile_create.addPositionalArg(.{ .name = "name", .description = "Canonical profile name; omit to derive from install-source (-diskless suffix for diskless)", .required = false });
     try profile_create.addPositionalArg(.{ .name = "install-source", .description = "Imported install source name", .required = true });
     try addConfigPathFlag(profile_create);
     try addOutputFlag(profile_create);
@@ -1441,8 +1420,8 @@ fn setupHandler(ctx: zli.CommandContext) !void {
             setExitCode(ctx, 1);
             return;
         };
-        if ((imported_config.?.value.schema_version != 3 and imported_config.?.value.schema_version != 4) or imported_config.?.value.distros.len != 0 or imported_config.?.value.profiles.len != 0 or imported_config.?.value.nodes.len != 0 or imported_config.?.value.provisioning_bundles.len != 0) {
-            try errorWriter(ctx).writeAll("error: config: imported startup config must use schema 3 or 4 and must not embed catalog entities\n");
+        if (imported_config.?.value.schema_version != 4 or imported_config.?.value.distros.len != 0 or imported_config.?.value.profiles.len != 0 or imported_config.?.value.nodes.len != 0 or imported_config.?.value.provisioning_bundles.len != 0) {
+            try errorWriter(ctx).writeAll("error: config: imported startup config must use schema 4 and must not embed catalog entities\n");
             imported_config.?.deinit();
             setExitCode(ctx, 1);
             return;
@@ -1510,7 +1489,6 @@ fn setupHandler(ctx: zli.CommandContext) !void {
         try views.success(ctx.writer, "NodeForge initialized", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config", .value = p.config_path }, .{ .label = "Catalog", .value = p.catalog_dir } });
         return;
     }
-    const migrated = try nodeforge.setup.migrateLegacy(ctx.io, ctx.allocator, p);
     var catalog = try nodeforge.catalog_store.load(ctx.io, ctx.allocator, p.catalog_dir);
     defer catalog.deinit();
     var installed_config: ?std.json.Parsed(nodeforge.model.AppConfig) = null;
@@ -1532,7 +1510,7 @@ fn setupHandler(ctx: zli.CommandContext) !void {
     if (imported_config != null)
         try views.success(ctx.writer, "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config source", .value = import_config_path }, .{ .label = "Config schema", .value = schema_text }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } })
     else
-        try views.success(ctx.writer, if (migrated) "legacy deployment migrated" else "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config schema", .value = schema_text }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } });
+        try views.success(ctx.writer, "deployment reconfigured", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config schema", .value = schema_text }, .{ .label = "Catalog layout", .value = "1" }, .{ .label = "Systemd unit", .value = p.service_path }, .{ .label = "Service", .value = "unchanged; run systemctl daemon-reload/restart nodeforged" } });
 }
 
 fn setupFlagError(ctx: zli.CommandContext, message: []const u8) void {
@@ -1559,7 +1537,7 @@ fn purgeSetupHistory(ctx: zli.CommandContext, p: *const nodeforge.paths.Paths) !
         try runRequired(ctx, &.{ "chmod", "-R", "u+rwx", p.work_dir });
         try runRequired(ctx, &.{ "rm", "-rf", "--", p.work_dir });
     };
-    for ([_][]const u8{ p.config_path, p.legacy_catalog_path }) |path| {
+    for ([_][]const u8{p.config_path}) |path| {
         const migration_backup = try std.fmt.allocPrint(ctx.allocator, "{s}.m4.7.bak", .{path});
         defer ctx.allocator.free(migration_backup);
         std.Io.Dir.cwd().deleteFile(ctx.io, migration_backup) catch {};
@@ -1848,8 +1826,9 @@ fn configExportHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed_config.deinit();
-    if ((parsed_config.value.schema_version != 2 and parsed_config.value.schema_version != 3) or parsed_config.value.distros.len != 0 or parsed_config.value.profiles.len != 0 or parsed_config.value.nodes.len != 0 or parsed_config.value.provisioning_bundles.len != 0) {
-        try errorWriter(ctx).writeAll("error: config: schema-1/model migration requires nodeforge setup --reconfigure\n");
+    // schema 永久默认 v4；只拒绝 legacy 内联实体格式。
+    if (parsed_config.value.schema_version != 4 or parsed_config.value.distros.len != 0 or parsed_config.value.profiles.len != 0 or parsed_config.value.nodes.len != 0 or parsed_config.value.provisioning_bundles.len != 0) {
+        try errorWriter(ctx).writeAll("error: config: legacy inline entities require nodeforge setup --reconfigure\n");
         setExitCode(ctx, 1);
         return;
     }
@@ -1897,144 +1876,6 @@ fn catalogExportHandler(ctx: zli.CommandContext) !void {
 
 fn catalogShowHandler(ctx: zli.CommandContext) !void {
     try catalogResourceHandler(ctx, "install-sources", ctx.positional_args[0]);
-}
-
-fn catalogMigrateHandler(ctx: zli.CommandContext) !void {
-    _ = outputFromContext(ctx) orelse return;
-    const dry_run = ctx.flag("dry-run", bool);
-    const apply = ctx.flag("apply", bool);
-    const digest = ctx.flag("plan-digest", []const u8);
-    if (dry_run == apply or (apply and digest.len != 64) or (dry_run and digest.len != 0)) {
-        try writeCommandError(ctx, "catalog.migration_invalid", "catalog migrate requires exactly one of --dry-run or --apply; --apply requires --plan-digest <64-hex>", 2);
-        return;
-    }
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer parsed_config.deinit();
-    var response: [256 * 1024]u8 = undefined;
-    const body = (if (apply) nodeforge.management_client.catalogMigrationApplyJson(ctx.io, parsed_config.value.server.http_port, digest, &response) else nodeforge.management_client.catalogMigrationPlanJson(ctx.io, parsed_config.value.server.http_port, &response)) catch null orelse {
-        try writeCommandError(ctx, "catalog.migration_failed", "catalog migration request failed", 1);
-        return;
-    };
-    if (apply) {
-        try renderOutputDocument(ctx, .{ .human = .{ .text = "catalog migration applied" }, .json = body });
-        return;
-    }
-    // daemon 响应是规范的诊断产物。human 模式
-    // 在 apply 增加操作生命周期视图前刻意保持简洁。
-    const Response = struct { result: struct { plan_digest: []const u8, applicable: bool, plan: struct { renames: []const std.json.Value, blockers: []const std.json.Value } } };
-    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch {
-        try writeCommandError(ctx, "catalog.invalid_response", "invalid migration plan response", 1);
-        return;
-    };
-    defer parsed.deinit();
-    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "renames", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.renames.len}), .section = "runtime", .json_path = "plan.renames" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "true" else "false", .section = "runtime" } };
-    const sections = [_]nodeforge.cli_document.Section{.{ .key = "runtime", .title = "Runtime" }};
-    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = "Catalog migration plan", .sections = &sections, .fields = &fields } }, .json = body });
-}
-
-fn schemaV3PlanHandler(ctx: zli.CommandContext) !void {
-    _ = outputFromContext(ctx) orelse return;
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer parsed_config.deinit();
-    var response: [256 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.schemaV3PlanJson(ctx.io, parsed_config.value.server.http_port, &response) catch null orelse {
-        try writeCommandError(ctx, "schema-v3.plan_failed", "schema-v3 migration plan request failed", 1);
-        return;
-    };
-    const Response = struct { result: struct { plan_digest: []const u8, applicable: bool, plan: struct { affected_profiles: []const []const u8, affected_nodes: []const []const u8, blockers: []const std.json.Value } } };
-    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidManagementResponse;
-    defer parsed.deinit();
-    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "affected_profiles", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_profiles.len}), .section = "runtime", .json_path = "plan.affected_profiles" }, .{ .key = "affected_nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_nodes.len}), .section = "runtime", .json_path = "plan.affected_nodes" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "true" else "false", .section = "runtime" } };
-    const sections = [_]nodeforge.cli_document.Section{.{ .key = "runtime", .title = "Runtime" }};
-    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = "Schema v3 migration plan", .sections = &sections, .fields = &fields } }, .json = body });
-}
-
-fn schemaV3ApplyHandler(ctx: zli.CommandContext) !void {
-    return schemaV3MutationHandler(ctx, false);
-}
-
-fn schemaV4PlanHandler(ctx: zli.CommandContext) !void {
-    _ = outputFromContext(ctx) orelse return;
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer parsed_config.deinit();
-    var response: [256 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.schemaV4PlanJson(ctx.io, parsed_config.value.server.http_port, &response) catch null orelse {
-        try writeCommandError(ctx, "schema-v4.plan_failed", "schema-v4 migration plan request failed", 1);
-        return;
-    };
-    const Response = struct { result: struct { plan_digest: []const u8, applicable: bool, plan: struct { affected_profiles: []const []const u8, affected_nodes: []const []const u8, blockers: []const std.json.Value } } };
-    const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidManagementResponse;
-    defer parsed.deinit();
-    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "affected_profiles", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_profiles.len}), .section = "runtime", .json_path = "plan.affected_profiles" }, .{ .key = "affected_nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_nodes.len}), .section = "runtime", .json_path = "plan.affected_nodes" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "true" else "false", .section = "runtime" } };
-    const sections = [_]nodeforge.cli_document.Section{.{ .key = "runtime", .title = "Runtime" }};
-    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = "Schema v4 migration plan", .sections = &sections, .fields = &fields } }, .json = body });
-}
-
-fn schemaV3RollbackHandler(ctx: zli.CommandContext) !void {
-    return schemaV3MutationHandler(ctx, true);
-}
-
-fn schemaV3MutationHandler(ctx: zli.CommandContext, rollback: bool) !void {
-    _ = outputFromContext(ctx) orelse return;
-    const digest = ctx.positional_args[0];
-    if (digest.len != 64) {
-        try writeCommandError(ctx, "schema-v3.invalid_digest", "schema-v3 plan digest must be 64 lowercase hexadecimal characters", 2);
-        return;
-    }
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer parsed_config.deinit();
-    var response: [256 * 1024]u8 = undefined;
-    const body = (if (rollback)
-        nodeforge.management_client.schemaV3RollbackJson(ctx.io, parsed_config.value.server.http_port, digest, &response)
-    else
-        nodeforge.management_client.schemaV3ApplyJson(ctx.io, parsed_config.value.server.http_port, digest, &response)) catch null orelse {
-        try writeCommandError(ctx, "schema-v3.mutation_failed", if (rollback) "schema-v3 rollback request failed" else "schema-v3 apply request failed", 1);
-        return;
-    };
-    try renderOutputDocument(ctx, .{ .human = .{ .text = if (rollback) "schema v3 migration rolled back" else "schema v3 migration applied" }, .json = body });
-}
-
-fn schemaV4ApplyHandler(ctx: zli.CommandContext) !void {
-    return schemaV4MutationHandler(ctx, false);
-}
-
-fn schemaV4RollbackHandler(ctx: zli.CommandContext) !void {
-    return schemaV4MutationHandler(ctx, true);
-}
-
-fn schemaV4MutationHandler(ctx: zli.CommandContext, rollback: bool) !void {
-    _ = outputFromContext(ctx) orelse return;
-    const digest = ctx.positional_args[0];
-    if (digest.len != 64) {
-        try writeCommandError(ctx, "schema-v4.invalid_digest", "schema-v4 plan digest must be 64 lowercase hexadecimal characters", 2);
-        return;
-    }
-    var parsed_config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer parsed_config.deinit();
-    var response: [256 * 1024]u8 = undefined;
-    const body = (if (rollback)
-        nodeforge.management_client.schemaV4RollbackJson(ctx.io, parsed_config.value.server.http_port, digest, &response)
-    else
-        nodeforge.management_client.schemaV4ApplyJson(ctx.io, parsed_config.value.server.http_port, digest, &response)) catch null orelse {
-        try writeCommandError(ctx, "schema-v4.mutation_failed", if (rollback) "schema-v4 rollback request failed" else "schema-v4 apply request failed", 1);
-        return;
-    };
-    try renderOutputDocument(ctx, .{ .human = .{ .text = if (rollback) "schema v4 migration rolled back" else "schema v4 migration applied" }, .json = body });
 }
 
 /// 通过本机 daemon 注册一个已经位于受管根目录中的资产。
@@ -3828,11 +3669,10 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
 
 fn profileCreateHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
-    const name = ctx.getArg("name") orelse return;
     const install_source = ctx.getArg("install-source") orelse return;
-    if (!nodeforge.config_validate.validLogicalId(name) or !nodeforge.config_validate.validLogicalId(install_source)) {
+    if (!nodeforge.config_validate.validLogicalId(install_source)) {
         const output = outputFromContext(ctx) orelse return;
-        try cli_output.writeError(errorWriter(ctx), output, "profile.invalid", "profile create: name and install-source must be canonical logical identifiers");
+        try cli_output.writeError(errorWriter(ctx), output, "profile.invalid", "profile create: install-source must be a canonical logical identifier");
         setExitCode(ctx, 2);
         return;
     }
@@ -3851,6 +3691,27 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
         setExitCode(ctx, 2);
         return;
     }
+    // 当 name 省略（未传或为 "-"）时，从 install source 名派生默认 Profile 名：
+    //   - diskless → <source>-diskless（如 rocky-9.7 → rocky-9.7-diskless）
+    //   - install  → <source>（install Profile 直接复用 source 名）
+    // 设计依据：V0_2_CLI.md §5「阶段 4：创建 diskless Profile」。
+    // 这确保 diskless rootfs 命名始终可追溯到源 ISO，操作员无需手敲名字即可
+    // 创建与 install Profile 同源的 diskless 变体。显式传入 name 时覆盖派生值。
+    const derived_name: []const u8 = if (std.mem.eql(u8, kind, "diskless"))
+        try std.fmt.allocPrint(ctx.allocator, "{s}-diskless", .{install_source})
+    else
+        install_source;
+    const explicit_name = ctx.getArg("name");
+    const name: []const u8 = if (explicit_name) |n| blk: {
+        if (n.len == 0 or std.mem.eql(u8, n, "-")) break :blk derived_name;
+        if (!nodeforge.config_validate.validLogicalId(n)) {
+            const output = outputFromContext(ctx) orelse return;
+            try cli_output.writeError(errorWriter(ctx), output, "profile.invalid", "profile create: name must be a canonical logical identifier");
+            setExitCode(ctx, 2);
+            return;
+        }
+        break :blk n;
+    } else derived_name;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
@@ -4485,6 +4346,34 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
     const force = ctx.flag("force", bool);
+    var catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, nodeforge.paths.require().catalog_dir) catch {
+        try writeCommandError(ctx, "catalog.unavailable", "cannot load the installed catalog", 1);
+        return;
+    };
+    defer catalog.deinit();
+    const node = nodeforge.catalog.findNode(&catalog.value, node_id) orelse {
+        try writeCommandError(ctx, "node.not_found", "node not found", 1);
+        return;
+    };
+    const profile = nodeforge.catalog.findProfile(&catalog.value, node.profile orelse {
+        try writeCommandError(ctx, "node.profile_unassigned", "node has no bound profile", 1);
+        return;
+    }) orelse {
+        try writeCommandError(ctx, "profile.not_found", "node profile not found", 1);
+        return;
+    };
+    if (profile.kind != .install) {
+        try writeCommandError(ctx, "profile.not_install", "node retry only rearms install profiles; diskless nodes boot again when deploy=true, and stuck diskless sessions can be cancelled with 'nodeforge node session cancel <session_id>'", 2);
+        return;
+    }
+    if (!node.deploy and !force) {
+        try ctx.writer.print("Node {s} currently has deploy=false. retry will enable deploy=true before rearming. Continue? [y/N]: ", .{node_id});
+        const answer = ctx.reader.takeDelimiter('\n') catch null;
+        if (answer == null or !(std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r"), "y") or std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r"), "yes"))) {
+            try writeCommandError(ctx, "deploy.confirmation_required", "retry aborted; use --force to enable deploy=true without prompting", 2);
+            return;
+        }
+    }
     // retry 的用户语义是“允许下一次 PXE 再执行”。若节点仍 deploy=false，单纯
     // 增加 generation 仍会被 resolver 拒绝，因此先启用 deploy，再 rearm。
     var deploy_reason: [256]u8 = undefined;
@@ -4503,6 +4392,26 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     if (!result.healthy) return reportMutationFailure(ctx, result, "install retry failed: daemon unreachable");
     const human = try std.fmt.allocPrint(ctx.allocator, "install generation rearmed for {s}; waiting for next PXE", .{node_id});
     try renderCommandResult(ctx, human, .{ .node_id = node_id, .deploy = true });
+}
+
+fn nodeDeployHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const node_id = ctx.getArg("node_id") orelse return;
+    const enabled = ctx.getArg("enabled") orelse return;
+    if (!std.mem.eql(u8, enabled, "true") and !std.mem.eql(u8, enabled, "false")) {
+        try writeCommandError(ctx, "deploy.invalid_value", "deploy value must be true or false", 2);
+        return;
+    }
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.scalarMutations(ctx.io, config.value.server.http_port, "node", node_id, &.{.{ .key = "deploy", .value = enabled }}, ctx.flag("force", bool), &reason);
+    if (!result.healthy) return reportMutationFailure(ctx, result, "deploy update failed");
+    const human = try std.fmt.allocPrint(ctx.allocator, "deploy set to {s} for {s}", .{ enabled, node_id });
+    try renderCommandResult(ctx, human, .{ .node_id = node_id, .deploy = std.mem.eql(u8, enabled, "true") });
 }
 
 // ── M4.2 节点 CRUD 处理器 ───────────────────────────────────────
@@ -4548,7 +4457,7 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
 }
 
 fn serializeNodeAddRequest(allocator: std.mem.Allocator, node: model.NodeConfig) ![]u8 {
-    return nodeforge.catalog_schema_v3_dto.renderNode(allocator, node);
+    return nodeforge.catalog_dto.renderNode(allocator, node);
 }
 
 fn nodeSetHandler(ctx: zli.CommandContext) !void {
@@ -4684,7 +4593,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     const Response = struct {
         result: struct {
             view_revision: struct { config: u64, catalog: u64, node_status: u64, deployment: u64, inventory: u64 },
-            node: nodeforge.catalog_schema_v3_dto.Node,
+            node: nodeforge.catalog_dto.Node,
             profile: struct { name: []const u8, kind: []const u8, boot_bundle: ?[]const u8, install_source: []const u8, kernel_args: ?[]const u8, platform: struct { distro: []const u8, version: []const u8, arch: []const u8 } },
             effective_system: struct {
                 localization: model.LocalizationConfig,
@@ -5204,7 +5113,7 @@ fn addCatalogPathFlag(command: *zli.Command) !void {
     try command.addFlag(.{
         .name = "catalog",
         .shortcut = "C",
-        .description = "Catalog JSON path",
+        .description = "Catalog directory path",
         .type = .String,
         .default_value = .{ .String = nodeforge.catalog_store.defaultPath() },
     });

@@ -229,48 +229,6 @@ pub fn softwareCapabilitiesJson(io: std.Io, port: u16, resource: []const u8, nam
     return managementJson(io, port, writer.buffered(), output);
 }
 
-pub fn catalogMigrationPlanJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
-    const reply = try managementPostJson(io, port, "/api/v1/management/catalog/migration-plans", "{}", null, output, null);
-    if (reply.status < 200 or reply.status >= 300) return null;
-    return reply.body;
-}
-
-pub fn catalogMigrationApplyJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
-    if (digest.len != 64 or !querySafe(digest)) return error.InvalidPlanDigest;
-    var body: [96]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&body, "{{\"plan_digest\":{f}}}", .{std.json.fmt(digest, .{})});
-    const reply = try managementPostJson(io, port, "/api/v1/management/catalog/migrations", rendered, digest, output, null);
-    if (reply.status < 200 or reply.status >= 300) return null;
-    return reply.body;
-}
-
-pub fn schemaV3PlanJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
-    const reply = try managementPostJson(io, port, "/api/v1/management/catalog/schema-v3/migration-plans", "{}", null, output, null);
-    if (reply.status < 200 or reply.status >= 300) return null;
-    return reply.body;
-}
-
-pub fn schemaV3ApplyJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
-    return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v3/migrations", digest, output);
-}
-
-pub fn schemaV3RollbackJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
-    return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v3/rollbacks", digest, output);
-}
-pub fn schemaV4PlanJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
-    const reply = try managementPostJson(io, port, "/api/v1/management/catalog/schema-v4/migration-plans", "{}", null, output, null);
-    if (reply.status < 200 or reply.status >= 300) return null;
-    return reply.body;
-}
-
-pub fn schemaV4ApplyJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
-    return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v4/migrations", digest, output);
-}
-
-pub fn schemaV4RollbackJson(io: std.Io, port: u16, digest: []const u8, output: []u8) !?[]const u8 {
-    return schemaV3MutationJson(io, port, "/api/v1/management/catalog/schema-v4/rollbacks", digest, output);
-}
-
 pub fn valuesMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, operation: []const u8, key: []const u8, values: []const []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, force: bool, reason_buf: []u8) Mutation {
     if (!querySafe(owner) or !querySafe(identity) or !querySafe(key)) return .{ .reachable = false, .healthy = false };
     var path_buffer: [336]u8 = undefined;
@@ -386,15 +344,6 @@ pub fn itemValuesJson(io: std.Io, port: u16, owner: []const u8, resource_identit
     var path: [512]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&path, "/api/v1/management/{s}s/{s}/items?key={s}&identity={s}&field={s}", .{ owner, resource_identity, key, item_identity, field });
     return managementJson(io, port, rendered, output);
-}
-
-fn schemaV3MutationJson(io: std.Io, port: u16, path: []const u8, digest: []const u8, output: []u8) !?[]const u8 {
-    if (digest.len != 64 or !querySafe(digest)) return error.InvalidPlanDigest;
-    var body: [96]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&body, "{{\"plan_digest\":{f}}}", .{std.json.fmt(digest, .{})});
-    const reply = try managementPostJson(io, port, path, rendered, digest, output, null);
-    if (reply.status < 200 or reply.status >= 300) return null;
-    return reply.body;
 }
 
 /// M4.5：管理写请求结果。`reason` 在失败时指向调用方提供的 `reason_buf`，

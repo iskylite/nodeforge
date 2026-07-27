@@ -140,7 +140,7 @@ pub const CatalogRuntime = struct {
         try self.publishLocked(candidate, old.revision + 1);
     }
     /// 检查当前 catalog 中是否存在指定的 asset path。
-    /// 用于 catalog-migration 回滚时判断 asset 文件是否需要一起回滚。
+    /// 用于判断 asset 文件是否需要一起回滚。
     pub fn containsAssetPath(self: *CatalogRuntime, path: []const u8) bool {
         const snapshot = self.acquire();
         defer snapshot.release();

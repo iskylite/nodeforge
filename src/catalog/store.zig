@@ -1,14 +1,13 @@
 //! M4.7 catalog manifest/entity store。
 //!
-//! `manifest.json` 是唯一可见提交点；每个实体文件保存一个 JSON 数组。writer
-//! 先持久化 journal 与 changed entity stage，依次发布实体，最后发布 manifest。
-//! loader 在读取 manifest 前恢复未完成事务，并对每个实体做 SHA-256 校验，
-//! 因而崩溃不会暴露 mixed generation。
+//! catalog 只接受目录布局（manifest 布局），不支持单文件 `.json` 加载/保存。
+//! `manifest.json` 是唯一可见提交点；每个实体文件保存一个 JSON 数组（discovery_policy
+//! 除外，它是 singleton struct）。writer 先持久化 journal 与 changed entity stage，
+//! 依次发布实体，最后发布 manifest。loader 在读取 manifest 前恢复未完成事务，
+//! 并对每个实体做 SHA-256 校验，因而崩溃不会暴露 mixed generation。
 
 const std = @import("std");
 const model = @import("../model.zig");
-const schema_v3_dto = @import("schema_v3_dto.zig");
-const schema_v2_dto = @import("schema_v2_dto.zig");
 const paths = @import("../paths.zig");
 const atomic = @import("../state/dhcp_store.zig").atomicWrite;
 
@@ -46,43 +45,30 @@ pub fn empty() model.Catalog {
     return .{};
 }
 
-/// 显式 `.json` 路径只用于 legacy 诊断/迁移；正常路径必须是 catalog 目录。
-/// 加载 catalog。路径可以是目录（manifest 布局）或 `.json` 文件（legacy 单文件）。
+/// 加载 catalog。路径必须是 catalog 目录（manifest 布局）。
 ///
-/// 目录路径走 `loadDirectory`，会先恢复未完成事务，再按 manifest 加载实体。
-/// `.json` 路径走 `loadLegacy`，只用于诊断/迁移，不会触发事务恢复。
+/// 不支持单文件 `.json` 加载：生产路径（setup、daemon、CLI 默认值）始终传入
+/// 目录路径，单文件加载已移除。先恢复未完成事务，再按 manifest 加载实体。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(model.Catalog) {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return err,
         else => return err,
     };
-    if (stat.kind == .file) return loadLegacy(io, allocator, path);
     if (stat.kind != .directory) return error.InvalidCatalogLayout;
     return loadDirectory(io, allocator, path);
 }
 
-/// 加载 legacy 单文件 catalog。根据 schema_version 选择 v2 或 v3 DTO 解析。
-pub fn loadLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(model.Catalog) {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_catalog_bytes));
-    defer allocator.free(bytes);
-    const Header = struct { schema_version: u32 };
-    const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
-    defer header.deinit();
-    // schema 4 直接存储完整模型形态（保留 diskless kind、
-    // boot_bundle、rootfs_build/first_boot 步骤和 runtime_kernel 资产，
-    // 严格 v3 DTO 会省略这些）；schema 3 使用严格 v3 DTO；其余为旧版 v2。
-    if (header.value.schema_version == 3) return schema_v3_dto.parse(allocator, bytes);
-    if (header.value.schema_version == 4) return std.json.parseFromSlice(model.Catalog, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
-    return schema_v2_dto.parse(allocator, bytes);
-}
-
+/// 初始化空 catalog 目录。setup 首次安装时调用。
 pub fn initializeEmpty(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, directory);
     try saveDirectory(io, allocator, directory, &model.Catalog{}, null);
 }
 
+/// 保存 catalog 到目录（manifest 布局）。路径必须是目录。
+///
+/// 不支持单文件 `.json` 保存：所有写入口（setup、daemon runtime、CLI mutation）
+/// 始终传入目录路径，单文件保存已移除。
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, catalog: *const model.Catalog) !void {
-    if (std.mem.endsWith(u8, path, ".json")) return saveLegacy(io, allocator, path, catalog);
     return saveDirectory(io, allocator, path, catalog, null);
 }
 
@@ -100,6 +86,7 @@ pub fn render(allocator: std.mem.Allocator, catalog: *const model.Catalog) ![]u8
 
 fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !std.json.Parsed(model.Catalog) {
     try recover(io, allocator, directory);
+    // 检测旧版单文件 catalog.json 与 manifest.json 共存的冲突布局。
     const legacy = try joinPath(allocator, directory, "catalog.json");
     defer allocator.free(legacy);
     const manifest_path = try joinPath(allocator, directory, "manifest.json");
@@ -110,9 +97,7 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     var parsed_manifest = try std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{ .allocate = .alloc_always });
     defer parsed_manifest.deinit();
     const manifest = parsed_manifest.value;
-    // schema 3 和 4 持久化完整 10 实体集；旧版 v2 仅 8 个。
-    const entity_names = if (manifest.catalog_schema_version >= 3) names[0..] else names[0..8];
-    if (manifest.layout_schema_version != layout_schema_version or (manifest.catalog_schema_version < 2 or manifest.catalog_schema_version > 4) or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != entity_names.len)
+    if (manifest.layout_schema_version != layout_schema_version or manifest.catalog_schema_version != 4 or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != names.len)
         return error.InvalidCatalogManifest;
     var declared_tx: [64]u8 = undefined;
     try transactionId(manifest.catalog_revision, manifest.entities, &declared_tx);
@@ -121,7 +106,7 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     var combined: std.Io.Writer.Allocating = .init(allocator);
     defer combined.deinit();
     try combined.writer.print("{{\"schema_version\":{d},\"revision\":{d}", .{ manifest.catalog_schema_version, manifest.catalog_revision });
-    for (entity_names) |name| {
+    for (names) |name| {
         const entity = findEntity(manifest.entities, name) orelse return error.InvalidCatalogManifest;
         const expected_file = try std.fmt.allocPrint(allocator, "{s}.json", .{name});
         defer allocator.free(expected_file);
@@ -137,14 +122,9 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
         try combined.writer.writeAll(bytes);
     }
     try combined.writer.writeByte('}');
-    // schema 4 实体为直接模型序列化；按 model.Catalog 解析。
-    return if (manifest.catalog_schema_version == 3)
-        schema_v3_dto.parse(allocator, combined.written())
-    else if (manifest.catalog_schema_version == 4)
-        std.json.parseFromSlice(model.Catalog, allocator, combined.written(), .{ .allocate = .alloc_always, .ignore_unknown_fields = true })
-    else
-        schema_v2_dto.parse(allocator, combined.written());
+    return std.json.parseFromSlice(model.Catalog, allocator, combined.written(), .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
 }
+
 
 fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, catalog: *const model.Catalog, crash: ?CrashPoint) !void {
     try std.Io.Dir.cwd().createDirPath(io, directory);
@@ -165,27 +145,15 @@ fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     };
     contents[0] = try content(allocator, names[0], catalog.distros);
     initialized += 1;
-    contents[1] = if (catalog.schema_version == 3)
-        try contentBytes(allocator, names[1], try schema_v3_dto.renderProfiles(allocator, catalog.profiles))
-    else
-        try content(allocator, names[1], catalog.profiles);
+    contents[1] = try content(allocator, names[1], catalog.profiles);
     initialized += 1;
-    contents[2] = if (catalog.schema_version == 3)
-        try contentBytes(allocator, names[2], try schema_v3_dto.renderNodes(allocator, catalog.nodes))
-    else
-        try content(allocator, names[2], catalog.nodes);
+    contents[2] = try content(allocator, names[2], catalog.nodes);
     initialized += 1;
-    contents[3] = if (catalog.schema_version == 3)
-        try contentBytes(allocator, names[3], try schema_v3_dto.renderBundles(allocator, catalog.provisioning_bundles))
-    else
-        try content(allocator, names[3], catalog.provisioning_bundles);
+    contents[3] = try content(allocator, names[3], catalog.provisioning_bundles);
     initialized += 1;
     contents[4] = try content(allocator, names[4], catalog.repositories);
     initialized += 1;
-    contents[5] = if (catalog.schema_version == 3)
-        try contentBytes(allocator, names[5], try schema_v3_dto.renderAssets(allocator, catalog.assets))
-    else
-        try content(allocator, names[5], catalog.assets);
+    contents[5] = try content(allocator, names[5], catalog.assets);
     initialized += 1;
     contents[6] = try content(allocator, names[6], catalog.install_sources);
     initialized += 1;
@@ -196,12 +164,10 @@ fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     contents[9] = try content(allocator, names[9], catalog.unknown_client_observations);
     initialized += 1;
 
-    // schema 3 和 4 持久化全部 10 个实体；旧版 v2 仅 8 个。
-    const content_count: usize = if (catalog.schema_version >= 3) names.len else 8;
-    const selected_contents = contents[0..content_count];
+    const selected_contents = contents[0..names.len];
     var entities: [names.len]ManifestEntity = undefined;
     for (selected_contents, 0..) |*item, index| entities[index] = .{ .name = item.name, .file = item.file, .sha256 = &item.digest };
-    const selected_entities = entities[0..content_count];
+    const selected_entities = entities[0..names.len];
     var transaction_id: [64]u8 = undefined;
     try transactionId(revision, selected_entities, &transaction_id);
     const manifest: Manifest = .{ .layout_schema_version = layout_schema_version, .catalog_schema_version = catalog.schema_version, .catalog_revision = revision, .transaction_id = &transaction_id, .entities = selected_entities };
@@ -279,11 +245,6 @@ fn recover(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !voi
     try std.Io.Dir.cwd().deleteFile(io, journal_path);
 }
 
-fn saveLegacy(io: std.Io, allocator: std.mem.Allocator, path_name: []const u8, catalog: *const model.Catalog) !void {
-    const bytes = try render(allocator, catalog);
-    defer allocator.free(bytes);
-    try secureAtomic(io, allocator, path_name, bytes);
-}
 fn content(allocator: std.mem.Allocator, name: []const u8, values: anytype) !Content {
     const bytes = try std.json.Stringify.valueAlloc(allocator, values, .{ .whitespace = .indent_2 });
     errdefer allocator.free(bytes);

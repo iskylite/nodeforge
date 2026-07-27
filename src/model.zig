@@ -6,8 +6,7 @@
 //! ## 两层事实源
 //!
 //! - [`AppConfig`]：启动配置 `<install-root>/config/config.json`，包含服务网、端口、
-//!   DHCP 地址池和容量策略等站点级参数。schema v3 后只保存启动/策略输入，不再保存
-//!   catalog 实体。
+//!   DHCP 地址池和容量策略等站点级参数。只保存启动/策略输入，不保存 catalog 实体。
 //! - [`Catalog`]：管理目录 `<install-root>/catalog/`，由 `nodeforged` 独占写入。
 //!   包含 distro、profile、node、repository、asset、install_source 等 daemon-owned 实体。
 //!
@@ -20,12 +19,11 @@
 /// NodeForge 启动配置事实源 `<install-root>/config/config.json` 的根对象。
 ///
 /// 该文件由 `nodeforge setup --reconfigure` 写入，daemon 启动时只读加载。
-/// schema v3 取消了 distros/profiles/nodes/provisioning_bundles 的持久化——
-/// 这些实体已迁移到 Catalog，此处只保留投影字段以缩小协议模块的破坏面。
+/// distros/profiles/nodes/provisioning_bundles 由 Catalog 独占持久化，
+/// 此处只保留投影字段以缩小协议模块的破坏面。
 pub const AppConfig = struct {
-    /// 配置文件 schema 版本。版本 1 为 legacy 单文件输入，版本 2 为 M4.7 多文件迁移，
-    /// 版本 3 为 v0.1 所有权修复。运行时只接受 3；更低版本由 setup 迁移。
-    schema_version: u32 = 3,
+    /// 配置文件 schema 版本。永久默认 4（最新）；setup 始终生成 v4，不存在版本迁移。
+    schema_version: u32 = 4,
     /// 单进程服务配置：实例名称、PXE 网卡、服务网 IP 和 HTTP 端口。
     server: ServerConfig,
     /// HTTP 大文件和发行版仓库目录配置。
@@ -40,7 +38,7 @@ pub const AppConfig = struct {
     logging: LoggingConfig = .{},
     /// 业务事件审计流（events.jsonl）的轮转策略。
     events: EventsConfig = .{},
-    /// Legacy migration staging fields。schema 3 文件禁止写出这些字段；
+    /// Catalog 实体投影字段；config.json 不持久化这些字段，
     /// 运行时通过 [`projectCatalog`] 从 Catalog 投影到这里，以缩小协议模块的破坏面。
     distros: []const DistroConfig = &.{},
     /// 节点可绑定的安装策略模板。投影自 `Catalog.profiles`。
@@ -56,9 +54,9 @@ pub const AppConfig = struct {
 /// 该文件只由 `nodeforged` 通过 catalog store 原子事务写入，CLI 不直接编辑。
 /// 磁盘布局为 manifest + 8 个 entity 文件，内存模型由本结构体表达。
 pub const Catalog = struct {
-    /// 内存 catalog schema 版本。版本 1 为 legacy 单文件，版本 2 为 M4.7 多文件，
-    /// 版本 3 为 v0.1 所有权修复。磁盘布局另由 manifest schema 约束。
-    schema_version: u32 = 3,
+    /// 内存 catalog schema 版本。永久默认 4（最新）；setup 始终生成 v4，不存在版本迁移。
+    /// 磁盘布局另由 manifest schema 约束。
+    schema_version: u32 = 4,
     /// manifest 的单调 catalog revision；每次原子事务提交递增。legacy 单文件输入为 0。
     revision: u64 = 0,
     /// ISO 导入后自动形成的发行版能力索引。非操作员手动创建的策略对象。
@@ -82,10 +80,6 @@ pub const Catalog = struct {
     discovery_policy: DiscoveryPolicy = .{},
     /// 持久化的未知 DHCP 客户端观察记录。与临时 DHCP lease 分开存储和过期清理。
     unknown_client_observations: []const UnknownClientObservation = &.{},
-    /// Read-only schema-v2 迁移证据。schema-v3 序列化器省略这些字段，
-    /// 仅用于迁移审计和回滚诊断。
-    legacy_diskless_profiles: []const []const u8 = &.{},
-    legacy_multidisk_nodes: []const []const u8 = &.{},
 };
 
 /// 未知 DHCP 客户端的站点级处理动作。
@@ -149,7 +143,7 @@ pub const UnknownClientObservation = struct {
 /// 将 daemon-owned catalog 实体投影到协议代码读取的 AppConfig 视图。
 ///
 /// 旧代码通过 `config.distros`/`config.profiles` 等字段访问实体数据。
-/// schema v3 后这些实体只存在于 Catalog，此函数将它们投影到 AppConfig 的
+/// 这些实体只存在于 Catalog，此函数将它们投影到 AppConfig 的
 /// 对应字段，避免修改所有协议模块的读取入口。
 ///
 /// 返回值只借用两侧内存，不得越过 config/catalog snapshot 生命周期。
@@ -758,6 +752,11 @@ pub const TargetSystemConfig = struct {
     users: []const TargetUserConfig = &default_target_users,
     /// 额外安装的包名列表（独立于 software selection 的补充）。
     packages: []const []const u8 = &.{},
+    /// 是否默认采用 profile 创建时导入的宿主机 /etc/hosts。
+    import_host_hosts: bool = true,
+    /// 目标系统 /etc/hosts 的显式内容。null 时由渲染器生成最小 hosts；
+    /// profile create 默认填入宿主机 /etc/hosts，可通过 CLI 覆盖或关闭导入。
+    hosts_content: ?[]const u8 = null,
 };
 
 /// 目标系统网络模式枚举。

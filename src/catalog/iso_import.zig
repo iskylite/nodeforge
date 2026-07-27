@@ -201,7 +201,7 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
             bootloader_hash[i * 2] = hex_chars[byte >> 4];
             bootloader_hash[i * 2 + 1] = hex_chars[byte & 0xf];
         }
-        break :blk try contentAddressedBootloaderPath(allocator, detected.arch, &bootloader_hash);
+        break :blk try contentAddressedBootloaderPath(allocator, source_name, detected.arch, &bootloader_hash);
     } else "";
     // bootloader_rel 的所有权转移给 Result.bootloader_asset.path（见下方
     // Result 构造），由调用方负责释放。此处不得 defer free。
@@ -384,23 +384,12 @@ fn detectRhelMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []cons
     defer allocator.free(treeinfo_path);
     const treeinfo = try std.Io.Dir.cwd().readFileAlloc(io, treeinfo_path, allocator, .limited(256 * 1024));
     defer allocator.free(treeinfo);
-    // Kylin V10 和其他一些受支持的 RHEL 系媒体将 repodata 发布在
-    // ISO 根目录，并省略可选的 repository 键。
-    const repository_path = valueFor(treeinfo, "repository") orelse "";
-    if (repository_path.len != 0) try assets.validateRelativePath(repository_path);
-    const repomd_path = if (repository_path.len == 0)
-        try allocator.dupe(u8, "repodata/repomd.xml")
-    else
-        try std.fmt.allocPrint(allocator, "{s}/repodata/repomd.xml", .{repository_path});
-    defer allocator.free(repomd_path);
+    const repository_path = try detectRhelRepositoryBase(io, allocator, mount_point, treeinfo);
+    defer if (repository_path) |path| allocator.free(path);
     const product_label = valueFor(treeinfo, "family");
     const distro = requested.distro orelse
         (if (product_label) |label| distroForRhelFamily(label) else null) orelse
         return error.MediaTupleMismatch;
-    const has_repository = blk: {
-        _ = assets.verifyRegularFile(io, mount_point, repomd_path) catch break :blk false;
-        break :blk true;
-    };
     const version = requested.version orelse valueFor(treeinfo, "version") orelse return error.MediaTupleMismatch;
     const arch = requested.arch orelse blk: {
         const arch_text = valueFor(treeinfo, "arch") orelse return error.MediaTupleMismatch;
@@ -412,8 +401,56 @@ fn detectRhelMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []cons
         .version = try allocator.dupe(u8, version),
         .arch = arch,
         .source_label = if (product_label) |label| try allocator.dupe(u8, label) else null,
-        .layout = .{ .kernel_path = "images/pxeboot/vmlinuz", .initrd_path = "images/pxeboot/initrd.img", .repository_base = if (has_repository) try allocator.dupe(u8, repository_path) else null },
+        .layout = .{ .kernel_path = "images/pxeboot/vmlinuz", .initrd_path = "images/pxeboot/initrd.img", .repository_base = if (repository_path) |path| try allocator.dupe(u8, path) else null },
     };
+}
+
+fn detectRhelRepositoryBase(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, treeinfo: []const u8) !?[]const u8 {
+    if (valueFor(treeinfo, "repository")) |configured| {
+        if (configured.len != 0) try assets.validateRelativePath(configured);
+        const repomd_path = if (configured.len == 0)
+            try allocator.dupe(u8, "repodata/repomd.xml")
+        else
+            try std.fmt.allocPrint(allocator, "{s}/repodata/repomd.xml", .{configured});
+        defer allocator.free(repomd_path);
+        _ = assets.verifyRegularFile(io, mount_point, repomd_path) catch return null;
+        return try allocator.dupe(u8, configured);
+    }
+    return findRhelRepositoryBase(io, allocator, mount_point);
+}
+
+fn findRhelRepositoryBase(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8) !?[]const u8 {
+    var root = try std.Io.Dir.openDirAbsolute(io, mount_point, .{ .iterate = true, .access_sub_paths = true });
+    defer root.close(io);
+    return findRepomdInDir(io, allocator, &root, "");
+}
+
+fn findRepomdInDir(io: std.Io, allocator: std.mem.Allocator, root: *std.Io.Dir, relative: []const u8) !?[]const u8 {
+    const scan_rel = if (relative.len == 0) "." else relative;
+    var directory = root.openDir(io, scan_rel, .{ .iterate = true, .follow_symlinks = false }) catch return null;
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory and entry.kind != .unknown) continue;
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        const child_rel = if (relative.len == 0) try allocator.dupe(u8, entry.name) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ relative, entry.name });
+        errdefer allocator.free(child_rel);
+        if (std.mem.eql(u8, entry.name, "repodata")) {
+            const repomd = try std.fmt.allocPrint(allocator, "{s}/repomd.xml", .{child_rel});
+            defer allocator.free(repomd);
+            if (root.openFile(io, repomd, .{ .mode = .read_only, .follow_symlinks = false, .resolve_beneath = true })) |file| {
+                file.close(io);
+                allocator.free(child_rel);
+                return if (relative.len == 0) try allocator.dupe(u8, "") else try allocator.dupe(u8, relative);
+            } else |_| {}
+        }
+        if (try findRepomdInDir(io, allocator, root, child_rel)) |found| {
+            allocator.free(child_rel);
+            return found;
+        }
+        allocator.free(child_rel);
+    }
+    return null;
 }
 
 /// 从 Ubuntu live-server ISO 的 `.disk/info` 检测媒体信息。
@@ -708,16 +745,16 @@ fn sha256Path(io: std.Io, path: []const u8, out: *[32]u8) !void {
     hash.final(out);
 }
 
-/// 生成内容寻址的 bootloader TFTP 路径：`efi/<sha256[:16]>-grubaa64.efi`。
+/// 生成内容寻址的 bootloader TFTP 路径：`efi/<source>/<sha256[:16]>-grubaa64.efi`。
 /// 使用 SHA-256 前 16 个十六进制字符（8 字节）作为区分前缀，足以避免
 /// 实际碰撞。同内容 ISO 导入得到相同路径（复用），不同内容得到不同路径。
-fn contentAddressedBootloaderPath(allocator: std.mem.Allocator, arch: model.Arch, hash: *const [64]u8) ![]const u8 {
+fn contentAddressedBootloaderPath(allocator: std.mem.Allocator, source_name: []const u8, arch: model.Arch, hash: *const [64]u8) ![]const u8 {
     const prefix = hash[0..16]; // 8 字节 = 16 hex chars
     const filename = switch (arch) {
         .aarch64 => "grubaa64.efi",
         .x86_64 => "grubx64.efi",
     };
-    return std.fmt.allocPrint(allocator, "efi/{s}-{s}", .{ prefix, filename });
+    return std.fmt.allocPrint(allocator, "efi/{s}/{s}-{s}", .{ source_name, prefix, filename });
 }
 
 /// 生成内容寻址的 bootloader catalog 名称：`grub-uefi-<arch>-<sha256[:16]>`。
@@ -753,13 +790,13 @@ fn findBootloaderMediaPath(io: std.Io, root: []const u8, arch: model.Arch) ?[]co
 
 test "content-addressed UEFI bootloader paths use SHA-256 prefix" {
     const hash = "abcdef0123456789" ** 4; // 64 hex chars
-    const path_aarch64 = try contentAddressedBootloaderPath(std.testing.allocator, .aarch64, hash);
+    const path_aarch64 = try contentAddressedBootloaderPath(std.testing.allocator, "rocky-9.7", .aarch64, hash);
     defer std.testing.allocator.free(path_aarch64);
-    try std.testing.expectEqualStrings("efi/abcdef0123456789-grubaa64.efi", path_aarch64);
+    try std.testing.expectEqualStrings("efi/rocky-9.7/abcdef0123456789-grubaa64.efi", path_aarch64);
 
-    const path_x86_64 = try contentAddressedBootloaderPath(std.testing.allocator, .x86_64, hash);
+    const path_x86_64 = try contentAddressedBootloaderPath(std.testing.allocator, "rocky-9.7", .x86_64, hash);
     defer std.testing.allocator.free(path_x86_64);
-    try std.testing.expectEqualStrings("efi/abcdef0123456789-grubx64.efi", path_x86_64);
+    try std.testing.expectEqualStrings("efi/rocky-9.7/abcdef0123456789-grubx64.efi", path_x86_64);
 
     const name_aarch64 = try contentAddressedBootloaderName(std.testing.allocator, .aarch64, hash);
     defer std.testing.allocator.free(name_aarch64);
@@ -769,9 +806,9 @@ test "content-addressed UEFI bootloader paths use SHA-256 prefix" {
 test "content-addressed paths differ for different content" {
     const hash1 = "1111111111111111" ** 4;
     const hash2 = "2222222222222222" ** 4;
-    const path1 = try contentAddressedBootloaderPath(std.testing.allocator, .aarch64, hash1);
+    const path1 = try contentAddressedBootloaderPath(std.testing.allocator, "rocky-9.7", .aarch64, hash1);
     defer std.testing.allocator.free(path1);
-    const path2 = try contentAddressedBootloaderPath(std.testing.allocator, .aarch64, hash2);
+    const path2 = try contentAddressedBootloaderPath(std.testing.allocator, "rocky-9.7", .aarch64, hash2);
     defer std.testing.allocator.free(path2);
     try std.testing.expect(!std.mem.eql(u8, path1, path2));
 }

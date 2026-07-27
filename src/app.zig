@@ -107,9 +107,7 @@ pub fn run(
     };
     const transaction_dir = try model_transaction.directoryForConfig(allocator, config_path);
     defer allocator.free(transaction_dir);
-    _ = try operations.reconcileMigrationRecovery(io, allocator, transaction_dir, &operation_store, current_time);
     try operations.save(io, allocator, paths.require().operations_path, &operation_store);
-    try operations.clearMigrationRecoveryRecords(io, allocator, transaction_dir);
     var rootfs_artifacts = rootfs_artifact_store.Store.init(allocator, paths.require().rootfs_artifacts_path);
     defer rootfs_artifacts.deinit();
     rootfs_artifacts.load(io) catch |err| switch (err) {
@@ -332,13 +330,7 @@ fn forProfile(config: *const model.AppConfig, name: []const u8) ?*const model.Pr
 /// 尝试从旧版 `runtime.json` 迁移。
 fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.DhcpState, now_val: i64, mono_now: i64) void {
     dhcp_store.load(io, allocator, paths.require().leases_path, dhcp, now_val, mono_now) catch |err| switch (err) {
-        error.FileNotFound => {
-            // 新文件缺失：尝试从旧版 runtime.json 迁移 lease。
-            dhcp_store.migrateLegacy(io, allocator, paths.require().runtime_path, dhcp, now_val, mono_now) catch |legacy_err| switch (legacy_err) {
-                error.FileNotFound => {},
-                else => observe_log.err("dhcp: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),
-            };
-        },
+        error.FileNotFound => {},
         else => observe_log.err("dhcp: ignoring invalid leases snapshot: {t}", .{err}),
     };
 }
@@ -347,13 +339,7 @@ fn loadLeases(io: std.Io, allocator: std.mem.Allocator, dhcp: *runtime_state.Dhc
 /// `runtime.json` 迁移。
 fn loadStatuses(io: std.Io, allocator: std.mem.Allocator, store: *node_status.Store) void {
     status_store.load(io, allocator, paths.require().node_status_path, store) catch |err| switch (err) {
-        error.FileNotFound => {
-            // 新文件缺失：尝试从遗留 runtime.json 迁移状态。
-            status_store.migrateLegacy(io, allocator, paths.require().runtime_path, store) catch |legacy_err| switch (legacy_err) {
-                error.FileNotFound => {},
-                else => observe_log.err("status: ignoring invalid legacy runtime snapshot: {t}", .{legacy_err}),
-            };
-        },
+        error.FileNotFound => {},
         else => observe_log.err("status: ignoring invalid node-status snapshot: {t}", .{err}),
     };
 }

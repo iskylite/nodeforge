@@ -18,9 +18,9 @@ echo "=== initrd size: $(du -h "$work/initramfs.img" | cut -f1) ==="
 echo "=== kernel: vmlinuz-$KREL ==="
 
 # Ensure assets in place
-mkdir -p "$install_root/assets/boot" "$install_root/assets/initrd-ubuntu" "$install_root/assets/rootfs-ubuntu"
+mkdir -p "$install_root/assets/boot" "$install_root/assets/boot/diskless/ubuntu" "$install_root/assets/rootfs-ubuntu"
 cp "$work/vmlinuz-$KREL" "$install_root/assets/boot/vmlinuz-$KREL"
-cp "$work/initramfs.img" "$install_root/assets/initrd-ubuntu/ub-mkinit2-initrd"
+cp "$work/initramfs.img" "$install_root/assets/boot/diskless/ubuntu/ub-mkinit2-initrd"
 cp "$work/rootfs.squashfs" "$install_root/assets/rootfs-ubuntu/ub-mkinit2-rootfs"
 
 # Start daemon

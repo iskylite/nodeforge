@@ -206,6 +206,19 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"installer_started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.writeAll("  late-commands:\n");
+    if (system.import_host_hosts) {
+        if (system.hosts_content) |hosts| {
+            try w.writeAll("    - ");
+            var command: std.Io.Writer.Allocating = .init(allocator);
+            defer command.deinit();
+            try command.writer.writeAll("cat > /target/etc/hosts <<'NODEFORGE_HOSTS_EOF'\n");
+            try command.writer.writeAll(hosts);
+            if (hosts.len == 0 or hosts[hosts.len - 1] != '\n') try command.writer.writeByte('\n');
+            try command.writer.writeAll("NODEFORGE_HOSTS_EOF\nchmod 0644 /target/etc/hosts");
+            try render.yamlQuote(w, command.written());
+            try w.writeByte('\n');
+        }
+    }
     if (install.completion.action == .halt) try w.writeAll("    - 'printf \"[Unit]\\nDescription=Halt after NodeForge install\\n[Service]\\nType=oneshot\\nExecStart=/usr/bin/systemctl halt\\n[Install]\\nWantedBy=multi-user.target\\n\" > /target/etc/systemd/system/nodeforge-halt-after-install.service && curtin in-target --target=/target -- systemctl enable nodeforge-halt-after-install.service'\n");
     if (system.security.apparmor == .disabled) try w.writeAll("    - 'curtin in-target --target=/target -- systemctl disable --now apparmor || true'\n") else if (system.security.apparmor == .complain) try w.writeAll("    - 'curtin in-target --target=/target -- aa-complain /etc/apparmor.d/* || true'\n") else try w.writeAll("    - 'curtin in-target --target=/target -- aa-enforce /etc/apparmor.d/* || true'\n");
     if (install.proxy.no_proxy.len != 0) {
@@ -466,7 +479,7 @@ fn curtinRaidLevel(mode: model.StorageMode) []const u8 {
     };
 }
 
-test "schema v3 automatic storage renders all modes with native Curtin actions" {
+test "automatic storage renders all modes with native Curtin actions" {
     const modes = [_]model.StorageMode{ .single, .lvm, .raid0, .raid1, .raid5, .raid6, .raid10, .@"raid0-lvm", .@"raid1-lvm", .@"raid5-lvm", .@"raid6-lvm", .@"raid10-lvm" };
     const disks = [_][]const u8{ "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd" };
     for (modes) |mode| {
@@ -500,7 +513,7 @@ test "schema v3 automatic storage renders all modes with native Curtin actions" 
     }
 }
 
-test "schema v3 custom logical layout renders all modes natively in Curtin" {
+test "custom logical layout renders all modes natively in Curtin" {
     const modes = [_]model.StorageMode{ .single, .lvm, .raid0, .raid1, .raid5, .raid6, .raid10, .@"raid0-lvm", .@"raid1-lvm", .@"raid5-lvm", .@"raid6-lvm", .@"raid10-lvm" };
     const disks = [_][]const u8{ "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd" };
     const partitions = [_]model.PartitionConfig{ .{ .id = "esp", .mount = "/boot/efi", .filesystem = "fat32", .size_mib = 1024, .kind = .esp }, .{ .id = "boot", .mount = "/boot", .filesystem = "ext4", .size_mib = 2048, .kind = .boot }, .{ .id = "var", .mount = "/var", .filesystem = "ext4", .size_mib = 8192 }, .{ .id = "root", .mount = "/", .filesystem = "ext4", .grow = true, .kind = .root } };

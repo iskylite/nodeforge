@@ -14,6 +14,7 @@
 //! MVP 不实现 WRQ，收到写请求直接返回标准 ERROR。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const model = @import("../model.zig");
 const lookup = @import("../catalog.zig");
 const catalog_runtime = @import("../state/catalog_runtime.zig");
@@ -387,23 +388,26 @@ fn sendEphemeralError(io: std.Io, remote: *const std.Io.net.IpAddress, code: pac
 /// M3.5/M3.6：识别严格匹配的虚拟 GRUB 配置请求。
 ///
 /// 只有以下精确模式被识别为虚拟配置候选：
-/// - `efi/grub.cfg-01-<客户端 MAC 的小写连字符形式>`
-///   例如 `efi/grub.cfg-01-02-aa-bb-cc-dd-ef`
+/// - `<dir>/grub.cfg-01-<客户端 MAC 的小写连字符形式>`
+///   例如 `efi/grub.cfg-01-02-aa-bb-cc-dd-ef` 或
+///   `efi/rocky-9.7/grub.cfg-01-02-aa-bb-cc-dd-ef`
 ///   MAC 各字节必须是小写 hex，用连字符分隔（GRUB 的标准 MAC 格式）。
-/// - `efi/grub.cfg-<客户端 IPv4 的大写十六进制形式>`
+/// - `<dir>/grub.cfg-<客户端 IPv4 的大写十六进制形式>`
 ///   例如 `efi/grub.cfg-C0A81BC8`（对应 192.168.27.200）
 ///   IP 各字节必须是大写 hex，无分隔符（GRUB 的标准 IP hex 格式）。
-/// - `efi/grub.cfg`（GRUB 回退名称）
+/// - `<dir>/grub.cfg`（GRUB 回退名称）
 ///
 /// 其他路径继续走正常的 catalog asset 白名单检查。
 /// 文件名本身不决定响应内容；调用方还必须拥有该 peer IP 的有效已 ACK session
 /// 才能渲染和传输配置。允许 GRUB 常见的单个前导 `/`（如 `/efi/grub.cfg-...`）。
 fn isVirtualGrubConfig(filename: []const u8) bool {
     const normalized = trimLeadingSlash(filename);
+    if (normalized.len == 0 or std.mem.indexOfScalar(u8, normalized, '\\') != null or std.mem.indexOf(u8, normalized, "..") != null) return false;
+    const basename = if (std.mem.lastIndexOfScalar(u8, normalized, '/')) |index| normalized[index + 1 ..] else normalized;
     // MAC 形式：efi/grub.cfg-01-<6 个用连字符分隔的 hex 对>
     // 总长度："efi/grub.cfg-01-" (16) + "XX-XX-XX-XX-XX-XX" (17) = 33
-    if (std.mem.startsWith(u8, normalized, "efi/grub.cfg-01-")) {
-        const suffix = normalized["efi/grub.cfg-01-".len..];
+    if (std.mem.startsWith(u8, basename, "grub.cfg-01-")) {
+        const suffix = basename["grub.cfg-01-".len..];
         if (suffix.len != 17) return false;
         for (suffix, 0..) |c, i| {
             if (i % 3 == 2) {
@@ -412,16 +416,16 @@ fn isVirtualGrubConfig(filename: []const u8) bool {
         }
         return true;
     }
-    if (std.mem.startsWith(u8, normalized, "efi/grub.cfg-")) {
+    if (std.mem.startsWith(u8, basename, "grub.cfg-")) {
         // Hex IP 形式：grub.cfg-<8 个 hex 字符>（如 C0A81BC8）
-        const suffix = normalized["efi/grub.cfg-".len..];
+        const suffix = basename["grub.cfg-".len..];
         if (suffix.len == 8) {
             for (suffix) |c| if (!(std.ascii.isDigit(c) or (c >= 'A' and c <= 'F'))) return false;
             return true;
         }
         return false;
     }
-    if (std.mem.eql(u8, normalized, "efi/grub.cfg")) return true;
+    if (std.mem.eql(u8, basename, "grub.cfg")) return true;
     return false;
 }
 
@@ -831,7 +835,7 @@ fn transfer(
                     switch (retryAction(is_final_block, attempts, limit)) {
                         .retransmit => {
                             attempts += 1;
-                            log.warn("retransmit {s} block {d} attempt {d}/{d}", .{ request.filename, expected_ack, attempts, limit });
+                            logRetransmit("retransmit {s} block {d} attempt {d}/{d}", .{ request.filename, expected_ack, attempts, limit });
                             // 客户端无法在 window 中较早的块丢失时 ACK window 末尾，
                             // 因此按顺序重传整个未完成 window，而非仅重传最后一块。
                             var resend_offset = window_start_offset;
@@ -967,13 +971,17 @@ fn sendOackAndAwaitAck(socket: *std.Io.net.Socket, io: std.Io, remote: *const st
         awaitAck(socket, io, remote, 0, backoffSeconds(base_timeout, attempts)) catch |err| {
             if (err == error.Timeout and retryAction(false, attempts, max_retries) == .retransmit) {
                 attempts += 1;
-                log.warn("retransmit OACK attempt {d}/{d}", .{ attempts, max_retries });
+                logRetransmit("retransmit OACK attempt {d}/{d}", .{ attempts, max_retries });
                 continue;
             }
             return err;
         };
         return;
     }
+}
+
+fn logRetransmit(comptime format: []const u8, args: anytype) void {
+    if (!builtin.is_test) log.warn(format, args);
 }
 
 /// 等待指定 block number 的 ACK，超时返回 `error.Timeout`。
@@ -1239,11 +1247,15 @@ test "OACK does not add unrequested blksize" {
 test "identifies virtual GRUB config filenames" {
     // MAC 形式
     try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-ef"));
+    try std.testing.expect(isVirtualGrubConfig("efi/rocky-9.7-aarch64-minimal/grub.cfg-01-02-aa-bb-cc-dd-ef"));
     // Hex IP 形式（大写）
     try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg-C0A81BC8"));
+    try std.testing.expect(isVirtualGrubConfig("efi/rocky-9.7-aarch64-minimal/grub.cfg-C0A81BC8"));
     // 回退名称
     try std.testing.expect(isVirtualGrubConfig("efi/grub.cfg"));
     try std.testing.expect(isVirtualGrubConfig("/efi/grub.cfg-C0A81BC8"));
+    try std.testing.expect(isVirtualGrubConfig("/EFI/BOOT/grub.cfg-C0A81BC8"));
+    try std.testing.expect(isVirtualGrubConfig("grub.cfg"));
     // 不匹配的路径
     try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-ef-extra"));
     try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-XYZ"));
@@ -1251,7 +1263,6 @@ test "identifies virtual GRUB config filenames" {
     try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-01-02-AA-bb-cc-dd-ef"));
     try std.testing.expect(!isVirtualGrubConfig("efi/grub.cfg-01-02-aa-bb-cc-dd-gg"));
     try std.testing.expect(!isVirtualGrubConfig("efi/grubaa64.efi"));
-    try std.testing.expect(!isVirtualGrubConfig("grub.cfg"));
     try std.testing.expect(!isVirtualGrubConfig("../etc/grub.cfg"));
 }
 

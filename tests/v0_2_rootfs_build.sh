@@ -81,9 +81,9 @@ with open(f"{dst}/manifest.json", "w") as f: json.dump(manifest, f, indent=2)
 print(f"install-source fixture prepared: assets={len(assets)} repos={len(repos)}")
 PY
 
-mkdir -p "$install_root/assets/boot/rootfs-test" "$install_root/assets/initrd/rootfs-test"
+mkdir -p "$install_root/assets/boot/rootfs-test" "$install_root/assets/boot/diskless/rootfs-test"
 cp /boot/vmlinuz-5.14.0-611.5.1.el9_7.aarch64 "$install_root/assets/boot/rootfs-test/nf-test-kernel"
-cp zig-out/bin/nodeforge-initrd "$install_root/assets/initrd/rootfs-test/nf-test-initrd"
+cp zig-out/bin/nodeforge-initrd "$install_root/assets/boot/diskless/rootfs-test/nf-test-initrd"
 
 setsid zig-out/bin/nodeforged --install-root "$install_root" </dev/null >"$work/daemon.log" 2>&1 &
 test_daemon_pid=$!

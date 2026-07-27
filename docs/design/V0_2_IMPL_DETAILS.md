@@ -303,13 +303,13 @@ manifest、event 或日志都不得包含 private key bytes。
 
 ## 5. schema 迁移
 
-- catalog `schema_version`：v3（v0.1 冻结）/ v4（v0.2 同时新增 tagged kind
-  `ProfileKind = install|diskless` 与 `rootfs-build|first-boot` tagged action/phase）。
+- catalog `schema_version`：v4（v0.2 唯一标准，同时新增 tagged kind
+  `ProfileKind = install|diskless` 与 `rootfs-build|first-boot` tagged action/phase）。v0.1 的 v3 已废弃，不存在版本迁移 CLI 命令。
 - BootConfig DTO `schema_version` v2（独立命名空间）。
 - AgentPlan DTO `schema_version` v1（独立命名空间）；v0.4 target topology 升 v2，v0.5 保持 v2。
 - v0.3 `firmware.mode`/`install-post` schema v5；v0.4 schema v6；v0.5 rootfs 形态 schema v7，见
   [`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
-- `catalog migrate plan/apply/rollback` 的 rollback 只指 migration transaction finalize 前，按 durable migration journal
+- v0.2 不提供 `catalog migrate` CLI 命令；schema v4 是唯一标准。后续版本（v0.3-v0.5）新增 schema 变更时，rollback 只指 migration transaction finalize 前，按 durable migration journal
   恢复 pre-migration snapshot；它不承诺任意已写入新特性后的版本 downgrade。
 - schema downgrade 必须先做 representability preflight。任一资源包含目标旧 schema 无法表达的 kind/field/item 时返回
   `migration.non_representable`，JSON 至少列出 `resource_type/resource_id/path/reason/target_schema`；不得通过 nullable、

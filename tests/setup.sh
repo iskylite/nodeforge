@@ -150,29 +150,3 @@ if "$half_bundle/nodeforge" setup --install-root "$half_install" --non-interacti
 fi
 test ! -f "$half_install/.nodeforge-root"
 test ! -e "$broken/.nodeforge-root"
-
-# Schema-1 config + monolithic catalog migrate without losing catalog facts.
-legacy="$tmp/legacy"
-mkdir -p "$legacy/bin" "$legacy/config" "$legacy/catalog"
-cp "$cli" "$legacy/bin/nodeforge"
-cp "$daemon" "$legacy/bin/nodeforged"
-: >"$legacy/.nodeforge-root"
-jq --slurpfile catalog "$repo/catalog.example.json" '.schema_version=1 | .distros=$catalog[0].distros' "$repo/config.example.json" >"$legacy/config/config.json"
-jq '.schema_version=1 | del(.revision,.distros,.profiles,.nodes,.provisioning_bundles)' "$repo/catalog.example.json" >"$legacy/catalog/catalog.json"
-"$legacy/bin/nodeforge" setup --reconfigure --non-interactive --yes >"$tmp/migrate"
-grep -Fq 'legacy deployment migrated' "$tmp/migrate"
-test "$(jq -r .schema_version "$legacy/config/config.json")" = 2
-test "$(jq -r 'has("distros")' "$legacy/config/config.json")" = false
-test "$(jq -r 'length' "$legacy/catalog/distros.json")" -gt 0
-test -f "$legacy/config/config.json.m4.7.bak"
-test -f "$legacy/catalog/catalog.json.m4.7.bak"
-test ! -f "$legacy/catalog/catalog.json"
-
-# A crash after config publication is resumed from the migration marker. This
-# is the only state in which a legacy file may coexist with a new manifest.
-cp "$legacy/catalog/catalog.json.m4.7.bak" "$legacy/catalog/catalog.json"
-printf '%s\n' '{"schema_version":1,"state":"prepared","request_digest":"recovery-test"}' >"$legacy/state/m4.7-migration.json"
-"$legacy/bin/nodeforge" setup --reconfigure --non-interactive --yes >"$tmp/migrate-recover"
-grep -Fq 'legacy deployment migrated' "$tmp/migrate-recover"
-test ! -f "$legacy/catalog/catalog.json"
-test ! -f "$legacy/state/m4.7-migration.json"

@@ -5,7 +5,7 @@ set -euo pipefail
 repo=${NODEFORGE_REPO:-/root/NodeForge}
 fixture=${NODEFORGE_QEMU_FIXTURE:-/root/nf-smoke}
 base_rootfs=${NODEFORGE_BASE_ROOTFS:-/opt/nodeforge/assets/rootfs/2c6893dd3f2d6c5129cdface5f76591dcacce2c5b7c0466b4bba446825239d7b.squashfs}
-base_initrd=${NODEFORGE_BASE_INITRD:-/opt/nodeforge/assets/initrd/diskless/rocky-9.7/aarch64/initrd.img}
+base_initrd=${NODEFORGE_BASE_INITRD:-/opt/nodeforge/assets/boot/diskless/rocky-9.7/aarch64/initrd.img}
 kernel=${NODEFORGE_QEMU_KERNEL:-/boot/vmlinuz-5.14.0-611.5.1.el9_7.aarch64}
 work=/tmp/nodeforge-v02-qemu
 install_root=/tmp/nodeforge-v02-install
@@ -143,10 +143,10 @@ print(f"install-source fixture prepared; assets={len(assets)} repos={len(repos)}
 PYINJ
 
 # `assets register` consumes files below the configured TFTP asset root.
-mkdir -p "$install_root/assets/boot/rootfs-test" "$install_root/assets/initrd/rootfs-test"
+mkdir -p "$install_root/assets/boot/rootfs-test" "$install_root/assets/boot/diskless/rootfs-test"
 cp "$kernel" "$install_root/assets/boot/rootfs-test/nf-test-kernel"
 (cd "$work/initrd-root" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 \
-    >"$install_root/assets/initrd/rootfs-test/nf-test-initrd")
+    >"$install_root/assets/boot/diskless/rootfs-test/nf-test-initrd")
 
 systemctl stop nodeforged
 for _ in {1..50}; do

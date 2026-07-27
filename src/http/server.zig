@@ -33,13 +33,9 @@ const auth = @import("auth.zig");
 const lookup = @import("../catalog.zig");
 const asset_validate = @import("../assets/validate.zig");
 const iso_import = @import("../catalog/iso_import.zig");
-const catalog_migration = @import("../catalog/migration.zig");
 const catalog_discovery = @import("../catalog/discovery.zig");
-const schema_v3 = @import("../catalog/schema_v3.zig");
-const schema_v3_dto = @import("../catalog/schema_v3_dto.zig");
-const schema_v4 = @import("../catalog/schema_v4.zig");
+const dto = @import("../catalog/dto.zig");
 const model_transaction = @import("../state/model_transaction.zig");
-const schema_v3_transaction = @import("../state/schema_v3_transaction.zig");
 const config_store = @import("../config/store.zig");
 const catalog_store = @import("../catalog/store.zig");
 const dhcp_server = @import("../dhcp/server.zig");
@@ -419,14 +415,6 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/repositories")) return managementRepositories(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/repositories/", "/software")) |name| return managementRepositorySoftware(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/repositories/")) |name| return managementRepository(request, context, name, meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/migration-plans")) return catalogMigrationPlan(request, context, meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/migrations")) return catalogMigrationApply(request, context, meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/migration-plans")) return schemaV3MigrationPlan(request, context, meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/migrations")) return schemaV3MigrationApply(request, context, meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v3/rollbacks")) return schemaV3MigrationRollback(request, context, meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v4/migration-plans")) return schemaV4MigrationPlan(request, context, meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v4/migrations")) return schemaV4MigrationApply(request, context, meta);
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/catalog/schema-v4/rollbacks")) return schemaV4MigrationRollback(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (nodePath(path, "/api/v1/management/operations/")) |operation_id| return managementOperation(request, context, operation_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/operations")) return managementOperations(request, context, meta);
     var allow_buffer: [128]u8 = undefined;
@@ -631,9 +619,9 @@ fn bootFile(request: zap.Request, context: *const RouteContext, relative: []cons
     const asset_info = blk: {
         const catalog_snapshot = context.catalog_snapshot;
         const asset = lookup.findAssetByPath(catalog_snapshot.value(), relative) orelse return notFound(request, meta);
-        break :blk .{ .path = asset.path, .checksum = asset.sha256 };
+        break :blk .{ .path = asset.path, .checksum = asset.sha256, .root = if (asset.kind == .nodeforge_initrd) paths.require().initrd_dir else context.config.tftp.asset_root };
     };
-    return staticFile(request, context, context.config.tftp.asset_root, asset_info.path, asset_info.checksum, meta);
+    return staticFile(request, context, asset_info.root, asset_info.path, asset_info.checksum, meta);
 }
 
 fn repositoryAsset(request: zap.Request, context: *const RouteContext, name: []const u8, tail: []const u8, meta: RequestMeta) !void {
@@ -2178,207 +2166,6 @@ fn managementOperations(request: zap.Request, context: *const RouteContext, meta
     return json(request, .ok, output.written(), meta);
 }
 
-fn schemaV3MigrationPlan(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
-    if (request.body) |body| if (body.len != 0 and !std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "{}"))
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"request.unknown_field\",\"message\":\"schema-v3 plan accepts an empty object\"}}\n", meta);
-    var plan = schema_v3.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.plan_failed\",\"message\":\"cannot construct schema-v3 plan\"}}\n", meta);
-    defer plan.deinit();
-    var output: std.Io.Writer.Allocating = .init(context.allocator);
-    defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"applicable\":{s},\"plan\":", .{ std.json.fmt(&plan.digest, .{}), if (plan.applicable()) "true" else "false" });
-    try output.writer.writeAll(plan.canonical_json);
-    try output.writer.writeAll("}}\n");
-    return json(request, .ok, output.written(), meta);
-}
-
-fn schemaV4MigrationPlan(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
-    if (request.body) |body| if (body.len != 0 and !std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "{}"))
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"request.unknown_field\",\"message\":\"schema-v4 plan accepts an empty object\"}}\n", meta);
-    var plan = schema_v4.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.plan_failed\",\"message\":\"cannot construct schema-v4 plan\"}}\n", meta);
-    defer plan.deinit();
-    var output: std.Io.Writer.Allocating = .init(context.allocator);
-    defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"applicable\":{s},\"plan\":", .{ std.json.fmt(&plan.digest, .{}), if (plan.applicable()) "true" else "false" });
-    try output.writer.writeAll(plan.canonical_json);
-    try output.writer.writeAll("}}\n");
-    return json(request, .ok, output.written(), meta);
-}
-
-fn schemaV4MigrationApply(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
-    var parsed = parseSchemaV3Digest(request, context.allocator) catch
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.invalid_request\",\"message\":\"plan_digest must be 64 lowercase hexadecimal characters\"}}\n", meta);
-    defer parsed.deinit();
-    context.models.lock();
-    defer context.models.unlock();
-    if (context.configs.currentRevision() != context.config_revision or context.catalog.currentRevision() != context.catalog_snapshot.revision)
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"model.revision_conflict\",\"message\":\"model changed after plan was read\"}}\n", meta);
-    if (context.sessions.hasActive(boot_session.monotonicNow()))
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.active_session\",\"message\":\"all active boot sessions must finish or be terminated\"}}\n", meta);
-    var plan = schema_v4.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.plan_failed\",\"message\":\"cannot rebuild schema-v4 plan\"}}\n", meta);
-    defer plan.deinit();
-    if (!std.mem.eql(u8, &plan.digest, parsed.value.plan_digest))
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.digest_conflict\",\"message\":\"plan digest no longer identifies the current model\"}}\n", meta);
-    if (!plan.applicable()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.blocked\",\"message\":\"migration plan contains blockers\"}}\n", meta);
-    var candidate = schema_v4.candidates(context.allocator, context.config, context.catalog_snapshot.value(), &plan) catch
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.materialization_failed\",\"message\":\"cannot materialize migration candidate\"}}\n", meta);
-    defer candidate.deinit();
-    config_validate.validateModel(&candidate.config.value, &candidate.catalog.value) catch |err|
-        return validationError(request, err, meta);
-    const config_json = try config_store.render(context.allocator, &candidate.config.value);
-    defer context.allocator.free(config_json);
-    const config_revision = try deployment_control.revisionForConfig(context.allocator, &candidate.config.value);
-    const prepared_config = try context.configs.prepare(candidate.config.value, config_revision);
-    var published = false;
-    defer if (!published) prepared_config.release();
-    const prepared_catalog = try context.catalog.prepare(candidate.catalog.value, context.catalog_snapshot.revision + 1);
-    defer if (!published) prepared_catalog.release();
-    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
-    defer context.allocator.free(transaction_dir);
-    schema_v3_transaction.commit(context.io, context.allocator, transaction_dir, &plan.digest, context.config_path, context.catalog.path, config_json, &candidate.catalog.value) catch |err| {
-        observe_log.err("schema-v4 transaction failed: {t}", .{err});
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.transaction_failed\",\"message\":\"schema-v4 transaction did not commit\"}}\n", meta);
-    };
-    context.configs.publishPrepared(prepared_config);
-    context.catalog.lock();
-    context.catalog.publishPreparedLocked(prepared_catalog);
-    context.catalog.unlock();
-    published = true;
-    var output: [256]u8 = undefined;
-    const body = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"schema_version\":4,\"catalog_revision\":{d}}}}}\n", .{ std.json.fmt(&plan.digest, .{}), context.catalog_snapshot.revision + 1 });
-    return json(request, .ok, body, meta);
-}
-
-fn schemaV4MigrationRollback(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
-    var parsed = parseSchemaV3Digest(request, context.allocator) catch
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.invalid_request\",\"message\":\"plan_digest must identify a retained migration backup\"}}\n", meta);
-    defer parsed.deinit();
-    context.models.lock();
-    defer context.models.unlock();
-    if (context.sessions.hasActive(boot_session.monotonicNow()))
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.active_session\",\"message\":\"all active boot sessions must finish or be terminated\"}}\n", meta);
-    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
-    defer context.allocator.free(transaction_dir);
-    schema_v3_transaction.rollback(context.io, context.allocator, transaction_dir, parsed.value.plan_digest) catch |err| {
-        observe_log.err("schema-v4 rollback failed: {t}", .{err});
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v4.rollback_failed\",\"message\":\"retained backup cannot be rolled back\"}}\n", meta);
-    };
-    var old_config = try config_load.load(context.io, context.allocator, context.config_path);
-    defer old_config.deinit();
-    var old_catalog = try catalog_store.load(context.io, context.allocator, context.catalog.path);
-    defer old_catalog.deinit();
-    config_validate.validateModel(&old_config.value, &old_catalog.value) catch |err| return validationError(request, err, meta);
-    const projected = model.projectCatalog(old_config.value, &old_catalog.value);
-    const config_revision = try deployment_control.revisionForConfig(context.allocator, &projected);
-    const prepared_config = try context.configs.prepare(projected, config_revision);
-    const prepared_catalog = try context.catalog.prepare(old_catalog.value, old_catalog.value.revision);
-    context.configs.publishPrepared(prepared_config);
-    context.catalog.lock();
-    context.catalog.publishPreparedLocked(prepared_catalog);
-    context.catalog.unlock();
-    return json(request, .ok, "{\"ok\":true,\"result\":{\"rolled_back\":true}}\n", meta);
-}
-
-const SchemaV3DigestRequest = struct { plan_digest: []const u8 };
-
-fn parseSchemaV3Digest(request: zap.Request, allocator: std.mem.Allocator) !std.json.Parsed(SchemaV3DigestRequest) {
-    const body = request.body orelse return error.MissingRequestBody;
-    const parsed = try std.json.parseFromSlice(SchemaV3DigestRequest, allocator, body, .{ .allocate = .alloc_always });
-    errdefer parsed.deinit();
-    if (parsed.value.plan_digest.len != 64 or !allLowerHex(parsed.value.plan_digest)) return error.InvalidPlanDigest;
-    return parsed;
-}
-
-fn schemaV3MigrationApply(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
-    var parsed = parseSchemaV3Digest(request, context.allocator) catch
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.invalid_request\",\"message\":\"plan_digest must be 64 lowercase hexadecimal characters\"}}\n", meta);
-    defer parsed.deinit();
-    context.models.lock();
-    defer context.models.unlock();
-    if (context.configs.currentRevision() != context.config_revision or context.catalog.currentRevision() != context.catalog_snapshot.revision)
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"model.revision_conflict\",\"message\":\"model changed after plan was read\"}}\n", meta);
-    if (context.sessions.hasActive(boot_session.monotonicNow()))
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.active_session\",\"message\":\"all active boot sessions must finish or be terminated\"}}\n", meta);
-    var plan = schema_v3.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.plan_failed\",\"message\":\"cannot rebuild schema-v3 plan\"}}\n", meta);
-    defer plan.deinit();
-    if (!std.mem.eql(u8, &plan.digest, parsed.value.plan_digest))
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.digest_conflict\",\"message\":\"plan digest no longer identifies the current model\"}}\n", meta);
-    if (!plan.applicable()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.blocked\",\"message\":\"migration plan contains blockers\"}}\n", meta);
-    var candidate = schema_v3.candidates(context.allocator, context.config, context.catalog_snapshot.value(), &plan) catch
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.materialization_failed\",\"message\":\"cannot materialize migration candidate\"}}\n", meta);
-    defer candidate.deinit();
-    config_validate.validateModel(&candidate.config.value, &candidate.catalog.value) catch |err|
-        return validationError(request, err, meta);
-    const config_json = try config_store.render(context.allocator, &candidate.config.value);
-    defer context.allocator.free(config_json);
-    const config_revision = try deployment_control.revisionForConfig(context.allocator, &candidate.config.value);
-    const prepared_config = try context.configs.prepare(candidate.config.value, config_revision);
-    var published = false;
-    defer if (!published) prepared_config.release();
-    const prepared_catalog = try context.catalog.prepare(candidate.catalog.value, context.catalog_snapshot.revision + 1);
-    defer if (!published) prepared_catalog.release();
-    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
-    defer context.allocator.free(transaction_dir);
-    schema_v3_transaction.commit(context.io, context.allocator, transaction_dir, &plan.digest, context.config_path, context.catalog.path, config_json, &candidate.catalog.value) catch |err| {
-        observe_log.err("schema-v3 transaction failed: {t}", .{err});
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.transaction_failed\",\"message\":\"schema-v3 transaction did not commit\"}}\n", meta);
-    };
-    context.configs.publishPrepared(prepared_config);
-    context.catalog.lock();
-    context.catalog.publishPreparedLocked(prepared_catalog);
-    context.catalog.unlock();
-    published = true;
-    var output: [256]u8 = undefined;
-    const body = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"schema_version\":3,\"catalog_revision\":{d}}}}}\n", .{ std.json.fmt(&plan.digest, .{}), context.catalog_snapshot.revision + 1 });
-    return json(request, .ok, body, meta);
-}
-
-fn schemaV3MigrationRollback(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
-    var parsed = parseSchemaV3Digest(request, context.allocator) catch
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.invalid_request\",\"message\":\"plan_digest must identify a retained migration backup\"}}\n", meta);
-    defer parsed.deinit();
-    context.models.lock();
-    defer context.models.unlock();
-    if (context.sessions.hasActive(boot_session.monotonicNow()))
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.active_session\",\"message\":\"all active boot sessions must finish or be terminated\"}}\n", meta);
-    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
-    defer context.allocator.free(transaction_dir);
-    schema_v3_transaction.rollback(context.io, context.allocator, transaction_dir, parsed.value.plan_digest) catch |err| {
-        observe_log.err("schema-v3 rollback failed: {t}", .{err});
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"schema_v3.rollback_failed\",\"message\":\"retained backup cannot be rolled back\"}}\n", meta);
-    };
-    var old_config = try config_load.load(context.io, context.allocator, context.config_path);
-    defer old_config.deinit();
-    var old_catalog = try catalog_store.load(context.io, context.allocator, context.catalog.path);
-    defer old_catalog.deinit();
-    config_validate.validateModel(&old_config.value, &old_catalog.value) catch |err| return validationError(request, err, meta);
-    const projected = model.projectCatalog(old_config.value, &old_catalog.value);
-    const config_revision = try deployment_control.revisionForConfig(context.allocator, &projected);
-    const prepared_config = try context.configs.prepare(projected, config_revision);
-    const prepared_catalog = try context.catalog.prepare(old_catalog.value, old_catalog.value.revision);
-    context.configs.publishPrepared(prepared_config);
-    context.catalog.lock();
-    context.catalog.publishPreparedLocked(prepared_catalog);
-    context.catalog.unlock();
-    return json(request, .ok, "{\"ok\":true,\"result\":{\"rolled_back\":true}}\n", meta);
-}
-
-fn catalogMigrationPlan(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
-    if (request.body) |body| if (body.len != 0 and !std.mem.eql(u8, std.mem.trim(u8, body, " \t\r\n"), "{}"))
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"request.unknown_field\",\"message\":\"migration plan currently accepts an empty object\"}}\n", meta);
-    var plan = catalog_migration.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision) catch
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"migration.plan_failed\",\"message\":\"cannot construct migration plan\"}}\n", meta);
-    defer plan.deinit();
-    var output: std.Io.Writer.Allocating = .init(context.allocator);
-    defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"plan_digest\":{f},\"applicable\":{s},\"plan\":", .{ std.json.fmt(&plan.digest, .{}), if (plan.applicable()) "true" else "false" });
-    try output.writer.writeAll(plan.canonical_json);
-    try output.writer.writeAll("}}\n");
-    return json(request, .ok, output.written(), meta);
-}
 
 fn managementInstallSource(request: zap.Request, context: *const RouteContext, name: []const u8, meta: RequestMeta) !void {
     const source = lookup.findInstallSource(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
@@ -2407,101 +2194,6 @@ fn managementInstallSource(request: zap.Request, context: *const RouteContext, n
     };
     try output.writer.writeAll("]}}\n");
     return json(request, .ok, output.written(), meta);
-}
-
-const MigrationApplyRequest = struct { plan_digest: []const u8 };
-
-fn catalogMigrationApply(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
-    const idempotency_key = request.getHeader("idempotency-key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_key_required\",\"message\":\"Idempotency-Key header is required\"}}\n", meta);
-    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"migration.invalid_request\",\"message\":\"missing request body\"}}\n", meta);
-    const parsed = std.json.parseFromSlice(MigrationApplyRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"migration.invalid_request\",\"message\":\"invalid request body\"}}\n", meta);
-    defer parsed.deinit();
-    if (parsed.value.plan_digest.len != 64 or !allLowerHex(parsed.value.plan_digest)) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"migration.invalid_digest\",\"message\":\"plan_digest must be 64 lowercase hexadecimal characters\"}}\n", meta);
-    const begun = context.operations.beginRequest(context.io, idempotency_key, parsed.value.plan_digest, .catalog_migration, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for another migration\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create migration operation\"}}\n", meta);
-    try operations.save(context.io, context.allocator, paths.require().operations_path, context.operations);
-    if (begun.reused) return operationResponse(request, begun.entry, true, meta);
-    var operation_done = false;
-    defer if (!operation_done) {
-        _ = context.operations.fail(begun.entry.idSlice(), "migration.failed", unixNow()) catch {};
-        operations.save(context.io, context.allocator, paths.require().operations_path, context.operations) catch {};
-    };
-    context.models.lock();
-    defer context.models.unlock();
-    if (context.configs.currentRevision() != context.config_revision or context.catalog.currentRevision() != context.catalog_snapshot.revision)
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"model.revision_conflict\",\"message\":\"model changed after migration plan was read\"}}\n", meta);
-    var plan = try catalog_migration.build(context.allocator, context.config, context.catalog_snapshot.value(), context.config_revision, context.catalog_snapshot.revision);
-    defer plan.deinit();
-    if (!std.mem.eql(u8, &plan.digest, parsed.value.plan_digest)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"model.revision_conflict\",\"message\":\"plan digest no longer identifies the current model\"}}\n", meta);
-    if (!plan.applicable()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"migration.blocked\",\"message\":\"migration plan contains blockers\"}}\n", meta);
-    for (plan.renames) |rename| if (context.sessions.hasActiveInstallSource(rename.source, boot_session.monotonicNow())) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"migration.active_session\",\"message\":\"an active boot session owns a source in this plan\"}}\n", meta);
-    if (plan.renames.len == 0) {
-        const completed = try context.operations.succeed(begun.entry.idSlice(), &plan.digest, unixNow());
-        try operations.save(context.io, context.allocator, paths.require().operations_path, context.operations);
-        operation_done = true;
-        return operationResponse(request, completed, true, meta);
-    }
-    var candidate = try catalog_migration.candidates(context.allocator, context.config, context.catalog_snapshot.value(), &plan);
-    defer candidate.deinit();
-    const config_json = try config_store.render(context.allocator, &candidate.config.value);
-    defer context.allocator.free(config_json);
-    const catalog_json = try catalog_store.render(context.allocator, &candidate.catalog.value);
-    defer context.allocator.free(catalog_json);
-    var moves = try migrationMoves(context.allocator, context.config, context.catalog_snapshot.value(), &candidate.catalog.value, &plan);
-    defer moves.deinit();
-    const config_revision = try deployment_control.revisionForConfig(context.allocator, &candidate.config.value);
-    const prepared_config = try context.configs.prepare(candidate.config.value, config_revision);
-    var snapshots_published = false;
-    defer if (!snapshots_published) prepared_config.release();
-    const prepared_catalog = try context.catalog.prepare(candidate.catalog.value, context.catalog_snapshot.revision + 1);
-    defer if (!snapshots_published) prepared_catalog.release();
-    const transaction_dir = try model_transaction.directoryForConfig(context.allocator, context.config_path);
-    defer context.allocator.free(transaction_dir);
-    model_transaction.commit(context.io, context.allocator, transaction_dir, &plan.digest, context.config_path, context.catalog.path, config_json, catalog_json, moves.items.items, null) catch |err| {
-        observe_log.err("catalog migration transaction failed: {t}", .{err});
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.transaction_failed\",\"message\":\"migration transaction did not commit\"}}\n", meta);
-    };
-    // 所有可失败的快照分配都在持久化提交前完成。
-    // 此后发布仅在持有 model gate 期间交换指针。
-    context.configs.publishPrepared(prepared_config);
-    context.catalog.lock();
-    context.catalog.publishPreparedLocked(prepared_catalog);
-    context.catalog.unlock();
-    snapshots_published = true;
-    const completed = try context.operations.succeed(begun.entry.idSlice(), &plan.digest, unixNow());
-    try operations.save(context.io, context.allocator, paths.require().operations_path, context.operations);
-    operation_done = true;
-    return operationResponse(request, completed, true, meta);
-}
-
-const MigrationMoves = struct {
-    allocator: std.mem.Allocator,
-    items: std.ArrayList(model_transaction.Move) = .empty,
-    owned: std.ArrayList([]u8) = .empty,
-    fn deinit(self: *MigrationMoves) void {
-        for (self.owned.items) |value| self.allocator.free(value);
-        self.owned.deinit(self.allocator);
-        self.items.deinit(self.allocator);
-    }
-    fn add(self: *MigrationMoves, old: []u8, new: []u8) !void {
-        try self.owned.append(self.allocator, old);
-        errdefer _ = self.owned.pop();
-        try self.owned.append(self.allocator, new);
-        try self.items.append(self.allocator, .{ .old = old, .new = new });
-    }
-};
-
-fn migrationMoves(allocator: std.mem.Allocator, config: *const model.AppConfig, old_catalog: *const model.Catalog, new_catalog: *const model.Catalog, plan: *const catalog_migration.Plan) !MigrationMoves {
-    var result: MigrationMoves = .{ .allocator = allocator };
-    errdefer result.deinit();
-    for (plan.renames) |rename| {
-        try result.add(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.repository_root, rename.source }), try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.repository_root, rename.target }));
-        try result.add(try std.fmt.allocPrint(allocator, "{s}/install/{s}", .{ config.tftp.asset_root, rename.source }), try std.fmt.allocPrint(allocator, "{s}/install/{s}", .{ config.tftp.asset_root, rename.target }));
-    }
-    for (old_catalog.assets, new_catalog.assets) |old, new| {
-        if (old.kind != .iso or std.mem.eql(u8, old.path, new.path)) continue;
-        try result.add(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.asset_root, old.path }), try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.asset_root, new.path }));
-    }
-    return result;
 }
 
 fn allLowerHex(value: []const u8) bool {
@@ -2582,7 +2274,8 @@ fn claimPath(path: []const u8) ?[]const u8 {
 
 fn installGenerations(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return notFound(request, meta);
-    _ = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.profile_unassigned\",\"message\":\"node has no bound profile\"}}\n", meta)) orelse return notFound(request, meta);
+    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.profile_unassigned\",\"message\":\"node has no bound profile\"}}\n", meta)) orelse return notFound(request, meta);
+    if (profile.kind != .install) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_install\",\"message\":\"install retry is only available for install profiles; diskless nodes boot again when deploy=true\"}}\n", meta);
     var effective_plan = @import("../profile/effective.zig").compile(context.allocator, context.catalog_snapshot.value(), node) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"effective.unavailable\",\"message\":\"effective node plan cannot be compiled\"}}\n", meta);
     defer effective_plan.deinit();
     const ForceRequest = struct { force: bool = false };
@@ -2680,7 +2373,7 @@ fn runtimeSummary(request: zap.Request, context: *const RouteContext, meta: Requ
     try json(request, .ok, output.written(), meta);
 }
 
-const NodeAddRequest = schema_v3_dto.Node;
+const NodeAddRequest = dto.Node;
 
 const ProfileCreateRequest = struct { name: []const u8, install_source: []const u8, kind: ?[]const u8 = null, boot_bundle: ?[]const u8 = null };
 const ValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, values: []const []const u8 = &.{}, mutations: []const scalar_mutation.Mutation = &.{} };
@@ -3090,7 +2783,6 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
     @import("../config/profile_mutation.zig").addInstallProfile(context.io, context.allocator, context.config, context.catalog.path, parsed.value.name, parsed.value.install_source, kind, boot_bundle) catch |err| switch (err) {
         error.ProfileAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.already_exists\",\"message\":\"profile name already exists\"}}\n", meta),
         error.InstallSourceNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"profile.install_source_not_found\",\"message\":\"install source does not exist\"}}\n", meta),
-        error.DisklessRequiresSchemaV4 => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.diskless_requires_schema_v4\",\"message\":\"diskless profiles require the catalog to be migrated to schema v4 first\"}}\n", meta),
         error.DisklessBootBundleRequired => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.boot_bundle_required\",\"message\":\"--kind diskless requires a boot bundle\"}}\n", meta),
         else => return validationError(request, err, meta),
     };
@@ -3213,15 +2905,15 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     defer std.Io.Dir.cwd().deleteTree(context.io, staging) catch {};
 
     // 1. OS 层：发行版原生 install-root 工具从受管 repository 构建 chroot-able 基线。
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 1/5 - building OS layer (staging={s})", .{ name, staging });
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 1/6 - building OS layer (staging={s})", .{ name, staging });
     rootfs_os_builder.buildOsLayer(context.io, context.allocator, staging, os_package_manager, install_source.version, repo_closure.file_urls) catch |err| {
         std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 1 FAILED - OS layer ({t})", .{ name, err });
         return buildError(request, err, "os-layer", meta);
     };
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 1/5 - OS layer done", .{name});
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 1/6 - OS layer done", .{name});
 
     // 2. 物化 rootfs-build content_asset 到 chroot 内 payload 目录。
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 2/5 - materializing payload assets ({d} step(s))", .{ name, build_steps.len });
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 2/6 - materializing payload assets ({d} step(s))", .{ name, build_steps.len });
     var payload_paths = context.allocator.alloc(?[]const u8, build_steps.len) catch return validationError(request, error.OutOfMemory, meta);
     defer context.allocator.free(payload_paths);
     for (payload_paths) |*p| p.* = null;
@@ -3250,19 +2942,19 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     //    安装到 staging（host 上下文，不进入 chroot），避免单 worker daemon 回连
     //    自死锁，也无需 bind-mount /dev/proc/sys；managed_file/archive/script 仍
     //    chroot 执行（写绝对路径到 staging lower）。两者都不接触公网。
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 3/5 - executing rootfs-build steps ({d} step(s))", .{ name, build_steps.len });
-    const plan = rootfs_build_executor.buildPlan(context.allocator, build_steps, dto_manager, repo_closure.file_urls, payload_paths, staging) catch |err| return validationError(request, err, meta);
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 3/6 - executing rootfs-build steps ({d} step(s))", .{ name, build_steps.len });
+    const plan = rootfs_build_executor.buildPlan(context.allocator, build_steps, dto_manager, repo_closure.repository_urls, payload_paths, staging) catch |err| return validationError(request, err, meta);
     defer plan.deinit(context.allocator);
     rootfs_build_executor.execute(context.io, context.allocator, staging, plan) catch |err| {
         std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 3 FAILED - rootfs-build steps ({t})", .{ name, err });
         return buildError(request, err, "rootfs-build", meta);
     };
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 3/5 - rootfs-build steps done", .{name});
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 3/6 - rootfs-build steps done", .{name});
 
     // 4a. 注入 nodeforge-agent 和 firstboot systemd unit。
     //     agent 是 switch_root 后第一个执行的程序，因此是每个 rootfs 基线的必要组件，
     //     与 Profile 步骤无关。
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 4/5 - injecting agent + firstboot unit", .{name});
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 4/6 - injecting agent + firstboot unit", .{name});
     const agent_source = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-agent", .{paths.require().bin_dir});
     defer context.allocator.free(agent_source);
     const agent_dest = try std.fmt.allocPrint(context.allocator, "{s}/usr/sbin/nodeforge-agent", .{staging});
@@ -3296,7 +2988,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     const firstboot_link = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-firstboot.service", .{firstboot_wants});
     defer context.allocator.free(firstboot_link);
     runBuildCmd(context.io, context.allocator, &.{ "ln", "-sfn", "../nodeforge-firstboot.service", firstboot_link }) catch |err| return buildError(request, err, "agent-inject", meta);
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 4/5 - agent + firstboot unit injected", .{name});
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 4/6 - agent + firstboot unit injected", .{name});
 
     // R9: 默认确保 /etc/rc.d/rc.local 可执行。Rocky/RHEL 系默认 rc.local 无执行权限，
     //     导致 install/diskless 后处理中写入的 rc.local 指令不会被执行。
@@ -3313,8 +3005,108 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     }
     runBuildCmd(context.io, context.allocator, &.{ "chmod", "0755", rc_local_path }) catch |err| return buildError(request, err, "rc-local-chmod", meta);
 
-    // 5. mksquashfs 压缩到内容寻址 .part 文件（rootfs_dir），再校验 SHA-512 后原子发布。
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 5/5 - compressing squashfs + SHA-512", .{name});
+    // ── Stage 5/6：Profile 共享 SSH 信任基线 ──────────────────────────
+    // 设计依据：DISKLESS_FINAL.md §4「Profile 共享 SSH keys」、
+    //           V0_2_DESIGN.md §5.4 构建期与启动期边界表。
+    //
+    // 本阶段在 squashfs 压缩前向只读 lower 写入三类 SSH 资产，使同 Profile 的全部
+    // 节点共享同一信任域：
+    //   1. client keypair（ed25519）→ /root/.ssh/id_ed25519
+    //      - 同 Profile 所有节点持有相同 client 私钥，彼此可免密 SSH 登录。
+    //      - 这是 Profile 信任域的显式产品语义，而非 Node 唯一身份。
+    //   2. authorized_keys → /root/.ssh/authorized_keys
+    //      - 合并 Profile `system.ssh.root_authorized_keys`（操作员手动配置的公钥）
+    //        和自动生成的 client public key，使 root 同时信任外部管理密钥和域内节点。
+    //   3. sshd host key（ed25519）→ /etc/ssh/ssh_host_ed25519_key
+    //      - 同 Profile 节点共享 host fingerprint，域内首次连接无需人工确认。
+    //      - 这是信任整个 Profile 域的预期行为，不承担 Node 唯一身份。
+    //
+    // 重建时若需换全部 SSH keys，使用 `profile rootfs build --new-ssh-keys`；
+    // 旧 artifact/active session 不变，新旧 rootfs 混跑时双向免密不保证。
+    //
+    // 注意：此处写入的密钥属于 Profile 级共享基线（只读 lower），不是 Node 级
+    // override。Node 级 SSH 差量（追加/删除 key）由 agent pre-init 写 overlay upper。
+    // mandatory Profile client key 不可由标准 Node `authorized_keys.remove` 删除。
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 5/6 - generating SSH keys + configuring passwordless SSH", .{name});
+    {
+        // 创建 root .ssh 目录（0700，SSH 强制要求）
+        const root_ssh_dir = try std.fmt.allocPrint(context.allocator, "{s}/root/.ssh", .{staging});
+        defer context.allocator.free(root_ssh_dir);
+        std.Io.Dir.cwd().createDirPath(context.io, root_ssh_dir) catch |err| return buildError(request, err, "ssh-keygen", meta);
+        runBuildCmd(context.io, context.allocator, &.{ "chmod", "0700", root_ssh_dir }) catch |err| return buildError(request, err, "ssh-keygen", meta);
+
+        // 生成 SSH client keypair（ed25519，无密码）
+        // ed25519 比 RSA 更短更快，且不携带可追溯的随机数生成器指纹。
+        const client_key_path = try std.fmt.allocPrint(context.allocator, "{s}/root/.ssh/id_ed25519", .{staging});
+        defer context.allocator.free(client_key_path);
+        std.Io.Dir.cwd().deleteFile(context.io, client_key_path) catch {};
+        const client_pub_path = try std.fmt.allocPrint(context.allocator, "{s}.pub", .{client_key_path});
+        defer context.allocator.free(client_pub_path);
+        std.Io.Dir.cwd().deleteFile(context.io, client_pub_path) catch {};
+        runBuildCmd(context.io, context.allocator, &.{ "ssh-keygen", "-t", "ed25519", "-f", client_key_path, "-N", "", "-q", "-C", "nodeforge-profile" }) catch |err| return buildError(request, err, "ssh-keygen", meta);
+        runBuildCmd(context.io, context.allocator, &.{ "chmod", "0600", client_key_path }) catch |err| return buildError(request, err, "ssh-keygen", meta);
+
+        // 读取 client public key 用于合并到 authorized_keys
+        const pub_key_content = std.Io.Dir.cwd().readFileAlloc(context.io, client_pub_path, context.allocator, .limited(8192)) catch |err| return buildError(request, err, "ssh-keygen", meta);
+        defer context.allocator.free(pub_key_content);
+
+        // 写入 authorized_keys：合并 Profile 配置的 root_authorized_keys 和自动生成的 client public key。
+        // 顺序：先写操作员手动配置的外部公钥，再写自动生成的域内 client 公钥。
+        // mandatory client public key 放在最后，使 Node override 的 `remove` 操作
+        // 不影响它（标准 remove 从文件中删除匹配行，但不影响 Profile 级基线的重建）。
+        const authorized_keys_path = try std.fmt.allocPrint(context.allocator, "{s}/root/.ssh/authorized_keys", .{staging});
+        defer context.allocator.free(authorized_keys_path);
+        var auth_keys: std.Io.Writer.Allocating = .init(context.allocator);
+        defer auth_keys.deinit();
+        for (profile.system.ssh.root_authorized_keys) |key| {
+            try auth_keys.writer.writeAll(key);
+            try auth_keys.writer.writeByte('\n');
+        }
+        try auth_keys.writer.writeAll(pub_key_content);
+        if (pub_key_content.len > 0 and pub_key_content[pub_key_content.len - 1] != '\n') {
+            try auth_keys.writer.writeByte('\n');
+        }
+        std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = authorized_keys_path, .data = auth_keys.written() }) catch |err| return buildError(request, err, "ssh-keygen", meta);
+        runBuildCmd(context.io, context.allocator, &.{ "chmod", "0600", authorized_keys_path }) catch |err| return buildError(request, err, "ssh-keygen", meta);
+
+        // 生成 sshd host key（ed25519）。
+        // 同 Profile 节点共享 host key/fingerprint 是信任整个 Profile 域的预期行为。
+        // 设计上 `/etc/ssh/ssh_known_hosts` 应将 Profile `system.hosts` 声明的全部
+        // address/names/aliases 绑定到该共享 host public key（后续完善点）。
+        const etc_ssh_dir = try std.fmt.allocPrint(context.allocator, "{s}/etc/ssh", .{staging});
+        defer context.allocator.free(etc_ssh_dir);
+        std.Io.Dir.cwd().createDirPath(context.io, etc_ssh_dir) catch {};
+        const host_key_path = try std.fmt.allocPrint(context.allocator, "{s}/ssh_host_ed25519_key", .{etc_ssh_dir});
+        defer context.allocator.free(host_key_path);
+        std.Io.Dir.cwd().deleteFile(context.io, host_key_path) catch {};
+        const host_pub_path = try std.fmt.allocPrint(context.allocator, "{s}.pub", .{host_key_path});
+        defer context.allocator.free(host_pub_path);
+        std.Io.Dir.cwd().deleteFile(context.io, host_pub_path) catch {};
+        runBuildCmd(context.io, context.allocator, &.{ "ssh-keygen", "-t", "ed25519", "-f", host_key_path, "-N", "", "-q", "-C", "nodeforge-host" }) catch |err| return buildError(request, err, "ssh-keygen", meta);
+
+        // 创建 sshd_config.d drop-in，显式启用公钥认证并指定 authorized_keys 路径。
+        // 使用 drop-in 而非修改主 sshd_config，避免与发行版默认配置冲突。
+        const sshd_dropin_dir = try std.fmt.allocPrint(context.allocator, "{s}/etc/ssh/sshd_config.d", .{staging});
+        defer context.allocator.free(sshd_dropin_dir);
+        std.Io.Dir.cwd().createDirPath(context.io, sshd_dropin_dir) catch {};
+        const sshd_dropin = try std.fmt.allocPrint(context.allocator, "{s}/00-nodeforge.conf", .{sshd_dropin_dir});
+        defer context.allocator.free(sshd_dropin);
+        std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = sshd_dropin, .data =
+            "PubkeyAuthentication yes\n" ++
+            "AuthorizedKeysFile .ssh/authorized_keys\n"
+        }) catch |err| return buildError(request, err, "ssh-keygen", meta);
+    }
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 5/6 - SSH keys generated + passwordless SSH configured", .{name});
+
+    // ── Stage 6/6：squashfs 压缩 + SHA-512 校验 + 原子发布 ──────────
+    // 设计依据：DISKLESS_FINAL.md §4「共享 rootfs 构建模型」、
+    //           V0_2_DESIGN.md §5.4「rootfs 缓存与共享」。
+    //
+    // 使用 mksquashfs 将 staging 目录压缩为只读 lower 镜像，压缩算法 zstd。
+    // 输出文件以 rootfs_input_digest 命名（内容寻址），先写 .part 再原子 rename。
+    // SHA-512 流式校验确保下载端 initrd 可验证完整性。
+    // 同一 rootfs_input_digest 的构建输出可跨 Node 共享，只增不删。
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 6/6 - compressing squashfs + SHA-512", .{name});
     const rootfs_dir = paths.require().rootfs_dir;
     std.Io.Dir.cwd().createDirPath(context.io, rootfs_dir) catch {};
     const file_name = try std.fmt.allocPrint(context.allocator, "{s}.squashfs", .{digest_hex});
@@ -3326,7 +3118,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
     errdefer std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
     runBuildCmd(context.io, context.allocator, &.{ "mksquashfs", staging, part, "-noappend", "-no-progress", "-comp", "zstd" }) catch |err| {
-        std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 5 FAILED - mksquashfs ({t})", .{ name, err });
+        std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 6 FAILED - mksquashfs ({t})", .{ name, err });
         return buildError(request, err, "mksquashfs", meta);
     };
 
@@ -4067,6 +3859,11 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
         try owned_password_hashes.append(context.allocator, value);
         break :blk value;
     } else null;
+    const diskless_root_keys = try context.allocator.alloc([]const u8, plan.node_apply.system.ssh.root_authorized_keys.len + 1 + context.additional_keys.len);
+    defer context.allocator.free(diskless_root_keys);
+    @memcpy(diskless_root_keys[0..plan.node_apply.system.ssh.root_authorized_keys.len], plan.node_apply.system.ssh.root_authorized_keys);
+    diskless_root_keys[plan.node_apply.system.ssh.root_authorized_keys.len] = context.bootstrap_key;
+    @memcpy(diskless_root_keys[plan.node_apply.system.ssh.root_authorized_keys.len + 1 ..], context.additional_keys);
     // Phase 8：把 Profile-fixed first-boot 步骤与完整 content-addressed payload
     // closure 固定进 AgentPlan。小型 inline content 仍可直接携带；content_asset
     // 只投影 payload path/digest/size，节点不再按 catalog 的 latest 名称取文件。
@@ -4208,9 +4005,11 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
                     .password_authentication = plan.node_apply.system.ssh.password_authentication,
                     .root_login = plan.node_apply.system.ssh.root_login,
                     .root_password_hash = root_password_hash,
-                    .root_authorized_keys = plan.node_apply.system.ssh.root_authorized_keys,
+                    .root_authorized_keys = diskless_root_keys,
                 },
                 .security = plan.node_apply.system.security,
+                .import_host_hosts = plan.node_apply.system.import_host_hosts,
+                .hosts_content = plan.node_apply.system.hosts_content,
                 .users = agent_users,
                 .packages = plan.node_apply.system.packages,
             },
@@ -4457,16 +4256,18 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
     try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"items\":[", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision() });
     for (context.catalog_snapshot.value().nodes[page.offset..end], 0..) |node, index| {
         if (index != 0) try output.writer.writeByte(',');
-        const desired_digest: ?deployment_control.Digest = desiredPlanDigest(context, node.id) catch null;
-        const deployment = context.deployments.view(node.id);
-        const status = if (desired_digest) |digest| currentProjectedStatus(context, node.id, deployment, digest) else null;
+        const profile = if (node.profile) |profile_name| lookup.findProfile(context.catalog_snapshot.value(), profile_name) else null;
+        const is_install = if (profile) |value| value.kind == .install else false;
+        const desired_digest: ?deployment_control.Digest = if (is_install) desiredPlanDigest(context, node.id) catch null else null;
+        const deployment = if (is_install) context.deployments.view(node.id) else null;
+        const status = if (is_install) if (desired_digest) |digest| currentProjectedStatus(context, node.id, deployment, digest) else null else null;
         const inventory = context.inventories.get(node.id);
         try output.writer.print("{{\"id\":{f},\"mac\":{f},\"pxe\":{{\"ip_reservation\":", .{ std.json.fmt(node.id, .{}), std.json.fmt(node.mac, .{}) });
         if (node.pxe.ip_reservation) |ip| try output.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try output.writer.writeAll("null");
         try output.writer.print("}},\"profile\":{f},\"deploy\":{s},\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"armed_generation\":{f},\"status\":", .{
             std.json.fmt(node.profile, .{}),
             if (node.deploy) "true" else "false",
-            std.json.fmt(if (desired_digest) |digest| installIntent(node.deploy, deployment, digest) else if (node.deploy) "blocked" else "disabled", .{}),
+            std.json.fmt(if (is_install) if (desired_digest) |digest| installIntent(node.deploy, deployment, digest) else if (node.deploy) "blocked" else "disabled" else "not-applicable", .{}),
             if (desired_digest) |digest| if (installPxeReady(node.deploy, deployment, digest)) "true" else "false" else "false",
             if (retryPending(deployment)) "true" else "false",
             std.json.fmt(if (deployment) |value| value.armed_generation else null, .{}),
@@ -4514,13 +4315,14 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     var effective_plan = @import("../profile/effective.zig").compile(context.allocator, context.catalog_snapshot.value(), node) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"effective.unavailable\",\"message\":\"effective node plan cannot be compiled\"}}\n", meta);
     defer effective_plan.deinit();
     const desired_revision = desiredRevision(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired model revision\"}}\n", meta);
-    const desired_digest = desiredPlanDigest(context, node_id) catch deployment_control.empty_digest;
-    const deployment = context.deployments.view(node_id);
-    const status = currentProjectedStatus(context, node_id, deployment, desired_digest);
+    const is_install = profile.kind == .install;
+    const desired_digest = if (is_install) desiredPlanDigest(context, node_id) catch deployment_control.empty_digest else deployment_control.empty_digest;
+    const deployment = if (is_install) context.deployments.view(node_id) else null;
+    const status = if (is_install) currentProjectedStatus(context, node_id, deployment, desired_digest) else null;
     const inventory = context.inventories.get(node_id);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    const node_json = try schema_v3_dto.renderNode(context.allocator, node.*);
+    const node_json = try dto.renderNode(context.allocator, node.*);
     defer context.allocator.free(node_json);
     // Node detail 的 profile 投影必须包含 kind/boot_bundle：它们决定 install 与
     // diskless 分支以及实际启动材料，也是 CLI Runtime 区域的权威数据源。
@@ -4541,7 +4343,11 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
         if (value.session_active) "true" else "false",
     }) else try output.writer.writeAll("null");
     try output.writer.writeAll(",\"deployment\":");
-    if (deployment) |value| {
+    if (!is_install) {
+        try output.writer.writeAll("{\"install_intent\":\"not-applicable\",\"pxe_ready\":false,\"retry_pending\":false,\"current_generation\":null,\"armed_generation\":null,\"consumed_generation\":null,\"terminal_generation\":null,\"requested_revision\":0,\"applied_revision\":0,\"desired_revision\":");
+        try output.writer.print("{d}", .{desired_revision});
+        try output.writer.writeAll(",\"requested_plan_digest\":null,\"applied_plan_digest\":null,\"desired_plan_digest\":null,\"drifted\":false,\"drift_state\":\"not-applicable\",\"requested_by\":null,\"start_at\":0,\"install_at\":0,\"finished_at\":0,\"successful_generation\":0,\"deployed_at\":0}");
+    } else if (deployment) |value| {
         const times = deploymentTimes(value);
         const digest_available = deployment_control.digestSet(desired_digest);
         const drift = if (digest_available) context.deployments.drift(node_id, desired_digest) else .unknown;

@@ -179,7 +179,7 @@ pub fn compile(allocator: std.mem.Allocator, config: *const model.AppConfig, cat
         .mac = node.mac,
         .arch = node.arch,
         .hostname = node.hostname,
-        .network = node.network,
+        .network = inner.network,
         .system = inner.system,
         .software = inner.software,
         .first_boot_bundle = node_firstboot_bundle,
@@ -419,7 +419,7 @@ test "phaseSteps filters interleaved phases without admitting neighbours" {
     const steps = [_]model.ProvisionStep{
         .{ .name = "build-a", .phase = .rootfs_build, .action = .managed_file },
         .{ .name = "boot-a", .phase = .first_boot, .action = .script },
-        .{ .name = "build-b", .phase = .rootfs_build, .action = .@"package" },
+        .{ .name = "build-b", .phase = .rootfs_build, .action = .package },
         .{ .name = "install-a", .phase = .install_post, .action = .standard_packages },
         .{ .name = "boot-b", .phase = .first_boot, .action = .archive },
     };
