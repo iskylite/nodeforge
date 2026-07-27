@@ -3157,11 +3157,14 @@ const RootfsBuildRequest = struct { if_input_digest: ?[]const u8 = null };
 fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
     const body = request.body orelse "";
     var if_input_digest: ?[]const u8 = null;
+    // parseFromSlice 的 arena 在 parsed.deinit() 后失效；构建流程会继续使用
+    // anti-drift digest，因此复制到请求级 allocator，并在 handler 末尾释放。
+    defer if (if_input_digest) |value| context.allocator.free(value);
     if (body.len != 0) {
         const parsed = std.json.parseFromSlice(RootfsBuildRequest, context.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
             return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"invalid request body\"}}\n", meta);
         defer parsed.deinit();
-        if_input_digest = parsed.value.if_input_digest;
+        if_input_digest = if (parsed.value.if_input_digest) |value| try context.allocator.dupe(u8, value) else null;
     }
 
     const catalog = context.catalog_snapshot.value();
@@ -4519,7 +4522,9 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     defer output.deinit();
     const node_json = try schema_v3_dto.renderNode(context.allocator, node.*);
     defer context.allocator.free(node_json);
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{s},\"profile\":{{\"name\":{f},\"install_source\":{f},\"kernel_args\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), node_json, std.json.fmt(profile.name, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile_source.distro, .{}), std.json.fmt(profile_source.version, .{}), std.json.fmt(@tagName(profile_source.arch), .{}) });
+    // Node detail 的 profile 投影必须包含 kind/boot_bundle：它们决定 install 与
+    // diskless 分支以及实际启动材料，也是 CLI Runtime 区域的权威数据源。
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{s},\"profile\":{{\"name\":{f},\"kind\":{f},\"boot_bundle\":{f},\"install_source\":{f},\"kernel_args\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), node_json, std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.kind), .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile_source.distro, .{}), std.json.fmt(profile_source.version, .{}), std.json.fmt(@tagName(profile_source.arch), .{}) });
     try writeTargetSystem(&output.writer, effective_plan.system);
     try output.writer.print(",\"effective_software\":{f}", .{std.json.fmt(effective_plan.software, .{})});
     try output.writer.writeAll(",\"storage\":");
@@ -4795,6 +4800,8 @@ test "management effective system exposes canonical password policy values" {
 }
 
 fn managementProfiles(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
+    // list/show 对 profile 身份字段保持同一契约，避免 valid=true 但调用者无法
+    // 判断其类型或所引用 BootBundle 的不完整 DTO。
     const page = pageRequest(request, "profiles", context.catalog_snapshot.revision) catch |err| return pageError(request, err, meta);
     if (page.offset > context.catalog_snapshot.value().profiles.len) return pageError(request, error.InvalidCursor, meta);
     const end = @min(page.offset + page.limit, context.catalog_snapshot.value().profiles.len);
@@ -4808,7 +4815,7 @@ fn managementProfiles(request: zap.Request, context: *const RouteContext, meta: 
             refs += 1;
         };
         const source = lookup.findInstallSource(context.catalog_snapshot.value(), profile.install_source) orelse return notFound(request, meta);
-        try output.writer.print("{{\"name\":{f},\"install_source\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"nodes\":{d},\"valid\":true}}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(source.distro, .{}), std.json.fmt(source.version, .{}), std.json.fmt(@tagName(source.arch), .{}), refs });
+        try output.writer.print("{{\"name\":{f},\"kind\":{f},\"boot_bundle\":{f},\"install_source\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"nodes\":{d},\"valid\":true}}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.kind), .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(source.distro, .{}), std.json.fmt(source.version, .{}), std.json.fmt(@tagName(source.arch), .{}), refs });
     }
     try output.writer.writeByte(']');
     try writeNextCursor(&output.writer, "profiles", context.catalog_snapshot.revision, end, context.catalog_snapshot.value().profiles.len);
@@ -4824,7 +4831,7 @@ fn managementProfile(request: zap.Request, context: *const RouteContext, name: [
     const capability = lookup.findDistroVersion(context.catalog_snapshot.value(), source.distro, source.version, source.arch) orelse return notFound(request, meta);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"name\":{f},\"kernel_args\":{f},\"install\":{f},\"validation\":{{\"valid\":true}},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"capability\":{{\"family\":{f},\"install_adapter\":{f},\"package_manager\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(profile.name, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.install, .{}), std.json.fmt(source.distro, .{}), std.json.fmt(source.version, .{}), std.json.fmt(@tagName(source.arch), .{}), std.json.fmt(@tagName(distro.family), .{}), std.json.fmt(@tagName(capability.install_adapter), .{}), std.json.fmt(@tagName(capability.package_manager), .{}) });
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"name\":{f},\"kind\":{f},\"boot_bundle\":{f},\"kernel_args\":{f},\"install\":{f},\"validation\":{{\"valid\":true}},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"capability\":{{\"family\":{f},\"install_adapter\":{f},\"package_manager\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.kind), .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.install, .{}), std.json.fmt(source.distro, .{}), std.json.fmt(source.version, .{}), std.json.fmt(@tagName(source.arch), .{}), std.json.fmt(@tagName(distro.family), .{}), std.json.fmt(@tagName(capability.install_adapter), .{}), std.json.fmt(@tagName(capability.package_manager), .{}) });
     try writeEffectiveSystem(&output.writer, profile);
     try output.writer.print(",\"software\":{f}", .{std.json.fmt(profile.software, .{})});
     try output.writer.writeAll(",\"install_source\":");

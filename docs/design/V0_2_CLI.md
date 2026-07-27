@@ -151,7 +151,8 @@ nodeforge assets install-source list
 nodeforge assets install-source show <source>
 nodeforge assets install-source software list <source> [--kind package|group|environment|task]
 nodeforge assets repository list
-nodeforge assets repository validate <repository>
+nodeforge assets repository show <repository>
+nodeforge assets repository render <repository>
 nodeforge assets repository software list <repository> [--kind package|group|environment|task]
 
 nodeforge assets runtime-kernel prepare --source <install-source> [--release <release>] [--wait]
@@ -163,7 +164,12 @@ nodeforge assets runtime-kernel validate <kernel-asset>
 ISO import 成功必须原子发布 install source、installer kernel、media tree、本地 repositories 和 software index。
 默认 install source 及同名 profile 名称由完整 ISO basename 去掉 `.iso` 后规范化得到，因而适用于所有发行版，
 并自然保留 Kylin 等介质文件名中的 SP、发行批次和 Release 日期。`--name` 可覆盖该名称，`--version` 可覆盖
-媒体元数据中的 catalog 版本事实。每个 source 使用独立 ISO、boot 和 repository 路径；导入不覆盖既有同名内容。
+媒体元数据中的 catalog 版本事实。Ubuntu point release（如 `22.04.5`）保留为 catalog 版本和资源身份；
+APT Release 的 `Version` 校验使用对应 series（如 `22.04`），两者不得混为一个字段。每个 source 使用独立
+ISO、boot 和 repository 路径；导入不覆盖既有同名内容。
+
+`repository render` 生成客户端配置：DNF 输出 `.repo`，APT 从已发布的 `dists/*/Release` 读取
+Codename/Suite 和 Components 输出 `sources.list`。该命令只消费 catalog 与介质 metadata，不猜测发行版代号。
 diskless `runtime-kernel prepare` 从固定 revision 的本地 kernel package 提取可启动 kernel，并记录完全匹配的 modules/package
 closure、release 与 arch；不能默认把安装器 kernel 当作运行 kernel。重复 import 相同内容返回 existing resource；同名
 不同 digest 返回 conflict，不静默覆盖。
@@ -663,6 +669,9 @@ nodeforge assets register --type kernel --name <k> --path <p> \
 nodeforge assets initrd build <i> \
   --from-install-source <source> --kernel-release <r>
 
+# vendor-overlay 保持 ISO installer initrd 为逐字节不变前缀。NodeForge PID 1
+# 通过 ISO 自带 udev 规则和 modalias 执行 coldplug，不注入或写死具体网卡驱动。
+
 # 4. 创建 boot bundle（仅绑定 kernel/initrd；派生 rootfs 不进入 bundle）
 #    这是 diskless 全流程 CLI 的关键环节，替代手动编辑 catalog JSON
 nodeforge assets boot-bundle create <name> \
@@ -680,6 +689,8 @@ nodeforge profile rootfs build <diskless-profile>
 # 7. 注册节点并启用；session/capsule 由 PXE 请求创建
 nodeforge node add <id> mac=<mac> arch=<a> profile=<name> [pxe.ip_reservation=<ip>] [network.*=<value>] [overrides.*=<value>]
 nodeforge node set <id> deploy=true
+# 失败后重新部署；retry 会先确保 deploy=true，再 rearm generation
+nodeforge node retry <id>
 ```
 
 ### 8.2 `assets boot-bundle create` 命令
@@ -718,10 +729,12 @@ initrd 资产 kind=nodeforge_initrd → catalog 原子写入。
 | `boot_bundle.asset_kind_mismatch` | 400 | 资产类型不匹配（如 kernel 资产 kind 不是 kernel） |
 | `catalog.publish_failed` | 503 | catalog 持久化但快照发布失败 |
 
-### 8.3 `assets boot-bundle list` 命令（计划中）
+### 8.3 `assets boot-bundle list/show` 命令
 
 ```text
 nodeforge assets boot-bundle list [options]
+nodeforge assets boot-bundle show <name> [options]
 ```
 
-列出所有已注册的 boot bundles。**API**：`GET /api/v1/management/boot-bundles`
+列出或查看已注册的 boot bundles。两种视图消费同一 revision 的完整集合，避免字段漂移。
+**API**：`GET /api/v1/management/boot-bundles`

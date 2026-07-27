@@ -140,12 +140,21 @@ fn buildInternal(
     const dhclient_script = try std.fmt.allocPrint(a, "{s}/usr/sbin/nodeforge-dhclient-script", .{initrd_root});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dhclient_script, .data =
         \\#!/bin/sh
+        \\mask_prefix() {
+        \\ old_ifs=$IFS; IFS=.; set -- $1; IFS=$old_ifs; prefix=0
+        \\ for octet in "$@"; do
+        \\  case "$octet" in 255) bits=8;; 254) bits=7;; 252) bits=6;; 248) bits=5;; 240) bits=4;; 224) bits=3;; 192) bits=2;; 128) bits=1;; 0) bits=0;; *) return 1;; esac
+        \\  prefix=$((prefix + bits))
+        \\ done
+        \\ echo "$prefix"
+        \\}
         \\case "${reason:-}" in
         \\ PREINIT) /sbin/ip link set "$interface" up ;;
         \\ BOUND|RENEW|REBIND|REBOOT)
+        \\  prefix=$(mask_prefix "$new_subnet_mask") || exit 1
         \\  /sbin/ip addr flush dev "$interface"
-        \\  /sbin/ip addr add "$new_ip_address/$new_subnet_mask" dev "$interface"
-        \\  for router in ${new_routers:-}; do /sbin/ip route replace default via "$router" dev "$interface"; break; done
+        \\  /sbin/ip addr add "$new_ip_address/$prefix" dev "$interface" || exit 1
+        \\  for router in ${new_routers:-}; do /sbin/ip route replace default via "$router" dev "$interface" || exit 1; break; done
         \\  ;;
         \\esac
         \\exit 0
@@ -155,12 +164,21 @@ fn buildInternal(
     const udhcpc_script = try std.fmt.allocPrint(a, "{s}/usr/sbin/nodeforge-udhcpc-script", .{initrd_root});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = udhcpc_script, .data =
         \\#!/bin/sh
+        \\mask_prefix() {
+        \\ old_ifs=$IFS; IFS=.; set -- $1; IFS=$old_ifs; prefix=0
+        \\ for octet in "$@"; do
+        \\  case "$octet" in 255) bits=8;; 254) bits=7;; 252) bits=6;; 248) bits=5;; 240) bits=4;; 224) bits=3;; 192) bits=2;; 128) bits=1;; 0) bits=0;; *) return 1;; esac
+        \\  prefix=$((prefix + bits))
+        \\ done
+        \\ echo "$prefix"
+        \\}
         \\case "${1:-${reason:-}}" in
         \\ deconfig) /sbin/ip addr flush dev "$interface" ;;
         \\ bound|renew)
+        \\  prefix=$(mask_prefix "${subnet:-255.255.255.0}") || exit 1
         \\  /sbin/ip addr flush dev "$interface"
-        \\  /sbin/ip addr add "$ip/${subnet:-255.255.255.0}" dev "$interface"
-        \\  for gateway in ${router:-}; do /sbin/ip route replace default via "$gateway" dev "$interface"; break; done
+        \\  /sbin/ip addr add "$ip/$prefix" dev "$interface" || exit 1
+        \\  for gateway in ${router:-}; do /sbin/ip route replace default via "$gateway" dev "$interface" || exit 1; break; done
         \\  ;;
         \\esac
         \\exit 0

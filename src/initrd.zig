@@ -19,10 +19,10 @@
 //! `.part`/`.chunk` 临时文件需要写入 `/run`，因此 `main()` 中显式挂载
 //! `/run` 为 tmpfs。
 //!
-//! **内核模块未加载**：Rocky Linux 内核中 `squashfs`、`loop`、`overlay` 是
-//! 编译为模块（`=m`）而非内置（`=y`）。`main()` 在挂载前显式 `modprobe`
-//! 这三个模块。使用 `runIgnore` 而非 `mustRun`——如果模块已内置则 modprobe
-//! 返回非零但不影响功能。
+//! **硬件冷插拔**：自定义 PID 1 不会自动执行 installer initrd 原本由 systemd
+//! 完成的 udev coldplug。`main()` 启动 ISO initrd 自带的 systemd-udevd，并通过
+//! `udevadm trigger` 按内核 modalias 自动加载介质自带驱动；不写死任何网卡模块。
+//! Rocky Linux 内核中的 `squashfs`、`loop`、`overlay` 则在挂载前显式加载。
 //!
 //! **DHCP 客户端边界**：daemon 内置的是 DHCP server，不能复用为 initrd 的
 //! DHCP client。initrd 先接受内核/vendor userspace 已配置的全局地址，再优先
@@ -58,6 +58,18 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 
 /// initrd 环境的 PATH：覆盖 /usr/bin、/usr/sbin、/bin、/sbin。
 const initrd_path = "/usr/bin:/usr/sbin:/bin:/sbin";
+
+/// 恢复 vendor installer initrd 的硬件自动发现流程。脚本只触发 udev
+/// subsystem/device coldplug，具体模块完全由 ISO 规则与内核 modalias 决定。
+const hardware_coldplug_script =
+    \\mkdir -p /run/udev
+    \\if [ -x /usr/lib/systemd/systemd-udevd ] && [ -x /usr/bin/udevadm ]; then
+    \\ /usr/lib/systemd/systemd-udevd --daemon >/dev/console 2>&1
+    \\ /usr/bin/udevadm trigger --type=subsystems --action=add
+    \\ /usr/bin/udevadm trigger --type=devices --action=add
+    \\ /usr/bin/udevadm settle --timeout=10
+    \\fi
+;
 
 /// 向 stderr（console）输出一行日志。在 initrd 中 stderr 连接到串口控制台。
 /// 与 `http.zig` 中的 log 函数一致，使用 write(2) 直接输出。
@@ -134,17 +146,16 @@ pub fn main(init: std.process.Init) !void {
     // 而非传统 POSIX 的 O_WRONLY/O_CREAT/O_TRUNC 前缀名。
     initrd_log_fd = std.c.open("/run/initrd.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
     log("[nodeforge-initrd] initrd log retention enabled (/run/initrd.log)\n", .{});
+    // 恢复 vendor installer initrd 的硬件 coldplug 语义。自定义 /init 替换了
+    // systemd 后，udev 不会自行启动；若不触发 modalias，ISO 中即使包含正确
+    // 网卡驱动，内核也不会自动加载，DHCP 客户端最终看不到任何广播接口。
+    // 这里只运行 ISO 自带的 udev 规则，不指定 vmxnet3/virtio_net 等具体模块。
+    try mustRun(io, allocator, &.{ "sh", "-c", hardware_coldplug_script });
     // 加载 squashfs/loop/overlay 内核模块（这些在 Rocky 内核中是模块而非内置）。
     // 在挂载 squashfs rootfs 和 overlay 合并前必须已加载。
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "squashfs" });
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "loop" });
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "overlay" });
-    // QEMU/VMware 常见的 virtio NIC 在最小 initramfs 中不会由 udev 自动加载；
-    // DHCP client 可能在无可用网卡时仍退出，因此必须先显式加载常见驱动。
-    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "virtio_net" });
-    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "vmxnet3" });
-    try runIgnore(io, allocator, &.{ "/sbin/modprobe", "e1000e" });
-
     const cmdline = try readCmdline(io, allocator);
     defer freeCmdline(allocator, cmdline);
 
@@ -295,13 +306,17 @@ fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator) !void {
     try runIgnore(io, allocator, &.{ "mkdir", "-p", "/var/lib/dhclient" });
     try mustRun(io, allocator, &.{
         "sh", "-c",
-        \\if command -v udhcpc >/dev/null 2>&1; then
-        \\ udhcpc -n -q -t 5 -T 3 -s /usr/sbin/nodeforge-udhcpc-script
+        \\PATH=/usr/bin:/usr/sbin:/bin:/sbin
+        \\export PATH
+        \\udhcpc_path=''
+        \\for candidate in /usr/sbin/udhcpc /sbin/udhcpc /usr/bin/udhcpc /bin/udhcpc; do [ -x "$candidate" ] && udhcpc_path="$candidate" && break; done
+        \\if [ -n "$udhcpc_path" ]; then
+        \\ "$udhcpc_path" -n -q -t 5 -T 3 -s /usr/sbin/nodeforge-udhcpc-script >/dev/console 2>&1
         \\ if [ -n "$(/sbin/ip -4 -o addr show scope global)" ]; then exit 0; fi
         \\ echo 'udhcpc did not configure a global IPv4 address; trying dhclient' >&2
         \\fi
-        \\if command -v dhclient >/dev/null 2>&1; then
-        \\ exec dhclient -v -1 -sf /usr/sbin/nodeforge-dhclient-script
+        \\if [ -x /usr/sbin/dhclient ]; then
+        \\ exec /usr/sbin/dhclient -v -1 -sf /usr/sbin/nodeforge-dhclient-script >/dev/console 2>&1
         \\fi
         \\echo 'no supported DHCP client (udhcpc or dhclient)' >&2
         \\exit 127
@@ -585,4 +600,13 @@ fn runIgnore(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8)
     const result = std.process.run(allocator, io, .{ .argv = argv }) catch return;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
+}
+
+test "vendor coldplug delegates NIC selection to udev modalias" {
+    try std.testing.expect(std.mem.containsAtLeast(u8, hardware_coldplug_script, 1, "udevadm trigger --type=subsystems"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, hardware_coldplug_script, 1, "udevadm trigger --type=devices"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, hardware_coldplug_script, 1, "udevadm settle --timeout=10"));
+    for ([_][]const u8{ "vmxnet3", "virtio_net", "e1000e" }) |driver| {
+        try std.testing.expect(!std.mem.containsAtLeast(u8, hardware_coldplug_script, 1, driver));
+    }
 }

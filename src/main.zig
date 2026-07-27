@@ -78,7 +78,7 @@ fn renderFullHelp(command: *zli.Command) std.Io.Writer.Error!void {
         try writer.writeAll("\nScalar properties\nKEY\tTYPE\tOPTIONAL\tAPPLICABILITY\n");
         for (cli_properties.properties) |spec| {
             if (spec.owner != value or spec.mutability != .mutable) continue;
-            try writer.print("{s}\t{s}\t{s}\t{s}\n", .{ spec.path, @tagName(spec.kind), if (spec.optional) "yes" else "no", @tagName(spec.applicability) });
+            try writer.print("{s}\t{s}\t{s}\t{s}\n", .{ spec.path, @tagName(spec.kind), if (spec.optional) "true" else "false", @tagName(spec.applicability) });
         }
         try writer.writeAll("\nCollection properties\nKEY\tSEMANTICS\tOPERATIONS\n");
         for (cli_properties.collections) |spec| {
@@ -583,7 +583,16 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(boot_bundle_create);
     try addOutputFlag(boot_bundle_create);
     try addDebugFlag(boot_bundle_create);
-    try boot_bundle.addCommands(&.{boot_bundle_create});
+    const boot_bundle_list = try zli.Command.init(init_options, .{ .name = "list", .description = "列出 diskless BootBundle" }, bootBundleListHandler);
+    try addConfigPathFlag(boot_bundle_list);
+    try addOutputFlag(boot_bundle_list);
+    try addDebugFlag(boot_bundle_list);
+    const boot_bundle_show = try zli.Command.init(init_options, .{ .name = "show", .description = "查看一个 diskless BootBundle" }, bootBundleShowHandler);
+    try boot_bundle_show.addPositionalArg(.{ .name = "name", .description = "BootBundle 名称", .required = true });
+    try addConfigPathFlag(boot_bundle_show);
+    try addOutputFlag(boot_bundle_show);
+    try addDebugFlag(boot_bundle_show);
+    try boot_bundle.addCommands(&.{ boot_bundle_create, boot_bundle_list, boot_bundle_show });
     try assets.addCommands(&.{boot_bundle});
 
     // ── runtime 资源（DHCP/TFTP 运行态查看）──────────────────────────────
@@ -772,6 +781,9 @@ fn addAssetCatalogCommands(assets: *zli.Command, init_options: zli.InitOptions) 
     const repository_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List repositories" }, repositoryListHandler);
     const repository_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show one repository" }, repositoryShowHandler);
     try repository_show.addPositionalArg(.{ .name = "repository", .description = "Repository name", .required = true });
+    const repository_render = try zli.Command.init(init_options, .{ .name = "render", .description = "Render a yum/dnf .repo or apt sources.list entry" }, repositoryRenderHandler);
+    try repository_render.addPositionalArg(.{ .name = "repository", .description = "Repository name", .required = true });
+    try addOutputFlag(repository_render);
     const repository_software = try zli.Command.init(init_options, .{ .name = "software", .description = "Inspect raw repository capabilities" }, showCurrentHelp);
     const repository_software_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List or search repository capabilities" }, repositorySoftwareListHandler);
     try repository_software_list.addPositionalArg(.{ .name = "repository", .description = "Repository name", .required = true });
@@ -786,7 +798,7 @@ fn addAssetCatalogCommands(assets: *zli.Command, init_options: zli.InitOptions) 
         try addDebugFlag(command);
     }
     try repository_software.addCommands(&.{ repository_software_list, repository_software_show });
-    try repositories.addCommands(&.{ repository_list, repository_show, repository_software });
+    try repositories.addCommands(&.{ repository_list, repository_show, repository_render, repository_software });
     try assets.addCommands(&.{ sources, repositories });
 }
 
@@ -1918,7 +1930,7 @@ fn catalogMigrateHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed.deinit();
-    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "renames", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.renames.len}), .section = "runtime", .json_path = "plan.renames" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "yes" else "no", .section = "runtime" } };
+    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "renames", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.renames.len}), .section = "runtime", .json_path = "plan.renames" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "true" else "false", .section = "runtime" } };
     const sections = [_]nodeforge.cli_document.Section{.{ .key = "runtime", .title = "Runtime" }};
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = "Catalog migration plan", .sections = &sections, .fields = &fields } }, .json = body });
 }
@@ -1938,7 +1950,7 @@ fn schemaV3PlanHandler(ctx: zli.CommandContext) !void {
     const Response = struct { result: struct { plan_digest: []const u8, applicable: bool, plan: struct { affected_profiles: []const []const u8, affected_nodes: []const []const u8, blockers: []const std.json.Value } } };
     const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidManagementResponse;
     defer parsed.deinit();
-    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "affected_profiles", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_profiles.len}), .section = "runtime", .json_path = "plan.affected_profiles" }, .{ .key = "affected_nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_nodes.len}), .section = "runtime", .json_path = "plan.affected_nodes" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "yes" else "no", .section = "runtime" } };
+    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "affected_profiles", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_profiles.len}), .section = "runtime", .json_path = "plan.affected_profiles" }, .{ .key = "affected_nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_nodes.len}), .section = "runtime", .json_path = "plan.affected_nodes" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "true" else "false", .section = "runtime" } };
     const sections = [_]nodeforge.cli_document.Section{.{ .key = "runtime", .title = "Runtime" }};
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = "Schema v3 migration plan", .sections = &sections, .fields = &fields } }, .json = body });
 }
@@ -1962,7 +1974,7 @@ fn schemaV4PlanHandler(ctx: zli.CommandContext) !void {
     const Response = struct { result: struct { plan_digest: []const u8, applicable: bool, plan: struct { affected_profiles: []const []const u8, affected_nodes: []const []const u8, blockers: []const std.json.Value } } };
     const parsed = std.json.parseFromSlice(Response, ctx.allocator, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidManagementResponse;
     defer parsed.deinit();
-    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "affected_profiles", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_profiles.len}), .section = "runtime", .json_path = "plan.affected_profiles" }, .{ .key = "affected_nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_nodes.len}), .section = "runtime", .json_path = "plan.affected_nodes" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "yes" else "no", .section = "runtime" } };
+    const fields = [_]nodeforge.cli_document.Field{ .{ .key = "plan_digest", .value = parsed.value.result.plan_digest, .section = "runtime" }, .{ .key = "affected_profiles", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_profiles.len}), .section = "runtime", .json_path = "plan.affected_profiles" }, .{ .key = "affected_nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.affected_nodes.len}), .section = "runtime", .json_path = "plan.affected_nodes" }, .{ .key = "blockers", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{parsed.value.result.plan.blockers.len}), .section = "runtime", .json_path = "plan.blockers" }, .{ .key = "applicable", .value = if (parsed.value.result.applicable) "true" else "false", .section = "runtime" } };
     const sections = [_]nodeforge.cli_document.Section{.{ .key = "runtime", .title = "Runtime" }};
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = "Schema v4 migration plan", .sections = &sections, .fields = &fields } }, .json = body });
 }
@@ -2107,6 +2119,17 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
     var published = false;
     defer if (!published) std.Io.Dir.cwd().deleteFile(ctx.io, part) catch {};
     const initrd_binary = try std.fmt.allocPrint(ctx.allocator, "{s}/nodeforge-initrd", .{nodeforge.paths.require().bin_dir});
+    const agent_binary = try std.fmt.allocPrint(ctx.allocator, "{s}/nodeforge-agent", .{nodeforge.paths.require().bin_dir});
+    for ([_][]const u8{ initrd_binary, agent_binary }) |companion| {
+        const stat = std.Io.Dir.cwd().statFile(ctx.io, companion, .{ .follow_symlinks = false }) catch {
+            try writeCommandError(ctx, "initrd.companion_missing", "nodeforge-initrd and nodeforge-agent must both be installed beside nodeforge", 1);
+            return;
+        };
+        if (stat.kind != .file) {
+            try writeCommandError(ctx, "initrd.companion_missing", "nodeforge-initrd and nodeforge-agent must both be regular files beside nodeforge", 1);
+            return;
+        }
+    }
     try errorWriter(ctx).print("Building initrd {s} (kver={s}, arch={s}, mode={s})...\n", .{ name, kernel_release, @tagName(arch), if (base_initrd != null) "vendor-overlay" else "dracut-fallback" });
     const build_result = if (base_initrd) |base|
         nodeforge.provision_initrd_build_executor.buildFromInstaller(ctx.io, ctx.allocator, kernel_release, initrd_binary, base, part)
@@ -2352,6 +2375,65 @@ fn repositoryListHandler(ctx: zli.CommandContext) !void {
 }
 fn repositoryShowHandler(ctx: zli.CommandContext) !void {
     try catalogResourceHandler(ctx, "repositories", ctx.positional_args[0]);
+}
+
+fn repositoryRenderHandler(ctx: zli.CommandContext) !void {
+    // 从已发布 repository 事实生成客户端可直接使用的配置，而不是根据发行版
+    // 名称猜测 suite/component。DNF 使用 catalog URL；APT 读取实际 Release。
+    _ = outputFromContext(ctx) orelse return;
+    const name = ctx.getArg("repository") orelse return;
+    var loaded = loadCatalogOrEmpty(ctx.io, ctx.allocator, nodeforge.paths.require().catalog_dir, errorWriter(ctx), false) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer loaded.deinit();
+    const repository = nodeforge.catalog.findRepository(loaded.value(), name) orelse {
+        try writeCommandError(ctx, "repository.not_found", "repository is not registered", 1);
+        return;
+    };
+    const rendered = switch (repository.manager) {
+        .dnf => try std.fmt.allocPrint(ctx.allocator,
+            \\[{s}]
+            \\name=NodeForge {s}
+            \\baseurl={s}
+            \\enabled=1
+            \\gpgcheck={d}
+            \\{s}
+        , .{ repository.name, repository.name, repository.base_url, @intFromBool(repository.gpg_check), if (repository.gpg_key) |key| try std.fmt.allocPrint(ctx.allocator, "gpgkey={s}", .{key}) else "" }),
+        .apt => try renderAptRepository(ctx, repository),
+    };
+    const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = true, .result = .{ .repository = repository.name, .manager = @tagName(repository.manager), .config = rendered } }, .{});
+    try renderOutputDocument(ctx, .{ .human = .{ .text = std.mem.trimEnd(u8, rendered, "\n") }, .json = json });
+}
+
+fn renderAptRepository(ctx: zli.CommandContext, repository: *const model.RepositoryConfig) ![]const u8 {
+    // 一个 ISO repository 可能包含不同 suite；逐个读取 dists/*/Release，优先
+    // 使用 Codename，其次 Suite，并保留介质声明的 Components 顺序。
+    const dists_path = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}/dists", .{ nodeforge.paths.require().repos_dir, repository.name });
+    var dists = std.Io.Dir.openDirAbsolute(ctx.io, dists_path, .{ .iterate = true, .follow_symlinks = false }) catch {
+        try writeCommandError(ctx, "repository.metadata_missing", "APT repository has no dists directory", 1);
+        return error.RepositoryMetadataMissing;
+    };
+    defer dists.close(ctx.io);
+    var iterator = dists.iterate();
+    while (try iterator.next(ctx.io)) |entry| {
+        const release_path = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}/Release", .{ dists_path, entry.name });
+        const release = std.Io.Dir.cwd().readFileAlloc(ctx.io, release_path, ctx.allocator, .limited(256 * 1024)) catch continue;
+        const suite = aptReleaseValue(release, "Codename") orelse aptReleaseValue(release, "Suite") orelse entry.name;
+        const components = aptReleaseValue(release, "Components") orelse "main";
+        return std.fmt.allocPrint(ctx.allocator, "deb [trusted={s}] {s} {s} {s}\n", .{ if (repository.gpg_check) "no" else "yes", repository.base_url, suite, components });
+    }
+    try writeCommandError(ctx, "repository.metadata_missing", "APT repository has no readable Release metadata", 1);
+    return error.RepositoryMetadataMissing;
+}
+
+fn aptReleaseValue(release: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, release, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.mem.eql(u8, std.mem.trim(u8, line[0..colon], " \t\r"), key)) return std.mem.trim(u8, line[colon + 1 ..], " \t\r");
+    }
+    return null;
 }
 
 fn catalogResourceHandler(ctx: zli.CommandContext, resource: []const u8, name: ?[]const u8) !void {
@@ -3321,7 +3403,7 @@ fn discoveryListHandler(ctx: zli.CommandContext) !void {
     const rows = try ctx.allocator.alloc(nodeforge.cli_table.Row, count);
     const jsonl = try ctx.allocator.alloc([]const u8, count);
     for (parsed.value.result.items, 0..) |item, index| {
-        cells[index] = .{ item.mac, if (item.observed_architecture) |arch| @tagName(arch) else "-", item.last_ip orelse "-", try std.fmt.allocPrint(ctx.allocator, "{d}", .{item.request_count}), try std.fmt.allocPrint(ctx.allocator, "{d}", .{item.revision}), if (item.claim != null) "yes" else "no", if (item.claim) |claim| claim.node_id else "-" };
+        cells[index] = .{ item.mac, if (item.observed_architecture) |arch| @tagName(arch) else "-", item.last_ip orelse "-", try std.fmt.allocPrint(ctx.allocator, "{d}", .{item.request_count}), try std.fmt.allocPrint(ctx.allocator, "{d}", .{item.revision}), if (item.claim != null) "true" else "false", if (item.claim) |claim| claim.node_id else "-" };
         rows[index] = .{ .cells = &cells[index] };
         jsonl[index] = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = true, .result = item }, .{});
     }
@@ -3528,7 +3610,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
             item.mac,
             item.pxe.ip_reservation orelse "-",
             item.profile orelse "<unassigned>",
-            if (item.deploy) "yes" else "no",
+            if (item.deploy) "true" else "false",
             item.install_intent,
             item.status orelse "-",
             try a.dupe(u8, views.formatTimestamp(&start_buf, item.start_at orelse 0)),
@@ -3546,7 +3628,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     if (truncated) try errorWriter(ctx).writeAll("note: node list truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
 
-const ProfileListItem = struct { name: []const u8, install_source: []const u8, platform: struct { distro: []const u8, version: []const u8, arch: []const u8 }, nodes: usize, valid: bool };
+const ProfileListItem = struct { name: []const u8, kind: []const u8, boot_bundle: ?[]const u8, install_source: []const u8, platform: struct { distro: []const u8, version: []const u8, arch: []const u8 }, nodes: usize, valid: bool };
 const ProfileListPage = struct { ok: bool, result: struct { items: []const ProfileListItem, next_cursor: ?[]const u8, view_revision: u64 } };
 
 fn profileListHandler(ctx: zli.CommandContext) !void {
@@ -3613,18 +3695,18 @@ fn profileListHandler(ctx: zli.CommandContext) !void {
             return;
         };
     }
-    const cells = try a.alloc([7][]const u8, items.items.len);
+    const cells = try a.alloc([9][]const u8, items.items.len);
     const rows = try a.alloc(nodeforge.cli_table.Row, items.items.len);
     const jsonl = try a.alloc([]const u8, items.items.len);
     for (items.items, 0..) |profile, index| {
         var count_buf: [24]u8 = undefined;
-        cells[index] = .{ profile.name, profile.platform.distro, profile.platform.version, profile.platform.arch, profile.install_source, try a.dupe(u8, try std.fmt.bufPrint(&count_buf, "{d}", .{profile.nodes})), if (profile.valid) "yes" else "no" };
+        cells[index] = .{ profile.name, profile.kind, profile.platform.distro, profile.platform.version, profile.platform.arch, profile.install_source, profile.boot_bundle orelse "-", try a.dupe(u8, try std.fmt.bufPrint(&count_buf, "{d}", .{profile.nodes})), if (profile.valid) "true" else "false" };
         rows[index] = .{ .cells = &cells[index] };
         jsonl[index] = try std.json.Stringify.valueAlloc(a, .{ .ok = true, .result = profile }, .{});
     }
     const Result = struct { items: []const ProfileListItem, next_cursor: ?[]const u8 = null, view_revision: u64 };
     const json = try std.json.Stringify.valueAlloc(a, .{ .ok = true, .result = Result{ .items = items.items, .view_revision = view_revision.? } }, .{});
-    const columns = [_]nodeforge.cli_table.Column{ .{ .key = "name", .title = "NAME" }, .{ .key = "distro", .title = "DISTRO" }, .{ .key = "version", .title = "VERSION" }, .{ .key = "arch", .title = "ARCH" }, .{ .key = "source", .title = "INSTALL_SOURCE" }, .{ .key = "nodes", .title = "NODES", .alignment = .right }, .{ .key = "valid", .title = "VALID" } };
+    const columns = [_]nodeforge.cli_table.Column{ .{ .key = "name", .title = "NAME" }, .{ .key = "kind", .title = "KIND" }, .{ .key = "distro", .title = "DISTRO" }, .{ .key = "version", .title = "VERSION" }, .{ .key = "arch", .title = "ARCH" }, .{ .key = "source", .title = "INSTALL_SOURCE" }, .{ .key = "boot_bundle", .title = "BOOT_BUNDLE" }, .{ .key = "nodes", .title = "NODES", .alignment = .right }, .{ .key = "valid", .title = "VALID" } };
     try renderOutputDocument(ctx, .{ .human = .{ .table = .{ .columns = &columns, .rows = rows, .empty_message = "No profiles configured." } }, .json = json, .jsonl = jsonl });
     if (truncated) try errorWriter(ctx).writeAll("note: profile list truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
@@ -3662,6 +3744,8 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
         result: struct {
             model_revision: struct { config: u64, catalog: u64 },
             name: []const u8,
+            kind: []const u8,
+            boot_bundle: ?[]const u8,
             platform: struct { distro: []const u8, version: []const u8, arch: []const u8 },
             kernel_args: ?[]const u8,
             install: model.InstallConfig,
@@ -3699,12 +3783,44 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     if (result.assets.len == 0) assets_buf.writer.writeAll("(none)\n") catch {};
     const sections = [_]nodeforge.cli_document.Section{ .{ .key = "stored", .title = "Stored" }, .{ .key = "effective", .title = "Effective" }, .{ .key = "capabilities", .title = "Capabilities" }, .{ .key = "assets", .title = "Assets" }, .{ .key = "runtime", .title = "Runtime" } };
     const fields = [_]nodeforge.cli_document.Field{
-        .{ .key = "name", .value = result.name, .section = "stored" },                                                                                                                     .{ .key = "install_source", .value = result.install_source.name, .section = "stored", .json_path = "install_source.name" },                                                                                .{ .key = "kernel_args", .value = result.kernel_args orelse "-", .section = "stored" },                                                                                    .{ .key = "platform.distro", .value = result.platform.distro, .section = "capabilities" },                                                                                                                                .{ .key = "platform.version", .value = result.platform.version, .section = "capabilities" },                                                                                 .{ .key = "platform.arch", .value = result.platform.arch, .section = "capabilities" },
-        .{ .key = "install.storage.mode", .value = @tagName(install.storage.mode), .section = "effective", .json_path = "install.storage.mode" },                                          .{ .key = "install.storage.wipe", .value = if (install.storage.wipe) "yes" else "no", .section = "effective", .json_path = "install.storage.wipe" },                                                       .{ .key = "install.storage.partition_table", .value = @tagName(install.storage.partition_table), .section = "effective", .json_path = "install.storage.partition_table" }, .{ .key = "install.bootloader.install", .value = if (install.bootloader.install) "yes" else "no", .section = "effective", .json_path = "install.bootloader.install" },                                                    .{ .key = "system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" }, .{ .key = "system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },
-        .{ .key = "system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" }, .{ .key = "system.connectivity.time_sync", .value = if (result.effective_system.connectivity.time_sync) "yes" else "no", .section = "effective", .json_path = "effective_system.connectivity.time_sync" }, .{ .key = "system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.enabled" },  .{ .key = "system.ssh.password_authentication", .value = if (result.effective_system.ssh.password_authentication) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.password_authentication" }, .{ .key = "system.ssh.root_login", .value = result.effective_system.ssh.root_login, .section = "effective", .json_path = "effective_system.ssh.root_login" },                .{ .key = "system.ssh.root_password", .value = if (result.effective_system.ssh.root_password != null) "<redacted>" else "<unset>", .section = "effective", .json_path = "effective_system.ssh.root_password" },
-        .{ .key = "system.security.firewall", .value = result.effective_system.security.firewall, .section = "effective", .json_path = "effective_system.security.firewall" },             .{ .key = "system.security.selinux", .value = result.effective_system.security.selinux, .section = "effective", .json_path = "effective_system.security.selinux" },                                        .{ .key = "system.security.apparmor", .value = result.effective_system.security.apparmor, .section = "effective", .json_path = "effective_system.security.apparmor" },     .{ .key = "install.apt.fallback", .value = @tagName(install.apt.fallback), .section = "effective", .json_path = "install.apt.fallback" },                                                                                 .{ .key = "install.completion.action", .value = @tagName(install.completion.action), .section = "effective", .json_path = "install.completion.action" },                     .{ .key = "install.updates.mode", .value = @tagName(install.updates.mode), .section = "effective", .json_path = "install.updates.mode" },
-        .{ .key = "install.proxy.url", .value = install.proxy.url orelse "<unset>", .section = "effective", .json_path = "install.proxy.url" },                                            .{ .key = "install.reinstall_policy", .value = @tagName(install.reinstall_policy), .section = "effective", .json_path = "install.reinstall_policy" },                                                      .{ .key = "install.post_install.bundle", .value = install.post_install.bundle orelse "<unset>", .section = "effective", .json_path = "install.post_install.bundle" },      .{ .key = "capability.family", .value = result.capability.family, .section = "capabilities" },                                                                                                                            .{ .key = "capability.install_adapter", .value = result.capability.install_adapter, .section = "capabilities" },                                                             .{ .key = "capability.package_manager", .value = result.capability.package_manager, .section = "capabilities" },
-        .{ .key = "validation.valid", .value = if (result.validation.valid) "yes" else "no", .section = "runtime" },                                                                       .{ .key = "model_revision.config", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.config}), .section = "runtime" },                                                         .{ .key = "model_revision.catalog", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.catalog}), .section = "runtime" },                       .{ .key = "nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.nodes.len}), .section = "runtime" },                                                                                                    .{ .key = "assets", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.assets.len}), .section = "runtime" },                                                     .{ .key = "assets.paths", .value = assets_buf.written(), .section = "assets" },
+        .{ .key = "kind", .value = result.kind, .section = "stored" },
+        .{ .key = "boot_bundle", .value = result.boot_bundle orelse "<unset>", .section = "stored" },
+        .{ .key = "name", .value = result.name, .section = "stored" },
+        .{ .key = "install_source", .value = result.install_source.name, .section = "stored", .json_path = "install_source.name" },
+        .{ .key = "kernel_args", .value = result.kernel_args orelse "-", .section = "stored" },
+        .{ .key = "platform.distro", .value = result.platform.distro, .section = "capabilities" },
+        .{ .key = "platform.version", .value = result.platform.version, .section = "capabilities" },
+        .{ .key = "platform.arch", .value = result.platform.arch, .section = "capabilities" },
+        .{ .key = "install.storage.mode", .value = @tagName(install.storage.mode), .section = "effective", .json_path = "install.storage.mode" },
+        .{ .key = "install.storage.wipe", .value = if (install.storage.wipe) "true" else "false", .section = "effective", .json_path = "install.storage.wipe" },
+        .{ .key = "install.storage.partition_table", .value = @tagName(install.storage.partition_table), .section = "effective", .json_path = "install.storage.partition_table" },
+        .{ .key = "install.bootloader.install", .value = if (install.bootloader.install) "true" else "false", .section = "effective", .json_path = "install.bootloader.install" },
+        .{ .key = "system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },
+        .{ .key = "system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },
+        .{ .key = "system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
+        .{ .key = "system.connectivity.time_sync", .value = if (result.effective_system.connectivity.time_sync) "true" else "false", .section = "effective", .json_path = "effective_system.connectivity.time_sync" },
+        .{ .key = "system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "true" else "false", .section = "effective", .json_path = "effective_system.ssh.enabled" },
+        .{ .key = "system.ssh.password_authentication", .value = if (result.effective_system.ssh.password_authentication) "true" else "false", .section = "effective", .json_path = "effective_system.ssh.password_authentication" },
+        .{ .key = "system.ssh.root_login", .value = result.effective_system.ssh.root_login, .section = "effective", .json_path = "effective_system.ssh.root_login" },
+        .{ .key = "system.ssh.root_password", .value = if (result.effective_system.ssh.root_password != null) "<redacted>" else "<unset>", .section = "effective", .json_path = "effective_system.ssh.root_password" },
+        .{ .key = "system.security.firewall", .value = result.effective_system.security.firewall, .section = "effective", .json_path = "effective_system.security.firewall" },
+        .{ .key = "system.security.selinux", .value = result.effective_system.security.selinux, .section = "effective", .json_path = "effective_system.security.selinux" },
+        .{ .key = "system.security.apparmor", .value = result.effective_system.security.apparmor, .section = "effective", .json_path = "effective_system.security.apparmor" },
+        .{ .key = "install.apt.fallback", .value = @tagName(install.apt.fallback), .section = "effective", .json_path = "install.apt.fallback" },
+        .{ .key = "install.completion.action", .value = @tagName(install.completion.action), .section = "effective", .json_path = "install.completion.action" },
+        .{ .key = "install.updates.mode", .value = @tagName(install.updates.mode), .section = "effective", .json_path = "install.updates.mode" },
+        .{ .key = "install.proxy.url", .value = install.proxy.url orelse "<unset>", .section = "effective", .json_path = "install.proxy.url" },
+        .{ .key = "install.reinstall_policy", .value = @tagName(install.reinstall_policy), .section = "effective", .json_path = "install.reinstall_policy" },
+        .{ .key = "install.post_install.bundle", .value = install.post_install.bundle orelse "<unset>", .section = "effective", .json_path = "install.post_install.bundle" },
+        .{ .key = "capability.family", .value = result.capability.family, .section = "capabilities" },
+        .{ .key = "capability.install_adapter", .value = result.capability.install_adapter, .section = "capabilities" },
+        .{ .key = "capability.package_manager", .value = result.capability.package_manager, .section = "capabilities" },
+        .{ .key = "validation.valid", .value = if (result.validation.valid) "true" else "false", .section = "runtime" },
+        .{ .key = "model_revision.config", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.config}), .section = "runtime" },
+        .{ .key = "model_revision.catalog", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.catalog}), .section = "runtime" },
+        .{ .key = "nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.nodes.len}), .section = "runtime" },
+        .{ .key = "assets", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.assets.len}), .section = "runtime" },
+        .{ .key = "assets.paths", .value = assets_buf.written(), .section = "assets" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Profile {s}", .{result.name});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
@@ -3800,6 +3916,64 @@ fn bootBundleCreateHandler(ctx: zli.CommandContext) !void {
     }
     const human = try std.fmt.allocPrint(ctx.allocator, "boot bundle created: {s} (kernel={s}, initrd={s})", .{ name, kernel, initrd });
     try renderCommandResult(ctx, human, .{ .name = name, .kernel = kernel, .initrd = initrd });
+}
+
+fn bootBundleListHandler(ctx: zli.CommandContext) !void {
+    try bootBundleQueryHandler(ctx, null);
+}
+
+fn bootBundleShowHandler(ctx: zli.CommandContext) !void {
+    try bootBundleQueryHandler(ctx, ctx.getArg("name") orelse return);
+}
+
+fn bootBundleQueryHandler(ctx: zli.CommandContext, name: ?[]const u8) !void {
+    // management API 返回完整集合；list 直接表格化，show 在相同 revision 内
+    // 精确筛选，确保两种视图不会因不同端点产生字段漂移。
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var response: [256 * 1024]u8 = undefined;
+    const body = nodeforge.management_client.bootBundlesJson(ctx.io, config.value.server.http_port, &response) catch null orelse {
+        try writeCommandError(ctx, "boot_bundle.query_failed", "boot bundle query failed", 1);
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, body, .{}) catch {
+        try writeCommandError(ctx, "boot_bundle.invalid_response", "boot bundle query returned malformed JSON", 1);
+        return;
+    };
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return error.InvalidManagementResponse;
+    const items = result.object.get("items") orelse return error.InvalidManagementResponse;
+    if (name) |target_name| {
+        for (items.array.items) |item| {
+            const object = item.object;
+            if (!std.mem.eql(u8, jsonString(object.get("name")), target_name)) continue;
+            const keys = [_][]const u8{ "name", "distro", "version", "arch", "kernel_release", "kernel", "runtime_kernel", "initrd" };
+            var fields: [keys.len]nodeforge.cli_document.Field = undefined;
+            for (keys, 0..) |key, index| fields[index] = .{ .key = key, .value = try jsonDisplay(ctx.allocator, object.get(key)), .section = "stored" };
+            const sections = [_]nodeforge.cli_document.Section{.{ .key = "stored", .title = "Stored" }};
+            const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = true, .result = .{ .boot_bundle = item } }, .{});
+            const title = try std.fmt.allocPrint(ctx.allocator, "BootBundle {s}", .{target_name});
+            try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = json });
+            return;
+        }
+        try writeCommandError(ctx, "boot_bundle.not_found", "boot bundle not found", 1);
+        return;
+    }
+    const cells = try ctx.allocator.alloc([7][]const u8, items.array.items.len);
+    const rows = try ctx.allocator.alloc(nodeforge.cli_table.Row, items.array.items.len);
+    const jsonl = try ctx.allocator.alloc([]const u8, items.array.items.len);
+    for (items.array.items, 0..) |item, index| {
+        const object = item.object;
+        cells[index] = .{ jsonString(object.get("name")), jsonString(object.get("distro")), jsonString(object.get("version")), jsonString(object.get("arch")), jsonString(object.get("kernel_release")), jsonString(object.get("kernel")), jsonString(object.get("initrd")) };
+        rows[index] = .{ .cells = &cells[index] };
+        jsonl[index] = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = true, .result = item }, .{});
+    }
+    const columns = [_]nodeforge.cli_table.Column{ .{ .key = "name", .title = "NAME" }, .{ .key = "distro", .title = "DISTRO" }, .{ .key = "version", .title = "VERSION" }, .{ .key = "arch", .title = "ARCH" }, .{ .key = "kernel_release", .title = "KERNEL RELEASE" }, .{ .key = "kernel", .title = "KERNEL" }, .{ .key = "initrd", .title = "INITRD" } };
+    try renderOutputDocument(ctx, .{ .human = .{ .table = .{ .columns = &columns, .rows = rows, .empty_message = "没有 BootBundle。" } }, .json = body, .jsonl = jsonl });
 }
 
 fn profileRootfsPlanHandler(ctx: zli.CommandContext) !void {
@@ -4205,9 +4379,9 @@ fn nodeReadinessHandler(ctx: zli.CommandContext) !void {
     defer parsed.deinit();
     const result = parsed.value.result;
     const human = if (result.required_min_memory_bytes) |required|
-        try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}\nmemory: {s}\nrequired_min_memory_bytes: {d}", .{ result.node_id, result.stage, if (result.ready) "yes" else "no", result.rootfs_input_digest, result.desired_plan_digest, result.memory orelse "unknown", required })
+        try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}\nmemory: {s}\nrequired_min_memory_bytes: {d}", .{ result.node_id, result.stage, if (result.ready) "true" else "false", result.rootfs_input_digest, result.desired_plan_digest, result.memory orelse "unknown", required })
     else
-        try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}", .{ result.node_id, result.stage, if (result.ready) "yes" else "no", result.rootfs_input_digest, result.desired_plan_digest });
+        try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}", .{ result.node_id, result.stage, if (result.ready) "true" else "false", result.rootfs_input_digest, result.desired_plan_digest });
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
 }
 
@@ -4310,19 +4484,25 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
-    if (ctx.flag("force", bool)) {
+    const force = ctx.flag("force", bool);
+    // retry 的用户语义是“允许下一次 PXE 再执行”。若节点仍 deploy=false，单纯
+    // 增加 generation 仍会被 resolver 拒绝，因此先启用 deploy，再 rearm。
+    var deploy_reason: [256]u8 = undefined;
+    const deploy_result = nodeforge.management_client.scalarMutations(ctx.io, config.value.server.http_port, "node", node_id, &.{.{ .key = "deploy", .value = "true" }}, force, &deploy_reason);
+    if (!deploy_result.healthy) return reportMutationFailure(ctx, deploy_result, "retry could not enable deployment");
+    if (force) {
         var reason: [256]u8 = undefined;
         const result = nodeforge.management_client.installGenerationsForce(ctx.io, config.value.server.http_port, node_id, &reason);
         if (!result.healthy) return reportMutationFailure(ctx, result, "forced install retry failed: daemon unreachable");
         const human = try std.fmt.allocPrint(ctx.allocator, "active install session superseded; generation rearmed for {s}; waiting for next PXE", .{node_id});
-        try renderCommandResult(ctx, human, .{ .node_id = node_id, .superseded_active_session = true });
+        try renderCommandResult(ctx, human, .{ .node_id = node_id, .deploy = true, .superseded_active_session = true });
         return;
     }
     var reason: [256]u8 = undefined;
     const result = nodeforge.management_client.installGenerations(ctx.io, config.value.server.http_port, node_id, &reason);
     if (!result.healthy) return reportMutationFailure(ctx, result, "install retry failed: daemon unreachable");
     const human = try std.fmt.allocPrint(ctx.allocator, "install generation rearmed for {s}; waiting for next PXE", .{node_id});
-    try renderCommandResult(ctx, human, .{ .node_id = node_id });
+    try renderCommandResult(ctx, human, .{ .node_id = node_id, .deploy = true });
 }
 
 // ── M4.2 节点 CRUD 处理器 ───────────────────────────────────────
@@ -4505,7 +4685,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
         result: struct {
             view_revision: struct { config: u64, catalog: u64, node_status: u64, deployment: u64, inventory: u64 },
             node: nodeforge.catalog_schema_v3_dto.Node,
-            profile: struct { name: []const u8, install_source: []const u8, kernel_args: ?[]const u8, platform: struct { distro: []const u8, version: []const u8, arch: []const u8 } },
+            profile: struct { name: []const u8, kind: []const u8, boot_bundle: ?[]const u8, install_source: []const u8, kernel_args: ?[]const u8, platform: struct { distro: []const u8, version: []const u8, arch: []const u8 } },
             effective_system: struct {
                 localization: model.LocalizationConfig,
                 connectivity: model.ConnectivityPolicy,
@@ -4550,7 +4730,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     defer parsed.deinit();
     const result = parsed.value.result;
     const stored_node = result.node.modelValue();
-    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "stored", .title = "Stored" }, .{ .key = "overrides", .title = "Overrides" }, .{ .key = "effective", .title = "Effective" }, .{ .key = "runtime", .title = "Runtime" } };
+    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "runtime", .title = "Runtime" }, .{ .key = "stored", .title = "Stored" }, .{ .key = "overrides", .title = "Overrides" }, .{ .key = "effective", .title = "Effective" } };
     const storage = if (result.storage) |value| value.effective else model.StorageConfig{};
     const status_phase = if (result.status) |status| status.phase else "-";
     const status_reason = if (result.status) |status| if (status.reason.len == 0) "-" else status.reason else "-";
@@ -4562,17 +4742,17 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     const search_domains = if (stored_node.network.search_domains.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.network.search_domains);
     const network_routes = if (stored_node.network.routes.len == 0) "<none>" else try formatRoutes(ctx.allocator, stored_node.network.routes);
     const fields = [_]nodeforge.cli_document.Field{
-        .{ .key = "id", .value = stored_node.id, .section = "stored", .json_path = "node.id" },                                                                                                                                                 .{ .key = "mac", .value = stored_node.mac, .section = "stored", .json_path = "node.mac" },                                                                                                                                                                    .{ .key = "arch", .value = @tagName(stored_node.arch), .section = "stored", .json_path = "node.arch" },                                                                                                                    .{ .key = "profile", .value = stored_node.profile orelse "<unset>", .section = "stored", .json_path = "node.profile" },
-        .{ .key = "pxe.ip_reservation", .value = stored_node.pxe.ip_reservation orelse "<unset>", .section = "stored", .json_path = "node.pxe.ip_reservation" },                                                                                .{ .key = "hostname", .value = stored_node.hostname orelse "<unset>", .section = "stored", .json_path = "node.hostname" },                                                                                                                                    .{ .key = "deploy", .value = if (stored_node.deploy) "yes" else "no", .section = "stored", .json_path = "node.deploy" },                                                                                                   .{ .key = "http_accel", .value = if (stored_node.http_accel) "yes" else "no", .section = "stored", .json_path = "node.http_accel" },
-        .{ .key = "storage.boot_disk", .value = stored_node.storage.boot_disk, .section = "stored", .json_path = "node.storage.boot_disk" },                                                                                                    .{ .key = "storage.additional_disks", .value = additional_disks, .section = "stored", .json_path = "node.storage.additional_disks" },                                                                                                                         .{ .key = "network.mode", .value = @tagName(stored_node.network.mode), .section = "stored", .json_path = "node.network.mode" },                                                                                            .{ .key = "network.interface_name", .value = stored_node.network.interface orelse "<auto>", .section = "stored", .json_path = "node.network.interface_name" },
-        .{ .key = "network.match_mac", .value = stored_node.network.match_mac orelse "<node mac>", .section = "stored", .json_path = "node.network.match_mac" },                                                                                .{ .key = "network.address", .value = stored_node.network.address orelse "<unset>", .section = "stored", .json_path = "node.network.address" },                                                                                                               .{ .key = "network.prefix_len", .value = if (stored_node.network.prefix_len) |value| try std.fmt.allocPrint(ctx.allocator, "{d}", .{value}) else "<unset>", .section = "stored", .json_path = "node.network.prefix_len" }, .{ .key = "network.gateway", .value = stored_node.network.gateway orelse "<unset>", .section = "stored", .json_path = "node.network.gateway" },
-        .{ .key = "network.dns", .value = network_dns, .section = "stored", .json_path = "node.network.dns" },                                                                                                                                  .{ .key = "network.search_domains", .value = search_domains, .section = "stored", .json_path = "node.network.search_domains" },                                                                                                                               .{ .key = "network.routes", .value = network_routes, .section = "stored", .json_path = "node.network.routes" },                                                                                                            .{ .key = "overrides.install.storage.mode", .value = if (stored_node.overrides.install.storage.mode) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.mode" },
-        .{ .key = "overrides.install.storage.wipe", .value = if (stored_node.overrides.install.storage.wipe) |value| if (value) "yes" else "no" else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.wipe" }, .{ .key = "overrides.install.storage.partition_table", .value = if (stored_node.overrides.install.storage.partition_table) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.partition_table" }, .{ .key = "overrides.system.localization.locale", .value = stored_node.overrides.system.localization.locale orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.locale" },        .{ .key = "overrides.system.localization.timezone", .value = stored_node.overrides.system.localization.timezone orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.timezone" },
-        .{ .key = "overrides.system.localization.keyboard", .value = stored_node.overrides.system.localization.keyboard orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.keyboard" },               .{ .key = "effective.install.storage.mode", .value = @tagName(storage.mode), .section = "effective", .json_path = "storage.effective.mode" },                                                                                                                 .{ .key = "effective.install.storage.wipe", .value = if (storage.wipe) "yes" else "no", .section = "effective", .json_path = "storage.effective.wipe" },                                                                   .{ .key = "effective.install.storage.partition_table", .value = @tagName(storage.partition_table), .section = "effective", .json_path = "storage.effective.partition_table" },
-        .{ .key = "effective.install.storage.boot_disk", .value = storage.boot_disk, .section = "effective", .json_path = "storage.effective.boot_disk" },                                                                                      .{ .key = "effective.system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },                                                                        .{ .key = "effective.system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },                               .{ .key = "effective.system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
-        .{ .key = "effective.system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.enabled" },                                                     .{ .key = "effective.system.security.firewall", .value = @tagName(result.effective_system.security.firewall), .section = "effective", .json_path = "effective_system.security.firewall" },                                                                    .{ .key = "effective.system.security.selinux", .value = @tagName(result.effective_system.security.selinux), .section = "effective", .json_path = "effective_system.security.selinux" },                                    .{ .key = "effective.system.security.apparmor", .value = @tagName(result.effective_system.security.apparmor), .section = "effective", .json_path = "effective_system.security.apparmor" },
-        .{ .key = "runtime.phase", .value = status_phase, .section = "runtime", .json_path = "status.phase" },                                                                                                                                  .{ .key = "runtime.reason", .value = status_reason, .section = "runtime", .json_path = "status.reason" },                                                                                                                                                     .{ .key = "runtime.install_intent", .value = install_intent, .section = "runtime", .json_path = "deployment.install_intent" },                                                                                             .{ .key = "runtime.drift_state", .value = drift_state, .section = "runtime", .json_path = "deployment.drift_state" },
-        .{ .key = "runtime.serial_number", .value = inventory_serial, .section = "runtime", .json_path = "inventory.serial_number" },
+        .{ .key = "id", .value = stored_node.id, .section = "stored", .json_path = "node.id" },                                                                                                                                                     .{ .key = "mac", .value = stored_node.mac, .section = "stored", .json_path = "node.mac" },                                                                                                                                                                    .{ .key = "arch", .value = @tagName(stored_node.arch), .section = "stored", .json_path = "node.arch" },                                                                                                                    .{ .key = "profile", .value = stored_node.profile orelse "<unset>", .section = "stored", .json_path = "node.profile" },
+        .{ .key = "pxe.ip_reservation", .value = stored_node.pxe.ip_reservation orelse "<unset>", .section = "stored", .json_path = "node.pxe.ip_reservation" },                                                                                    .{ .key = "hostname", .value = stored_node.hostname orelse "<unset>", .section = "stored", .json_path = "node.hostname" },                                                                                                                                    .{ .key = "deploy", .value = if (stored_node.deploy) "true" else "false", .section = "stored", .json_path = "node.deploy" },                                                                                               .{ .key = "http_accel", .value = if (stored_node.http_accel) "true" else "false", .section = "stored", .json_path = "node.http_accel" },
+        .{ .key = "storage.boot_disk", .value = stored_node.storage.boot_disk, .section = "stored", .json_path = "node.storage.boot_disk" },                                                                                                        .{ .key = "storage.additional_disks", .value = additional_disks, .section = "stored", .json_path = "node.storage.additional_disks" },                                                                                                                         .{ .key = "network.mode", .value = @tagName(stored_node.network.mode), .section = "stored", .json_path = "node.network.mode" },                                                                                            .{ .key = "network.interface_name", .value = stored_node.network.interface orelse "<auto>", .section = "stored", .json_path = "node.network.interface_name" },
+        .{ .key = "network.match_mac", .value = stored_node.network.match_mac orelse "<node mac>", .section = "stored", .json_path = "node.network.match_mac" },                                                                                    .{ .key = "network.address", .value = stored_node.network.address orelse "<unset>", .section = "stored", .json_path = "node.network.address" },                                                                                                               .{ .key = "network.prefix_len", .value = if (stored_node.network.prefix_len) |value| try std.fmt.allocPrint(ctx.allocator, "{d}", .{value}) else "<unset>", .section = "stored", .json_path = "node.network.prefix_len" }, .{ .key = "network.gateway", .value = stored_node.network.gateway orelse "<unset>", .section = "stored", .json_path = "node.network.gateway" },
+        .{ .key = "network.dns", .value = network_dns, .section = "stored", .json_path = "node.network.dns" },                                                                                                                                      .{ .key = "network.search_domains", .value = search_domains, .section = "stored", .json_path = "node.network.search_domains" },                                                                                                                               .{ .key = "network.routes", .value = network_routes, .section = "stored", .json_path = "node.network.routes" },                                                                                                            .{ .key = "overrides.install.storage.mode", .value = if (stored_node.overrides.install.storage.mode) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.mode" },
+        .{ .key = "overrides.install.storage.wipe", .value = if (stored_node.overrides.install.storage.wipe) |value| if (value) "true" else "false" else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.wipe" }, .{ .key = "overrides.install.storage.partition_table", .value = if (stored_node.overrides.install.storage.partition_table) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.partition_table" }, .{ .key = "overrides.system.localization.locale", .value = stored_node.overrides.system.localization.locale orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.locale" },        .{ .key = "overrides.system.localization.timezone", .value = stored_node.overrides.system.localization.timezone orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.timezone" },
+        .{ .key = "overrides.system.localization.keyboard", .value = stored_node.overrides.system.localization.keyboard orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.keyboard" },                   .{ .key = "effective.install.storage.mode", .value = @tagName(storage.mode), .section = "effective", .json_path = "storage.effective.mode" },                                                                                                                 .{ .key = "effective.install.storage.wipe", .value = if (storage.wipe) "true" else "false", .section = "effective", .json_path = "storage.effective.wipe" },                                                               .{ .key = "effective.install.storage.partition_table", .value = @tagName(storage.partition_table), .section = "effective", .json_path = "storage.effective.partition_table" },
+        .{ .key = "effective.install.storage.boot_disk", .value = storage.boot_disk, .section = "effective", .json_path = "storage.effective.boot_disk" },                                                                                          .{ .key = "effective.system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },                                                                        .{ .key = "effective.system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },                               .{ .key = "effective.system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
+        .{ .key = "effective.system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "true" else "false", .section = "effective", .json_path = "effective_system.ssh.enabled" },                                                     .{ .key = "effective.system.security.firewall", .value = @tagName(result.effective_system.security.firewall), .section = "effective", .json_path = "effective_system.security.firewall" },                                                                    .{ .key = "effective.system.security.selinux", .value = @tagName(result.effective_system.security.selinux), .section = "effective", .json_path = "effective_system.security.selinux" },                                    .{ .key = "effective.system.security.apparmor", .value = @tagName(result.effective_system.security.apparmor), .section = "effective", .json_path = "effective_system.security.apparmor" },
+        .{ .key = "runtime.phase", .value = status_phase, .section = "runtime", .json_path = "status.phase" },                                                                                                                                      .{ .key = "runtime.reason", .value = status_reason, .section = "runtime", .json_path = "status.reason" },                                                                                                                                                     .{ .key = "runtime.install_intent", .value = install_intent, .section = "runtime", .json_path = "deployment.install_intent" },                                                                                             .{ .key = "runtime.drift_state", .value = drift_state, .section = "runtime", .json_path = "deployment.drift_state" },
+        .{ .key = "runtime.serial_number", .value = inventory_serial, .section = "runtime", .json_path = "inventory.serial_number" },                                                                                                               .{ .key = "runtime.profile_kind", .value = result.profile.kind, .section = "runtime", .json_path = "profile.kind" },                                                                                                                                          .{ .key = "runtime.boot_bundle", .value = result.profile.boot_bundle orelse "-", .section = "runtime", .json_path = "profile.boot_bundle" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Node {s}", .{stored_node.id});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
@@ -5000,7 +5180,7 @@ fn jsonDisplay(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const u8
     const actual = value orelse return "-";
     return switch (actual) {
         .string => |text| text,
-        .bool => |flag| if (flag) "yes" else "no",
+        .bool => |flag| if (flag) "true" else "false",
         .null => "<unset>",
         .integer => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),
         .float => |number| try std.fmt.allocPrint(allocator, "{d}", .{number}),

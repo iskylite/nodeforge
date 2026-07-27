@@ -206,6 +206,12 @@ pub fn catalogResourcesJson(io: std.Io, port: u16, resource: []const u8, name: ?
     return managementJson(io, port, rendered, output);
 }
 
+/// 查询 BootBundle 集合。list/show 共用同一只读端点，show 由 CLI 在本地按
+/// canonical name 筛选，避免为纯展示再引入一套服务端资源语义。
+pub fn bootBundlesJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    return managementJson(io, port, "/api/v1/management/boot-bundles", output);
+}
+
 pub fn softwareCapabilitiesJson(io: std.Io, port: u16, resource: []const u8, name: []const u8, kind: ?[]const u8, search: ?[]const u8, output: []u8) !?[]const u8 {
     if (!std.mem.eql(u8, resource, "install-sources") and !std.mem.eql(u8, resource, "repositories") and !std.mem.eql(u8, resource, "profiles")) return error.InvalidResource;
     if (!querySafe(name)) return error.InvalidResourceName;

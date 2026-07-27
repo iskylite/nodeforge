@@ -283,6 +283,39 @@ R12 修复了 diskless 终态未同步终止 `boot_session.Store` 的问题，�
 mutation handler）、`src/http/client.zig`（5 个 mutation client 函数新增 `force` 参数）、
 `src/main.zig`（CLI 命令定义新增 `--force` 标志、handler 函数传递 `force` 参数）。
 
+### R14. 多 ISO 展示契约、repository 渲染与 vendor initrd 冷插拔
+
+**问题**：
+1. Ubuntu point release 被截断为 LTS series，`22.04.5` 与其他 `22.04.x` 介质无法保持独立身份。
+2. repository 虽已导入，但 CLI 不能生成可直接使用的 `.repo`/`sources.list`；Profile DTO 也未展示
+   `kind` 和 `boot_bundle`。
+3. 自定义 diskless PID 1 替换 installer initrd 的 systemd 后，没有执行原生 udev coldplug。
+   ISO 内虽然存在匹配的网卡模块，内核却未按 modalias 自动加载，DHCP 报
+   `No broadcast interfaces found`。
+4. `node retry` 只 rearm generation，在 `deploy=false` 时仍无法进入 PXE resolver。
+
+**修订**：
+1. Ubuntu catalog 版本保留完整 point release；APT `Release: Version` 完整性检查单独使用
+   `major.minor` series。资源名、source、profile 和 repository 因而可以按完整版本共存。
+2. 新增 `assets repository render`：DNF 从 catalog 生成 `.repo`，APT 从实际
+   `dists/*/Release` 提取 Codename/Suite 与 Components 生成 `sources.list`。Profile list/show
+   和 Node detail 同时公开 `kind`、`boot_bundle`。
+3. vendor-overlay 构建保持 installer initrd 为逐字节不变前缀，只追加 NodeForge userspace。
+   NodeForge PID 1 挂载 `/proc`、`/sys`、`/dev`、`/run` 后，启动 ISO 自带
+   `systemd-udevd`，依次执行 subsystem/device trigger 和 bounded settle。驱动由 ISO udev 规则
+   与内核 modalias 自动选择；禁止写死、额外注入或主动加载特定网卡模块。
+4. DHCP 客户端使用显式 PATH 和绝对路径；dhclient/udhcpc hook 将 dotted netmask 严格转换为
+   CIDR，并对地址、默认路由写入失败执行 fail closed。
+5. `node retry` 先设置 `deploy=true`，再 rearm generation；human 布尔字段统一为
+   `true`/`false`。`node show` 将 Runtime 放在首区并展示 profile kind/BootBundle。
+
+**重建不变式**：BootBundle 或 initrd revision 改变后，Profile 的 `rootfs_input_digest` 必须变化；
+操作员必须重新执行 `profile rootfs plan` 与带精确 `--if-input-digest` 的 `profile rootfs build`。
+旧 rootfs 不得被新 BootBundle 静默复用。
+
+**验收边界**：静态验收必须证明最终 initrd 以 vendor initrd 为相同字节前缀，overlay 不包含人为
+添加的网卡模块，并包含 udev coldplug、DHCP client 与 hooks。该验收不能替代真实硬件 PXE 启动。
+
 ## 0. 文档结构与阅读路径
 
 ### 0.1 总分职责

@@ -133,6 +133,13 @@ if grep -Fq -- '--rootfs' "$tmp/boot-bundle-create-help"; then
     echo "boot bundle must not own a Profile-derived rootfs artifact" >&2
     exit 1
 fi
+"$cli" assets boot-bundle list --help >"$tmp/boot-bundle-list-help"
+"$cli" assets boot-bundle show --help >"$tmp/boot-bundle-show-help"
+grep -Fq 'BootBundle 名称' "$tmp/boot-bundle-show-help"
+"$cli" assets initrd build --help >"$tmp/initrd-build-help"
+grep -Fq -- '--from-install-source' "$tmp/initrd-build-help"
+grep -Fq -- '--kernel-release' "$tmp/initrd-build-help"
+grep -Fq 'preserves the ISO vendor initrd' "$tmp/initrd-build-help"
 "$cli" profile rootfs plan --help >"$tmp/profile-rootfs-plan-help"
 grep -Fq 'rootfs input digest and cache state' "$tmp/profile-rootfs-plan-help"
 "$cli" profile rootfs build --help >"$tmp/profile-rootfs-build-help"

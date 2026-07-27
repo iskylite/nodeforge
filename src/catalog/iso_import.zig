@@ -430,7 +430,7 @@ fn detectRhelMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []cons
 /// 解析步骤：
 /// 1. 验证必需文件存在（含 casper squashfs）
 /// 2. 读取 `.disk/info` 并解析 distro/version/arch
-/// 3. 版本截取到 major.minor（如 `22.04`），去除 patch 组件
+/// 3. 保留介质发布版本（如 `22.04.5`）；APT Release 校验使用其 LTS series
 /// 4. 始终发布 ISO 媒体树；仅在 APT metadata 完整时创建 repository
 ///
 /// Ubuntu live-server ISO 通常包含 dists/ 和 pool/ 目录，但某些定制或
@@ -455,7 +455,7 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
     const arch = requested.arch orelse if (detected_tuple) |tuple| tuple.arch else return error.MediaTupleMismatch;
     // 只有完整的 dists/pool/Release 才能发布 apt repository；媒体树本身
     // 无论如何都会通过 install source 发布。
-    const has_repository = try ubuntuRepositoryComplete(io, allocator, mount_point, version, arch);
+    const has_repository = try ubuntuRepositoryComplete(io, allocator, mount_point, ubuntuSeries(version), arch);
     return .{
         .family = .ubuntu,
         .distro = distro,
@@ -542,19 +542,27 @@ const UbuntuTuple = struct { version: []const u8, arch: model.Arch };
 
 /// `.disk/info` 在 live-server 介质上是一个人可读字符串，例如：
 /// `Ubuntu-Server 22.04.5 LTS ... arm64 (...)`
-/// 支持的 profile tuple 使用 major.minor（`22.04`），因此有意截取 patch 组件。
+/// 保留完整介质版本，使多个 point release 可以作为独立 source/profile 共存。
 /// 架构从字符串中的 `arm64` 或 `amd64` 关键字检测。
 fn parseUbuntuDiskInfo(info: []const u8) ?UbuntuTuple {
     if (!std.mem.containsAtLeast(u8, info, 1, "Ubuntu-Server")) return null;
     const start = std.mem.indexOf(u8, info, "Ubuntu-Server") orelse return null;
     var tokens = std.mem.tokenizeAny(u8, info[start + "Ubuntu-Server".len ..], " \t\r\n");
     const release = tokens.next() orelse return null;
-    const first_dot = std.mem.indexOfScalar(u8, release, '.') orelse return null;
-    const second_dot = if (std.mem.indexOfScalar(u8, release[first_dot + 1 ..], '.')) |offset| first_dot + 1 + offset else release.len;
-    const version = release[0..second_dot];
+    _ = std.mem.indexOfScalar(u8, release, '.') orelse return null;
+    const version = release;
     if (version.len == 0 or !std.ascii.isDigit(version[0])) return null;
     const arch: model.Arch = if (std.mem.containsAtLeast(u8, info, 1, " arm64")) .aarch64 else if (std.mem.containsAtLeast(u8, info, 1, " amd64")) .x86_64 else return null;
     return .{ .version = version, .arch = arch };
+}
+
+fn ubuntuSeries(version: []const u8) []const u8 {
+    // Ubuntu point release 是 catalog 身份的一部分；Release 文件中的 Version
+    // 通常只声明 LTS series（例如资源 22.04.5 对应 metadata 22.04）。
+    const first_dot = std.mem.indexOfScalar(u8, version, '.') orelse return version;
+    const rest = version[first_dot + 1 ..];
+    const second_dot = std.mem.indexOfScalar(u8, rest, '.') orelse return version;
+    return version[0 .. first_dot + 1 + second_dot];
 }
 
 fn ubuntuArch(arch: model.Arch) []const u8 {
@@ -884,6 +892,7 @@ test "Ubuntu media metadata uses ISO architecture spelling" {
 
 test "Ubuntu disk metadata detects the profile tuple without CLI flags" {
     const tuple = parseUbuntuDiskInfo("Ubuntu-Server 22.04.5 LTS \"Jammy Jellyfish\" - Release arm64 (20230810)").?;
-    try std.testing.expectEqualStrings("22.04", tuple.version);
+    try std.testing.expectEqualStrings("22.04.5", tuple.version);
+    try std.testing.expectEqualStrings("22.04", ubuntuSeries(tuple.version));
     try std.testing.expectEqual(model.Arch.aarch64, tuple.arch);
 }
