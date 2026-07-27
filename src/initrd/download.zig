@@ -60,15 +60,10 @@ fn finalHeaderBlock(headers: []const u8) []const u8 {
     // 响应块。但 1xx 中间响应理论上仍可能出现，最终有效块是最后一个以 `HTTP/`
     // 开头的块。该函数从前往后逐次锚定 `HTTP/`，返回最后一次匹配的子串。
     //
-    // 易错点：响应头里若出现子串 `HTTP/`（例如故障注入服务器默认的
-    // `Server: BaseHTTP/0.6 Python/3.x`），会被误判为新块的起点而把真实块截短。
-    // 因此校验只应锚定行首的 `HTTP/`，但 `indexOfPos` 不区分行首；实际依赖
-    // `tests/v0_2_transfer_fault.sh` 的故障服务器抑制 `Server:` 头来规避。
-    // 生产 nodeforged 不发 `Server` 头，无此风险。
     var result = headers;
     var offset: usize = 0;
     while (std.mem.indexOfPos(u8, headers, offset, "HTTP/")) |index| {
-        result = headers[index..];
+        if (index == 0 or headers[index - 1] == '\n') result = headers[index..];
         offset = index + 5;
     }
     return result;
@@ -130,4 +125,10 @@ test "strict HEAD and Range metadata validation" {
         10,
         etag,
     ));
+}
+
+test "header block detection ignores HTTP token inside header values" {
+    const head = "HTTP/1.1 200 OK\r\nServer: BaseHTTP/0.6 Python/3.12\r\nContent-Length: 10\r\nETag: \"abcdef\"\r\nAccept-Ranges: bytes\r\n\r\n";
+    const parsed = try parseHead(head, 10, "\"abcdef\"");
+    try std.testing.expectEqual(@as(u64, 10), parsed.size);
 }

@@ -103,7 +103,6 @@ pub fn candidates(allocator: std.mem.Allocator, config: *const model.AppConfig, 
     result.catalog.value.schema_version = 3;
     result.catalog.value.discovery_policy.unknown_action = .record;
     try migrateProfiles(result.catalog.arena.allocator(), &result.catalog.value);
-    try migrateNodes(result.catalog.arena.allocator(), &result.catalog.value);
     // 旧版 schema-1 config 可能仍内嵌实体。投影迁移后的 catalog
     // 值，使校验在序列化前看到唯一的所有权世代。
     result.config.value.profiles = result.catalog.value.profiles;
@@ -115,15 +114,6 @@ pub fn candidates(allocator: std.mem.Allocator, config: *const model.AppConfig, 
 fn migrateProfiles(allocator: std.mem.Allocator, catalog: *model.Catalog) !void {
     _ = allocator;
     _ = catalog;
-}
-
-fn migrateNodes(allocator: std.mem.Allocator, catalog: *model.Catalog) !void {
-    const nodes = try allocator.dupe(model.NodeConfig, catalog.nodes);
-    for (nodes) |*node| {
-        if (node.ip) |ip| node.pxe.ip_reservation = ip;
-        node.ip = null;
-    }
-    catalog.nodes = nodes;
 }
 
 fn kernelArgsUnique(args: []const u8) bool {
@@ -162,7 +152,7 @@ test "ownership candidate moves discovery and direct Node facts" {
     const source: model.InstallSourceConfig = .{ .name = "source", .distro = "rocky", .version = "9", .arch = .x86_64, .source_asset = "iso", .installer_kernel = "kernel", .installer_initrd = "initrd" };
     const nodes = [_]model.NodeConfig{
         .{ .id = "unknown", .mac = "02:00:00:00:00:01", .arch = .x86_64, .profile = null, .deploy = false },
-        .{ .id = "target", .mac = "02:00:00:00:00:02", .arch = .x86_64, .profile = "install", .ip = "192.0.2.20", .storage = .{ .boot_disk = "/dev/nvme0n1" }, .network = .{ .mode = .static, .address = "192.0.2.20", .prefix_len = 24 } },
+        .{ .id = "target", .mac = "02:00:00:00:00:02", .arch = .x86_64, .profile = "install", .pxe = .{ .ip_reservation = "192.0.2.20" }, .storage = .{ .boot_disk = "/dev/nvme0n1" }, .network = .{ .mode = .static, .address = "192.0.2.20", .prefix_len = 24 } },
     };
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1" } };
     const catalog: model.Catalog = .{ .profiles = &profiles, .nodes = &nodes, .install_sources = &.{source} };

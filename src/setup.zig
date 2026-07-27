@@ -15,6 +15,9 @@ const deployment_control = @import("state/deployment_control.zig");
 const model_transaction = @import("state/model_transaction.zig");
 const atomicWrite = @import("state/dhcp_store.zig").atomicWrite;
 
+/// 默认安装根的登录 shell 环境脚本固定路径。
+pub const environment_path = "/etc/profile.d/nodeforge.sh";
+
 /// `nodeforge setup` 收集的网络配置输入。
 ///
 /// 这些字段在交互式提示中收集，生成初始 `config.json`。
@@ -122,6 +125,33 @@ pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     const unit = try renderSystemd(allocator, p);
     defer allocator.free(unit);
     try atomicWrite(io, p.service_path, unit);
+    try installEnvironment(io, allocator, p);
+}
+
+/// 渲染登录 shell 的 PATH 初始化脚本。`case` 判断保证重复 source 和重复登录
+/// 不会多次插入同一 bin 目录，也不会覆盖管理员已有的 PATH 顺序。
+pub fn renderEnvironment(allocator: std.mem.Allocator, p: *const paths_mod.Paths) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\# 由 NodeForge setup 管理；setup --reconfigure 会覆盖本地修改。
+        \\case ":$PATH:" in
+        \\  *:"{s}":*) ;;
+        \\  *) export PATH="{s}:$PATH" ;;
+        \\esac
+        \\
+    , .{ p.bin_dir, p.bin_dir });
+}
+
+/// 为默认安装根发布 `/etc/profile.d/nodeforge.sh`。
+///
+/// 自定义安装根常用于测试、并行实例或非 root 部署，不能擅自修改宿主全局
+/// 环境，因此仅 `/opt/nodeforge` 写入 profile.d。发布使用原子替换并固定为
+/// `0644`，保证所有登录用户可读取，同时不允许普通用户修改。
+pub fn installEnvironment(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) !void {
+    if (!std.mem.eql(u8, p.install_root, paths_mod.default_install_root)) return;
+    const content = try renderEnvironment(allocator, p);
+    defer allocator.free(content);
+    try atomicWrite(io, environment_path, content);
+    try chmod(io, allocator, "644", environment_path);
 }
 
 /// 原地升级 schema 1。若后续步骤失败则备份与 marker 保留；因 manifest 提交
@@ -356,4 +386,8 @@ test "generated config and systemd use custom runtime root" {
     defer std.testing.allocator.free(unit);
     try std.testing.expect(std.mem.indexOf(u8, unit, p.nodeforged_path) != null);
     try std.testing.expect(std.mem.indexOf(u8, unit, "--config") == null);
+    const environment = try renderEnvironment(std.testing.allocator, &p);
+    defer std.testing.allocator.free(environment);
+    try std.testing.expect(std.mem.indexOf(u8, environment, p.bin_dir) != null);
+    try std.testing.expect(std.mem.indexOf(u8, environment, "export PATH=") != null);
 }

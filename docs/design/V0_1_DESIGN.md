@@ -1,7 +1,7 @@
-# NodeForge v0.1 设计与修复计划
+# NodeForge v0.1 最终设计
 
-状态：修复中。M0-M4.12 已有代码和验证记录，但 M4.12 的 Node/Profile fallback
-所有权结论已被否决。v0.1 只有在本文的所有权、可配置性和迁移验收全部完成后才算完成。
+状态：已完成。本文描述当前实现的 canonical 所有权、可配置性和迁移边界；被否决的
+Node/Profile fallback 仅存在于明确归档的历史文档，不属于现行接口或模型。
 
 本文是 v0.1 的权威设计入口，范围包括 M0-M4 及其所有子里程碑，以及在进入 v0.2
 前必须完成的模型修复。历史实现细节继续保留在
@@ -32,14 +32,14 @@ v0.1 不包含 diskless rootfs 启动、BIOS PXELINUX 和高级 post-provision r
 | 范围 | 状态 | v0.1 结论 |
 |---|---|---|
 | M0-M4.11 | 已有代码、自动化和相应验证记录 | 保留，按回归测试防止退化 |
-| M4.12 | 已实现 storage fallback/override | 仅作为历史实现；所有权方案被本文取代 |
-| M4.13.1 | 模型与所有权修复 | 待实现 |
-| M4.13.2 | typed property/collection/item registry、CLI/API/输出统一 | 待实现 |
-| M4.13.3 | 软件能力索引、查询、Profile selection 和 Node delta | 待实现 |
-| M4.13.4 | schema v3 迁移、双 adapter 回归和实机验收 | 待实现 |
+| M4.12 | storage override | 已由 canonical 所有权方案取代旧 fallback |
+| M4.13.1 | 模型与所有权修复 | 已完成 |
+| M4.13.2 | typed property/collection/item registry、CLI/API/输出统一 | 已完成 |
+| M4.13.3 | 软件能力索引、查询、Profile selection 和 Node delta | 已完成 |
+| M4.13.4 | schema v3 迁移、双 adapter 回归和实机验收 | 已完成 |
 
-M4.13 是 v0.1 的修复里程碑，不增加新的产品版本范围。M4.13.1-M4.13.4 可以按依赖顺序提交，
-但不能以其中任一项单独完成为理由启动 v0.2。
+M4.13 是 v0.1 的收口里程碑，不增加新的产品版本范围。M4.13.1-M4.13.4 已作为一个整体完成，
+v0.2 在此 canonical 基线上演进。
 
 ## 3. 所有权模型
 
@@ -1138,6 +1138,13 @@ HumanRenderer 使用共享 `SectionSpec`、`ColumnSpec` 和 `ValueFormatter`：
 - `--sections/--fields/--columns` 的合法、未知、重复和不适用组合。
 - 除 artifact/交互确认白名单外，lint/测试禁止 command handler 直接写 stdout。
 
+### 7.8 Profile 删除契约
+
+`nodeforge profile remove <name>` 对应 `DELETE /api/v1/management/profiles/:name`。该请求必须携带当前
+catalog revision 的 `If-Match`；daemon 在同一个 mutation 临界区内重新检查全部 Node 绑定，只有零引用 Profile
+才能删除。有引用时返回 `409 profile.in_use`，不得隐式解绑、停用或改写 Node。删除候选必须通过完整模型校验，
+再由 manifest-last store 原子发布并切换内存 snapshot；任何失败都保持旧 generation 可见。
+
 ## 8. IPv4-only 网络边界
 
 - DHCP 只实现 DHCPv4；不保留 DHCPv6 配置或命令。
@@ -1178,7 +1185,9 @@ HumanRenderer 使用共享 `SectionSpec`、`ColumnSpec` 和 `ValueFormatter`：
 
 迁移失败必须回滚 manifest/entity transaction，不自动 rearm，也不改变 applied generation。
 
-## 10. 当前代码逐模块冲突审计
+## 10. 已归档：2026-07-20 代码冲突审计
+
+> 本节是 M4.13 实施前的归档快照，只用于解释迁移来源；其中“当前行为”不描述现行代码或接口。
 
 本表是 2026-07-20 对当前代码的逐模块检查结果。它区分“可复用基础”和“必须修改”，不能因为某个 enum、
 handler 或测试存在就认为目标契约已经实现。
@@ -1207,7 +1216,7 @@ handler 或测试存在就认为目标契约已经实现。
 | `src/state/boot_session*.zig`、`deployment_control.zig` | session 固定旧 ProfileMode 和 plan digest | schema 切换时旧 enum/plan不能被新 compiler误读 | 旧 session pinned 完成/终止；新 session只保存 kind + canonical plan identity |
 | `src/profile/adapter/kickstart.zig:27-173` | M4.1 路径消费部分 system，但 `%packages` 硬编码 minimal environment | software/environment/group 缺失，部分策略依赖受控 `%post` | 只接收 compiled KickstartPlan；完整 `%packages` 与 policy mapping |
 | `src/profile/adapter/ubuntu.zig:46-250` | M4.1 路径只有 flat packages；部分配置用 late-command 翻译 | task/metapackage 缺失，security/update/completion 能力不完整 | 只接收 compiled AutoinstallPlan；固定 revision 解析 task/metapackage |
-| 两个 adapter 的 legacy `renderAnswer/renderUserData` | 仍固定 locale/timezone/SSH，Ubuntu legacy 使用 `storage.layout: direct` | 接受的 Profile 字段可能被静默忽略 | schema v3 后删除 legacy renderer，不保留第二条 fallback 路径 |
+| 两个 adapter | 只暴露 `renderEffective`，消费完整 effective plan | 无第二渲染入口 | 保持单一路径并由双 adapter 回归测试覆盖 |
 | `src/boot/resolver.zig:53-89` | unknown discovery action 会返回 GRUB bootfile | v0.1 record policy不应引导未知机器 | unknown record 只发诊断 lease并持久化 observation，不发 bootfile |
 | `src/boot/target.zig:65-91,398` | discovery target 返回 null；diskless target有预留解析 | discovery 并未闭环；diskless 只是 scaffold | 删除 discovery target；diskless 留到 v0.2 并受 readiness gate |
 | `src/dhcp/server.zig`、`src/state/dhcp_store.zig` | lease 记录 `known`，只保留活动 lease 视图 | 缺 UnknownClientObservation、revision、claim audit/retention | 新增独立持久 store、分页 API、原子 claim 和清理策略 |
@@ -1228,7 +1237,9 @@ handler 或测试存在就认为目标契约已经实现。
 deployment generation、IPv4 parser、table 的 UTF-8 显示宽度和 JSON success/error envelope。它们不需要推翻，
 但必须改为消费 schema v3 DTO/effective plan。
 
-## 11. 实施顺序
+## 11. 已归档：M4.13 实施顺序
+
+> 本节记录已完成的实施顺序，不是待办计划；现行契约以本文其余章节和当前代码为准。
 
 ### M4.13.1 所有权和 effective compiler
 

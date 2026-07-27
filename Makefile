@@ -27,7 +27,7 @@ linux-arm64-debug: ## Cross-compile Debug binaries for Linux aarch64 development
 	$(ZIG) build -Dtarget=$(LINUX_ARM64_TARGET) -Doptimize=Debug
 
 define package_dist
-	@v=$$(sed -n 's/.*"version", "\([^"]*\)".*/\1/p' build.zig); \
+	@v=$$(sed -n 's/^const nodeforge_version = "\([^"]*\)";.*/\1/p' build.zig); \
 	commit=$$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown); \
 	date=$$(date -u +%Y%m%d); \
 	pkg=nodeforge-v$$v-$$date+git$$commit-$(1); \

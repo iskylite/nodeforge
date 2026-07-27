@@ -30,10 +30,6 @@ pub fn effectiveInstall(node: *const model.NodeConfig, profile: *const model.Pro
         .updates = policy_install.updates,
         .proxy = policy_install.proxy,
         .post_install = policy_install.post_install,
-        .packages = policy_install.packages,
-        .users = policy_install.users,
-        .ssh_authorized_keys = policy_install.ssh_authorized_keys,
-        .bundle = policy_install.bundle,
     };
     // schema v3 物理设备始终为 Node 持有。调用方 scratch 为
     // 现有消费者保持默认单盘成员列表零分配。
@@ -64,7 +60,6 @@ test "M4.2 implicit users default" {
     const default_system = try effectiveSystem(&base);
     try std.testing.expectEqual(@as(usize, 1), default_system.users.len);
     try std.testing.expectEqualStrings("nodeforge", default_system.users[0].name);
-
 }
 
 pub fn planDigest(allocator: std.mem.Allocator, node: *const model.NodeConfig, profile: *const model.ProfileConfig, source: *const model.InstallSourceConfig) !u64 {
@@ -162,7 +157,7 @@ test "kickstart consumes the effective node storage override" {
     const node: model.NodeConfig = .{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "rocky", .storage = .{ .boot_disk = "/dev/nvme0n1" } };
     var scratch: [1][]const u8 = undefined;
     const install = try effectiveInstall(&node, &profile, &scratch);
-    const answer = try kickstart.renderAnswer(std.testing.allocator, &node, install, "http://repo", null, "http://event", "0123456789abcdef0123456789abcdef", "token");
+    const answer = try kickstart.renderEffective(std.testing.allocator, &node, install, .{}, node.network, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(answer);
     try std.testing.expect(std.mem.indexOf(u8, answer, "clearpart --all --initlabel --drives=nvme0n1") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "--drives=sda") == null);

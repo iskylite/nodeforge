@@ -32,6 +32,8 @@ const software_index = @import("software_index.zig");
 /// 已知产品从媒体标签映射，未知产品只有提供 `distro` 时才继续。
 pub const Request = struct {
     filename: []const u8,
+    /// 原始 ISO basename，仅用于默认逻辑命名；文件访问始终使用 filename。
+    original_filename: []const u8,
     name: ?[]const u8 = null,
     /// 可选的产品覆盖。family 始终由 ISO 布局决定；提供的值直接采用，
     /// 不与媒体元数据比对，用于已知布局但标签未知或元数据不完整的介质。
@@ -97,6 +99,7 @@ pub const Result = struct {
 /// 临时工作目录在函数返回时通过 defer 清理（deleteTree）。
 pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, request: Request) !Result {
     if (!safeFilename(request.filename)) return error.UnsafeImportFilename;
+    if (!safeFilename(request.original_filename) or !std.mem.endsWith(u8, request.original_filename, ".iso")) return error.UnsafeImportFilename;
 
     // `sha256File` 在受管根下以 NOFOLLOW+RESOLVE_BENEATH 方式打开文件，
     // 验证暂存输入是普通非符号链接文件。同时计算 SHA-256 用于 catalog 发布。
@@ -138,11 +141,10 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     const source_name = if (request.name) |name|
         try allocator.dupe(u8, name)
     else blk: {
-        const version_slug = try logicalComponent(allocator, detected.version);
-        defer allocator.free(version_slug);
-        break :blk try std.fmt.allocPrint(allocator, "{s}-{s}-{s}-iso", .{ detected.distro, version_slug, @tagName(detected.arch) });
+        const stem = request.original_filename[0 .. request.original_filename.len - ".iso".len];
+        break :blk try logicalComponent(allocator, stem);
     };
-    const iso_rel = try allocator.dupe(u8, request.filename);
+    const iso_rel = try std.fmt.allocPrint(allocator, "{s}.iso", .{source_name});
     const kernel_rel = try std.fmt.allocPrint(allocator, "install/{s}/vmlinuz", .{source_name});
     const initrd_rel = try std.fmt.allocPrint(allocator, "install/{s}/initrd.img", .{source_name});
     const bootloader_media_rel = findBootloaderMediaPath(io, staged_repo, detected.arch);
@@ -277,9 +279,9 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
         } else null,
         .bootloader_created = bootloader_created,
         // kernel 资产名称使用 -kernel（而非 -installer-kernel），因为 kind=kernel 的
-// 资产既用于 install PXE boot 也用于 diskless PXE boot。boot bundle 的 kernel
-// 字段引用此资产。命名应反映通用性，不暗示仅限 installer 使用。
-.kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
+        // 资产既用于 install PXE boot 也用于 diskless PXE boot。boot bundle 的 kernel
+        // 字段引用此资产。命名应反映通用性，不暗示仅限 installer 使用。
+        .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
         .initrd_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .kind = .installer_initrd, .path = initrd_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &initrd_hash) },
         .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = model.packageManagerForFamily(detected.family), .base_url = if (base.len == 0) try allocator.dupe(u8, media_tree_url) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base }), .software_index = repository_index } else null,
         .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names },
@@ -678,7 +680,6 @@ fn copyFileNoClobber(io: std.Io, allocator: std.mem.Allocator, source: []const u
 ///
 /// 该设计消除了 `copyFileIfMissing`/`sha256Path` 的内容比较需求和
 /// `BootloaderContentConflict` 错误。`sha256Path` 仍用于计算内容寻址哈希。
-
 /// 对 importer 已约束出的普通文件路径计算原始 SHA-256。source 来自只读
 /// mount 的已验证 EFI 路径，destination 位于受管 TFTP root；调用方不得将
 /// 未验证的 HTTP/CLI 路径传入本函数。
@@ -861,6 +862,12 @@ test "automatic media name canonicalizes vendor version text" {
     const value = try logicalComponent(std.testing.allocator, "V10 SP3");
     defer std.testing.allocator.free(value);
     try std.testing.expectEqualStrings("v10-sp3", value);
+}
+
+test "ISO basename canonicalizes into a universal default source name" {
+    const value = try logicalComponent(std.testing.allocator, "Kylin-Server-V10-SP3-2403-Release-20240426-ARM64");
+    defer std.testing.allocator.free(value);
+    try std.testing.expectEqualStrings("kylin-server-v10-sp3-2403-release-20240426-arm64", value);
 }
 
 test "Ubuntu media metadata uses ISO architecture spelling" {

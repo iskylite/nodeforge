@@ -44,6 +44,8 @@ pub const AssetImport = struct {
 pub const InstallSourceImport = struct {
     /// 已暂存到 import_dir 的 ISO 文件名（不含路径前缀），由 CLI 生成。
     filename: []const u8,
+    /// 用户选择的 ISO basename，仅用于生成默认逻辑名称，不用于文件访问。
+    original_filename: []const u8,
     content_sha256: []const u8,
     idempotency_key: []const u8,
     name: ?[]const u8 = null,
@@ -412,6 +414,16 @@ pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []
     return managementMutation(io, port, "POST", "/api/v1/management/profiles", rendered, revision, reason_buf);
 }
 
+/// 删除未被 Node 引用的 Profile。客户端先读取当前 catalog revision，并通过
+/// `If-Match` 提交 DELETE，确保检查引用关系和删除发生在同一 generation 上。
+pub fn profileRemove(io: std.Io, port: u16, name: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}", .{name}) catch return .{ .reachable = false, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "DELETE", route, "", revision, reason_buf);
+}
+
 /// v0.2 boot-bundle 创建：diskless profile 引用的 kernel/initrd 组合。
 /// CLI 命令 `nodeforge assets boot-bundle create` 调用此函数。
 /// 三个资产必须已通过 `nodeforge assets register` 注册到 catalog 中。
@@ -722,10 +734,10 @@ pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) 
     inline for ([_]?[]const u8{ request.name, request.distro, request.version, request.arch }) |optional|
         if (optional) |value|
             if (!querySafe(value)) return error.InvalidInstallSourceField;
-    const Wire = struct { filename: []const u8, sha256: []const u8, name: ?[]const u8, distro: ?[]const u8, version: ?[]const u8, arch: ?[]const u8 };
+    const Wire = struct { filename: []const u8, original_filename: []const u8, sha256: []const u8, name: ?[]const u8, distro: ?[]const u8, version: ?[]const u8, arch: ?[]const u8 };
     var body_writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer body_writer.deinit();
-    try std.json.Stringify.value(Wire{ .filename = request.filename, .sha256 = request.content_sha256, .name = request.name, .distro = request.distro, .version = request.version, .arch = request.arch }, .{ .emit_null_optional_fields = true }, &body_writer.writer);
+    try std.json.Stringify.value(Wire{ .filename = request.filename, .original_filename = request.original_filename, .sha256 = request.content_sha256, .name = request.name, .distro = request.distro, .version = request.version, .arch = request.arch }, .{ .emit_null_optional_fields = true }, &body_writer.writer);
     var response: [16 * 1024]u8 = undefined;
     var location: [256]u8 = undefined;
     var reply = try managementPostJson(io, port, "/api/v1/management/install-sources", body_writer.written(), request.idempotency_key, &response, &location);
@@ -804,7 +816,7 @@ fn readHttpResponse(reader: *std.Io.Reader, output: []u8, location_out: ?[]u8) !
         };
     }
     const length = content_length orelse if (status == 204) @as(usize, 0) else return error.MissingContentLength;
-    if (length > output.len or length > 150 * 1024) return error.ResponseTooLarge;
+    if (length > output.len) return error.ResponseTooLarge;
     if (length == 0) return .{ .status = status, .body = output[0..0], .location = location };
     reader.readSliceAll(output[0..length]) catch return error.TruncatedResponse;
     return .{ .status = status, .body = output[0..length], .location = location };
@@ -818,6 +830,18 @@ test "bounded response reader handles multiline and protocol failures" {
     try std.testing.expectError(error.UnsupportedTransferEncoding, readHttpResponse(&chunked, &output, null));
     var truncated: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort");
     try std.testing.expectError(error.TruncatedResponse, readHttpResponse(&truncated, &output, null));
+}
+
+test "bounded response reader honors caller capacity above 150 KiB" {
+    const body_len = 160 * 1024;
+    var response: [body_len + 64]u8 = undefined;
+    const header = try std.fmt.bufPrint(&response, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body_len});
+    @memset(response[header.len .. header.len + body_len], 'x');
+    var source: std.Io.Reader = .fixed(response[0 .. header.len + body_len]);
+    var output: [body_len]u8 = undefined;
+    const reply = try readHttpResponse(&source, &output, null);
+    try std.testing.expectEqual(body_len, reply.body.?.len);
+    try std.testing.expectEqual(@as(u8, 'x'), reply.body.?[body_len - 1]);
 }
 
 test "readHttpResponse handles 204 empty body and captures Location" {

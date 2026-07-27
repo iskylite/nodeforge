@@ -71,6 +71,7 @@ pub const properties = [_]PropertySpec{
     .{ .owner = .node, .path = "http_accel", .kind = .boolean, .applicability = .uefi_grub },
     .{ .owner = .node, .path = "network.mode", .kind = .enumeration },
     .{ .owner = .node, .path = "network.interface_name", .kind = .string, .optional = true },
+    .{ .owner = .node, .path = "network.match_mac", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "network.address", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "network.prefix_len", .kind = .positive_integer, .optional = true },
     .{ .owner = .node, .path = "network.gateway", .kind = .string, .optional = true },

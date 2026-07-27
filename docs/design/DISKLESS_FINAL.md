@@ -130,6 +130,17 @@ hosts/known_hosts、sshd、本地化/NTP/security、software/service exact trans
 agent 不在节点侧重新 merge Profile/Node，也不读取“最新”catalog。Profile 完整基线已在 rootfs；AgentPlan 只交付
 Node effective 差量，不重复交付 Profile SSH private keys。
 
+### initrd DHCP 客户端边界
+
+`nodeforged` 的内置 DHCP 实现是监听 UDP/67、分配租约并生成 PXE 响应的 server，不能作为启动节点上
+监听 UDP/68、执行 DISCOVER/OFFER/REQUEST/ACK 并配置本地地址/路由的 client 复用。NodeForge overlay
+还会以自己的 `/init` 接管 PID 1，因此不能假定 vendor dracut/NetworkManager 的正常 hook 已经执行。
+
+initrd 网络初始化按以下顺序收敛：复用已有全局 IPv4 地址；优先调用 vendor initrd 常见的 BusyBox
+`udhcpc`；没有 `udhcpc` 时回退到构建器连同动态依赖注入的 `dhclient`。两者都只调用 NodeForge 提供的
+最小地址/默认路由 hook，并采用有界重试。保留 `dhclient` fallback 是为了 Rocky 与 Ubuntu vendor initrd
+差异下的确定性，不把 daemon 的 server 状态机、租约存储和额外攻击面复制进早期启动 PID 1。
+
 完整启动时序（其中 1-4 由 initrd 在 `switch_root` 前完成）：
 
 1. DHCP/TFTP 引导 boot bundle（kernel + 共享 NodeForge initrd）和 per-session credential capsule；GRUB 将

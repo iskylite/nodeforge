@@ -416,6 +416,13 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addDebugFlag(profile_create);
     try profile_create.addFlag(.{ .name = "kind", .description = "Profile kind: install (default) or diskless", .type = .String, .default_value = .{ .String = "install" } });
     try profile_create.addFlag(.{ .name = "boot-bundle", .description = "Boot bundle name (required for --kind diskless)", .type = .String, .default_value = .{ .String = "" } });
+    // Profile 删除只开放零引用场景；引用保护由 daemon 在同一 catalog revision
+    // 内执行，CLI 不做可能过期的本地预判。
+    const profile_remove = try zli.Command.init(init_options, .{ .name = "remove", .description = "Remove an unreferenced profile" }, profileRemoveHandler);
+    try profile_remove.addPositionalArg(.{ .name = "name", .description = "Profile name", .required = true });
+    try addConfigPathFlag(profile_remove);
+    try addOutputFlag(profile_remove);
+    try addDebugFlag(profile_remove);
     const profile_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List PXE profiles" }, profileListHandler);
     try addConfigPathFlag(profile_list);
     try addOutputFlag(profile_list);
@@ -471,7 +478,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(profile_rootfs_status);
     try addDebugFlag(profile_rootfs_status);
     try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_build, profile_rootfs_register, profile_rootfs_status });
-    try profile.addCommands(&.{ profile_create, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
+    try profile.addCommands(&.{ profile_create, profile_remove, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
     try addValuesCommands(profile, init_options, "profile");
     try addItemCommands(profile, init_options, "profile");
     try addProfileSoftwareCommands(profile, init_options);
@@ -1507,6 +1514,7 @@ fn setupHandler(ctx: zli.CommandContext) !void {
     // 配置导入不得改写。运行中的 daemon 只在重启后加载新 pair。
     if (imported_config != null) try nodeforge.config_store.save(ctx.io, ctx.allocator, p.config_path, startup_config);
     try nodeforge.dhcp_store.atomicWrite(ctx.io, p.service_path, unit);
+    try nodeforge.setup.installEnvironment(ctx.io, ctx.allocator, p);
     const schema_text = try std.fmt.allocPrint(ctx.allocator, "{d}", .{startup_config.schema_version});
     defer ctx.allocator.free(schema_text);
     if (imported_config != null)
@@ -1629,8 +1637,8 @@ fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
     try command.addPositionalArg(.{ .name = "iso-path", .description = "Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso", .required = true });
     try command.addFlags(&.{
         .{ .name = "distro", .description = "Override an unknown or ambiguous product id; e.g. rocky, kylin, ubuntu. Family still comes from ISO layout", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "name", .description = "Explicit canonical logical name; e.g. rocky-9.7-aarch64-dvd", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "version", .description = "Override auto-detected version; e.g. 9.7, 22.04. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "name", .description = "Override the ISO-basename-derived install-source/profile name; e.g. kylin-v10-sp3-2403", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "version", .description = "Override auto-detected catalog version; e.g. V10-SP3-2403-Release-20240426. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "arch", .description = "Override auto-detected arch; e.g. aarch64, x86_64. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
     });
     return command;
@@ -2241,6 +2249,7 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
     const import_key = installImportKey(staged.sha256, if (name.len == 0) null else name, if (distro.len == 0) null else distro, if (version.len == 0) null else version, if (arch.len == 0) null else arch);
     const imported = nodeforge.management_client.importInstallSource(ctx.io, parsed_config.value.server.http_port, .{
         .filename = staged.filename,
+        .original_filename = std.fs.path.basename(iso_path),
         .content_sha256 = &staged.sha256,
         .idempotency_key = &import_key,
         .name = if (name.len == 0) null else name,
@@ -3423,7 +3432,7 @@ const NodeListViewRevision = struct { config: u64, catalog: u64, node_status: u6
 const NodeListItem = struct {
     id: []const u8,
     mac: []const u8,
-    ip: ?[]const u8,
+    pxe: struct { ip_reservation: ?[]const u8 },
     profile: ?[]const u8,
     deploy: bool,
     install_intent: []const u8,
@@ -3517,7 +3526,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
         cells[index] = .{
             item.id,
             item.mac,
-            item.ip orelse "-",
+            item.pxe.ip_reservation orelse "-",
             item.profile orelse "<unassigned>",
             if (item.deploy) "yes" else "no",
             item.install_intent,
@@ -3695,8 +3704,7 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
         .{ .key = "system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" }, .{ .key = "system.connectivity.time_sync", .value = if (result.effective_system.connectivity.time_sync) "yes" else "no", .section = "effective", .json_path = "effective_system.connectivity.time_sync" }, .{ .key = "system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.enabled" },  .{ .key = "system.ssh.password_authentication", .value = if (result.effective_system.ssh.password_authentication) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.password_authentication" }, .{ .key = "system.ssh.root_login", .value = result.effective_system.ssh.root_login, .section = "effective", .json_path = "effective_system.ssh.root_login" },                .{ .key = "system.ssh.root_password", .value = if (result.effective_system.ssh.root_password != null) "<redacted>" else "<unset>", .section = "effective", .json_path = "effective_system.ssh.root_password" },
         .{ .key = "system.security.firewall", .value = result.effective_system.security.firewall, .section = "effective", .json_path = "effective_system.security.firewall" },             .{ .key = "system.security.selinux", .value = result.effective_system.security.selinux, .section = "effective", .json_path = "effective_system.security.selinux" },                                        .{ .key = "system.security.apparmor", .value = result.effective_system.security.apparmor, .section = "effective", .json_path = "effective_system.security.apparmor" },     .{ .key = "install.apt.fallback", .value = @tagName(install.apt.fallback), .section = "effective", .json_path = "install.apt.fallback" },                                                                                 .{ .key = "install.completion.action", .value = @tagName(install.completion.action), .section = "effective", .json_path = "install.completion.action" },                     .{ .key = "install.updates.mode", .value = @tagName(install.updates.mode), .section = "effective", .json_path = "install.updates.mode" },
         .{ .key = "install.proxy.url", .value = install.proxy.url orelse "<unset>", .section = "effective", .json_path = "install.proxy.url" },                                            .{ .key = "install.reinstall_policy", .value = @tagName(install.reinstall_policy), .section = "effective", .json_path = "install.reinstall_policy" },                                                      .{ .key = "install.post_install.bundle", .value = install.post_install.bundle orelse "<unset>", .section = "effective", .json_path = "install.post_install.bundle" },      .{ .key = "capability.family", .value = result.capability.family, .section = "capabilities" },                                                                                                                            .{ .key = "capability.install_adapter", .value = result.capability.install_adapter, .section = "capabilities" },                                                             .{ .key = "capability.package_manager", .value = result.capability.package_manager, .section = "capabilities" },
-        .{ .key = "validation.valid", .value = if (result.validation.valid) "yes" else "no", .section = "runtime" },                                                                       .{ .key = "model_revision.config", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.config}), .section = "runtime" },                                                         .{ .key = "model_revision.catalog", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.catalog}), .section = "runtime" },                       .{ .key = "nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.nodes.len}), .section = "runtime" },                                                                                                    .{ .key = "assets", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.assets.len}), .section = "runtime" },
-        .{ .key = "assets.paths", .value = assets_buf.written(), .section = "assets" },
+        .{ .key = "validation.valid", .value = if (result.validation.valid) "yes" else "no", .section = "runtime" },                                                                       .{ .key = "model_revision.config", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.config}), .section = "runtime" },                                                         .{ .key = "model_revision.catalog", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.model_revision.catalog}), .section = "runtime" },                       .{ .key = "nodes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.nodes.len}), .section = "runtime" },                                                                                                    .{ .key = "assets", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{result.assets.len}), .section = "runtime" },                                                     .{ .key = "assets.paths", .value = assets_buf.written(), .section = "assets" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Profile {s}", .{result.name});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
@@ -3740,6 +3748,26 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
     }
     const human = try std.fmt.allocPrint(ctx.allocator, "{s} profile created: {s}", .{ kind, name });
     try renderCommandResult(ctx, human, .{ .profile = name, .mode = kind, .install_source = install_source, .boot_bundle = bundle_opt });
+}
+
+/// 通过本机 management API 删除一个零引用 Profile。所有错误均复用 mutation
+/// 信封，因此 `profile.in_use`、revision 冲突和 daemon 不可达具有一致退出码。
+fn profileRemoveHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const name = ctx.getArg("name") orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.profileRemove(ctx.io, config.value.server.http_port, name, &reason);
+    if (!result.healthy) {
+        try reportMutationFailure(ctx, result, "profile remove failed: daemon unreachable");
+        return;
+    }
+    const human = try std.fmt.allocPrint(ctx.allocator, "profile removed: {s}", .{name});
+    try renderCommandResult(ctx, human, .{ .name = name });
 }
 
 fn bootBundleCreateHandler(ctx: zli.CommandContext) !void {
@@ -4086,7 +4114,7 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     defer ctx.allocator.free(bootstrap_key);
     var preview_bundle: ?ResolvedPreviewBundle = null;
     defer if (preview_bundle) |*value| value.deinit(ctx.allocator);
-    const bundle = if (effective_plan.install.post_install.bundle orelse effective_plan.install.bundle) |name| blk: {
+    const bundle = if (effective_plan.install.post_install.bundle) |name| blk: {
         preview_bundle = resolvePreviewBundle(ctx.allocator, catalog.value(), name, config.value.server.server_ip, config.value.server.http_port) catch {
             try errorWriter(ctx).writeAll("error: install: provision bundle or managed-file asset unavailable\n");
             setExitCode(ctx, 1);
@@ -4312,10 +4340,10 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     const config_path = ctx.flag("config", []const u8);
     const node_id = ctx.getArg("node_id") orelse return;
-    const patch = parseNodeProperties(ctx.allocator, ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
-    const mac = patch.mac orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
-    const arch = patch.arch orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
-    const profile = patch.profile orelse return nodePropertyError(ctx, error.MissingRequiredAttribute);
+    const parsed_node = parseNodeProperties(node_id, ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
+    const node_value = parsed_node.node;
+    if (!parsed_node.mac_set or !parsed_node.arch_set or !parsed_node.pxe_ip_reservation_set) return nodePropertyError(ctx, error.MissingRequiredAttribute);
+    if (node_value.profile == null and node_value.deploy) return nodePropertyError(ctx, error.ProfileRequiredWhileDeployed);
 
     var config = loadConfig(ctx.io, ctx.allocator, config_path, errorWriter(ctx), ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
@@ -4323,7 +4351,11 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     // hostname 未显式指定时默认使用 node_id，使 kickstart/answer 渲染无需特殊回退逻辑。
-    const body = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .id = node_id, .mac = mac, .arch = arch, .profile = profile, .pxe = model.PxeConfig{ .ip_reservation = patch.pxe_ip_reservation }, .hostname = patch.hostname orelse node_id, .deploy = patch.deploy orelse true, .http_accel = patch.http_accel orelse false, .storage = model.NodeStorageConfig{ .boot_disk = patch.storage_boot_disk orelse "/dev/sda" }, .network = model.TargetNetworkConfig{ .mode = patch.network_mode orelse .dhcp, .interface = patch.network_interface, .address = patch.network_address, .prefix_len = patch.network_prefix_len, .gateway = patch.network_gateway } }, .{ .emit_null_optional_fields = false });
+    var request_node = node_value;
+    if (request_node.hostname == null) request_node.hostname = node_id;
+    // 只序列化管理 API 的 canonical schema-v3 Node DTO。profile 可为 null，
+    // 未认领节点 (`deploy=false`) 必须显式发送 `"profile":null`。
+    const body = try serializeNodeAddRequest(ctx.allocator, request_node);
     defer ctx.allocator.free(body);
     var reason: [256]u8 = undefined;
     const node_result = nodeforge.management_client.nodeAdd(ctx.io, config.value.server.http_port, body, &reason);
@@ -4332,7 +4364,11 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
         return;
     }
     const human = try std.fmt.allocPrint(ctx.allocator, "node added: {s}", .{node_id});
-    try renderCommandResult(ctx, human, .{ .node_id = node_id, .mac = mac, .profile = profile });
+    try renderCommandResult(ctx, human, .{ .node_id = node_id, .mac = node_value.mac, .profile = node_value.profile });
+}
+
+fn serializeNodeAddRequest(allocator: std.mem.Allocator, node: model.NodeConfig) ![]u8 {
+    return nodeforge.catalog_schema_v3_dto.renderNode(allocator, node);
 }
 
 fn nodeSetHandler(ctx: zli.CommandContext) !void {
@@ -4366,10 +4402,9 @@ fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
     try mutateScalarBatchCli(ctx, "node", node_id, mutations.items, ctx.flag("force", bool));
 }
 
-const NodeProperties = struct { mac: ?[]const u8 = null, arch: ?model.Arch = null, profile: ?[]const u8 = null, pxe_ip_reservation: ?[]const u8 = null, hostname: ?[]const u8 = null, deploy: ?bool = null, http_accel: ?bool = null, storage_boot_disk: ?[]const u8 = null, network_mode: ?model.NetworkMode = null, network_interface: ?[]const u8 = null, network_address: ?[]const u8 = null, network_prefix_len: ?u8 = null, network_gateway: ?[]const u8 = null };
-fn parseNodeProperties(allocator: std.mem.Allocator, values: []const []const u8) !NodeProperties {
-    _ = allocator;
-    var result: NodeProperties = .{};
+const ParsedNodeProperties = struct { node: model.NodeConfig, mac_set: bool = false, arch_set: bool = false, pxe_ip_reservation_set: bool = false };
+fn parseNodeProperties(node_id: []const u8, values: []const []const u8) !ParsedNodeProperties {
+    var result: ParsedNodeProperties = .{ .node = .{ .id = node_id, .mac = "", .arch = .x86_64 } };
     var seen: std.StringHashMap(void) = .init(std.heap.page_allocator);
     defer seen.deinit();
     for (values) |item| {
@@ -4379,14 +4414,47 @@ fn parseNodeProperties(allocator: std.mem.Allocator, values: []const []const u8)
         if (key.len == 0 or value.len == 0) return error.InvalidAttribute;
         if (seen.contains(key)) return error.DuplicateAttribute;
         try seen.put(key, {});
-        if (std.mem.eql(u8, key, "mac")) result.mac = value else if (std.mem.eql(u8, key, "arch")) result.arch = std.meta.stringToEnum(model.Arch, value) orelse return error.InvalidAttribute else if (std.mem.eql(u8, key, "profile")) result.profile = value else if (std.mem.eql(u8, key, "pxe.ip_reservation")) result.pxe_ip_reservation = value else if (std.mem.eql(u8, key, "hostname")) result.hostname = value else if (std.mem.eql(u8, key, "deploy")) result.deploy = parseStrictBool(value) orelse return error.InvalidAttribute else if (std.mem.eql(u8, key, "http_accel")) result.http_accel = parseStrictBool(value) orelse return error.InvalidAttribute else if (std.mem.eql(u8, key, "storage.boot_disk")) result.storage_boot_disk = value else if (std.mem.eql(u8, key, "network.mode")) result.network_mode = std.meta.stringToEnum(model.NetworkMode, value) orelse return error.InvalidAttribute else if (std.mem.eql(u8, key, "network.interface_name")) result.network_interface = value else if (std.mem.eql(u8, key, "network.address")) result.network_address = value else if (std.mem.eql(u8, key, "network.prefix_len")) result.network_prefix_len = std.fmt.parseInt(u8, value, 10) catch return error.InvalidAttribute else if (std.mem.eql(u8, key, "network.gateway")) result.network_gateway = value else return error.UnknownAttribute;
+        const spec = nodeforge.cli_properties.property(.node, key) orelse {
+            if (nodeforge.cli_properties.collection(.node, key) != null) return error.CollectionRequiresValuesCommand;
+            return error.UnknownAttribute;
+        };
+        if (spec.mutability != .mutable) return error.UnknownAttribute;
+        nodeforge.scalar_mutation.applyNode(&result.node, key, value) catch return error.InvalidAttribute;
+        if (std.mem.eql(u8, key, "mac")) result.mac_set = true;
+        if (std.mem.eql(u8, key, "arch")) result.arch_set = true;
+        if (std.mem.eql(u8, key, "pxe.ip_reservation")) result.pxe_ip_reservation_set = true;
     }
     return result;
 }
-fn parseStrictBool(value: []const u8) ?bool {
-    if (std.mem.eql(u8, value, "true")) return true;
-    if (std.mem.eql(u8, value, "false")) return false;
-    return null;
+
+test "node add keeps nullable profile and registered optional scalars in request" {
+    const parsed = try parseNodeProperties("unclaimed", &.{
+        "mac=02:4e:46:00:00:01",
+        "arch=aarch64",
+        "deploy=false",
+        "pxe.ip_reservation=192.168.27.190",
+        "network.mode=static",
+        "network.match_mac=02:4e:46:00:00:01",
+        "network.address=192.168.27.190",
+        "network.prefix_len=24",
+        "overrides.system.localization.timezone=Asia/Shanghai",
+    });
+    const body = try serializeNodeAddRequest(std.testing.allocator, parsed.node);
+    defer std.testing.allocator.free(body);
+    const Request = struct { profile: ?[]const u8, deploy: bool, network: model.TargetNetworkConfig, pxe: model.PxeConfig, overrides: model.NodeOverrideConfig };
+    const request = try std.json.parseFromSlice(Request, std.testing.allocator, body, .{ .ignore_unknown_fields = true });
+    defer request.deinit();
+    try std.testing.expect(request.value.profile == null);
+    try std.testing.expect(!request.value.deploy);
+    try std.testing.expect(parsed.pxe_ip_reservation_set);
+    try std.testing.expectEqualStrings("192.168.27.190", request.value.pxe.ip_reservation.?);
+    try std.testing.expectEqualStrings("192.168.27.190", request.value.network.address.?);
+    try std.testing.expectEqualStrings("Asia/Shanghai", request.value.overrides.system.localization.timezone.?);
+}
+
+test "node add parser tracks required PXE reservation" {
+    const missing = try parseNodeProperties("missing-ip", &.{ "mac=02:4e:46:00:00:02", "arch=aarch64", "deploy=false" });
+    try std.testing.expect(!missing.pxe_ip_reservation_set);
 }
 fn nodePropertyError(ctx: zli.CommandContext, err: anyerror) void {
     var message: [128]u8 = undefined;
@@ -4436,7 +4504,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     const Response = struct {
         result: struct {
             view_revision: struct { config: u64, catalog: u64, node_status: u64, deployment: u64, inventory: u64 },
-            node: model.NodeConfig,
+            node: nodeforge.catalog_schema_v3_dto.Node,
             profile: struct { name: []const u8, install_source: []const u8, kernel_args: ?[]const u8, platform: struct { distro: []const u8, version: []const u8, arch: []const u8 } },
             effective_system: struct {
                 localization: model.LocalizationConfig,
@@ -4481,6 +4549,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     const result = parsed.value.result;
+    const stored_node = result.node.modelValue();
     const sections = [_]nodeforge.cli_document.Section{ .{ .key = "stored", .title = "Stored" }, .{ .key = "overrides", .title = "Overrides" }, .{ .key = "effective", .title = "Effective" }, .{ .key = "runtime", .title = "Runtime" } };
     const storage = if (result.storage) |value| value.effective else model.StorageConfig{};
     const status_phase = if (result.status) |status| status.phase else "-";
@@ -4488,19 +4557,36 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     const install_intent = if (result.deployment) |deployment| deployment.install_intent else "-";
     const drift_state = if (result.deployment) |deployment| deployment.drift_state else "-";
     const inventory_serial = if (result.inventory) |inventory| inventory.serial_number orelse "-" else "-";
+    const additional_disks = if (stored_node.storage.additional_disks.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.storage.additional_disks);
+    const network_dns = if (stored_node.network.dns.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.network.dns);
+    const search_domains = if (stored_node.network.search_domains.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.network.search_domains);
+    const network_routes = if (stored_node.network.routes.len == 0) "<none>" else try formatRoutes(ctx.allocator, stored_node.network.routes);
     const fields = [_]nodeforge.cli_document.Field{
-        .{ .key = "id", .value = result.node.id, .section = "stored", .json_path = "node.id" },                                                                                                                                                 .{ .key = "mac", .value = result.node.mac, .section = "stored", .json_path = "node.mac" },                                                                                                                                                                    .{ .key = "arch", .value = @tagName(result.node.arch), .section = "stored", .json_path = "node.arch" },                                                                                                             .{ .key = "profile", .value = result.node.profile orelse "<unset>", .section = "stored", .json_path = "node.profile" },
-        .{ .key = "pxe.ip_reservation", .value = result.node.pxe.ip_reservation orelse "<unset>", .section = "stored", .json_path = "node.pxe.ip_reservation" },                                                                                .{ .key = "hostname", .value = result.node.hostname orelse "<unset>", .section = "stored", .json_path = "node.hostname" },                                                                                                                                    .{ .key = "deploy", .value = if (result.node.deploy) "yes" else "no", .section = "stored", .json_path = "node.deploy" },                                                                                            .{ .key = "http_accel", .value = if (result.node.http_accel) "yes" else "no", .section = "stored", .json_path = "node.http_accel" },
-        .{ .key = "storage.boot_disk", .value = result.node.storage.boot_disk, .section = "stored", .json_path = "node.storage.boot_disk" },                                                                                                    .{ .key = "network.mode", .value = @tagName(result.node.network.mode), .section = "stored", .json_path = "node.network.mode" },                                                                                                                               .{ .key = "network.address", .value = result.node.network.address orelse "<unset>", .section = "stored", .json_path = "node.network.address" },                                                                     .{ .key = "overrides.install.storage.mode", .value = if (result.node.overrides.install.storage.mode) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.mode" },
-        .{ .key = "overrides.install.storage.wipe", .value = if (result.node.overrides.install.storage.wipe) |value| if (value) "yes" else "no" else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.wipe" }, .{ .key = "overrides.install.storage.partition_table", .value = if (result.node.overrides.install.storage.partition_table) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.partition_table" }, .{ .key = "overrides.system.localization.locale", .value = result.node.overrides.system.localization.locale orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.locale" }, .{ .key = "overrides.system.localization.timezone", .value = result.node.overrides.system.localization.timezone orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.timezone" },
-        .{ .key = "overrides.system.localization.keyboard", .value = result.node.overrides.system.localization.keyboard orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.keyboard" },               .{ .key = "effective.install.storage.mode", .value = @tagName(storage.mode), .section = "effective", .json_path = "storage.effective.mode" },                                                                                                                 .{ .key = "effective.install.storage.wipe", .value = if (storage.wipe) "yes" else "no", .section = "effective", .json_path = "storage.effective.wipe" },                                                            .{ .key = "effective.install.storage.partition_table", .value = @tagName(storage.partition_table), .section = "effective", .json_path = "storage.effective.partition_table" },
-        .{ .key = "effective.install.storage.boot_disk", .value = storage.boot_disk, .section = "effective", .json_path = "storage.effective.boot_disk" },                                                                                      .{ .key = "effective.system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },                                                                        .{ .key = "effective.system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },                        .{ .key = "effective.system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
-        .{ .key = "effective.system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.enabled" },                                                     .{ .key = "effective.system.security.firewall", .value = @tagName(result.effective_system.security.firewall), .section = "effective", .json_path = "effective_system.security.firewall" },                                                                    .{ .key = "effective.system.security.selinux", .value = @tagName(result.effective_system.security.selinux), .section = "effective", .json_path = "effective_system.security.selinux" },                             .{ .key = "effective.system.security.apparmor", .value = @tagName(result.effective_system.security.apparmor), .section = "effective", .json_path = "effective_system.security.apparmor" },
-        .{ .key = "runtime.phase", .value = status_phase, .section = "runtime", .json_path = "status.phase" },                                                                                                                                  .{ .key = "runtime.reason", .value = status_reason, .section = "runtime", .json_path = "status.reason" },                                                                                                                                                     .{ .key = "runtime.install_intent", .value = install_intent, .section = "runtime", .json_path = "deployment.install_intent" },                                                                                      .{ .key = "runtime.drift_state", .value = drift_state, .section = "runtime", .json_path = "deployment.drift_state" },
+        .{ .key = "id", .value = stored_node.id, .section = "stored", .json_path = "node.id" },                                                                                                                                                 .{ .key = "mac", .value = stored_node.mac, .section = "stored", .json_path = "node.mac" },                                                                                                                                                                    .{ .key = "arch", .value = @tagName(stored_node.arch), .section = "stored", .json_path = "node.arch" },                                                                                                                    .{ .key = "profile", .value = stored_node.profile orelse "<unset>", .section = "stored", .json_path = "node.profile" },
+        .{ .key = "pxe.ip_reservation", .value = stored_node.pxe.ip_reservation orelse "<unset>", .section = "stored", .json_path = "node.pxe.ip_reservation" },                                                                                .{ .key = "hostname", .value = stored_node.hostname orelse "<unset>", .section = "stored", .json_path = "node.hostname" },                                                                                                                                    .{ .key = "deploy", .value = if (stored_node.deploy) "yes" else "no", .section = "stored", .json_path = "node.deploy" },                                                                                                   .{ .key = "http_accel", .value = if (stored_node.http_accel) "yes" else "no", .section = "stored", .json_path = "node.http_accel" },
+        .{ .key = "storage.boot_disk", .value = stored_node.storage.boot_disk, .section = "stored", .json_path = "node.storage.boot_disk" },                                                                                                    .{ .key = "storage.additional_disks", .value = additional_disks, .section = "stored", .json_path = "node.storage.additional_disks" },                                                                                                                         .{ .key = "network.mode", .value = @tagName(stored_node.network.mode), .section = "stored", .json_path = "node.network.mode" },                                                                                            .{ .key = "network.interface_name", .value = stored_node.network.interface orelse "<auto>", .section = "stored", .json_path = "node.network.interface_name" },
+        .{ .key = "network.match_mac", .value = stored_node.network.match_mac orelse "<node mac>", .section = "stored", .json_path = "node.network.match_mac" },                                                                                .{ .key = "network.address", .value = stored_node.network.address orelse "<unset>", .section = "stored", .json_path = "node.network.address" },                                                                                                               .{ .key = "network.prefix_len", .value = if (stored_node.network.prefix_len) |value| try std.fmt.allocPrint(ctx.allocator, "{d}", .{value}) else "<unset>", .section = "stored", .json_path = "node.network.prefix_len" }, .{ .key = "network.gateway", .value = stored_node.network.gateway orelse "<unset>", .section = "stored", .json_path = "node.network.gateway" },
+        .{ .key = "network.dns", .value = network_dns, .section = "stored", .json_path = "node.network.dns" },                                                                                                                                  .{ .key = "network.search_domains", .value = search_domains, .section = "stored", .json_path = "node.network.search_domains" },                                                                                                                               .{ .key = "network.routes", .value = network_routes, .section = "stored", .json_path = "node.network.routes" },                                                                                                            .{ .key = "overrides.install.storage.mode", .value = if (stored_node.overrides.install.storage.mode) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.mode" },
+        .{ .key = "overrides.install.storage.wipe", .value = if (stored_node.overrides.install.storage.wipe) |value| if (value) "yes" else "no" else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.wipe" }, .{ .key = "overrides.install.storage.partition_table", .value = if (stored_node.overrides.install.storage.partition_table) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.partition_table" }, .{ .key = "overrides.system.localization.locale", .value = stored_node.overrides.system.localization.locale orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.locale" },        .{ .key = "overrides.system.localization.timezone", .value = stored_node.overrides.system.localization.timezone orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.timezone" },
+        .{ .key = "overrides.system.localization.keyboard", .value = stored_node.overrides.system.localization.keyboard orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.keyboard" },               .{ .key = "effective.install.storage.mode", .value = @tagName(storage.mode), .section = "effective", .json_path = "storage.effective.mode" },                                                                                                                 .{ .key = "effective.install.storage.wipe", .value = if (storage.wipe) "yes" else "no", .section = "effective", .json_path = "storage.effective.wipe" },                                                                   .{ .key = "effective.install.storage.partition_table", .value = @tagName(storage.partition_table), .section = "effective", .json_path = "storage.effective.partition_table" },
+        .{ .key = "effective.install.storage.boot_disk", .value = storage.boot_disk, .section = "effective", .json_path = "storage.effective.boot_disk" },                                                                                      .{ .key = "effective.system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },                                                                        .{ .key = "effective.system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },                               .{ .key = "effective.system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
+        .{ .key = "effective.system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "yes" else "no", .section = "effective", .json_path = "effective_system.ssh.enabled" },                                                     .{ .key = "effective.system.security.firewall", .value = @tagName(result.effective_system.security.firewall), .section = "effective", .json_path = "effective_system.security.firewall" },                                                                    .{ .key = "effective.system.security.selinux", .value = @tagName(result.effective_system.security.selinux), .section = "effective", .json_path = "effective_system.security.selinux" },                                    .{ .key = "effective.system.security.apparmor", .value = @tagName(result.effective_system.security.apparmor), .section = "effective", .json_path = "effective_system.security.apparmor" },
+        .{ .key = "runtime.phase", .value = status_phase, .section = "runtime", .json_path = "status.phase" },                                                                                                                                  .{ .key = "runtime.reason", .value = status_reason, .section = "runtime", .json_path = "status.reason" },                                                                                                                                                     .{ .key = "runtime.install_intent", .value = install_intent, .section = "runtime", .json_path = "deployment.install_intent" },                                                                                             .{ .key = "runtime.drift_state", .value = drift_state, .section = "runtime", .json_path = "deployment.drift_state" },
         .{ .key = "runtime.serial_number", .value = inventory_serial, .section = "runtime", .json_path = "inventory.serial_number" },
     };
-    const title = try std.fmt.allocPrint(ctx.allocator, "Node {s}", .{result.node.id});
+    const title = try std.fmt.allocPrint(ctx.allocator, "Node {s}", .{stored_node.id});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
+}
+
+fn formatRoutes(allocator: std.mem.Allocator, routes: []const model.RouteConfig) ![]const u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (routes, 0..) |route, index| {
+        if (index != 0) try output.writer.writeByte('\n');
+        try output.writer.print("{s}: {s} via {s}", .{ route.id, route.destination, route.gateway });
+        if (route.metric) |metric| try output.writer.print(" metric {d}", .{metric});
+    }
+    return output.toOwnedSlice();
 }
 
 fn findBundle(config: *const nodeforge.model.AppConfig, name: []const u8) ?*const nodeforge.model.ProvisioningBundle {

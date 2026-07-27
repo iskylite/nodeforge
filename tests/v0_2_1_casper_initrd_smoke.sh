@@ -40,7 +40,25 @@ unsquashfs -d "$work/rootfs" -f "$m/casper/ubuntu-server-minimal.ubuntu-server.i
 
 # Inject nodeforge-agent + firstboot service
 install -m 0755 zig-out/bin/nodeforge-agent "$work/rootfs/usr/sbin/nodeforge-agent"
-install -D -m 0644 packaging/systemd/nodeforge-firstboot.service "$work/rootfs/etc/systemd/system/nodeforge-firstboot.service"
+mkdir -p "$work/rootfs/etc/systemd/system"
+printf '%s\n' \
+    '[Unit]' \
+    'Description=NodeForge diskless first-boot provisioning' \
+    'After=local-fs.target network-online.target' \
+    'Before=rc-local.service' \
+    'Wants=network-online.target' \
+    'ConditionPathExists=/var/lib/nodeforge/boot.json' \
+    '' \
+    '[Service]' \
+    'Type=oneshot' \
+    'ExecStart=/usr/sbin/nodeforge-agent' \
+    'RemainAfterExit=yes' \
+    'StandardOutput=journal+file:/var/lib/nodeforge/firstboot.log' \
+    'StandardError=journal+file:/var/lib/nodeforge/firstboot.log' \
+    '' \
+    '[Install]' \
+    'WantedBy=multi-user.target' \
+    >"$work/rootfs/etc/systemd/system/nodeforge-firstboot.service"
 mkdir -p "$work/rootfs/etc/systemd/system/multi-user.target.wants"
 ln -sfn ../nodeforge-firstboot.service "$work/rootfs/etc/systemd/system/multi-user.target.wants/nodeforge-firstboot.service"
 mkdir -p "$work/rootfs/etc/systemd/system/nodeforge-firstboot.service.d"
@@ -156,7 +174,7 @@ for m in loop squashfs overlay virtio virtio_pci virtio_pci_modern_dev virtio_ne
     modprobe "$m" 2>/dev/null
 done
 
-# Configure network (best-effort, dhclient in nodeforge-initrd will retry)
+# 尽力预配置网络；nodeforge-initrd 会优先复用，缺失时再尝试 udhcpc/dhclient。
 ip link set eth0 up 2>/dev/null
 ip addr add 10.0.2.15/24 dev eth0 2>/dev/null
 ip route add default via 10.0.2.2 2>/dev/null

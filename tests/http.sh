@@ -149,7 +149,7 @@ jq -e --arg id "$software_id" '.ok and .result.capability.id == $id and .result.
 grep -Fq 'contract-profile' "$tmp/profile-list"
 "$cli" profile list -o jsonl >"$tmp/profile-list-jsonl"
 jq -e '.ok and .result.name == "contract-profile" and .result.install_source == "rocky-9.7-aarch64-dvd"' "$tmp/profile-list-jsonl" >/dev/null
-"$cli" node add contract-node mac=02:00:00:00:00:42 arch=aarch64 profile=contract-profile deploy=false >"$tmp/node-add"
+"$cli" node add contract-node mac=02:00:00:00:00:42 arch=aarch64 profile=contract-profile pxe.ip_reservation=192.168.27.210 deploy=false >"$tmp/node-add"
 "$cli" node replace-values contract-node storage.additional_disks /dev/sdb --set overrides.install.storage.mode=raid1 -o json >"$tmp/node-storage-atomic"
 jq -e '.ok and .result.operation == "replace"' "$tmp/node-storage-atomic" >/dev/null
 "$cli" node show contract-node -o json >"$tmp/node-storage-atomic-show"
@@ -169,8 +169,8 @@ fi
 "$cli" node software show contract-node -o json --fields effective.software.repositories >"$tmp/node-software-show-json"
 jq -e '.ok and .result.effective_software.repositories and (.result | keys) == ["effective_software"] and (.result.effective_software | keys) == ["repositories"]' "$tmp/node-software-show-json" >/dev/null
 "$cli" profile show contract-profile --sections stored --fields name,install_source >"$tmp/profile-show-fields"
-grep -Fqx 'Stored' "$tmp/profile-show-fields"
-grep -Fq $'name\tcontract-profile' "$tmp/profile-show-fields"
+grep -Fqx 'Stored:' "$tmp/profile-show-fields"
+grep -Eq '^  name +contract-profile$' "$tmp/profile-show-fields"
 if grep -Fq 'Effective' "$tmp/profile-show-fields"; then
     echo 'profile show section filter retained effective fields' >&2
     exit 1
@@ -190,15 +190,16 @@ if [ "$code" != 200 ]; then
     cat "$tmp/node-list-api" >&2
     exit 1
 fi
-jq -e '.ok and .result.items[0].id == "contract-node"' "$tmp/node-list-api" >/dev/null
+jq -e '.ok and .result.items[0].id == "contract-node" and .result.items[0].pxe.ip_reservation == "192.168.27.210" and (.result.items[0] | has("ip") | not)' "$tmp/node-list-api" >/dev/null
 code=$(curl --silent -o "$tmp/node-show-api" -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes/contract-node")
 if [ "$code" != 200 ]; then
     cat "$tmp/node-show-api" >&2
     exit 1
 fi
+jq -e '.ok and .result.node.pxe.ip_reservation == "192.168.27.210" and .result.node.network.interface_name == null and (.result.node | has("ip") | not) and (.result.node.network | has("interface") | not) and (.result.node.overrides.install | has("apt_fallback") | not)' "$tmp/node-show-api" >/dev/null
 "$cli" node show contract-node --sections stored --fields id,mac,profile >"$tmp/node-show-fields"
-grep -Fqx 'Stored' "$tmp/node-show-fields"
-grep -Fq $'id\tcontract-node' "$tmp/node-show-fields"
+grep -Fqx 'Stored:' "$tmp/node-show-fields"
+grep -Eq '^  id +contract-node$' "$tmp/node-show-fields"
 if grep -Fq 'Runtime' "$tmp/node-show-fields"; then
     echo 'node show section filter retained runtime fields' >&2
     exit 1

@@ -41,14 +41,16 @@ const render = @import("../render.zig");
 const runner = @import("../../provision/runner.zig");
 const password_hash = @import("../password_hash.zig");
 
-/// M4.1 渲染器。原始 M4 入口点保留为兼容包装；
-/// 所有 daemon answer 下发均使用此 common-system 变体。
-pub fn renderUserDataM41(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
+/// 测试夹具将共享 system 字段投影为 canonical software 输入；所有断言最终
+/// 覆盖唯一的 `renderEffective`，不会重新引入简化版 Autoinstall 路径。
+fn renderTestFixture(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     const network = node.network;
     const software: model.SoftwareSelection = .{ .packages = .{ .include = system.packages } };
     return renderEffective(allocator, node, install, system, network, software, bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session, token, password_scope, kernel_args);
 }
 
+/// 从已编译的唯一 effective plan 渲染 Ubuntu Autoinstall。Profile、Node
+/// override、软件选择和目标网络必须在进入 adapter 前完成合并与校验。
 pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, network: model.TargetNetworkConfig, software: model.SoftwareSelection, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -193,8 +195,8 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try w.writeAll("\n    preserve_hostname: false\n    disable_root: false\n    ssh_pwauth: ");
     try w.writeAll(if (system.ssh.password_authentication) "true" else "false");
     try w.writeAll("\n    users:\n");
-    try renderCloudUser(w, allocator, "root", system.ssh.root_password, false, &.{}, bootstrap_key, system.ssh.root_authorized_keys, &.{}, password_scope);
-    for (system.users, 0..) |user, index| try renderCloudUser(w, allocator, user.name, user.password, user.sudo, user.groups, bootstrap_key, user.ssh_authorized_keys, if (index == 0) install.ssh_authorized_keys else &.{}, password_scope);
+    try renderCloudUser(w, allocator, "root", system.ssh.root_password, false, &.{}, bootstrap_key, system.ssh.root_authorized_keys, password_scope);
+    for (system.users) |user| try renderCloudUser(w, allocator, user.name, user.password, user.sudo, user.groups, bootstrap_key, user.ssh_authorized_keys, password_scope);
     try w.writeAll("  early-commands:\n");
     const facts_command = try std.fmt.allocPrint(allocator, "nf_fact() {{ test -r /sys/class/dmi/id/$1 && head -c 256 /sys/class/dmi/id/$1 | tr -d '\\r\\n' | sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g'; }}; s=$(nf_fact product_serial); u=$(nf_fact product_uuid); v=$(nf_fact sys_vendor); m=$(nf_fact product_name); d=$(printf '{{\"serial_number\":\"%s\",\"product_uuid\":\"%s\",\"vendor\":\"%s\",\"model\":\"%s\"}}' \"$s\" \"$u\" \"$v\" \"$m\"); curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d \"$d\" {s} || true", .{ token, session, facts_url });
     defer allocator.free(facts_command);
@@ -523,7 +525,7 @@ test "schema v3 custom logical layout renders all modes natively in Curtin" {
     }
 }
 
-fn renderCloudUser(w: *std.Io.Writer, allocator: std.mem.Allocator, name: []const u8, password: ?[]const u8, sudo: bool, groups: []const []const u8, bootstrap_key: []const u8, keys: []const []const u8, legacy_keys: []const []const u8, session: []const u8) !void {
+fn renderCloudUser(w: *std.Io.Writer, allocator: std.mem.Allocator, name: []const u8, password: ?[]const u8, sudo: bool, groups: []const []const u8, bootstrap_key: []const u8, keys: []const []const u8, session: []const u8) !void {
     try w.writeAll("      - name: ");
     try render.yamlQuote(w, name);
     try w.writeAll("\n        lock_passwd: ");
@@ -565,165 +567,6 @@ fn renderCloudUser(w: *std.Io.Writer, allocator: std.mem.Allocator, name: []cons
             try w.writeByte('\n');
         }
     }
-    for (legacy_keys, 0..) |key, legacy_index| if (!render.sameSshKey(key, bootstrap_key)) {
-        var duplicate = false;
-        for (keys) |existing| {
-            if (render.sameSshKey(key, existing)) duplicate = true;
-        }
-        for (legacy_keys[0..legacy_index]) |existing| if (render.sameSshKey(key, existing)) {
-            duplicate = true;
-            break;
-        };
-        if (!duplicate) {
-            try w.writeAll("          - ");
-            try render.yamlQuote(w, key);
-            try w.writeByte('\n');
-        }
-    };
-}
-
-/// 渲染 Ubuntu Autoinstall user-data（cloud-config 格式）。
-///
-/// 输出的 YAML 分为两个区域：
-///
-/// 1. **`autoinstall:` 段**（缩进 2 空格）：Subiquity 读取的安装配置。
-///    所有字段名和枚举值严格遵循 Subiquity 官方 `autoinstall-schema.json`。
-///
-/// 2. **cloud-config 顶层键**（零缩进）：cloud-init 自身模块读取的配置。
-///    这些键不在 `autoinstall:` 段内，而是 cloud-config 文档的顶层属性。
-///
-/// ## autoinstall 段字段清单（按渲染顺序）
-///
-/// | 字段 | 值 | schema 依据 / 离线 PXE 原因 |
-/// | --- | --- | --- |
-/// | `version` | `1` | schema required，唯一支持值 |
-/// | `refresh-installer.update` | `false` | 阻止 Subiquity 从 snapstore.io 刷新 snap；隔离网段无 NAT/DNS 会超时 |
-/// | `timezone` | `UTC` | 阻止 Subiquity geoIP 检测时区（需 HTTP 请求 ubuntu.com） |
-/// | `locale` | `en_US.UTF-8` | 阻止交互式语言选择 |
-/// | `identity` | hostname/username/password | schema required（username/hostname/password）；密码为 SHA-256 摘要 |
-/// | `ssh` | install-server + allow-pw | 允许安装阶段 SSH 调试 |
-/// | `packages` | 来自 InstallConfig | 额外包列表 |
-/// | `apt.mirror-selection.primary` | NodeForge 本地 URL | 阻止 Subiquity 默认访问 archive.ubuntu.com |
-/// | `apt.fallback` | `install.apt.fallback` | mirror 失败时终止、离线回退或继续；默认离线回退 |
-/// | `apt.geoip` | `false` | 阻止 geoIP 镜像检测 |
-/// | `storage.layout` | `direct` | Subiquity 自行决定分区方案 |
-/// | `late-commands` | bundle + event curl | 安装后命令，通过 curtin in-target 在 /target 中执行 |
-///
-/// ## cloud-config 顶层字段清单
-///
-/// | 字段 | 值 | 原因 |
-/// | --- | --- | --- |
-/// | `ntp.enabled` | `false` | 禁用 cloud-init NTP 模块；隔离网段无 NTP 服务器 |
-/// | `package_update` | `false` | 禁用 cloud-init 的 apt-get update 步骤 |
-/// | `package_upgrade` | `false` | 禁用 cloud-init 的 apt-get upgrade 步骤 |
-///
-/// ## 参数说明
-///
-/// - `node`：目标节点配置，提供主机名
-/// - `install`：安装器输入配置（存储、用户、包等）
-/// - `bundle`：可选的后处理 bundle，展开为 `late-commands` 中的 curtin 命令
-/// - `apt_primary_url`：NodeForge 发布的 APT 仓库 URL；null 时渲染空 uri
-/// - `event_url`：事件上报端点 URL
-/// - `session`：boot session ID，用于事件关联
-/// - `token`：capability token，用于 HTTP 认证
-///
-/// 返回调用方拥有的堆分配字节切片，包含完整的 user-data 内容。
-/// 输出以 `#cloud-config` 开头，供 Subiquity 通过 NoCloud-Net 数据源读取。
-pub fn renderUserData(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, event_url: []const u8, session: []const u8, token: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const w = &out.writer;
-    // cloud-config 头部 + autoinstall 版本 1
-    //
-    // 隔离 PXE 网段防超时配置（autoinstall 段内）：
-    // - refresh-installer: { update: false }：阻止 Subiquity 从 snapstore.io
-    //   刷新安装器 snap。字段名是 refresh-installer（经 autoinstall-schema.json
-    //   确认），旧代码误写为 refresh 会被 Subiquity 静默忽略，导致隔离网段
-    //   长时间等待 snap 刷新超时。
-    // - timezone: UTC：显式指定时区，阻止 Subiquity 通过 geoIP 检测时区
-    // - locale: en_US.UTF-8：显式指定语言环境，阻止交互式语言选择
-    try w.writeAll("#cloud-config\nautoinstall:\n  version: 1\n  refresh-installer:\n    update: false\n  timezone: UTC\n  locale: en_US.UTF-8\n  identity:\n    hostname: ");
-    try render.yamlQuote(w, render.hostname(node));
-    // 用户配置：Subiquity 只支持 identity 段中的单个用户
-    if (install.users.len != 0) {
-        const user = install.users[0];
-        // 密码使用 SHA-256 哈希，因为 Subiquity 要求非明文密码
-        // 不使用 crypt(3) SHA-512，因为 MVP 配置模型以明文存储密码
-        var digest: [64]u8 = undefined;
-        try w.writeAll("\n    username: ");
-        try render.yamlQuote(w, user.name);
-        // 密码为 null 时使用 "!" 表示禁用密码登录
-        try w.writeAll("\n    password: ");
-        try render.yamlQuote(w, if (user.password) |p| render.passwordDigest(&digest, p) else "!");
-    }
-    // SSH 配置：允许安装阶段 SSH 登录（用于调试）和密码认证
-    try w.writeAll("\n  ssh:\n    install-server: true\n    allow-pw: true\n  packages:\n");
-    // 额外包列表
-    for (install.packages) |package| {
-        try w.writeAll("    - ");
-        try render.yamlQuote(w, package);
-        try w.writeByte('\n');
-    }
-    // APT 源配置必须在 packages 前由 Subiquity 处理，不能交给 late-commands。
-    // mirror-selection 中不限定架构（不写 arches），使 ARM64 与 AMD64 都探测
-    // 本地 repository。Jammy ARM64 若使用 legacy `arches: [default]` 会被解释
-    // 为 ports 的默认候选，导致即使 URI 指向 NodeForge 仍访问 ports.ubuntu.com。
-    //
-    // APT 失败策略（经 autoinstall-schema.json 确认）：
-    // - fallback 由 install.apt.fallback 配置。默认 offline-install 在 mirror
-    //   不完整时使用 squashfs；abort 用于强制验证 HTTP APT；continue-anyway
-    //   仅透传 Subiquity 能力，不建议用于生产。
-    // - geoip: false：关闭 geoIP 镜像检测，阻止 HTTP 请求到 ubuntu.com。
-    // - 不使用 disable_suites：该字段是 curtin 的内部字段，不在 Subiquity 的
-    //   autoinstall schema 中。Subiquity 会静默忽略它，导致所有默认 suite 仍
-    //   被配置，apt-get update 因 404 返回失败。
-    try w.writeAll("  apt:\n    mirror-selection:\n      primary:\n        - uri: ");
-    try render.yamlQuote(w, apt_primary_url orelse "");
-    try w.print("\n    fallback: {s}\n    geoip: false\n", .{@tagName(install.apt.fallback)});
-    // 存储布局：使用 direct 模式，Subiquity 自行决定分区方案
-    // 这比显式分区更安全，因为 Subiquity 会根据磁盘类型选择合适的方案
-    try w.writeAll("  storage:\n    layout:\n      name: direct\n  late-commands:\n");
-    // bundle 后处理步骤：通过 curtin in-target 在目标系统中执行
-    if (bundle) |value| {
-        // Ubuntu 使用 apt 包管理器
-        const script = try runner.renderInstallPost(allocator, value, .apt);
-        defer allocator.free(script);
-        // curtin in-target 在 /target chroot 中执行命令
-        // shell 脚本中的单引号需要转义（`'` → `'\''`），步骤换行符
-        // 转为 `&&`，使整个脚本保持单行并保留失败状态。
-        var command: std.Io.Writer.Allocating = .init(allocator);
-        defer command.deinit();
-        const command_writer = &command.writer;
-        try command_writer.writeAll("curtin in-target --target=/target -- sh -c '");
-        const trimmed_script = std.mem.trimEnd(u8, script, "\r\n");
-        for (trimmed_script) |c| if (c == '\'') try command_writer.writeAll("'\\''") else if (c == '\n') try command_writer.writeAll(" && ") else try command_writer.writeByte(c);
-        try command_writer.writeAll("'");
-        try w.writeAll("    - ");
-        try render.yamlQuote(w, command.written());
-        try w.writeByte('\n');
-    }
-    // 事件上报：通过 curl 在目标系统中上报安装后阶段完成
-    // 携带 capability token 和 session id 用于认证和关联
-    // `|| true` 确保即使事件上报失败也不阻塞安装完成
-    const event_command = try std.fmt.allocPrint(allocator, "curtin in-target --target=/target -- sh -c \"curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"post\\\"}}' {s} || true\"", .{ token, session, session, event_url });
-    defer allocator.free(event_command);
-    try w.writeAll("    - ");
-    try render.yamlQuote(w, event_command);
-    try w.writeByte('\n');
-    // cloud-config 顶层配置（autoinstall 段外）：
-    // 以下键由 cloud-init 自身模块读取，用于阻止隔离网段中的超时行为。
-    // 它们必须位于 YAML 顶层（零缩进），不在 autoinstall: 段内。
-    //
-    // - ntp: { enabled: false }：禁用 cloud-init NTP 模块。隔离网段无 NTP
-    //   服务器，cloud-init 会等待 NTP 同步超时，导致 Subiquity 显示
-    //   "waiting for cloud-init"。
-    // - package_update: false：禁用 cloud-init 的 apt-get update 步骤。
-    //   apt 源已在 autoinstall.apt 中配置为 NodeForge 本地 URL，但
-    //   cloud-init 的 package_update 仍可能触发额外网络操作。
-    // - package_upgrade: false：禁用 cloud-init 的 apt-get upgrade 步骤。
-    //   安装阶段不需要升级已安装的包。
-    try w.writeAll("ntp:\n  enabled: false\npackage_update: false\npackage_upgrade: false\n");
-    return out.toOwnedSlice();
 }
 
 /// 渲染 NoCloud-Net meta-data 文件。
@@ -756,7 +599,7 @@ pub fn renderMetaData(allocator: std.mem.Allocator, node: *const model.NodeConfi
 // - cloud-config 顶层 ntp/package_update/package_upgrade 禁用网络操作
 test "autoinstall has NoCloud header and late event hook" {
     const node: model.NodeConfig = .{ .id = "node-01", .mac = "00:11:22:33:44:55", .arch = .aarch64, .profile = "ubuntu" };
-    const bytes = try renderUserData(std.testing.allocator, &node, .{ .packages = &.{"curl"} }, null, "http://repo", "http://event", "0123456789abcdef0123456789abcdef", "token");
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "#cloud-config") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "autoinstall:") != null);
@@ -772,8 +615,8 @@ test "autoinstall has NoCloud header and late event hook" {
     // 隔离网段防超时配置
     try std.testing.expect(std.mem.indexOf(u8, bytes, "refresh-installer:") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "update: false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "timezone: UTC") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "locale: en_US.UTF-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "timezone: 'UTC'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "locale: 'en_US.UTF-8'") != null);
     // cloud-config 顶层键（零缩进，在 autoinstall 段外）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\nntp:\n  enabled: false") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\npackage_update: false") != null);
@@ -785,7 +628,7 @@ test "autoinstall has NoCloud header and late event hook" {
 // 即使 URI 为空，默认 fallback: offline-install 仍能保证安装继续。
 test "apt section is always rendered even when apt_primary_url is null" {
     const node: model.NodeConfig = .{ .id = "node-02", .mac = "00:11:22:33:44:66", .arch = .x86_64, .profile = "ubuntu" };
-    const bytes = try renderUserData(std.testing.allocator, &node, .{}, null, null, "http://event", "0123456789abcdef0123456789abcdef", "token");
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, null, "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     // 即使 apt_primary_url 为 null，apt 段也必须存在
     try std.testing.expect(std.mem.indexOf(u8, bytes, "apt:") != null);
@@ -796,16 +639,16 @@ test "apt section is always rendered even when apt_primary_url is null" {
 
 test "apt fallback is rendered from the install profile" {
     const node: model.NodeConfig = .{ .id = "node-strict", .mac = "00:11:22:33:44:88", .arch = .aarch64, .profile = "ubuntu" };
-    const bytes = try renderUserData(std.testing.allocator, &node, .{ .apt = .{ .fallback = .abort } }, null, "http://repo", "http://event", "0123456789abcdef0123456789abcdef", "token");
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{ .apt = .{ .fallback = .abort } }, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "fallback: abort") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "fallback: offline-install") == null);
 }
 
 test "M4.1 autoinstall renders target defaults and static network" {
-    const node: model.NodeConfig = .{ .id = "node-04", .mac = "00:11:22:33:44:99", .arch = .aarch64, .profile = "ubuntu", .ip = "192.168.50.27", .network = .{ .mode = .static, .interface = "ens160", .address = "192.168.50.27", .prefix_len = 24, .gateway = "192.168.50.1", .dns = &.{"192.168.50.1"}, .search_domains = &.{"nodeforge.local"} } };
+    const node: model.NodeConfig = .{ .id = "node-04", .mac = "00:11:22:33:44:99", .arch = .aarch64, .profile = "ubuntu", .pxe = .{ .ip_reservation = "192.168.50.27" }, .network = .{ .mode = .static, .interface = "ens160", .address = "192.168.50.27", .prefix_len = 24, .gateway = "192.168.50.1", .dns = &.{"192.168.50.1"}, .search_domains = &.{"nodeforge.local"} } };
     const system: model.TargetSystemConfig = .{ .localization = .{ .locale = "zh_CN.UTF-8", .timezone = "Asia/Shanghai", .keyboard = "us" }, .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} }, .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }} };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/artifacts/repositories/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/artifacts/repositories/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
     // report_url="" 表示未配置 installer-hooks/subiquity 端点（不渲染 reporting 块）
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "locale: 'zh_CN.UTF-8'") != null);
@@ -833,7 +676,7 @@ test "M4.1 autoinstall renders target defaults and static network" {
 test "M4.2 webhook reporting rendered when report_url is non-empty" {
     // 非空 report_url 渲染 reporting 块（webhook reporter 在 22.04 和 24.04 均可用）
     const node: model.NodeConfig = .{ .id = "node-rpt", .mac = "00:11:22:33:44:aa", .arch = .aarch64, .profile = "ubuntu", .hostname = "noderpt" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "http://192.168.50.1:18080/report", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "http://192.168.50.1:18080/report", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     // reporting 块应渲染，type 必须是 webhook（不是 http）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "reporting:") != null);
@@ -849,7 +692,7 @@ test "M4.2 webhook reporting rendered when report_url is non-empty" {
 test "M4.2 hostname always rendered even without users" {
     // 显式空 users 保留 root-only；目标 hostname 必须位于 autoinstall.user-data。
     const node: model.NodeConfig = .{ .id = "node-nh", .mac = "00:11:22:33:44:bb", .arch = .aarch64, .profile = "ubuntu", .hostname = "myhost" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{ .users = &.{} }, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{ .users = &.{} }, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "  user-data:\n    hostname: 'myhost'\n    preserve_hostname: false\n    disable_root: false") != null);
     // identity 不应出现（无 users）
@@ -858,7 +701,7 @@ test "M4.2 hostname always rendered even without users" {
 
 test "M4.2 autoinstall renders default nodeforge identity" {
     const node: model.NodeConfig = .{ .id = "node-default", .mac = "00:11:22:33:44:bc", .arch = .aarch64, .profile = "ubuntu", .hostname = "ubuntu-default" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "identity:\n    hostname: 'ubuntu-default'\n    username: 'nodeforge'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "name: 'nodeforge'") != null);
@@ -867,7 +710,7 @@ test "M4.2 autoinstall renders default nodeforge identity" {
 
 test "M4.6 autoinstall persists literal kernel args in GRUB drop-in" {
     const node: model.NodeConfig = .{ .id = "node-kargs", .mac = "00:11:22:33:44:bd", .arch = .aarch64, .profile = "ubuntu" };
-    const bytes = try renderUserDataM41(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", "iommu=pt hugepages=4");
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", "iommu=pt hugepages=4");
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/default/grub.d/99-nodeforge.cfg") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "GRUB_CMDLINE_LINUX=\"${GRUB_CMDLINE_LINUX} iommu=pt hugepages=4\"") != null);
@@ -881,7 +724,7 @@ test "late command keeps managed files single-line and fail-fast" {
         .{ .name = "packages", .action = .standard_packages, .packages = &.{"curl"} },
         .{ .name = "hosts", .action = .managed_file, .destination = "/etc/hosts.d/nodeforge", .content = "127.0.0.1 localhost\n" },
     } };
-    const bytes = try renderUserData(std.testing.allocator, &node, .{}, &bundle, "http://repo", "http://event", "0123456789abcdef0123456789abcdef", "token");
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", &bundle, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "NODEFORGE_EOF") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, " && install -d") != null);

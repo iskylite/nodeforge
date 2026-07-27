@@ -46,20 +46,30 @@ NodeForge/
 │   ├── cli/                      # CLI 输出格式化与视图
 │   └── observe/                  # 结构化日志与错误渲染
 ├── tests/                        # 单元测试、CLI 契约、HTTP 集成与实机脚本
-├── vendor/zli/                   # CLI 框架（v5.1.2）
+├── vendor/
+│   ├── zli/                      # CLI 框架（v5.1.2），编译时链接
+│   └── dhcp/                     # ISC DHCP 源码，仅作协议实现参考，不参与编译
 └── docs/                         # 设计文档、审计与验证记录
 ```
+
+`vendor/` 下两个目录的用途不同：
+
+- **`vendor/zli/`**：CLI 框架依赖，`build.zig` 编译时直接链接，是运行时必需组件。
+- **`vendor/dhcp/`**：ISC DHCP（dhcp-4.4.3）的 C 源码，**本项目中未使用、不参与编译**，仅保留为 DHCPv4 协议实现的参考资料。NodeForge 的 DHCP 服务端（`src/dhcp/`）是基于 RFC 2131/2132 的 Zig 原生实现，不依赖此目录中的任何代码。
 
 两个二进制共享同一核心模块（`src/root.zig`），避免 CLI 与 daemon 行为分叉：
 
 - **`nodeforged`**：守护进程，承载 DHCP/TFTP/HTTP 服务和本机管理接口。
 - **`nodeforge`**：管理客户端，通过 `127.0.0.1` 调用 daemon 的管理 API。
 
+默认安装根为 `/opt/nodeforge`。`nodeforge setup` 会生成 `/etc/profile.d/nodeforge.sh`，新登录 shell
+自动将 `/opt/nodeforge/bin` 加入 `PATH`；当前 shell 可执行 `source /etc/profile.d/nodeforge.sh` 立即生效。
+
 ## 文档
 
 详细设计、审计和验证记录位于 [`docs/`](docs/)，入口见 [文档导航](docs/README.md)：
 
-- [v0.1 设计与修复计划](docs/design/V0_1_DESIGN.md)：当前权威设计，定义所有权模型和完成标准。
+- [v0.1 最终设计](docs/design/V0_1_DESIGN.md)：当前权威设计，定义已实现的所有权模型和完成标准。
 - [v0.2 设计总纲](docs/design/V0_2_DESIGN.md)：diskless 无盘启动主流程，已实现并通过 aarch64 QEMU 完整闭环验证。
 - [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu casper squashfs 叠加方案，支持 Rocky/RHEL 宿主构建 Ubuntu 无盘系统。
 - [v0.2.2 保留项](docs/validation/V0_2_2_RESERVED.md)：异架构/实机验证矩阵（x86_64 UEFI smoke、VMware compute_use），当前暂不验证。
@@ -106,15 +116,15 @@ NodeForge 是单进程服务，在同一端口上复用 HTTP 健康检查、管�
 
 ### v0.1（当前）
 
-IPv4 PXE 无人值守安装产品，M0-M4 的基础服务和安装链路已完成实机验证，正在通过 M4.13 收口所有权模型和 typed property registry。主要里程碑：
+IPv4 PXE 无人值守安装产品已完成；所有权模型、typed property registry、软件能力索引和 schema v3 迁移均已收口。主要里程碑：
 
 | 里程碑 | 范围 | 状态 |
 |---|---|---|
 | M0-M3 | 基础服务、PXE 协议、HTTP 资产和安装源链路 | 已实现 |
 | M4/M4.1 | Rocky 9.7 与 Ubuntu 22.04 无人值守安装和生命周期 | 已验证 |
 | M4.2-M4.11 | 部署健壮性、URL 契约、容量扩展、fresh CLI 闭环和统一 status | 已实现 |
-| M4.12 | 存储 fallback/override | 历史实现，所有权方案已被取代 |
-| M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 进行中 |
+| M4.12 | 存储 override | 已由 canonical Node/Profile 所有权模型取代旧 fallback |
+| M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 已完成 |
 
 ### v0.2（进行中）
 
@@ -164,6 +174,13 @@ make dist-linux-arm64   # 交叉编译并打包 Linux aarch64
 ```
 
 构建产物位于 `zig-out/bin/`，包含 `nodeforge` 和 `nodeforged` 两个二进制。
+
+产品版本统一定义在 `build.zig` 文件级常量 `nodeforge_version` 中；发布新版本时同时更新
+`build.zig.zon` 的包版本。构建时间由 Zig 标准库读取实时时钟并格式化为 RFC 3339 UTC，格式为
+`YYYY-MM-DDTHH:MM:SSZ`，不依赖宿主 shell 或 `date`。可复现构建使用 `-Dbuild-time=<固定值>` 覆盖。
+
+可运行 `zig run -lc examples/time_format_demo.zig` 验证时间转换边界：构建所用的纯 Zig
+`std.time.epoch` 输出 UTC 日历时间，libc `localtime_r`/`strftime` 输出宿主本地时间。
 
 ## 部署
 
@@ -222,10 +239,26 @@ nodeforged --check --config config.example.json --catalog catalog.example.json
 # 导入 ISO（自动识别布局并创建 install profile）
 nodeforge assets import /path/to/Rocky-9.7-aarch64-dvd.iso
 
+# 默认 source/profile 名来自完整 ISO 文件名，因此 SP、批次和日期天然隔离
+nodeforge assets import /path/to/Kylin-Server-V10-SP3-2403-Release-20240426-ARM64.iso
+
+# 必要时仍可覆盖 catalog 版本和 source/profile 名称
+nodeforge assets import /path/to/custom.iso \
+  --distro kylin --version V10-SP3-2403-Release-20240426 --arch aarch64 \
+  --name kylin-v10-sp3-2403-20240426-aarch64
+
 # 管理节点和 Profile
-nodeforge node add node-01 --mac 00:50:56:2a:23:db --profile rocky-9
+nodeforge node add node-01 mac=00:50:56:2a:23:db arch=aarch64 profile=rocky-9 \
+  pxe.ip_reservation=192.168.50.110 network.mode=dhcp
 nodeforge node set node-01 storage.boot_disk=/dev/sda
 nodeforge profile set rocky-9 'kernel_args=iommu=pt hugepages=4'
+
+# 仅可删除没有 Node 引用的 Profile；有引用时返回 profile.in_use
+nodeforge profile remove unused-profile
+
+# 详情视图按 Stored / Overrides / Effective / Runtime 分区，并按点路径分层对齐
+nodeforge node show node-01
+nodeforge profile show rocky-9
 
 # 部署
 nodeforge install retry node-01     # 武装安装 generation

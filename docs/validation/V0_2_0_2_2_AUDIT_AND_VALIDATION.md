@@ -15,7 +15,8 @@ r97n0 QEMU 与 VMware Fusion `r97n1` 真实 UEFI PXE 两层验证通过。原实
   `nodeforge-initrd`/`nodeforge-agent`，两者必须成对安装。
 - `assets initrd build --from-install-source` 保留 ISO vendor initrd 及其
   patch/firmware/ko，仅追加 NodeForge overlay；overlay 自动补入安装器 initrd
-  可能缺少的 `dhclient`、`switch_root` 及其动态依赖。无 source 时才调用通用
+  可能缺少的 `dhclient` fallback、`switch_root` 及其动态依赖，并同时注入 `udhcpc`/`dhclient`
+  最小 hook；运行时先复用已有地址，再优先使用 vendor `udhcpc`。无 source 时才调用通用
   dracut fallback。输出原子发布到专用 initrd store 并注册 catalog。
 - boot bundle 只绑定 kernel/initrd，不再绑定 Profile 派生 rootfs。
 - PXE 请求虚拟 per-MAC GRUB 时，服务端内部创建 delivery session；GRUB 追加
@@ -103,6 +104,35 @@ MAC `00:50:56:2A:23:DB`；通过 Computer Use 直接操作 Fusion。
   `192.168.27.0/24` 直连路由，不配置默认网关。
 - 验证后关闭 VM；r97n0 原生产二进制、catalog 和登记 initrd 已恢复，
   `nodeforged` 为 active 且健康。
+
+## 2026-07-27 r97n0 增量部署验证
+
+本轮在 macOS/Zig 0.16.0 使用 `aarch64-linux-gnu ReleaseSafe` 交叉编译四个产物。部署前先停止
+`nodeforged`，确认生产进程退出且 UDP 67/69 不再由 NodeForge 占用；上传到独立暂存目录并核对 ELF
+架构与 SHA-256 后，备份旧二进制，再以同目录 rename 替换 `/opt/nodeforge/bin/`。随后执行
+`nodeforged --check-config`、`nodeforged --check`、systemd start 和 `/healthz`，全部通过。
+最终远端 SHA-256 为：`nodeforge=227fb68b93f16edf2055b18321fac0418856b9e61a81cd433bd2919efab44308`、
+`nodeforged=c439405bb4918d42092e7b19ca0c3744c26e29c6ad1405939fdaf94487a30fcf`、
+`nodeforge-agent=03abfbb1e70240ecbe9005bafd0ea9a45064d56c653aab400afd5f30a4e21c76`、
+`nodeforge-initrd=b8b68276a02e0cb08d360de681185779df720fcb118db9e0b051022abb35961e`。
+
+实机验证不是只检查 help：通过生产 management API 创建绑定 `rocky-9.7-diskless`、但
+`deploy=false` 的临时节点，同时提交 `pxe.ip_reservation`、静态 `network.address/prefix_len/gateway`、
+`network.interface_name`、`network.match_mac` 和 Node timezone override。`node show` 按
+`Stored / Overrides / Effective / Runtime` 分区，点路径形成缩进层级并正确对齐；`profile show` 的
+Stored/Effective/Capabilities/Assets/Runtime 同样正常。验证后删除临时节点，catalog 仅保留原 `r97n1`；
+服务保持 active，healthz 成功，journal 无 warning。
+
+部署验证发现并修复了两处仅靠编译未暴露的创建契约漂移：
+
+1. `deploy=false/profile=null` 时 CLI 曾省略必需 nullable `profile`，服务端 strict DTO 解码失败；现显式发送 null。
+2. CLI 已接受创建时 overrides，但 HTTP `NodeAddRequest` 和 catalog `AddParams` 未贯通，且直接序列化
+   `NodeConfig` 会泄漏 strict DTO 不接受的 legacy 字段；现使用 canonical create payload，并让 overrides
+   从 CLI 经 HTTP 原子落入 catalog。对应回归测试已加入 native test suite。
+
+本轮部署的 `nodeforge-initrd` 二进制已确认包含“已有地址 → udhcpc → dhclient fallback”选择逻辑；但未重新
+构建并 PXE 启动生产 initrd asset，因此本节不把字符串/构建验证表述为新的 diskless 启动闭环证据。既有
+Rocky/VMware 启动证据仍来自上一节，下一次重建 boot bundle 时应执行一次真实 PXE 回归。
 
 ## v0.2.1 / v0.2.2 边界
 

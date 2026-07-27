@@ -64,63 +64,60 @@ pub fn forNode(allocator: std.mem.Allocator, config: *const model.AppConfig, sou
     try append(&canonical.writer, "distro", .{ .name = distro.name, .family = distro.family, .version = distro_version.* });
 
     {
-            // 编译 effective 配置：将 node 和 profile 的默认值、覆盖值合并为
-            // 最终安装输入。effective 包含存储、网络、软件包等所有影响
-            // 安装结果的字段。
-            var effective = try @import("../profile/effective.zig").compileInputs(allocator, node, profile, install_source);
-            defer effective.deinit();
-            try append(&canonical.writer, "effective", .{
-                .node_id = effective.node.id,
-                .mac = effective.node.mac,
-                .arch = effective.node.arch,
-                .hostname = effective.node.hostname,
-                .deploy = effective.node.deploy,
-                .http_accel = effective.node.http_accel,
-                .pxe = effective.node.pxe,
-                .profile_name = effective.profile_name,
-                .install = effective.install,
-                .system = effective.system,
-                .software = effective.software,
-                .network = effective.network,
-                .kernel_args = effective.kernel_args,
-            });
-            try append(&canonical.writer, "install_source", install_source.*);
-            // 追加被引用的 asset：ISO、kernel、initrd。每个 asset 的 SHA-256
-            // 也参与摘要，确保资产内容变更会改变 digest（触发 drift 检测）。
-            try appendAsset(&canonical.writer, source, install_source.source_asset);
-            try appendAsset(&canonical.writer, source, install_source.installer_kernel);
-            try appendAsset(&canonical.writer, source, install_source.installer_initrd);
-            // DHCP option 67 使用每架构共享的 canonical UEFI bootloader。
-            // bootloader 文件名由架构决定，不取决于配置。
-            const bootloader_name = switch (install_source.arch) {
-                .aarch64 => "grub-uefi-aarch64",
-                .x86_64 => "grub-uefi-x86-64",
+        // 编译 effective 配置：将 node 和 profile 的默认值、覆盖值合并为
+        // 最终安装输入。effective 包含存储、网络、软件包等所有影响
+        // 安装结果的字段。
+        var effective = try @import("../profile/effective.zig").compileInputs(allocator, node, profile, install_source);
+        defer effective.deinit();
+        try append(&canonical.writer, "effective", .{
+            .node_id = effective.node.id,
+            .mac = effective.node.mac,
+            .arch = effective.node.arch,
+            .hostname = effective.node.hostname,
+            .deploy = effective.node.deploy,
+            .http_accel = effective.node.http_accel,
+            .pxe = effective.node.pxe,
+            .profile_name = effective.profile_name,
+            .install = effective.install,
+            .system = effective.system,
+            .software = effective.software,
+            .network = effective.network,
+            .kernel_args = effective.kernel_args,
+        });
+        try append(&canonical.writer, "install_source", install_source.*);
+        // 追加被引用的 asset：ISO、kernel、initrd。每个 asset 的 SHA-256
+        // 也参与摘要，确保资产内容变更会改变 digest（触发 drift 检测）。
+        try appendAsset(&canonical.writer, source, install_source.source_asset);
+        try appendAsset(&canonical.writer, source, install_source.installer_kernel);
+        try appendAsset(&canonical.writer, source, install_source.installer_initrd);
+        // DHCP option 67 使用每架构共享的 canonical UEFI bootloader。
+        // bootloader 文件名由架构决定，不取决于配置。
+        const bootloader_name = switch (install_source.arch) {
+            .aarch64 => "grub-uefi-aarch64",
+            .x86_64 => "grub-uefi-x86-64",
+        };
+        for (source.assets) |asset| {
+            if (asset.kind != .bootloader or !std.mem.eql(u8, asset.name, bootloader_name)) continue;
+            try append(&canonical.writer, "bootloader_asset", asset);
+        }
+        // bootloader asset 是架构级共享资产；不含可用 UEFI bootloader 的
+        // 迁移输入仍可计算 plan，但 drift 摘要不含该资产。
+        // 仓库配置及其 GPG key asset 也参与摘要。
+        for (install_source.repositories) |name| {
+            const repository = catalog.findRepository(source, name) orelse return error.RepositoryNotFound;
+            try append(&canonical.writer, "repository", repository.*);
+            if (repository.gpg_key) |key| try appendAsset(&canonical.writer, source, key);
+        }
+        // provisioning bundle（可选）：post_install 或 install bundle。
+        if (profile.install.post_install.bundle) |name| {
+            var found = false;
+            for (source.provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) {
+                try append(&canonical.writer, "provisioning_bundle", bundle);
+                found = true;
+                break;
             };
-            var found_bootloader = false;
-            for (source.assets) |asset| {
-                if (asset.kind != .bootloader or !std.mem.eql(u8, asset.name, bootloader_name)) continue;
-                try append(&canonical.writer, "bootloader_asset", asset);
-                found_bootloader = true;
-            }
-            // bootloader asset 是架构级共享资产;ISO 导入时可能尚未发布。
-            // 跳过 bootloader 摘要不影响安装计划完整性,仅降低 drift 检测粒度。
-            // TODO: ISO 导入应自动发布 canonical UEFI bootloader asset。
-            // 仓库配置及其 GPG key asset 也参与摘要。
-            for (install_source.repositories) |name| {
-                const repository = catalog.findRepository(source, name) orelse return error.RepositoryNotFound;
-                try append(&canonical.writer, "repository", repository.*);
-                if (repository.gpg_key) |key| try appendAsset(&canonical.writer, source, key);
-            }
-            // provisioning bundle（可选）：post_install 或 install bundle。
-            if (profile.install.post_install.bundle orelse profile.install.bundle) |name| {
-                var found = false;
-                for (source.provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) {
-                    try append(&canonical.writer, "provisioning_bundle", bundle);
-                    found = true;
-                    break;
-                };
-                if (!found) return error.ProvisioningBundleNotFound;
-            }
+            if (!found) return error.ProvisioningBundleNotFound;
+        }
     }
 
     // 对规范化字符串计算 SHA-256，输出为 64 字符小写十六进制。

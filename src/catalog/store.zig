@@ -72,7 +72,7 @@ pub fn loadLegacy(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !s
     // boot_bundle、rootfs_build/first_boot 步骤和 runtime_kernel 资产，
     // 严格 v3 DTO 会省略这些）；schema 3 使用严格 v3 DTO；其余为旧版 v2。
     if (header.value.schema_version == 3) return schema_v3_dto.parse(allocator, bytes);
-    if (header.value.schema_version == 4) return std.json.parseFromSlice(model.Catalog, allocator, bytes, .{ .allocate = .alloc_always });
+    if (header.value.schema_version == 4) return std.json.parseFromSlice(model.Catalog, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     return schema_v2_dto.parse(allocator, bytes);
 }
 
@@ -141,7 +141,7 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     return if (manifest.catalog_schema_version == 3)
         schema_v3_dto.parse(allocator, combined.written())
     else if (manifest.catalog_schema_version == 4)
-        std.json.parseFromSlice(model.Catalog, allocator, combined.written(), .{ .allocate = .alloc_always })
+        std.json.parseFromSlice(model.Catalog, allocator, combined.written(), .{ .allocate = .alloc_always, .ignore_unknown_fields = true })
     else
         schema_v2_dto.parse(allocator, combined.written());
 }

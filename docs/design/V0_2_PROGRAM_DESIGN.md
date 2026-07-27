@@ -1,11 +1,21 @@
 # NodeForge v0.2 程序边界设计
 
-状态：v0.2 程序分册，设计冻结、实现未开始。总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文只定义
+状态：v0.2 程序分册，核心实现已落地并持续按验证结果收口。总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文只定义
 三个编译产物的职责、生命周期、信任边界和凭据所有权。CLI 见 [`V0_2_CLI.md`](V0_2_CLI.md)，
 diskless 时序见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，状态机/协议栈见
 [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md)。
 
 本文不维护完整命令参考或逐协议状态转移；功能列表用于确定代码归属，不能替代实现分册。
+
+## 0. 构建溯源约定
+
+- `build.zig` 文件级常量 `nodeforge_version` 是二进制产品版本的构建事实源；发布时必须同步更新
+  `build.zig.zon` 的包版本，避免产物版本与包元数据分叉。
+- CLI 与 daemon 共用编译期注入的 version、Git commit、dirty 状态和 build time。
+- build time 由 `std.Io.Clock.real` 读取 Unix timestamp，再由 `std.time.epoch` 格式化为 RFC 3339 UTC，
+  固定格式为 `YYYY-MM-DDTHH:MM:SSZ`；构建过程不依赖宿主 shell 或 `date`。
+- 可复现构建通过 `-Dbuild-time=<固定值>` 显式注入时间。运行时代码若需要本地时间，统一通过 libc
+  `localtime_r`/`strftime`；结构化 API 与事件时间保持 UTC 语义。
 
 ## 1. 三程序总览
 
@@ -15,9 +25,17 @@ diskless 时序见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，状态机/协议�
 | `nodeforge-initrd` | dracut 引导程序：拉最小 BootConfig、下载/校验/挂载 rootfs、交接 AgentPlan locator、switch_root | initrd（switch_root 前） | node-bound boot/rootfs capability token | 是 |
 | `nodeforge-agent` | 单次启动执行框架：从服务端拉 immutable AgentPlan/payload，pre-init 应用全部 Node override 并 exec 真正 init；systemd 后执行 first-boot | 切根后 pre-init + 运行期 | session-bound `agent:read` + `event:append` token，无 enrollment | 是（仅 diskless） |
 
-三者共享核心模块（`src/root.zig` 为 `nodeforge` 模块），避免行为分叉；当前 `build.zig` 仅产出
-`nodeforged` 与 `nodeforge`（管理 CLI），v0.2 新增 `nodeforge-initrd` 与 `nodeforge-agent` 两个
-executable，复用同一 core module。
+三者共享核心模块（`src/root.zig` 为 `nodeforge` 模块），避免行为分叉；当前 `build.zig` 产出
+`nodeforge`、`nodeforged`、`nodeforge-initrd` 与 `nodeforge-agent`，四个可执行文件复用同一 core module。
+
+### 1.2 setup 与宿主环境边界
+
+默认安装根 `/opt/nodeforge` 的初始化和 reconfigure 会原子生成 `/etc/profile.d/nodeforge.sh`，固定权限
+`0644 root:root`，幂等地把 `/opt/nodeforge/bin` 加入登录 shell 的 `PATH`。脚本不覆盖已有 PATH，也不会重复插入；
+当前会话可显式 source，新登录会话自动生效。自定义安装根用于测试或并行实例，禁止写宿主全局 profile.d。
+
+`setup` 只发布环境脚本和 `/opt/nodeforge/systemd/nodeforged.service` 事实文件；systemd 的 daemon-reload、enable、
+restart 仍是显式运维动作，避免 reconfigure 在无确认时改变服务生命周期。
 
 ### 1.1 启动阶段与写入边界
 
@@ -54,6 +72,8 @@ v0.1 已实现单进程内置 DHCPv4/TFTP/HTTP 与本机管理 API。v0.2 在其
 - effective compiler / readiness / validator：与 v0.1 同一编译结果（diskless 分支消费 immutable
   DisklessEffectivePlan）。
 - 管理本机 API：复用 v0.1 management API 与 `admin_key` 鉴权。
+- Profile 删除：`DELETE /api/v1/management/profiles/:name` 必须携带 catalog `If-Match`；daemon 在 model gate
+  内检查 Node 引用，零引用才原子发布新 catalog generation，有引用返回 `profile.in_use`。
 
 ### 2.2 实现要点
 

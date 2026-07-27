@@ -262,7 +262,6 @@ casper initrd，.ko 与 kernel 同源，vermagic 完全匹配。
 | boot kernel | initrd 来源 | .ko vermagic | modprobe 结果 | 状态 |
 |---|---|---|---|---|
 | Ubuntu 5.15.0-119-generic | **casper initrd（ISO 同源）** | 5.15.0-119-generic | ✅ 完全匹配 | **推荐** |
-| Ubuntu 5.15.0-119-generic | Rocky dracut（5.14.0-611 .ko） | 5.14.0-611.el9 | ❌ 不匹配 | ~~已废弃~~ |
 | Rocky 5.14.0-611 | Rocky dracut（5.14.0-611 .ko） | 5.14.0-611.el9 | ✅ 匹配 | 仅适用 Rocky diskless |
 
 **验证证据**（r97n0 实测）：
@@ -465,18 +464,7 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
 | casper rootfs `mkinitramfs` | ✅ 已安装 | `/usr/sbin/mkinitramfs` + `/usr/sbin/update-initramfs` 存在 |
 | Ubuntu ISO `/casper/vmlinuz` | ✅ | gzip compressed, `vmlinuz-5.15.0-119-generic.efi.signed` |
 
-### 8.3 已废弃的验证（Rocky kernel 混搭）
-
-> **以下验证已作废**——使用 Rocky kernel + Rocky dracut initrd + Ubuntu rootfs 的混搭，
-> 虽然在 QEMU 中能启动，但这不是 Ubuntu diskless 方案的正确实现。
-> 仅保留作为反面记录。
-
-| 验证项 | 结果 | 说明 |
-|---|---|---|
-| ~~QEMU smoke: Ubuntu rootfs + Rocky kernel + Rocky dracut initrd~~ | ~~✅~~ | **已废弃**：kernel/initrd/rootfs 三者不同源，非正确方案 |
-| ~~dracut initramfs 在 Rocky 上生成+提取+重打包~~ | ~~✅~~ | **已废弃**：Ubuntu diskless 不使用 dracut 构建 initrd |
-
-### 8.4 casper initrd 复用方案：QEMU 完整验证（已通过）
+### 8.3 casper initrd 复用方案：QEMU 完整验证（已通过）
 
 验证脚本：`tests/v0_2_1_casper_initrd_smoke.sh`
 验证环境：r97n0 Rocky 9.8 aarch64
@@ -540,14 +528,11 @@ NODEFORGE_UBUNTU_CASPER_VALIDATION_DONE
 | /init 预挂载 | 无问题 | 无问题（修正后） | Rocky 的 dracut /init 不预挂载，Ubuntu 修正后也不预挂载 |
 | vermagic 匹配 | ✅ 同宿主机 | ✅ 同 ISO | Rocky: kernel+initrd 同宿主机；Ubuntu: kernel+initrd 同 ISO |
 | switch_root | ✅ `/usr/sbin/switch_root` | ✅ `/usr/bin/switch_root` | 两者都有 |
-| dhclient | ✅ dracut 有 | ✅ casper 有 | 两者都有 |
+| DHCP client | `dhclient` fallback | casper 常见 `udhcpc`/`dhclient` | NodeForge 先复用已有地址，再优先 `udhcpc`、回退 `dhclient` |
 
-**注意**：`src/initrd.zig` 第 9 行注释隐式假设了 dracut 环境：
-```zig
-//! 本程序运行在 dracut 提供的最小 userspace（含 `ip`/`dhclient`/`curl`/`mount`/
-//! `losetup`/`switch_root`）中
-```
-这对 Rocky diskless 成立，但对 Ubuntu casper 不成立（缺 curl）。
+**最新边界**：`nodeforge-initrd` 不再假设单一 dracut 工具闭包。HTTP 已由 Zig 原生客户端实现；网络先复用
+已有全局 IPv4，再优先使用 vendor initrd 的 BusyBox `udhcpc`，最后回退到构建 overlay 注入的 `dhclient`。
+因此 Ubuntu casper 是否自带 curl 不再影响启动，是否自带 dhclient 也不再是唯一客户端判据。
 差异在 initrd 构建步骤中处理（注入 curl），不需要修改 `initrd.zig` 本身。
 
 ## 9. 两种 initrd 构建方案对比分析
@@ -658,7 +643,7 @@ mkinitramfs 生成的 initrd 与 casper initrd 的工具对比：
 | curl | ❌ 需注入 | ❌ 需注入 | ✅ 是 |
 | modprobe | ✅ 有 | ❌ 需注入 | ✅ 是（/init 脚本使用） |
 | ip | ✅ 有 | ✅ 有 | ✅ 是 |
-| dhclient | ✅ 有 | ✅ 有 | ✅ 是 |
+| DHCP client | `dhclient` fallback | `udhcpc` 或 `dhclient` | ✅ 至少一条路径；builder 保证 fallback |
 | switch_root | ✅ 有 | ✅ 有 | ✅ 是 |
 | mount | ✅ 有 | ✅ 有 | ✅ 是 |
 | busybox | ✅ 有 | ✅ 有 | ✅ 是 |
@@ -805,4 +790,3 @@ casper initrd **不包含 curl**（只有 `wget`），而 `nodeforge-initrd` 运
 
 **总结**：v0.2.2（原生 HTTP）之后，方案 A **不再需要** 拷贝 curl。方案 B（mkinitramfs）
 构建的 initrd 也不需要注入 curl，因为 `nodeforge-initrd` 使用原生 HTTP 客户端，不再依赖任何外部工具。
-

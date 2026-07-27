@@ -105,6 +105,7 @@ pub const specs = [_]RouteSpec{
     .{ .method = "GET", .template = "/api/v1/management/profiles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/profiles", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
+    .{ .method = "DELETE", .template = "/api/v1/management/profiles/:name", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles/:name/values", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "POST", .template = "/api/v1/management/profiles/:name/values", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
     .{ .method = "GET", .template = "/api/v1/management/profiles/:name/items", .plane = .management, .auth = .loopback, .cache = .no_store, .log = .api },
@@ -297,7 +298,7 @@ test "Allow aggregation reflects registered methods for detail and collection pa
     try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/assets/rocky-kernel", &buffer).?);
     // v3 profile detail 为只读；规范变更使用 /properties、
     // /values 和 /items 子资源。
-    try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/profiles/rocky-install", &buffer).?);
+    try std.testing.expectEqualStrings("GET, DELETE", allowed("/api/v1/management/profiles/rocky-install", &buffer).?);
     try std.testing.expectEqualStrings("POST", allowed("/api/v1/management/profiles/rocky-install/properties", &buffer).?);
     try std.testing.expectEqualStrings("GET, PATCH", allowed("/api/v1/management/discovery/policy", &buffer).?);
     try std.testing.expectEqualStrings("GET", allowed("/api/v1/management/discovery/observations/02:00:00:00:00:01", &buffer).?);

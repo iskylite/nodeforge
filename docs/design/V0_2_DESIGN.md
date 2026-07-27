@@ -148,6 +148,8 @@ Result），但 `bootloader_rel` 错误地多了 defer free。对比 `bootloader
 4. daemon 端 rootfs build 添加 `std.log.scoped(.rootfs_build)` 分阶段进度日志
    （stage 1/5 ~ 5/5 + DONE/FAILED），initrd build executor 同样添加 7 阶段进度日志。
    日志可通过 `journalctl -u nodeforged` 或 daemon 日志文件查看。
+5. 所有 detail document 的 human renderer 按 section 分区；点路径展开为父级标题与叶子字段，字段值按终端可见宽度
+   对齐，多行值的续行与首行 value 列对齐。JSON/JSONL 字段路径与筛选语义不变。
 
 **影响范围**：`src/main.zig`（profile show / rootfs build / rootfs plan / rootfs status /
 rootfs register / initrd build handler）、`src/http/server.zig`（rootfs build 进度日志）、
@@ -1094,10 +1096,10 @@ reconciliation/远程控制为永久非目标，无对应 CLI（见 §7）。v0.
 - enrollment 机制（可续期的运行期节点认证 secret）全版本不引入；boot/first-boot 仍使用与 session 或 generation
   绑定、短时、最小权限且服务端只存 hash 的 capability token，不能升级为 management credential。
 - 跨不可信网络 TLS/mTLS、远程管理。
-- `profile remove`/`node remove`：v0.2 不提供删除命令。Profile/Node 与 delivery snapshot、
-  active session 和历史审计存在引用关系，删除会产生孤儿引用或丢失历史证据。废弃通过 `deploy=false` 停用 +
-  换绑归档；有引用的 Profile/Node 不能删除，无引用时也不提供 remove。后续版本若需要回收，必须另行设计
-  tombstone、retention 和审计引用，不由 v0.2 提前宣告为全版本永久非目标。
+- `profile remove`：只允许删除当前 catalog 中零 Node 引用的 Profile。DELETE mutation 必须携带当前 catalog
+  `If-Match`，并在 daemon mutation mutex/model gate 内完成引用复查、模型校验、manifest-last 发布和 snapshot 切换；
+  有引用返回稳定的 `profile.in_use`，禁止隐式解绑。历史 deployment/session snapshot 是已固定事实，不随当前
+  Profile 删除重写。`node remove` 继续受活动 session gate 保护；需要保留的机器通过 `deploy=false` 停用。
 
 ## 8. 文档与实现规则
 
@@ -1236,7 +1238,7 @@ v0.2 进入条件，且未触碰任何代码。
 daemon 依赖约定；补 `profile list`、`provision-bundle list/item remove`、per-action 字段矩阵、`preflight` human 输出、
 `rootfs plan` JSON digest 字段、`boot preview`/`node status`/`runtime`/`status --component` 输出格式、`postprocess` 默认 session
 与 `--include-output` 语义；新增 §13 digest 流转表与从零启用流程示例；统一 `preflight diskless-builder` 命令形式
-（`V0_2_DISKLESS_WORKFLOW.md` 同步）；补 `profile create` 向后兼容默认 `--kind install`、`node effective` vs `node show` 区分、
+（`V0_2_DISKLESS_WORKFLOW.md` 同步）；补 `profile create` 默认 `--kind install`、`node effective` vs `node show` 区分、
 `profile/node remove` 为 v0.2 非目标（§7）。`V0_3/V0_4` 的 `postinstall` 统一为 `postprocess`。全部改动未触碰代码、未改变 v0.1 冻结
 owner 或 v0.2 进入条件。
 
@@ -1320,7 +1322,7 @@ Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或�
    nodeforge profile rootfs build <diskless-profile>
 
    # 7. 注册并启用节点
-   nodeforge node add <id> --mac <mac> --arch <a> --profile <name>
+   nodeforge node add <id> mac=<mac> arch=<a> profile=<name>
    nodeforge node set <id> deploy=true
 
    # 节点网络启动后自动执行：
@@ -1342,7 +1344,10 @@ Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或�
    - 显式挂载 `/run` 为 tmpfs（rootfs 下载的 .part/.chunk 文件写入此处，initramfs 根可能只读）
    - 加载 `squashfs`/`loop`/`overlay` 内核模块（Rocky 内核中这些是模块而非内置，使用 `runIgnore`
      容忍模块已内置时的非零返回）
-   - 使用 `dhclient -v -1`（尝试一次即退出）避免在无法获取租约时无限阻塞 PID 1
+   - 已有全局 IPv4 时直接复用；否则优先使用 vendor initrd 的 BusyBox `udhcpc`，未配置出地址或不存在时
+     回退到构建器注入的 `dhclient -v -1`；两条路径均有界退出
+   - daemon 内置 DHCP 是 UDP/67 server，不能复用为 initrd 的 UDP/68 client；自定义 `/init` 也不会执行
+     vendor dracut/NetworkManager 的完整网络状态机
    - 使用 shell 参数展开 `${i##*/}` 替代 `basename` 命令依赖
    - 显式设置 `PATH=/usr/bin:/usr/sbin:/bin:/sbin`（内核启动 PID 1 时不携带环境变量）
    - `switch_root` 使用 `/usr/sbin/nodeforge-agent`（rootfs 中的实际路径）

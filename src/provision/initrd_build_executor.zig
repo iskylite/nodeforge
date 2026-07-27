@@ -74,14 +74,14 @@ fn buildInternal(
         std.log.scoped(.initrd_build).info("initrd build: stage 2/7 - dracut fallback (no vendor initrd)", .{});
         const base_img = try std.fmt.allocPrint(a, "{s}/initrd-base.img", .{work_dir});
         runCmd(io, allocator, &.{
-            "dracut", "--no-hostonly",
-            "--kver", kernel_release,
-            "--modules", "network base",
+            "dracut",        "--no-hostonly",
+            "--kver",        kernel_release,
+            "--modules",     "network base",
             "--filesystems", "squashfs overlay",
             // Generic fallback covers common bare-metal emulation and virtio.
             // vmxnet3 is VMware-specific and is intentionally not universal.
             "--add-drivers", "loop virtio_net e1000e",
-            "--install", "/usr/sbin/switch_root",
+            "--install",     "/usr/sbin/switch_root",
             base_img,
         }) catch |err| {
             std.log.scoped(.initrd_build).err("dracut failed: {t}", .{err});
@@ -93,17 +93,19 @@ fn buildInternal(
             return error.UnpackFailed;
         };
     } else {
-        // Installer initrds commonly use NetworkManager and do not contain the
-        // standalone dhclient binary used by NodeForge's PID-1 network setup;
-        // installer images may also omit switch_root. Add only those userspace
+        // 安装器 initrd 通常使用 NetworkManager，不一定提供 NodeForge PID 1
+        // 兜底路径可调用的独立 DHCP 客户端；安装镜像也可能缺少 switch_root。
+        // 这里只补充这些用户态工具，避免改变安装器原有的启动结构。
         // companions (plus dynamic dependencies); all kernel modules and
         // firmware still come untouched from the ISO initrd. The build host
         // must match the target distro/architecture.
         std.log.scoped(.initrd_build).info("initrd build: stage 2/7 - vendor initrd overlay mode", .{});
         runCmd(io, allocator, &.{
             "/usr/lib/dracut/dracut-install",
-            "-D", initrd_root,
-            "-l", "-a",
+            "-D",
+            initrd_root,
+            "-l",
+            "-a",
             "/usr/sbin/dhclient",
             "/usr/sbin/switch_root",
         }) catch |err| {
@@ -132,8 +134,9 @@ fn buildInternal(
     };
     try runCmd(io, allocator, &.{ "chmod", "0755", agent_dest });
 
-    // 4. 注入不依赖 NetworkManager/systemd 的最小 DHCP hook。
-    std.log.scoped(.initrd_build).info("initrd build: stage 4/7 - creating dhclient hook", .{});
+    // 4. 注入不依赖 NetworkManager/systemd 的最小 DHCP hooks。运行时优先使用
+    // vendor initrd 已有的 BusyBox udhcpc；dhclient 是跨发行版确定性 fallback。
+    std.log.scoped(.initrd_build).info("initrd build: stage 4/7 - creating DHCP client hooks", .{});
     const dhclient_script = try std.fmt.allocPrint(a, "{s}/usr/sbin/nodeforge-dhclient-script", .{initrd_root});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dhclient_script, .data =
         \\#!/bin/sh
@@ -149,6 +152,21 @@ fn buildInternal(
         \\
     });
     try runCmd(io, allocator, &.{ "chmod", "0755", dhclient_script });
+    const udhcpc_script = try std.fmt.allocPrint(a, "{s}/usr/sbin/nodeforge-udhcpc-script", .{initrd_root});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = udhcpc_script, .data =
+        \\#!/bin/sh
+        \\case "${1:-${reason:-}}" in
+        \\ deconfig) /sbin/ip addr flush dev "$interface" ;;
+        \\ bound|renew)
+        \\  /sbin/ip addr flush dev "$interface"
+        \\  /sbin/ip addr add "$ip/${subnet:-255.255.255.0}" dev "$interface"
+        \\  for gateway in ${router:-}; do /sbin/ip route replace default via "$gateway" dev "$interface"; break; done
+        \\  ;;
+        \\esac
+        \\exit 0
+        \\
+    });
+    try runCmd(io, allocator, &.{ "chmod", "0755", udhcpc_script });
 
     // 5. 创建 /init 脚本（PID 1 入口，exec nodeforge-initrd）
     std.log.scoped(.initrd_build).info("initrd build: stage 5/7 - creating /init PID 1 script", .{});

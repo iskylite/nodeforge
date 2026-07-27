@@ -40,7 +40,25 @@ unsquashfs -d "$work/rootfs" -f "$m/casper/ubuntu-server-minimal.ubuntu-server.i
 
 # Inject nodeforge-agent + firstboot service
 install -m 0755 zig-out/bin/nodeforge-agent "$work/rootfs/usr/sbin/nodeforge-agent"
-install -D -m 0644 packaging/systemd/nodeforge-firstboot.service "$work/rootfs/etc/systemd/system/nodeforge-firstboot.service"
+mkdir -p "$work/rootfs/etc/systemd/system"
+printf '%s\n' \
+    '[Unit]' \
+    'Description=NodeForge diskless first-boot provisioning' \
+    'After=local-fs.target network-online.target' \
+    'Before=rc-local.service' \
+    'Wants=network-online.target' \
+    'ConditionPathExists=/var/lib/nodeforge/boot.json' \
+    '' \
+    '[Service]' \
+    'Type=oneshot' \
+    'ExecStart=/usr/sbin/nodeforge-agent' \
+    'RemainAfterExit=yes' \
+    'StandardOutput=journal+file:/var/lib/nodeforge/firstboot.log' \
+    'StandardError=journal+file:/var/lib/nodeforge/firstboot.log' \
+    '' \
+    '[Install]' \
+    'WantedBy=multi-user.target' \
+    >"$work/rootfs/etc/systemd/system/nodeforge-firstboot.service"
 mkdir -p "$work/rootfs/etc/systemd/system/multi-user.target.wants"
 ln -sfn ../nodeforge-firstboot.service "$work/rootfs/etc/systemd/system/multi-user.target.wants/nodeforge-firstboot.service"
 mkdir -p "$work/rootfs/etc/systemd/system/nodeforge-firstboot.service.d"

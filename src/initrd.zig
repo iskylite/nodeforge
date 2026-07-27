@@ -12,7 +12,7 @@
 //!
 //! **无环境变量**：内核启动 PID 1 时不携带任何环境变量。`/init` 脚本可能
 //! 设置 PATH 也可能不设置。`main()` 中显式调用 `setenv("PATH", ...)` 确保
-//! `/usr/sbin/ip`、`/usr/sbin/dhclient`、`/usr/sbin/switch_root` 等命令通过裸名
+//! `/usr/sbin/ip`、`udhcpc`/`dhclient`、`/usr/sbin/switch_root` 等命令通过裸名
 //! 调用时能被找到。
 //!
 //! **只读根文件系统**：dracut initramfs 的根可能是只读的。rootfs 下载的
@@ -24,10 +24,11 @@
 //! 这三个模块。使用 `runIgnore` 而非 `mustRun`——如果模块已内置则 modprobe
 //! 返回非零但不影响功能。
 //!
-//! **dhclient 依赖**：`dhclient` 需要 `/var/lib/dhclient/` 目录存放 lease
-//! 文件，需要 `/usr/sbin/dhclient-script` 处理 DHCP 事件。`bringUpNetwork`
-//! 显式创建该目录。使用 `dhclient -v -1`（尝试一次即退出）避免在无法获取
-//! 租约时无限阻塞 PID 1。
+//! **DHCP 客户端边界**：daemon 内置的是 DHCP server，不能复用为 initrd 的
+//! DHCP client。initrd 先接受内核/vendor userspace 已配置的全局地址，再优先
+//! 使用镜像常见的 BusyBox `udhcpc`，最后回退到构建器注入的 `dhclient`。
+//! 两条客户端路径都使用 NodeForge 自带的最小 hook，避免依赖
+//! NetworkManager/systemd 或发行版脚本。
 //!
 //! **无 coreutils 依赖**：`bringUpNetwork` 使用 shell 参数展开 `${i##*/}`
 //! 替代 `basename` 命令，避免对 initrd 中可能不存在的 coreutils 的依赖。
@@ -49,7 +50,7 @@ const http = @import("initrd/http.zig");
 
 /// C 库 setenv：在 initrd 最小环境中为子进程设置 PATH。
 /// 内核启动 PID 1 时不携带环境变量，`/init` 脚本可能未 export PATH，
-/// 导致 `/usr/sbin/ip`、`/usr/sbin/dhclient`、`/usr/sbin/switch_root` 等
+/// 导致 `/usr/sbin/ip`、`udhcpc`/`dhclient`、`/usr/sbin/switch_root` 等
 /// 命令通过裸名调用时找不到。此处显式设置 PATH 作为安全网。
 /// `single_threaded = true`（见 build.zig）时 Zig 不链接 libpthread，
 /// setenv 仍可用（它是 libc 函数，非 pthread 函数）。
@@ -112,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const io = init.io;
 
-    // 内核启动 PID 1 时不设置环境变量。显式设置 PATH 确保 ip/dhclient/
+    // 内核启动 PID 1 时不设置环境变量。显式设置 PATH 确保 ip/DHCP client/
     // switch_root/losetup 等 /usr/sbin 下的命令可通过裸名调用。
     _ = setenv("PATH", initrd_path, 1);
 
@@ -139,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "loop" });
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "overlay" });
     // QEMU/VMware 常见的 virtio NIC 在最小 initramfs 中不会由 udev 自动加载；
-    // 无网卡时 dhclient 可能仍以 0 退出，因此必须在枚举接口前显式尝试。
+    // DHCP client 可能在无可用网卡时仍退出，因此必须先显式加载常见驱动。
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "virtio_net" });
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "vmxnet3" });
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "e1000e" });
@@ -147,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
     const cmdline = try readCmdline(io, allocator);
     defer freeCmdline(allocator, cmdline);
 
-    // 基本网络：链路 up + DHCP（dracut 环境提供 dhclient/udhcpc）。
+    // 基本网络：复用已有地址，或通过 vendor udhcpc / 注入的 dhclient 获取。
     log("[nodeforge-initrd] bringing up network...\n", .{});
     try bringUpNetwork(io, allocator);
     log("[nodeforge-initrd] network setup done\n", .{});
@@ -277,23 +278,34 @@ pub fn main(init: std.process.Init) !void {
     return std.process.replace(io, .{ .argv = &.{ "/usr/sbin/switch_root", merged_mnt, "/usr/sbin/nodeforge-agent", "--pre-init" } });
 }
 
-/// up 第一个非 lo 网卡并 DHCP（dracut 环境提供 `ip`/`dhclient`）。
+/// up 第一个非 lo 网卡并取得 IPv4 配置。
 /// 使用 shell 参数展开 `${i##*/}` 替代 `basename`，避免对 coreutils 的依赖。
-/// 先 up 网卡再 DHCP，并确保 dhclient 所需的 `/var/lib/dhclient/` 目录存在。
-/// 使用 `dhclient -v -1`（尝试一次即退出），避免在无法获取租约时无限阻塞。
+/// 已有全局地址时直接复用；否则优先使用 initrd 自带 `udhcpc`，再回退到
+/// `dhclient -1`。所有路径都有界退出，避免 PID 1 无限阻塞。
 fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator) !void {
     try runIgnore(io, allocator, &.{ "ip", "link", "set", "lo", "up" });
     // 用 ${i##*/} 取接口名，不依赖 basename。
     try runIgnore(io, allocator, &.{ "sh", "-c", "for i in /sys/class/net/*; do dev=${i##*/}; [ \"$dev\" != lo ] && ip link set \"$dev\" up && break; done" });
-    // dhclient 需要 /var/lib/dhclient/ 存放 lease 文件。DHCP 是后续所有
-    // capability 请求的硬前置条件，失败必须在这里暴露，不能吞掉错误后
-    // 误报 “network setup done”，再把根因伪装成 HTTP 连接失败。
+    const existing = try captureRun(io, allocator, &.{ "/sbin/ip", "-4", "-o", "addr", "show", "scope", "global" });
+    defer allocator.free(existing);
+    if (std.mem.trim(u8, existing, " \t\r\n").len != 0) {
+        log("[nodeforge-initrd] using preconfigured network: {s}", .{existing});
+        return;
+    }
     try runIgnore(io, allocator, &.{ "mkdir", "-p", "/var/lib/dhclient" });
-    // -1: try once, -v: verbose；非零退出由 mustRun fail closed。
-    // Use the canonical absolute path. PID 1 starts without a conventional
-    // environment and libc's spawnp lookup is not reliable across minimal
-    // initramfs layouts even after setting PATH.
-    try mustRun(io, allocator, &.{ "/sbin/dhclient", "-v", "-1", "-sf", "/usr/sbin/nodeforge-dhclient-script" });
+    try mustRun(io, allocator, &.{
+        "sh", "-c",
+        \\if command -v udhcpc >/dev/null 2>&1; then
+        \\ udhcpc -n -q -t 5 -T 3 -s /usr/sbin/nodeforge-udhcpc-script
+        \\ if [ -n "$(/sbin/ip -4 -o addr show scope global)" ]; then exit 0; fi
+        \\ echo 'udhcpc did not configure a global IPv4 address; trying dhclient' >&2
+        \\fi
+        \\if command -v dhclient >/dev/null 2>&1; then
+        \\ exec dhclient -v -1 -sf /usr/sbin/nodeforge-dhclient-script
+        \\fi
+        \\echo 'no supported DHCP client (udhcpc or dhclient)' >&2
+        \\exit 127
+    });
     const addresses = try captureRun(io, allocator, &.{ "/sbin/ip", "-4", "-o", "addr", "show", "scope", "global" });
     defer allocator.free(addresses);
     if (std.mem.trim(u8, addresses, " \t\r\n").len == 0) return error.DhcpAddressMissing;

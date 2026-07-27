@@ -22,7 +22,7 @@ const Install = struct {
     proxy: model.ProxyConfig = .{},
     post_install: model.PostInstallConfig = .{},
     packages: []const []const u8 = &.{},
-    users: []const model.UserConfig = &.{},
+    users: []const model.TargetUserConfig = &.{},
     ssh_authorized_keys: []const []const u8 = &.{},
     bundle: ?[]const u8 = null,
 };
@@ -96,12 +96,27 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(m
     for (source.value.profiles) |profile| switch (profile.mode) {
         .install => {
             const install_source = profile.install_source orelse return error.LegacyInstallSourceMissing;
+            const legacy_install: Install = profile.install orelse Install{};
+            var system = profile.system;
+            var software = profile.software;
+            if (legacy_install.packages.len != 0) {
+                if (software.packages.include.len != 0) return error.LegacyPackageOwnershipConflict;
+                software.packages.include = legacy_install.packages;
+            }
+            if (legacy_install.users.len != 0) {
+                if (!model.targetUsersAreImplicitDefault(system.users)) return error.LegacyUserOwnershipConflict;
+                system.users = legacy_install.users;
+            }
+            if (legacy_install.ssh_authorized_keys.len != 0) {
+                if (system.ssh.root_authorized_keys.len != 0) return error.LegacySshOwnershipConflict;
+                system.ssh.root_authorized_keys = legacy_install.ssh_authorized_keys;
+            }
             profiles[profile_index] = .{
                 .name = profile.name,
                 .install_source = install_source,
-                .system = profile.system,
-                .software = profile.software,
-                .install = toInstall(profile.install orelse .{}, profile.safety.reinstall_policy),
+                .system = system,
+                .software = software,
+                .install = toInstall(legacy_install, profile.safety.reinstall_policy),
                 .kernel_args = profile.kernel_args,
             };
             profile_index += 1;
@@ -168,11 +183,7 @@ fn toInstall(value: Install, reinstall_policy: model.ReinstallPolicy) model.Prof
         .completion = value.completion,
         .updates = value.updates,
         .proxy = value.proxy,
-        .post_install = value.post_install,
-        .packages = value.packages,
-        .users = value.users,
-        .ssh_authorized_keys = value.ssh_authorized_keys,
-        .bundle = value.bundle,
+        .post_install = .{ .bundle = value.post_install.bundle orelse value.bundle },
     };
 }
 

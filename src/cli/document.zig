@@ -135,21 +135,90 @@ fn validateSelection(selection: []const u8, keys: KeySet) output.ContractError!v
 fn renderDetail(writer: *std.Io.Writer, detail: Detail, sections: []const u8, fields: []const u8) !void {
     try writer.print("{s}\n", .{detail.title});
     if (detail.sections.len == 0) {
-        for (detail.fields) |field| if (selected(fields, field.key)) try writer.print("{s}\t{s}\n", .{ field.key, field.value });
+        const width = detailFieldWidth(detail.fields, fields, "");
+        for (detail.fields) |field| if (selected(fields, field.key)) try renderDetailValue(writer, field.key, field.value, width, 0);
         return;
     }
     for (detail.sections) |section| {
         if (!selected(sections, section.key)) continue;
         var heading_written = false;
+        var previous_path: ?[]const u8 = null;
+        const width = detailFieldWidth(detail.fields, fields, section.key);
         for (detail.fields) |field| {
             if (!std.mem.eql(u8, field.section, section.key) or !selected(fields, field.key)) continue;
             if (!heading_written) {
-                try writer.print("\n{s}\n", .{section.title});
+                try writer.print("\n{s}:\n", .{section.title});
                 heading_written = true;
             }
-            try writer.print("{s}\t{s}\n", .{ field.key, field.value });
+            const path = relativeFieldPath(field.key, section.key);
+            const depth = componentCount(path);
+            const common = if (previous_path) |previous| commonParentCount(previous, path) else 0;
+            if (depth > 1) for (common..depth - 1) |level| {
+                try writeSpaces(writer, (level + 1) * 2);
+                try writer.print("{s}:\n", .{componentAt(path, level).?});
+            };
+            try renderDetailValue(writer, componentAt(path, depth - 1).?, field.value, width, depth * 2);
+            previous_path = path;
         }
     }
+}
+
+fn relativeFieldPath(key: []const u8, section: []const u8) []const u8 {
+    if (section.len < key.len and std.mem.startsWith(u8, key, section) and key[section.len] == '.') return key[section.len + 1 ..];
+    return key;
+}
+
+fn componentCount(path: []const u8) usize {
+    var count: usize = 1;
+    for (path) |byte| if (byte == '.') {
+        count += 1;
+    };
+    return count;
+}
+
+fn componentAt(path: []const u8, wanted: usize) ?[]const u8 {
+    var parts = std.mem.splitScalar(u8, path, '.');
+    var index: usize = 0;
+    while (parts.next()) |part| : (index += 1) if (index == wanted) return part;
+    return null;
+}
+
+fn commonParentCount(left: []const u8, right: []const u8) usize {
+    const maximum = @min(componentCount(left), componentCount(right)) - 1;
+    var count: usize = 0;
+    while (count < maximum) : (count += 1) {
+        if (!std.mem.eql(u8, componentAt(left, count).?, componentAt(right, count).?)) break;
+    }
+    return count;
+}
+
+fn detailFieldWidth(all_fields: []const Field, selection: []const u8, section: []const u8) usize {
+    var width: usize = 0;
+    for (all_fields) |field| {
+        if (!std.mem.eql(u8, field.section, section) or !selected(selection, field.key)) continue;
+        const path = relativeFieldPath(field.key, section);
+        const depth = componentCount(path);
+        width = @max(width, depth * 2 + table.displayWidth(componentAt(path, depth - 1).?));
+    }
+    return width;
+}
+
+fn renderDetailValue(writer: *std.Io.Writer, key: []const u8, value: []const u8, width: usize, indent: usize) !void {
+    try writeSpaces(writer, indent);
+    try writer.writeAll(key);
+    try writeSpaces(writer, width - indent - table.displayWidth(key) + 2);
+    var lines = std.mem.splitScalar(u8, std.mem.trim(u8, value, "\r\n"), '\n');
+    try writer.writeAll(lines.next() orelse "");
+    try writer.writeByte('\n');
+    while (lines.next()) |line| {
+        try writeSpaces(writer, width + 2);
+        try writer.writeAll(line);
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeSpaces(writer: *std.Io.Writer, count: usize) !void {
+    for (0..count) |_| try writer.writeByte(' ');
 }
 
 fn renderFilteredJson(writer: *std.Io.Writer, raw: []const u8, detail: Detail, sections: []const u8, fields: []const u8) !void {
@@ -215,7 +284,7 @@ test "document renders detail fields and JSONL through one pipeline" {
     var human_buffer: [128]u8 = undefined;
     var human: std.Io.Writer = .fixed(&human_buffer);
     try document.render(&human, .{ .mode = .human, .no_color = true, .fields = "name" });
-    try std.testing.expectEqualStrings("Node\nname\tn1\n", human.buffered());
+    try std.testing.expectEqualStrings("Node\nname  n1\n", human.buffered());
     try std.testing.expectError(error.ModeNotSupported, document.validate(.{ .mode = .jsonl, .no_color = true }));
 }
 
@@ -240,9 +309,26 @@ test "detail sections and fields compose as an intersection" {
     var buffer: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try detail.render(&writer, .{ .mode = .human, .no_color = true, .sections = "runtime", .fields = "phase" });
-    try std.testing.expectEqualStrings("Node\n\nRuntime\nphase\tready\n", writer.buffered());
+    try std.testing.expectEqualStrings("Node\n\nRuntime:\n  phase  ready\n", writer.buffered());
     try std.testing.expectError(error.UnknownSelection, detail.validate(.{ .mode = .human, .no_color = true, .sections = "missing" }));
     try std.testing.expectError(error.DuplicateSelection, detail.validate(.{ .mode = .human, .no_color = true, .sections = "stored,stored" }));
+}
+
+test "detail renderer groups dotted paths and aligns multiline values" {
+    const sections = [_]Section{.{ .key = "stored", .title = "Stored" }};
+    const fields = [_]Field{
+        .{ .key = "id", .value = "n1", .section = "stored" },
+        .{ .key = "network.mode", .value = "static", .section = "stored" },
+        .{ .key = "network.routes", .value = "r1: 10.0.0.0/8 via 192.0.2.1\nr2: 0.0.0.0/0 via 192.0.2.254", .section = "stored" },
+    };
+    const detail: OutputDocument = .{ .human = .{ .detail = .{ .title = "Node n1", .sections = &sections, .fields = &fields } }, .json = "{}" };
+    var buffer: [512]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try detail.render(&writer, .{ .mode = .human, .no_color = true });
+    try std.testing.expectEqualStrings(
+        "Node n1\n\nStored:\n  id      n1\n  network:\n    mode  static\n    routes  r1: 10.0.0.0/8 via 192.0.2.1\n            r2: 0.0.0.0/0 via 192.0.2.254\n",
+        writer.buffered(),
+    );
 }
 
 test "detail selections filter JSON envelope structurally" {

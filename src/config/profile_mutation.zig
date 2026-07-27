@@ -48,6 +48,35 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
+/// 删除一个未被 Node 引用的 Profile。
+///
+/// 删除前先检查全部 Node 的绑定关系；任何引用都会返回 `ProfileInUse`，避免
+/// 产生悬空 Profile 引用。候选 catalog 会经过完整模型校验，再由 manifest-last
+/// store 原子发布，因此失败不会暴露半写入 generation。
+pub fn removeProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8) !void {
+    var parsed = try catalog_store.load(io, allocator, catalog_path);
+    defer parsed.deinit();
+    for (parsed.value.nodes) |node| if (node.profile) |profile_name| if (std.mem.eql(u8, profile_name, name)) return error.ProfileInUse;
+    var target: ?usize = null;
+    for (parsed.value.profiles, 0..) |profile, index| if (std.mem.eql(u8, profile.name, name)) {
+        target = index;
+        break;
+    };
+    const remove = target orelse return error.ProfileNotFound;
+    const profiles = try allocator.alloc(model.ProfileConfig, parsed.value.profiles.len - 1);
+    defer allocator.free(profiles);
+    var write: usize = 0;
+    for (parsed.value.profiles, 0..) |profile, index| if (index != remove) {
+        profiles[write] = profile;
+        write += 1;
+    };
+    var candidate = parsed.value;
+    candidate.profiles = profiles;
+    const projected = model.projectCatalog(config.*, &candidate);
+    try validate.validate(&projected, &candidate);
+    try catalog_store.save(io, allocator, catalog_path, &candidate);
+}
+
 /// 修改已有 profile 的 kernel_args 字段。
 ///
 /// 执行 load-find-canonicalize-validate-save 事务。

@@ -1,6 +1,6 @@
 # NodeForge v0.2 实现细节
 
-状态：v0.2 实现分册，设计冻结、实现未开始。总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文细化
+状态：v0.2 实现分册，核心闭环已实现并持续按验证结果收口。总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文细化
 diskless 主流程的三项核心闭环实现，优先级
 **1 -> 2 -> 3**：BootSession 状态机 -> server DHCP/TFTP/HTTP 协议栈 -> effective compiler/
 readiness/validator。与 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 一致；程序边界见

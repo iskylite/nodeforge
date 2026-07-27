@@ -17,8 +17,8 @@ pub const git_commit = options.git_commit;
 /// true 表示该构建包含未提交的修改，不能作为正式发布。
 pub const git_dirty = options.git_dirty;
 
-/// 编译时的 UTC 时间戳（ISO 8601 格式）。
-/// 支持 `SOURCE_DATE_EPOCH` 环境变量实现可复现构建。
+/// 编译时的 RFC 3339 UTC 时间戳，格式为 `YYYY-MM-DDTHH:MM:SSZ`。
+/// 默认由构建脚本通过 Zig 标准库生成；可用 `-Dbuild-time` 显式覆盖。
 pub const build_time = options.build_time;
 
 /// 返回 git commit 的前 12 个字符（短 hash），用于版本输出的紧凑显示。

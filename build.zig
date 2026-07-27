@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// NodeForge 产品版本的唯一构建事实源。发布新版本时同步更新 build.zig.zon。
+const nodeforge_version = "0.2.0";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -7,9 +10,11 @@ pub fn build(b: *std.Build) void {
     const zap = b.dependency("zap", .{ .target = target, .optimize = optimize });
     const build_options = b.addOptions();
     const git_commit = b.option([]const u8, "git-commit", "Git commit recorded in version output") orelse commandOutput(b, &.{ "git", "rev-parse", "HEAD" }) orelse "unknown";
-    const build_time = b.option([]const u8, "build-time", "UTC build time recorded in version output") orelse commandOutput(b, &.{ "sh", "-c", "if [ -n \"${SOURCE_DATE_EPOCH:-}\" ]; then date -u -r \"$SOURCE_DATE_EPOCH\" '+%Y-%m-%dT%H:%M:%SZ'; else date -u '+%Y-%m-%dT%H:%M:%SZ'; fi" }) orelse "unknown";
+    // 使用 Zig 标准库读取实时时钟并格式化为 UTC，避免依赖宿主 shell/date。
+    // 可复现构建可通过 -Dbuild-time 显式注入固定值。
+    const build_time = b.option([]const u8, "build-time", "UTC build time recorded in version output") orelse utcBuildTime(b) orelse "unknown";
     const git_dirty = if (commandOutput(b, &.{ "git", "status", "--porcelain", "--untracked-files=no" })) |status| status.len != 0 else false;
-    build_options.addOption([]const u8, "version", "0.2.0");
+    build_options.addOption([]const u8, "version", nodeforge_version);
     build_options.addOption([]const u8, "git_commit", git_commit);
     build_options.addOption(bool, "git_dirty", git_dirty);
     build_options.addOption([]const u8, "build_time", build_time);
@@ -94,11 +99,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(agent);
-    // Rootfs/image builder installs this unit together with nodeforge-agent.
-    // Keeping the unit in the product artifact avoids relying on host-specific
-    // validation scripts to reconstruct the first-boot runtime contract.
-    b.installFile("packaging/systemd/nodeforge-firstboot.service", "share/nodeforge/systemd/nodeforge-firstboot.service");
-
     const run_daemon = b.addRunArtifact(daemon);
     if (b.args) |args| run_daemon.addArgs(args);
     const run_daemon_step = b.step("run-daemon", "Run nodeforged");
@@ -154,4 +154,22 @@ fn commandOutput(b: *std.Build, argv: []const []const u8) ?[]const u8 {
         else => return null,
     }
     return b.allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n")) catch null;
+}
+
+/// 使用 Zig 标准库生成秒精度 RFC 3339 UTC 构建时间。
+fn utcBuildTime(b: *std.Build) ?[]const u8 {
+    const timestamp = std.Io.Clock.real.now(b.graph.io).toSeconds();
+    if (timestamp < 0) return null;
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    return std.fmt.allocPrint(b.allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    }) catch null;
 }

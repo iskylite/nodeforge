@@ -167,7 +167,6 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     }
     _ = std.Io.net.IpAddress.parseIp4(config.server.server_ip, 0) catch
         return error.InvalidServerIpv4;
-    if (config.server.ssh_authorized_public_key) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
     for (config.server.ssh_authorized_public_keys) |key| if (!validSshKey(key)) return error.InstallAccessUnavailable;
     if (config.server.http_port == 0) return error.InvalidHttpPort;
     if (config.http.asset_root.len == 0 or config.http.repository_root.len == 0)
@@ -451,7 +450,7 @@ fn validateProvisioningBundles(catalog: *const model.Catalog) ValidationError!vo
                             const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
                             if (asset.kind != .script) return error.AssetKindMismatch;
                         },
-                        .@"package" => {
+                        .package => {
                             if (step.packages.len == 0 and step.repository == null) return error.InvalidProvisioningStep;
                         },
                         .repository, .standard_packages => return error.InvalidProvisioningStep,
@@ -618,7 +617,7 @@ fn validateInstallConfig(config: *const model.AppConfig, system: model.TargetSys
         if (uri.scheme.len == 0 or uri.host == null or (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https"))) return error.InvalidProfileSource;
     }
     for (install.proxy.no_proxy) |value| if (!validNetworkName(value)) return error.InvalidProfileSource;
-    if (install.post_install.bundle orelse install.bundle) |name| {
+    if (install.post_install.bundle) |name| {
         var found = false;
         for (config.provisioning_bundles) |bundle| {
             if (std.mem.eql(u8, bundle.name, name)) found = true;
@@ -657,7 +656,7 @@ fn validateNodes(config: *const model.AppConfig, catalog: *const model.Catalog) 
             const bundle = found_bundle orelse return error.MissingProvisioningBundle;
             for (bundle.steps) |step| if (step.phase != .first_boot) return error.InvalidProvisioningStep;
         }
-        if (node.pxe.ip_reservation orelse node.ip) |ip| {
+        if (node.pxe.ip_reservation) |ip| {
             const parsed_ip = std.Io.net.IpAddress.parseIp4(ip, 0) catch return error.InvalidNodeIpv4;
             if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed_ip))) return error.NodeOutsideDhcpSubnet;
         }
@@ -706,10 +705,7 @@ fn validateTargetNetwork(config: *const model.AppConfig, node: model.NodeConfig,
     const address = network.address orelse return error.InvalidTargetNetwork;
     const prefix = network.prefix_len orelse return error.InvalidTargetNetwork;
     if (prefix == 0 or prefix > 32) return error.InvalidTargetNetwork;
-    if (config.schema_version < 3) {
-        const node_ip = node.ip orelse return error.StaticAddressMismatch;
-        if (!std.mem.eql(u8, node_ip, address)) return error.StaticAddressMismatch;
-    }
+    if (node.pxe.ip_reservation) |reservation| if (!std.mem.eql(u8, reservation, address)) return error.StaticAddressMismatch;
     if (network.match_mac) |mac| if (!std.ascii.eqlIgnoreCase(mac, node.mac)) return error.InvalidTargetNetwork;
     const parsed = std.Io.net.IpAddress.parseIp4(address, 0) catch return error.InvalidTargetNetwork;
     if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed))) return error.NodeOutsideDhcpSubnet;

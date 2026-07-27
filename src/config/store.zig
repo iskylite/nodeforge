@@ -6,8 +6,8 @@ const std = @import("std");
 const model = @import("../model.zig");
 const schema_v3_dto = @import("schema_v3_dto.zig");
 
-/// 磁盘 `config.json` 的唯一可序列化形状。AppConfig 中保留的 legacy 管理实体
-/// 只用于 schema 1 迁移/运行时投影，绝不能被 daemon 写回启动配置。
+/// 磁盘 `config.json` 的唯一可序列化形状。AppConfig 中的迁移期管理实体
+/// 只用于 schema 1 输入和运行时投影，绝不能被 daemon 写回启动配置。
 const StartupConfig = struct {
     schema_version: u32 = 2,
     server: model.ServerConfig,

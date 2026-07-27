@@ -26,10 +26,9 @@ fn generatedPublicTemp() []const u8 {
 }
 
 pub fn resolve(io: std.Io, allocator: std.mem.Allocator, server: model.ServerConfig) ![]u8 {
-    // 显式多公钥数组是最高优先级事实源。第一个 key 作为兼容旧渲染接口的
-    // bootstrap_key，其余 key 由 resolveAdditional 返回；不得混入磁盘来源。
+    // 显式公钥数组是最高优先级事实源。第一个 key 是 bootstrap key，
+    // 其余 key 由 resolveAdditional 返回；不得混入磁盘来源。
     if (server.ssh_authorized_public_keys.len > 0) return checkedDupe(allocator, server.ssh_authorized_public_keys[0]);
-    if (server.ssh_authorized_public_key) |key| return checkedDupe(allocator, key);
     const imported = try readImportedKeys(io, allocator);
     if (imported.len > 0) {
         const primary = imported[0];
@@ -74,9 +73,9 @@ pub fn resolve(io: std.Io, allocator: std.mem.Allocator, server: model.ServerCon
     return readKey(io, allocator, generatedPublic()) catch error.ServerAdminKeyUnavailable;
 }
 
-/// M4.2 F5：解析主 key 之外需要一并注入的 SSH 公钥。
-/// 显式多公钥数组非空时只采用该数组；旧单值非空时不混入其他来源；两者
-/// 都为空时才扫描 assets/keys，并把排序后的第一个 key 留给 resolve()。
+/// 解析主 key 之外需要一并注入的 SSH 公钥。
+/// 显式公钥数组非空时只采用该数组；为空时才扫描 assets/keys，
+/// 并把排序后的第一个 key 留给 resolve()。
 pub fn resolveAdditional(io: std.Io, allocator: std.mem.Allocator, server: model.ServerConfig) ![][]const u8 {
     var keys: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -95,8 +94,6 @@ pub fn resolveAdditional(io: std.Io, allocator: std.mem.Allocator, server: model
         }
         return keys.toOwnedSlice(allocator);
     }
-    if (server.ssh_authorized_public_key != null) return keys.toOwnedSlice(allocator);
-
     const imported = try readImportedKeys(io, allocator);
     defer allocator.free(imported);
     if (imported.len == 0) return keys.toOwnedSlice(allocator);
@@ -287,10 +284,6 @@ pub fn sourceLabel(io: std.Io, allocator: std.mem.Allocator, server: model.Serve
     for (server.ssh_authorized_public_keys, 0..) |configured, index| {
         if (sameKey(configured, key)) return std.fmt.allocPrint(allocator, "config:server.ssh_authorized_public_keys[{d}]", .{index});
     }
-    if (server.ssh_authorized_public_key) |configured| {
-        if (sameKey(configured, key)) return allocator.dupe(u8, "config:server.ssh_authorized_public_key");
-    }
-
     var directory = std.Io.Dir.cwd().openDir(io, generatedDir(), .{ .iterate = true, .follow_symlinks = false }) catch null;
     if (directory) |*dir| {
         defer dir.close(io);
@@ -336,7 +329,6 @@ test "M4.2 explicit key array is authoritative and deduplicated" {
     const second = "ssh-rsa " ++ blob ++ " auditor";
     const server: model.ServerConfig = .{
         .server_ip = "192.168.50.1",
-        .ssh_authorized_public_key = "ssh-ed25519 ignored-legacy-value",
         .ssh_authorized_public_keys = &.{ first, duplicate, second },
     };
 

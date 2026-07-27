@@ -36,6 +36,7 @@ const iso_import = @import("../catalog/iso_import.zig");
 const catalog_migration = @import("../catalog/migration.zig");
 const catalog_discovery = @import("../catalog/discovery.zig");
 const schema_v3 = @import("../catalog/schema_v3.zig");
+const schema_v3_dto = @import("../catalog/schema_v3_dto.zig");
 const schema_v4 = @import("../catalog/schema_v4.zig");
 const model_transaction = @import("../state/model_transaction.zig");
 const schema_v3_transaction = @import("../state/schema_v3_transaction.zig");
@@ -371,6 +372,7 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/build")) |name| return managementRootfsBuild(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs")) |name| return managementRootfsStatus(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfileCreate(request, context, meta);
+    if (std.mem.eql(u8, method, "DELETE")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfileRemove(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfile(request, context, name, meta);
     if (std.mem.eql(u8, path, "/api/v1/management/discovery/policy")) {
         if (std.mem.eql(u8, method, "GET")) return managementDiscoveryPolicy(request, context, meta);
@@ -1031,27 +1033,18 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     defer if (report_url.len > 0) context.allocator.free(report_url);
     var effective_plan = @import("../profile/effective.zig").compileInputs(context.allocator, node, profile, &plan.install_source) catch return error.MissingInstallConfig;
     defer effective_plan.deinit();
-    const install_orig = effective_plan.install;
-    // M4.2 F5：将服务端级别的额外 SSH 公钥合并到安装配置中。
+    const install = effective_plan.install;
+    var system = effective_plan.system;
+    // 服务端级额外 SSH 公钥属于目标系统 root SSH 策略，不进入 install alias。
     const merged_keys: []const []const u8 = if (context.additional_keys.len > 0) blk: {
-        const combined = try context.allocator.alloc([]const u8, install_orig.ssh_authorized_keys.len + context.additional_keys.len);
-        @memcpy(combined[0..install_orig.ssh_authorized_keys.len], install_orig.ssh_authorized_keys);
-        @memcpy(combined[install_orig.ssh_authorized_keys.len..], context.additional_keys);
+        const combined = try context.allocator.alloc([]const u8, system.ssh.root_authorized_keys.len + context.additional_keys.len);
+        @memcpy(combined[0..system.ssh.root_authorized_keys.len], system.ssh.root_authorized_keys);
+        @memcpy(combined[system.ssh.root_authorized_keys.len..], context.additional_keys);
         break :blk combined;
-    } else install_orig.ssh_authorized_keys;
+    } else system.ssh.root_authorized_keys;
     defer if (context.additional_keys.len > 0) context.allocator.free(merged_keys);
-    const install: model.InstallConfig = if (context.additional_keys.len > 0) .{
-        .storage = install_orig.storage,
-        .bootloader = install_orig.bootloader,
-        .packages = install_orig.packages,
-        .users = install_orig.users,
-        .ssh_authorized_keys = merged_keys,
-        .bundle = install_orig.bundle,
-        .apt = install_orig.apt,
-        .reinstall_policy = install_orig.reinstall_policy,
-    } else install_orig;
-    const system = effective_plan.system;
-    const bundle = if (install.post_install.bundle orelse install.bundle) |name| findProvisioningBundleIn(plan.provisioning_bundles, name) else null;
+    system.ssh.root_authorized_keys = merged_keys;
+    const bundle = if (install.post_install.bundle) |name| findProvisioningBundleIn(plan.provisioning_bundles, name) else null;
     var password_scope_buffer: [96]u8 = undefined;
     // salt scope 必须能经受 daemon 重启。session id 是随机的，且
     // 捕获的模型 revision 对本次投递不可变；daemon 实例
@@ -1138,9 +1131,9 @@ fn buildInstallPlan(context: *const RouteContext, node_id: []const u8, profile_n
     defer context.allocator.free(repositories);
     for (source.repositories, 0..) |name, index|
         repositories[index] = (lookup.findRepository(catalog_snapshot.value(), name) orelse return error.MissingRepository).*;
-    const bundle_count: usize = if (profile.install.post_install.bundle orelse profile.install.bundle) |_| 1 else 0;
+    const bundle_count: usize = if (profile.install.post_install.bundle) |_| 1 else 0;
     const bundles = try plan_allocator.alloc(model.ProvisioningBundle, bundle_count);
-    if (profile.install.post_install.bundle orelse profile.install.bundle) |name| {
+    if (profile.install.post_install.bundle) |name| {
         var found: ?model.ProvisioningBundle = null;
         for (catalog_snapshot.value().provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) {
             found = bundle;
@@ -1704,7 +1697,7 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
 /// 替换仅在完整候选存在后才被序列化。
 fn importInstallSource(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
-    const ImportRequest = struct { filename: []const u8, sha256: []const u8, name: ?[]const u8 = null, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null };
+    const ImportRequest = struct { filename: []const u8, original_filename: []const u8, sha256: []const u8, name: ?[]const u8 = null, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null };
     const body = request.body orelse return assetInputError(request, "missing body", meta);
     const parsed = std.json.parseFromSlice(ImportRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid JSON body", meta);
     defer parsed.deinit();
@@ -1720,7 +1713,7 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     const arch_text = if (arch) |value| @tagName(value) else null;
     const idempotency_key = request.getHeader("idempotency-key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_key_required\",\"message\":\"Idempotency-Key header is required\"}}\n", meta);
     var digest_buf: [32]u8 = undefined;
-    const digest_input = try std.fmt.allocPrint(context.allocator, "sha256={s}&name={s}&distro={s}&version={s}&arch={s}", .{ declared_sha256, name orelse "", distro orelse "", version orelse "", arch_text orelse "" });
+    const digest_input = try std.fmt.allocPrint(context.allocator, "sha256={s}&original_filename={s}&name={s}&distro={s}&version={s}&arch={s}", .{ declared_sha256, parsed.value.original_filename, name orelse "", distro orelse "", version orelse "", arch_text orelse "" });
     defer context.allocator.free(digest_input);
     std.crypto.hash.sha2.Sha256.hash(digest_input, &digest_buf, .{});
     var digest_hex: [64]u8 = undefined;
@@ -1762,7 +1755,7 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
         .io = context.io,
         .allocator = context.allocator,
         .config = context.config,
-        .request = .{ .filename = filename, .name = name, .distro = distro, .version = version, .arch = arch },
+        .request = .{ .filename = filename, .original_filename = parsed.value.original_filename, .name = name, .distro = distro, .version = version, .arch = arch },
     };
     const worker = std.Thread.spawn(.{}, runIsoImport, .{&task}) catch |err| {
         observe_log.err("ISO import worker could not start: {t}", .{err});
@@ -2687,18 +2680,7 @@ fn runtimeSummary(request: zap.Request, context: *const RouteContext, meta: Requ
     try json(request, .ok, output.written(), meta);
 }
 
-const NodeAddRequest = struct {
-    id: []const u8,
-    mac: []const u8,
-    arch: model.Arch,
-    profile: ?[]const u8,
-    pxe: model.PxeConfig = .{},
-    hostname: ?[]const u8 = null,
-    deploy: bool = true,
-    http_accel: bool = false,
-    storage: model.NodeStorageConfig = .{},
-    network: model.TargetNetworkConfig = .{},
-};
+const NodeAddRequest = schema_v3_dto.Node;
 
 const ProfileCreateRequest = struct { name: []const u8, install_source: []const u8, kind: ?[]const u8 = null, boot_bundle: ?[]const u8 = null };
 const ValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, values: []const []const u8 = &.{}, mutations: []const scalar_mutation.Mutation = &.{} };
@@ -3119,6 +3101,25 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
     const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"name\":{f},\"mode\":{f},\"kind\":{f},\"install_source\":{f},\"boot_bundle\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(parsed.value.name, .{}), std.json.fmt(@tagName(kind), .{}), std.json.fmt(@tagName(kind), .{}), std.json.fmt(parsed.value.install_source, .{}), std.json.fmt(boot_bundle, .{}), context.catalog.currentRevision() });
     try setRevisionEtag(request, context.catalog.currentRevision());
     return json(request, .created, rendered, meta);
+}
+
+/// 处理 Profile 删除请求。mutation mutex、model gate 与 `If-Match` 一起保证
+/// 引用检查、持久化和内存 snapshot 发布串行发生；有 Node 引用时稳定返回
+/// `profile.in_use`，不会隐式解绑或修改任何 Node。
+fn managementProfileRemove(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    @import("../config/profile_mutation.zig").removeProfile(context.io, context.allocator, context.config, context.catalog.path, name) catch |err| switch (err) {
+        error.ProfileNotFound => return notFound(request, meta),
+        error.ProfileInUse => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.in_use\",\"message\":\"profile is referenced by one or more nodes\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"profile removed but snapshot publish failed\"}}\n", meta);
+    try setRevisionEtag(request, context.catalog.currentRevision());
+    return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
 }
 
 /// 在 model gate 内从 manifest store 载入新 catalog generation，同时用相同
@@ -4381,8 +4382,8 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    const value = parsed.value;
-    node_mutation.addNode(context.io, context.allocator, context.config, context.catalog.path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .pxe_ip_reservation = value.pxe.ip_reservation, .hostname = value.hostname, .deploy = value.deploy, .http_accel = value.http_accel, .storage = value.storage, .network = value.network }) catch |err| switch (err) {
+    const value = parsed.value.modelValue();
+    node_mutation.addNode(context.io, context.allocator, context.config, context.catalog.path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .pxe_ip_reservation = value.pxe.ip_reservation, .hostname = value.hostname, .overrides = value.overrides, .deploy = value.deploy, .http_accel = value.http_accel, .storage = value.storage, .network = value.network }) catch |err| switch (err) {
         error.ProfileNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"node.profile_not_found\",\"message\":\"referenced profile does not exist; create it with nodeforge profile create\"}}\n", meta),
         error.NodeAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.already_exists\",\"message\":\"node identifier already exists\"}}\n", meta),
         error.DuplicateMac => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.duplicate_mac\",\"message\":\"MAC address is already assigned to another node\"}}\n", meta),
@@ -4457,9 +4458,9 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
         const deployment = context.deployments.view(node.id);
         const status = if (desired_digest) |digest| currentProjectedStatus(context, node.id, deployment, digest) else null;
         const inventory = context.inventories.get(node.id);
-        try output.writer.print("{{\"id\":{f},\"mac\":{f},\"ip\":", .{ std.json.fmt(node.id, .{}), std.json.fmt(node.mac, .{}) });
-        if (node.ip) |ip| try output.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try output.writer.writeAll("null");
-        try output.writer.print(",\"profile\":{f},\"deploy\":{s},\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"armed_generation\":{f},\"status\":", .{
+        try output.writer.print("{{\"id\":{f},\"mac\":{f},\"pxe\":{{\"ip_reservation\":", .{ std.json.fmt(node.id, .{}), std.json.fmt(node.mac, .{}) });
+        if (node.pxe.ip_reservation) |ip| try output.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try output.writer.writeAll("null");
+        try output.writer.print("}},\"profile\":{f},\"deploy\":{s},\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"armed_generation\":{f},\"status\":", .{
             std.json.fmt(node.profile, .{}),
             if (node.deploy) "true" else "false",
             std.json.fmt(if (desired_digest) |digest| installIntent(node.deploy, deployment, digest) else if (node.deploy) "blocked" else "disabled", .{}),
@@ -4516,7 +4517,9 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     const inventory = context.inventories.get(node_id);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{f},\"profile\":{{\"name\":{f},\"install_source\":{f},\"kernel_args\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), std.json.fmt(node, .{}), std.json.fmt(profile.name, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile_source.distro, .{}), std.json.fmt(profile_source.version, .{}), std.json.fmt(@tagName(profile_source.arch), .{}) });
+    const node_json = try schema_v3_dto.renderNode(context.allocator, node.*);
+    defer context.allocator.free(node_json);
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{s},\"profile\":{{\"name\":{f},\"install_source\":{f},\"kernel_args\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), node_json, std.json.fmt(profile.name, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile_source.distro, .{}), std.json.fmt(profile_source.version, .{}), std.json.fmt(@tagName(profile_source.arch), .{}) });
     try writeTargetSystem(&output.writer, effective_plan.system);
     try output.writer.print(",\"effective_software\":{f}", .{std.json.fmt(effective_plan.software, .{})});
     try output.writer.writeAll(",\"storage\":");

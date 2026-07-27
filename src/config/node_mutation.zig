@@ -23,6 +23,8 @@ pub const AddParams = struct {
     pxe_ip_reservation: ?[]const u8 = null,
     /// 节点 hostname；null 时回退到 node.id。
     hostname: ?[]const u8 = null,
+    /// 创建时一并设置的 Node 级策略覆盖。
+    overrides: model.NodeOverrideConfig = .{},
     /// 是否参与 PXE 部署。
     deploy: bool = true,
     /// 是否使用 HTTP 加速 initrd 下载。
@@ -40,10 +42,6 @@ pub const SetParams = struct {
     arch: ?model.Arch = null,
     /// 新 profile 名称；null 不修改。空字符串显式解绑。
     profile: ?[]const u8 = null,
-    /// Legacy IP 字段值。
-    ip: ?[]const u8 = null,
-    /// Legacy IP 字段是否被显式设置（区分 null=不修改 vs null=清空）。
-    ip_set: bool = false,
     /// hostname 值。
     hostname: ?[]const u8 = null,
     /// hostname 是否被显式设置。
@@ -72,7 +70,7 @@ pub fn addNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.Ap
     const nodes = try allocator.alloc(model.NodeConfig, parsed.value.nodes.len + 1);
     defer allocator.free(nodes);
     @memcpy(nodes[0..parsed.value.nodes.len], parsed.value.nodes);
-    nodes[parsed.value.nodes.len] = .{ .id = params.id, .mac = params.mac, .arch = params.arch, .profile = params.profile, .pxe = .{ .ip_reservation = params.pxe_ip_reservation }, .hostname = params.hostname, .deploy = params.deploy, .http_accel = params.http_accel, .storage = params.storage, .network = params.network };
+    nodes[parsed.value.nodes.len] = .{ .id = params.id, .mac = params.mac, .arch = params.arch, .profile = params.profile, .pxe = .{ .ip_reservation = params.pxe_ip_reservation }, .hostname = params.hostname, .overrides = params.overrides, .deploy = params.deploy, .http_accel = params.http_accel, .storage = params.storage, .network = params.network };
     var candidate = parsed.value;
     candidate.nodes = nodes;
     try validateCandidate(config, &candidate);
@@ -98,7 +96,6 @@ pub fn setNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.Ap
     if (params.mac) |value| node.mac = value;
     if (params.arch) |value| node.arch = value;
     if (params.profile) |value| node.profile = value;
-    if (params.ip_set) node.ip = params.ip;
     if (params.hostname_set) node.hostname = params.hostname;
     if (params.deploy) |value| node.deploy = value;
     if (params.http_accel) |value| node.http_accel = value;

@@ -186,7 +186,7 @@ pub fn nodeDetail(writer: *std.Io.Writer, node: model.NodeConfig) !void {
     try table.writeEscaped(writer, node.id);
     try writer.writeAll(" key=value)\n");
     try writer.print("  mac={s}\n  arch={s}\n  profile={s}\n", .{ node.mac, @tagName(node.arch), node.profile orelse "<unassigned>" });
-    if (node.ip) |ip| try writer.print("  ip={s}\n", .{ip}) else try writer.print("  # ip is unset; action: nodeforge node unset {s} ip\n", .{node.id});
+    if (node.pxe.ip_reservation) |ip| try writer.print("  pxe.ip_reservation={s}\n", .{ip}) else try writer.print("  # pxe.ip_reservation is unset\n", .{});
     if (node.hostname) |hostname| try writer.print("  hostname={s}\n", .{hostname}) else try writer.print("  # hostname is unset; action: nodeforge node unset {s} hostname\n", .{node.id});
     try writer.print("  deploy={s}\n  http_accel={s}\n", .{ if (node.deploy) "true" else "false", if (node.http_accel) "true" else "false" });
     try writer.print("  storage.boot_disk={s}\n", .{node.storage.boot_disk});
@@ -408,13 +408,13 @@ test "node detail uses exact set parser keys" {
         .mac = "00:50:56:2A:23:DB",
         .arch = .aarch64,
         .profile = "rocky",
-        .ip = "192.168.27.210",
+        .pxe = .{ .ip_reservation = "192.168.27.210" },
         .hostname = "r97n1",
         .deploy = true,
         .http_accel = false,
     });
     const out = writer.buffered();
-    inline for (.{ "mac=00:50:56:2A:23:DB", "arch=aarch64", "profile=rocky", "ip=192.168.27.210", "hostname=r97n1", "deploy=true", "http_accel=false", "storage.boot_disk=/dev/sda", "storage.additional_disks=" }) |needle|
+    inline for (.{ "mac=00:50:56:2A:23:DB", "arch=aarch64", "profile=rocky", "pxe.ip_reservation=192.168.27.210", "hostname=r97n1", "deploy=true", "http_accel=false", "storage.boot_disk=/dev/sda", "storage.additional_disks=" }) |needle|
         try std.testing.expect(std.mem.indexOf(u8, out, needle) != null);
 }
 

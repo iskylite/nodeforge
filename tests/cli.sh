@@ -160,6 +160,8 @@ grep -Fq 'show' "$tmp/node-software-help"
 "$cli" node capabilities show --help >"$tmp/node-capabilities-help"
 grep -Fq 'adapter capability registry' "$tmp/node-capabilities-help"
 grep -Fq 'Override an unknown or ambiguous product id; e.g. rocky, kylin, ubuntu. Family still comes from ISO layout' "$tmp/assets-import-help"
+grep -Fq 'Override the ISO-basename-derived install-source/profile name' "$tmp/assets-import-help"
+grep -Fq 'V10-SP3-2403-Release-20240426' "$tmp/assets-import-help"
 grep -Fq 'atomically publishes the distro tuple with the install source' "$tmp/assets-import-help"
 if grep -Fq 'relative to /opt/nodeforge/work/import' "$tmp/assets-import-help"; then
     echo "assets import must accept an arbitrary ISO path" >&2

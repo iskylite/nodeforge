@@ -79,7 +79,7 @@ const Override = struct {
     software: SoftwareOverride = .{},
     kernel_args: model.StringSetDelta = .{},
 };
-const Node = struct {
+pub const Node = struct {
     id: []const u8,
     mac: []const u8,
     arch: model.Arch,
@@ -91,6 +91,10 @@ const Node = struct {
     network: Network = .{},
     deploy: bool = true,
     http_accel: bool = false,
+
+    pub fn modelValue(value: Node) model.NodeConfig {
+        return toNode(value);
+    }
 };
 
 const ManagedFileStep = struct {
@@ -154,6 +158,10 @@ pub fn renderNodes(allocator: std.mem.Allocator, values: []const model.NodeConfi
     defer allocator.free(dtos);
     for (values, 0..) |value, index| dtos[index] = fromNode(value);
     return std.json.Stringify.valueAlloc(allocator, dtos, .{ .whitespace = .indent_2 });
+}
+
+pub fn renderNode(allocator: std.mem.Allocator, value: model.NodeConfig) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, fromNode(value), .{});
 }
 
 pub fn renderBundles(allocator: std.mem.Allocator, values: []const model.ProvisioningBundle) ![]u8 {
@@ -230,7 +238,7 @@ fn fromProfile(value: model.ProfileConfig, kernel_args: []const []const u8) Prof
             .bootloader = .{ .install = install.bootloader.install },
             .apt = install.apt,
             .reinstall_policy = install.reinstall_policy,
-            .post_install = .{ .bundle = install.post_install.bundle orelse install.bundle },
+            .post_install = .{ .bundle = install.post_install.bundle },
             .completion = install.completion,
             .updates = install.updates,
             .proxy = install.proxy,
@@ -273,7 +281,6 @@ fn toProfile(allocator: std.mem.Allocator, value: Profile, source: *const model.
             .bootloader = .{ .install = value.install.bootloader.install },
             .apt = value.install.apt,
             .reinstall_policy = value.install.reinstall_policy,
-            .bundle = value.install.post_install.bundle,
             .post_install = .{ .bundle = value.install.post_install.bundle },
             .completion = value.install.completion,
             .updates = value.install.updates,
@@ -366,7 +373,7 @@ fn findSource(values: []const model.InstallSourceConfig, name: []const u8) ?*con
 
 test "strict profile and node render omit legacy ownership keys" {
     const profile: model.ProfileConfig = .{ .name = "p", .install_source = "s" };
-    const node: model.NodeConfig = .{ .id = "n", .mac = "02:00:00:00:00:01", .arch = .x86_64, .ip = "192.0.2.2" };
+    const node: model.NodeConfig = .{ .id = "n", .mac = "02:00:00:00:00:01", .arch = .x86_64, .pxe = .{ .ip_reservation = "192.0.2.2" } };
     const profiles = try renderProfiles(std.testing.allocator, &.{profile});
     defer std.testing.allocator.free(profiles);
     const nodes = try renderNodes(std.testing.allocator, &.{node});
@@ -375,6 +382,7 @@ test "strict profile and node render omit legacy ownership keys" {
     try std.testing.expect(std.mem.indexOf(u8, profiles, "\"distro\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, profiles, "install_disks") == null);
     try std.testing.expect(std.mem.indexOf(u8, nodes, "\"ip\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, nodes, "ip_reservation") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes, "match_mac") == null);
 }
 

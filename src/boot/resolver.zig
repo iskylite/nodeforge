@@ -56,7 +56,7 @@ pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Arc
             .bootfile = null,
             .known = true,
             .node_id = node.id,
-            .reserved_ip = node.pxe.ip_reservation orelse node.ip,
+            .reserved_ip = node.pxe.ip_reservation,
             .profile = node.profile,
             .mode = null,
             .install_not_armed = false,
@@ -69,7 +69,7 @@ pub fn resolve(config: *const model.AppConfig, mac: []const u8, arch: packet.Arc
             .bootfile = if (node.profile != null and architectureMatches(node.arch, arch)) bootfile(arch) else null,
             .known = true,
             .node_id = node.id,
-            .reserved_ip = node.pxe.ip_reservation orelse node.ip,
+            .reserved_ip = node.pxe.ip_reservation,
             .profile = node.profile,
             .mode = if (node.profile) |name| profileMode(config, name) else null,
         };

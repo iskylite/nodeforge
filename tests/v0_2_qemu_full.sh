@@ -41,7 +41,25 @@ done
 # Produce derived fixtures; preserve the historical base rootfs/initramfs.
 unsquashfs -d "$work/rootfs" "$base_rootfs" >/dev/null
 install -m 0755 zig-out/bin/nodeforge-agent "$work/rootfs/usr/sbin/nodeforge-agent"
-install -D -m 0644 packaging/systemd/nodeforge-firstboot.service "$work/rootfs/etc/systemd/system/nodeforge-firstboot.service"
+mkdir -p "$work/rootfs/etc/systemd/system"
+printf '%s\n' \
+    '[Unit]' \
+    'Description=NodeForge diskless first-boot provisioning' \
+    'After=local-fs.target network-online.target' \
+    'Before=rc-local.service' \
+    'Wants=network-online.target' \
+    'ConditionPathExists=/var/lib/nodeforge/boot.json' \
+    '' \
+    '[Service]' \
+    'Type=oneshot' \
+    'ExecStart=/usr/sbin/nodeforge-agent' \
+    'RemainAfterExit=yes' \
+    'StandardOutput=journal+file:/var/lib/nodeforge/firstboot.log' \
+    'StandardError=journal+file:/var/lib/nodeforge/firstboot.log' \
+    '' \
+    '[Install]' \
+    'WantedBy=multi-user.target' \
+    >"$work/rootfs/etc/systemd/system/nodeforge-firstboot.service"
 mkdir -p "$work/rootfs/etc/systemd/system/multi-user.target.wants"
 ln -sfn ../nodeforge-firstboot.service "$work/rootfs/etc/systemd/system/multi-user.target.wants/nodeforge-firstboot.service"
 # Validation-only drop-in: invoke the oneshot a second time to prove the
@@ -63,7 +81,19 @@ else
 fi
 install -m 0755 zig-out/bin/nodeforge-initrd "$work/initrd-root/usr/sbin/nodeforge-initrd"
 install -m 0755 zig-out/bin/nodeforge-agent "$work/initrd-root/usr/sbin/nodeforge-agent"
-install -m 0755 packaging/initrd/nodeforge-dhclient-script "$work/initrd-root/usr/sbin/nodeforge-dhclient-script"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "${reason:-}" in' \
+    ' PREINIT) /sbin/ip link set "$interface" up ;;' \
+    ' BOUND|RENEW|REBIND|REBOOT)' \
+    '  /sbin/ip addr flush dev "$interface"' \
+    '  /sbin/ip addr add "$new_ip_address/$new_subnet_mask" dev "$interface"' \
+    '  for router in ${new_routers:-}; do /sbin/ip route replace default via "$router" dev "$interface"; break; done' \
+    '  ;;' \
+    'esac' \
+    'exit 0' \
+    >"$work/initrd-root/usr/sbin/nodeforge-dhclient-script"
+chmod 0755 "$work/initrd-root/usr/sbin/nodeforge-dhclient-script"
 install -m 0755 /usr/sbin/switch_root "$work/initrd-root/usr/sbin/switch_root"
 # The historical fixture predates loop-backed squashfs validation. Keep its
 # kernel modules aligned with the kernel used for this direct boot.

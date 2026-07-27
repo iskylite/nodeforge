@@ -682,7 +682,7 @@ fn poolContains(config: *const model.AppConfig, ip: u32) bool {
 /// 检查地址是否被其他节点静态保留。动态分配时跳过其他节点的保留地址。
 fn reservedForOther(config: *const model.AppConfig, ip: u32, mac: []const u8) bool {
     for (config.nodes) |node| {
-        const reserved = if (node.ip) |value| parseIp(value) else null;
+        const reserved = if (node.pxe.ip_reservation) |value| parseIp(value) else null;
         if (reserved != null and reserved.? == ip and !resolver.sameMac(node.mac, mac)) return true;
     }
     return false;
@@ -757,7 +757,7 @@ test "legacy discovery action does not boot unknown clients" {
 }
 
 test "dynamic allocation skips another node's static reservation" {
-    const nodes = [_]model.NodeConfig{.{ .id = "reserved", .mac = "02:00:00:00:00:01", .arch = .x86_64, .profile = "unused", .ip = "192.168.50.100" }};
+    const nodes = [_]model.NodeConfig{.{ .id = "reserved", .mac = "02:00:00:00:00:01", .arch = .x86_64, .profile = "unused", .pxe = .{ .ip_reservation = "192.168.50.100" } }};
     const config: model.AppConfig = .{
         .server = .{ .server_ip = "192.168.50.1" },
         .dhcp = .{ .pool_start = "192.168.50.100", .pool_end = "192.168.50.101" },

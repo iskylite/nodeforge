@@ -1,6 +1,6 @@
 # NodeForge v0.2 CLI 接口
 
-状态：v0.2 接口分册，设计收敛、实现未开始。总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文是 CLI
+状态：v0.2 接口分册，核心 CLI/API 已实现并持续按验证结果收口。总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文是 CLI
 命令树、flag、CAS、输出和 exit code 的唯一事实源。推荐操作顺序见
 [`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md)。命令必须复用 v0.1
 资源-动作树、typed PropertySpec/CollectionSpec/ItemSpec、统一 OutputDocument 和 optimistic concurrency；
@@ -133,6 +133,10 @@ nodeforge node readiness <id> --stage boot
 nodeforge node set <id> deploy=true
 ```
 
+默认安装根初始化和 `setup --reconfigure` 必须原子生成 `/etc/profile.d/nodeforge.sh`（`0644`），
+幂等地将 `/opt/nodeforge/bin` 加入登录 shell 的 `PATH`。新登录会话可直接执行 `nodeforge`；当前会话可
+执行 `source /etc/profile.d/nodeforge.sh`。自定义安装根不写宿主全局 profile.d。
+
 **已实现**（见 V0_2_DESIGN.md 实现修订记录）：
 - R5: `assets initrd build` 已接线为同步 CLI；异步 durable operation 是 v0.2.2 增强
 - R4: `profile rootfs build` capability 已在 `setup.zig` 中修复
@@ -142,7 +146,7 @@ nodeforge node set <id> deploy=true
 ## 2. 阶段 1：导入本地 OS 源
 
 ```text
-nodeforge assets import <iso> [--name <source>] [--wait]
+nodeforge assets import <iso> [--name <source>] [--distro <id>] [--version <version>] [--arch <arch>]
 nodeforge assets install-source list
 nodeforge assets install-source show <source>
 nodeforge assets install-source software list <source> [--kind package|group|environment|task]
@@ -157,6 +161,9 @@ nodeforge assets runtime-kernel validate <kernel-asset>
 ```
 
 ISO import 成功必须原子发布 install source、installer kernel、media tree、本地 repositories 和 software index。
+默认 install source 及同名 profile 名称由完整 ISO basename 去掉 `.iso` 后规范化得到，因而适用于所有发行版，
+并自然保留 Kylin 等介质文件名中的 SP、发行批次和 Release 日期。`--name` 可覆盖该名称，`--version` 可覆盖
+媒体元数据中的 catalog 版本事实。每个 source 使用独立 ISO、boot 和 repository 路径；导入不覆盖既有同名内容。
 diskless `runtime-kernel prepare` 从固定 revision 的本地 kernel package 提取可启动 kernel，并记录完全匹配的 modules/package
 closure、release 与 arch；不能默认把安装器 kernel 当作运行 kernel。重复 import 相同内容返回 existing resource；同名
 不同 digest 返回 conflict，不静默覆盖。
@@ -263,10 +270,11 @@ nodeforge profile add-values <profile> software.packages.include chrony
 nodeforge profile remove-values <profile> software.packages.include <package>
 nodeforge profile show <profile>
 nodeforge profile effective <profile> [--section build|boot|all]
+nodeforge profile remove <profile>
 ```
 
 `--kind` 是 immutable discriminant。`--source` 对 install/diskless 都必填，diskless boot bundle 内的 source 必须与其
-一致。`profile create` 不带 `--kind` 时默认 `--kind install`（向后兼容 v0.1）；
+一致。`profile create` 不带 `--kind` 时默认 `--kind install`；
 一旦创建后 kind 不可改变；v0.2 通过创建新 Profile、换绑 Node 和归档旧引用完成替换。diskless 不接受
 `install.*`；install Profile 不接受 `diskless.*`。
 `profile list --kind` 按 kind 过滤；human 输出保留 v0.1 install 信息并增加 tagged kind 字段：
@@ -300,8 +308,11 @@ SSH_HOST_KEY      SHA256:... (shared host public fingerprint)
 具体 Node 的情况下声称网络、inventory memory、rootfs readiness 或 quarantine 已通过；`--section all`（默认）输出两者。
 只有 `node effective --section boot`/`node readiness --stage boot` 消费 Node direct/override/runtime 后给出最终 boot 投影与
 readiness。Profile 输出不产生可供 `deploy=true` 使用的 `desired_plan_digest`。
-Profile 删除是 v0.2 非目标：有引用 Node 的 Profile 不能删除，无引用时也不提供 `profile remove`
-（避免与 active session/delivery snapshot 产生孤儿引用；废弃 Profile 通过换绑 Node 归档）。
+`profile remove` 只删除当前 catalog 中零 Node 引用的 Profile。CLI 通过
+`DELETE /api/v1/management/profiles/:name` 提交带 `If-Match` 的 mutation；daemon 在 mutation mutex 和 model gate
+内重新检查引用，再执行完整模型校验与 manifest-last 原子发布。有任何 Node 引用时返回
+`profile.in_use`，不会隐式解绑、停用或修改 Node。历史 deployment/session snapshot 保存的是已固定事实，不会因
+删除当前零引用 Profile 而被重写；活动 Node 绑定会被引用检查阻止。
 `diskless.provision.bundle` 可省略；Node 可通过 `overrides.diskless.provision.bundle` 完整替换自身 first-boot，
 但该 override bundle 只能包含 `phase=first-boot` item，出现 rootfs-build item 在 mutation/compile 阶段拒绝。
 Profile first-boot manifest/assets/package closure 在 rootfs build 中预置；Node override payload 由 agent pre-init 切根后
@@ -328,8 +339,8 @@ collection 时不要在 clone 上同时传 `--build`，先完成 target mutation
 nodeforge node add <id> mac=<mac> arch=<arch> profile=<diskless-profile> deploy=false
 # hostname 未显式指定时默认使用 node_id；network.mode 默认 dhcp
 nodeforge node set <id> pxe.ip_reservation=<ip> hostname=<fqdn>
-nodeforge node set <id> network.mode=dhcp network.interface=<nic>
-nodeforge node set <id> network.mode=static network.interface=<nic> \
+nodeforge node set <id> network.mode=dhcp network.interface_name=<nic>
+nodeforge node set <id> network.mode=static network.interface_name=<nic> network.match_mac=<mac> \
   network.address=<ip> network.prefix_len=<prefix> network.gateway=<gw>
 nodeforge node add-values <id> network.dns <dns>...
 nodeforge node add-values <id> overrides.kernel_args.add console=ttyS0
@@ -353,8 +364,15 @@ nodeforge node show <id>
 nodeforge node effective <id> [--section build|boot|all]
 ```
 
-- `node show` 输出 Node direct 字段 + 绑定 Profile + current state 投影（不含 effective 编译结果）。host fingerprint
+- `node add` 与 `node set` 共享同一套 scalar `PropertySpec`/parser；创建时可一次提交 PXE 保留地址、hostname、
+  storage/network 标量和 `overrides.*` 标量。集合仍使用 `add-values`/`replace-values` 或 item 命令，不能伪装成
+  `key=value`。CLI 只发送 canonical create DTO；`profile` 是必需 nullable 字段，`deploy=false` 的未绑定节点
+  显式发送 null。
+- `node show` 输出 Node direct 字段、Node overrides、绑定 Profile 编译出的 effective 摘要与 current state 投影；human
+  视图固定按 `Stored / Overrides / Effective / Runtime` 分区，并把点路径展开为缩进层级、按可见宽度对齐。host fingerprint
   属于绑定 Profile，由 `profile show` 展示；Node 不保存独立 host key。
+  当前详情 API 需要已绑定 Profile 才能编译 effective；未认领节点可 list/claim/set/remove，但 `node show` 返回
+  `node.profile_unassigned`。若未来需要 unclaimed detail，应单独定义 nullable effective DTO，不得伪造默认 Profile。
   `node effective` 引用绑定 Profile 的不可变 build projection，并按 v0.1 优先级合并适用的 Node override 得到
   Node boot/node-apply/effective first-boot projection；Node 差量不合入 diskless rootfs lower。两者使用相同 section 名，
   但 `boot` 在 Profile 下是 requirements，在 Node 下才是 resolved projection/readiness 输入。
@@ -660,7 +678,7 @@ nodeforge profile set <name> diskless.boot_bundle=<new-bundle>
 nodeforge profile rootfs build <diskless-profile>
 
 # 7. 注册节点并启用；session/capsule 由 PXE 请求创建
-nodeforge node add <id> --mac <mac> --arch <a> --profile <name>
+nodeforge node add <id> mac=<mac> arch=<a> profile=<name> [pxe.ip_reservation=<ip>] [network.*=<value>] [overrides.*=<value>]
 nodeforge node set <id> deploy=true
 ```
 

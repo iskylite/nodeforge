@@ -67,7 +67,7 @@ pub const Catalog = struct {
     profiles: []const ProfileConfig = &.{},
     /// 已录入节点。Node 描述单台机器的身份、直接配置和物理绑定。
     nodes: []const NodeConfig = &.{},
-    /// 可复用的后处理步骤集合。通过 profile.install.bundle 引用。
+    /// 可复用的后处理步骤集合。通过 profile.install.post_install.bundle 引用。
     provisioning_bundles: []const ProvisioningBundle = &.{},
     /// 可由 dnf/apt 直接使用的软件仓库。ISO 导入自动生成本地仓库。
     repositories: []const RepositoryConfig = &.{},
@@ -175,12 +175,8 @@ pub const ServerConfig = struct {
     /// 唯一 HTTP 监听端口；同时承载 PXE 数据路由和管理路由。CLI 固定使用 loopback 访问。
     /// 默认 18080，避免与常见 Web 服务（8080）冲突。配置文件可显式覆盖。
     http_port: u16 = 18080,
-    /// NodeForge 管理端在目标机上使用的 bootstrap SSH 公钥；私钥绝不进入配置。
-    /// 该密钥注入到所有目标节点的 authorized_keys，用于安装后首次访问。
-    ssh_authorized_public_key: ?[]const u8 = null,
-    /// M4.2 F5: 额外的 SSH 公钥列表，注入到所有目标节点的 authorized_keys。
-    /// 这些密钥不用于 nodeforged 自身的 SSH 访问（那由 `ssh_authorized_public_key` 负责），
-    /// 而是用于操作员/审计员的额外访问。CLI key-* 命令管理 `assets/keys` 中的密钥文件。
+    /// 注入所有目标节点 authorized_keys 的管理公钥。第一个 key 是 bootstrap key，
+    /// 其余 key 用于操作员或审计员访问；私钥绝不进入配置。
     ssh_authorized_public_keys: []const []const u8 = &.{},
 };
 
@@ -554,9 +550,6 @@ pub const BootBundleConfig = struct {
     runtime_kernel: ?[]const u8 = null,
     /// NodeForge 小 initrd 资产名称；必须指向 kind 为 `nodeforge_initrd` 的资产。
     initrd: []const u8,
-    /// v0.2 早期 catalog 的只读兼容字段。新写入流程永远保持 null，解析、
-    /// readiness 和 rootfs 构建均不得消费它，避免重新引入 Profile/bundle 创建环。
-    rootfs: ?[]const u8 = null,
 };
 
 /// profile 的安全元数据，供未知节点策略做静态判断。
@@ -1046,15 +1039,6 @@ pub const InstallConfig = struct {
     proxy: ProxyConfig = .{},
     /// 后处理 bundle 配置。
     post_install: PostInstallConfig = .{},
-    /// 额外安装的包名列表；渲染器将其写入 `%packages`（Kickstart）或 `packages`（Autoinstall）段。
-    packages: []const []const u8 = &.{},
-    /// 创建的用户列表；Kickstart 渲染为 `user` 指令，Autoinstall 渲染为 `identity` 段。
-    users: []const UserConfig = &.{},
-    /// SSH 公钥列表；渲染器将其写入安装后配置的 authorized_keys。
-    ssh_authorized_keys: []const []const u8 = &.{},
-    /// 可选的后处理 bundle 名称；引用 `Catalog.provisioning_bundles` 中的条目。
-    /// 渲染器将 bundle 中的步骤展开为安装后 shell 命令（`%post` 或 `late-commands`）。
-    bundle: ?[]const u8 = null,
 };
 
 /// v0.1 Profile 持久化安装策略。物理设备从 Node 编译。
@@ -1078,14 +1062,6 @@ pub const ProfileInstallConfig = struct {
     proxy: ProxyConfig = .{},
     /// 后处理 bundle 配置。
     post_install: PostInstallConfig = .{},
-    /// 额外包列表。
-    packages: []const []const u8 = &.{},
-    /// 用户列表。
-    users: []const UserConfig = &.{},
-    /// SSH 公钥列表。
-    ssh_authorized_keys: []const []const u8 = &.{},
-    /// 后处理 bundle 名称引用。
-    bundle: ?[]const u8 = null,
 };
 
 /// 安装完成动作枚举。
@@ -1276,9 +1252,6 @@ pub const BootloaderInstallConfig = struct {
     install: bool = true,
 };
 
-/// M4 兼容拼写；M4.1 将其规范化为 `profile.system.users`。
-pub const UserConfig = TargetUserConfig;
-
 /// 后处理执行阶段。M4 只实现 `install_post`（安装后）；
 /// 后续阶段（如 `first_boot`、`runtime`）在 M7 补充。
 pub const ProvisionPhase = enum {
@@ -1301,7 +1274,7 @@ pub const ProvisionAction = enum {
     script,
     /// 安装预解析并固定的包闭包（v0.2）。只允许访问 AgentPlan 指定的 nodeforged
     /// 受管 HTTP Yum/APT 源；缺依赖在 build/readiness 阶段失败。
-    @"package",
+    package,
     /// 添加软件仓库（dnf config-manager 或 apt sources.list）。
     repository,
     /// 安装标准软件包（dnf install 或 apt-get install）。
@@ -1347,10 +1320,10 @@ pub const ProvisionStep = struct {
     content_sha256: ?[]const u8 = null,
 };
 
-/// 可复用的后处理步骤集合。通过 profile.install.bundle 引用。
+/// 可复用的后处理步骤集合。通过 profile.install.post_install.bundle 引用。
 /// 同一 bundle 可被多个 profile 共享，减少配置重复。
 pub const ProvisioningBundle = struct {
-    /// bundle 名称；profile.install.bundle 引用此值。
+    /// bundle 名称；profile.install.post_install.bundle 引用此值。
     name: []const u8,
     /// bundle 版本；用于未来兼容性检查，M4 不强制校验。
     version: []const u8 = "1",
@@ -1380,9 +1353,6 @@ pub const NodeConfig = struct {
     /// 所绑定 profile 名称，必须能在 `Catalog.profiles` 中找到。
     /// null 表示未绑定（未认领的发现节点）。
     profile: ?[]const u8 = null,
-    /// DHCP 静态保留地址（IPv4 点分格式）。Legacy 字段，迁移输入。
-    /// schema v3 后使用 `pxe.ip_reservation`。
-    ip: ?[]const u8 = null,
     /// Schema v3 canonical PXE lease 保留配置。
     pxe: PxeConfig = .{},
     /// 节点主机名；用于渲染安装配置中的 hostname。
@@ -1427,7 +1397,6 @@ pub const NodeConfig = struct {
 /// PXE lease 保留配置。Schema v3 canonical 保留地址。
 pub const PxeConfig = struct {
     /// DHCP 静态保留地址（IPv4 点分格式）。null 时从地址池动态分配。
-    /// 与 legacy `node.ip` 同义，schema v3 后使用此字段。
     ip_reservation: ?[]const u8 = null,
 };
 
