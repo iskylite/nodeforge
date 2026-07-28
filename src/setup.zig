@@ -20,6 +20,8 @@ pub const environment_path = "/etc/profile.d/nodeforge.sh";
 ///
 /// 这些字段在交互式提示中收集，生成初始 `config.json`。
 pub const Network = struct {
+    /// 开发阶段新部署默认输出 debug；可由 setup --log-level 覆盖。
+    log_level: model.LogLevel = .debug,
     /// PXE 服务网卡名称（如 `enp1s0`）。DHCP 服务绑定该网卡收发广播。
     bind_interface: []const u8 = "eth0",
     /// PXE 服务网对外 IPv4 地址。用于生成 HTTP/TFTP URL 和 DHCP next-server。
@@ -51,6 +53,7 @@ pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppCon
         .http = .{ .asset_root = p.iso_dir, .repository_root = p.repos_dir },
         .tftp = .{ .asset_root = p.boot_dir },
         .dhcp = .{ .subnet = network.subnet, .pool_start = network.pool_start, .pool_end = network.pool_end },
+        .logging = .{ .level = network.log_level },
     };
 }
 
@@ -63,9 +66,9 @@ pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppCon
 /// 错误时部分目录可能已创建，但 `setup` 的幂等性保证重试可完成。
 pub fn repairDirectories(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) !void {
     const cwd = std.Io.Dir.cwd();
-    inline for (.{ p.bin_dir, p.systemd_dir, p.config_dir, p.catalog_dir, p.state_dir, p.logs_dir, p.iso_dir, p.boot_dir, p.repos_dir, p.keys_dir, p.initrd_dir, p.rootfs_dir, p.bundles_dir, p.provisioned_dir, p.run_dir, p.work_dir, p.import_dir, p.model_transactions_dir }) |directory|
+    inline for (.{ p.bin_dir, p.systemd_dir, p.config_dir, p.catalog_dir, p.state_dir, p.logs_dir, p.iso_dir, p.boot_dir, p.repos_dir, p.repository_indexes_dir, p.keys_dir, p.initrd_dir, p.rootfs_dir, p.bundles_dir, p.provisioned_dir, p.run_dir, p.work_dir, p.import_dir, p.model_transactions_dir }) |directory|
         try cwd.createDirPath(io, directory);
-    inline for (.{ p.install_root, p.bin_dir, p.systemd_dir, p.logs_dir, p.assets_dir, p.iso_dir, p.boot_dir, p.repos_dir, p.initrd_dir, p.rootfs_dir, p.bundles_dir }) |directory|
+    inline for (.{ p.install_root, p.bin_dir, p.systemd_dir, p.logs_dir, p.assets_dir, p.iso_dir, p.boot_dir, p.repos_dir, p.repository_indexes_dir, p.initrd_dir, p.rootfs_dir, p.bundles_dir }) |directory|
         try chmod(io, allocator, "750", directory);
     inline for (.{ p.config_dir, p.catalog_dir, p.state_dir, p.keys_dir, p.provisioned_dir, p.run_dir, p.work_dir, p.import_dir, p.model_transactions_dir }) |directory|
         try chmod(io, allocator, "700", directory);
@@ -309,6 +312,11 @@ test "generated config and systemd use custom runtime root" {
     try std.testing.expectEqualStrings(p.iso_dir, config.http.asset_root);
     // setup 生成的配置必须显式声明 http_port=18080，而非隐式依赖 model 默认值。
     try std.testing.expectEqual(@as(u16, 18080), config.server.http_port);
+    try std.testing.expectEqual(model.LogLevel.debug, config.logging.level);
+    try std.testing.expectEqual(@as(?u64, null), config.capacity.install_plan_max_bytes);
+    const rendered_config = try config_store.render(std.testing.allocator, &config);
+    defer std.testing.allocator.free(rendered_config);
+    try std.testing.expect(std.mem.indexOf(u8, rendered_config, "\"install_plan_max_bytes\": null") != null);
     const unit = try renderSystemd(std.testing.allocator, &p);
     defer std.testing.allocator.free(unit);
     try std.testing.expect(std.mem.indexOf(u8, unit, p.nodeforged_path) != null);

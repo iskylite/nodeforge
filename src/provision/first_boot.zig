@@ -200,8 +200,8 @@ fn sleepSeconds(io: std.Io, allocator: std.mem.Allocator, seconds: u32) void {
 }
 
 /// 渲染单个步骤为一条 `/bin/sh -c` 命令字符串。first-boot 与 rootfs-build 共用本函数：
-///   - `nogpgcheck`：rootfs-build 构建期为 true（本地 `file://` 源未签名，跳过 GPG）；
-///     first-boot 运行期为 false（强制 GPG 校验）。
+///   - `nogpgcheck`：rootfs-build 构建期为 true（ISO 导出的受管 HTTP 源未单独
+///     签名，跳过 GPG）；first-boot 运行期为 false（强制 GPG 校验）。
 ///   - `installroot`：非 null（rootfs-build）时为 dnf 注入 `--installroot=<staging>`，
 ///     在 host 上下文安装到 staging，不进 chroot、不 bind-mount `/dev/proc/sys`，
 ///     规避单 worker daemon 自死锁与 bind-mount 清理风险；first-boot 传 null（chroot 到真根）。
@@ -247,7 +247,7 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
                         try writeQuoted(w, url);
                         try w.print(" --enablerepo=nodeforge-{d}", .{index});
                     }
-                    // 构建期本地 file:// 源未签名才跳过 GPG；运行期强制校验。
+                    // 构建期 ISO 导出的受管 HTTP 源未签名才跳过 GPG；运行期强制校验。
                     if (nogpgcheck) try w.writeAll(" --nogpgcheck");
                     try w.writeAll(" install");
                     for (step.packages) |pkg| {

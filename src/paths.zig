@@ -44,6 +44,9 @@ pub const Paths = struct {
     boot_dir: []const u8,
     /// 仓库目录（`<root>/assets/repos`），通过 HTTP 只读发布。
     repos_dir: []const u8,
+    /// Repository 软件能力索引内容寻址目录。完整 index 按 SHA-256 只保存一次，
+    /// InstallPlan 只持有引用，避免同 profile 多节点重复快照。
+    repository_indexes_dir: []const u8,
     /// SSH 密钥目录（`<root>/assets/keys`），存放 bootstrap 和操作员密钥。
     keys_dir: []const u8,
     /// Bootstrap SSH 私钥路径（`<root>/assets/keys/id_ed25519`）。
@@ -271,6 +274,7 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .iso_dir = try join(allocator, root, "assets/iso"),
         .boot_dir = try join(allocator, root, "assets/boot"),
         .repos_dir = try join(allocator, root, "assets/repos"),
+        .repository_indexes_dir = try join(allocator, root, "assets/repository-indexes"),
         .keys_dir = try join(allocator, root, "assets/keys"),
         .bootstrap_private_key_path = try join(allocator, root, "assets/keys/id_ed25519"),
         .bootstrap_public_key_path = try join(allocator, root, "assets/keys/id_ed25519.pub"),

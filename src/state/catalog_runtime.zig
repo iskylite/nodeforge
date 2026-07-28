@@ -270,7 +270,10 @@ pub const CatalogRuntime = struct {
                 for (value.assets) |existing|
                     if (std.mem.eql(u8, existing.name, bootloader.name)) return error.DuplicateObjectName;
         }
-        if (imported.repository) |repository| for (value.repositories) |existing| if (std.mem.eql(u8, existing.name, repository.name)) return error.DuplicateObjectName;
+        // 多 variant ISO 的 Result.repositories 可能包含多个 RepositoryConfig
+        // （如 Rocky DVD 的 AppStream + BaseOS）。每个 repository 名必须唯一；
+        // 同名异内容返回 DuplicateObjectName，绝不覆盖。
+        for (imported.repositories) |repository| for (value.repositories) |existing| if (std.mem.eql(u8, existing.name, repository.name)) return error.DuplicateObjectName;
         for (value.install_sources) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
         for (value.profiles) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
         const addition_count = required_additions.len + @as(usize, if (bootloader_addition != null) 1 else 0);
@@ -280,11 +283,14 @@ pub const CatalogRuntime = struct {
         @memcpy(assets[value.assets.len .. value.assets.len + required_additions.len], &required_additions);
         if (bootloader_addition) |bootloader|
             assets[value.assets.len + required_additions.len] = bootloader;
-        const repo_count: usize = if (imported.repository == null) 0 else 1;
+        // 批量追加所有 repository（可能为 0 个、1 个或多个）。
+        // 多 variant ISO 的每个 variant 对应一个独立的 RepositoryConfig，
+        // 但它们共享同一个 source_name 目录的文件。
+        const repo_count = imported.repositories.len;
         const repositories = try self.allocator.alloc(model.RepositoryConfig, value.repositories.len + repo_count);
         defer self.allocator.free(repositories);
         @memcpy(repositories[0..value.repositories.len], value.repositories);
-        if (imported.repository) |repository| repositories[value.repositories.len] = repository;
+        @memcpy(repositories[value.repositories.len .. value.repositories.len + repo_count], imported.repositories);
         const sources = try self.allocator.alloc(model.InstallSourceConfig, value.install_sources.len + 1);
         defer self.allocator.free(sources);
         @memcpy(sources[0..value.install_sources.len], value.install_sources);
@@ -495,7 +501,7 @@ fn importedFixture(distro: []const u8, version: []const u8, arch: model.Arch, fa
         .iso_asset = .{ .name = "fixture-image", .kind = .iso, .path = "fixture.iso", .distro = distro, .version = version, .arch = arch },
         .kernel_asset = .{ .name = "fixture-kernel", .kind = .kernel, .path = "install/fixture/vmlinuz", .distro = distro, .version = version, .arch = arch },
         .initrd_asset = .{ .name = "fixture-initrd", .kind = .installer_initrd, .path = "install/fixture/initrd.img", .distro = distro, .version = version, .arch = arch },
-        .repository = null,
+        .repositories = &.{},
         .install_source = .{ .name = "fixture-source", .distro = distro, .version = version, .arch = arch, .source_asset = "fixture-image", .installer_kernel = "fixture-kernel", .installer_initrd = "fixture-initrd" },
     };
 }

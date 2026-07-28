@@ -101,95 +101,18 @@ if [[ -d ./sbin && ! -L ./sbin ]]; then
     echo "/sbin is a directory (not symlink)"
 fi
 
-# Install nodeforge-initrd
+# nodeforge-initrd 本身直接作为 PID 1。它内置 HTTP 客户端并自行设置 PATH，
+# 因此验证产物不得再注入 curl、目标 rootfs libc 或 shell wrapper。
+install -m 0755 "$repo/zig-out/bin/nodeforge-initrd" ./init
+mkdir -p ./usr/sbin
 install -m 0755 "$repo/zig-out/bin/nodeforge-initrd" ./usr/sbin/nodeforge-initrd
-# Also ensure /sbin/nodeforge-initrd works
-if [[ -L ./sbin ]]; then
-    echo "/sbin is symlink to $(readlink ./sbin)"
-else
-    ln -sf ../usr/sbin/nodeforge-initrd ./sbin/nodeforge-initrd 2>/dev/null || true
-fi
-
-# Inject curl from Ubuntu rootfs (casper initrd only has wget, but nodeforge-initrd calls curl)
-echo "=== Injecting curl from Ubuntu rootfs ==="
-ROOTFS="$work/rootfs"
-INITRD="$work/initrd-root"
-
-# Copy curl binary
-install -m 0755 "$ROOTFS/usr/bin/curl" "$INITRD/usr/bin/curl"
-
-# Use chroot to resolve curl dependencies within the rootfs context
-# (ldd on host resolves against host /lib64, not rootfs /lib/aarch64-linux-gnu)
-chroot_libraries=$(chroot "$ROOTFS" ldd /usr/bin/curl 2>/dev/null | grep '=>' | awk '{print $3}')
-for lib_path in $chroot_libraries; do
-    [[ -z "$lib_path" || "$lib_path" == "(0x"* ]] && continue
-    lib_name=$(basename "$lib_path")
-    # Check if already in initrd
-    found=$(find "$INITRD" -name "$lib_name" 2>/dev/null | head -1)
-    if [[ -z "$found" ]]; then
-        # Copy to the same relative path in initrd
-        dest_dir="$INITRD$(dirname "$lib_path")"
-        mkdir -p "$dest_dir"
-        cp -L "$ROOTFS$lib_path" "$dest_dir/"
-        echo "  copied: $lib_name -> $(dirname "$lib_path")"
-    else
-        echo "  exists: $lib_name"
-    fi
-done
-
-# Also copy ld-linux if not present (should already be there)
-if [[ ! -e "$INITRD/lib/ld-linux-aarch64.so.1" && ! -e "$INITRD/lib64/ld-linux-aarch64.so.1" ]]; then
-    cp -a "$ROOTFS/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" "$INITRD/lib/aarch64-linux-gnu/"
-    echo "  copied: ld-linux-aarch64.so.1"
-fi
-
-# Verify curl exists and libraries are present
-echo "=== Verify curl in initrd ==="
-file "$INITRD/usr/bin/curl"
-echo "curl lib count: $(find "$INITRD" -name 'libcurl*' 2>/dev/null | wc -l)"
-
-# Run ldconfig in chroot to create ld.so.cache for the new libraries
-echo "=== Running ldconfig in initrd ==="
-chroot "$INITRD" /sbin/ldconfig 2>/dev/null || {
-    echo "ldconfig not found, trying ldconfig.real..."
-    chroot "$INITRD" ldconfig 2>/dev/null || echo "ldconfig failed, will use LD_LIBRARY_PATH fallback"
-}
-echo "ld.so.cache exists: $(ls -la "$INITRD/etc/ld.so.cache" 2>/dev/null || echo 'no')"
-
-# Replace /init with nodeforge wrapper
-cat > ./init << 'INITEOF'
-#!/bin/sh
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export LD_LIBRARY_PATH=/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib64
-
-# Create mount points (nodeforge-initrd will mount proc/sys/dev)
-[ -d /dev ] || mkdir -m 0755 /dev
-[ -d /sys ] || mkdir /sys
-[ -d /proc ] || mkdir /proc
-[ -d /tmp ] || mkdir /tmp
-[ -d /root ] || mkdir -m 0700 /root
-
-# Load required modules (best-effort, before /proc /sys are mounted by nodeforge-initrd)
-for m in loop squashfs overlay virtio virtio_pci virtio_pci_modern_dev virtio_net; do
-    modprobe "$m" 2>/dev/null
-done
-
-# 尽力预配置网络；nodeforge-initrd 会优先复用，缺失时再尝试 udhcpc/dhclient。
-ip link set eth0 up 2>/dev/null
-ip addr add 10.0.2.15/24 dev eth0 2>/dev/null
-ip route add default via 10.0.2.2 2>/dev/null
-
-echo "=== casper-initrd wrapper: eth0 up ==="
-exec /usr/sbin/nodeforge-initrd
-INITEOF
-chmod 0755 ./init
 
 # Create capsule directory
 mkdir -p ./capsule; rm -f ./capsule/*
 
 # Verify key files exist
 echo "=== verification ==="
-echo "init: $(head -1 ./init)"
+echo "init: $(file ./init)"
 echo "nodeforge-initrd: $(ls -la ./usr/sbin/nodeforge-initrd | awk '{print $1, $5}')"
 echo "modules: $(find ./usr/lib/modules -name '*.ko*' 2>/dev/null | wc -l)"
 echo "overlay.ko: $(find ./usr/lib/modules -name 'overlay.ko*' 2>/dev/null | head -1)"
@@ -293,7 +216,9 @@ zig-out/bin/nodeforge --install-root "$install_root" profile create "$profile" u
     --kind diskless --boot-bundle ub-casper-bundle --config "$config" --output json >/dev/null 2>&1 || true
 zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" diskless.failure.max_attempts=3 --config "$config" --output json >/dev/null
 zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" diskless.failure.backoff_seconds=1 --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" --path "$work/rootfs.squashfs" --config "$config" --output json >/dev/null
+zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" \
+    --path "$work/rootfs.squashfs" --uncompressed-size "$(du -s --block-size=1 "$work/rootfs" | cut -f1)" \
+    --config "$config" --output json >/dev/null
 
 # Prepare boot
 prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")

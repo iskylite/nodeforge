@@ -85,7 +85,7 @@ test {
     _ = provision_node_apply;
     _ = provision_rootfs_build_executor;
     _ = provision_rootfs_os_builder;
-_ = provision_initrd_build_executor;
+    _ = provision_initrd_build_executor;
     _ = initrd_memory;
     _ = initrd_download;
 }
@@ -113,6 +113,7 @@ pub const status_store = @import("state/status_store.zig");
 pub const deployment_control = @import("state/deployment_control.zig");
 /// M4.9b：仅包含节点实际引用事实的完整 SHA-256 部署计划摘要。
 pub const plan_digest = @import("state/plan_digest.zig");
+pub const repository_index_blob = @import("state/repository_index_blob.zig");
 /// CLI 管理客户端：通过本机 HTTP 管理 API 与 daemon 通信。
 pub const management_client = @import("http/client.zig");
 pub const http_routes = @import("http/routes.zig");
@@ -218,6 +219,7 @@ test {
     _ = status_store;
     _ = deployment_control;
     _ = plan_digest;
+    _ = repository_index_blob;
     _ = profile_diskless;
     _ = management_client;
     _ = http_routes;

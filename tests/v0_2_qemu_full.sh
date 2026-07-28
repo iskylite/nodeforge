@@ -225,6 +225,7 @@ cli profile set "$profile" diskless.failure.max_attempts=3 \
 cli profile set "$profile" diskless.failure.backoff_seconds=1 \
     --config "$config" --output json >/dev/null
 cli profile rootfs register "$profile" --path "$work/rootfs.squashfs" \
+    --uncompressed-size "$(du -s --block-size=1 "$work/rootfs" | cut -f1)" \
     --config "$config" --output json >/dev/null
 cli node add "$node" mac=52:54:00:12:34:57 arch=aarch64 \
     profile="$profile" --config "$config" --output json >/dev/null

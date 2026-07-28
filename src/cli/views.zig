@@ -18,8 +18,8 @@ pub const AssetRow = struct { name: []const u8, kind: []const u8, path: []const 
 pub const TftpSessionRow = struct { id: []const u8, phase: []const u8, filename: []const u8 };
 /// DHCP 租约列表表格的单行数据。`expires_at` 为预格式化的本地时间字符串。
 pub const DhcpLeaseRow = struct { ip: []const u8, mac: []const u8, phase: []const u8, expires_at: []const u8 };
-/// 节点列表表格的单行数据。start/install/finished 分别映射任务武装、安装开始和终态时间。
-pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8, deploy: []const u8, install_intent: []const u8, status: []const u8, start_at: []const u8, install_at: []const u8, finished_at: []const u8, serial_number: []const u8 };
+/// 节点列表表格的单行数据。armed/install/finished 分别映射 generation 武装、安装开始和终态时间。
+pub const NodeRow = struct { id: []const u8, mac: []const u8, ip: []const u8, profile: []const u8, deploy: []const u8, install_intent: []const u8, status: []const u8, armed_at: []const u8, install_at: []const u8, finished_at: []const u8, serial_number: []const u8 };
 /// profile 列表表格的单行数据。`nodes` 为关联节点计数，`valid` 为校验状态文本。
 pub const ProfileRow = struct { name: []const u8, mode: []const u8, distro: []const u8, version: []const u8, arch: []const u8, install_source: []const u8, nodes: []const u8, valid: []const u8 };
 /// 事件列表表格的单行数据。`fields` 为预格式化的 `key=value key=value` 字符串。
@@ -96,14 +96,14 @@ pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
 }
 /// 渲染节点列表表格（带选项）。超过 256 行返回 `error.TooManyRows`。
 pub fn nodesWithOptions(writer: *std.Io.Writer, rows: []const NodeRow, options: table.Options) !void {
-    // Start/Install/Finished 分别映射任务武装、实际安装阶段开始和任务终态，
+    // Armed/Install/Finished 分别映射 generation 武装、实际安装阶段开始和任务终态，
     // 避免把内部 requested_at/started_at 字段名误当成用户语义。
-    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "start_at", .title = "START" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
+    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "armed_at", .title = "ARMED" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
     var cells: [256][11][]const u8 = undefined;
     var table_rows: [256]table.Row = undefined;
     if (rows.len > table_rows.len) return error.TooManyRows;
     for (rows, 0..) |row, i| {
-        cells[i] = .{ row.id, row.mac, row.ip, row.profile, row.deploy, row.install_intent, row.status, row.start_at, row.install_at, row.finished_at, row.serial_number };
+        cells[i] = .{ row.id, row.mac, row.ip, row.profile, row.deploy, row.install_intent, row.status, row.armed_at, row.install_at, row.finished_at, row.serial_number };
         table_rows[i] = .{ .cells = &cells[i] };
     }
     try renderTableDocument(writer, &columns, table_rows[0..rows.len], "No nodes registered.", options);
@@ -362,15 +362,15 @@ test "formatTimestamp renders local 24-hour visualization time" {
     try std.testing.expectEqualStrings("-", formatTimestamp(&buffer, -1));
 }
 
-test "node list table shows task start install and finish columns" {
-    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "start_at", .title = "START" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" } };
+test "node list table shows armed install and finish columns" {
+    const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "armed_at", .title = "ARMED" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" } };
     const cells = [_][]const u8{ "node-01", "2026-07-11 16:29:00", "2026-07-11 16:30:00", "2026-07-11 16:45:00" };
     const rows = [_]table.Row{.{ .cells = &cells }};
     var buffer: [256]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try table.render(&writer, &columns, &rows, "empty", .{});
     const out = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "START") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ARMED") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "INSTALL") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FINISHED") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "2026-07-11 16:30:00") != null);

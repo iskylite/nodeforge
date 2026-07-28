@@ -151,7 +151,7 @@ echo "overlay.ko: $(find . -name 'overlay.ko*' 2>/dev/null | head -1)"
 echo "squashfs.ko: $(find . -name 'squashfs.ko*' 2>/dev/null | head -1)"
 
 echo "=== Critical tools check ==="
-for tool in curl ip dhclient modprobe switch_root mount busybox wget; do
+for tool in ip dhclient modprobe switch_root mount busybox wget; do
     found=$(find . -name "$tool" -type f 2>/dev/null | head -1)
     if [[ -z "$found" ]]; then
         echo "MISSING: $tool"
@@ -160,65 +160,17 @@ for tool in curl ip dhclient modprobe switch_root mount busybox wget; do
     fi
 done
 
-# Install nodeforge-initrd
+# 直接安装为 /init；禁止 shell wrapper 和从目标 rootfs 注入动态库。
+install -m 0755 "$repo/zig-out/bin/nodeforge-initrd" ./init
+mkdir -p ./usr/sbin
 install -m 0755 "$repo/zig-out/bin/nodeforge-initrd" ./usr/sbin/nodeforge-initrd
-
-# Check if curl exists in mkinitramfs output
-if [[ ! -f ./usr/bin/curl ]]; then
-    echo "=== Injecting curl from rootfs ==="
-    ROOTFS="$work/rootfs"
-    INITRD="$work/initrd-root"
-    install -m 0755 "$ROOTFS/usr/bin/curl" "$INITRD/usr/bin/curl"
-    chroot_libraries=$(chroot "$ROOTFS" ldd /usr/bin/curl 2>/dev/null | grep '=>' | awk '{print $3}')
-    for lib_path in $chroot_libraries; do
-        [[ -z "$lib_path" || "$lib_path" == "(0x"* ]] && continue
-        lib_name=$(basename "$lib_path")
-        found=$(find "$INITRD" -name "$lib_name" 2>/dev/null | head -1)
-        if [[ -z "$found" ]]; then
-            dest_dir="$INITRD$(dirname "$lib_path")"
-            mkdir -p "$dest_dir"
-            cp -L "$ROOTFS$lib_path" "$dest_dir/"
-            echo "  copied: $lib_name"
-        fi
-    done
-else
-    echo "curl already present in mkinitramfs output"
-fi
-
-# Replace /init with nodeforge wrapper
-cat > ./init << 'INITEOF'
-#!/bin/sh
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export LD_LIBRARY_PATH=/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib64
-
-# Create mount points (nodeforge-initrd will mount proc/sys/dev)
-[ -d /dev ] || mkdir -m 0755 /dev
-[ -d /sys ] || mkdir /sys
-[ -d /proc ] || mkdir /proc
-[ -d /tmp ] || mkdir /tmp
-[ -d /root ] || mkdir -m 0700 /root
-
-# Load required modules (best-effort)
-for m in loop squashfs overlay virtio virtio_pci virtio_pci_modern_dev virtio_net; do
-    modprobe "$m" 2>/dev/null
-done
-
-# Configure network (best-effort)
-ip link set eth0 up 2>/dev/null
-ip addr add 10.0.2.15/24 dev eth0 2>/dev/null
-ip route add default via 10.0.2.2 2>/dev/null
-
-echo "=== mkinitramfs wrapper: eth0 up ==="
-exec /usr/sbin/nodeforge-initrd
-INITEOF
-chmod 0755 ./init
 
 # Create capsule directory
 mkdir -p ./capsule; rm -f ./capsule/*
 
 # Verify
 echo "=== verification ==="
-echo "init: $(head -1 ./init)"
+echo "init: $(file ./init)"
 echo "nodeforge-initrd: $(ls -la ./usr/sbin/nodeforge-initrd | awk '{print $1, $5}')"
 echo "modules: $(find ./usr/lib/modules -name '*.ko*' 2>/dev/null | wc -l)"
 
@@ -311,7 +263,9 @@ zig-out/bin/nodeforge --install-root "$install_root" profile create "$profile" u
     --kind diskless --boot-bundle ub-mkinit-bundle --config "$config" --output json >/dev/null 2>&1 || true
 zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" diskless.failure.max_attempts=3 --config "$config" --output json >/dev/null
 zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" diskless.failure.backoff_seconds=1 --config "$config" --output json >/dev/null
-zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" --path "$work/rootfs.squashfs" --config "$config" --output json >/dev/null
+zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" \
+    --path "$work/rootfs.squashfs" --uncompressed-size "$(du -s --block-size=1 "$work/rootfs" | cut -f1)" \
+    --config "$config" --output json >/dev/null
 
 # Prepare boot
 prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")

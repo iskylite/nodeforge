@@ -76,6 +76,10 @@ rootfs = OS 层 + rootfs-build phase 业务内容 + Profile target-system 骨架
   的 environment/group/task/package selection，按 local-only 移除公网 mirror/metalink/
   GeoIP/vendor NTP，只引用本地 repository。OS 层可按 software capability revision 内部
   缓存复用，但对设计透明、不作为独立 Resource。
+
+  多 variant ISO（如 Rocky 10.2 DVD 的 AppStream + BaseOS）的 install source 引用多个
+  repository，`buildRepositoryClosure` 自动合并所有 variant 的 repository URL，dnf 在
+  `--installroot` 时同时消费 AppStream 和 BaseOS 的包元数据。
 - **rootfs-build phase**：在 OS 层之上向只读 lower 追加业务内容（managed-file、archive、
   受控 script、经本地 repo 解析的 package）。由服务端 rootfs builder 执行（无节点 agent），
   builder 提供 chroot/staging 上下文使步骤以 `/` 为目标写入 lower。
@@ -158,16 +162,20 @@ Node effective 差量，不重复交付 Profile SSH private keys。
 监听 UDP/68、执行 DISCOVER/OFFER/REQUEST/ACK 并配置本地地址/路由的 client 复用。NodeForge overlay
 还会以自己的 `/init` 接管 PID 1，因此不能假定 vendor dracut/NetworkManager 的正常 hook 已经执行。
 
-initrd 网络初始化按以下顺序收敛：复用已有全局 IPv4 地址；优先调用 vendor initrd 常见的 BusyBox
-`udhcpc`；没有 `udhcpc` 时回退到构建器连同动态依赖注入的 `dhclient`。两者都只调用 NodeForge 提供的
-最小地址/默认路由 hook，并采用有界重试。保留 `dhclient` fallback 是为了 Rocky 与 Ubuntu vendor initrd
-差异下的确定性，不把 daemon 的 server 状态机、租约存储和额外攻击面复制进早期启动 PID 1。
+initrd 网络初始化按以下顺序收敛：先用 `SIOCGIFADDR` 查找已经持有 PXE reservation IP
+的接口；若内核/vendor initramfs 尚未配置该地址，再按 DHCP/TFTP identity 携带的 PXE MAC
+匹配 sysfs；两者都失败才进入 vendor `udhcpc`/`dhclient` 兼容路径。禁止选择第一个非 lo
+接口或假设 `eth0`。地址、netmask 与 gateway 设置失败均 fail closed。
+
+MAC 必须在第一次 BootConfig HTTP 请求前可得，因此当前作为无密钥 cmdline bootstrap fact；
+不能只放入需要网络才能取得的 BootConfig。它不是节点授权凭据，授权仍由 capsule 中的
+scope token 完成。
 
 完整启动时序（其中 1-4 由 initrd 在 `switch_root` 前完成）：
 
 1. DHCP/TFTP 引导 boot bundle（kernel + 共享 NodeForge initrd）和 per-session credential capsule；GRUB 将
    极小 capsule 作为第二个 initrd cpio 追加加载。kernel cmdline 只携带无密钥的
-   `nodeforge.config_url`、node/session identity 与 `kernel_args`。
+   `nodeforge.config_url`、node identity、PXE IP/prefix/gateway/MAC 与 `kernel_args`。
 2. initrd 起后从 `config_url` 拉 BootConfig（单用途、仅容忍响应中断的有界重放 config token），校验 DTO、计划 snapshot、时钟窗口和
    feature，再取得 rootfs 专用 artifact token；agent/event token 已在 credential capsule 中分域，initrd 不使用其读权限。
 3. initrd 先完成 rootfs HEAD/Range 下载、整文件校验，再建立 lower/upper/work/merged；它只把 AgentPlan

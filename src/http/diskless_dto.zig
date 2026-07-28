@@ -20,7 +20,8 @@ pub const RootfsLocator = struct {
     /// rootfs 内容 SHA-512（immutable ETag）。
     sha512: []const u8,
     size: u64,
-    uncompressed_size: u64,
+    /// null 表示外部 rootfs 未提供展开大小；客户端必须跳过容量硬校验。
+    uncompressed_size: ?u64 = null,
 };
 
 /// BootConfig v2 中引用的 AgentPlan 定位器。

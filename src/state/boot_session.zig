@@ -241,8 +241,11 @@ pub const Store = struct {
         self.effective = @max(active, @max(@as(usize, 1), @min(derived, max_sessions)));
     }
 
-    pub fn captureInstallPlan(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, json: []const u8, model_revision: u64) !void {
-        if (!validId(session_id) or json.len == 0 or json.len > 1024 * 1024) return error.InvalidInstallPlan;
+    pub fn captureInstallPlan(self: *Store, allocator: std.mem.Allocator, session_id: []const u8, json: []const u8, model_revision: u64, max_bytes: ?u64) !void {
+        // json 的底层 slice 一直是动态长度；可选 max_bytes 只是 config.json 的
+        // 运维保护阈值，不参与 InstallPlan 业务语义。null 不施加人为上限。
+        if (!validId(session_id) or json.len == 0) return error.InvalidInstallPlan;
+        if (max_bytes) |limit| if (json.len > limit) return error.InstallPlanTooLarge;
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(json, &digest, .{});
         const plan = try allocator.create(InstallPlanSnapshot);
@@ -1132,9 +1135,9 @@ test "immutable install plan cannot change within one boot session" {
     var store: Store = .{};
     const acquired = try store.acquireDhcp(std.testing.io, .{ .mac = &.{ 2, 0, 0, 0, 0, 1 }, .xid = 1, .node_id = "node-01", .profile = "install", .mode = .install, .model_revision = 7 }, 1, 1);
     const id = acquired.link.id().?;
-    try store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":7}", 7);
-    try store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":7}", 7);
-    try std.testing.expectError(error.InstallPlanChanged, store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":8}", 8));
+    try store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":7}", 7, null);
+    try store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":7}", 7, null);
+    try std.testing.expectError(error.InstallPlanChanged, store.captureInstallPlan(std.testing.allocator, id, "{\"revision\":8}", 8, null));
     const copied = (try store.copyInstallPlan(std.testing.allocator, id)).?;
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualStrings("{\"revision\":7}", copied);

@@ -12,6 +12,47 @@ const cli_events = @import("nodeforge").cli_events;
 const model = @import("nodeforge").model;
 const node_mutation = @import("nodeforge").node_mutation;
 
+// zli 当前把有限选项 flag 建模为字符串。所有合法值必须保存在普通 flag
+// description 中；`--help` 与 `--help-full` 共享这份元数据，操作员不应通过
+// 阅读源码或故意触发失败请求才能发现可选值。
+const archFlagHelp = "Architecture; allowed: x86_64, aarch64";
+const softwareKindFlagHelp = "Capability kind filter; allowed: environment, group, task, metapackage, package; omit to list all kinds (DNF: environment/group/package; APT: task/metapackage/package)";
+const requiredSoftwareKindFlagHelp = "Capability kind; allowed: environment, group, task, metapackage, package (DNF: environment/group/package; APT: task/metapackage/package)";
+const assetKindFlagHelp = "Asset kind; allowed: iso, bootloader, kernel, runtime_kernel, installer_initrd, nodeforge_initrd, rootfs, gpg_key, managed_file, archive, script";
+const structuredInputFlagHelp = "Input format; allowed: yaml, json";
+
+/// 常规 management JSON 响应的统一上限。
+///
+/// 集合接口过去分别使用 8 KiB～256 KiB 的栈数组，同一规模的数据会因命令不同
+/// 而表现为成功或 `ResponseTooLarge`。统一改为 2 MiB 堆缓冲；软件能力索引等已知
+/// 大对象仍使用各自更高、可解释的上限。
+const managementResponseCapacity: usize = 2 * 1024 * 1024;
+
+fn allocManagementResponse(ctx: zli.CommandContext) ![]u8 {
+    return ctx.allocator.alloc(u8, managementResponseCapacity);
+}
+
+fn expectEnumHelpComplete(comptime Enum: type, help: []const u8) !void {
+    inline for (@typeInfo(Enum).@"enum".fields) |field| {
+        var words = std.mem.tokenizeAny(u8, help, " \t,;:()");
+        var found = false;
+        while (words.next()) |word| {
+            if (std.mem.eql(u8, word, field.name)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "closed-choice flag help lists every model enum value" {
+    try expectEnumHelpComplete(model.Arch, archFlagHelp);
+    try expectEnumHelpComplete(model.SoftwareKind, softwareKindFlagHelp);
+    try expectEnumHelpComplete(model.SoftwareKind, requiredSoftwareKindFlagHelp);
+    try expectEnumHelpComplete(model.AssetKind, assetKindFlagHelp);
+}
+
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = nodeforge.log_backend.logFn };
 
 /// zli handler 共享的可变执行结果。
@@ -75,10 +116,10 @@ fn renderFullHelp(command: *zli.Command) std.Io.Writer.Error!void {
     const owner = commandOwner(command);
     try writer.writeAll("\nDetailed help\n");
     if (owner) |value| {
-        try writer.writeAll("\nScalar properties\nKEY\tTYPE\tOPTIONAL\tAPPLICABILITY\n");
+        try writer.writeAll("\nScalar properties\nKEY\tTYPE\tVALUES/CONSTRAINT\tOPTIONAL\tAPPLICABILITY\n");
         for (cli_properties.properties) |spec| {
             if (spec.owner != value or spec.mutability != .mutable) continue;
-            try writer.print("{s}\t{s}\t{s}\t{s}\n", .{ spec.path, @tagName(spec.kind), if (spec.optional) "true" else "false", @tagName(spec.applicability) });
+            try writer.print("{s}\t{s}\t{s}\t{s}\t{s}\n", .{ spec.path, @tagName(spec.kind), cli_properties.valueConstraint(spec.kind, spec.value_constraint), if (spec.optional) "true" else "false", @tagName(spec.applicability) });
         }
         try writer.writeAll("\nCollection properties\nKEY\tSEMANTICS\tOPERATIONS\n");
         for (cli_properties.collections) |spec| {
@@ -86,7 +127,7 @@ fn renderFullHelp(command: *zli.Command) std.Io.Writer.Error!void {
             try writer.print("{s}\t{s}\tlist, add, remove, replace, clear\n", .{ spec.path, @tagName(spec.semantics) });
             if (spec.item_spec) |item_name| if (findItemSpec(item_name)) |item| {
                 try writer.print("  item {s}; identity={s}; fields=", .{ item.name, item.identity });
-                for (item.fields, 0..) |field, index| try writer.print("{s}{s}:{s}{s}", .{ if (index == 0) "" else ",", field.name, @tagName(field.kind), if (field.required) "!" else "" });
+                for (item.fields, 0..) |field, index| try writer.print("{s}{s}:{s}[{s}]{s}", .{ if (index == 0) "" else ",", field.name, @tagName(field.kind), cli_properties.valueConstraint(field.kind, field.value_constraint), if (field.required) "!" else "" });
                 try writer.writeByte('\n');
                 for (item.collections) |field| try writer.print("  item collection {s}.{s}; operations=list, add, remove, replace, clear\n", .{ item.name, field.name });
             };
@@ -165,7 +206,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addDebugFlag(operation_show);
     const operation_wait = try zli.Command.init(init_options, .{ .name = "wait", .description = "Wait for one durable operation to reach a terminal state", .usage = "nodeforge operation wait <id> [--timeout <seconds>] [options]" }, operationWaitHandler);
     try operation_wait.addPositionalArg(.{ .name = "id", .description = "Opaque operation identifier", .required = true });
-    try operation_wait.addFlag(.{ .name = "timeout", .description = "Maximum seconds to wait without cancelling the operation", .type = .Int, .default_value = .{ .Int = 300 } });
+    try operation_wait.addFlag(.{ .name = "timeout", .description = "Maximum seconds to wait without cancelling; allowed range: 1..86400 (default: 300)", .type = .Int, .default_value = .{ .Int = 300 } });
     try addConfigPathFlag(operation_wait);
     try addOutputFlag(operation_wait);
     try addDebugFlag(operation_wait);
@@ -319,7 +360,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     }, nodeClaimHandler);
     try node_claim.addPositionalArg(.{ .name = "node_id", .description = "Node identifier to create or update", .required = true });
     try node_claim.addPositionalArg(.{ .name = "properties", .description = "discovery.mac=<mac> and arch=<arch>", .required = true, .variadic = true });
-    try node_claim.addFlag(.{ .name = "observation-revision", .description = "Exact observation revision from discovery show", .type = .Int, .default_value = .{ .Int = 0 } });
+    try node_claim.addFlag(.{ .name = "observation-revision", .description = "Exact positive observation revision from `discovery show`; must be >0", .type = .Int, .default_value = .{ .Int = 0 } });
     try addConfigPathFlag(node_claim);
     try addOutputFlag(node_claim);
     try addDebugFlag(node_claim);
@@ -353,7 +394,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .usage = "nodeforge node readiness <node_id> --stage <build|boot> [options]",
     }, nodeReadinessHandler);
     try node_readiness.addPositionalArg(.{ .name = "node_id", .description = "Registered diskless node identifier", .required = true });
-    try node_readiness.addFlag(.{ .name = "stage", .description = "Readiness stage: build or boot", .type = .String, .default_value = .{ .String = "boot" } });
+    try node_readiness.addFlag(.{ .name = "stage", .description = "Readiness stage; allowed: build, boot (default: boot)", .type = .String, .default_value = .{ .String = "boot" } });
     try addConfigPathFlag(node_readiness);
     try addOutputFlag(node_readiness);
     try addDebugFlag(node_readiness);
@@ -393,7 +434,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_create);
     try addOutputFlag(profile_create);
     try addDebugFlag(profile_create);
-    try profile_create.addFlag(.{ .name = "kind", .description = "Profile kind: install (default) or diskless", .type = .String, .default_value = .{ .String = "install" } });
+    try profile_create.addFlag(.{ .name = "kind", .description = "Profile kind; allowed: install, diskless (default: install)", .type = .String, .default_value = .{ .String = "install" } });
     try profile_create.addFlag(.{ .name = "boot-bundle", .description = "Boot bundle name (required for --kind diskless)", .type = .String, .default_value = .{ .String = "" } });
     // Profile 删除只开放零引用场景；引用保护由 daemon 在同一 catalog revision
     // 内执行，CLI 不做可能过期的本地预判。
@@ -439,9 +480,10 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_rootfs_plan);
     try addOutputFlag(profile_rootfs_plan);
     try addDebugFlag(profile_rootfs_plan);
-    const profile_rootfs_register = try zli.Command.init(init_options, .{ .name = "register", .description = "Register a prebuilt rootfs artifact for a diskless profile", .usage = "nodeforge profile rootfs register <profile> --path <file> [options]" }, profileRootfsRegisterHandler);
+    const profile_rootfs_register = try zli.Command.init(init_options, .{ .name = "register", .description = "Register a prebuilt rootfs artifact for a diskless profile", .usage = "nodeforge profile rootfs register <profile> --path <file> [--uncompressed-size <bytes>] [options]" }, profileRootfsRegisterHandler);
     try profile_rootfs_register.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
     try profile_rootfs_register.addFlag(.{ .name = "path", .description = "Path to the prebuilt squashfs rootfs file", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_register.addFlag(.{ .name = "uncompressed-size", .description = "Logical uncompressed rootfs bytes; allowed: 0 (unknown) or a positive integer", .type = .Int, .default_value = .{ .Int = 0 } });
     try addConfigPathFlag(profile_rootfs_register);
     try addOutputFlag(profile_rootfs_register);
     try addDebugFlag(profile_rootfs_register);
@@ -512,7 +554,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try initrd_build.addFlags(&.{
         .{ .name = "distro", .description = "Distro name (for example rocky)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Distro version (for example 9.7)", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "Architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = archFlagHelp, .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "kernel-release", .description = "Installed kernel uname release used by dracut", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "from-install-source", .description = "Derive from this ISO install source's vendor installer initrd (recommended)", .type = .String, .default_value = .{ .String = "" } },
     });
@@ -556,7 +598,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .{ .name = "initrd", .description = "NodeForge initrd asset name (kind=nodeforge_initrd)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "distro", .description = "Distro name (e.g. rocky, ubuntu)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Distro version (e.g. 9.7, 24.04)", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "Architecture: aarch64 or x86_64", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = archFlagHelp, .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "kernel-release", .description = "Kernel uname release string (e.g. 5.14.0-611.5.1.el9_7.aarch64)", .type = .String, .default_value = .{ .String = "" } },
     });
     try addConfigPathFlag(boot_bundle_create);
@@ -666,6 +708,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .{ .name = "purge-data", .description = "With --reset-all, also purge catalog and assets", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "purge-all", .description = "With --reset-all, purge catalog, assets, work files, logs, backups, and migration backups", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "dry-run", .description = "Describe the selected operation without writing", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "log-level", .description = "Persist daemon log level: debug, info, warn, or err (new deployments default to debug)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "bind-interface", .description = "PXE bind interface for generated config", .type = .String, .default_value = .{ .String = "eth0" } },
         .{ .name = "server-ip", .description = "PXE server IPv4 address", .type = .String, .default_value = .{ .String = "192.168.50.1" } },
         .{ .name = "http-port", .description = "HTTP/management listen port for generated config", .type = .Int, .default_value = .{ .Int = 18080 } },
@@ -770,7 +813,7 @@ fn addAssetCatalogCommands(assets: *zli.Command, init_options: zli.InitOptions) 
     const repository_software_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show one repository capability" }, repositorySoftwareShowHandler);
     try repository_software_show.addPositionalArg(.{ .name = "repository", .description = "Repository name", .required = true });
     try repository_software_show.addPositionalArg(.{ .name = "id", .description = "Capability id", .required = true });
-    try repository_software_show.addFlag(.{ .name = "kind", .description = "Required capability kind", .type = .String, .default_value = .{ .String = "" } });
+    try repository_software_show.addFlag(.{ .name = "kind", .description = requiredSoftwareKindFlagHelp, .type = .String, .default_value = .{ .String = "" } });
     for ([_]*zli.Command{ repository_list, repository_show, repository_software_list, repository_software_show }) |command| {
         try addConfigPathFlag(command);
         try addOutputFlag(command);
@@ -783,7 +826,7 @@ fn addAssetCatalogCommands(assets: *zli.Command, init_options: zli.InitOptions) 
 
 fn addSoftwareQueryFlags(command: *zli.Command) !void {
     try command.addFlags(&.{
-        .{ .name = "kind", .description = "Capability kind, or all when omitted", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "kind", .description = softwareKindFlagHelp, .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "search", .description = "Case-insensitive id/name search", .type = .String, .default_value = .{ .String = "" } },
     });
 }
@@ -853,7 +896,7 @@ fn addItemCommands(parent: *zli.Command, init_options: zli.InitOptions, owner: [
     const replace = try zli.Command.init(init_options, .{ .name = "replace-items", .description = "Atomically replace structured items from a file" }, replaceItemsHandler);
     try addItemBase(replace, owner, false);
     try replace.addFlag(.{ .name = "from-file", .description = "Structured collection file, or - for stdin", .type = .String, .default_value = .{ .String = "" } });
-    try replace.addFlag(.{ .name = "input", .description = "Input format: yaml or json", .type = .String, .default_value = .{ .String = "yaml" } });
+    try replace.addFlag(.{ .name = "input", .description = structuredInputFlagHelp, .type = .String, .default_value = .{ .String = "yaml" } });
     const clear = try zli.Command.init(init_options, .{ .name = "clear-items", .description = "Clear a structured collection or local replacement" }, replaceItemsHandler);
     try addItemBase(clear, owner, false);
     for ([_]*zli.Command{ replace, clear }) |command| try command.addFlag(.{
@@ -929,7 +972,7 @@ fn addProvisionBundleCommands(assets: *zli.Command, init_options: zli.InitOption
         try addDebugFlag(command);
     }
     try replace.addFlag(.{ .name = "from-file", .description = "Structured steps file or - for stdin", .type = .String, .default_value = .{ .String = "" } });
-    try replace.addFlag(.{ .name = "input", .description = "yaml or json", .type = .String, .default_value = .{ .String = "yaml" } });
+    try replace.addFlag(.{ .name = "input", .description = structuredInputFlagHelp, .type = .String, .default_value = .{ .String = "yaml" } });
     try bundles.addCommands(&.{ list, show, create, remove, item, replace, clear });
     try assets.addCommand(bundles);
 }
@@ -964,8 +1007,9 @@ fn valuesHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     if (std.mem.eql(u8, ctx.command.cmd_options.name, "list-values")) {
-        var response: [256 * 1024]u8 = undefined;
-        const body = nodeforge.management_client.valuesJson(ctx.io, config.value.server.http_port, owner_text, identity, key, &response) catch null orelse {
+        const response = try allocManagementResponse(ctx);
+        defer ctx.allocator.free(response);
+        const body = nodeforge.management_client.valuesJson(ctx.io, config.value.server.http_port, owner_text, identity, key, response) catch null orelse {
             try writeCommandError(ctx, "property.query_failed", "property query failed", 1);
             return;
         };
@@ -1071,9 +1115,10 @@ fn itemHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     if (std.mem.eql(u8, command_name, "list") or std.mem.eql(u8, command_name, "show")) {
-        var response: [256 * 1024]u8 = undefined;
+        const response = try allocManagementResponse(ctx);
+        defer ctx.allocator.free(response);
         const item_identity: ?[]const u8 = if (std.mem.eql(u8, command_name, "show")) ctx.positional_args[2] else null;
-        const body = nodeforge.management_client.itemsJson(ctx.io, config.value.server.http_port, owner_text, resource, key, item_identity, &response) catch null orelse {
+        const body = nodeforge.management_client.itemsJson(ctx.io, config.value.server.http_port, owner_text, resource, key, item_identity, response) catch null orelse {
             try writeCommandError(ctx, "item.query_failed", "item query failed", 1);
             return;
         };
@@ -1171,8 +1216,9 @@ fn itemValuesHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const command_name = ctx.command.cmd_options.name;
     if (std.mem.eql(u8, command_name, "list-values")) {
-        var response: [256 * 1024]u8 = undefined;
-        const body = nodeforge.management_client.itemValuesJson(ctx.io, config.value.server.http_port, owner_text, resource_identity, key, item_identity, field, &response) catch null orelse {
+        const response = try allocManagementResponse(ctx);
+        defer ctx.allocator.free(response);
+        const body = nodeforge.management_client.itemValuesJson(ctx.io, config.value.server.http_port, owner_text, resource_identity, key, item_identity, field, response) catch null orelse {
             try writeCommandError(ctx, "item.values_query_failed", "item values query failed", 1);
             return;
         };
@@ -1375,6 +1421,11 @@ fn setupHandler(ctx: zli.CommandContext) !void {
     const p = nodeforge.paths.require();
     const dry_run = ctx.flag("dry-run", bool);
     const import_config_path = ctx.flag("import-config", []const u8);
+    const log_level_text = ctx.flag("log-level", []const u8);
+    const requested_log_level: ?nodeforge.model.LogLevel = if (log_level_text.len == 0)
+        null
+    else
+        std.meta.stringToEnum(nodeforge.model.LogLevel, log_level_text) orelse return setupFlagError(ctx, "--log-level must be debug, info, warn, or err");
     const operation_count = @as(u8, @intFromBool(ctx.flag("generate-systemd", bool))) + @as(u8, @intFromBool(ctx.flag("repair-dirs", bool))) + @as(u8, @intFromBool(ctx.flag("reset-state", bool))) + @as(u8, @intFromBool(ctx.flag("reset-all", bool))) + @as(u8, @intFromBool(ctx.flag("reconfigure", bool)));
     const reset_then_reconfigure = ctx.flag("reset-all", bool) and ctx.flag("reconfigure", bool);
     if (operation_count > 1 and !(operation_count == 2 and reset_then_reconfigure))
@@ -1407,6 +1458,7 @@ fn setupHandler(ctx: zli.CommandContext) !void {
         }
     }
     const network: nodeforge.setup.Network = .{
+        .log_level = requested_log_level orelse .debug,
         .bind_interface = ctx.flag("bind-interface", []const u8),
         .server_ip = ctx.flag("server-ip", []const u8),
         .http_port = ctx.flag("http-port", u16),
@@ -1426,6 +1478,7 @@ fn setupHandler(ctx: zli.CommandContext) !void {
             setExitCode(ctx, 1);
             return;
         }
+        if (requested_log_level) |level| imported_config.?.value.logging.level = level;
     }
     defer if (imported_config) |*candidate| candidate.deinit();
     if (dry_run) {
@@ -1494,6 +1547,9 @@ fn setupHandler(ctx: zli.CommandContext) !void {
     var installed_config: ?std.json.Parsed(nodeforge.model.AppConfig) = null;
     if (imported_config == null) installed_config = try nodeforge.config.load(ctx.io, ctx.allocator, p.config_path);
     defer if (installed_config) |*current| current.deinit();
+    if (imported_config == null) {
+        if (requested_log_level) |level| installed_config.?.value.logging.level = level;
+    }
     const startup_config = if (imported_config) |*candidate| &candidate.value else &installed_config.?.value;
     const effective = nodeforge.model.projectCatalog(startup_config.*, &catalog.value);
     try nodeforge.config_validate.validate(&effective, &catalog.value);
@@ -1502,7 +1558,7 @@ fn setupHandler(ctx: zli.CommandContext) !void {
     // M4.9：setup 是 startup config 的唯一写入口。发布前必须把 candidate
     // 与当前 catalog 联合校验；requested/applied provenance 是历史事实，
     // 配置导入不得改写。运行中的 daemon 只在重启后加载新 pair。
-    if (imported_config != null) try nodeforge.config_store.save(ctx.io, ctx.allocator, p.config_path, startup_config);
+    if (imported_config != null or requested_log_level != null) try nodeforge.config_store.save(ctx.io, ctx.allocator, p.config_path, startup_config);
     try nodeforge.dhcp_store.atomicWrite(ctx.io, p.service_path, unit);
     try nodeforge.setup.installEnvironment(ctx.io, ctx.allocator, p);
     const schema_text = try std.fmt.allocPrint(ctx.allocator, "{d}", .{startup_config.schema_version});
@@ -1629,7 +1685,7 @@ fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
         .{ .name = "distro", .description = "Override an unknown or ambiguous product id; e.g. rocky, kylin, ubuntu. Family still comes from ISO layout", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "name", .description = "Override the ISO-basename-derived install-source/profile name; e.g. kylin-v10-sp3-2403", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Override auto-detected catalog version; e.g. V10-SP3-2403-Release-20240426. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "Override auto-detected arch; e.g. aarch64, x86_64. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Override auto-detected architecture; allowed: x86_64, aarch64; omit to auto-detect", .type = .String, .default_value = .{ .String = "" } },
     });
     return command;
 }
@@ -1640,12 +1696,12 @@ fn assetImportCommand(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(command);
     try addDebugFlag(command);
     try command.addFlags(&.{
-        .{ .name = "type", .description = "Asset kind; e.g. bootloader (also kernel, installer_initrd, nodeforge_initrd, rootfs, iso, gpg_key)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "type", .description = assetKindFlagHelp, .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "name", .description = "Unique catalog name; e.g. rocky-9.7-aarch64-kernel", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "path", .description = "Path relative to tftp.asset_root; e.g. boot/rocky/9.7/aarch64/vmlinuz", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "distro", .description = "Distro name, used with --version and --arch; e.g. rocky", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Distro version, used with --distro and --arch; e.g. 9.7", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "arch", .description = "Architecture, used with --distro and --version; e.g. aarch64 (or x86_64)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "arch", .description = "Architecture used with --distro and --version; allowed: x86_64, aarch64", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "kernel-release", .description = "Kernel uname release for bundle matching; e.g. 5.14.0-611.el9.aarch64", .type = .String, .default_value = .{ .String = "" } },
     });
     return command;
@@ -1769,10 +1825,11 @@ fn operationRead(ctx: zli.CommandContext, wait: bool) !void {
         return;
     }
     const attempts: usize = if (wait) @intCast(timeout_seconds * 4) else 1;
-    var response: [64 * 1024]u8 = undefined;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
     var attempt: usize = 0;
     while (attempt < attempts) : (attempt += 1) {
-        const body = nodeforge.management_client.operationJson(ctx.io, config.value.server.http_port, id, &response) catch null orelse {
+        const body = nodeforge.management_client.operationJson(ctx.io, config.value.server.http_port, id, response) catch null orelse {
             try writeCommandError(ctx, "operation.unavailable", "operation is not found or daemon is unavailable", 6);
             return;
         };
@@ -1900,6 +1957,7 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
     var catalog: ?std.json.Parsed(nodeforge.model.Catalog) = null;
     defer if (catalog) |*value| value.deinit();
     var base_initrd: ?[]const u8 = null;
+    var source_kernel_release: ?[]const u8 = null;
     if (source_name.len != 0) {
         catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, nodeforge.paths.require().catalog_dir) catch {
             try writeCommandError(ctx, "initrd.catalog_unavailable", "cannot load the installed catalog", 1);
@@ -1917,6 +1975,15 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
             try writeCommandError(ctx, "initrd.installer_initrd_invalid", "install source initrd has the wrong asset kind", 1);
             return;
         }
+        const source_kernel = nodeforge.catalog.findAsset(&catalog.?.value, source.installer_kernel) orelse {
+            try writeCommandError(ctx, "initrd.installer_kernel_missing", "install source has no registered kernel", 1);
+            return;
+        };
+        if (source_kernel.kind != .kernel) {
+            try writeCommandError(ctx, "initrd.installer_kernel_invalid", "install source kernel has the wrong asset kind", 1);
+            return;
+        }
+        source_kernel_release = source_kernel.kernel_release;
         if ((distro.len != 0 and !std.mem.eql(u8, distro, source.distro)) or
             (version.len != 0 and !std.mem.eql(u8, version, source.version)) or
             (arch_text.len != 0 and !std.mem.eql(u8, arch_text, @tagName(source.arch))))
@@ -1942,12 +2009,25 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "initrd.invalid_arch", "unsupported --arch", 2);
         return;
     };
+    if (source_kernel_release) |detected_release| {
+        if (!std.mem.eql(u8, detected_release, kernel_release))
+            try errorWriter(ctx).print(
+                "WARNING: requested kernel release {s} differs from install source {s} kernel release {s}; continuing with the user-provided value.\n",
+                .{ kernel_release, source_name, detected_release },
+            );
+    }
     if (!nodeforge.management_client.health(ctx.io, config.value.server.http_port).healthy) {
         try writeCommandError(ctx, "initrd.daemon_unavailable", "local daemon must be healthy before building and registering an initrd", 1);
         return;
     }
 
-    const relative = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}/{s}/{s}.img", .{ distro, version, @tagName(arch), name });
+    // source 派生的 initrd 在文件系统中显式保留 source + uname-r provenance；
+    // 手工构建则放入 manual namespace，避免相同 distro tuple 下不同 ISO 的产物
+    // 混在一起，也避免 source-derived 与 manual 同名冲突。
+    const relative = if (source_name.len != 0)
+        try std.fmt.allocPrint(ctx.allocator, "sources/{s}/{s}/{s}.img", .{ source_name, kernel_release, name })
+    else
+        try std.fmt.allocPrint(ctx.allocator, "manual/{s}/{s}/{s}/{s}/{s}.img", .{ distro, version, @tagName(arch), kernel_release, name });
     const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ nodeforge.paths.require().initrd_dir, relative });
     const part = try std.fmt.allocPrint(ctx.allocator, "{s}.part", .{destination});
     const parent = std.fs.path.dirname(destination) orelse unreachable;
@@ -2284,8 +2364,9 @@ fn catalogResourceHandler(ctx: zli.CommandContext, resource: []const u8, name: ?
         return;
     };
     defer config.deinit();
-    var response: [256 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.catalogResourcesJson(ctx.io, config.value.server.http_port, resource, name, &response) catch null orelse {
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.catalogResourcesJson(ctx.io, config.value.server.http_port, resource, name, response) catch null orelse {
         const message = try std.fmt.allocPrint(ctx.allocator, "{s} query failed", .{resource});
         try writeCommandError(ctx, "catalog.query_failed", message, 1);
         return;
@@ -2383,9 +2464,39 @@ fn softwareAvailableHandler(ctx: zli.CommandContext, resource: []const u8, exact
         return;
     };
     defer config.deinit();
-    var response: [256 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.softwareCapabilitiesJson(ctx.io, config.value.server.http_port, resource, name, if (kind_value.len == 0) null else kind_value, if (search_value.len == 0) null else search_value, &response) catch null orelse {
-        try writeCommandError(ctx, "software.query_failed", "software capability query failed", 1);
+    // 软件 capability 响应可能很大：Rocky 10.2 DVD 的 package 索引约 1.8 MB，
+    // Ubuntu live-server 的 task/metapackage 索引较小但仍可能增长。
+    // 原实现使用 256 KB 栈缓冲区（`var response: [256 * 1024]u8`），
+    // 对 Rocky DVD 返回 `error.ResponseTooLarge`（client.zig:779），但
+    // `catch null orelse` 把该错误与连接失败、404/409 等服务端拒绝
+    // 混为同一个 `software.query_failed`，无法定位根因。
+    //
+    // 修复：改用堆分配（8 MB 上限），并把 `catch null orelse` 拆分为
+    // `catch |err|`（连接/协议错误，区分 ResponseTooLarge）和 `orelse`
+    //（服务端返回非 2xx，如 404 source not found、409 no index、
+    // 422 kind not applicable），使 CLI 输出可定位故障类别。
+    const response_capacity: usize = 8 * 1024 * 1024;
+    const response_buf = ctx.allocator.alloc(u8, response_capacity) catch {
+        try writeCommandError(ctx, "software.query_failed", "cannot allocate response buffer", 1);
+        return;
+    };
+    defer ctx.allocator.free(response_buf);
+    const body = nodeforge.management_client.softwareCapabilitiesJson(ctx.io, config.value.server.http_port, resource, name, if (kind_value.len == 0) null else kind_value, if (search_value.len == 0) null else search_value, response_buf) catch |err| {
+        // 连接失败（daemon 未运行）、协议错误（截断、不支持传输编码）
+        // 或响应体超过 8 MB 上限。ResponseTooLarge 给出可操作的提示，
+        // 其余错误保持通用消息——debug 模式可进一步定位。
+        if (err == error.ResponseTooLarge) {
+            try writeCommandError(ctx, "software.response_too_large", "software capability response exceeds 8 MB buffer; use --kind or --search to narrow the query", 1);
+        } else {
+            try writeCommandError(ctx, "software.query_failed", "software capability query failed", 1);
+        }
+        return;
+    } orelse {
+        // managementJson 对非 2xx 返回 null（client.zig:610）。
+        // 常见原因：404（install source 或其 repository 不在 catalog 中）、
+        // 409（source 无 repository 或 software index 未建立）、
+        // 422（--kind 不适用于该 repository 的包管理器）。
+        try writeCommandError(ctx, "software.query_failed", "software capability query was rejected", 1);
         return;
     };
     const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, body, .{}) catch {
@@ -2469,9 +2580,10 @@ fn capabilitiesShowHandler(ctx: zli.CommandContext, profile_resource: bool) !voi
         return;
     };
     defer config.deinit();
-    var response: [256 * 1024]u8 = undefined;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
     const owner = if (profile_resource) "profile" else "node";
-    const body = nodeforge.management_client.capabilitiesJson(ctx.io, config.value.server.http_port, owner, ctx.positional_args[0], &response) catch null orelse {
+    const body = nodeforge.management_client.capabilitiesJson(ctx.io, config.value.server.http_port, owner, ctx.positional_args[0], response) catch null orelse {
         try writeCommandError(ctx, "capability.query_failed", "capability query failed", 1);
         return;
     };
@@ -2500,11 +2612,12 @@ fn softwareSelectionShowHandler(ctx: zli.CommandContext, profile: bool) !void {
         return;
     };
     defer config.deinit();
-    var response: [256 * 1024]u8 = undefined;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
     const body = if (profile)
-        nodeforge.management_client.profilesJson(ctx.io, config.value.server.http_port, ctx.positional_args[0], &response) catch null
+        nodeforge.management_client.profilesJson(ctx.io, config.value.server.http_port, ctx.positional_args[0], response) catch null
     else
-        nodeforge.management_client.nodesJson(ctx.io, config.value.server.http_port, ctx.positional_args[0], &response) catch null;
+        nodeforge.management_client.nodesJson(ctx.io, config.value.server.http_port, ctx.positional_args[0], response) catch null;
     const value = body orelse {
         try writeCommandError(ctx, "software.selection_query_failed", "software selection query failed", 1);
         return;
@@ -2536,30 +2649,46 @@ fn softwareSelectionShowHandler(ctx: zli.CommandContext, profile: bool) !void {
             count += 1;
         }
     } else {
+        // management DTO 使用 canonical 嵌套结构：
+        // software.packages.include/exclude，而不是旧内部字段
+        // packages_include/packages_exclude。所有中间对象都允许为 null；
+        // show 命令必须显示空值，不能因未选择软件而访问错误的 union 字段。
         const node = result.object.get("node") orelse .null;
-        const overrides = node.object.get("overrides") orelse .null;
-        const software = overrides.object.get("software") orelse .null;
+        const overrides = if (node == .object) node.object.get("overrides") orelse .null else .null;
+        const software = if (overrides == .object) overrides.object.get("software") orelse .null else .null;
         const scalar = [_][]const u8{"environment"};
         for (scalar) |key| {
-            fields[count] = .{ .key = try std.fmt.allocPrint(ctx.allocator, "overrides.software.{s}", .{key}), .value = try jsonDisplay(ctx.allocator, software.object.get(key)), .section = "overrides", .json_path = try std.fmt.allocPrint(ctx.allocator, "node.overrides.software.{s}", .{key}) };
+            const field_value = if (software == .object) software.object.get(key) else null;
+            fields[count] = .{ .key = try std.fmt.allocPrint(ctx.allocator, "overrides.software.{s}", .{key}), .value = try jsonDisplay(ctx.allocator, field_value), .section = "overrides", .json_path = try std.fmt.allocPrint(ctx.allocator, "node.overrides.software.{s}", .{key}) };
             count += 1;
         }
-        for ([_][]const u8{ "repositories", "groups", "tasks", "packages_include", "packages_exclude" }) |key| {
-            const delta = software.object.get(key) orelse .null;
+        for ([_][]const u8{ "repositories", "groups", "tasks" }) |key| {
+            const delta = if (software == .object) software.object.get(key) orelse .null else .null;
             for ([_][]const u8{ "add", "remove" }) |operation| {
-                const canonical_key = if (std.mem.startsWith(u8, key, "packages_")) try std.fmt.allocPrint(ctx.allocator, "overrides.software.packages.{s}.{s}", .{ key["packages_".len..], operation }) else try std.fmt.allocPrint(ctx.allocator, "overrides.software.{s}.{s}", .{ key, operation });
-                fields[count] = .{ .key = canonical_key, .value = try jsonDisplay(ctx.allocator, delta.object.get(operation)), .section = "overrides", .json_path = try std.fmt.allocPrint(ctx.allocator, "node.overrides.software.{s}.{s}", .{ key, operation }) };
+                const field_value = if (delta == .object) delta.object.get(operation) else null;
+                fields[count] = .{ .key = try std.fmt.allocPrint(ctx.allocator, "overrides.software.{s}.{s}", .{ key, operation }), .value = try jsonDisplay(ctx.allocator, field_value), .section = "overrides", .json_path = try std.fmt.allocPrint(ctx.allocator, "node.overrides.software.{s}.{s}", .{ key, operation }) };
+                count += 1;
+            }
+        }
+        const package_deltas = if (software == .object) software.object.get("packages") orelse .null else .null;
+        for ([_][]const u8{ "include", "exclude" }) |kind| {
+            const delta = if (package_deltas == .object) package_deltas.object.get(kind) orelse .null else .null;
+            for ([_][]const u8{ "add", "remove" }) |operation| {
+                const field_value = if (delta == .object) delta.object.get(operation) else null;
+                fields[count] = .{ .key = try std.fmt.allocPrint(ctx.allocator, "overrides.software.packages.{s}.{s}", .{ kind, operation }), .value = try jsonDisplay(ctx.allocator, field_value), .section = "overrides", .json_path = try std.fmt.allocPrint(ctx.allocator, "node.overrides.software.packages.{s}.{s}", .{ kind, operation }) };
                 count += 1;
             }
         }
         const effective = result.object.get("effective_software") orelse .null;
         for ([_][]const u8{ "repositories", "environment", "groups", "tasks" }) |key| {
-            fields[count] = .{ .key = try std.fmt.allocPrint(ctx.allocator, "effective.software.{s}", .{key}), .value = try jsonDisplay(ctx.allocator, effective.object.get(key)), .section = "effective", .json_path = try std.fmt.allocPrint(ctx.allocator, "effective_software.{s}", .{key}) };
+            const field_value = if (effective == .object) effective.object.get(key) else null;
+            fields[count] = .{ .key = try std.fmt.allocPrint(ctx.allocator, "effective.software.{s}", .{key}), .value = try jsonDisplay(ctx.allocator, field_value), .section = "effective", .json_path = try std.fmt.allocPrint(ctx.allocator, "effective_software.{s}", .{key}) };
             count += 1;
         }
-        const packages = effective.object.get("packages") orelse .null;
+        const packages = if (effective == .object) effective.object.get("packages") orelse .null else .null;
         for ([_][]const u8{ "include", "exclude" }) |key| {
-            fields[count] = .{ .key = try std.fmt.allocPrint(ctx.allocator, "effective.software.packages.{s}", .{key}), .value = try jsonDisplay(ctx.allocator, packages.object.get(key)), .section = "effective", .json_path = try std.fmt.allocPrint(ctx.allocator, "effective_software.packages.{s}", .{key}) };
+            const field_value = if (packages == .object) packages.object.get(key) else null;
+            fields[count] = .{ .key = try std.fmt.allocPrint(ctx.allocator, "effective.software.packages.{s}", .{key}), .value = try jsonDisplay(ctx.allocator, field_value), .section = "effective", .json_path = try std.fmt.allocPrint(ctx.allocator, "effective_software.packages.{s}", .{key}) };
             count += 1;
         }
     }
@@ -2709,8 +2838,9 @@ fn provisionBundleHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     if (std.mem.eql(u8, command, "list") or std.mem.eql(u8, command, "show")) {
-        var response: [256 * 1024]u8 = undefined;
-        const body = nodeforge.management_client.provisionBundleJson(ctx.io, config.value.server.http_port, name, false, null, &response) catch null orelse {
+        const response = try allocManagementResponse(ctx);
+        defer ctx.allocator.free(response);
+        const body = nodeforge.management_client.provisionBundleJson(ctx.io, config.value.server.http_port, name, false, null, response) catch null orelse {
             try writeCommandError(ctx, "provision-bundle.query_failed", "provision bundle query failed", 1);
             return;
         };
@@ -2765,9 +2895,10 @@ fn provisionBundleItemHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     if (std.mem.eql(u8, command, "list") or std.mem.eql(u8, command, "show")) {
-        var response: [256 * 1024]u8 = undefined;
+        const response = try allocManagementResponse(ctx);
+        defer ctx.allocator.free(response);
         const identity = if (std.mem.eql(u8, command, "show")) ctx.positional_args[2] else null;
-        const body = nodeforge.management_client.provisionBundleJson(ctx.io, config.value.server.http_port, bundle, true, identity, &response) catch null orelse {
+        const body = nodeforge.management_client.provisionBundleJson(ctx.io, config.value.server.http_port, bundle, true, identity, response) catch null orelse {
             try writeCommandError(ctx, "provision-bundle.item_query_failed", "provision bundle item query failed", 1);
             return;
         };
@@ -3137,8 +3268,9 @@ fn tftpSessionListHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer parsed_config.deinit();
-    var response: [8192]u8 = undefined;
-    const body = try nodeforge.management_client.tftpSessionsJson(ctx.io, parsed_config.value.server.http_port, &response);
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = try nodeforge.management_client.tftpSessionsJson(ctx.io, parsed_config.value.server.http_port, response);
     if (body == null) {
         try writeCommandError(ctx, "tftp.sessions_unavailable", "local daemon TFTP session API unavailable", 1);
         return;
@@ -3192,8 +3324,9 @@ fn runtimeLeaseList(ctx: zli.CommandContext, unknown_only: bool) !void {
         return;
     };
     defer config.deinit();
-    var response: [64 * 1024]u8 = undefined;
-    const body = try nodeforge.management_client.dhcpLeasesJson(ctx.io, config.value.server.http_port, unknown_only, &response);
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = try nodeforge.management_client.dhcpLeasesJson(ctx.io, config.value.server.http_port, unknown_only, response);
     if (body == null) {
         try writeCommandError(ctx, "dhcp.leases_unavailable", "local daemon DHCP lease API unavailable", 1);
         return;
@@ -3227,8 +3360,9 @@ fn discoveryListHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    var response: [128 * 1024]u8 = undefined;
-    const body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/discovery/observations", null, &response) catch null) orelse {
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/discovery/observations", null, response) catch null) orelse {
         try writeCommandError(ctx, "discovery.unavailable", "local daemon discovery API unavailable", 1);
         return;
     };
@@ -3260,8 +3394,9 @@ fn discoveryShowHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    var response: [16 * 1024]u8 = undefined;
-    const body = (nodeforge.management_client.discoveryObservationsJson(ctx.io, config.value.server.http_port, mac, &response) catch null) orelse {
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = (nodeforge.management_client.discoveryObservationsJson(ctx.io, config.value.server.http_port, mac, response) catch null) orelse {
         try writeCommandError(ctx, "discovery.not_found", "observation was not found", 1);
         return;
     };
@@ -3282,8 +3417,9 @@ fn discoveryPolicyShowHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    var response: [4096]u8 = undefined;
-    const body = (nodeforge.management_client.discoveryPolicyJson(ctx.io, config.value.server.http_port, &response) catch null) orelse {
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = (nodeforge.management_client.discoveryPolicyJson(ctx.io, config.value.server.http_port, response) catch null) orelse {
         try writeCommandError(ctx, "discovery.policy_unavailable", "discovery policy API unavailable", 1);
         return;
     };
@@ -3363,7 +3499,7 @@ const NodeListItem = struct {
     retry_pending: bool,
     armed_generation: ?u64,
     status: ?[]const u8,
-    start_at: ?i64,
+    armed_at: ?i64,
     install_at: ?i64,
     finished_at: ?i64,
     deployed_at: ?i64,
@@ -3383,8 +3519,9 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     // 两种输出模式各自处理分页。JSON 是一个完整集合
     // 信封；human 渲染保持其文档约定的 256 行显示上限。
-    var response: [128 * 1024]u8 = undefined;
-    const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", null, &response) catch {
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", null, response) catch {
         try cli_output.writeError(errorWriter(ctx), output, "node.unavailable", "local daemon management API unavailable");
         setExitCode(ctx, 1);
         return;
@@ -3403,7 +3540,8 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     var truncated = false;
     var view_revision: ?NodeListViewRevision = null;
     while (true) {
-        const parsed = std.json.parseFromSlice(NodeListPage, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        const parsed = std.json.parseFromSlice(NodeListPage, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+            nodeforge.management_client.reportJsonFailure("NodeListPage", err, page_body);
             try cli_output.writeError(errorWriter(ctx), output, "node.invalid_response", "malformed daemon response");
             setExitCode(ctx, 1);
             return;
@@ -3433,7 +3571,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
                 return;
             }
         } else break;
-        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", cursor, &response) catch null) orelse {
+        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/nodes", cursor, response) catch null) orelse {
             try cli_output.writeError(errorWriter(ctx), output, "node.pagination_failed", "daemon became unavailable while following pagination");
             setExitCode(ctx, 1);
             return;
@@ -3454,7 +3592,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
             if (item.deploy) "true" else "false",
             item.install_intent,
             item.status orelse "-",
-            try a.dupe(u8, views.formatTimestamp(&start_buf, item.start_at orelse 0)),
+            try a.dupe(u8, views.formatTimestamp(&start_buf, item.armed_at orelse 0)),
             try a.dupe(u8, views.formatTimestamp(&install_buf, item.install_at orelse 0)),
             try a.dupe(u8, views.formatTimestamp(&finished_buf, item.finished_at orelse 0)),
             item.serial_number orelse "-",
@@ -3464,7 +3602,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     }
     const Result = struct { view_revision: NodeListViewRevision, items: []const NodeListItem, next_cursor: ?[]const u8 = null };
     const json = try std.json.Stringify.valueAlloc(a, .{ .ok = true, .result = Result{ .view_revision = view_revision.?, .items = items.items } }, .{});
-    const columns = [_]nodeforge.cli_table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "start_at", .title = "START" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
+    const columns = [_]nodeforge.cli_table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "armed_at", .title = "ARMED" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
     try renderOutputDocument(ctx, .{ .human = .{ .table = .{ .columns = &columns, .rows = rows, .empty_message = "No nodes registered." } }, .json = json, .jsonl = jsonl });
     if (truncated) try errorWriter(ctx).writeAll("note: node list truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
@@ -3480,8 +3618,9 @@ fn profileListHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    var response: [128 * 1024]u8 = undefined;
-    const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", null, &response) catch {
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const first = nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", null, response) catch {
         try cli_output.writeError(errorWriter(ctx), output, "profile.unavailable", "local daemon management API unavailable");
         setExitCode(ctx, 1);
         return;
@@ -3500,7 +3639,8 @@ fn profileListHandler(ctx: zli.CommandContext) !void {
     var truncated = false;
     var view_revision: ?u64 = null;
     while (true) {
-        const parsed = std.json.parseFromSlice(ProfileListPage, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        const parsed = std.json.parseFromSlice(ProfileListPage, a, page_body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+            nodeforge.management_client.reportJsonFailure("ProfileListPage", err, page_body);
             try cli_output.writeError(errorWriter(ctx), output, "profile.invalid_response", "malformed daemon response");
             setExitCode(ctx, 1);
             return;
@@ -3530,7 +3670,7 @@ fn profileListHandler(ctx: zli.CommandContext) !void {
                 return;
             }
         } else break;
-        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", cursor, &response) catch null) orelse {
+        page_body = (nodeforge.management_client.collectionPageJson(ctx.io, config.value.server.http_port, "/api/v1/management/profiles", cursor, response) catch null) orelse {
             try cli_output.writeError(errorWriter(ctx), output, "profile.pagination_failed", "daemon became unavailable while following pagination");
             setExitCode(ctx, 1);
             return;
@@ -3572,8 +3712,9 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const name = ctx.getArg("name") orelse return;
-    var response: [128 * 1024]u8 = undefined;
-    const body = try nodeforge.management_client.profilesJson(ctx.io, config.value.server.http_port, name, &response);
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = try nodeforge.management_client.profilesJson(ctx.io, config.value.server.http_port, name, response);
     if (body == null) {
         try writeCommandError(ctx, "profile.unavailable", "local daemon management API unavailable", 1);
         return;
@@ -3796,8 +3937,9 @@ fn bootBundleQueryHandler(ctx: zli.CommandContext, name: ?[]const u8) !void {
         return;
     };
     defer config.deinit();
-    var response: [256 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.bootBundlesJson(ctx.io, config.value.server.http_port, &response) catch null orelse {
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.bootBundlesJson(ctx.io, config.value.server.http_port, response) catch null orelse {
         try writeCommandError(ctx, "boot_bundle.query_failed", "boot bundle query failed", 1);
         return;
     };
@@ -3845,8 +3987,9 @@ fn profileRootfsPlanHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const name = ctx.getArg("name") orelse return;
-    var response: [64 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.rootfsPlanJson(ctx.io, config.value.server.http_port, name, &response) catch null;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.rootfsPlanJson(ctx.io, config.value.server.http_port, name, response) catch null;
     if (body == null) {
         try writeCommandError(ctx, "rootfs.unavailable", "local daemon management API unavailable", 1);
         return;
@@ -3887,8 +4030,9 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
         try reportMutationFailure(ctx, result, "rootfs build failed: daemon unreachable");
         return;
     }
-    var response: [64 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, &response) catch null;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, response) catch null;
     if (body == null) {
         const human = try std.fmt.allocPrint(ctx.allocator, "rootfs built for profile {s}", .{name});
         try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = "{}" });
@@ -3926,18 +4070,28 @@ fn profileRootfsRegisterHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const name = ctx.getArg("name") orelse return;
     const file_path = ctx.flag("path", []const u8);
+    const uncompressed_size_raw = ctx.flag("uncompressed-size", i64);
     if (file_path.len == 0) {
         try writeCommandError(ctx, "rootfs.invalid", "profile rootfs register: --path is required", 2);
         return;
     }
+    if (uncompressed_size_raw < 0) {
+        try writeCommandError(ctx, "rootfs.invalid", "profile rootfs register: --uncompressed-size cannot be negative", 2);
+        return;
+    }
+    // 0 是 CLI 的“未提供”哨兵，不代表空 rootfs。未知大小只降低内存
+    // readiness 的证明强度，不能阻止制品登记或后续部署。
+    if (uncompressed_size_raw == 0)
+        try errorWriter(ctx).writeAll("WARNING: rootfs uncompressed size is unknown; registration will continue and hard memory-capacity checks will be skipped.\n");
     var reason: [256]u8 = undefined;
-    const result = nodeforge.management_client.rootfsRegister(ctx.io, config.value.server.http_port, name, file_path, &reason);
+    const result = nodeforge.management_client.rootfsRegister(ctx.io, config.value.server.http_port, name, file_path, @intCast(uncompressed_size_raw), &reason);
     if (!result.healthy) {
         try reportMutationFailure(ctx, result, "rootfs register failed: daemon unreachable");
         return;
     }
-    var response: [64 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, &response) catch null;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, response) catch null;
     if (body == null) {
         const human = try std.fmt.allocPrint(ctx.allocator, "rootfs registered for profile {s}", .{name});
         try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = "{}" });
@@ -3973,8 +4127,9 @@ fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const name = ctx.getArg("name") orelse return;
-    var response: [64 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, &response) catch null;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, response) catch null;
     if (body == null) {
         try writeCommandError(ctx, "rootfs.unavailable", "local daemon management API unavailable", 1);
         return;
@@ -3987,6 +4142,10 @@ fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed.deinit();
     const r = parsed.value.result;
+    const uncompressed_text = if (r.uncompressed_bytes) |size|
+        try std.fmt.allocPrint(ctx.allocator, "{d}", .{size})
+    else
+        "unknown";
     const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" } };
     const fields = [_]nodeforge.cli_document.Field{
         .{ .key = "profile", .value = r.profile, .section = "artifact" },
@@ -3994,7 +4153,7 @@ fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
         .{ .key = "state", .value = r.state, .section = "artifact" },
         .{ .key = "content_sha512", .value = r.content_sha512 orelse "-", .section = "artifact" },
         .{ .key = "compressed_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.compressed_bytes orelse 0}), .section = "artifact" },
-        .{ .key = "uncompressed_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.uncompressed_bytes orelse 0}), .section = "artifact" },
+        .{ .key = "uncompressed_bytes", .value = uncompressed_text, .section = "artifact" },
         .{ .key = "kernel_release", .value = r.kernel_release orelse "-", .section = "runtime" },
         .{ .key = "file", .value = r.file orelse "-", .section = "runtime" },
     };
@@ -4164,7 +4323,18 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     else blk: {
         const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
         defer ctx.allocator.free(install_root);
-        break :blk try nodeforge.kickstart.renderEffective(ctx.allocator, node, effective_plan.install, effective_plan.system, effective_plan.network, effective_plan.software, bootstrap_key, install_root, bundle, "<facts-url>", event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope, effective_plan.kernel_args);
+        var repository_urls: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (repository_urls.items) |url| ctx.allocator.free(url);
+            repository_urls.deinit(ctx.allocator);
+        }
+        for (effective_plan.software.repositories) |repository_name| {
+            const repository = nodeforge.catalog.findRepository(catalog.value(), repository_name) orelse return error.MissingRepository;
+            const marker = "/artifacts/repositories/";
+            const marker_index = std.mem.indexOf(u8, repository.base_url, marker) orelse return error.ExternalEndpointForbidden;
+            try repository_urls.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}{s}", .{ config.value.server.server_ip, config.value.server.http_port, repository.base_url[marker_index..] }));
+        }
+        break :blk try nodeforge.kickstart.renderEffective(ctx.allocator, node, effective_plan.install, effective_plan.system, effective_plan.network, effective_plan.software, bootstrap_key, install_root, repository_urls.items, bundle, "<facts-url>", event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope, effective_plan.kernel_args);
     };
     defer ctx.allocator.free(answer);
     try ctx.writer.writeAll(answer);
@@ -4178,9 +4348,10 @@ fn nodeBootPrepareHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
-    var response: [64 * 1024]u8 = undefined;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
     var reason: [256]u8 = [_]u8{0} ** 256;
-    const body = nodeforge.management_client.bootPrepareJson(ctx.io, config.value.server.http_port, node_id, &response, &reason) catch null;
+    const body = nodeforge.management_client.bootPrepareJson(ctx.io, config.value.server.http_port, node_id, response, &reason) catch null;
     if (body == null) {
         const reason_slice = std.mem.sliceTo(&reason, 0);
         const msg = if (reason_slice.len > 0) reason_slice else "local daemon management API unavailable";
@@ -4212,9 +4383,10 @@ fn nodeReadinessHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
-    var response: [64 * 1024]u8 = undefined;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
     var reason: [256]u8 = [_]u8{0} ** 256;
-    const body = nodeforge.management_client.nodeReadinessJson(ctx.io, config.value.server.http_port, node_id, stage, &response, &reason) catch null;
+    const body = nodeforge.management_client.nodeReadinessJson(ctx.io, config.value.server.http_port, node_id, stage, response, &reason) catch null;
     if (body == null) {
         const reason_slice = std.mem.sliceTo(&reason, 0);
         try writeCommandError(ctx, "readiness.not_ready", if (reason_slice.len > 0) reason_slice else "readiness check failed", 4);
@@ -4267,8 +4439,9 @@ fn disklessSessionListHandler(ctx: zli.CommandContext) !void {
         return;
     };
     defer config.deinit();
-    var response: [64 * 1024]u8 = undefined;
-    const body = nodeforge.management_client.disklessSessionsJson(ctx.io, config.value.server.http_port, null, &response) catch null orelse {
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.disklessSessionsJson(ctx.io, config.value.server.http_port, null, response) catch null orelse {
         try writeCommandError(ctx, "diskless.session_unavailable", "cannot list delivery sessions", 1);
         return;
     };
@@ -4310,12 +4483,13 @@ fn disklessSessionOne(ctx: zli.CommandContext, cancel: bool) !void {
         return;
     };
     defer config.deinit();
-    var response: [64 * 1024]u8 = undefined;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
     var reason: [256]u8 = [_]u8{0} ** 256;
     const body = if (cancel)
-        nodeforge.management_client.cancelDisklessSession(ctx.io, config.value.server.http_port, session_id, &response, &reason) catch null
+        nodeforge.management_client.cancelDisklessSession(ctx.io, config.value.server.http_port, session_id, response, &reason) catch null
     else
-        nodeforge.management_client.disklessSessionsJson(ctx.io, config.value.server.http_port, session_id, &response) catch null;
+        nodeforge.management_client.disklessSessionsJson(ctx.io, config.value.server.http_port, session_id, response) catch null;
     if (body == null) {
         const detail = std.mem.sliceTo(&reason, 0);
         try writeCommandError(ctx, "diskless.session_unavailable", if (detail.len > 0) detail else "delivery session not found or daemon unavailable", 1);
@@ -4583,8 +4757,9 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
 
-    var response: [128 * 1024]u8 = undefined;
-    const body = try nodeforge.management_client.nodesJson(ctx.io, config.value.server.http_port, node_id, &response);
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = try nodeforge.management_client.nodesJson(ctx.io, config.value.server.http_port, node_id, response);
     if (body == null) {
         const message = try std.fmt.allocPrint(ctx.allocator, "node not found or daemon unavailable: {s}", .{node_id});
         try writeCommandError(ctx, "node.unavailable", message, 1);
@@ -4966,7 +5141,7 @@ fn eventsTypesHandler(ctx: zli.CommandContext) !void {
 
 fn addEventsFilterFlags(command: *zli.Command, comptime include_limit: bool) !void {
     try command.addFlags(&.{
-        .{ .name = "type", .description = "Registered event type", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "type", .description = "Registered event type; list allowed values with `nodeforge events types`", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "node", .description = "Filter by node_id", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "session", .description = "Filter by boot_session_id", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "since", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
@@ -5175,13 +5350,14 @@ fn statusProbe(
     const active_config = nodeforge.management_client.validateActiveConfig(io, parsed_config.value.server.http_port);
     const tftp = nodeforge.management_client.tftpCounters(io, port);
 
-    var nodes_buffer: [128 * 1024]u8 = undefined;
-    const nodes_api = (nodeforge.management_client.nodesJson(io, port, null, &nodes_buffer) catch null) != null;
-    var profiles_buffer: [128 * 1024]u8 = undefined;
-    const profiles_api = (nodeforge.management_client.profilesJson(io, port, null, &profiles_buffer) catch null) != null;
+    // doctor 只关心端点是否可用，不需要同时保留三个响应体。复用同一块统一容量
+    // 的堆缓冲，避免旧实现一次在栈上保留 3 × 128 KiB。
+    const response_buffer = allocator.alloc(u8, managementResponseCapacity) catch return null;
+    defer allocator.free(response_buffer);
+    const nodes_api = (nodeforge.management_client.nodesJson(io, port, null, response_buffer) catch null) != null;
+    const profiles_api = (nodeforge.management_client.profilesJson(io, port, null, response_buffer) catch null) != null;
     const catalog_api = nodes_api and profiles_api;
-    var dhcp_buffer: [128 * 1024]u8 = undefined;
-    const dhcp_api = (nodeforge.management_client.dhcpLeasesJson(io, port, false, &dhcp_buffer) catch null) != null;
+    const dhcp_api = (nodeforge.management_client.dhcpLeasesJson(io, port, false, response_buffer) catch null) != null;
 
     const ok = status.healthy and loopback_health.healthy and advertised_health.healthy and active_config.healthy and catalog_api and dhcp_api and tftp.healthy;
     return .{
@@ -5247,6 +5423,10 @@ fn loadConfig(
     out: *std.Io.Writer,
     debug: bool,
 ) ?std.json.Parsed(nodeforge.model.AppConfig) {
+    // CLI 每次只执行一个命令；在公共配置入口同步当前线程的 HTTP 诊断目标，
+    // 使所有 management client 调用共享一致的 `--debug` 行为，无需把布尔参数
+    // 逐层穿透六十余个资源包装函数。false 必须显式清空，避免同进程测试串线。
+    nodeforge.management_client.configureDiagnostics(if (debug) out else null);
     var parsed = nodeforge.config.load(io, allocator, path) catch |err| {
         printLoadError(out, "config", path, err, debug) catch {};
         return null;

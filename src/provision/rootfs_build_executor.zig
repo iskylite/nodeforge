@@ -114,8 +114,8 @@ pub fn buildPlan(
             const fb = try toFirstBootStep(step, payload_paths[i]);
             var body: std.Io.Writer.Allocating = .init(allocator);
             errdefer body.deinit();
-            // package 以 --installroot 在 host 上下文安装（与 OS 层一致，本地 file:// 源，
-            // 不回连 daemon、不需 chroot/bind-mount）；其余动作 chroot 写 staging lower。
+            // package 以 --installroot 在 host 上下文安装，并消费 nodeforged 受管
+            // HTTP 源；其余动作 chroot 写 staging lower。
             const installroot: ?[]const u8 = if (step.action == .package) staging else null;
             try first_boot.renderStep(&body.writer, fb, package_manager, repository_urls, true, installroot);
             const script_path = try std.fmt.allocPrint(allocator, "{s}{d}.sh", .{ script_prefix, index });

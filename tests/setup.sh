@@ -24,6 +24,7 @@ cp "$cli" "$bundle/nodeforge-initrd"
 cp "$cli" "$bundle/nodeforge-agent"
 
 "$bundle/nodeforge" setup --install-root "$install" --non-interactive --yes >"$tmp/init.out"
+test "$(jq -r '.logging.level' "$install/config/config.json")" = "debug"
 grep -Fq 'NodeForge initialized' "$tmp/init.out"
 test -f "$install/.nodeforge-root"
 test -x "$install/bin/nodeforge"
@@ -55,6 +56,8 @@ grep -Fq 'deployment reconfigured' "$tmp/reconfigure"
 printf '%s\n' stale-unit >"$install/systemd/nodeforged.service"
 "$install/bin/nodeforge" setup --reconfigure --non-interactive --yes >"$tmp/reconfigure-unit"
 grep -Fq "ExecStart=$install_real/bin/nodeforged --log-output file" "$install/systemd/nodeforged.service"
+"$install/bin/nodeforge" setup --reconfigure --log-level warn --non-interactive --yes >"$tmp/reconfigure-log-level"
+test "$(jq -r '.logging.level' "$install/config/config.json")" = "warn"
 if "$install/bin/nodeforge" setup --reconfigure --install --non-interactive --yes >"$tmp/reconfigure-install" 2>&1; then
     echo "reconfigure unexpectedly accepted standalone systemd --install" >&2
     exit 1

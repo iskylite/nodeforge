@@ -4570,8 +4570,8 @@ session 创建序号和 facts digest；更高 generation 胜出，同 generation
 内保持“仅首次写入”幂等，`rollbackRearm` 原样恢复这些时间戳。
 管理 API 提供所有节点列表和单节点聚合投影。config/catalog 来自同一个 ModelSnapshotPair；status/deployment/inventory
 在各自锁内复制并携带独立 revision，响应返回完整 `view_revision` vector，不把多 store 顺序读取伪装成单一事务。
-`node list` 至少显示 ID/MAC/IP/profile/status/Start/Install/Finished/SN：API 字段依次为
-`start_at=requested_at`、`install_at=started_at`、`finished_at`。后续 diskless 继承 Start/Finished 任务边界，
+`node list` 至少显示 ID/MAC/IP/profile/status/Armed/Install/Finished/SN：API 字段依次为
+`armed_at=requested_at`、`install_at=started_at`、`finished_at`。后续 diskless 继承 Armed/Finished 任务边界，
 另行定义与 Install 并列的实际启动阶段。成功的 deployed_at 与 finished_at 重合，作为详情留给 `node show`；
 `node show` 显示完整 NodeConfig、profile/effective system、status、generation/revision/drift 和 inventory，secret 默认脱敏。
 所有 CLI human 输出时间统一渲染为 RFC 3339 UTC 可视化时间，不再直接打印裸 epoch 整数，未发生显示 `-`。
@@ -4756,7 +4756,7 @@ ISO/asset import 与 catalog migration 是长任务，返回 202 Operation + Loc
 最终幂等仍由 M4.3 SHA/logical-id 状态机决定。M4.4 复用 M4.3 持久 operations/key registry；restart 后 running
 import 形成稳定 interrupted failure，journal migration 按恢复结果重建 terminal operation，不能退回 memory-only registry。
 
-专项设计 §5.3 的 DTO 表是 implementation contract：NodeSummary 固定身份/profile/status/start_at/install_at/finished_at/deployed_at/SN/drift，
+专项设计 §5.3 的 DTO 表是 implementation contract：NodeSummary 固定身份/profile/status/armed_at/install_at/finished_at/deployed_at/SN/drift，
 NodeDetail 固定 node/profile/effective_system/deployment/runtime/inventory/view_revision 七类事实，ProfileDetail 固定
 capability/source/repositories/assets/effective-system/safety/references/validation，InstallSourceDetail 固定真实
 family/distro/version/arch/media/repositories/assets/SHA/profile refs。Generation、Validation、MigrationPlan、Operation

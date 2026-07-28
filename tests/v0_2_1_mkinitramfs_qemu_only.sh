@@ -33,7 +33,10 @@ pgrep -f "nodeforged --install-root $install_root" >/dev/null || { echo "daemon 
 echo "daemon started"
 
 # Register rootfs
-zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" --path "$work/rootfs.squashfs" --config "$config" --output json >/dev/null 2>&1 || true
+rootfs_uncompressed_size=$(unsquashfs -lln "$work/rootfs.squashfs" | awk '$1 ~ /^-/ { total += $3 } END { print total + 0 }')
+zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" \
+    --path "$work/rootfs.squashfs" --uncompressed-size "$rootfs_uncompressed_size" \
+    --config "$config" --output json >/dev/null 2>&1 || true
 
 # Prepare boot
 prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")

@@ -11,6 +11,15 @@
 ## 0. 共用约定
 
 - `show key == --help-full key == parser key == API operation path`。
+- 所有 closed-choice/enum 参数必须在该 flag 的普通 description 中完整列出合法 token，因而 `--help`
+  和 `--help-full` 都能直接发现取值；不得只写 “kind/type/state” 或依赖错误响应说明。省略参数若表示
+  “全部”，必须明确写成 “omit to list all”，不能暗示存在未被 parser 接受的 `all` token。合法值按
+  后端或资源而变化时，帮助同时列出全集及适用关系；动态集合则必须给出查询合法值的 CLI（例如
+  `nodeforge events types`）。新增/扩展 Zig enum 时必须有 contract test 证明帮助覆盖每个枚举标签。
+- 该可发现性契约不限于 Zig `enum`：布尔 token、格式名、阶段/模式字符串、整数范围、哨兵值、成组或
+  互斥关系也必须在参数 description 或 `--help-full` 的 `VALUES/CONSTRAINT` 中说明。PropertySpec 和
+  ItemSpec 对 enumeration/arch 字段必须登记 `value_constraint`；布尔统一展示 `true|false`，正整数
+  统一展示 `>0`，更窄范围由字段覆盖。parser 已接受而 registry/help 未登记的值属于 contract bug。
 - 结构化输入使用 `FIELD=VALUE` 或 `--from-file`，不要求 shell 内嵌 JSON。
 - 全局 flag：`-c/--config <path>`、`-o/--output human|json|jsonl`、`--debug`；catalog 路径从 config
   解析，不另建会绕过 daemon owner 的写入口。
@@ -104,8 +113,9 @@ nodeforge assets boot-bundle create <name> \
 nodeforge profile create [<name>] <install-source> --kind diskless --boot-bundle <bundle>
 
 # 5. 构建 Profile 派生 rootfs；外部构建时改用 register
-nodeforge profile rootfs build <diskless-profile> [--wait]
-nodeforge profile rootfs register <diskless-profile> --path <squashfs-path>
+nodeforge profile rootfs build <diskless-profile> [--if-input-digest <digest>]
+nodeforge profile rootfs register <diskless-profile> \
+  --path <squashfs-path> [--uncompressed-size <bytes>]
 
 # 6. 添加节点（保持 deploy=false）
 nodeforge node add <id> mac=<mac> arch=<a> profile=<diskless-profile>
@@ -115,6 +125,11 @@ nodeforge node deploy <id> false
 nodeforge node readiness <id> --stage boot
 nodeforge node deploy <id> true
 ```
+
+外部制品首次省略 `--uncompressed-size` 时仍会登记成功，但容量状态为 unknown。
+之后可对同一文件再次执行 register 并提供可信正数；服务端返回
+`state=metadata_updated` 并持久化补全。已知值冲突或其他不可变元数据漂移会返回
+冲突，并保证不覆盖正式 rootfs 文件。
 
 默认安装根初始化和 `setup --reconfigure` 必须原子生成 `/etc/profile.d/nodeforge.sh`（`0644`），
 幂等地将 `/opt/nodeforge/bin` 加入登录 shell 的 `PATH`。新登录会话可直接执行 `nodeforge`；当前会话可
@@ -132,11 +147,11 @@ nodeforge node deploy <id> true
 nodeforge assets import <iso> [--name <source>] [--distro <id>] [--version <version>] [--arch <arch>]
 nodeforge assets install-source list
 nodeforge assets install-source show <source>
-nodeforge assets install-source software list <source> [--kind package|group|environment|task]
+nodeforge assets install-source software list <source> [--kind package|group|environment|task|metapackage]
 nodeforge assets repository list
 nodeforge assets repository show <repository>
 nodeforge assets repository render <repository>
-nodeforge assets repository software list <repository> [--kind package|group|environment|task]
+nodeforge assets repository software list <repository> [--kind package|group|environment|task|metapackage]
 
 ```
 
@@ -150,6 +165,24 @@ ISO、boot 和 repository 路径；导入不覆盖既有同名内容。
 `repository render` 生成客户端配置：DNF 输出 `.repo`，APT 从已发布的 `dists/*/Release` 读取
 Codename/Suite 和 Components 输出 `sources.list`。该命令只消费 catalog 与介质 metadata，不猜测发行版代号。
 重复 import 相同内容返回 existing resource；同名不同 digest 返回 conflict，不静默覆盖。
+
+Install 与 diskless 的 effective software 都默认继承当前 InstallSource 的全部 repository。Profile
+`software.repositories` 在默认集合上追加并去重，Node
+`overrides.software.repositories.remove` 可显式移除。Install 不再只把受管源当作一次性安装介质：
+
+- Rocky/RHEL Kickstart 在目标系统删除 vendor 公网 `.repo`，并生成
+  `/etc/yum.repos.d/nodeforge.repo`；URL 按当前 nodeforged IP/port 重新绑定。
+- Ubuntu Autoinstall 通过 `apt.mirror-selection.primary` 将 NodeForge 本地 APT 源交给
+  Subiquity/curtin 持久化。
+- `profile/node software show` 展示 stored override 与 effective closure。API 中软件包 delta
+  使用 `packages.include/exclude.{add,remove}` 嵌套结构；字段或 effective software 为空时 CLI
+  显示空值，不得 panic。
+
+RHEL comps 选择区分 environment、group 与 package。未设置
+`software.environment` 时 Kickstart 使用 `@^minimal-environment`。`@^environment` 或 `@group`
+安装 comps 定义的 mandatory/default 内容，不代表安装 optional 包，也不代表安装仓库全部包。
+当前 CLI 没有“包含某 group 全部 optional 包”的开关；需要该语义时必须新增显式 package-type
+策略，不能把全局 `%packages --optional` 隐式套用到 minimal environment。
 
 ## 3. 阶段 2：导入定制资产与 bundle
 
@@ -212,7 +245,9 @@ per-action 必填字段矩阵（`item add` 拒绝不适用的字段）：
 
 ```text
 nodeforge assets initrd build <name> \
-  --from-install-source <source> --kernel-release <r> [options]
+  --from-install-source <source> --kernel-release <r> \
+  [--target-sysroot <path>] [--module-source <asset>] \
+  [--add-drivers <module-or-alias>]... [--install-package <package>]...
 # 无可用 ISO/install source 时使用通用 fallback：
 nodeforge assets initrd build <name> \
   --distro <d> --version <v> --arch <a> --kernel-release <r>
@@ -229,10 +264,56 @@ nodeforge assets boot-bundle show <name>
 
 `assets initrd build` 优先使用 `--from-install-source`：保留 ISO vendor initrd（含发行版补丁、固件和内核模块）
 并追加 NodeForge overlay。无 `--from-install-source` 时使用 `--distro/--version/--arch` 选择通用 dracut fallback。
-原子发布到受管 initrd store 并注册结果。
+原子发布到受管 initrd store 并注册结果。source 模式的物理路径为
+`assets/boot/diskless/sources/<source>/<kernel-release>/<name>.img`；通用模式为
+`assets/boot/diskless/manual/<distro>/<version>/<arch>/<kernel-release>/<name>.img`，
+因此只看目录即可区分 ISO/source 来源，且同名制品不会跨 source 冲突。
+
+`--kernel-release` 是用户明确指定的目标 ABI，不做阻断式一致性校验。若 source 中
+installer kernel 已检测出 release 且与参数不同，CLI 输出警告并继续；后续
+BootBundle 创建也只记录警告。initrd asset 自身声明的 release 仍必须与
+BootBundle 一致，否则 kernel/modules ABI 无法成立。
 
 BootBundle 只固定 source + prepared kernel + NodeForge initrd revisions，不含 rootfs。active session
 的旧 snapshot 不得被原位破坏。
+
+### 4.1 initrd 扩展输入模型
+
+`--add-drivers` 与 `--install-package` 是目标 initrd 的声明式输入，不是宿主
+`dracut` 参数透传。只要出现任一扩展参数，builder 必须能确定目标四元组
+`(distro, version, arch, kernel_release)`，并从 `--from-install-source`、
+`--target-sysroot` 或 `--module-source` 得到目标文件来源。
+
+- `--target-sysroot` 是已物化的目标发行版文件树；动态加载器、package database
+  和 `/lib/modules/<kernel_release>` 都必须来自这里，禁止回退宿主 `/`。
+- `--module-source` 是已导入的 module bundle；manifest 声明四元组、模块、
+  firmware、签名状态和 digest，适用于预编译厂商/OOT 驱动。
+- `--add-drivers` 按模块名或 modalias 从目标 module tree 求依赖闭包；所有 `.ko`
+  的 vermagic 必须匹配 `kernel_release`。
+- `--install-package` 从匹配 install source 的 RPM/DEB 仓库离线解析并提取到
+  extension staging。纯 userspace、firmware、匹配内核的 kmod 可用；覆盖 `/init`、
+  动态加载器、libc、shell 或 vendor 自有文件默认拒绝。
+
+| 场景 | 基底 | 扩展执行器 | 禁止事项 |
+|---|---|---|---|
+| Rocky/RHEL vendor | ISO vendor initrd | 在匹配目标 sysroot 中运行的 dracut/module 工具，或受控 closure copier | 读取宿主 `/` 的 `dracut-install`、宿主模块 |
+| Ubuntu casper | ISO `/casper/initrd` | DEB/module bundle 提取 + depmod + NodeForge 追加层 | 在 Rocky 宿主用 dracut 生成 Ubuntu initrd |
+| 通用 fallback | 明确 target sysroot | target dracut | 未给 sysroot 时安装包/驱动 |
+| 异架构目标 | install source/module bundle | 纯提取工具；必要时显式构建执行环境 | 隐式 qemu/chroot 执行目标 ELF |
+
+这里的“禁止宿主 dracut”特指禁止 dracut 从构建机 `/` 解析 userspace/module
+闭包；并不禁止在明确的匹配目标 sysroot/构建环境里运行 dracut。
+
+manifest 记录 source revision/digest、四元组、请求参数、解析后的文件/模块闭包、
+vermagic/签名检查、碰撞清单和最终 digest。`plan` 先完成解析与冲突检查，`build`
+只消费不可变计划。CLI 实现前，parser 不得提前接受这些 flag，以免形成把宿主内容
+静默注入目标 initrd 的半契约。
+
+外部 rootfs 注册可提供 `--uncompressed-size <bytes>`。该值是解压后文件树的
+apparent size，不是 squashfs 文件大小；有值时进入 BootConfig 并参与 diskless
+内存预算。缺失时登记为 unknown、输出 warning 并跳过内存容量硬校验，不阻止
+注册或部署。只有明确大小与可用内存证明预算不足时才拒绝启动。由 NodeForge
+构建的 rootfs 会在压缩前自动测量；测量失败同样降级为 unknown，而不是终止构建。
 
 ## 5. 阶段 4：创建 diskless Profile
 
@@ -243,6 +324,11 @@ nodeforge profile set <profile> FIELD=VALUE...
 nodeforge profile unset <profile> KEY...
 nodeforge profile add-values <profile> software.packages.include <package>...
 nodeforge profile remove-values <profile> software.packages.include <package>
+nodeforge profile set <profile> software.environment=minimal-environment
+nodeforge profile add-values <profile> software.groups development network-tools
+nodeforge profile software available <profile> --kind environment
+nodeforge profile software available <profile> --kind group
+nodeforge profile software show <profile>
 nodeforge profile item add <profile> system.hosts id=controller address=192.168.50.2 names=controller,controller.local
 nodeforge profile show <profile>
 nodeforge profile remove <profile>
@@ -376,6 +462,8 @@ JSON 输出关键字段（用于后续命令的 CAS）：
 - 不带 guard 时由服务端原子确定 input digest；带 `--if-input-digest` 时若已漂移，返回
   `operation.input_digest_conflict`（exit 3）。相同 digest building 时 join operation，ready 时返回 cache hit。
 - operation 输出 `queued|building|validating|ready|failed`、step、percent/bytes、started/updated、稳定 reason。
+- build/register 的中间路径包含请求标识；已有制品校验、正式文件改名和 Store
+  持久化在同一临界区提交。冲突请求不会覆盖已发布文件，持久化失败不会留下内存幽灵记录。
 
 ## 8. 阶段 7：boot readiness 与启用
 
@@ -412,6 +500,10 @@ quarantine 状态。JSON 输出 `current` tagged union + `history` 最近 sessio
 `runtime dhcp-leases` human 输出列：`NODE MAC IP LEASE_EXPIRES SESSION`；`tftp-sessions` 列：
 `NODE MAC FILENAME BYTES TRANSFERRED STATUS SESSION`。`events list --limit` 默认 100，`--until` 与 `--since`
 均为包含边界，构成闭区间，与 v0.1 本地 event reader 契约一致。`events types` 列出全部已注册事件类型（继承 v0.1）。
+`node list` human 输出列：`ID MAC IP PROFILE DEPLOY INSTALL_INTENT STATUS ARMED INSTALL FINISHED SN`。
+`ARMED` 取 deployment_control 的 `requested_at`（generation 武装时刻），`INSTALL` 取内部 `started_at`/`install.started`，
+`FINISHED` 取首次 terminal/`finished_at`。management API JSON 返回 `armed_at`/`install_at`/`finished_at`，
+并在详情中保留最近成功的 `deployed_at`。
 
 `STATE` 是唯一 current lifecycle state。JSON `current` 是 tagged union：
 

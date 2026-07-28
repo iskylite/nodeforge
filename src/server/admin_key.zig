@@ -251,7 +251,11 @@ pub fn valid(key: []const u8) bool {
     const blob_end = std.mem.indexOfScalar(u8, tail, ' ') orelse tail.len;
     const blob = tail[0..blob_end];
     if (blob.len == 0) return false;
-    const size = std.base64.standard_no_pad.Decoder.calcSizeForSlice(blob) catch return false;
+    // OpenSSH 公钥的 base64 blob 可能包含尾部 padding（=），
+    // standard_no_pad 解码器不接受 padding 字符，需要先去除。
+    var blob_end_idx = blob.len;
+    while (blob_end_idx > 0 and blob[blob_end_idx - 1] == '=') blob_end_idx -= 1;
+    const size = std.base64.standard_no_pad.Decoder.calcSizeForSlice(blob[0..blob_end_idx]) catch return false;
     return size >= 16;
 }
 
@@ -259,10 +263,14 @@ pub fn valid(key: []const u8) bool {
 /// 返回内存归调用者所有，格式固定为 `SHA256:<base64-no-padding>`。
 pub fn fingerprint(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
     const parts = keyParts(key) orelse return error.InvalidPublicKey;
-    const decoded_len = std.base64.standard_no_pad.Decoder.calcSizeForSlice(parts.blob) catch return error.InvalidPublicKey;
+    // 去除 base64 blob 的尾部 padding（=），与 valid 函数保持一致。
+    var blob_end_idx = parts.blob.len;
+    while (blob_end_idx > 0 and parts.blob[blob_end_idx - 1] == '=') blob_end_idx -= 1;
+    const blob_trimmed = parts.blob[0..blob_end_idx];
+    const decoded_len = std.base64.standard_no_pad.Decoder.calcSizeForSlice(blob_trimmed) catch return error.InvalidPublicKey;
     const decoded = try allocator.alloc(u8, decoded_len);
     defer allocator.free(decoded);
-    std.base64.standard_no_pad.Decoder.decode(decoded, parts.blob) catch return error.InvalidPublicKey;
+    std.base64.standard_no_pad.Decoder.decode(decoded, blob_trimmed) catch return error.InvalidPublicKey;
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(decoded, &digest, .{});

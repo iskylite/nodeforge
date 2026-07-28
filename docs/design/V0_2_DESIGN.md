@@ -72,6 +72,51 @@ rename 到专用 initrd store 并注册 catalog；异步 durable operation 属 v
 kernel 字段。命名去掉了 `-installer-` 前缀，明确表示 kernel 通用复用，不需要为 diskless
 单独注册 kernel 资产。
 
+#### R6.1 ISO 内核 release 检测与 ABI 语义
+
+`AssetConfig.kernel_release` 保存完整的 Linux UTS release，即目标内核启动后的 `uname -r`。
+它不是 NodeForge 统一格式化的“内核版本号”，也不能通过简单删除或追加架构得到。该字符串同时是
+`/lib/modules/<kernel_release>/`、`depmod`、`modprobe` 和 initramfs 模块 ABI 的关联键。
+
+不同发行版对 UTS release 的命名不同：
+
+| family | ISO 中的典型来源 | 保存的 `kernel_release` |
+|---|---|---|
+| RHEL family | `vmlinuz-5.14.0-611.5.1.el9_7.aarch64` | `5.14.0-611.5.1.el9_7.aarch64` |
+| Ubuntu family | `vmlinuz-5.15.0-119-generic.efi.signed` | `5.15.0-119-generic` |
+
+RHEL 的 `.x86_64`/`.aarch64` 是 UTS release 的组成部分，必须保留。Ubuntu DEB 文件名末尾的
+`_amd64.deb`/`_arm64.deb` 是包架构字段，不属于 UTS release，不能追加到
+`5.15.0-119-generic` 后面。
+
+检测按“实际启动产物优先、仓库包名最后”的顺序执行：
+
+1. 从 ISO 实际启动的 `vmlinuz` 读取 Linux 自描述信息：
+   - RFC 1952 gzip `FNAME`，包括正确跳过可选 `FEXTRA`；
+   - x86/x86_64 Linux boot protocol `kernel_version`；
+   - raw Image 或 EFI stub 中的 `Linux version <uname-r>` banner。
+2. 若内核镜像没有可读 release，则只读列举配套 initrd，读取唯一的
+   `lib/modules/<uname-r>` 目录。当前依次尝试 `lsinitrd` 与 `lsinitramfs`；工具不存在、
+   initrd 不受支持或出现多个 modules ABI 时，本层不作猜测。
+3. 最后才扫描仓库包名：
+   - CentOS/RHEL 7 的 `kernel-<release>.rpm`；
+   - RHEL/Rocky 8+ 的 `kernel-core-<release>.rpm`；
+   - Ubuntu 的版本化 `linux-image-<release>_*.deb`。
+   只有去重后恰好一个 production 候选才采用；debug、RT、meta 包和多候选均不推断。
+4. 所有证据都失败或存在歧义时，`kernel_release = null`，资产文件名退回 `vmlinuz`。
+   错失一个可选 release 优于把仓库中另一个内核写入 catalog。
+
+主路径只依赖 Linux 内核格式和 initramfs modules ABI，不依赖 Rocky、CentOS 或 Ubuntu 的
+具体版本号。包名规则被隔离为最后兼容层，因此新增同 family 发行版通常无需增加产品特例。
+测试必须维持如下不变量：
+
+```text
+vmlinuz 内嵌 release
+  == initrd /lib/modules/<release>
+  == 唯一包候选推导的 release
+  == 目标内核 uname -r
+```
+
 **仍需单独构建的资产**：
 - `nodeforge_initrd`（kind=nodeforge_initrd）：需要 `nodeforge-initrd` 二进制 + dracut 构建（见 R5）
 - `rootfs`（kind=rootfs）：需要 `dnf --installroot` + mksquashfs 构建（`profile rootfs build`）
@@ -221,9 +266,10 @@ an active boot session"。
    并通过 `checkpointSessions` 同步持久化。终态原因：`diskless_running` → `.completed`，
    `failed` → `.failed`。
 
-3. `boot_session_store.load()` 已有 `if (record.mode != .install) continue` 保护，
-   diskless session 不会从 checkpoint 恢复。但保持 checkpoint 一致性仍是必要的，
-   避免当前 daemon 实例中 session 残留。
+3. `boot_session_store.load()` 已有 `if (record.mode != .install) continue` 保护，因此
+   diskless 使用过的临时 DHCP/PXE `boot_session` 不从该 store 恢复；长期 delivery
+   生命周期由独立 `diskless_delivery` checkpoint 恢复。两类 store 仍须在终态同步提交，
+   避免当前 daemon 实例残留临时 PXE session。
 
 **影响范围**：`src/state/boot_session.zig`（新增 `finishNodeDelivery` 方法）、
 `src/http/server.zig`（`disklessEvent` handler 终态同步）。
@@ -315,6 +361,102 @@ mutation handler）、`src/http/client.zig`（5 个 mutation client 函数新增
 
 **验收边界**：静态验收必须证明最终 initrd 以 vendor initrd 为相同字节前缀，overlay 不包含人为
 添加的网卡模块，并包含 udev coldplug、DHCP client 与 hooks。该验收不能替代真实硬件 PXE 启动。
+
+### R15. diskless 运行态投影、目标 repo 与网卡名
+
+1. `node list` 对 install 继续读取 deployment/status；对 diskless 则读取当前
+   `diskless_delivery.Session`。只有 session 的 node/profile 与当前 catalog 同源才允许投影。
+2. diskless 的 `ARMED` 为 session `created_at`，`INSTALL` 为首次
+   `diskless.initrd_started`，`FINISHED` 为首次进入 running/failed/expired；时间随
+   session checkpoint 持久化，禁止扫描审计日志临时反推。终态 session 即使 capability
+   TTL 已过期也保留；同节点下一次 delivery 原位替换旧终态，避免无界增长。
+   checkpoint 自带单调 `revision`，并进入 `node list.view_revision.diskless`，使客户端
+   能识别仅由无盘生命周期引起的视图变化。
+3. rootfs builder 和目标系统都只消费 nodeforged 发布的受管 HTTP repository URL。
+   构建器不得把 daemon 本机路径改写成 `file://`；目标 AgentPlan 即使没有
+   install/remove package delta，也必须持久化同一组 HTTP repo。构建结束时删除 dnf/apt
+   带入的 vendor repo，任何目录遍历或删除失败均使构建失败，禁止留下公网源后继续发布。
+4. MAC 是网卡稳定身份，`network.interface_name` 是可选强制值。未指定时 agent 在切根后、
+   systemd 前扫描 `/sys/class/net/*/address`，按 MAC 得到实际名称并写入
+   NetworkManager 文件名/connection id/`interface-name` 与 Netplan 设备键/`set-name`。
+   按 MAC 找不到设备时 fail closed，不再生成名为 `nodeforge` 的兜底网络配置。
+5. initrd 扩展采用目标 sysroot/module source 模型，具体 CLI 与碰撞/vermagic 规则见
+   `V0_2_CLI.md` §4.1。vendor 追加层不得调用宿主 `dracut-install`。
+
+#### R15.1 目标网络 adapter 的选择
+
+不能把 CentOS 7 的 ifcfg 当作所有 RHEL 系发行版的共同格式，也不能只按
+`ID`/`VERSION_ID` 硬编码。agent 已经在目标 rootfs 内执行，因此按实际能力选择：
+
+1. `/etc/netplan` 存在且目标 `netplan` 可执行：选择 `netplan`；
+2. 目标 `nmcli` 存在：实际执行 `nmcli --offline connection add` 生成临时 keyfile，
+   命令成功且文件有效才选择 `nm-keyfile`，不能用 `--help` 文本猜能力；
+3. `NetworkManager --print-config` 明确声明 `ifcfg-rh` plugin：选择 `ifcfg-rh`；
+4. `NetworkManager --print-config` 明确声明 `keyfile` plugin：选择兼容 keyfile；
+5. 均不满足：fail closed。
+
+三个 adapter 消费同一 typed 输入（实际 interface、MAC、DHCP/static、address/prefix、
+gateway、DNS/search、routes/metric），分别生成：
+
+| adapter | 目标文件 |
+|---|---|
+| `netplan` | `/etc/netplan/60-nodeforge.yaml`，设备键和 `set-name` 均为实际网卡名 |
+| `nm-keyfile` | `/etc/NetworkManager/system-connections/<iface>.nmconnection` |
+| `ifcfg-rh` | `/etc/sysconfig/network-scripts/ifcfg-<iface>` 和可选 `route-<iface>` |
+
+能力判断使用目标系统的 binary/目录，不能调用构建宿主的 `nmcli`。普通在线
+`nmcli connection add` 依赖 NetworkManager/D-Bus，此时 systemd 尚未启动；只有
+`--offline` 能力才可作为 pre-init 的 keyfile 判据。
+
+#### R15.2 initrd 启动网卡选择
+
+控制面分配的 IP 只是租约事实，不保证进入 NodeForge `/init` 时地址已经绑定到网卡。
+因此不能只按接口枚举顺序，也不能只依赖 MAC：
+
+1. 枚举非 loopback 接口，通过 `SIOCGIFADDR` 查询当前 IPv4；与
+   `nodeforge.ip` 相等时直接采用该接口；
+2. 若没有接口持有该 IP，再读取 `/sys/class/net/*/address`，按本次 DHCP/TFTP
+   identity 的 PXE MAC 精确匹配；
+3. 两者都失败则 fail closed，禁止选择“第一个非 lo”或假设 `eth0`；
+4. 选定后以 ioctl 设置 link/address/netmask，并以明确接口写入默认路由。
+
+MAC 不能只放在 BootConfig：拉取 BootConfig 之前必须先有可用网络，会形成循环依赖。
+当前把无密钥的 `nodeforge.mac=<17-byte-mac>` 放入 cmdline，增加约 32 字节，属于
+bootstrap network 的最小事实；未来若 bootloader 已可靠追加 authenticated capsule，
+可迁入 capsule，但仍必须在首次 HTTP 请求前可读。为兼容旧 cmdline，若 IP 已实际绑定，
+即使没有 MAC 也允许继续；只有进入 MAC fallback 时才要求 MAC。
+
+#### R15.3 `single_threaded` 与目标 libc 闭包
+
+`single_threaded = true` 只配置在 `nodeforge-initrd` 与 `nodeforge-agent`，不影响
+daemon/CLI。两者当前都是顺序状态机，不使用线程、线程池或依赖线程同步的库。该设置
+避免 glibc 2.34 之前产生独立 `NEEDED libpthread.so.0`，但不能降低二进制所要求的
+GLIBC symbol version；CentOS 7 兼容仍必须以目标基线 sysroot（例如 glibc 2.17）交叉编译。
+
+若未来取消该设置：
+
+- initrd overlay 必须从目标 ISO/sysroot 递归解析 ELF interpreter 和全部
+  `DT_NEEDED`，包含目标 loader、libc、`libpthread.so.0`（glibc < 2.34）及其依赖；
+- 这些文件必须来自与 vendor initrd 相同的 distro/version/arch ABI closure，禁止从
+  构建宿主或另一 rootfs 复制；
+- 发布前必须校验 interpreter、递归依赖和最高 `GLIBC_*` version，不能只检查文件大小；
+- agent 可在确有并行下载/心跳需求时单独启用线程并使用完整目标 rootfs 闭包，不应因此
+  扩大最早期 `/init` 的依赖面。
+
+当前决策是两者继续保持 `single_threaded = true`。
+
+#### R15.4 repository index 内容寻址完整性
+
+SoftwareIndex JSON 以 SHA-256 digest 命名并跨 profile/node/session 复用。命中已有
+`<digest>.json` 时不能只比较文件大小：同尺寸损坏、非原子外部覆盖或存储故障都会让
+错误内容冒充正确 digest。发布路径必须：
+
+1. 校验目标是普通文件且长度与新 JSON 相同；
+2. 流式重新计算已有文件 SHA-256，并使用 constant-time digest 比较；
+3. 摘要不等立即返回 `RepositoryIndexBlobCorrupt`，不得覆盖后继续；
+4. 新内容仍经同目录原子写发布。
+
+测试必须覆盖“长度相同、内容被单字节修改”的损坏场景。
 
 ## 0. 文档结构与阅读路径
 
@@ -430,6 +572,13 @@ v0.2 不是在 M5-M7 命令旁保留旧 M4 语义的并行产品。以下契约�
   `replace-items --from-file`；ordered override 首次 item mutation 复用 v0.1 的原子物化语义。
 - 所有 leaf command 继续统一支持紧凑 `-h/--help` 和详细 `--help-full`；完整 canonical key、item schema、
   约束和示例从同一 PropertySpec/CollectionSpec/ItemSpec/CommandSpec 生成，不能维护另一套帮助文本。
+- closed-choice/enum flag 的合法 token 必须直接出现在共享 flag description 中，使普通 `--help` 与
+  `--help-full` 同时完整可发现。省略表示不过滤时必须明确说明，不能把 `all` 写成看似可传但 parser
+  不接受的值；动态 token 集合必须指向其查询命令。模型 enum 与帮助文本之间必须有覆盖全部标签的
+  contract test，新增枚举标签而未更新帮助应使测试失败。
+- 同一规则覆盖非 enum 的受约束输入：boolean token、格式、阶段、整数范围/哨兵以及参数组合约束。
+  PropertySpec/ItemSpec 保存 `value_constraint`，详细帮助生成 `VALUES/CONSTRAINT` 列；enumeration
+  与 arch 条目缺少约束时 contract test 必须失败，禁止 parser 与帮助各维护一套隐式取值。
 - 任何 v0.2 CLI 都不得要求 Shell 内嵌 JSON。HTTP transport 和 JSON/YAML 文件输入仍可表达结构化对象，
   但 CLI 必须从 typed flags、`FIELD=VALUE` 或 `--from-file` 构造请求。
 - 普通命令继续走 `CommandResult/ViewModel -> OutputDocument -> human/json/jsonl`；rootfs/initrd 导出等
@@ -613,6 +762,20 @@ finalizer，把 password/users/SSH/hosts/network/NTP/localization/security/machi
 | `overrides.kernel_args.add/remove` | installer PXE + 目标 bootloader | 当前 PXE kernel cmdline；每次启动重放，无持久 bootloader |
 | postprocess bundle reference | `overrides.install.post_install.bundle` 由 installer 执行 | `overrides.diskless.provision.bundle` 替换该 Node 的 first-boot，由 agent 执行 |
 
+两种 kind 使用同一 effective repository 基线：先继承 InstallSource 导入时发布的全部受管
+repository，再合并 Profile 追加项和 Node add/remove delta。Install 的 immutable plan 固定
+repository identity/path，投递 answer 时才把路径重新绑定到当前 daemon authority，避免把导入时
+可能过期的 IP/port 写入目标系统。Rocky/RHEL 的 Kickstart `%post` 删除 vendor 公网 `.repo` 并
+持久化 `/etc/yum.repos.d/nodeforge.repo`；Ubuntu 由 Subiquity/curtin 持久化
+`apt.mirror-selection.primary`。安装介质 URL 与安装后包管理器配置是两个独立责任，不能因
+Anaconda/Subiquity 能完成 package phase 就假定受管源已落盘。
+
+RHEL comps 的 environment/group 选择采用发行版标准语义：未配置 environment 时默认
+`minimal-environment`；`@^environment` 与 `@group` 安装 mandatory/default 包，不隐式包含
+optional 包。若产品需要“某 group 的全部 optional 包”，模型必须增加显式 package-type 策略并
+进入 plan digest；不得全局启用 `%packages --optional`，否则会同时扩张 minimal environment 和
+所有其他选中 group。
+
 纯安装机械字段 `overrides.install.storage.*`、bootloader、apt installer policy、completion、updates、proxy、
 reinstall policy 没有“最终运行系统”的 diskless 对象，因此仅这些字段 not-applicable；这不减少共享 target-system
 配置面。任一已注册为 diskless 可用的 override 都必须在 adapter/build manifest 中有可验证 agent pre-init consumer 与 prerequisite，
@@ -661,6 +824,13 @@ nodeforge profile capabilities show <profile>
 nodeforge node capabilities show <node>
 ```
 
+source 派生的 NodeForge initrd 存放在
+`assets/boot/diskless/sources/<source>/<kernel-release>/<name>.img`，手工 tuple
+构建则存放在
+`assets/boot/diskless/manual/<distro>/<version>/<arch>/<kernel-release>/<name>.img`。
+kernel release 同时进入文件名/目录和 asset manifest；RHEL 的 `uname -r` 本身含
+`.x86_64`/`.aarch64`，Ubuntu 的 `uname -r` 不含 arch，NodeForge 不擅自裁剪。
+
 rootfs manifest 的 files/features、initrd modules/features 和 boot-bundle compatibility constraints 若为 scalar
 collection，使用 values 命令；manifest entries 或 build steps 若为 structured collection，使用 item CRUD/
 `replace-items --from-file`。Assets detail 的 stored/capabilities/runtime sections 继续遵守 v0.1 输出和 exact-key 规则。
@@ -670,7 +840,7 @@ collection，使用 values 命令；manifest entries 或 build steps 若为 stru
 
 | Resource | 必填持久事实 | 只读派生事实 |
 |---|---|---|
-| rootfs | format、arch、content digest/size、uncompressed size、builder version、software capability revision、Profile build digest、features | validation/readiness、rootfs consumers |
+| rootfs | format、arch、content digest/压缩 size、可选 uncompressed size、builder version、software capability revision、Profile build digest、features | validation/readiness、rootfs consumers |
 | runtime-kernel | source/package revision、arch、kernel release、content digest、modules/package closure digest | initrd/rootfs modules ABI compatibility |
 | nodeforge-initrd | arch、kernel release、content digest/size、builder version、modules/features | validation/readiness、supported overlay/network features |
 | boot-bundle | install-source ref、runtime-kernel ref、nodeforge-initrd ref、arch、kernel release、required features | joint boot digest、build compatibility/readiness、consumer count |
@@ -678,6 +848,38 @@ collection，使用 values 命令；manifest entries 或 build steps 若为 stru
 Resource name 不是内容身份；内容或 builder 输入变化必须发布新 revision/digest。Boot bundle 在 transaction 中
 pin source/kernel/initrd revision 并派生 joint boot digest。rootfs 是 `rootfs_input_digest` 对应的只读派生缓存；
 DeliveryManifest 固定 boot bundle revisions + rootfs SHA-512，不能把交付输出反写 Profile。
+
+#### rootfs 展开大小与内存校验契约
+
+`uncompressed_size` 是可选的证明信息，不是 rootfs identity，也不是部署前置条件：
+
+- NodeForge 内部构建在 `mksquashfs` 前测量目录树 apparent size；测量成功记录正数，
+  测量失败记录 unknown 并告警，仍可原子发布制品。
+- 外部 `profile rootfs register` 可通过 `--uncompressed-size` 提供可信正数；省略时
+  API 不写该字段，持久层使用内部哨兵 0，所有 JSON/BootConfig 对外统一呈现 `null`。
+- 对同一 `rootfs_input_digest` 重新登记相同内容时，若旧记录的展开大小未知而新请求
+  提供了可信正数，服务端原子补全并持久化该字段，返回 `state=metadata_updated`。
+  两个已知展开大小不同，或 SHA-512、压缩大小、Profile、内核 release、正式文件名
+  任一不可变元数据发生变化时，必须以 drift 冲突拒绝，不能覆盖已有制品。
+- unknown 不等于 0 字节，禁止回退为 compressed size、估算值或旧 checkpoint 中的
+  其它字段；跨重启仍必须保持 unknown。
+- rootfs 登记、boot-prepare 和 deploy 不因 unknown 失败。readiness 返回稳定 warning、
+  `uncompressed_bytes=null`、`required_min_memory_bytes=null`；initrd 同样记录 warning，
+  按 Profile 的 `tmpfs_percent` 创建 upper，但跳过容量硬闸。
+- 只有 uncompressed size 明确存在时，才按 checked arithmetic 计算
+  `compressed + uncompressed + node payload + upper + safety margin`，并在实际
+  `MemAvailable` 明确不足时 fail-closed。数值溢出也视为无法证明安全并拒绝。
+
+#### rootfs 原子发布与并发契约
+
+- 每个 build/register 请求使用包含 `request_id` 的独立暂存目录和临时文件；相同
+  input digest 的并发请求不得共享、截断或删除彼此的中间产物。
+- 已有记录校验、正式文件原子改名和 artifact store 持久化必须在同一发布临界区内
+  串行执行。已有制品先校验内容与不可变元数据，任何 drift 都必须发生在正式文件
+  被替换之前。
+- 新制品只有在临时文件完整写入、同步并计算 SHA-512 后才能改名发布。Store 持久化
+  失败必须同时回滚内存记录并删除刚发布但尚无记录的文件；不得产生仅当前进程可见
+  的幽灵记录，也不得破坏此前已发布的制品。
 
 ### 4.3 ISO、Profile 与 diskless 制品关系
 
@@ -687,9 +889,28 @@ ISO import 一次原子生成：
 - 内容寻址 UEFI bootloader（媒体存在时）；
 - vendor installer kernel（通用 `kernel` asset）；
 - vendor installer initrd（仅安装器使用的 `installer_initrd` asset）；
-- repository/media tree；
+- 零个、一个或多个 repository + media tree；
 - InstallSource；
 - 一个引用该 InstallSource 的默认 install Profile。
+
+#### 多 variant ISO 的 repository 发现
+
+RHEL-family DVD ISO 通常包含多个 variant（如 Rocky 10.2 DVD 的 AppStream + BaseOS），
+每个 variant 在 `.treeinfo` 中有独立的 `[variant-<name>]` 段和 `repository` 键。
+导入器从 `[general]` 段的 `variants` 列表遍历所有 variant，为每个存在
+`repodata/repomd.xml` 的 variant 构建独立的 `RepositoryConfig` 和 `SoftwareIndex`。
+
+命名规则（logical ID 仅允许小写 ASCII）：
+
+| ISO 类型 | variant 数 | repository 名 | base_url |
+|---------|-----------|--------------|----------|
+| 单 variant（如 Rocky 9.7 Minimal） | 1 | `source_name` | `.../source_name/<base>` |
+| 多 variant（如 Rocky 10.2 DVD） | 2+ | `source_name-<variant_lowered>` | `.../source_name/<Variant>` |
+| 无 repository（仅安装器介质） | 0 | — | — |
+
+所有 variant 的文件共享同一个 `source_name` 目录（ISO 媒体树整体复制）。HTTP 服务器
+的 `/artifacts/repositories/:name/*` 路由同时接受 install source 名和 repository 名，
+文件系统路径始终使用 source_name 作为目录名。
 
 ISO import 不生成 rootfs、NodeForge initrd、boot bundle 或 diskless Profile：
 
@@ -897,7 +1118,7 @@ readiness 只读、不暗中构建。`profile rootfs status <profile>` / `assets
 | `software.*` 包 | 从本地 repo 安装并记 manifest | Node software override 由 agent `node-apply` 按 session 固定的 local-only repository revision/package closure 安装或移除 |
 | `system.users` | 创建 passwd/group/home/shell/sudo，写 password hash 与 authorized_keys | 将 Node users/password/key effective 差量写 upper |
 | 公共 `/etc/hosts` | 由 Profile/rootfs-build 写入 | 合并 Node hosts override、写节点 hostname/self entry，并以 effective hosts + 共享 host public key 重算 `ssh_known_hosts` |
-| repository | 删除/禁用公网源，只保留 Profile 选中的本地源 | Node repositories add/remove 只接受 InstallSource capability id；compiler 固定 effective repository revision/GPG policy，agent 使用临时本地 repo 配置，不接受 URL |
+| repository | 删除/禁用公网源；installroot 也只消费 nodeforged 受管 HTTP URL，构建结束严格清除临时 repo 文件 | compiler 把 session 绑定的同类 nodeforged HTTP URL 写入 AgentPlan；agent 即使没有包 delta 也持久化 `nodeforge.repo`/APT source，并在包事务中禁用其他源 |
 | hostname | 通用占位 | 写节点 hostname |
 | 网络 | 保留 DHCP bootstrap 能力和 NM/Netplan | 写目标静态/DHCP 持久配置 |
 | machine-id | 清理，不在共享 lower 留唯一身份 | 每次启动在 upper 生成 |
@@ -1187,9 +1408,11 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
   active session。跨 kind 换绑仅在 `deploy=false` 且无 active/recoverable session 时允许，历史只进 trace。
 - `squashfs_overlay`（v0.2 唯一 rootfs 形态）通过 UEFI x86_64/aarch64 QEMU smoke + VMware 虚拟机部署（compute_use）
   实机代理验证；至少一架构完成断网恢复、switch_root、running event 和 retry 闭环，覆盖真机 NIC/firmware/内存差异。
-  大镜像内存预算场景按统一 `available_budget` 计 squashfs compressed size + 完整 upper limit + safety margin；readiness
+  大镜像内存预算场景在 uncompressed size 已知时按统一 `available_budget` 计 squashfs compressed size +
+  uncompressed size + 完整 upper limit + safety margin；readiness
   用 inventory 减 kernel/initrd，initrd 直接使用 `MemAvailable`，不得重复扣 kernel/initrd。无 inventory 时 readiness 明示
-  unknown/checked required minimum，并由 initrd 实测硬闸。可切换 rootfs 形态
+  unknown/checked required minimum，并由 initrd 实测硬闸。若 rootfs uncompressed size 本身未知，则只告警并跳过
+  容量硬闸，不得把 compressed size 当作替代值。可切换 rootfs 形态
   （`ram_rootfs` 等）属 v0.5，不纳入 v0.2 验收。
 - install Profile 的既有 PXE、全部 v0.1 storage/software/override 和 schema v3 migration 回归不退化。
 
@@ -1377,14 +1600,16 @@ Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或�
    （如 `pthread_create`/`pthread_mutex_init`）。glibc >= 2.34 将 pthread 合并入 libc，但交叉编译
    sysroot 可能使用 glibc < 2.34，导致链接产物包含 `NEEDED libpthread.so.0`。最小 initrd 环境中
    不包含该库，二进制无法加载。`single_threaded = true` 阻止 stdlib 引入任何 pthread 符号。
-   同时添加 `strip = true`（ReleaseSafe/ReleaseFast 模式）减小二进制体积。
+   同时添加 `strip = true`（ReleaseSafe/ReleaseFast 模式）减小二进制体积。该开关只影响
+   initrd/agent，不影响 daemon/CLI；CentOS 7 兼容还必须把交叉编译目标固定为 glibc 2.17。
+   取消该开关时所需的目标 ELF 闭包和验证要求见 R15.3。
 
 4. **initrd 挂载修复**：在 `nodeforge-initrd` main() 开头：
    - 显式挂载 `/run` 为 tmpfs（rootfs 下载的 .part/.chunk 文件写入此处，initramfs 根可能只读）
    - 加载 `squashfs`/`loop`/`overlay` 内核模块（Rocky 内核中这些是模块而非内置，使用 `runIgnore`
      容忍模块已内置时的非零返回）
-   - 已有全局 IPv4 时直接复用；否则优先使用 vendor initrd 的 BusyBox `udhcpc`，未配置出地址或不存在时
-     回退到构建器注入的 `dhclient -v -1`；两条路径均有界退出
+   - 先按已绑定的 PXE IP 查实际接口，找不到再按 cmdline PXE MAC 查接口；设置地址、掩码和
+     gateway 后继续。只有缺少结构化租约事实的兼容路径才尝试 vendor `udhcpc`/`dhclient`
    - daemon 内置 DHCP 是 UDP/67 server，不能复用为 initrd 的 UDP/68 client；自定义 `/init` 也不会执行
      vendor dracut/NetworkManager 的完整网络状态机
    - 使用 shell 参数展开 `${i##*/}` 替代 `basename` 命令依赖

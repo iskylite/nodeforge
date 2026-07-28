@@ -36,6 +36,7 @@ pub const ValidationError = error{
     InvalidDhcpPingTimeout,
     InvalidDhcpCapacity,
     InvalidManagedCapacity,
+    InvalidInstallPlanCapacity,
     InvalidLogRotation,
     InvalidEventsRotation,
     InvalidLogFilePath,
@@ -182,6 +183,11 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     try validateDhcp(&config.dhcp);
     if (config.capacity.managed_entries) |value| {
         if (value == 0 or value > capacity.store_ceiling) return error.InvalidManagedCapacity;
+    }
+    // null 是默认值，表示完整动态 slice 不受应用层人为上限约束。只有站点显式
+    // 导入 config 并设置数值时才校验保护阈值；setup 不为此低频项提供参数。
+    if (config.capacity.install_plan_max_bytes) |value| {
+        if (value == 0) return error.InvalidInstallPlanCapacity;
     }
     try uniqueNamed(model.DistroConfig, config.distros);
     try uniqueNamed(model.ProfileConfig, config.profiles);
@@ -516,10 +522,9 @@ fn validateBootBundles(config: *const model.AppConfig, catalog: *const model.Cat
         const initrd = try requireAssetKind(catalog, bundle.initrd, .nodeforge_initrd);
 
         // kernel 和 initrd 必须与 bundle 的 distro/version/arch 三元组匹配。
-        // kernel_release 仅对 initrd 强制校验：ISO 导入的 installer kernel 不携带
-        // kernel_release（该字段为 null），而 boot bundle 的 kernel_release 是
-        // 操作员提供的权威值。nodeforge_initrd 资产在构建时已固定 kernel_release，
-        // 因此必须与 bundle 完全匹配。kernel 资产的 kernel_release 允许为 null。
+        // nodeforge_initrd 是按指定 uname-r 构建的模块 ABI，必须与 bundle 严格
+        // 一致。kernel asset 的探测 release 仅作诊断：操作员可显式选择不同
+        // --kernel-release，创建 API 会记录 WARNING，但模型校验不据此拒绝。
         for ([_]*const model.AssetConfig{ kernel, initrd }) |asset| {
             if (!optionalEqual(asset.distro, bundle.distro) or
                 !optionalEqual(asset.version, bundle.version) or

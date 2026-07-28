@@ -25,10 +25,9 @@
 //! Rocky Linux 内核中的 `squashfs`、`loop`、`overlay` 则在挂载前显式加载。
 //!
 //! **DHCP 客户端边界**：daemon 内置的是 DHCP server，不能复用为 initrd 的
-//! DHCP client。initrd 先接受内核/vendor userspace 已配置的全局地址，再优先
-//! 使用镜像常见的 BusyBox `udhcpc`，最后回退到构建器注入的 `dhclient`。
-//! 两条客户端路径都使用 NodeForge 自带的最小 hook，避免依赖
-//! NetworkManager/systemd 或发行版脚本。
+//! DHCP client。正常路径先按已绑定租约 IP、再按 PXE MAC 选择接口并直接配置；
+//! 只有旧 cmdline 缺少结构化租约事实时，才依次尝试 vendor initrd 已有的
+//! BusyBox `udhcpc`/`dhclient`。构建器只提供最小 hook，不从宿主注入客户端或 libc。
 //!
 //! **无 coreutils 依赖**：`bringUpNetwork` 使用 shell 参数展开 `${i##*/}`
 //! 替代 `basename` 命令，避免对 initrd 中可能不存在的 coreutils 的依赖。
@@ -41,7 +40,9 @@
 //!
 //! **构建配置**（见 `build.zig`）：`single_threaded = true` 避免 Zig stdlib
 //! 引入 libpthread 依赖（glibc < 2.34 的 `libpthread.so.0` 在最小 initrd 中
-//! 可能不存在）。`strip = true` 减小二进制体积。
+//! 可能不存在）。该开关不降低 GLIBC symbol version，旧发行版仍须使用对应
+//! sysroot 交叉编译；取消时必须随 `/init` 提供目标 ISO/sysroot 的完整 ELF
+//! interpreter/DT_NEEDED 闭包，不能复制构建宿主库。`strip = true` 减小体积。
 const std = @import("std");
 const builtin = @import("builtin");
 const memory = @import("initrd/memory.zig");
@@ -55,6 +56,7 @@ const http = @import("initrd/http.zig");
 /// `single_threaded = true`（见 build.zig）时 Zig 不链接 libpthread，
 /// setenv 仍可用（它是 libc 函数，非 pthread 函数）。
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn ioctl(fd: c_int, request: c_ulong, argp: *anyopaque) c_int;
 
 /// initrd 环境的 PATH：覆盖常见 Linux、dracut 和管理员本地路径。
 const initrd_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin:/run/current-system/sw/sbin";
@@ -114,11 +116,27 @@ fn mountBootstrap(
     if (std.os.linux.errno(rc) != .SUCCESS) return error.MountFailed;
 }
 
+fn moveMount(comptime source: [:0]const u8, comptime target: [:0]const u8) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    const rc = std.os.linux.mount(source.ptr, target.ptr, null, std.os.linux.MS.MOVE, 0);
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.MoveMountFailed;
+}
+
+fn enterRoot(comptime root: [:0]const u8) !void {
+    if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    if (std.os.linux.errno(std.os.linux.chroot(root.ptr)) != .SUCCESS) return error.ChrootFailed;
+    if (std.os.linux.errno(std.os.linux.chdir("/")) != .SUCCESS) return error.ChdirFailed;
+}
+
 const Cmdline = struct {
     config_url: ?[]const u8 = null,
     node: ?[]const u8 = null,
     session: ?[]const u8 = null,
     kernel_args: ?[]const u8 = null,
+    mac: ?[]const u8 = null,
+    ip: ?[]const u8 = null,
+    prefix: ?[]const u8 = null,
+    gateway: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -159,9 +177,9 @@ pub fn main(init: std.process.Init) !void {
     const cmdline = try readCmdline(io, allocator);
     defer freeCmdline(allocator, cmdline);
 
-    // 基本网络：复用已有地址，或通过 vendor udhcpc / 注入的 dhclient 获取。
+    // 基本网络：按 IP/MAC 复用 PXE 租约；旧启动参数才调用 vendor DHCP client。
     log("[nodeforge-initrd] bringing up network...\n", .{});
-    try bringUpNetwork(io, allocator);
+    try bringUpNetwork(io, allocator, &cmdline);
     log("[nodeforge-initrd] network setup done\n", .{});
 
     const config_token = try readToken(io, allocator, capsule_config_token_path);
@@ -214,14 +232,24 @@ pub fn main(init: std.process.Init) !void {
     current_phase = "diskless.rootfs_downloading";
     const meminfo = try captureRun(io, allocator, &.{ "cat", "/proc/meminfo" });
     defer allocator.free(meminfo);
-    const upper_limit = try memory.upperLimit(.{
-        .available_budget = try memory.memAvailableBytes(meminfo),
-        .rootfs_size = bc.rootfs_size,
-        .node_payload_size = bc.node_payload_size,
-        .tmpfs_percent = bc.tmpfs_percent,
-        .minimum_free_bytes = bc.minimum_free_bytes,
-        .safety_margin_bytes = bc.safety_margin_bytes,
-    });
+    const available_budget = try memory.memAvailableBytes(meminfo);
+    const scaled_upper = std.math.mul(u64, available_budget, bc.tmpfs_percent) catch return error.MemoryBudgetOverflow;
+    const upper_limit = if (bc.rootfs_uncompressed_size) |uncompressed_size|
+        try memory.upperLimit(.{
+            .available_budget = available_budget,
+            .rootfs_size = bc.rootfs_size,
+            .rootfs_uncompressed_size = uncompressed_size,
+            .node_payload_size = bc.node_payload_size,
+            .tmpfs_percent = bc.tmpfs_percent,
+            .minimum_free_bytes = bc.minimum_free_bytes,
+            .safety_margin_bytes = bc.safety_margin_bytes,
+        })
+    else blk: {
+        // 未知不等于 0 字节，也不能拿压缩大小冒充展开大小。继续启动并仅使用
+        // Profile 配置的 tmpfs 百分比；实际分配失败仍由 mount/write 自然报告。
+        log("[nodeforge-initrd] WARNING: rootfs uncompressed size is unknown; skipping hard memory-capacity check\n", .{});
+        break :blk scaled_upper / 100;
+    };
     try downloadRootfs(io, allocator, &bc, rootfs_token, session);
     log("[nodeforge-initrd] rootfs downloaded, verifying SHA-512...\n", .{});
     verifySha512(io, rootfs_blob, bc.rootfs_sha512) catch return error.RootfsHashMismatch;
@@ -283,23 +311,48 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(retain_logs);
     runIgnore(io, allocator, &.{ "sh", "-c", retain_logs }) catch {};
 
-    // switch_root -> nodeforge-agent --pre-init（agent 校验 plan/payload、node-apply 后 exec /sbin/init）。
-    // 必须 by PID 1 执行：用 replace（execve）替换当前进程，而非 spawn 子进程。
-    // 仅 exec 失败才会返回（成功时进程镜像已被替换，不返回）。
-    // nodeforge-agent 在 rootfs 中的路径是 /usr/sbin/nodeforge-agent
-    // （由 `nodeforge profile rootfs build` 安装到 rootfs squashfs 中）。
-    log("[nodeforge-initrd] switch_root to {s}/usr/sbin/nodeforge-agent --pre-init\n", .{merged_mnt});
-    return std.process.replace(io, .{ .argv = &.{ "/usr/sbin/switch_root", merged_mnt, "/usr/sbin/nodeforge-agent", "--pre-init" } });
+    // 直接通过内核 syscall 把 bootstrap mounts 交给新根并 chroot，避免 util-linux
+    // mount 在移动 /run 后因无法更新 utab 返回 16，也避免依赖 vendor initrd 或
+    // rootfs 中的 mount/chroot 命令及其 libc closure。replace 保持 agent 为 PID 1。
+    inline for (.{ "proc", "sys", "dev", "run" }) |mount_name| {
+        const source = "/" ++ mount_name;
+        const target = merged_mnt ++ "/" ++ mount_name;
+        try moveMount(source, target);
+    }
+    try enterRoot(merged_mnt);
+    log("[nodeforge-initrd] exec /usr/sbin/nodeforge-agent --pre-init in new root\n", .{});
+    return std.process.replace(io, .{ .argv = &.{ "/usr/sbin/nodeforge-agent", "--pre-init" } });
 }
 
-/// up 第一个非 lo 网卡并取得 IPv4 配置。
-/// 使用 shell 参数展开 `${i##*/}` 替代 `basename`，避免对 coreutils 的依赖。
-/// 已有全局地址时直接复用；否则优先使用 initrd 自带 `udhcpc`，再回退到
-/// `dhclient -1`。所有路径都有界退出，避免 PID 1 无限阻塞。
-fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator) !void {
-    try runIgnore(io, allocator, &.{ "ip", "link", "set", "lo", "up" });
-    // 用 ${i##*/} 取接口名，不依赖 basename。
-    try runIgnore(io, allocator, &.{ "sh", "-c", "for i in /sys/class/net/*; do dev=${i##*/}; [ \"$dev\" != lo ] && ip link set \"$dev\" up && break; done" });
+/// 优先按已配置的租约 IP、其次按 PXE MAC 确定网卡并取得 IPv4 配置。
+/// 只有缺少控制面静态租约事实的兼容路径才尝试 DHCP client；所有路径都有界
+/// 退出，避免 PID 1 无限阻塞。
+fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator, cmdline: *const Cmdline) !void {
+    if (cmdline.ip != null and cmdline.prefix != null) {
+        // PXE DHCP lease 已由 daemon 确认；直接复用该地址，避免自定义 PID 1
+        // 依赖 vendor systemd/NetworkManager 或宿主机注入的 DHCP client。
+        // 参数由控制面从结构化 DHCP 配置生成，只接受 IPv4/prefix 字符集。
+        if ((cmdline.mac != null and !validMac(cmdline.mac.?)) or
+            !validIpv4(cmdline.ip.?) or !validPrefix(cmdline.prefix.?) or
+            (cmdline.gateway != null and !validIpv4(cmdline.gateway.?)))
+            return error.InvalidBootstrapNetwork;
+        log("[nodeforge-initrd] applying PXE lease {s}/{s} mac={s} gateway={s}\n", .{
+            cmdline.ip.?,
+            cmdline.prefix.?,
+            cmdline.mac orelse "(none)",
+            cmdline.gateway orelse "(none)",
+        });
+        const interface = try configureBootstrapIpv4(io, allocator, cmdline.mac, cmdline.ip.?, cmdline.prefix.?);
+        if (cmdline.gateway) |gateway| {
+            try mustRun(io, allocator, &.{ "/sbin/ip", "route", "replace", "default", "via", gateway, "dev", interface });
+        }
+        log("[nodeforge-initrd] PXE lease configured with native ioctl\n", .{});
+        return;
+    } else {
+        try runIgnore(io, allocator, &.{ "ip", "link", "set", "lo", "up" });
+        // 用 ${i##*/} 取接口名，不依赖 basename。
+        try runIgnore(io, allocator, &.{ "sh", "-c", "for i in /sys/class/net/*; do dev=${i##*/}; [ \"$dev\" != lo ] && ip link set \"$dev\" up && break; done" });
+    }
     const existing = try captureRun(io, allocator, &.{ "/sbin/ip", "-4", "-o", "addr", "show", "scope", "global" });
     defer allocator.free(existing);
     if (std.mem.trim(u8, existing, " \t\r\n").len != 0) {
@@ -328,6 +381,124 @@ fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator) !void {
     defer allocator.free(addresses);
     if (std.mem.trim(u8, addresses, " \t\r\n").len == 0) return error.DhcpAddressMissing;
     log("[nodeforge-initrd] DHCP configured: {s}", .{addresses});
+}
+
+const Ifreq = extern struct {
+    name: [16]u8 = [_]u8{0} ** 16,
+    data: [24]u8 = [_]u8{0} ** 24,
+};
+
+fn configureBootstrapIpv4(io: std.Io, allocator: std.mem.Allocator, mac_text: ?[]const u8, ip_text: []const u8, prefix_text: []const u8) ![]const u8 {
+    const ip = parseIpv4(ip_text) orelse return error.InvalidBootstrapNetwork;
+    const socket_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.DGRAM, 0);
+    if (std.os.linux.errno(socket_rc) != .SUCCESS) return error.NetworkSocketFailed;
+    const fd: c_int = @intCast(socket_rc);
+    defer _ = std.c.close(fd);
+
+    var dir = try std.Io.Dir.openDirAbsolute(io, "/sys/class/net", .{ .iterate = true });
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    var interface_buf: [15]u8 = undefined;
+    var interface_len: usize = 0;
+
+    // `ip=dhcp` 可能已由内核/vendor initramfs 配好地址。先以实际地址反查接口，
+    // 这是最强的现场事实；找不到时才使用 DHCP/TFTP 会话携带的 PXE MAC。
+    while (try iterator.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "lo") or entry.name.len >= 16) continue;
+        var address_request: Ifreq = .{};
+        @memcpy(address_request.name[0..entry.name.len], entry.name);
+        if (ioctl(fd, 0x8915, &address_request) == 0 and std.mem.eql(u8, address_request.data[4..8], &ip)) { // SIOCGIFADDR
+            @memcpy(interface_buf[0..entry.name.len], entry.name);
+            interface_len = entry.name.len;
+            break;
+        }
+    }
+    if (interface_len == 0 and mac_text != null) {
+        iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (std.mem.eql(u8, entry.name, "lo") or entry.name.len >= 16) continue;
+            const address_path = try std.fmt.allocPrint(allocator, "/sys/class/net/{s}/address", .{entry.name});
+            defer allocator.free(address_path);
+            const address = readFile(io, allocator, address_path) catch continue;
+            defer allocator.free(address);
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, address, " \t\r\n"), mac_text.?)) continue;
+            @memcpy(interface_buf[0..entry.name.len], entry.name);
+            interface_len = entry.name.len;
+            break;
+        }
+    }
+    if (interface_len == 0) return error.NetworkInterfaceMissing;
+    const name = interface_buf[0..interface_len];
+    const prefix = std.fmt.parseInt(u8, prefix_text, 10) catch return error.InvalidBootstrapNetwork;
+    const mask_value: u32 = if (prefix == 0) 0 else ~@as(u32, 0) << @intCast(32 - prefix);
+    const mask = [4]u8{
+        @intCast((mask_value >> 24) & 0xff),
+        @intCast((mask_value >> 16) & 0xff),
+        @intCast((mask_value >> 8) & 0xff),
+        @intCast(mask_value & 0xff),
+    };
+
+    var request: Ifreq = .{};
+    @memcpy(request.name[0..name.len], name);
+    if (ioctl(fd, 0x8913, &request) != 0) return error.NetworkIoctlFailed; // SIOCGIFFLAGS
+    const current_flags = std.mem.readInt(u16, request.data[0..2], .native);
+    std.mem.writeInt(u16, request.data[0..2], current_flags | 0x1, .native); // IFF_UP
+    if (ioctl(fd, 0x8914, &request) != 0) return error.NetworkIoctlFailed; // SIOCSIFFLAGS
+
+    setSockaddr(&request, ip);
+    if (ioctl(fd, 0x8916, &request) != 0) return error.NetworkIoctlFailed; // SIOCSIFADDR
+    setSockaddr(&request, mask);
+    if (ioctl(fd, 0x891c, &request) != 0) return error.NetworkIoctlFailed; // SIOCSIFNETMASK
+    return try allocator.dupe(u8, name);
+}
+
+fn setSockaddr(request: *Ifreq, address: [4]u8) void {
+    @memset(&request.data, 0);
+    std.mem.writeInt(u16, request.data[0..2], std.os.linux.AF.INET, .native);
+    @memcpy(request.data[4..8], &address);
+}
+
+fn parseIpv4(value: []const u8) ?[4]u8 {
+    var result: [4]u8 = undefined;
+    var index: usize = 0;
+    var it = std.mem.splitScalar(u8, value, '.');
+    while (it.next()) |part| {
+        if (index == result.len or part.len == 0) return null;
+        result[index] = std.fmt.parseInt(u8, part, 10) catch return null;
+        index += 1;
+    }
+    return if (index == result.len) result else null;
+}
+
+fn validIpv4(value: []const u8) bool {
+    if (value.len < 7 or value.len > 15) return false;
+    var dots: u8 = 0;
+    for (value) |c| {
+        if (c == '.') {
+            dots += 1;
+        } else if (!std.ascii.isDigit(c)) return false;
+    }
+    return dots == 3;
+}
+
+fn validMac(value: []const u8) bool {
+    if (value.len != 17) return false;
+    for (value, 0..) |c, index| {
+        if (index % 3 == 2) {
+            if (c != ':') return false;
+        } else if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
+
+fn validPrefix(value: []const u8) bool {
+    if (value.len == 0 or value.len > 2) return false;
+    var parsed: u8 = 0;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+        parsed = parsed * 10 + (c - '0');
+    }
+    return parsed <= 32;
 }
 
 /// 把 AgentPlan locator + agent/event token 写入新根 `/var/lib/nodeforge`（boot.json +
@@ -360,6 +531,8 @@ const BootConfig = struct {
     event_url: []u8,
     /// rootfs 字节大小，HEAD 与最终落盘大小都须与之精确相等。
     rootfs_size: u64,
+    /// null 表示外部 rootfs 未提供展开大小；此时跳过容量硬校验。
+    rootfs_uncompressed_size: ?u64,
     /// tmpfs upper 占 MemAvailable 的百分比上限。
     tmpfs_percent: u8,
     /// 内存闸保留的最小空闲字节（低于即 fail-closed，见 memory.upperLimit）。
@@ -373,7 +546,7 @@ const BootConfig = struct {
 /// 从 BootConfig v2 JSON 解析 rootfs/overlay/agent_plan/event 定位与内存预算字段。
 fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
     const Parsed = struct {
-        rootfs: struct { url: []const u8, sha512: []const u8, size: u64 },
+        rootfs: struct { url: []const u8, sha512: []const u8, size: u64, uncompressed_size: ?u64 = null },
         overlay: struct {
             tmpfs_percent: u8,
             minimum_free_bytes: u64,
@@ -392,6 +565,7 @@ fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
         .agent_plan_digest = try allocator.dupe(u8, p.value.agent_plan.digest),
         .event_url = try allocator.dupe(u8, p.value.event_url),
         .rootfs_size = p.value.rootfs.size,
+        .rootfs_uncompressed_size = p.value.rootfs.uncompressed_size,
         .tmpfs_percent = p.value.overlay.tmpfs_percent,
         .minimum_free_bytes = p.value.overlay.minimum_free_bytes,
         .safety_margin_bytes = p.value.overlay.safety_margin_bytes,
@@ -550,6 +724,10 @@ fn readCmdline(io: std.Io, allocator: std.mem.Allocator) !Cmdline {
         if (std.mem.startsWith(u8, tok, "nodeforge.node=")) c.node = try allocator.dupe(u8, tok["nodeforge.node=".len..]);
         if (std.mem.startsWith(u8, tok, "nodeforge.session=")) c.session = try allocator.dupe(u8, tok["nodeforge.session=".len..]);
         if (std.mem.startsWith(u8, tok, "nodeforge.kernel_args=")) c.kernel_args = try allocator.dupe(u8, tok["nodeforge.kernel_args=".len..]);
+        if (std.mem.startsWith(u8, tok, "nodeforge.mac=")) c.mac = try allocator.dupe(u8, tok["nodeforge.mac=".len..]);
+        if (std.mem.startsWith(u8, tok, "nodeforge.ip=")) c.ip = try allocator.dupe(u8, tok["nodeforge.ip=".len..]);
+        if (std.mem.startsWith(u8, tok, "nodeforge.prefix=")) c.prefix = try allocator.dupe(u8, tok["nodeforge.prefix=".len..]);
+        if (std.mem.startsWith(u8, tok, "nodeforge.gateway=")) c.gateway = try allocator.dupe(u8, tok["nodeforge.gateway=".len..]);
     }
     return c;
 }
@@ -560,6 +738,10 @@ fn freeCmdline(allocator: std.mem.Allocator, c: Cmdline) void {
     if (c.node) |s| allocator.free(s);
     if (c.session) |s| allocator.free(s);
     if (c.kernel_args) |s| allocator.free(s);
+    if (c.mac) |s| allocator.free(s);
+    if (c.ip) |s| allocator.free(s);
+    if (c.prefix) |s| allocator.free(s);
+    if (c.gateway) |s| allocator.free(s);
 }
 
 /// 运行子进程并返回 stdout；退出码非 0 即失败。

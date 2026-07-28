@@ -639,8 +639,8 @@ M0 默认 HTTP/管理共用端口为 `18080`（可在配置文件 `server.http_p
   DHCP/67、TFTP/69、HTTP/18080 和 `nodeforge check` 全部正常。
 - 后续语义复审撤销了实验性的 `boot_started_at`/schema 3 方案：整个任务的 `Start` 应稳定对应
   `requested_at`，`Install` 对应内部 `started_at`/`install.started`，`Finished` 对应 terminal
-  `finished_at`。列表固定显示 `START / INSTALL / FINISHED`；这套边界可直接延伸到 diskless，后者只需
-  增加与 Install 并列的实际启动阶段，而不重新解释 Start。deployment-control 因此继续使用 schema 2。
+  `finished_at`。列表固定显示 `ARMED / INSTALL / FINISHED`；这套边界可直接延伸到 diskless，后者只需
+  增加与 Install 并列的实际启动阶段，而不重新解释 Armed。deployment-control 因此继续使用 schema 2。
 - 同一复审补齐 `profile show/set/unset kernel_args`、完整结构化 `node show` 和本地回归。此前包含
   `boot_started_at` 的二进制/状态验证只作为被否决方案的历史记录，不是当前发布候选；当前源码须在新的
   ReleaseSafe aarch64 构建和受控部署验证后再记录二进制 SHA、schema 与服务状态。

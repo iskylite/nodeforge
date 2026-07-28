@@ -31,7 +31,10 @@ pgrep -f "nodeforged --install-root $install_root" >/dev/null || { echo "daemon 
 echo "daemon started"
 
 # Re-register rootfs with new size
-zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" --path "$work/rootfs2.squashfs" --config "$config" --output json >/dev/null 2>&1 || true
+rootfs_uncompressed_size=$(unsquashfs -lln "$work/rootfs2.squashfs" | awk '$1 ~ /^-/ { total += $3 } END { print total + 0 }')
+zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" \
+    --path "$work/rootfs2.squashfs" --uncompressed-size "$rootfs_uncompressed_size" \
+    --config "$config" --output json >/dev/null 2>&1 || true
 
 # Clear stale events
 > "$install_root/logs/events.jsonl" 2>/dev/null || true

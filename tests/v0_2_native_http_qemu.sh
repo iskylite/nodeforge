@@ -61,9 +61,8 @@ for r in repos:
     if "/artifacts/repositories/" in r["base_url"]:
         idx = r["base_url"].find("/artifacts/repositories/")
         r["base_url"] = f"http://{ip}:{port}{r['base_url'][idx:]}"
-    elif r["base_url"].startswith("file:///"):
-        path = r["base_url"].replace("file://", "")
-        r["base_url"] = f"http://{ip}:{port}/artifacts/repositories/{r['name']}/Minimal"
+    else:
+        raise SystemExit(f"repository is not managed HTTP: {r['base_url']}")
 with open(f"{catalog_dir}/repositories.json", "w") as f:
     json.dump(repos, f, indent=2)
 
@@ -113,7 +112,9 @@ fi
 config="$install_root/config/config.json"
 
 # 6. Register rootfs with test daemon
+rootfs_uncompressed_size=$(unsquashfs -lln "$rootfs_squashfs" | awk '$1 ~ /^-/ { total += $3 } END { print total + 0 }')
 zig-out/bin/nodeforge profile rootfs register "$profile" --path "$rootfs_squashfs" \
+    --uncompressed-size "$rootfs_uncompressed_size" \
     --config "$config" --output json >/dev/null
 
 # 7. Add node to test daemon

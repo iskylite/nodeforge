@@ -29,6 +29,8 @@ pub const PropertySpec = struct {
     mutability: Mutability = .mutable,
     /// 适用范围。
     applicability: Applicability = .all,
+    /// CLI 接受的有限值或格式/范围提示。枚举属性必须显式填写，帮助生成器直接消费。
+    value_constraint: ?[]const u8 = null,
 };
 
 /// 集合变更语义。决定 `set`/`add`/`remove` 命令如何处理集合内容。
@@ -53,32 +55,38 @@ pub const CollectionSpec = struct {
 };
 
 /// 集合 item 的标量字段定义。
-pub const ItemField = struct { name: []const u8, kind: ValueKind, required: bool = false };
+pub const ItemField = struct {
+    name: []const u8,
+    kind: ValueKind,
+    required: bool = false,
+    /// CLI 接受的有限值或格式/范围提示；不能只依赖 mutation parser 的错误信息。
+    value_constraint: ?[]const u8 = null,
+};
 /// 集合 item 的嵌套集合字段定义。
 pub const ItemCollectionField = struct { name: []const u8, semantics: CollectionSemantics = .set };
 /// 集合 item 规格。定义有序替换集合中每个元素的标识字段、标量字段和嵌套集合。
 pub const ItemSpec = struct { name: []const u8, identity: []const u8, fields: []const ItemField, collections: []const ItemCollectionField = &.{} };
 
 pub const properties = [_]PropertySpec{
-    .{ .owner = .site, .path = "discovery.policy.unknown_action", .kind = .enumeration },
+    .{ .owner = .site, .path = "discovery.policy.unknown_action", .kind = .enumeration, .value_constraint = "record|deny" },
     .{ .owner = .site, .path = "discovery.policy.observation_retention_days", .kind = .positive_integer },
     .{ .owner = .node, .path = "mac", .kind = .string },
-    .{ .owner = .node, .path = "arch", .kind = .arch },
+    .{ .owner = .node, .path = "arch", .kind = .arch, .value_constraint = "x86_64|aarch64" },
     .{ .owner = .node, .path = "profile", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "pxe.ip_reservation", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "hostname", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "deploy", .kind = .boolean },
     .{ .owner = .node, .path = "http_accel", .kind = .boolean, .applicability = .uefi_grub },
-    .{ .owner = .node, .path = "network.mode", .kind = .enumeration },
+    .{ .owner = .node, .path = "network.mode", .kind = .enumeration, .value_constraint = "dhcp|static" },
     .{ .owner = .node, .path = "network.interface_name", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "network.match_mac", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "network.address", .kind = .string, .optional = true },
-    .{ .owner = .node, .path = "network.prefix_len", .kind = .positive_integer, .optional = true },
+    .{ .owner = .node, .path = "network.prefix_len", .kind = .positive_integer, .optional = true, .value_constraint = "1..32" },
     .{ .owner = .node, .path = "network.gateway", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "storage.boot_disk", .kind = .string },
-    .{ .owner = .node, .path = "overrides.install.storage.mode", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.storage.mode", .kind = .enumeration, .optional = true, .value_constraint = "single|lvm|raid0|raid1|raid5|raid6|raid10|raid0-lvm|raid1-lvm|raid5-lvm|raid6-lvm|raid10-lvm" },
     .{ .owner = .node, .path = "overrides.install.storage.wipe", .kind = .boolean, .optional = true },
-    .{ .owner = .node, .path = "overrides.install.storage.partition_table", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.storage.partition_table", .kind = .enumeration, .optional = true, .value_constraint = "gpt|mbr" },
     .{ .owner = .node, .path = "overrides.install.bootloader.install", .kind = .boolean, .optional = true },
     .{ .owner = .node, .path = "overrides.system.localization.locale", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "overrides.system.localization.timezone", .kind = .string, .optional = true },
@@ -86,24 +94,24 @@ pub const properties = [_]PropertySpec{
     .{ .owner = .node, .path = "overrides.system.connectivity.time_sync", .kind = .boolean, .optional = true },
     .{ .owner = .node, .path = "overrides.system.ssh.enabled", .kind = .boolean, .optional = true },
     .{ .owner = .node, .path = "overrides.system.ssh.password_authentication", .kind = .boolean, .optional = true },
-    .{ .owner = .node, .path = "overrides.system.ssh.root_login", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.ssh.root_login", .kind = .enumeration, .optional = true, .value_constraint = "no|prohibit-password|yes" },
     .{ .owner = .node, .path = "overrides.system.ssh.root_password", .kind = .string, .optional = true },
-    .{ .owner = .node, .path = "overrides.system.security.firewall", .kind = .enumeration, .optional = true },
-    .{ .owner = .node, .path = "overrides.system.security.selinux", .kind = .enumeration, .optional = true },
-    .{ .owner = .node, .path = "overrides.system.security.apparmor", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.system.security.firewall", .kind = .enumeration, .optional = true, .value_constraint = "disabled|enabled" },
+    .{ .owner = .node, .path = "overrides.system.security.selinux", .kind = .enumeration, .optional = true, .value_constraint = "disabled|permissive|enforcing" },
+    .{ .owner = .node, .path = "overrides.system.security.apparmor", .kind = .enumeration, .optional = true, .value_constraint = "disabled|complain|enforce" },
     .{ .owner = .node, .path = "overrides.software.environment", .kind = .string, .optional = true },
-    .{ .owner = .node, .path = "overrides.install.apt.fallback", .kind = .enumeration, .optional = true },
-    .{ .owner = .node, .path = "overrides.install.completion.action", .kind = .enumeration, .optional = true },
-    .{ .owner = .node, .path = "overrides.install.updates.mode", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.apt.fallback", .kind = .enumeration, .optional = true, .value_constraint = "abort|offline-install|continue-anyway" },
+    .{ .owner = .node, .path = "overrides.install.completion.action", .kind = .enumeration, .optional = true, .value_constraint = "reboot|poweroff|halt" },
+    .{ .owner = .node, .path = "overrides.install.updates.mode", .kind = .enumeration, .optional = true, .value_constraint = "none|security|all" },
     .{ .owner = .node, .path = "overrides.install.proxy.url", .kind = .string, .optional = true },
-    .{ .owner = .node, .path = "overrides.install.reinstall_policy", .kind = .enumeration, .optional = true },
+    .{ .owner = .node, .path = "overrides.install.reinstall_policy", .kind = .enumeration, .optional = true, .value_constraint = "explicit|always" },
     .{ .owner = .node, .path = "overrides.install.post_install.bundle", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "overrides.diskless.overlay.tmpfs_percent", .kind = .positive_integer, .optional = true },
     .{ .owner = .node, .path = "overrides.diskless.provision.bundle", .kind = .string, .optional = true },
     .{ .owner = .profile, .path = "install_source", .kind = .string },
-    .{ .owner = .profile, .path = "install.storage.mode", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.storage.mode", .kind = .enumeration, .value_constraint = "single|lvm|raid0|raid1|raid5|raid6|raid10|raid0-lvm|raid1-lvm|raid5-lvm|raid6-lvm|raid10-lvm" },
     .{ .owner = .profile, .path = "install.storage.wipe", .kind = .boolean },
-    .{ .owner = .profile, .path = "install.storage.partition_table", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.storage.partition_table", .kind = .enumeration, .value_constraint = "gpt|mbr" },
     .{ .owner = .profile, .path = "install.bootloader.install", .kind = .boolean },
     .{ .owner = .profile, .path = "system.localization.locale", .kind = .string },
     .{ .owner = .profile, .path = "system.localization.timezone", .kind = .string },
@@ -111,19 +119,19 @@ pub const properties = [_]PropertySpec{
     .{ .owner = .profile, .path = "system.connectivity.time_sync", .kind = .boolean },
     .{ .owner = .profile, .path = "system.ssh.enabled", .kind = .boolean },
     .{ .owner = .profile, .path = "system.ssh.password_authentication", .kind = .boolean },
-    .{ .owner = .profile, .path = "system.ssh.root_login", .kind = .enumeration },
+    .{ .owner = .profile, .path = "system.ssh.root_login", .kind = .enumeration, .value_constraint = "no|prohibit-password|yes" },
     .{ .owner = .profile, .path = "system.ssh.root_password", .kind = .string, .optional = true },
     .{ .owner = .profile, .path = "system.import_host_hosts", .kind = .boolean },
     .{ .owner = .profile, .path = "system.hosts_content", .kind = .string, .optional = true },
-    .{ .owner = .profile, .path = "system.security.firewall", .kind = .enumeration },
-    .{ .owner = .profile, .path = "system.security.selinux", .kind = .enumeration, .applicability = .kickstart },
-    .{ .owner = .profile, .path = "system.security.apparmor", .kind = .enumeration, .applicability = .autoinstall },
+    .{ .owner = .profile, .path = "system.security.firewall", .kind = .enumeration, .value_constraint = "disabled|enabled" },
+    .{ .owner = .profile, .path = "system.security.selinux", .kind = .enumeration, .applicability = .kickstart, .value_constraint = "disabled|permissive|enforcing" },
+    .{ .owner = .profile, .path = "system.security.apparmor", .kind = .enumeration, .applicability = .autoinstall, .value_constraint = "disabled|complain|enforce" },
     .{ .owner = .profile, .path = "software.environment", .kind = .string, .optional = true, .applicability = .kickstart },
-    .{ .owner = .profile, .path = "install.apt.fallback", .kind = .enumeration, .applicability = .autoinstall },
-    .{ .owner = .profile, .path = "install.completion.action", .kind = .enumeration },
-    .{ .owner = .profile, .path = "install.updates.mode", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.apt.fallback", .kind = .enumeration, .applicability = .autoinstall, .value_constraint = "abort|offline-install|continue-anyway" },
+    .{ .owner = .profile, .path = "install.completion.action", .kind = .enumeration, .value_constraint = "reboot|poweroff|halt" },
+    .{ .owner = .profile, .path = "install.updates.mode", .kind = .enumeration, .value_constraint = "none|security|all" },
     .{ .owner = .profile, .path = "install.proxy.url", .kind = .string, .optional = true },
-    .{ .owner = .profile, .path = "install.reinstall_policy", .kind = .enumeration },
+    .{ .owner = .profile, .path = "install.reinstall_policy", .kind = .enumeration, .value_constraint = "explicit|always" },
     .{ .owner = .profile, .path = "install.post_install.bundle", .kind = .string, .optional = true },
     .{ .owner = .profile, .path = "diskless.boot_bundle", .kind = .string },
     .{ .owner = .profile, .path = "diskless.overlay.tmpfs_percent", .kind = .positive_integer },
@@ -175,7 +183,7 @@ pub const collections = [_]CollectionSpec{
 };
 
 const partition_fields = [_]ItemField{
-    .{ .name = "id", .kind = .string, .required = true }, .{ .name = "mount", .kind = .string }, .{ .name = "filesystem", .kind = .string }, .{ .name = "size_mib", .kind = .positive_integer }, .{ .name = "grow", .kind = .boolean },
+    .{ .name = "id", .kind = .string, .required = true }, .{ .name = "kind", .kind = .enumeration, .value_constraint = "esp|biosboot|swap|root|boot|plain" }, .{ .name = "mount", .kind = .string }, .{ .name = "filesystem", .kind = .string }, .{ .name = "size_mib", .kind = .positive_integer }, .{ .name = "grow", .kind = .boolean },
 };
 const route_fields = [_]ItemField{
     .{ .name = "id", .kind = .string, .required = true }, .{ .name = "destination", .kind = .string, .required = true }, .{ .name = "gateway", .kind = .string, .required = true }, .{ .name = "metric", .kind = .positive_integer },
@@ -185,7 +193,7 @@ const user_fields = [_]ItemField{
 };
 const user_collections = [_]ItemCollectionField{ .{ .name = "groups" }, .{ .name = "ssh_authorized_keys" } };
 const managed_file_step_fields = [_]ItemField{
-    .{ .name = "name", .kind = .string, .required = true }, .{ .name = "action", .kind = .enumeration, .required = true }, .{ .name = "destination", .kind = .string, .required = true }, .{ .name = "content_asset", .kind = .string, .required = true }, .{ .name = "mode", .kind = .positive_integer }, .{ .name = "owner", .kind = .string }, .{ .name = "group", .kind = .string },
+    .{ .name = "name", .kind = .string, .required = true }, .{ .name = "action", .kind = .enumeration, .required = true, .value_constraint = "managed-file" }, .{ .name = "destination", .kind = .string, .required = true }, .{ .name = "content_asset", .kind = .string, .required = true }, .{ .name = "mode", .kind = .positive_integer }, .{ .name = "owner", .kind = .string }, .{ .name = "group", .kind = .string },
 };
 pub const items = [_]ItemSpec{
     .{ .name = "partition", .identity = "id", .fields = &partition_fields },
@@ -206,11 +214,24 @@ pub fn collection(owner: Owner, path: []const u8) ?*const CollectionSpec {
     return null;
 }
 
+/// 返回帮助中展示的输入约束。显式约束优先；通用标量类型使用统一 token/range。
+pub fn valueConstraint(kind: ValueKind, explicit: ?[]const u8) []const u8 {
+    if (explicit) |value| return value;
+    return switch (kind) {
+        .boolean => "true|false",
+        .positive_integer => ">0",
+        .arch => "x86_64|aarch64",
+        .enumeration => "<registry-error>",
+        .string => "-",
+    };
+}
+
 test "typed registries have unique canonical paths and valid item references" {
     for (properties, 0..) |left, index| {
         try std.testing.expect(left.path.len != 0 and left.path[0] != '.');
         for (properties[index + 1 ..]) |right| try std.testing.expect(!(left.owner == right.owner and std.mem.eql(u8, left.path, right.path)));
         try std.testing.expect(collection(left.owner, left.path) == null);
+        if (left.kind == .enumeration or left.kind == .arch) try std.testing.expect(left.value_constraint != null);
     }
     for (collections, 0..) |left, index| {
         for (collections[index + 1 ..]) |right| try std.testing.expect(!(left.owner == right.owner and std.mem.eql(u8, left.path, right.path)));
@@ -226,6 +247,7 @@ test "typed registries have unique canonical paths and valid item references" {
         var identity_found = false;
         for (item.fields, 0..) |field, index| {
             if (std.mem.eql(u8, field.name, item.identity) and field.required) identity_found = true;
+            if (field.kind == .enumeration or field.kind == .arch) try std.testing.expect(field.value_constraint != null);
             for (item.fields[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, field.name, other.name));
         }
         for (item.collections, 0..) |field, index| {

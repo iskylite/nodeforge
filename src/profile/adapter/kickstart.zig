@@ -28,12 +28,12 @@ const password_hash = @import("../password_hash.zig");
 fn renderTestFixture(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, repo_url: []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     const network = node.network;
     const software: model.SoftwareSelection = .{ .packages = .{ .include = system.packages } };
-    return renderEffective(allocator, node, install, system, network, software, bootstrap_key, repo_url, bundle, facts_url, event_url, log_url, session, token, password_scope, kernel_args);
+    return renderEffective(allocator, node, install, system, network, software, bootstrap_key, repo_url, &.{repo_url}, bundle, facts_url, event_url, log_url, session, token, password_scope, kernel_args);
 }
 
 /// 从已编译的唯一 effective plan 渲染 Kickstart；调用方不得传入 raw Profile
 /// 或自行补默认值，避免校验、预览和实际安装产生不同答案。
-pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, network: model.TargetNetworkConfig, software: model.SoftwareSelection, bootstrap_key: []const u8, repo_url: []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
+pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, network: model.TargetNetworkConfig, software: model.SoftwareSelection, bootstrap_key: []const u8, repo_url: []const u8, repository_urls: []const []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -177,6 +177,16 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
         try w.writeAll("printf '%s\\n'");
         for (system.connectivity.ntp_servers) |server| try w.print(" 'server {s} iburst'", .{server});
         try w.writeAll(" > /etc/chrony.conf\nsystemctl enable chronyd\n");
+    }
+    if (repository_urls.len != 0) {
+        // Anaconda 的 `url`/`repo` 只保证安装阶段可用，不保证目标系统保留
+        // NodeForge 源。local-only 目标移除 vendor 公网 repo，并写入当前
+        // nodeforged endpoint 下的受管仓库闭包。
+        try w.writeAll("install -d -m 0755 /etc/yum.repos.d\nrm -f /etc/yum.repos.d/*.repo\ncat > /etc/yum.repos.d/nodeforge.repo <<'NODEFORGE_REPOS_EOF'\n");
+        for (repository_urls, 0..) |url, index| {
+            try w.print("[nodeforge-{d}]\nname=NodeForge managed repository {d}\nbaseurl={s}\nenabled=1\ngpgcheck=0\nmetadata_expire=never\n\n", .{ index, index, url });
+        }
+        try w.writeAll("NODEFORGE_REPOS_EOF\nchmod 0644 /etc/yum.repos.d/nodeforge.repo\n");
     }
     try renderHostsPost(w, system);
     if (bundle) |value| {
@@ -412,6 +422,9 @@ test "kickstart renders UEFI defaults and installer event hook" {
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "part /boot/efi") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "curl -fsS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "rm -f /etc/yum.repos.d/*.repo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/etc/yum.repos.d/nodeforge.repo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "baseurl=http://repo") != null);
 }
 
 test "M4.1 kickstart renders root crypt and security defaults" {

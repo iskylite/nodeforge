@@ -6,7 +6,7 @@
 //! 基底时才由 `dracut` 构建通用 fallback。随后：
 //! 3. 注入 `nodeforge-initrd` 二进制到 `/usr/sbin/`
 //! 4. 注入与 initrd 同一构建版本的 `nodeforge-agent`
-//! 5. 创建 `/init` 脚本（exec nodeforge-initrd）
+//! 5. 将 `nodeforge-initrd` 直接安装为 `/init`，避免 PID 1 启动依赖 `/bin/sh`
 //! 6. 创建空 `/capsule` 目录（真实 credential 由 TFTP 多-initrd 内存交付）
 //! 6. 重包 initramfs（find | cpio | gzip）
 //!
@@ -93,38 +93,28 @@ fn buildInternal(
             return error.UnpackFailed;
         };
     } else {
-        // 安装器 initrd 通常使用 NetworkManager，不一定提供 NodeForge PID 1
-        // 兜底路径可调用的独立 DHCP 客户端；安装镜像也可能缺少 switch_root。
-        // 这里只补充这些用户态工具，避免改变安装器原有的启动结构。
-        // companions (plus dynamic dependencies); all kernel modules and
-        // firmware still come untouched from the ISO initrd. The build host
-        // must match the target distro/architecture.
+        // Vendor initrd 与 boot kernel 来自同一 ISO，已经形成完整的 kernel/module
+        // 和 userspace ABI closure。这里绝不能用宿主机 dracut-install 补充
+        // dhclient/switch_root：它会递归复制宿主 libc/loader，追加 member 随后
+        // 覆盖 vendor 同名文件，形成例如 Rocky 10 /bin/sh + Rocky 9 libc 的混配。
+        //
+        // NodeForge overlay 只包含自身二进制、纯文本 hook、/init 和 capsule；
+        // 启动期网络与 switch-root 必须由 nodeforge-initrd 自身或 vendor closure
+        // 中已有的工具完成，不能隐式借用构建宿主 userspace。
         std.log.scoped(.initrd_build).info("initrd build: stage 2/7 - vendor initrd overlay mode", .{});
-        runCmd(io, allocator, &.{
-            "/usr/lib/dracut/dracut-install",
-            "-D",
-            initrd_root,
-            "-l",
-            "-a",
-            "/usr/sbin/dhclient",
-            "/usr/sbin/switch_root",
-        }) catch |err| {
-            std.log.scoped(.initrd_build).err("inject initrd userspace companions failed: {t}", .{err});
-            return error.InjectFailed;
-        };
     }
 
     // 3. 注入 nodeforge-initrd 二进制
     std.log.scoped(.initrd_build).info("initrd build: stage 3/7 - injecting nodeforge-initrd + agent binaries", .{});
     const initrd_bin_dest = try std.fmt.allocPrint(a, "{s}/usr/sbin", .{initrd_root});
-    std.Io.Dir.cwd().createDirPath(io, initrd_bin_dest) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, initrd_bin_dest);
     const initrd_bin_path = try std.fmt.allocPrint(a, "{s}/nodeforge-initrd", .{initrd_bin_dest});
     std.Io.Dir.copyFileAbsolute(nodeforge_initrd_binary, initrd_bin_path, io, .{ .replace = true, .make_path = true }) catch |err| {
         std.log.scoped(.initrd_build).err("inject nodeforge-initrd failed: {t}", .{err});
         return error.InjectFailed;
     };
     // 设置可执行权限
-    runCmd(io, allocator, &.{ "chmod", "0755", initrd_bin_path }) catch {};
+    try runCmd(io, allocator, &.{ "chmod", "0755", initrd_bin_path });
     const bin_parent = std.fs.path.dirname(nodeforge_initrd_binary) orelse return error.InjectFailed;
     const agent_source = try std.fmt.allocPrint(a, "{s}/nodeforge-agent", .{bin_parent});
     const agent_dest = try std.fmt.allocPrint(a, "{s}/nodeforge-agent", .{initrd_bin_dest});
@@ -186,24 +176,21 @@ fn buildInternal(
     });
     try runCmd(io, allocator, &.{ "chmod", "0755", udhcpc_script });
 
-    // 5. 创建 /init 脚本（PID 1 入口，exec nodeforge-initrd）
-    std.log.scoped(.initrd_build).info("initrd build: stage 5/7 - creating /init PID 1 script", .{});
-    const init_script = try std.fmt.allocPrint(a, "{s}/init", .{initrd_root});
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = init_script, .data =
-        \\#!/bin/sh
-        \\export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin:/run/current-system/sw/sbin
-        \\exec /usr/sbin/nodeforge-initrd
-        \\
-    }) catch |err| {
-        std.log.scoped(.initrd_build).err("create /init failed: {t}", .{err});
+    // 5. nodeforge-initrd 本身直接作为 PID 1。不能使用 `#!/bin/sh` wrapper：
+    // kernel 执行脚本时会先动态加载 vendor `/bin/sh`，使 NodeForge 代码运行前
+    // 就暴露于 initramfs 中 shell/libc 混配问题。main() 入口会立即设置完整 PATH。
+    std.log.scoped(.initrd_build).info("initrd build: stage 5/7 - installing nodeforge-initrd as /init PID 1", .{});
+    const init_path = try std.fmt.allocPrint(a, "{s}/init", .{initrd_root});
+    std.Io.Dir.copyFileAbsolute(nodeforge_initrd_binary, init_path, io, .{ .replace = true, .make_path = true }) catch |err| {
+        std.log.scoped(.initrd_build).err("install nodeforge-initrd as /init failed: {t}", .{err});
         return error.InitScriptFailed;
     };
-    runCmd(io, allocator, &.{ "chmod", "+x", init_script }) catch {};
+    try runCmd(io, allocator, &.{ "chmod", "0755", init_path });
 
     // 6. 创建 /capsule 目录（boot-prepare 注入 token 文件）
     std.log.scoped(.initrd_build).info("initrd build: stage 6/7 - creating /capsule directory", .{});
     const capsule_dir = try std.fmt.allocPrint(a, "{s}/capsule", .{initrd_root});
-    std.Io.Dir.cwd().createDirPath(io, capsule_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, capsule_dir);
 
     // 7. 发布。Vendor member 保持逐字节不变，NodeForge overlay 追加在后；
     // fallback 则重包成单一 gzip member。

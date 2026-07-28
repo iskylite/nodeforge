@@ -9,6 +9,12 @@ const dto = @import("../http/diskless_dto.zig");
 const model = @import("../model.zig");
 
 pub fn render(allocator: std.mem.Allocator, projection: dto.NodeApplyProjection) ![]u8 {
+    return renderResolved(allocator, projection, null);
+}
+
+/// `resolved_interface` 是 agent 在目标机 `/sys/class/net` 中按 MAC 查到的实际名称。
+/// 显式配置的 network.interface 优先；未配置时才使用运行期探测结果。
+pub fn renderResolved(allocator: std.mem.Allocator, projection: dto.NodeApplyProjection, resolved_interface: ?[]const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
@@ -17,6 +23,7 @@ pub fn render(allocator: std.mem.Allocator, projection: dto.NodeApplyProjection)
     // invoking usermod/systemctl and the distro package manager.
     try w.writeAll("set -eu\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nexport PATH\n");
 
+    try renderManagedRepositories(w, allocator, projection.software_transaction);
     try renderSoftware(w, projection.software_transaction);
     try emitFile(w, "/etc/hostname", projection.hostname orelse projection.node_id, 0o644);
     var free_hosts_content = false;
@@ -30,13 +37,34 @@ pub fn render(allocator: std.mem.Allocator, projection: dto.NodeApplyProjection)
     defer if (free_hosts_content) allocator.free(hosts_content);
     try emitFile(w, "/etc/hosts", hosts_content, 0o644);
 
-    try renderNetwork(w, allocator, projection);
+    try renderNetwork(w, allocator, projection, resolved_interface);
     try renderUsers(w, allocator, projection.system);
     try renderLocalization(w, projection.system);
     try renderSsh(w, allocator, projection.system.ssh);
     try renderNtp(w, allocator, projection.system.connectivity);
     try renderSecurity(w, projection.system.security);
     return out.toOwnedSlice();
+}
+
+fn renderManagedRepositories(w: *std.Io.Writer, allocator: std.mem.Allocator, transaction: dto.SoftwareTransaction) !void {
+    if (transaction.repository_urls.len == 0) return;
+    const manager = transaction.manager orelse return error.PackageManagerMissing;
+    switch (manager) {
+        .dnf => {
+            var content: std.Io.Writer.Allocating = .init(allocator);
+            defer content.deinit();
+            for (transaction.repository_urls, 0..) |url, index|
+                try content.writer.print("[nodeforge-{d}]\nname=NodeForge managed repo {d}\nbaseurl={s}\nenabled=1\ngpgcheck=0\n\n", .{ index, index, url });
+            try emitFile(w, "/etc/yum.repos.d/nodeforge.repo", content.written(), 0o644);
+        },
+        .apt => {
+            var content: std.Io.Writer.Allocating = .init(allocator);
+            defer content.deinit();
+            for (transaction.repository_urls) |url|
+                try content.writer.print("deb [trusted=yes] {s} ./\n", .{url});
+            try emitFile(w, "/etc/apt/sources.list.d/nodeforge.list", content.written(), 0o644);
+        },
+    }
 }
 
 fn renderSoftware(w: *std.Io.Writer, transaction: dto.SoftwareTransaction) !void {
@@ -115,80 +143,160 @@ fn protectedPackage(package: []const u8) bool {
     return false;
 }
 
-fn renderNetwork(w: *std.Io.Writer, allocator: std.mem.Allocator, projection: dto.NodeApplyProjection) !void {
+fn renderNetwork(w: *std.Io.Writer, allocator: std.mem.Allocator, projection: dto.NodeApplyProjection, resolved_interface: ?[]const u8) !void {
     const net = projection.network;
-    if (net.mode == .dhcp) {
-        var nm: std.Io.Writer.Allocating = .init(allocator);
-        defer nm.deinit();
-        try nm.writer.writeAll("[connection]\nid=nodeforge\ntype=ethernet\nautoconnect=true\n");
-        if (net.interface) |interface| try nm.writer.print("interface-name={s}\n", .{interface});
-        try nm.writer.writeAll("[ethernet]\n");
-        try nm.writer.print("mac-address={s}\n", .{net.match_mac orelse projection.mac});
-        try nm.writer.writeAll("[ipv4]\nmethod=auto\n[ipv6]\nmethod=ignore\n");
-        try emitFile(w, "/etc/NetworkManager/system-connections/nodeforge.nmconnection", nm.written(), 0o600);
-        var netplan: std.Io.Writer.Allocating = .init(allocator);
-        defer netplan.deinit();
-        try netplan.writer.print("network:\n  version: 2\n  ethernets:\n    nodeforge:\n      match:\n        macaddress: {s}\n      dhcp4: true\n      dhcp6: false\n", .{net.match_mac orelse projection.mac});
-        try w.writeAll("if [ -d /etc/netplan ]; then ");
-        try emitFileInline(w, "/etc/netplan/60-nodeforge.yaml", netplan.written(), 0o600);
-        try w.writeAll("; fi\n");
-        return;
-    }
-    const address = net.address orelse return error.StaticAddressMissing;
-    const prefix = net.prefix_len orelse return error.StaticPrefixMissing;
+    const interface = net.interface orelse resolved_interface orelse return error.NetworkInterfaceUnresolved;
+    const mac = net.match_mac orelse projection.mac;
+    const nm_path = try std.fmt.allocPrint(allocator, "/etc/NetworkManager/system-connections/{s}.nmconnection", .{interface});
+    defer allocator.free(nm_path);
+    const ifcfg_path = try std.fmt.allocPrint(allocator, "/etc/sysconfig/network-scripts/ifcfg-{s}", .{interface});
+    defer allocator.free(ifcfg_path);
+    const route_path = try std.fmt.allocPrint(allocator, "/etc/sysconfig/network-scripts/route-{s}", .{interface});
+    defer allocator.free(route_path);
+
     var nm: std.Io.Writer.Allocating = .init(allocator);
     defer nm.deinit();
-    try nm.writer.writeAll("[connection]\nid=nodeforge\ntype=ethernet\nautoconnect=true\n");
-    if (net.interface) |interface| try nm.writer.print("interface-name={s}\n", .{interface});
-    try nm.writer.writeAll("[ethernet]\n");
-    try nm.writer.print("mac-address={s}\n[ipv4]\nmethod=manual\naddress1={s}/{d}", .{ net.match_mac orelse projection.mac, address, prefix });
-    if (net.gateway) |gateway| try nm.writer.print(",{s}", .{gateway});
-    try nm.writer.writeByte('\n');
-    if (net.dns.len != 0) {
-        try nm.writer.writeAll("dns=");
-        for (net.dns, 0..) |server, i| try nm.writer.print("{s}{s}", .{ if (i == 0) "" else ";", server });
-        try nm.writer.writeAll(";\n");
-    }
-    for (net.routes, 0..) |route, i| {
-        try nm.writer.print("route{d}={s},{s}", .{ i + 1, route.destination, route.gateway });
-        if (route.metric) |metric| try nm.writer.print(",{d}", .{metric});
-        try nm.writer.writeByte('\n');
-    }
-    try nm.writer.writeAll("[ipv6]\nmethod=ignore\n");
-    try emitFile(w, "/etc/NetworkManager/system-connections/nodeforge.nmconnection", nm.written(), 0o600);
-    // 与 DHCP 分支对齐：纯 netplan 系统（Ubuntu/Debian 无 NetworkManager）也写入静态配置。
+    try nm.writer.print("[connection]\nid={s}\ntype=ethernet\nautoconnect=true\ninterface-name={s}\n[ethernet]\nmac-address={s}\n", .{ interface, interface, mac });
+    var ifcfg: std.Io.Writer.Allocating = .init(allocator);
+    defer ifcfg.deinit();
+    try ifcfg.writer.print("TYPE=Ethernet\nNAME={s}\nDEVICE={s}\nONBOOT=yes\nNM_CONTROLLED=yes\nHWADDR={s}\n", .{ interface, interface, mac });
+    var route_file: std.Io.Writer.Allocating = .init(allocator);
+    defer route_file.deinit();
     var netplan: std.Io.Writer.Allocating = .init(allocator);
     defer netplan.deinit();
-    try netplan.writer.print("network:\n  version: 2\n  ethernets:\n    nodeforge:\n      match:\n        macaddress: {s}\n      addresses:\n        - {s}/{d}\n", .{ net.match_mac orelse projection.mac, address, prefix });
-    var wrote_routes_header = false;
-    if (net.gateway) |gateway| {
-        try netplan.writer.print("      routes:\n        - to: default\n          via: {s}\n", .{gateway});
-        wrote_routes_header = true;
-    }
-    for (net.routes) |route| {
-        if (!wrote_routes_header) {
-            try netplan.writer.writeAll("      routes:\n");
-            wrote_routes_header = true;
-        }
-        try netplan.writer.print("        - to: {s}\n          via: {s}\n", .{ route.destination, route.gateway });
-        if (route.metric) |metric| try netplan.writer.print("          metric: {d}\n", .{metric});
-    }
-    if (net.dns.len != 0 or net.search_domains.len != 0) {
-        try netplan.writer.writeAll("      nameservers:\n");
+    try netplan.writer.print("network:\n  version: 2\n  ethernets:\n    {s}:\n      match:\n        macaddress: {s}\n      set-name: {s}\n", .{ interface, mac, interface });
+    var nmcli: std.Io.Writer.Allocating = .init(allocator);
+    defer nmcli.deinit();
+    try nmcli.writer.writeAll("nmcli --offline connection add type ethernet con-name ");
+    try quote(&nmcli.writer, interface);
+    try nmcli.writer.writeAll(" ifname ");
+    try quote(&nmcli.writer, interface);
+    try nmcli.writer.writeAll(" 802-3-ethernet.mac-address ");
+    try quote(&nmcli.writer, mac);
+
+    if (net.mode == .dhcp) {
+        try nm.writer.writeAll("[ipv4]\nmethod=auto\n[ipv6]\nmethod=ignore\n");
+        try ifcfg.writer.writeAll("BOOTPROTO=dhcp\nIPV6INIT=no\n");
+        try netplan.writer.writeAll("      dhcp4: true\n      dhcp6: false\n");
+        try nmcli.writer.writeAll(" ipv4.method auto ipv6.method disabled");
+    } else {
+        const address = net.address orelse return error.StaticAddressMissing;
+        const prefix = net.prefix_len orelse return error.StaticPrefixMissing;
+        try nm.writer.print("[ipv4]\nmethod=manual\naddress1={s}/{d}", .{ address, prefix });
+        if (net.gateway) |gateway| try nm.writer.print(",{s}", .{gateway});
+        try nm.writer.writeByte('\n');
+        try ifcfg.writer.print("BOOTPROTO=none\nIPADDR={s}\nPREFIX={d}\n", .{ address, prefix });
+        if (net.gateway) |gateway| try ifcfg.writer.print("GATEWAY={s}\n", .{gateway});
         if (net.dns.len != 0) {
-            try netplan.writer.writeAll("        addresses: [");
-            for (net.dns, 0..) |server, i| try netplan.writer.print("{s}{s}", .{ if (i == 0) "" else ", ", server });
-            try netplan.writer.writeAll("]\n");
+            try nm.writer.writeAll("dns=");
+            for (net.dns, 0..) |server, i| {
+                try nm.writer.print("{s}{s}", .{ if (i == 0) "" else ";", server });
+                try ifcfg.writer.print("DNS{d}={s}\n", .{ i + 1, server });
+            }
+            try nm.writer.writeAll(";\n");
         }
         if (net.search_domains.len != 0) {
-            try netplan.writer.writeAll("        search: [");
-            for (net.search_domains, 0..) |domain, i| try netplan.writer.print("{s}{s}", .{ if (i == 0) "" else ", ", domain });
-            try netplan.writer.writeAll("]\n");
+            try ifcfg.writer.writeAll("DOMAIN=\"");
+            for (net.search_domains, 0..) |domain, i| try ifcfg.writer.print("{s}{s}", .{ if (i == 0) "" else " ", domain });
+            try ifcfg.writer.writeAll("\"\n");
+        }
+        for (net.routes, 0..) |route, i| {
+            try nm.writer.print("route{d}={s},{s}", .{ i + 1, route.destination, route.gateway });
+            if (route.metric) |metric| try nm.writer.print(",{d}", .{metric});
+            try nm.writer.writeByte('\n');
+            try route_file.writer.print("{s} via {s}", .{ route.destination, route.gateway });
+            if (route.metric) |metric| try route_file.writer.print(" metric {d}", .{metric});
+            try route_file.writer.writeByte('\n');
+        }
+        try nm.writer.writeAll("[ipv6]\nmethod=ignore\n");
+        try ifcfg.writer.writeAll("IPV6INIT=no\n");
+        try nmcli.writer.writeAll(" ipv4.method manual ipv4.addresses ");
+        const cidr = try std.fmt.allocPrint(allocator, "{s}/{d}", .{ address, prefix });
+        defer allocator.free(cidr);
+        try quote(&nmcli.writer, cidr);
+        if (net.gateway) |gateway| {
+            try nmcli.writer.writeAll(" ipv4.gateway ");
+            try quote(&nmcli.writer, gateway);
+        }
+        for (net.dns) |server| {
+            try nmcli.writer.writeAll(" +ipv4.dns ");
+            try quote(&nmcli.writer, server);
+        }
+        for (net.search_domains) |domain| {
+            try nmcli.writer.writeAll(" +ipv4.dns-search ");
+            try quote(&nmcli.writer, domain);
+        }
+        for (net.routes) |route| {
+            const value = if (route.metric) |metric|
+                try std.fmt.allocPrint(allocator, "{s} {s} {d}", .{ route.destination, route.gateway, metric })
+            else
+                try std.fmt.allocPrint(allocator, "{s} {s}", .{ route.destination, route.gateway });
+            defer allocator.free(value);
+            try nmcli.writer.writeAll(" +ipv4.routes ");
+            try quote(&nmcli.writer, value);
+        }
+        try nmcli.writer.writeAll(" ipv6.method disabled");
+        try netplan.writer.print("      addresses:\n        - {s}/{d}\n", .{ address, prefix });
+        var wrote_routes_header = false;
+        if (net.gateway) |gateway| {
+            try netplan.writer.print("      routes:\n        - to: default\n          via: {s}\n", .{gateway});
+            wrote_routes_header = true;
+        }
+        for (net.routes) |route| {
+            if (!wrote_routes_header) {
+                try netplan.writer.writeAll("      routes:\n");
+                wrote_routes_header = true;
+            }
+            try netplan.writer.print("        - to: {s}\n          via: {s}\n", .{ route.destination, route.gateway });
+            if (route.metric) |metric| try netplan.writer.print("          metric: {d}\n", .{metric});
+        }
+        if (net.dns.len != 0 or net.search_domains.len != 0) {
+            try netplan.writer.writeAll("      nameservers:\n");
+            if (net.dns.len != 0) {
+                try netplan.writer.writeAll("        addresses: [");
+                for (net.dns, 0..) |server, i| try netplan.writer.print("{s}{s}", .{ if (i == 0) "" else ", ", server });
+                try netplan.writer.writeAll("]\n");
+            }
+            if (net.search_domains.len != 0) {
+                try netplan.writer.writeAll("        search: [");
+                for (net.search_domains, 0..) |domain, i| try netplan.writer.print("{s}{s}", .{ if (i == 0) "" else ", ", domain });
+                try netplan.writer.writeAll("]\n");
+            }
         }
     }
-    try w.writeAll("if [ -d /etc/netplan ]; then ");
+
+    // 统一 adapter 以目标 rootfs 的实际能力选择后端。现代 NetworkManager
+    // 必须实际执行目标 nmcli --offline 生成 keyfile；`--help` 返回成功不证明
+    // 当前版本能离线创建连接。ifcfg/keyfile fallback 也必须由目标
+    // NetworkManager 配置明确声明 plugin，不能只看目录是否存在。
+    try w.writeAll("rm -f /etc/NetworkManager/system-connections/nodeforge.nmconnection /etc/netplan/60-nodeforge.yaml\n");
+    try w.writeAll("if [ -d /etc/netplan ] && command -v netplan >/dev/null 2>&1; then ");
     try emitFileInline(w, "/etc/netplan/60-nodeforge.yaml", netplan.written(), 0o600);
-    try w.writeAll("; fi\n");
+    try w.writeAll("; elif command -v nmcli >/dev/null 2>&1; then install -d -m 0700 /etc/NetworkManager/system-connections; if ");
+    try w.writeAll(nmcli.written());
+    try w.writeAll(" > ");
+    try quote(w, nm_path);
+    try w.writeAll(".tmp; then chmod 0600 ");
+    try quote(w, nm_path);
+    try w.writeAll(".tmp; mv -f ");
+    try quote(w, nm_path);
+    try w.writeAll(".tmp ");
+    try quote(w, nm_path);
+    try w.writeAll("; else rm -f ");
+    try quote(w, nm_path);
+    try w.writeAll(".tmp; echo 'nodeforge: target nmcli lacks usable offline keyfile generation' >&2; exit 1; fi");
+    try w.writeAll("; elif command -v NetworkManager >/dev/null 2>&1 && NetworkManager --print-config 2>/dev/null | grep -Eq 'plugins=.*ifcfg-rh'; then ");
+    try emitFileInline(w, ifcfg_path, ifcfg.written(), 0o600);
+    if (route_file.written().len != 0) {
+        try w.writeAll("; ");
+        try emitFileInline(w, route_path, route_file.written(), 0o600);
+    } else {
+        try w.writeAll("; rm -f ");
+        try quote(w, route_path);
+    }
+    try w.writeAll("; elif command -v NetworkManager >/dev/null 2>&1 && NetworkManager --print-config 2>/dev/null | grep -Eq 'plugins=.*keyfile'; then install -d -m 0700 /etc/NetworkManager/system-connections; ");
+    try emitFileInline(w, nm_path, nm.written(), 0o600);
+    try w.writeAll("; else echo 'nodeforge: no supported target network adapter' >&2; exit 1; fi\n");
 }
 
 fn renderUsers(w: *std.Io.Writer, allocator: std.mem.Allocator, system: dto.AgentSystem) !void {
@@ -364,7 +472,7 @@ test "renderer contains no plaintext password and writes effective identity" {
         .mac = "02:00:00:00:00:01",
         .arch = .aarch64,
         .hostname = "worker-1",
-        .network = .{},
+        .network = .{ .interface = "eth0" },
         .system = .{
             .localization = .{},
             .connectivity = .{},
@@ -388,7 +496,7 @@ test "software transaction precedes target finalizer and protects boot closure" 
         .mac = "02:00:00:00:00:01",
         .arch = .aarch64,
         .hostname = null,
-        .network = .{},
+        .network = .{ .interface = "eth0" },
         .system = .{
             .localization = .{},
             .connectivity = .{},
@@ -409,9 +517,44 @@ test "software transaction precedes target finalizer and protects boot closure" 
     const install_at = std.mem.indexOf(u8, script, "dnf -y --disablerepo").?;
     const hostname_at = std.mem.indexOf(u8, script, "/etc/hostname").?;
     try std.testing.expect(install_at < hostname_at);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/yum.repos.d/nodeforge.repo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "baseurl=http://192.0.2.1/repo") == null);
 
     projection.software_transaction.remove = &.{"kernel-core"};
     try std.testing.expectError(error.ProtectedPackageRemoval, render(std.testing.allocator, projection));
+}
+
+test "managed repository persists without package delta and resolved interface is emitted" {
+    const projection: dto.NodeApplyProjection = .{
+        .node_id = "n1",
+        .mac = "02:00:00:00:00:01",
+        .arch = .aarch64,
+        .hostname = null,
+        .network = .{},
+        .system = .{
+            .localization = .{},
+            .connectivity = .{},
+            .ssh = .{ .enabled = false, .password_authentication = false, .root_login = .no },
+            .security = .{},
+            .users = &.{},
+        },
+        .software = .{},
+        .software_transaction = .{
+            .manager = .dnf,
+            .repository_urls = &.{"http://192.0.2.1/repo"},
+        },
+    };
+    const script = try renderResolved(std.testing.allocator, projection, "enp2s0");
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/yum.repos.d/nodeforge.repo") != null);
+    var encoded_interface: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded_interface.deinit();
+    try encodeOctal(&encoded_interface.writer, "interface-name=enp2s0");
+    try std.testing.expect(std.mem.indexOf(u8, script, encoded_interface.written()) != null);
+    var encoded_netplan: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded_netplan.deinit();
+    try encodeOctal(&encoded_netplan.writer, "set-name: enp2s0");
+    try std.testing.expect(std.mem.indexOf(u8, script, encoded_netplan.written()) != null);
 }
 
 test "encodeOctal round-trips arbitrary bytes through 3-digit octal" {
@@ -442,7 +585,7 @@ test "encodeOctal round-trips arbitrary bytes through 3-digit octal" {
     try std.testing.expectEqualSlices(u8, &tricky, decoded.items);
 }
 
-test "static network projection writes netplan alongside NetworkManager" {
+test "static network projection contains capability-selected netplan keyfile and ifcfg adapters" {
     const projection: dto.NodeApplyProjection = .{
         .node_id = "n1",
         .mac = "02:00:00:00:00:01",
@@ -450,6 +593,7 @@ test "static network projection writes netplan alongside NetworkManager" {
         .hostname = null,
         .network = .{
             .mode = .static,
+            .interface = "enp2s0",
             .match_mac = "02:00:00:00:00:01",
             .address = "192.0.2.10",
             .prefix_len = 24,
@@ -467,10 +611,13 @@ test "static network projection writes netplan alongside NetworkManager" {
     };
     const script = try render(std.testing.allocator, projection);
     defer std.testing.allocator.free(script);
-    // 静态分支现在与 DHCP 一致地写 netplan。文件内容字节经 encodeOctal 八进制转义
-    // （逐字节保真由上面的 encodeOctal 往返测试覆盖），这里只断言字面量：路径与 guard。
+    // 内容本身以八进制编码；这里验证三个 adapter 的路径和能力选择 guard。
     try std.testing.expect(std.mem.indexOf(u8, script, "/etc/netplan/60-nodeforge.yaml") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "if [ -d /etc/netplan ]; then") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/NetworkManager/system-connections/enp2s0.nmconnection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/sysconfig/network-scripts/ifcfg-enp2s0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "command -v netplan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "nmcli --offline connection add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "NetworkManager --print-config") != null);
 }
 
 test "sudo granted via portable sudoers drop-in; service enable best-effort" {
@@ -482,7 +629,7 @@ test "sudo granted via portable sudoers drop-in; service enable best-effort" {
         .mac = "02:00:00:00:00:01",
         .arch = .aarch64,
         .hostname = null,
-        .network = .{},
+        .network = .{ .interface = "eth0" },
         .system = .{
             .localization = .{},
             .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.example.org"} },

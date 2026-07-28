@@ -4,6 +4,54 @@
 const std = @import("std");
 const management = @import("management.zig");
 
+/// 单次 CLI 进程的 HTTP 诊断输出目标。
+///
+/// CLI 命令在解析出 `--debug` 后通过 `configureDiagnostics` 设置当前线程的
+/// stderr writer。这里使用 threadlocal 而不是进程全局变量，避免测试或未来并发
+/// CLI 调用互相串线；daemon worker 不会继承或写入 CLI 的诊断流。
+threadlocal var diagnostic_out: ?*std.Io.Writer = null;
+
+/// 启用或关闭当前线程的 management client 诊断输出。
+///
+/// 诊断默认只记录请求行、响应状态、长度和错误响应预览，不记录请求正文及认证类
+/// header，避免 `config_token`、幂等键或未来凭据意外进入终端日志。
+pub fn configureDiagnostics(out: ?*std.Io.Writer) void {
+    diagnostic_out = out;
+}
+
+/// 由 CLI 的 JSON 解码边界调用，补充类型、错误标签和受限输入预览。
+///
+/// 仅在 `--debug` 已启用时生效。预览经过 JSON 字符串转义并限制为 1024 字节，
+/// 防止 daemon 异常响应中的换行或控制字符破坏诊断输出结构。
+pub fn reportJsonFailure(comptime type_name: []const u8, err: anyerror, body: []const u8) void {
+    if (diagnostic_out == null) return;
+    const preview_len = @min(body.len, 1024);
+    debugPrint("json_decode_failed type={s} cause={t} bytes={d} preview={f} truncated={}", .{ type_name, err, body.len, std.json.fmt(body[0..preview_len], .{}), preview_len < body.len });
+}
+
+fn debugPrint(comptime format: []const u8, args: anytype) void {
+    const out = diagnostic_out orelse return;
+    out.print("debug: http " ++ format ++ "\n", args) catch {};
+}
+
+fn debugRequest(method: []const u8, path: []const u8, port: u16) void {
+    debugPrint("request method={s} path={s} address={s}:{d}", .{ method, path, management.client_ip, port });
+}
+
+fn debugConnectFailure(port: u16, err: anyerror) void {
+    debugPrint("connect_failed address={s}:{d} cause={t}", .{ management.client_ip, port, err });
+}
+
+fn debugResponse(method: []const u8, path: []const u8, reply: HttpReply) void {
+    const body = reply.body orelse "";
+    debugPrint("response method={s} path={s} status={d} bytes={d}", .{ method, path, reply.status, body.len });
+    // 成功正文可能包含交付 token 或节点配置；仅预览 daemon 的错误信封。
+    if (reply.status >= 400 and body.len != 0) {
+        const preview_len = @min(body.len, 1024);
+        debugPrint("response_error_body preview={f} truncated={}", .{ std.json.fmt(body[0..preview_len], .{}), preview_len < body.len });
+    }
+}
+
 pub const Status = struct {
     /// TCP 连接是否成功建立；false 表示进程不可达或端口未监听。
     reachable: bool,
@@ -408,10 +456,15 @@ pub fn rootfsStatusJson(io: std.Io, port: u16, name: []const u8, output: []u8) !
 }
 
 /// `profile rootfs register`：登记一个已构建 rootfs 制品（内容寻址）。
-pub fn rootfsRegister(io: std.Io, port: u16, name: []const u8, file_path: []const u8, reason_buf: []u8) Mutation {
+pub fn rootfsRegister(io: std.Io, port: u16, name: []const u8, file_path: []const u8, uncompressed_size: u64, reason_buf: []u8) Mutation {
     if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
     var body: [1024]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&body, "{{\"path\":{f}}}", .{std.json.fmt(file_path, .{})}) catch
+    // 0 表示调用方没有可信的展开大小，因此直接省略 JSON 字段。服务端将其解释
+    // 为 unknown；不能发送 0 并让下游误认为“已测量且为空”。
+    const rendered = (if (uncompressed_size == 0)
+        std.fmt.bufPrint(&body, "{{\"path\":{f}}}", .{std.json.fmt(file_path, .{})})
+    else
+        std.fmt.bufPrint(&body, "{{\"path\":{f},\"uncompressed_size\":{d}}}", .{ std.json.fmt(file_path, .{}), uncompressed_size })) catch
         return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs register request is too large") };
     var path: [256]u8 = undefined;
     const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/register", .{name}) catch return .{ .reachable = false, .healthy = false };
@@ -537,7 +590,11 @@ fn mutationUnreachable(reason_buf: []u8, message: []const u8) Mutation {
 /// `reason_buf`，供 CLI 结构化输出（§9.14.7）。
 fn managementMutation(io: std.Io, port: u16, method: []const u8, path: []const u8, body: []const u8, revision: u64, reason_buf: []u8) Mutation {
     const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return .{ .reachable = false, .healthy = false };
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return .{ .reachable = false, .healthy = false };
+    debugRequest(method, path, port);
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        debugConnectFailure(port, err);
+        return .{ .reachable = false, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+    };
     defer stream.close(io);
     var send_buffer: [4096]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
@@ -546,8 +603,11 @@ fn managementMutation(io: std.Io, port: u16, method: []const u8, path: []const u
     var recv_buffer: [4096]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
     var body_out: [4096]u8 = undefined;
-    const reply = readHttpResponse(&reader.interface, &body_out, null) catch |err|
+    const reply = readHttpResponse(&reader.interface, &body_out, null) catch |err| {
+        debugPrint("response_failed method={s} path={s} cause={t}", .{ method, path, err });
         return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+    };
+    debugResponse(method, path, reply);
     if (reply.status >= 200 and reply.status < 300) return .{ .reachable = true, .healthy = true };
     if (reply.body) |err_body|
         return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body) };
@@ -602,7 +662,10 @@ const no_reply: HttpReply = .{ .status = 0, .body = null, .location = null };
 
 fn managementJson(io: std.Io, port: u16, path: []const u8, output: []u8) !?[]const u8 {
     const reply = try getReply(io, port, path, output, null);
-    if (reply.status < 200 or reply.status >= 300) return null;
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |body| debugPrint("request_rejected path={s} status={d} body_bytes={d}", .{ path, reply.status, body.len });
+        return null;
+    }
     return reply.body;
 }
 
@@ -612,7 +675,11 @@ fn managementJson(io: std.Io, port: u16, path: []const u8, output: []u8) !?[]con
 /// 捕获 Location 头，供 202 Operation 轮询使用。
 fn managementPostJson(io: std.Io, port: u16, path: []const u8, body: []const u8, idempotency_key: ?[]const u8, output: []u8, location_out: ?[]u8) !HttpReply {
     const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return no_reply;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return no_reply;
+    debugRequest("POST", path, port);
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        debugConnectFailure(port, err);
+        return no_reply;
+    };
     defer stream.close(io);
     var send_buffer: [1024]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
@@ -622,12 +689,21 @@ fn managementPostJson(io: std.Io, port: u16, path: []const u8, body: []const u8,
     try writer.interface.flush();
     var recv_buffer: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
-    return try readHttpResponse(&reader.interface, output, location_out);
+    const reply = readHttpResponse(&reader.interface, output, location_out) catch |err| {
+        debugPrint("response_failed method=POST path={s} capacity={d} cause={t}", .{ path, output.len, err });
+        return err;
+    };
+    debugResponse("POST", path, reply);
+    return reply;
 }
 
 fn managementDeleteJson(io: std.Io, port: u16, path: []const u8, output: []u8) !HttpReply {
     const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return no_reply;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return no_reply;
+    debugRequest("DELETE", path, port);
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        debugConnectFailure(port, err);
+        return no_reply;
+    };
     defer stream.close(io);
     var send_buffer: [512]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
@@ -635,14 +711,23 @@ fn managementDeleteJson(io: std.Io, port: u16, path: []const u8, output: []u8) !
     try writer.interface.flush();
     var recv_buffer: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
-    return try readHttpResponse(&reader.interface, output, null);
+    const reply = readHttpResponse(&reader.interface, output, null) catch |err| {
+        debugPrint("response_failed method=DELETE path={s} capacity={d} cause={t}", .{ path, output.len, err });
+        return err;
+    };
+    debugResponse("DELETE", path, reply);
+    return reply;
 }
 
 /// M4.5：GET 管理 JSON 请求并返回完整响应。与 `managementPostJson` 共享
 /// `readHttpResponse`，供 202 Operation 轮询复用。
 fn getReply(io: std.Io, port: u16, path: []const u8, body_out: []u8, location_out: ?[]u8) !HttpReply {
     const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return no_reply;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return no_reply;
+    debugRequest("GET", path, port);
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        debugConnectFailure(port, err);
+        return no_reply;
+    };
     defer stream.close(io);
     var send_buffer: [512]u8 = undefined;
     var writer = stream.writer(io, &send_buffer);
@@ -650,7 +735,12 @@ fn getReply(io: std.Io, port: u16, path: []const u8, body_out: []u8, location_ou
     try writer.interface.flush();
     var recv_buffer: [16 * 1024]u8 = undefined;
     var reader = stream.reader(io, &recv_buffer);
-    return try readHttpResponse(&reader.interface, body_out, location_out);
+    const reply = readHttpResponse(&reader.interface, body_out, location_out) catch |err| {
+        debugPrint("response_failed method=GET path={s} capacity={d} cause={t}", .{ path, body_out.len, err });
+        return err;
+    };
+    debugResponse("GET", path, reply);
+    return reply;
 }
 
 /// 请求 daemon 导入资产并写入 catalog。
@@ -771,7 +861,10 @@ fn readHttpResponse(reader: *std.Io.Reader, output: []u8, location_out: ?[]u8) !
         };
     }
     const length = content_length orelse if (status == 204) @as(usize, 0) else return error.MissingContentLength;
-    if (length > output.len) return error.ResponseTooLarge;
+    if (length > output.len) {
+        debugPrint("response_too_large content_length={d} capacity={d}", .{ length, output.len });
+        return error.ResponseTooLarge;
+    }
     if (length == 0) return .{ .status = status, .body = output[0..0], .location = location };
     reader.readSliceAll(output[0..length]) catch return error.TruncatedResponse;
     return .{ .status = status, .body = output[0..length], .location = location };
@@ -785,6 +878,20 @@ test "bounded response reader handles multiline and protocol failures" {
     try std.testing.expectError(error.UnsupportedTransferEncoding, readHttpResponse(&chunked, &output, null));
     var truncated: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort");
     try std.testing.expectError(error.TruncatedResponse, readHttpResponse(&truncated, &output, null));
+}
+
+test "debug diagnostics include bounded JSON failure context" {
+    var buffer: [2048]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    configureDiagnostics(&writer);
+    defer configureDiagnostics(null);
+
+    reportJsonFailure("NodeListPage", error.UnexpectedToken, "{\nsecret-control");
+    const rendered = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "type=NodeListPage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "cause=UnexpectedToken") != null);
+    // 原始换行必须被 JSON 转义，保证每条 debug 记录保持单行。
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "{\\nsecret-control") != null);
 }
 
 test "bounded response reader honors caller capacity above 150 KiB" {

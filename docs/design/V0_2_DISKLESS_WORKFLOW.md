@@ -73,6 +73,13 @@ software capability index。diskless builder 不使用公网 mirror、metalink
 或运行时 distro update。导入成功不代表
 diskless ready；它只建立可重复构建的本地输入。
 
+导入得到的 kernel 资产同时记录完整 `kernel_release`，其语义严格等同于目标内核的
+`uname -r`，用于关联 initrd/rootfs 中的 `/lib/modules/<kernel_release>`。该字段保持发行版
+原始 ABI 命名：RHEL family 通常包含 `.x86_64`/`.aarch64`，Ubuntu 通常以 `-generic`
+等 flavor 结尾而不包含 DEB 包架构。检测优先读取实际 `vmlinuz` 和配套 initrd，包名只作为
+唯一候选时的最后 fallback；多内核或证据歧义时不得按目录顺序或最高版本猜测。完整检测规则见
+[V0_2_DESIGN.md 的 R6.1](V0_2_DESIGN.md#r61-iso-内核-release-检测与-abi-语义)。
+
 ## 4. 阶段 2：定义 build-time 与 first-boot 定制
 
 `rootfs-build` 用于所有共享节点都应具有、且必须在发布前完成的内容；`first-boot` 用于需要目标运行环境
@@ -122,6 +129,16 @@ nodeforge assets boot-bundle create rocky-9.7-diskless-x86_64 \
   --distro rocky --version 9.7 --arch x86_64 --kernel-release <r>
 nodeforge assets boot-bundle show rocky-9.7-diskless-x86_64
 ```
+
+使用 `--from-install-source` 时，initrd 发布到
+`assets/boot/diskless/sources/<source>/<kernel-release>/<name>.img`；不绑定
+source 的通用构建发布到
+`assets/boot/diskless/manual/<distro>/<version>/<arch>/<kernel-release>/<name>.img`。
+这个结构把来源放在最前层，运维人员无需查询 catalog 即可定位制品所属 ISO/source。
+
+用户提供的 `--kernel-release` 视为显式选择。它与 ISO installer kernel 中检测出的
+release 不一致时输出警告但不拒绝构建；initrd 与 BootBundle 的 release 一致性仍是
+硬约束。
 
 initrd manifest 必须证明包含启动 NIC driver/firmware、DHCP、HTTP、SHA-512、loop、squashfs、tmpfs、overlay、
 目标 network renderer handoff 和 `nodeforge-initrd`。BootBundle 校验 kernel release、rootfs 将使用的 modules ABI、
@@ -191,9 +208,15 @@ nodeforge profile rootfs build compute-diskless
 nodeforge profile rootfs status compute-diskless
 ```
 
+外部 squashfs 可用 `profile rootfs register <profile> --path <file>
+[--uncompressed-size <bytes>]` 登记。若第一次未提供展开大小，后续可对同一文件再次登记
+并补充可信数值；成功状态为 `metadata_updated`。内容摘要或不可变元数据不一致时请求
+在正式文件替换前被拒绝。
+
 builder 的固定过程（6 阶段流水线，对应 `src/http/server.zig` `managementRootfsBuild`）：
 
-1. 对 input digest 获取 build lease；相同输入并发请求 join 同一个 build。
+1. 对 input digest 获取 build lease；每个请求使用独立暂存目录和临时文件，相同输入
+   的并发提交由发布锁串行化，不共享中间产物。
 2. **Stage 1 — OS 层**：创建私有 staging/mount namespace，固定 install source/repository/asset revisions，关闭公网出口。
    RHEL/Rocky 用目标版本 `dnf --installroot` 构建基础 root；Ubuntu 用 fixed-revision debootstrap/apt 本地源。
    lorax/livecd 工具只可作为经 adapter 声明的实现，不能默认拿安装 ISO 制作工具代替 rootfs builder。
@@ -210,9 +233,11 @@ builder 的固定过程（6 阶段流水线，对应 `src/http/server.zig` `mana
    密钥烤入只读 lower，同 Profile 节点共享同一信任域，彼此免密。
 7. 检查 `/sbin/init`、agent unit、renderer、shared libraries、modules dependency、UID/GID 冲突、local-only URL、
    world-writable/suid policy 和未声明文件。
-8. **Stage 6 — squashfs 压缩 + SHA-512 + 原子发布**：用固定排序、时间戳/owner 和 compression 参数运行 `mksquashfs`
-   （zstd 压缩），得到可复现 squashfs。计算完整 SHA-512、size/uncompressed estimate，生成 manifest/SBOM/file inventory；
+8. **Stage 6 — squashfs 压缩 + SHA-512 + 原子发布**：在压缩前测量目录树 apparent size，再用固定排序、时间戳/owner
+   和 compression 参数运行 `mksquashfs`（zstd 压缩），得到可复现 squashfs。计算完整 SHA-512、compressed size，
+   测量成功时记录 uncompressed size，生成 manifest/SBOM/file inventory；
    unsquashfs 再读验证。原子发布 object 后再发布 ready manifest，释放 lease；失败只保留有界脱敏日志，staging 进入可审计清理。
+   uncompressed size 测量失败只降级为 unknown 并告警，不得终止构建，也不得拿 compressed size 代替。
 
 ## 9. 阶段 7：boot readiness 与启用 PXE
 
@@ -228,8 +253,11 @@ BootConfig 可渲染；MAC/arch/IP/renderer 一致；有可信内存 inventory �
 desired plan 未漂移。`node deploy true` 由服务端原子使用执行时最新 plan。
 设置成功只允许未来 PXE，不主动重启节点。
 
-全新 Node 常常没有可信内存 inventory。此时 boot readiness 返回 `memory=unknown` 和 `required_min_memory_bytes` warning，
-允许启用，但 initrd 必须读取实际 `MemAvailable` 做硬闸；不得把 unknown 当作“预算已通过”。
+全新 Node 常常没有可信内存 inventory。若 rootfs uncompressed size 已知，此时 boot readiness 返回
+`memory=unknown` 和已计算的 `required_min_memory_bytes` warning，允许启用，并由 initrd 读取实际
+`MemAvailable` 做硬闸。若 rootfs uncompressed size 也未知，则 readiness 返回
+`uncompressed_bytes=null`、`required_min_memory_bytes=null` 和 warning，initrd 跳过容量硬闸；
+unknown 不代表“预算已通过”，只表示没有足够证据做硬拒绝。
 
 若操作员修改 Profile/Node/bundle/source revision，desired plan 改变：新 DHCP bootfile 立即被 readiness gate 阻止，
 旧 active session 按自己的 delivery snapshot 完成；新 rootfs build/validation 完成后才能重新启用。
@@ -274,8 +302,12 @@ nodeforge node retry c001                                      # 重新启用 de
 
 - `deploy=false` 只阻止新 PXE，不杀死已经切根或正在下载的 fixed delivery session。
 - retry 重新启用 deploy 并 rearm PXE generation；`--force` 可超越卡住的 active session。
-- daemon 重启后仅在客户端已完整取得 raw token 时用 delivery record + token hash + snapshot refs 恢复同一交付；
-  capsule 未交付或中断且客户端无完整 token时旧 session 为 `recovery_incomplete`，不能重建 secret 或重新编译 plan 续跑。
+- daemon 重启后恢复未过期的活动 delivery；raw token 由持久 master secret 和
+  session/scope 确定性重建，并核对 checkpoint 中的 HMAC hash。
+- `running/failed/expired` 是 `node list` 的长期事实，不随 capability TTL 清除；终态时间和
+  checkpoint revision 持久化。下一次同节点 delivery 原位替换旧终态。
+- `node list.view_revision.diskless` 随 diskless checkpoint 成功提交而变化，客户端不能只观察
+  catalog/deployment revision。
 - v0.2 已发布 rootfs 只增不删；空间不足时阻止新 build，不自动回收。
 
 ## 12. 最小故障注入矩阵

@@ -192,7 +192,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
             std.crypto.hash.sha2.Sha256.hash(plan_json, &digest, .{});
             if (record.install_plan_digest == null or !std.crypto.timing_safe.eql([32]u8, digest, record.install_plan_digest.?)) return error.InvalidBootSessionState;
             try validatePlanAssets(allocator, plan_json, catalog, record_digest);
-            try store.captureInstallPlan(allocator, record.boot_session_id, plan_json, record.model_revision);
+            try store.captureInstallPlan(allocator, record.boot_session_id, plan_json, record.model_revision, null);
         } else if (record.mode == .install) return error.InvalidBootSessionState;
         restored += 1;
     }
@@ -282,7 +282,7 @@ test "delivery checkpoint restores capability and remaining TTL" {
     try before.setDeploymentGeneration(acquired.link.id().?, 1);
     const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
     const plan = "{\"plan_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
-    try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42);
+    try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42, null);
     try save(std.testing.io, std.testing.allocator, path, &before, 1002);
     var after: boot_session.Store = .{};
     defer after.deinit();
@@ -324,7 +324,7 @@ test "resume rejects install session whose deployment provenance was reset" {
     try before.setDeploymentGeneration(acquired.link.id().?, 3);
     const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
     const plan = "{\"plan_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
-    try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42);
+    try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42, null);
     try save(std.testing.io, std.testing.allocator, path, &before, 1002);
 
     var reset_deployments: deployment_control.Store = .{};

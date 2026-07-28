@@ -1,5 +1,6 @@
-//! NodeForge M0 服务日志门面。
-//! 默认只输出日常 info/error；debug 由启动配置或 daemon `--debug` 启用。
+//! NodeForge 服务日志门面。
+//! 实际等级由 `config.logging.level` 决定；fresh setup 在开发阶段写入 debug，
+//! 既有/导入配置保留自身等级，daemon `--debug` 只对本次启动强制覆盖。
 
 const std = @import("std");
 const backend = @import("log_backend.zig");
@@ -41,4 +42,6 @@ pub fn debug(comptime format: []const u8, args: anytype) void {
 }
 
 /// 将 `model.LogLevel` 转换为 `std.log.Level`，供 `log_backend` 使用。
-fn toStdLevel(level: Level) std.log.Level { return level.toStdLevel(); }
+fn toStdLevel(level: Level) std.log.Level {
+    return level.toStdLevel();
+}

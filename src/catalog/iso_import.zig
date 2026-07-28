@@ -46,11 +46,16 @@ pub const Request = struct {
 /// - ISO asset（通过 HTTP /artifacts/images/ 下载）
 /// - 可选的 UEFI GRUB bootloader asset（通过 TFTP 提供）
 /// - installer kernel/initrd assets（通过 TFTP 提供）
-/// - 可选的 repository（通过 HTTP /artifacts/repositories/ 提供）
+/// - 零个、一个或多个 repository（通过 HTTP /artifacts/repositories/ 提供）
 /// - install source（关联 ISO/kernel/initrd/repo 的 catalog 对象）
 ///
+/// 多 variant ISO（如 Rocky 10.2 DVD 的 AppStream+BaseOS）产生多个 repository，
+/// 每个对应一个 variant 子目录。单 variant ISO 产生一个 repository（向后兼容：
+/// repository 名等于 source_name）。无 repository 的 ISO（如缺少 repodata 的
+/// 仅安装器介质）产生空 slice。
+///
 /// 所有权约定：Result 中所有 `[]const u8` 字段（source_name、各 asset 的
-/// name/path/sha256、install_source 的各引用字段、repository 的 base_url 等）
+/// name/path/sha256、install_source 的各引用字段、各 repository 的 base_url 等）
 /// 均由 `importMedia` 的 `allocator` 分配，所有权随 Result 返回转移给调用方。
 /// 调用方在 catalog 发布完成后负责释放这些字符串。`importMedia` 内部不得
 /// 对转移给 Result 的字符串执行 `defer free`，否则会导致 use-after-free
@@ -69,7 +74,15 @@ pub const Result = struct {
     bootloader_created: bool = false,
     kernel_asset: model.AssetConfig,
     initrd_asset: model.AssetConfig,
-    repository: ?model.RepositoryConfig,
+    /// 零个、一个或多个 RepositoryConfig。多 variant ISO（如 Rocky DVD 的
+    /// AppStream+BaseOS）每个 variant 对应一个 repository。单 variant ISO
+    /// 向后兼容：repository 名等于 source_name。空 slice 表示仅安装器介质
+    /// （无可消费的包仓库元数据）。
+    ///
+    /// 所有 repository 的文件都存储在同一个 source_name 目录下
+    /// （`repository_root/source_name/`），通过 base_url 中的 variant 子路径区分。
+    /// HTTP 服务器按 install source 名路由文件请求，不依赖 repository 名。
+    repositories: []model.RepositoryConfig,
     install_source: model.InstallSourceConfig,
 };
 
@@ -144,8 +157,15 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
         const stem = request.original_filename[0 .. request.original_filename.len - ".iso".len];
         break :blk try logicalComponent(allocator, stem);
     };
+    // 从 ISO 实际携带的 kernel/initrd 配对中检测 kernel release。仓库包名只作为
+    // 最后的弱证据；无法唯一确定时宁可保留 null，也不把仓库中的另一个内核误认为
+    // 安装器正在启动的内核。
+    const kernel_release = detectKernelRelease(io, allocator, staged_repo, detected);
+    const kernel_filename = if (kernel_release) |kr| blk: {
+        break :blk try std.fmt.allocPrint(allocator, "vmlinuz-{s}", .{kr});
+    } else "vmlinuz";
     const iso_rel = try std.fmt.allocPrint(allocator, "{s}.iso", .{source_name});
-    const kernel_rel = try std.fmt.allocPrint(allocator, "install/{s}/vmlinuz", .{source_name});
+    const kernel_rel = try std.fmt.allocPrint(allocator, "install/{s}/{s}", .{ source_name, kernel_filename });
     const initrd_rel = try std.fmt.allocPrint(allocator, "install/{s}/initrd.img", .{source_name});
     const bootloader_media_rel = findBootloaderMediaPath(io, staged_repo, detected.arch);
     // bootloader 路径在计算 SHA-256 后确定（内容寻址），见下方 bootloader_rel 赋值。
@@ -246,30 +266,73 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     try assets.sha256File(io, config.tftp.asset_root, kernel_rel, &kernel_hash);
     try assets.sha256File(io, config.tftp.asset_root, initrd_rel, &initrd_hash);
 
-    const repository_index: model.SoftwareIndex = if (media.repository_base) |base| blk: {
-        const index_root = if (base.len == 0)
-            try allocator.dupe(u8, repo_destination)
-        else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_destination, base });
-        defer allocator.free(index_root);
-        break :blk try software_index.build(io, allocator, index_root, model.packageManagerForFamily(detected.family));
-    } else .{};
-
-    const repository_names = if (media.repository_base != null) blk: {
-        const names = try allocator.alloc([]const u8, 1);
-        names[0] = source_name;
-        break :blk names;
-    } else &.{};
     const distro_name = try allocator.dupe(u8, detected.distro);
     const distro_version = try allocator.dupe(u8, detected.version);
     const media_tree_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ config.server.server_ip, config.server.http_port, source_name });
+
+    // 为每个 variant 构建独立的 software index 和 RepositoryConfig。
+    //
+    // 命名规则（logical ID 不允许大写字母，见 config/validate.zig::validLogicalId）：
+    // - 单 variant ISO：repository 名 = source_name（向后兼容）
+    // - 多 variant ISO：repository 名 = source_name-<variant_path_lowered>
+    //   例如 source_name=rocky-10.2-aarch64-dvd1, base=AppStream -> rocky-10.2-aarch64-dvd1-appstream
+    //
+    // base_url 保持原始大小写以匹配磁盘上的 ISO 目录结构：
+    //   http://<ip>:<port>/artifacts/repositories/<source_name>/<Variant>
+    //
+    // 所有 variant 的文件共享同一个 source_name 目录（ISO 媒体树是整体复制的），
+    // HTTP 服务器通过 install source 名路由，不依赖 repository 名中的 variant 后缀。
+    const repo_configs: []model.RepositoryConfig = if (media.repository_paths) |repo_paths| blk: {
+        const configs = try allocator.alloc(model.RepositoryConfig, repo_paths.len);
+        for (repo_paths, 0..) |base, i| {
+            const index_root = if (base.len == 0)
+                try allocator.dupe(u8, repo_destination)
+            else
+                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_destination, base });
+            defer allocator.free(index_root);
+            const sw_index = try software_index.build(io, allocator, index_root, model.packageManagerForFamily(detected.family));
+            // 单 repository 时名 = source_name（向后兼容）；多 repository 时名 = source_name-<base_lowered>
+            // base 路径可能含大写（如 AppStream、BaseOS），但 logical ID 不允许大写，
+            // 因此转为小写用于命名。base_url 保持原始大小写以匹配磁盘路径。
+            const repo_name = if (repo_paths.len == 1)
+                try allocator.dupe(u8, source_name)
+            else if (base.len == 0)
+                try std.fmt.allocPrint(allocator, "{s}-root", .{source_name})
+            else blk_lowered: {
+                const lowered = try allocator.alloc(u8, base.len);
+                for (base, 0..) |c, j| lowered[j] = std.ascii.toLower(c);
+                defer allocator.free(lowered);
+                break :blk_lowered try std.fmt.allocPrint(allocator, "{s}-{s}", .{ source_name, lowered });
+            };
+            const repo_url = if (base.len == 0)
+                try allocator.dupe(u8, media_tree_url)
+            else
+                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base });
+            configs[i] = .{
+                .name = repo_name,
+                .distro = try allocator.dupe(u8, distro_name),
+                .version = try allocator.dupe(u8, distro_version),
+                .arch = detected.arch,
+                .manager = model.packageManagerForFamily(detected.family),
+                .base_url = repo_url,
+                .software_index = sw_index,
+            };
+        }
+        break :blk configs;
+    } else &.{};
+
+    const repository_names: []const []const u8 = if (media.repository_paths != null) blk: {
+        const names = try allocator.alloc([]const u8, repo_configs.len);
+        for (repo_configs, 0..) |repo, i| names[i] = repo.name;
+        break :blk names;
+    } else &.{};
     const result: Result = .{
         .source_name = source_name,
         .family = detected.family,
         .source_label = detected.source_label,
         .iso_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .kind = .iso, .path = iso_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &iso_hash) },
         .bootloader_asset = if (bootloader_media_rel != null) .{
-            .name = try contentAddressedBootloaderName(allocator, detected.arch, &bootloader_hash),
+            .name = try contentAddressedBootloaderName(allocator, source_name, detected.arch, &bootloader_hash),
             .kind = .bootloader,
             .path = bootloader_rel,
             .distro = distro_name,
@@ -281,9 +344,9 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
         // kernel 资产名称使用 -kernel（而非 -installer-kernel），因为 kind=kernel 的
         // 资产既用于 install PXE boot 也用于 diskless PXE boot。boot bundle 的 kernel
         // 字段引用此资产。命名应反映通用性，不暗示仅限 installer 使用。
-        .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &kernel_hash) },
+        .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .kernel_release = if (kernel_release) |kr| try allocator.dupe(u8, kr) else null, .sha256 = try allocator.dupe(u8, &kernel_hash) },
         .initrd_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .kind = .installer_initrd, .path = initrd_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &initrd_hash) },
-        .repository = if (media.repository_base) |base| .{ .name = source_name, .distro = distro_name, .version = distro_version, .arch = detected.arch, .manager = model.packageManagerForFamily(detected.family), .base_url = if (base.len == 0) try allocator.dupe(u8, media_tree_url) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ media_tree_url, base }), .software_index = repository_index } else null,
+        .repositories = repo_configs,
         .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names },
     };
     retain_outputs = true;
@@ -329,12 +392,23 @@ fn removeTreeBestEffort(io: std.Io, allocator: std.mem.Allocator, path: []const 
 }
 
 /// 媒体布局描述。描述 installer kernel/initrd 在挂载的 ISO 中的相对路径，
-/// 以及 repository 的基础路径（null 表示仅安装器介质，空字符串表示 repo 根）。
+/// 以及 repository 的 variant 路径列表。
 const MediaLayout = struct {
     kernel_path: []const u8,
     initrd_path: []const u8,
-    /// `null` 表示仅安装器介质（无 repository）；空字符串表示 repository 根。
-    repository_base: ?[]const u8,
+    /// `null` 表示仅安装器介质（无可消费的包仓库元数据）；非空 slice 中每个
+    /// 元素是一个 variant 的 repository 子目录相对路径（空字符串表示
+    /// repository 在 ISO 根目录）。
+    ///
+    /// 多 variant RHEL-family ISO（如 Rocky 10.2 DVD）在 `.treeinfo` 的
+    /// `[general]` 段声明 `variants = AppStream,BaseOS`，每个 variant 在
+    /// `[variant-<name>]` 段有独立的 `repository` 键。此 slice 收集所有
+    /// 存在 `repodata/repomd.xml` 的 variant 路径，用于在 `importMedia` 中
+    /// 为每个 variant 构建独立的 `SoftwareIndex` 和 `RepositoryConfig`。
+    ///
+    /// 单 variant ISO 回退到 `[general]` 段的 `repository` 值或文件系统扫描
+    /// 结果，slice 长度为 1，保持向后兼容。
+    repository_paths: ?[][]const u8,
 };
 
 /// 检测到的媒体信息。包含从 ISO 元数据提取的 distro/version/arch 和媒体布局。
@@ -372,10 +446,25 @@ fn detectMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8
 /// `.treeinfo` 是 INI 格式文件，包含 arch/family/version/repository 等字段。
 /// 检测步骤：
 /// 1. 验证 `.treeinfo`、`images/pxeboot/vmlinuz`、`images/pxeboot/initrd.img` 存在
-/// 2. 读取 `.treeinfo` 并提取 repository/version/arch
-/// 3. 验证 repository 路径安全性和 repomd.xml 存在
+/// 2. 读取 `.treeinfo` 并提取所有 variant 的 repository 路径（多 variant 支持）
+/// 3. 验证每个 repository 路径安全性和 repomd.xml 存在
 /// 4. 将已知 family 标签映射为产品 id；未知标签仅在 `--distro` 覆盖时接受
 /// 5. 解析 arch 为 model.Arch 枚举；family 固定为 rhel
+///
+/// 多 variant ISO 的 `.treeinfo` 结构示例（Rocky 10.2 DVD）：
+/// ```ini
+/// [general]
+/// variants = AppStream,BaseOS
+/// repository = AppStream
+///
+/// [variant-AppStream]
+/// repository = AppStream
+///
+/// [variant-BaseOS]
+/// repository = BaseOS
+/// ```
+/// `detectRhelRepositoryPaths` 遍历 variants 列表，从每个 `[variant-<name>]`
+/// 段提取 repository 路径并验证 `repodata/repomd.xml` 存在。
 fn detectRhelMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, requested: Request) !DetectedMedia {
     _ = try assets.verifyRegularFile(io, mount_point, ".treeinfo");
     _ = try assets.verifyRegularFile(io, mount_point, "images/pxeboot/vmlinuz");
@@ -384,8 +473,11 @@ fn detectRhelMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []cons
     defer allocator.free(treeinfo_path);
     const treeinfo = try std.Io.Dir.cwd().readFileAlloc(io, treeinfo_path, allocator, .limited(256 * 1024));
     defer allocator.free(treeinfo);
-    const repository_path = try detectRhelRepositoryBase(io, allocator, mount_point, treeinfo);
-    defer if (repository_path) |path| allocator.free(path);
+    const repository_paths = try detectRhelRepositoryPaths(io, allocator, mount_point, treeinfo);
+    defer if (repository_paths) |repo_paths| {
+        for (repo_paths) |path| allocator.free(path);
+        allocator.free(repo_paths);
+    };
     const product_label = valueFor(treeinfo, "family");
     const distro = requested.distro orelse
         (if (product_label) |label| distroForRhelFamily(label) else null) orelse
@@ -401,11 +493,51 @@ fn detectRhelMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []cons
         .version = try allocator.dupe(u8, version),
         .arch = arch,
         .source_label = if (product_label) |label| try allocator.dupe(u8, label) else null,
-        .layout = .{ .kernel_path = "images/pxeboot/vmlinuz", .initrd_path = "images/pxeboot/initrd.img", .repository_base = if (repository_path) |path| try allocator.dupe(u8, path) else null },
+        .layout = .{ .kernel_path = "images/pxeboot/vmlinuz", .initrd_path = "images/pxeboot/initrd.img", .repository_paths = if (repository_paths) |repo_paths| try dupePaths(allocator, repo_paths) else null },
     };
 }
 
-fn detectRhelRepositoryBase(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, treeinfo: []const u8) !?[]const u8 {
+/// 从 `.treeinfo` 解析所有 variant 的 repository 路径。
+///
+/// 多 variant ISO（如 Rocky 10.2 DVD）在 `[general]` 段声明 `variants = AppStream,BaseOS`，
+/// 每个 variant 在 `[variant-<name>]` 段有自己的 `repository` 键。此函数收集所有
+/// 存在 `repodata/repomd.xml` 的 variant 路径。
+///
+/// 单 variant 或无 `variants` 键的 ISO 回退到 `[general]` 段的 `repository` 值
+/// （当前行为），保持向后兼容。
+fn detectRhelRepositoryPaths(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, treeinfo: []const u8) !?[][]const u8 {
+    // 1. 尝试从 [general] 段解析 variants 列表
+    if (valueFor(treeinfo, "variants")) |variants_text| {
+        var collected: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (collected.items) |path| allocator.free(path);
+            collected.deinit(allocator);
+        }
+        var iter = std.mem.splitScalar(u8, variants_text, ',');
+        while (iter.next()) |raw_name| {
+            const variant = std.mem.trim(u8, raw_name, " \t\r");
+            if (variant.len == 0) continue;
+            // 在 [variant-<name>] 段查找 repository 键
+            const section = try std.fmt.allocPrint(allocator, "variant-{s}", .{variant});
+            defer allocator.free(section);
+            const repo_path = valueForInSection(treeinfo, section, "repository") orelse continue;
+            if (repo_path.len != 0) try assets.validateRelativePath(repo_path);
+            // 验证 repomd.xml 存在
+            const repomd_path = if (repo_path.len == 0)
+                try allocator.dupe(u8, "repodata/repomd.xml")
+            else
+                try std.fmt.allocPrint(allocator, "{s}/repodata/repomd.xml", .{repo_path});
+            defer allocator.free(repomd_path);
+            _ = assets.verifyRegularFile(io, mount_point, repomd_path) catch continue;
+            try collected.append(allocator, try allocator.dupe(u8, repo_path));
+        }
+        if (collected.items.len > 0) {
+            const result = try allocator.alloc([]const u8, collected.items.len);
+            for (collected.items, 0..) |path, i| result[i] = try allocator.dupe(u8, path);
+            return result;
+        }
+    }
+    // 2. 回退：[general] 段的 repository 值（单 repository）
     if (valueFor(treeinfo, "repository")) |configured| {
         if (configured.len != 0) try assets.validateRelativePath(configured);
         const repomd_path = if (configured.len == 0)
@@ -414,9 +546,42 @@ fn detectRhelRepositoryBase(io: std.Io, allocator: std.mem.Allocator, mount_poin
             try std.fmt.allocPrint(allocator, "{s}/repodata/repomd.xml", .{configured});
         defer allocator.free(repomd_path);
         _ = assets.verifyRegularFile(io, mount_point, repomd_path) catch return null;
-        return try allocator.dupe(u8, configured);
+        const result = try allocator.alloc([]const u8, 1);
+        result[0] = try allocator.dupe(u8, configured);
+        return result;
     }
-    return findRhelRepositoryBase(io, allocator, mount_point);
+    // 3. 无 repository 键时扫描文件系统查找 repodata
+    if (try findRhelRepositoryBase(io, allocator, mount_point)) |base| {
+        const result = try allocator.alloc([]const u8, 1);
+        result[0] = base;
+        return result;
+    }
+    return null;
+}
+
+/// 在 INI 文件的指定 section 内查找 key = value。
+fn valueForInSection(text: []const u8, section: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var in_section = false;
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+            in_section = std.mem.eql(u8, trimmed[1 .. trimmed.len - 1], section);
+            continue;
+        }
+        if (!in_section) continue;
+        const equal = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..equal], " \t\r"), key)) continue;
+        return std.mem.trim(u8, line[equal + 1 ..], " \t\r");
+    }
+    return null;
+}
+
+fn dupePaths(allocator: std.mem.Allocator, src_paths: []const []const u8) ![][]const u8 {
+    const result = try allocator.alloc([]const u8, src_paths.len);
+    for (src_paths, 0..) |path, i| result[i] = try allocator.dupe(u8, path);
+    return result;
 }
 
 fn findRhelRepositoryBase(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8) !?[]const u8 {
@@ -498,9 +663,13 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
         .distro = distro,
         .version = try allocator.dupe(u8, version),
         .arch = arch,
-        // 空字符串表示 ISO 根目录是完整 apt repository；null 表示仅发布
+        // 空 slice 表示 ISO 根目录是完整 apt repository；null 表示仅发布
         // installer media tree，不把不完整内容伪装成包仓库。
-        .layout = .{ .kernel_path = "casper/vmlinuz", .initrd_path = "casper/initrd", .repository_base = if (has_repository) "" else null },
+        .layout = .{ .kernel_path = "casper/vmlinuz", .initrd_path = "casper/initrd", .repository_paths = if (has_repository) blk: {
+            const r = try allocator.alloc([]const u8, 1);
+            r[0] = try allocator.dupe(u8, "");
+            break :blk r;
+        } else null },
     };
 }
 
@@ -530,6 +699,7 @@ fn distroForRhelFamily(family: []const u8) ?[]const u8 {
         .{ .prefix = "BigCloud-Enterprise-Linux", .distro = "bclinux" },
         .{ .prefix = "TurboLinux", .distro = "turbolinux" },
         .{ .prefix = "npserver", .distro = "npserver" },
+        .{ .prefix = "ScaleOS", .distro = "scaleos" },
     };
     for (mappings) |mapping| if (std.mem.startsWith(u8, family, mapping.prefix)) return mapping.distro;
     return null;
@@ -757,10 +927,12 @@ fn contentAddressedBootloaderPath(allocator: std.mem.Allocator, source_name: []c
     return std.fmt.allocPrint(allocator, "efi/{s}/{s}-{s}", .{ source_name, prefix, filename });
 }
 
-/// 生成内容寻址的 bootloader catalog 名称：`grub-uefi-<arch>-<sha256[:16]>`。
-fn contentAddressedBootloaderName(allocator: std.mem.Allocator, arch: model.Arch, hash: *const [64]u8) ![]const u8 {
+/// 生成 source-scoped bootloader catalog 名称：
+/// `<source>-grub-uefi-<arch>-<sha256[:16]>`。名称与 `efi/<source>/...` 路径使用
+/// 相同 ownership scope，避免两个 source 携带相同 GRUB 时出现全局名称冲突。
+fn contentAddressedBootloaderName(allocator: std.mem.Allocator, source_name: []const u8, arch: model.Arch, hash: *const [64]u8) ![]const u8 {
     const prefix = hash[0..16];
-    return std.fmt.allocPrint(allocator, "grub-uefi-{s}-{s}", .{ @tagName(arch), prefix });
+    return std.fmt.allocPrint(allocator, "{s}-grub-uefi-{s}-{s}", .{ source_name, @tagName(arch), prefix });
 }
 
 /// 返回 bootloader 文件名（不含路径），用于 TFTP path 构造。
@@ -798,9 +970,18 @@ test "content-addressed UEFI bootloader paths use SHA-256 prefix" {
     defer std.testing.allocator.free(path_x86_64);
     try std.testing.expectEqualStrings("efi/rocky-9.7/abcdef0123456789-grubx64.efi", path_x86_64);
 
-    const name_aarch64 = try contentAddressedBootloaderName(std.testing.allocator, .aarch64, hash);
+    const name_aarch64 = try contentAddressedBootloaderName(std.testing.allocator, "rocky-9.7", .aarch64, hash);
     defer std.testing.allocator.free(name_aarch64);
-    try std.testing.expectEqualStrings("grub-uefi-aarch64-abcdef0123456789", name_aarch64);
+    try std.testing.expectEqualStrings("rocky-9.7-grub-uefi-aarch64-abcdef0123456789", name_aarch64);
+}
+
+test "same bootloader content remains uniquely attributable to each source" {
+    const hash = "abcdef0123456789" ** 4;
+    const first = try contentAddressedBootloaderName(std.testing.allocator, "rocky-9.7-minimal", .aarch64, hash);
+    defer std.testing.allocator.free(first);
+    const second = try contentAddressedBootloaderName(std.testing.allocator, "rocky-9.7-dvd", .aarch64, hash);
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
 test "content-addressed paths differ for different content" {
@@ -827,12 +1008,474 @@ fn run(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void
 }
 /// 安全文件名校验：拒绝空字符串、包含路径分隔符（`/` 或 `\`）、
 /// 包含 null 字节、或等于 `.`/`..` 的值。这防止路径穿越攻击。
+/// `kernel_release` 的值是完整的 Linux UTS release（即目标内核 `uname -r`），
+/// 不是 NodeForge 归一化后的版本号。发行版决定 ABI 字符串的组成：例如 RHEL
+/// 通常把 `.x86_64`/`.aarch64` 包含在 release 中，而 Ubuntu 通常以
+/// `-generic` 等 flavor 结尾。这里既不删除架构，也不人为追加架构。
+///
+/// kernel release 检测链：
+/// 1. 实际 vmlinuz：gzip FNAME、x86 Linux boot protocol kernel_version，或
+///    未压缩 Image/EFI stub 中的标准 `Linux version <release>` banner；
+/// 2. 配套 initrd：通过发行版原生的 lsinitrd/lsinitramfs 查找 lib/modules/<release>；
+/// 3. 仓库包名：仅当 production 候选唯一时采用。
+///
+/// 前两层只依赖 Linux 文件格式/模块 ABI，不依赖发行版名称或版本，因此后续同 family
+/// 发行版升级通常不需要增加产品特例。包名规则被隔离在最后的兼容层。
+///
+/// 第 3 层故意不再“选择最高版本”。安装 ISO 可以同时携带 GA/HWE、普通/debug/RT
+/// 等多个内核，仓库版本大小不能证明 images/pxeboot/vmlinuz 或 casper/vmlinuz
+/// 实际对应哪一个。
+fn detectKernelRelease(io: std.Io, allocator: std.mem.Allocator, staged_repo: []const u8, detected: DetectedMedia) ?[]const u8 {
+    const vmlinuz_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ staged_repo, detected.layout.kernel_path }) catch null;
+    if (vmlinuz_path) |path| {
+        defer allocator.free(path);
+        if (detectKernelReleaseFromVmlinuz(io, allocator, path)) |kr| return kr;
+    }
+
+    const initrd_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ staged_repo, detected.layout.initrd_path }) catch null;
+    if (initrd_path) |path| {
+        defer allocator.free(path);
+        if (detectKernelReleaseFromInitrd(io, allocator, path)) |kr| return kr;
+    }
+
+    switch (detected.family) {
+        .rhel => return detectKernelReleaseRhel(io, allocator, staged_repo, detected),
+        .ubuntu => return detectKernelReleaseUbuntu(io, allocator, staged_repo, detected),
+    }
+}
+
+/// 从 vmlinuz 二进制文件的 gzip 头部提取 kernel release。
+///
+/// gzip 格式 (RFC 1952) 头部第 4 字节是 flags，FLG_FNAME (bit 3) 表示
+/// 紧跟一个以 null 结尾的原始文件名。例如：
+///   vmlinuz-5.15.0-119-generic.efi.signed\0
+///   vmlinuz-5.14.0-611.5.1.el9_7.aarch64\0
+///
+/// 提取文件名中的版本部分（去掉 vmlinuz- 前缀和 .efi.signed/.signed 后缀）。
+/// 如果 vmlinuz 不是 gzip 压缩或头部无法解析，返回 null。
+fn detectKernelReleaseFromVmlinuz(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .follow_symlinks = false }) catch return null;
+    defer file.close(io);
+    var prefix: [4096]u8 = undefined;
+    const n = file.readPositionalAll(io, &prefix, 0) catch return null;
+    const bytes = prefix[0..n];
+    if (kernelReleaseFromGzipHeader(bytes)) |release| return allocator.dupe(u8, release) catch null;
+    if (kernelReleaseFromX86BootHeader(bytes)) |release| return allocator.dupe(u8, release) catch null;
+    if (detectLinuxVersionBanner(io, allocator, file)) |release| return release;
+    return null;
+}
+
+/// RFC 1952 gzip FNAME 是可选字段，并且位于可选 FEXTRA 之后。不能固定从 offset 10
+/// 开始读取，否则带 extra field 的合法 gzip 会被误解析。
+fn kernelReleaseFromGzipHeader(bytes: []const u8) ?[]const u8 {
+    if (bytes.len < 10 or bytes[0] != 0x1f or bytes[1] != 0x8b or bytes[2] != 0x08) return null;
+    const flags = bytes[3];
+    if ((flags & 0xe0) != 0 or (flags & 0x08) == 0) return null;
+    var offset: usize = 10;
+    if ((flags & 0x04) != 0) {
+        if (offset + 2 > bytes.len) return null;
+        const extra_len: usize = @as(usize, bytes[offset]) | (@as(usize, bytes[offset + 1]) << 8);
+        offset += 2;
+        if (extra_len > bytes.len - offset) return null;
+        offset += extra_len;
+    }
+    const name_end_rel = std.mem.indexOfScalar(u8, bytes[offset..], 0) orelse return null;
+    const raw_name = bytes[offset .. offset + name_end_rel];
+    return kernelReleaseFromImageName(raw_name);
+}
+
+/// x86/x86_64 bzImage 在 Linux boot protocol setup header 中公开 kernel_version。
+/// 指针是相对 0x200 的 little-endian u16，适用于 CentOS 7 以及 RHEL/Rocky 8+ 的
+/// images/pxeboot/vmlinuz，不依赖其 RPM 是否叫 kernel 或 kernel-core。
+fn kernelReleaseFromX86BootHeader(bytes: []const u8) ?[]const u8 {
+    if (bytes.len < 0x210 or !std.mem.eql(u8, bytes[0x202..0x206], "HdrS")) return null;
+    const protocol = @as(u16, bytes[0x206]) | (@as(u16, bytes[0x207]) << 8);
+    if (protocol < 0x0200) return null;
+    const relative = @as(usize, bytes[0x20e]) | (@as(usize, bytes[0x20f]) << 8);
+    const offset = 0x200 + relative;
+    if (offset >= bytes.len) return null;
+    const end_rel = std.mem.indexOfScalar(u8, bytes[offset..], 0) orelse return null;
+    return parseUnameRelease(bytes[offset .. offset + end_rel]);
+}
+
+fn kernelReleaseFromImageName(raw_name: []const u8) ?[]const u8 {
+    // 去掉 "vmlinuz-" 前缀。
+    const after_prefix = if (std.mem.startsWith(u8, raw_name, "vmlinuz-"))
+        raw_name["vmlinuz-".len..]
+    else
+        raw_name;
+    // 去掉已知的后缀：.efi.signed, .signed, .gz
+    var end = after_prefix.len;
+    inline for ([_][]const u8{ ".efi.signed", ".signed", ".gz" }) |suffix| {
+        if (std.mem.endsWith(u8, after_prefix[0..end], suffix)) {
+            end -= suffix.len;
+        }
+    }
+    return parseUnameRelease(after_prefix[0..end]);
+}
+
+/// 解析并校验一个完整的 `uname -r` 候选。此函数只剥离 banner/空白等传输包装，
+/// 不改变 release 本身的组成，也不执行跨发行版“规范化”。
+fn parseUnameRelease(value: []const u8) ?[]const u8 {
+    var release = std.mem.trim(u8, value, " \t\r\n");
+    if (std.mem.startsWith(u8, release, "Linux version "))
+        release = release["Linux version ".len..];
+    const whitespace = std.mem.indexOfAny(u8, release, " \t\r\n");
+    if (whitespace) |end| release = release[0..end];
+    if (release.len == 0 or !std.ascii.isDigit(release[0])) return null;
+    for (release) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, ".-_+~", byte) == null) return null;
+    }
+    return release;
+}
+
+/// Linux 构建系统会把 `Linux version <uname-r>` banner 编入未压缩的内核映像。
+/// 这覆盖 raw arm64 Image、部分 EFI stub 和未来采用相同标准 banner 的内核格式，
+/// 不需要知道发行版或包名。分块扫描有固定内存上限，并保留跨块 marker 的 overlap。
+fn detectLinuxVersionBanner(io: std.Io, allocator: std.mem.Allocator, file: std.Io.File) ?[]const u8 {
+    const marker = "Linux version ";
+    var buffer: [64 * 1024 + marker.len - 1]u8 = undefined;
+    var carried: usize = 0;
+    var offset: u64 = 0;
+    while (true) {
+        const read = file.readPositionalAll(io, buffer[carried..], offset) catch return null;
+        const available = carried + read;
+        if (kernelReleaseFromLinuxVersionBanner(buffer[0..available])) |release|
+            return allocator.dupe(u8, release) catch null;
+        if (read == 0) return null;
+        offset += read;
+        carried = @min(marker.len - 1, available);
+        std.mem.copyForwards(u8, buffer[0..carried], buffer[available - carried .. available]);
+    }
+}
+
+fn kernelReleaseFromLinuxVersionBanner(bytes: []const u8) ?[]const u8 {
+    const marker = "Linux version ";
+    const marker_at = std.mem.indexOf(u8, bytes, marker) orelse return null;
+    const value_start = marker_at + marker.len;
+    if (value_start >= bytes.len) return null;
+    const tail = bytes[value_start..];
+    const end = std.mem.indexOfAny(u8, tail, " \t\r\n\x00") orelse tail.len;
+    return parseUnameRelease(tail[0..end]);
+}
+
+/// 使用宿主发行版提供的只读列举工具解析 initrd。两个命令都只接收 argv，
+/// 不经过 shell，也不会执行 initrd 内容。输出中的 modules 目录是启动时实际配套
+/// 的 ABI；只有恰好一个 release 时才接受，避免多 archive/多模块树时猜测。
+fn detectKernelReleaseFromInitrd(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    const tools = [_][]const u8{ "lsinitrd", "lsinitramfs" };
+    for (tools) |tool| {
+        const result = std.process.run(allocator, io, .{
+            .argv = &.{ tool, path },
+            .stdout_limit = .limited(32 * 1024 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        }) catch continue;
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code != 0) continue,
+            else => continue,
+        }
+        if (uniqueModuleReleaseFromListing(result.stdout)) |release|
+            return allocator.dupe(u8, release) catch null;
+    }
+    return null;
+}
+
+fn uniqueModuleReleaseFromListing(listing: []const u8) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    var lines = std.mem.tokenizeAny(u8, listing, "\r\n");
+    while (lines.next()) |line| {
+        const marker = "lib/modules/";
+        const marker_at = std.mem.indexOf(u8, line, marker) orelse continue;
+        const start = marker_at + marker.len;
+        if (start >= line.len) continue;
+        const tail = line[start..];
+        const end = std.mem.indexOfAny(u8, tail, "/ \t") orelse tail.len;
+        const release = parseUnameRelease(tail[0..end]) orelse continue;
+        if (found) |existing| {
+            if (!std.mem.eql(u8, existing, release)) return null;
+        } else {
+            found = release;
+        }
+    }
+    return found;
+}
+
+/// 从 RHEL family 仓库扫描 production kernel RPM 包名，提取 kernel release。
+///
+/// CentOS/RHEL 7 使用 `kernel-<version>.<arch>.rpm`；RHEL/Rocky 8+ 使用
+/// `kernel-core-<version>.<arch>.rpm`。前缀后必须紧跟数字，因此 debug/rt 等
+/// variant 不会被当成 production kernel。这里只删除 RPM 容器后缀 `.rpm`，
+/// 有意保留 `.x86_64`/`.aarch64`，因为它们属于 RHEL 的 `uname -r`。
+///
+/// 扫描所有 `.treeinfo` 中声明的 variant Packages 子目录（`<variant>/Packages/k/`），
+/// 单 variant 时回退到 `Packages/k/` 或 `Minimal/Packages/k/`。找不到时返回 null。
+fn detectKernelReleaseRhel(io: std.Io, allocator: std.mem.Allocator, staged_repo: []const u8, detected: DetectedMedia) ?[]const u8 {
+    // CentOS/RHEL 7 使用 monolithic kernel 包，RHEL/Rocky 8+ 使用 kernel-core。
+    // 包名只是最后 fallback；只在 production 候选唯一时返回。
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (candidates.items) |item| allocator.free(item);
+        candidates.deinit(allocator);
+    }
+
+    var search_dirs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (search_dirs.items) |path| allocator.free(path);
+        search_dirs.deinit(allocator);
+    }
+
+    if (detected.layout.repository_paths) |repo_paths| {
+        for (repo_paths) |variant| {
+            if (variant.len == 0) {
+                const dirs = [_][]const u8{ "Packages/k", "Packages" };
+                for (dirs) |sub| search_dirs.append(allocator, std.fmt.allocPrint(allocator, "{s}/{s}", .{ staged_repo, sub }) catch continue) catch continue;
+            } else {
+                const dirs = [_][]const u8{ "Packages/k", "Packages" };
+                for (dirs) |sub| search_dirs.append(allocator, std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ staged_repo, variant, sub }) catch continue) catch continue;
+            }
+        }
+    } else {
+        const dirs = [_][]const u8{ "Packages/k", "Packages" };
+        for (dirs) |sub| search_dirs.append(allocator, std.fmt.allocPrint(allocator, "{s}/{s}", .{ staged_repo, sub }) catch continue) catch continue;
+    }
+
+    for (search_dirs.items) |search_dir| {
+        var dir = std.Io.Dir.cwd().openDir(io, search_dir, .{ .iterate = true, .follow_symlinks = false }) catch continue;
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (iterator.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const name = entry.name;
+            const version_part = rhelKernelReleaseFromPackageName(name, detected.arch) orelse continue;
+            // 去重：跳过已存在的相同版本。
+            var already_exists = false;
+            for (candidates.items) |existing| {
+                if (std.mem.eql(u8, existing, version_part)) {
+                    already_exists = true;
+                    break;
+                }
+            }
+            if (already_exists) continue;
+            candidates.append(allocator, allocator.dupe(u8, version_part) catch continue) catch continue;
+        }
+    }
+    return selectUniqueCandidate(allocator, candidates.items);
+}
+
+fn rhelKernelReleaseFromPackageName(name: []const u8, arch: model.Arch) ?[]const u8 {
+    const package_prefix: []const u8 = if (std.mem.startsWith(u8, name, "kernel-core-"))
+        "kernel-core-"
+    else if (std.mem.startsWith(u8, name, "kernel-"))
+        "kernel-"
+    else
+        return null;
+    const after_prefix = name[package_prefix.len..];
+    if (after_prefix.len == 0 or !std.ascii.isDigit(after_prefix[0])) return null;
+    const arch_suffix = switch (arch) {
+        .aarch64 => ".aarch64.rpm",
+        .x86_64 => ".x86_64.rpm",
+    };
+    if (!std.mem.endsWith(u8, name, arch_suffix)) return null;
+    // 只移除 RPM 容器扩展名。arch_suffix 在上面仅用于校验目标架构，不从结果
+    // 中裁掉：RHEL 的 `.aarch64`/`.x86_64` 属于 uname -r 和 modules ABI。
+    return name[package_prefix.len .. name.len - ".rpm".len];
+}
+
+/// 从 Ubuntu family 仓库的 pool 目录扫描 linux-image .deb 包名，提取 kernel release。
+///
+/// Ubuntu .deb 文件名格式为 `linux-image-<version>-generic_<full_version>_<arch>.deb`，例如：
+///   linux-image-5.15.0-119-generic_5.15.0-119.129_arm64.deb -> 5.15.0-119-generic
+///   linux-image-6.8.0-40-generic_6.8.0-40.40~22.04.3_arm64.deb -> 6.8.0-40-generic
+/// `_arm64.deb`/`_amd64.deb` 是 Debian 包架构字段，不属于 Ubuntu 的 `uname -r`，
+/// 因此从第一个下划线前的 binary package name 提取 release。
+///
+/// 扫描 pool/main/l/linux/ 和 pool/main/l/linux-signed/ 目录。
+/// linux-signed 目录包含带签名的内核镜像包，通常优先于此包。
+/// 找不到时返回 null。
+fn detectKernelReleaseUbuntu(io: std.Io, allocator: std.mem.Allocator, staged_repo: []const u8, detected: DetectedMedia) ?[]const u8 {
+    const arch_suffix = switch (detected.arch) {
+        .aarch64 => "_arm64.deb",
+        .x86_64 => "_amd64.deb",
+    };
+    // Ubuntu ISO 可能同时包含 GA 内核和 HWE 内核。
+    // 例如 Ubuntu 22.04.5 同时包含：
+    //   linux-image-5.15.0-119-generic (GA)
+    //   linux-image-6.8.0-40-generic (HWE)
+    // 包名不能决定 casper/vmlinuz 选择 GA 还是 HWE；仅唯一候选可作为 fallback。
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (candidates.items) |item| allocator.free(item);
+        candidates.deinit(allocator);
+    }
+
+    // 扫描 pool/main/l/ 下所有可能的内核目录。
+    // 使用通配方式：先列出 pool/main/l/ 目录，再在每个子目录中搜索。
+    const pool_l = std.fmt.allocPrint(allocator, "{s}/pool/main/l", .{staged_repo}) catch return null;
+    defer allocator.free(pool_l);
+    var l_dir = std.Io.Dir.cwd().openDir(io, pool_l, .{ .iterate = true, .follow_symlinks = false }) catch return null;
+    defer l_dir.close(io);
+    var l_iter = l_dir.iterate();
+    while (l_iter.next(io) catch null) |l_entry| {
+        if (l_entry.kind != .directory and l_entry.kind != .unknown) continue;
+        if (!std.mem.startsWith(u8, l_entry.name, "linux")) continue;
+        const search_dir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ pool_l, l_entry.name }) catch continue;
+        defer allocator.free(search_dir);
+        var dir = std.Io.Dir.cwd().openDir(io, search_dir, .{ .iterate = true, .follow_symlinks = false }) catch continue;
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (iterator.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const name = entry.name;
+            const version_part = ubuntuKernelReleaseFromPackageName(name, arch_suffix) orelse continue;
+            // 去重。
+            var already_exists = false;
+            for (candidates.items) |existing| {
+                if (std.mem.eql(u8, existing, version_part)) {
+                    already_exists = true;
+                    break;
+                }
+            }
+            if (already_exists) continue;
+            candidates.append(allocator, allocator.dupe(u8, version_part) catch continue) catch continue;
+        }
+    }
+    return selectUniqueCandidate(allocator, candidates.items);
+}
+
+fn ubuntuKernelReleaseFromPackageName(name: []const u8, arch_suffix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, name, "linux-image-")) return null;
+    const after_prefix = name["linux-image-".len..];
+    if (after_prefix.len == 0 or !std.ascii.isDigit(after_prefix[0])) return null;
+    if (!std.mem.endsWith(u8, name, arch_suffix)) return null;
+    const middle = name["linux-image-".len .. name.len - arch_suffix.len];
+    // Debian binary package 文件名为 <package-name>_<version>_<arch>.deb。
+    // uname -r 来自版本化 package-name（linux-image-<release>），而不是末尾
+    // 的包架构字段，因此 release 截止到第一个下划线。
+    const underscore = std.mem.indexOfScalar(u8, middle, '_') orelse return null;
+    const version_part = middle[0..underscore];
+    if (version_part.len == 0) return null;
+    return version_part;
+}
+
+fn selectUniqueCandidate(allocator: std.mem.Allocator, candidates: []const []const u8) ?[]const u8 {
+    if (candidates.len != 1) return null;
+    return allocator.dupe(u8, candidates[0]) catch null;
+}
+
 fn safeFilename(value: []const u8) bool {
     return value.len > 0 and
         std.mem.indexOfAny(u8, value, "/\\") == null and
         std.mem.indexOfScalar(u8, value, 0) == null and
         !std.mem.eql(u8, value, ".") and
         !std.mem.eql(u8, value, "..");
+}
+
+test "kernel release parser handles gzip FEXTRA before FNAME" {
+    const bytes = [_]u8{
+        0x1f, 0x8b, 0x08, 0x0c, 0,   0, 0, 0, 0, 3, // gzip + FEXTRA + FNAME
+        3,    0,    'x',  'y',  'z',
+    } ++ "vmlinuz-5.15.0-119-generic.efi.signed\x00".*;
+    try std.testing.expectEqualStrings("5.15.0-119-generic", kernelReleaseFromGzipHeader(&bytes).?);
+}
+
+test "kernel release parser reads x86 Linux boot protocol header" {
+    var bytes = [_]u8{0} ** 4096;
+    @memcpy(bytes[0x202..0x206], "HdrS");
+    bytes[0x206] = 0x0f;
+    bytes[0x207] = 0x02;
+    const relative: u16 = 0x100;
+    bytes[0x20e] = @truncate(relative);
+    bytes[0x20f] = @truncate(relative >> 8);
+    @memcpy(bytes[0x300 .. 0x300 + "3.10.0-1160.118.1.el7.x86_64".len + 1], "3.10.0-1160.118.1.el7.x86_64\x00");
+    try std.testing.expectEqualStrings("3.10.0-1160.118.1.el7.x86_64", kernelReleaseFromX86BootHeader(&bytes).?);
+}
+
+test "kernel release parser reads the architecture-neutral Linux version banner" {
+    const image = "\x7fELF random bytes Linux version 6.12.0-211.16.1.el10_2.0.1.aarch64 (mock@builder) more";
+    try std.testing.expectEqualStrings(
+        "6.12.0-211.16.1.el10_2.0.1.aarch64",
+        kernelReleaseFromLinuxVersionBanner(image).?,
+    );
+}
+
+test "initrd listing accepts one module ABI and rejects ambiguity" {
+    const rocky =
+        \\drwxr-xr-x  usr/lib/modules/5.14.0-503.14.1.el9_5.x86_64/
+        \\-rw-r--r--  usr/lib/modules/5.14.0-503.14.1.el9_5.x86_64/modules.alias
+    ;
+    try std.testing.expectEqualStrings("5.14.0-503.14.1.el9_5.x86_64", uniqueModuleReleaseFromListing(rocky).?);
+
+    const ambiguous =
+        \\lib/modules/5.15.0-119-generic/kernel/foo.ko
+        \\lib/modules/6.8.0-40-generic/kernel/bar.ko
+    ;
+    try std.testing.expect(uniqueModuleReleaseFromListing(ambiguous) == null);
+}
+
+test "repository fallback requires a unique production kernel" {
+    const one = [_][]const u8{"4.18.0-553.el8_10.x86_64"};
+    const many = [_][]const u8{
+        "5.15.0-119-generic",
+        "6.8.0-40-generic",
+    };
+    const selected = selectUniqueCandidate(std.testing.allocator, &one).?;
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqualStrings(one[0], selected);
+    try std.testing.expect(selectUniqueCandidate(std.testing.allocator, &many) == null);
+}
+
+test "RHEL package fallback covers CentOS 7 and Rocky 8 through 10 variants" {
+    try std.testing.expectEqualStrings(
+        "3.10.0-1160.118.1.el7.x86_64",
+        rhelKernelReleaseFromPackageName("kernel-3.10.0-1160.118.1.el7.x86_64.rpm", .x86_64).?,
+    );
+    try std.testing.expectEqualStrings(
+        "4.18.0-553.40.1.el8_10.aarch64",
+        rhelKernelReleaseFromPackageName("kernel-core-4.18.0-553.40.1.el8_10.aarch64.rpm", .aarch64).?,
+    );
+    try std.testing.expectEqualStrings(
+        "6.12.0-211.16.1.el10_2.0.1.x86_64",
+        rhelKernelReleaseFromPackageName("kernel-core-6.12.0-211.16.1.el10_2.0.1.x86_64.rpm", .x86_64).?,
+    );
+    try std.testing.expect(rhelKernelReleaseFromPackageName("kernel-debug-3.10.0-1160.el7.x86_64.rpm", .x86_64) == null);
+    try std.testing.expect(rhelKernelReleaseFromPackageName("kernel-core-debug-5.14.0-503.el9.x86_64.rpm", .x86_64) == null);
+    try std.testing.expect(rhelKernelReleaseFromPackageName("kernel-rt-core-5.14.0-503.el9.x86_64.rpm", .x86_64) == null);
+}
+
+test "Ubuntu package fallback accepts versioned images and rejects meta packages" {
+    try std.testing.expectEqualStrings(
+        "5.15.0-119-generic",
+        ubuntuKernelReleaseFromPackageName("linux-image-5.15.0-119-generic_5.15.0-119.129_arm64.deb", "_arm64.deb").?,
+    );
+    try std.testing.expectEqualStrings(
+        "6.8.0-40-generic",
+        ubuntuKernelReleaseFromPackageName("linux-image-6.8.0-40-generic_6.8.0-40.40~22.04.3_amd64.deb", "_amd64.deb").?,
+    );
+    try std.testing.expect(ubuntuKernelReleaseFromPackageName("linux-image-generic_6.8.0.40.40_amd64.deb", "_amd64.deb") == null);
+    try std.testing.expect(ubuntuKernelReleaseFromPackageName("linux-image-6.8.0-40-generic_foo_arm64.deb", "_amd64.deb") == null);
+}
+
+test "kernel evidence preserves the distro uname-r ABI exactly" {
+    const rhel_release = "5.14.0-611.5.1.el9_7.aarch64";
+    const rhel_image = kernelReleaseFromImageName("vmlinuz-" ++ rhel_release).?;
+    const rhel_modules = uniqueModuleReleaseFromListing("usr/lib/modules/" ++ rhel_release ++ "/modules.alias").?;
+    const rhel_package = rhelKernelReleaseFromPackageName("kernel-core-" ++ rhel_release ++ ".rpm", .aarch64).?;
+    try std.testing.expectEqualStrings(rhel_release, rhel_image);
+    try std.testing.expectEqualStrings(rhel_image, rhel_modules);
+    try std.testing.expectEqualStrings(rhel_modules, rhel_package);
+
+    const ubuntu_release = "5.15.0-119-generic";
+    const ubuntu_image = kernelReleaseFromImageName("vmlinuz-" ++ ubuntu_release ++ ".efi.signed").?;
+    const ubuntu_modules = uniqueModuleReleaseFromListing("lib/modules/" ++ ubuntu_release ++ "/kernel/fs/overlayfs/overlay.ko").?;
+    const ubuntu_package = ubuntuKernelReleaseFromPackageName(
+        "linux-image-" ++ ubuntu_release ++ "_5.15.0-119.129_arm64.deb",
+        "_arm64.deb",
+    ).?;
+    try std.testing.expectEqualStrings(ubuntu_release, ubuntu_image);
+    try std.testing.expectEqualStrings(ubuntu_image, ubuntu_modules);
+    try std.testing.expectEqualStrings(ubuntu_modules, ubuntu_package);
 }
 
 test "import metadata parser accepts Rocky Minimal repository layout" {

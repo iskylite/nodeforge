@@ -84,10 +84,24 @@ pub fn compileInputs(allocator: std.mem.Allocator, node: *const model.NodeConfig
         .kernel_args = profile.kernel_args,
     };
     errdefer result.deinit();
+    // InstallSource 仓库是部署的默认受管源闭包。Profile 可以在此基础上增加
+    // source 已声明的仓库，Node remove delta 则可显式移除；install 与 diskless
+    // 因而共享同一套 effective software 语义。
+    result.software.repositories = try inheritSourceRepositories(&result, source.repositories, profile.software.repositories);
     try mergeSystem(&result, node.overrides.system);
     try mergeSoftware(&result, node.overrides.software);
     try mergeKernelArgs(&result, node.overrides.kernel_args);
     return result;
+}
+
+fn inheritSourceRepositories(plan: *Plan, source: []const []const u8, selected: []const []const u8) ![]const []const u8 {
+    var values: std.ArrayList([]const u8) = .empty;
+    defer values.deinit(plan.allocator);
+    for (source) |value| if (!contains(values.items, value)) try values.append(plan.allocator, value);
+    for (selected) |value| if (!contains(values.items, value)) try values.append(plan.allocator, value);
+    const owned = try values.toOwnedSlice(plan.allocator);
+    try plan.owned_slices.append(plan.allocator, owned);
+    return owned;
 }
 
 fn mergeSystem(plan: *Plan, override: model.SystemOverrideConfig) !void {
@@ -201,6 +215,34 @@ test "effective plan merges policy collections and direct node facts" {
     try std.testing.expectEqualStrings("c", plan.software.packages.include[1]);
     try std.testing.expectEqualStrings("console=ttyS0 iommu=pt", plan.kernel_args.?);
     try std.testing.expectEqual(model.NetworkMode.static, plan.network.mode);
+}
+
+test "effective plan inherits install source repositories and honors node removal" {
+    const source: model.InstallSourceConfig = .{
+        .name = "s",
+        .distro = "rocky",
+        .version = "10",
+        .arch = .aarch64,
+        .source_asset = "iso",
+        .installer_kernel = "kernel",
+        .installer_initrd = "initrd",
+        .repositories = &.{ "baseos", "appstream" },
+    };
+    const profile: model.ProfileConfig = .{
+        .name = "p",
+        .install_source = "s",
+        .software = .{ .repositories = &.{"appstream"} },
+    };
+    const node: model.NodeConfig = .{
+        .id = "n",
+        .mac = "02:00:00:00:00:01",
+        .arch = .aarch64,
+        .profile = "p",
+        .overrides = .{ .software = .{ .repositories = .{ .remove = &.{"appstream"} } } },
+    };
+    var plan = try compileInputs(std.testing.allocator, &node, &profile, &source);
+    defer plan.deinit();
+    try std.testing.expectEqualSlices([]const u8, &.{"baseos"}, plan.software.repositories);
 }
 
 test "pxe reservation defaults target network to static" {

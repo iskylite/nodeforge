@@ -4,8 +4,8 @@
 //! v2 交付据此解析节点 diskless Profile 的 rootfs locator（url/sha512/size）。
 //!
 //! 制品记录只增不删（v0.2 不做 rootfs GC，见 `V0_2_IMPL_DETAILS.md` §7）；
-//! 同一 `rootfs_input_digest` 重复 register 为幂等覆盖（仅当 sha512 一致），
-//! sha512 漂移则拒绝（immutable ETag 不变式）。rootfs 文件本体存于
+//! 同一 `rootfs_input_digest` 重复登记仅在不可变元数据一致时幂等；
+//! `uncompressed_size` 允许从未知补全为已知，其余漂移均拒绝。rootfs 文件本体存于
 //! `paths.rootfs_dir`（内容寻址 `<digest>.squashfs`），本模块只持记录。
 const std = @import("std");
 const atomicWrite = @import("dhcp_store.zig").atomicWrite;
@@ -19,7 +19,8 @@ pub const Artifact = struct {
     /// 压缩 squashfs 内容 SHA-512（immutable ETag）。
     content_sha512: []const u8,
     compressed_size: u64,
-    uncompressed_size: u64,
+    /// 逻辑展开大小；0 表示外部制品未提供，不能据此执行内存硬校验。
+    uncompressed_size: u64 = 0,
     /// 匹配的运行时内核 release（bootConfig kernel_release）。
     kernel_release: []const u8,
     /// 相对 rootfs_dir 的 squashfs 文件名（`<digest>.squashfs`）。
@@ -62,17 +63,40 @@ pub const Store = struct {
         for (parsed.value.artifacts) |item| try self.appendOwned(try dupArtifact(self.allocator, item));
     }
 
-    /// 登记一个 ready 制品。同 digest 幂等：sha512 一致则静默成功，漂移则
-    /// 返回 `RootfsDigestDrift`（immutable ETag 不变式）。新增制品持久化。
+    /// 登记一个就绪制品。同一输入摘要的内容与不可变元数据必须一致；
+    /// `uncompressed_size` 唯一允许从 0（未知）补全为已知值。
+    ///
+    /// 内存变更和持久化是一个提交单元：持久化失败时恢复原内存状态，避免
+    /// 当前进程可见、重启后消失的“幽灵制品”。
     pub fn register(self: *Store, io: std.Io, artifact: Artifact) !RegisterResult {
         for (self.artifacts.items) |*existing| {
             if (std.mem.eql(u8, existing.rootfs_input_digest, artifact.rootfs_input_digest)) {
                 if (!std.mem.eql(u8, existing.content_sha512, artifact.content_sha512)) return error.RootfsDigestDrift;
+                if (!sameImmutableMetadata(existing.*, artifact)) return error.RootfsMetadataDrift;
+                if (existing.uncompressed_size != 0 and artifact.uncompressed_size != 0 and
+                    existing.uncompressed_size != artifact.uncompressed_size)
+                    return error.RootfsMetadataDrift;
+                if (existing.uncompressed_size == 0 and artifact.uncompressed_size != 0) {
+                    existing.uncompressed_size = artifact.uncompressed_size;
+                    self.persist(io) catch |err| {
+                        existing.uncompressed_size = 0;
+                        return err;
+                    };
+                    return .metadata_updated;
+                }
                 return .already_present;
             }
         }
-        try self.appendOwned(try dupArtifact(self.allocator, artifact));
-        try self.persist(io);
+        const owned = try dupArtifact(self.allocator, artifact);
+        self.appendOwned(owned) catch |err| {
+            freeArtifact(self.allocator, owned);
+            return err;
+        };
+        self.persist(io) catch |err| {
+            const removed = self.artifacts.pop().?;
+            freeArtifact(self.allocator, removed);
+            return err;
+        };
         return .registered;
     }
 
@@ -98,7 +122,14 @@ pub const Store = struct {
     }
 };
 
-pub const RegisterResult = enum { registered, already_present };
+pub const RegisterResult = enum { registered, already_present, metadata_updated };
+
+fn sameImmutableMetadata(existing: Artifact, candidate: Artifact) bool {
+    return existing.compressed_size == candidate.compressed_size and
+        std.mem.eql(u8, existing.profile, candidate.profile) and
+        std.mem.eql(u8, existing.kernel_release, candidate.kernel_release) and
+        std.mem.eql(u8, existing.file, candidate.file);
+}
 
 fn dupArtifact(allocator: std.mem.Allocator, item: Artifact) !Artifact {
     return .{
@@ -138,6 +169,44 @@ test "register is idempotent and rejects digest drift" {
     // digest 漂移被拒绝
     const drifted = Artifact{ .rootfs_input_digest = "d1", .profile = "p", .content_sha512 = "cd", .compressed_size = 10, .uncompressed_size = 40, .kernel_release = "5.14.0", .file = "d1.squashfs", .created_at = 1 };
     try std.testing.expectError(error.RootfsDigestDrift, store.register(std.testing.io, drifted));
+    const metadata_drifted = Artifact{ .rootfs_input_digest = "d1", .profile = "p", .content_sha512 = "ab", .compressed_size = 11, .uncompressed_size = 40, .kernel_release = "5.14.0", .file = "d1.squashfs", .created_at = 1 };
+    try std.testing.expectError(error.RootfsMetadataDrift, store.register(std.testing.io, metadata_drifted));
+}
+
+test "register fills unknown uncompressed size and persists the update" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/rootfs_artifacts.json", .{root_buf[0..root_len]});
+    defer std.testing.allocator.free(path);
+    const unknown: Artifact = .{ .rootfs_input_digest = "d3", .profile = "p", .content_sha512 = "ab", .compressed_size = 10, .kernel_release = "5.14.0", .file = "d3.squashfs", .created_at = 1 };
+    {
+        var store = Store.init(std.testing.allocator, path);
+        defer store.deinit();
+        try std.testing.expectEqual(RegisterResult.registered, try store.register(std.testing.io, unknown));
+        var known = unknown;
+        known.uncompressed_size = 400;
+        try std.testing.expectEqual(RegisterResult.metadata_updated, try store.register(std.testing.io, known));
+    }
+    var restored = Store.init(std.testing.allocator, path);
+    defer restored.deinit();
+    try restored.load(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 400), restored.find("d3").?.uncompressed_size);
+}
+
+test "register rolls back memory when persistence fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const missing_parent_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing/rootfs_artifacts.json", .{root_buf[0..root_len]});
+    defer std.testing.allocator.free(missing_parent_path);
+    var store = Store.init(std.testing.allocator, missing_parent_path);
+    defer store.deinit();
+    const artifact: Artifact = .{ .rootfs_input_digest = "d4", .profile = "p", .content_sha512 = "ab", .compressed_size = 10, .kernel_release = "5.14.0", .file = "d4.squashfs", .created_at = 1 };
+    try std.testing.expectError(error.FileNotFound, store.register(std.testing.io, artifact));
+    try std.testing.expect(store.find("d4") == null);
 }
 
 test "store persists and reloads across instances" {

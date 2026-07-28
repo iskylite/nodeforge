@@ -250,6 +250,13 @@ pub const CapacityConfig = struct {
     /// 省略时按 config.nodes 数量派生；显式值只可放大派生值。
     /// 运行时仍受 2048 条编译期安全天花板约束。
     managed_entries: ?u32 = null,
+    /// 单个 install boot session 可固定的完整 InstallPlan JSON 最大字节数。
+    ///
+    /// InstallPlan 保留 repository software_index.capabilities 的完整动态 slice，
+    /// 因而大体量 DVD ISO 的计划可超过旧的 1 MiB 固定限制。null 表示不施加
+    /// NodeForge 人为上限，由动态 slice、allocator 和系统可用内存自然约束。
+    /// 非 null 值限制的是 JSON 快照字节数，不是 ISO 文件大小。
+    install_plan_max_bytes: ?u64 = null,
 };
 
 /// 服务日志配置。业务事件仍写入独立的 `events.jsonl` 审计流。
@@ -480,7 +487,9 @@ pub const AssetConfig = struct {
     version: ?[]const u8 = null,
     /// 可选目标架构；与 distro/version 配合使用。
     arch: ?Arch = null,
-    /// 内核相关资产可记录 uname release，便于验证 kernel/rootfs 一致。
+    /// 内核相关资产可记录完整的 Linux UTS release（目标内核 `uname -r`），
+    /// 便于验证 kernel/rootfs/modules ABI 一致。此值保持发行版原貌：RHEL
+    /// 通常包含 `.x86_64`/`.aarch64`，Ubuntu 通常不包含包架构后缀。
     kernel_release: ?[]const u8 = null,
     /// 导入阶段计算的 SHA-256 摘要；M0 允许为空，后续发布资产时必须存在。
     sha256: ?[]const u8 = null,

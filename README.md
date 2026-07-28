@@ -216,7 +216,7 @@ systemctl start nodeforged
 ├── catalog/        # manifest.json + entity files
 ├── assets/
 │   ├── iso/        # ISO 镜像
-│   ├── boot/       # TFTP 启动文件：efi/<iso>/、install/<iso>/、diskless/<distro>/<version>/<arch>/
+│   ├── boot/       # TFTP 启动文件：efi/<source>/、install/<source>/、diskless/sources/<source>/<uname-r>/ 或 diskless/manual/<distro>/<version>/<arch>/<uname-r>/
 │   ├── repos/      # HTTP 发布的仓库
 │   ├── rootfs/     # HTTP 发布的 diskless squashfs
 │   └── keys/       # SSH 密钥
@@ -283,6 +283,21 @@ nodeforge profile set rocky-9 system.import_host_hosts=false
 nodeforge profile set rocky-9 $'system.hosts_content=127.0.0.1 localhost\n192.168.50.1 nodeforge.local\n'
 ```
 
+Install 与 diskless 默认继承 Install Source 导入的受管 Yum/APT 仓库。Rocky 安装后只保留
+`/etc/yum.repos.d/nodeforge.repo`，Ubuntu 由 Subiquity 持久化 NodeForge APT primary。
+可以查询介质的软件能力并选择 environment/group：
+
+```bash
+nodeforge assets install-source software list rocky-9.7-aarch64-dvd --kind environment
+nodeforge assets install-source software list rocky-9.7-aarch64-dvd --kind group
+nodeforge profile set rocky-9 software.environment=minimal-environment
+nodeforge profile add-values rocky-9 software.groups development network-tools
+nodeforge node software show node-01
+```
+
+Rocky 默认 `minimal-environment`。comps environment/group 默认安装 mandatory/default 包，
+不包含 optional 包；NodeForge 当前没有隐式“安装 group 全部 optional 包”的开关。
+
 ### Diskless 流程
 
 ```bash
@@ -290,6 +305,13 @@ nodeforge profile set rocky-9 $'system.hosts_content=127.0.0.1 localhost\n192.16
 nodeforge assets initrd build rocky-9.7-nodeforge-initrd \
   --from-install-source rocky-9.7-aarch64-dvd \
   --kernel-release 5.14.0-611.5.1.el9_7.aarch64
+
+# source 模式发布到 assets/boot/diskless/sources/<source>/<uname-r>/<name>.img；
+# 无 source 的通用构建发布到
+# assets/boot/diskless/manual/<distro>/<version>/<arch>/<uname-r>/<name>.img。
+#
+# RHEL 的 uname -r 通常包含 .x86_64/.aarch64，Ubuntu 通常不包含。
+# 显式 --kernel-release 与 ISO 检测值不同时只警告，不阻止构建。
 
 # 2. 创建 boot bundle，并创建 diskless profile。
 nodeforge assets boot-bundle create rocky-9.7-diskless \
@@ -305,6 +327,17 @@ nodeforge profile rootfs plan rocky-9.7-diskless --output json
 nodeforge profile rootfs build rocky-9.7-diskless \
   --if-input-digest <rootfs_input_digest>
 nodeforge profile rootfs status rocky-9.7-diskless
+
+# 外部 squashfs 也可直接登记；以下两种写法二选一，展开大小可选。
+# 未提供时会告警并跳过内存容量硬校验，但不会阻止登记或部署。
+nodeforge profile rootfs register rocky-9.7-diskless \
+  --path /path/to/rootfs.squashfs
+# 或者，若已有可信测量值，可启用严格内存预算：
+nodeforge profile rootfs register rocky-9.7-diskless \
+  --path /path/to/rootfs.squashfs --uncompressed-size <bytes>
+
+# 如果第一次登记时未提供展开大小，可对同一文件再次登记以补全元数据；
+# 成功状态为 metadata_updated。内容或已知元数据冲突不会覆盖现有制品。
 
 # 4. 绑定节点、检查 readiness、打开 deploy gate。
 nodeforge node set node-01 profile=rocky-9.7-diskless
@@ -336,12 +369,34 @@ nodeforge node deploy node-01 false
 
 ### 日志
 
-服务默认输出 `info` 日志到 stderr/systemd journal。临时排障：
+开发阶段 fresh setup 默认把持久日志等级设置为 `debug`。可以在初始化或
+reconfigure 时显式设置：
 
 ```bash
-nodeforged -d                     # 强制 debug 日志
-nodeforge <command> -d            # 显示底层错误原因
+nodeforge setup --log-level debug
+nodeforge setup --reconfigure --log-level info
+nodeforged -d                      # 仅本次启动强制 debug，不改 config
+nodeforge <command> -d             # CLI 显示底层错误原因
 ```
+
+`--log-level` 支持 `debug|info|warn|err`。未显式指定时，fresh setup 使用
+`debug`；reconfigure 保留当前等级；`--import-config` 保留导入值。显式参数
+始终覆盖当前或导入配置。systemd 使用 config 中的 `logging.level`。
+
+所有非 2xx HTTP JSON 响应都会在服务日志中记录 method、path、status、
+`error_code`、reason、`request_id` 和 client，凭据及请求体不会进入日志。
+安装计划摘要不一致还会记录 session/desired revision、摘要前缀以及
+`same_revision`：只有 revision 不同才表示模型在 PXE 授权后变化；同 revision
+不一致表示运行时输入或 snapshot 不一致，需要按内部异常排查。
+
+repository 软件能力索引以 SHA-256 内容寻址 blob 完整保存并跨节点复用，InstallPlan
+只保存不可变引用。`capacity.install_plan_max_bytes` 默认 `null`（不施加人为上限）；
+setup 显式生成该默认值但不提供参数或交互项。确需站点保护阈值时通过 config import
+设置正整数；它限制的是 InstallPlan JSON，不是 ISO 文件大小。详见
+[日志与安装计划摘要约定](docs/design/LOGGING_AND_INSTALL_PLAN_DIGEST.md#5-完整-installplan-与容量上限)。
+
+完整日志与安装摘要诊断约定见
+[日志与安装计划摘要约定](docs/design/LOGGING_AND_INSTALL_PLAN_DIGEST.md)。
 
 ### 安全边界
 

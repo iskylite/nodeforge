@@ -128,8 +128,7 @@ cli assets provision-bundle item add "$bundle" steps \
     name=rb-script action=script phase=rootfs-build idempotency_key=rb-script-v1 timeout_s=30 retryable=true \
     content_asset=nf-rb-script >/dev/null
 
-# package action: exercises the chroot bind-mount local file:// source (no
-# self-deadlock against the single-worker daemon) and bakes a real RPM in.
+# package action: exercises the managed HTTP source and bakes a real RPM in.
 cli assets provision-bundle item add "$bundle" steps \
     name=rb-package action=package phase=rootfs-build idempotency_key=rb-package-v1 timeout_s=120 retryable=true \
     packages=tree >/dev/null

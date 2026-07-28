@@ -1,10 +1,16 @@
 # v0.2.1 设计：Ubuntu Casper Squashfs Diskless
 
-状态：**设计草案**。本文是 v0.2.1 的唯一设计入口，负责版本边界、方案选型、风险分析和实现范围。
+状态：**设计更新中**。本文是 v0.2.1 的唯一设计入口，负责版本边界、方案选型、风险分析和实现范围。
 总纲与跨版本不变式以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文不重复 v0.2 已冻结的架构、
 程序边界和 CLI 契约，只定义 v0.2.1 新增的 Ubuntu diskless 能力及其与 v0.2 的差异。
 
 日期：2026-07-25
+
+> 2026-07-28 实现基线：本文后半部分保留部分历史实验记录；发生冲突时以本段和
+> §2.3.2 为准。当前 `nodeforge-initrd` 本身直接成为追加层的 `/init`，使用原生
+> HTTP/IPv4/mount/chroot 路径，不依赖 `/bin/sh`、curl 或 LD_LIBRARY_PATH。
+> `rootfs_os_builder` 的 apt/casper 生产分支仍未接线，现有 smoke 脚本不能等同于
+> NodeForge 已交付 Ubuntu rootfs builder。
 
 ## 0. 版本定位
 
@@ -75,42 +81,27 @@ NodeForge 用 `nodeforge-initrd` 实现等价的 squashfs 叠加：
 内核模块（2222 个 `.ko`）仅存在于 ISO 的 `/casper/initrd` 中。
 这是 Canonical 的设计：casper initrd 负责引导期模块加载，rootfs 只负责用户态。
 
-因此，initrd **不能**从 rootfs 构建（rootfs 无 `/lib/modules/`），也**不应**用宿主机
-dracut 构建（vermagic 不匹配 Ubuntu 内核）。正确做法是**直接复用 casper initrd**：
+因此，initrd **不能仅从当前 casper rootfs lower 构建**（其中没有 module tree），
+也**不应**用 Rocky 宿主机 dracut 构建。正确做法是保持 casper initrd 为逐字节不变
+前缀，并追加一个受控 cpio member：
 
 ```text
-1. zstd -d <iso>/casper/initrd -o initrd.cpio     # 解压（casper initrd 是 zstd 格式）
-2. mkdir initrd-root && cd initrd-root
-3. cat ../initrd.cpio | cpio -idmv                   # 提取 cpio 镜像
-4. install -m 0755 nodeforge-initrd ./usr/sbin/     # 注入二进制
-4a. 从 rootfs 复制 curl 及其依赖库到 initrd            # casper initrd 缺少 curl
-4b. 设置 LD_LIBRARY_PATH 或运行 ldconfig             # 确保 curl 能找到 libcurl
-5. cat > ./init << 'EOF'                              # 替换 /init 脚本
-#!/bin/sh
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export LD_LIBRARY_PATH=/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib64
-[ -d /dev ] || mkdir -m 0755 /dev
-[ -d /sys ] || mkdir /sys
-[ -d /proc ] || mkdir /proc
-[ -d /tmp ] || mkdir /tmp
-for m in loop squashfs overlay virtio virtio_pci virtio_net; do modprobe "$m" 2>/dev/null; done
-# ... 网络配置 ...
-exec /usr/sbin/nodeforge-initrd
-EOF
-6. find . | cpio -o -H newc | gzip -9 > initrd.img    # 重新打包（gzip 格式）
+1. base = ISO /casper/initrd                    # 不解包、不重打包
+2. overlay/init = nodeforge-initrd              # ELF 直接作为 PID 1
+3. overlay/usr/sbin/nodeforge-agent = target agent
+4. overlay 只允许 NodeForge 自有文件和纯文本 hook
+5. final = base bytes || encoded overlay member
 ```
 
-**关键注意事项**（实测发现，见 §8.4）：
-- casper initrd **缺少 `curl`**：nodeforge-initrd 调用 `curl` 拉取 BootConfig，
-  但 casper initrd 只有 `wget`。必须从 Ubuntu rootfs 复制 curl 及其依赖库。
-- 库文件复制必须用 `cp -L`（解引用符号链接）：`libcurl.so.4` 是指向 `libcurl.so.4.7.0`
-  的符号链接，`cp -a` 只复制链接而非实际文件。
-- casper initrd **没有 `ldconfig`**：无法重建 `ld.so.cache`，需在 `/init` 中设置
-  `LD_LIBRARY_PATH` 或从 rootfs 复制 `ldconfig`。
-- `/init` 脚本**不能预挂载 proc/sys/dev**：nodeforge-initrd 的 `mustRun("mount", ...)`
-  在已挂载时返回 `EBUSY`，导致 `SubprocessFailed` panic。`/init` 只创建挂载点目录，
-  由 nodeforge-initrd 自己执行 mount。
-- 打包格式用 **gzip** 而非 zstd：`gzip -9` 兼容性更好，QEMU 内核可直接解压。
+追加层不得调用宿主 `dracut-install`，也不得复制宿主 libc、loader、shell 或模块。
+NodeForge PID 1 自己设置完整 PATH，并在挂载 proc/sys/dev/run 后调用 vendor
+`systemd-udevd` coldplug；模块仍由 casper initrd 的 modalias/module tree 自动选择。
+HTTP、静态 IPv4、move-mount 与 chroot 均由 NodeForge 原生实现，所以 casper 是否带
+curl/ldconfig 不再影响启动。
+
+需要额外驱动或包时，采用 `V0_2_CLI.md` §4.1 的目标 sysroot/module source 模型：
+Ubuntu DEB、module、firmware 必须与 ISO 的 distro/version/arch/kernel release 匹配，
+通过受控 extension staging 追加；Rocky 宿主只负责字节提取和校验，不执行宿主 dracut。
 
 casper initrd 已包含引导所需的一切：
 - 2222 个 `.ko`（vermagic `5.15.0-119-generic`，与 `/casper/vmlinuz` 完全匹配）
@@ -120,7 +111,8 @@ casper initrd 已包含引导所需的一切：
 
 #### 2.3.3 能否从 rootfs 构建 initrd？
 
-**可以**——已通过 QEMU 验证（见 §9 对比分析）。但需要额外步骤且存在多个问题：
+**技术上可以，但不是 v0.2.1 生产路径**。实验已通过 QEMU（见 §9），前提是先从
+同一 Ubuntu source 物化完整 kernel/module sysroot：
 
 1. `chroot rootfs apt install linux-image-generic`（填充 `/lib/modules/<KREL>/`）
 2. `chroot rootfs mkinitramfs -o initrd.img <KREL>`
@@ -148,6 +140,23 @@ casper initrd 已包含引导所需的一切：
 | 已验证 | ✅ QEMU smoke 通过 | ❌ `AptOsLayerUnsupported` |
 
 debootstrap/apt 方案保留为未来选项（v0.3+ 可考虑），但 v0.2.1 明确采用 casper squashfs 叠加。
+
+### 2.5 与当前 diskless 运行期对齐
+
+- casper 层只提供 ISO 匹配的共享 lower。rootfs 构建与目标系统均只使用当前
+  nodeforged 发布的受管 HTTP APT source，不生成 `file://` repo；agent 即使没有
+  package delta 也要持久化该 HTTP source。
+- AgentPlan 仍以节点 MAC 为网卡身份。`network.interface_name` 未配置时，agent 在
+  Ubuntu 目标根的 `/sys/class/net` 按 MAC 解析实际名称。NetworkManager 文件名、
+  connection id、`interface-name` 以及 Netplan 设备键、`set-name` 全部使用该名称；
+  显式名称优先，找不到匹配 MAC 时 fail closed。后端不按 Ubuntu 名称硬编码：
+  统一 adapter 会同时验证 `/etc/netplan` 与目标 `netplan` 可执行能力，满足时才选择
+  Netplan；完整选择顺序见 `V0_2_DESIGN.md` R15.1。
+- Ubuntu 与 Rocky 共享同一 `diskless_delivery.Session` 列表投影：
+  `ARMED=created_at`、`INSTALL=initrd_started`、`FINISHED=terminal`。
+- 当前代码的 `AptOsLayerUnsupported` 表明 casper layer discovery/materialization
+  尚需正式接入 `rootfs_os_builder`。完成标准必须包含 NodeForge CLI 构建、manifest
+  校验和 VMware/QEMU 启动，不能只引用手工 smoke 脚本。
 
 ## 3. 跨发行版宿主支持
 
@@ -475,7 +484,7 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
 | 产物 | 来源 | 版本 |
 |---|---|---|
 | kernel | Ubuntu ISO `/casper/vmlinuz` → 重命名为 `vmlinuz-5.15.0-119-generic` | 5.15.0-119-generic |
-| initrd | Ubuntu ISO `/casper/initrd` → zstd 解压 → cpio 提取 → 注入 curl + nodeforge-initrd → 替换 /init → cpio+gzip 重新打包 | .ko vermagic 5.15.0-119-generic（同源） |
+| initrd | Ubuntu ISO `/casper/initrd` 作为 vendor 层，追加仅含 NodeForge 自有文件的 cpio 层；`nodeforge-initrd` 直接成为 `/init` | .ko 仍来自 ISO/vendor initrd，与启动内核同源 |
 | rootfs | casper squashfs 3 层叠加 → 注入 agent/service → mksquashfs | Ubuntu 22.04 用户态 |
 
 **验证结果**：
@@ -509,9 +518,9 @@ NODEFORGE_UBUNTU_CASPER_VALIDATION_DONE
 
 | # | 问题 | 根因 | 修复 |
 |---|---|---|---|
-| 1 | casper initrd 缺少 `curl` | casper initrd 只含 `wget`，但 nodeforge-initrd 调用 `curl` | 从 Ubuntu rootfs 复制 curl 及其 25 个依赖库 |
-| 2 | `cp -a` 复制的是符号链接而非实际文件 | `libcurl.so.4` 是指向 `libcurl.so.4.7.0` 的符号链接 | 改用 `cp -L` 解引用 |
-| 3 | casper initrd 没有 `ldconfig` | 无法重建 `ld.so.cache`，curl 找不到 libcurl | 在 `/init` 中设置 `LD_LIBRARY_PATH` |
+| 1 | （历史）casper initrd 缺少 `curl` | 旧实现由 shell wrapper 调用 curl | 当前原生 HTTP 客户端已消除此依赖 |
+| 2 | （历史）复制动态库符号链接不完整 | 旧方案跨 rootfs/initrd 搬运 libcurl | 当前不再搬运目标 rootfs 动态库 |
+| 3 | （历史）casper initrd 没有 `ldconfig` | 旧方案需要刷新动态链接器缓存 | 当前 `/init` 为直接 ELF，不再使用 LD_LIBRARY_PATH wrapper |
 | 4 | `/init` 预挂载 proc/sys/dev 导致 panic | nodeforge-initrd 的 `mustRun("mount")` 在已挂载时返回 `EBUSY` | 不预挂载，由 nodeforge-initrd 自己 mount |
 | 5 | `vmlinuz` 必须按实际内核版本重命名 | PXE/TFTP 标准命名要求 | `cp vmlinuz vmlinuz-5.15.0-119-generic` |
 
@@ -523,17 +532,23 @@ NODEFORGE_UBUNTU_CASPER_VALIDATION_DONE
 
 | 方面 | Rocky (v0.2) | Ubuntu (v0.2.1) | 原因 |
 |---|---|---|---|
-| curl 可用性 | ✅ dracut 默认包含 | ❌→✅ 需注入 | dracut 默认安装 curl，casper 不安装 |
-| ldconfig | ✅ dracut 有 | ❌ 需 LD_LIBRARY_PATH | dracut 包含 ldconfig，casper 不包含 |
+| curl 可用性 | 非启动依赖 | 非启动依赖 | `nodeforge-initrd` 使用原生 HTTP |
+| ldconfig | 非 NodeForge 启动依赖 | 非 NodeForge 启动依赖 | 不再注入 curl/libc 或使用 LD_LIBRARY_PATH wrapper |
 | /init 预挂载 | 无问题 | 无问题（修正后） | Rocky 的 dracut /init 不预挂载，Ubuntu 修正后也不预挂载 |
 | vermagic 匹配 | ✅ 同宿主机 | ✅ 同 ISO | Rocky: kernel+initrd 同宿主机；Ubuntu: kernel+initrd 同 ISO |
 | switch_root | ✅ `/usr/sbin/switch_root` | ✅ `/usr/bin/switch_root` | 两者都有 |
-| DHCP client | `dhclient` fallback | casper 常见 `udhcpc`/`dhclient` | NodeForge 先复用已有地址，再优先 `udhcpc`、回退 `dhclient` |
+| DHCP client | vendor 兼容 fallback | vendor 兼容 fallback | 先按已绑定 IP 找接口，再按 PXE MAC 找接口 |
 
-**最新边界**：`nodeforge-initrd` 不再假设单一 dracut 工具闭包。HTTP 已由 Zig 原生客户端实现；网络先复用
-已有全局 IPv4，再优先使用 vendor initrd 的 BusyBox `udhcpc`，最后回退到构建 overlay 注入的 `dhclient`。
-因此 Ubuntu casper 是否自带 curl 不再影响启动，是否自带 dhclient 也不再是唯一客户端判据。
-差异在 initrd 构建步骤中处理（注入 curl），不需要修改 `initrd.zig` 本身。
+**最新边界**：`nodeforge-initrd` 不再假设单一 dracut 工具闭包。HTTP 已由 Zig 原生客户端实现；
+网络先按已绑定的 PXE IP 找实际接口，找不到再按 cmdline PXE MAC 匹配，只有旧启动参数兼容路径
+才尝试 vendor DHCP client。因此 Ubuntu casper 是否自带 curl/dhclient 不再决定启动可行性。
+差异只由 vendor initrd 提供的内核模块和工具能力处理；构建不得注入 curl 或目标
+rootfs libc，`initrd.zig` 本身通过原生 HTTP 和明确的启动网络事实工作。
+
+`single_threaded = true` 只用于 initrd/agent。Ubuntu 方案若取消该设置，也必须从
+Ubuntu ISO/目标 sysroot 解析并复制完整 ELF interpreter/`DT_NEEDED` 闭包；禁止借用 Rocky
+宿主 libc。当前顺序启动模型没有线程收益，因此继续保持该设置。完整规则见
+`V0_2_DESIGN.md` R15.3。
 
 ## 9. 两种 initrd 构建方案对比分析
 
@@ -640,7 +655,7 @@ mkinitramfs 生成的 initrd 与 casper initrd 的工具对比：
 
 | 工具 | casper initrd | mkinitramfs | nodeforge-initrd 需要？ |
 |---|---|---|---|
-| curl | ❌ 需注入 | ❌ 需注入 | ✅ 是 |
+| curl | 不需要 | 不需要 | 否（原生 HTTP） |
 | modprobe | ✅ 有 | ❌ 需注入 | ✅ 是（/init 脚本使用） |
 | ip | ✅ 有 | ✅ 有 | ✅ 是 |
 | DHCP client | `dhclient` fallback | `udhcpc` 或 `dhclient` | ✅ 至少一条路径；builder 保证 fallback |
@@ -650,7 +665,8 @@ mkinitramfs 生成的 initrd 与 casper initrd 的工具对比：
 | wget | ✅ 有 | ✅ 有 | ❌ 否 |
 | ldconfig | ❌ | ❌ | ❌ |
 
-**两种方案都需要注入 curl**，但 mkinitramfs 方案**还需要额外注入 modprobe**。
+**两种方案都不再注入 curl**。mkinitramfs 是独立构建 vendor initrd 的备选路径，
+其模块工具必须来自目标 sysroot，不得从宿主或另一发行版临时拷入。
 
 #### 9.3.4 mkinitramfs 格式为 zstd
 
@@ -666,7 +682,7 @@ mkinitramfs 默认输出 zstd 压缩的 cpio 镜像（与 casper initrd 格式�
 | **构建耗时** | ~30s | ~5min（apt update + install） |
 | **内核版本一致性** | ✅ 与 ISO 完全一致 | ⚠️ 取决于 apt 源：公网源会漂移，受管源可固定（见 §9.3.1） |
 | **rootfs 体积影响** | 无（rootfs 不变） | 需额外清理 1.6GB |
-| **工具注入** | 仅 curl | curl + modprobe |
+| **工具注入** | 无 curl 注入 | 由目标 sysroot/mkinitramfs 正常解析工具与模块 |
 | **InsufficientMemory 风险** | 无 | 有（需清理后才能避免） |
 | **离线构建** | ✅ 支持 | ❌ 不支持（需联网 apt） |
 | **跨发行版宿主机** | ✅ 仅需 zstd/cpio | ⚠️ 需要 chroot + apt |

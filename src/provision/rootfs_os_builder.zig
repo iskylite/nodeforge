@@ -51,6 +51,11 @@ fn buildDnf(
     try argv.append(a, try std.fmt.allocPrint(a, "--installroot={s}", .{staging}));
     try argv.append(a, try std.fmt.allocPrint(a, "--releasever={s}", .{majorVersion(version)}));
     try argv.append(a, "--setopt=install_weak_deps=False");
+    // `--repofrompath` only adds repositories; without this guard dnf also
+    // inherits enabled host repos (for example Rocky 9 EPEL) into a Rocky 10
+    // target build. Disable the host set first so the OS layer is sourced
+    // exclusively from the matching imported ISO repositories below.
+    try argv.append(a, "--disablerepo=*");
     for (repository_urls, 0..) |url, index| {
         try argv.append(a, try std.fmt.allocPrint(a, "--repofrompath=nodeforge-{d},{s}", .{ index, url }));
         try argv.append(a, try std.fmt.allocPrint(a, "--enablerepo=nodeforge-{d}", .{index}));
@@ -93,10 +98,10 @@ fn buildDnf(
         return error.OsLayerBuildFailed;
     }
 
-    // dnf --installroot 安装的 rocky-release 等包会带入指向公网 mirror 的默认
-    // .repo 文件。local-only 不变式要求 rootfs 只保留 nodeforge 管控的源。
-    // 删除全部 .repo，再写入 nodeforge 管控源配置。
-    try cleanupDefaultRepos(io, allocator, staging, repository_urls);
+    // 构建期与运行期都只使用 nodeforged 发布的 HTTP repository。这里清除
+    // dnf 带入的 vendor 公网源；节点启动时由 immutable AgentPlan 重写同一组
+    // 受管 HTTP 源，避免构建机路径泄漏到目标系统。
+    try cleanupDefaultRepos(io, allocator, staging);
     // 写入基础 sshd 配置：允许 root 密钥登录、禁用密码认证。
     try writeDefaultSshdConfig(io, allocator, staging);
     // 生成 Profile 级共享 SSH client keypair + sshd host keys，并配置自身免密。
@@ -106,32 +111,21 @@ fn buildDnf(
     try ensureDefaultTarget(io, allocator, staging);
 }
 
-/// 清除 dnf --installroot 带入的默认 .repo 文件，写入 nodeforge 管控源。
-/// local-only 不变式：rootfs 只保留 nodeforge 发布的本地受管源，不保留
-/// 任何指向公网 mirror 的默认仓库配置。
-fn cleanupDefaultRepos(io: std.Io, allocator: std.mem.Allocator, staging: []const u8, repository_urls: []const []const u8) !void {
+/// 清除 dnf --installroot 带入的默认 .repo 文件。构建与运行都使用受管 HTTP
+/// URL，但目标 rootfs 不继承构建工具生成的临时 repo 文件。
+fn cleanupDefaultRepos(io: std.Io, allocator: std.mem.Allocator, staging: []const u8) !void {
     const repos_dir = try std.fmt.allocPrint(allocator, "{s}/etc/yum.repos.d", .{staging});
     defer allocator.free(repos_dir);
-    // 创建目录（可能已存在）。
-    std.Io.Dir.cwd().createDirPath(io, repos_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, repos_dir);
     // 删除目录下所有 .repo 文件（rocky-release 等包带入的默认配置）。
-    var dir = std.Io.Dir.cwd().openDir(io, repos_dir, .{ .iterate = true }) catch return;
+    var dir = try std.Io.Dir.cwd().openDir(io, repos_dir, .{ .iterate = true });
     defer dir.close(io);
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".repo")) continue;
-        dir.deleteFile(io, entry.name) catch {};
+        try dir.deleteFile(io, entry.name);
     }
-    // 写入 nodeforge 管控源配置。
-    var content: std.Io.Writer.Allocating = .init(allocator);
-    defer content.deinit();
-    for (repository_urls, 0..) |url, index| {
-        try content.writer.print("[nodeforge-{d}]\nname=NodeForge managed repo {d}\nbaseurl={s}\nenabled=1\ngpgcheck=0\n\n", .{ index, index, url });
-    }
-    const repo_file = try std.fmt.allocPrint(allocator, "{s}/nodeforge.repo", .{repos_dir});
-    defer allocator.free(repo_file);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = repo_file, .data = content.written() });
 }
 
 /// 写入基础 sshd 配置 drop-in，使 sshd 在 node-apply 之前也有可用配置。

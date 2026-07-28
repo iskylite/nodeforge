@@ -67,7 +67,11 @@ pub const Session = struct {
     profile_len: u8 = 0,
     rootfs_input_digest: [digest_len]u8 = [_]u8{0} ** digest_len,
     rootfs_sha512: [sha512_len]u8 = [_]u8{0} ** sha512_len,
+    /// squashfs 传输字节数。
     rootfs_size: u64 = 0,
+    /// squashfs 展开后的逻辑字节数，用于启动期内存峰值校验；0 表示未知。
+    /// 未知值必须原样跨 checkpoint 保存，禁止回退成 rootfs_size。
+    rootfs_uncompressed_size: u64 = 0,
     tmpfs_percent: u8 = 50,
     minimum_free_bytes: u64 = 0,
     safety_margin_bytes: u64 = 0,
@@ -77,6 +81,10 @@ pub const Session = struct {
     agent_plan_len: u32 = 0,
     agent_plan_digest: [digest_len]u8 = [_]u8{0} ** digest_len,
     created_at: i64 = 0,
+    /// 节点首次进入 initrd 阶段的 UTC 时间；供 node list 的 INSTALL 列投影。
+    started_at: i64 = 0,
+    /// 进入 running/failed/expired 终态的 UTC 时间；0 表示尚未结束。
+    finished_at: i64 = 0,
     expires_at: i64 = 0,
     phase: lifecycle.Phase = .boot_tftp_complete,
     config_token: TokenSlot = .{},
@@ -117,6 +125,7 @@ pub const Store = struct {
     secret: []const u8,
     sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions,
     path: []const u8,
+    revision: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, secret: []const u8, path: []const u8) Store {
         return .{ .allocator = allocator, .secret = secret, .path = path };
@@ -139,10 +148,13 @@ pub const Store = struct {
         const parsed = try std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always });
         defer parsed.deinit();
         if (parsed.value.schema_version != persistence_schema_version) return error.InvalidDisklessDeliveryStore;
+        self.revision = parsed.value.revision;
         if (parsed.value.sessions.len > max_sessions) return error.InvalidDisklessDeliveryStore;
         var restored: usize = 0;
         for (parsed.value.sessions) |item| {
-            if (item.expires_at <= now_utc) continue;
+            // capability TTL 到期只淘汰未完成的 delivery。running/failed/expired
+            // 是节点长期运行事实，必须跨 daemon 重启保留给 node list 投影。
+            if (item.expires_at <= now_utc and !item.phase.isTerminal()) continue;
             const slot_index = self.findFree() orelse return error.DisklessSessionCapacity;
             var session = try restoreSession(item, now_mono, now_utc);
             try reconstructAndVerifyRaw(self.secret, &session, .config);
@@ -159,6 +171,9 @@ pub const Store = struct {
     /// token HMAC；raw token 永不落盘。
     pub fn persist(self: *Store, io: std.Io) !void {
         if (self.path.len == 0) return;
+        const previous_revision = self.revision;
+        self.revision = std.math.add(u64, self.revision, 1) catch return error.DisklessRevisionOverflow;
+        errdefer self.revision = previous_revision;
         var compact: [max_sessions]PersistedSession = undefined;
         var count: usize = 0;
         for (&self.sessions) |*session| {
@@ -167,6 +182,7 @@ pub const Store = struct {
             count += 1;
         }
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, PersistedFile{
+            .revision = self.revision,
             .sessions = compact[0..count],
         }, .{ .whitespace = .indent_2 });
         defer self.allocator.free(bytes);
@@ -174,10 +190,24 @@ pub const Store = struct {
         try chmod(self.allocator, io, "600", self.path);
     }
 
+    pub fn currentRevision(self: *const Store) u64 {
+        return self.revision;
+    }
+
     /// 创建一个 diskless session（不签发 token）。返回新 session 的只读引用；
     /// config/agent/event token 由 prepare/boot-config 分别签发。
-    pub fn begin(self: *Store, io: std.Io, node_id: []const u8, profile: []const u8, rootfs_input_digest: []const u8, rootfs_sha512: []const u8, rootfs_size: u64, kernel_release: []const u8, tmpfs_percent: u8, minimum_free_bytes: u64, safety_margin_bytes: u64, now_mono: i64, now_utc: i64) !*Session {
-        const slot = self.findFree() orelse return error.DisklessSessionCapacity;
+    pub fn begin(self: *Store, io: std.Io, node_id: []const u8, profile: []const u8, rootfs_input_digest: []const u8, rootfs_sha512: []const u8, rootfs_size: u64, rootfs_uncompressed_size: u64, kernel_release: []const u8, tmpfs_percent: u8, minimum_free_bytes: u64, safety_margin_bytes: u64, now_mono: i64, now_utc: i64) !*Session {
+        // 同节点新 delivery 原位取代旧终态快照；每个节点最多保留一条长期事实。
+        // 保存原值，checkpoint 失败时完整回滚。
+        var replacement: ?usize = null;
+        for (&self.sessions, 0..) |*existing, index| {
+            if (existing.active and existing.phase.isTerminal() and std.mem.eql(u8, existing.nodeId(), node_id)) {
+                replacement = index;
+                break;
+            }
+        }
+        const slot = replacement orelse self.findFree() orelse return error.DisklessSessionCapacity;
+        const previous_session = self.sessions[slot];
         var s: Session = .{ .active = true, .created_at = now_utc, .expires_at = now_utc + default_ttl_seconds };
         try generateId(io, &s.session_id);
         s.node_len = @intCast(@min(node_id.len, name_cap));
@@ -189,6 +219,7 @@ pub const Store = struct {
         const sh_len = @min(rootfs_sha512.len, sha512_len);
         @memcpy(s.rootfs_sha512[0..sh_len], rootfs_sha512[0..sh_len]);
         s.rootfs_size = rootfs_size;
+        s.rootfs_uncompressed_size = rootfs_uncompressed_size;
         s.tmpfs_percent = tmpfs_percent;
         s.minimum_free_bytes = minimum_free_bytes;
         s.safety_margin_bytes = safety_margin_bytes;
@@ -206,7 +237,7 @@ pub const Store = struct {
         s.event_token = .{ .issued = false, .scope = .event_append, .expires_mono = now_mono + default_ttl_seconds };
         self.sessions[slot] = s;
         self.persist(io) catch {
-            self.sessions[slot] = .{};
+            self.sessions[slot] = previous_session;
             return error.DisklessSessionPersistFailed;
         };
         return &self.sessions[slot];
@@ -320,8 +351,14 @@ pub const Store = struct {
     }
 
     pub fn findByNode(self: *Store, node_id: []const u8) ?*Session {
-        for (&self.sessions) |*s| if (s.active and std.mem.eql(u8, s.nodeId(), node_id)) return s;
-        return null;
+        var latest: ?*Session = null;
+        for (&self.sessions) |*s| {
+            if (!s.active or !std.mem.eql(u8, s.nodeId(), node_id)) continue;
+            // 历史 checkpoint 可能保留同节点的终态会话；列表和强制终止均选择
+            // created_at 最新的一次，不能由固定数组槽位顺序决定运行态。
+            if (latest == null or s.created_at > latest.?.created_at) latest = s;
+        }
+        return latest;
     }
 
     pub fn snapshot(self: *Store, out: *[max_sessions]Session) []const Session {
@@ -362,7 +399,7 @@ pub const Store = struct {
     /// 中提交新 phase/next sequence。重复/跳步/回退均由 reducer fail closed。
     pub const EventAdvanceResult = enum { applied, idempotent };
 
-    pub fn advanceEvent(self: *Store, io: std.Io, session_id: []const u8, expected: lifecycle.Phase, target: lifecycle.Phase, event_seq: u64) !EventAdvanceResult {
+    pub fn advanceEvent(self: *Store, io: std.Io, session_id: []const u8, expected: lifecycle.Phase, target: lifecycle.Phase, event_seq: u64, now_utc: i64) !EventAdvanceResult {
         const session = self.find(session_id) orelse return error.DisklessSessionNotFound;
         if (event_seq != std.math.maxInt(u64) and event_seq + 1 == session.event_token.event_seq and target == session.phase)
             return .idempotent;
@@ -370,11 +407,18 @@ pub const Store = struct {
         if (expected != session.phase) return error.DisklessExpectedPhaseMismatch;
         const previous_phase = session.phase;
         const previous_seq = session.event_token.event_seq;
+        const previous_started_at = session.started_at;
+        const previous_finished_at = session.finished_at;
         session.phase = try lifecycle.advance(session.phase, target);
         session.event_token.event_seq = std.math.add(u64, previous_seq, 1) catch return error.DisklessEventSequenceOverflow;
+        // INSTALL 对无盘节点表示真正开始执行 initrd，而不是服务端 prepare。
+        if (target == .diskless_initrd_started and session.started_at == 0) session.started_at = now_utc;
+        if (target.isTerminal() and session.finished_at == 0) session.finished_at = now_utc;
         self.persist(io) catch |err| {
             session.phase = previous_phase;
             session.event_token.event_seq = previous_seq;
+            session.started_at = previous_started_at;
+            session.finished_at = previous_finished_at;
             return err;
         };
         return .applied;
@@ -431,6 +475,8 @@ const PersistedSession = struct {
     rootfs_input_digest: []const u8,
     rootfs_sha512: []const u8,
     rootfs_size: u64,
+    /// schema v1 旧记录缺少该字段；恢复时临时回退 rootfs_size。
+    rootfs_uncompressed_size: u64 = 0,
     tmpfs_percent: u8,
     minimum_free_bytes: u64,
     safety_margin_bytes: u64,
@@ -438,6 +484,9 @@ const PersistedSession = struct {
     agent_plan_json: []const u8,
     agent_plan_digest: []const u8,
     created_at: i64,
+    /// schema v1 旧记录没有生命周期时间，缺省为 0 可向后兼容恢复。
+    started_at: i64 = 0,
+    finished_at: i64 = 0,
     expires_at: i64,
     phase: lifecycle.Phase,
     config_token: PersistedSlot,
@@ -448,6 +497,7 @@ const PersistedSession = struct {
 
 const PersistedFile = struct {
     schema_version: u32 = persistence_schema_version,
+    revision: u64 = 0,
     sessions: []const PersistedSession = &.{},
 };
 
@@ -472,6 +522,7 @@ fn persistedSession(session: *const Session) PersistedSession {
         .rootfs_input_digest = session.rootfsInputDigest(),
         .rootfs_sha512 = session.rootfsSha512(),
         .rootfs_size = session.rootfs_size,
+        .rootfs_uncompressed_size = session.rootfs_uncompressed_size,
         .tmpfs_percent = session.tmpfs_percent,
         .minimum_free_bytes = session.minimum_free_bytes,
         .safety_margin_bytes = session.safety_margin_bytes,
@@ -479,6 +530,8 @@ fn persistedSession(session: *const Session) PersistedSession {
         .agent_plan_json = session.agentPlanJson(),
         .agent_plan_digest = session.agentPlanDigest(),
         .created_at = session.created_at,
+        .started_at = session.started_at,
+        .finished_at = session.finished_at,
         .expires_at = session.expires_at,
         .phase = session.phase,
         .config_token = persistedSlot(&session.config_token),
@@ -501,10 +554,14 @@ fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session 
     var session: Session = .{
         .active = true,
         .rootfs_size = item.rootfs_size,
+        // 旧 checkpoint 缺少该字段时保持 unknown(0)，不能拿压缩大小冒充展开大小。
+        .rootfs_uncompressed_size = item.rootfs_uncompressed_size,
         .tmpfs_percent = item.tmpfs_percent,
         .minimum_free_bytes = item.minimum_free_bytes,
         .safety_margin_bytes = item.safety_margin_bytes,
         .created_at = item.created_at,
+        .started_at = item.started_at,
+        .finished_at = item.finished_at,
         .expires_at = item.expires_at,
         .phase = item.phase,
     };
@@ -631,6 +688,7 @@ test "delivery checkpoint restores session and reconstructs raw capabilities" {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         4096,
+        16384,
         "5.14.0",
         50,
         64,
@@ -659,6 +717,8 @@ test "delivery checkpoint restores session and reconstructs raw capabilities" {
     var after = Store.init(std.testing.allocator, &secret, checkpoint);
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1010));
     const restored = after.find(&session_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 4096), restored.rootfs_size);
+    try std.testing.expectEqual(@as(u64, 16384), restored.rootfs_uncompressed_size);
     try std.testing.expectEqualSlices(u8, &config_raw, &restored.config_token_raw);
     try std.testing.expectEqualSlices(u8, &rootfs_raw, &restored.rootfs_token_raw);
     try std.testing.expectEqualSlices(u8, &agent_raw, &restored.agent_token_raw);
@@ -685,6 +745,7 @@ test "diskless event CAS is ordered and exact retry is idempotent" {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         1,
+        4,
         "k",
         50,
         64,
@@ -701,6 +762,7 @@ test "diskless event CAS is ordered and exact retry is idempotent" {
         .boot_config_fetched,
         .diskless_initrd_started,
         0,
+        100,
     ));
     try std.testing.expectEqual(Store.EventAdvanceResult.idempotent, try store.advanceEvent(
         std.testing.io,
@@ -708,13 +770,16 @@ test "diskless event CAS is ordered and exact retry is idempotent" {
         .boot_config_fetched,
         .diskless_initrd_started,
         0,
+        101,
     ));
+    try std.testing.expectEqual(@as(i64, 100), store.find(&id).?.started_at);
     try std.testing.expectError(error.DisklessEventSequenceMismatch, store.advanceEvent(
         std.testing.io,
         &id,
         .diskless_initrd_started,
         .diskless_rootfs_downloading,
         4,
+        102,
     ));
     try std.testing.expectError(error.JumpRejected, store.advanceEvent(
         std.testing.io,
@@ -722,5 +787,27 @@ test "diskless event CAS is ordered and exact retry is idempotent" {
         .diskless_initrd_started,
         .diskless_rootfs_verified,
         1,
+        102,
     ));
+}
+
+test "missing rootfs uncompressed size remains unknown" {
+    const secret = [_]u8{0x44} ** 32;
+    var store = Store.init(std.testing.allocator, &secret, "");
+    const session = try store.begin(
+        std.testing.io,
+        "n-unknown",
+        "p-unknown",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        4096,
+        0,
+        "k",
+        50,
+        64,
+        32,
+        0,
+        0,
+    );
+    try std.testing.expectEqual(@as(u64, 0), session.rootfs_uncompressed_size);
 }

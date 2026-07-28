@@ -342,7 +342,9 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
             runtime.tftp.finish(session, false);
             if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
             switch (err) {
-                error.FileNotAllowed, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, remote, err }),
+                error.FileNotFound => observe_log.warn("tftp: not in catalog {s} from {f}", .{ request.filename, remote }),
+                error.FileNotAllowed => observe_log.warn("tftp: rejected unsafe path {s} from {f}", .{ request.filename, remote }),
+                error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, remote, err }),
                 else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
             }
             emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
@@ -733,7 +735,7 @@ fn transfer(
     // 去除后使路径相对于 TFTP asset root。
     const filename = trimLeadingSlash(request.filename);
     if (!isSafeRelativePath(filename)) return error.FileNotAllowed;
-    const asset = manifestAsset(catalog, filename) orelse return error.FileNotAllowed;
+    const asset = manifestAsset(catalog, filename) orelse return error.FileNotFound;
     // nodeforge_initrd assets intentionally live in the dedicated, daemon-owned
     // initrd store. Other PXE assets live below tftp.asset_root. Selecting the
     // root from the catalog kind closes the old build/register/serve mismatch

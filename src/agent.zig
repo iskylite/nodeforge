@@ -122,7 +122,6 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
     // (1) first-boot 在切根+systemd 后可直接读 boot.json 重放八步，无需远程控制；
     // (2) credential 文件已经在读取时 unlink，agent:read token 随后只剩内存副本并被清零。
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = handoff_path, .data = plan_json });
-
 }
 
 fn nodeApply(io: std.Io, allocator: std.mem.Allocator, plan: *const diskless_dto.AgentPlan, handoff_node: []const u8) !void {
@@ -132,9 +131,34 @@ fn nodeApply(io: std.Io, allocator: std.mem.Allocator, plan: *const diskless_dto
         return error.AgentPlanNodeMismatch;
     // hostname：machine-id 与 hostname 必须在真正 init 前写定。
     try writeFile(io, allocator, "/etc/machine-id", try machineId(allocator, projection.node_id));
-    const script = try node_apply.render(allocator, projection);
+    // AgentPlan 以 MAC 作为稳定身份。interface_name 未显式指定时，在目标机
+    // sysfs 中解析本次启动的真实名称（如 enp2s0），而不是把连接名 nodeforge
+    // 误当作设备名。diskless 每次启动都会重新探测，因此 PCI 拓扑变化也可收敛。
+    const resolved_interface = if (projection.network.interface == null)
+        (try interfaceNameByMac(io, allocator, projection.network.match_mac orelse projection.mac)) orelse
+            return error.NetworkInterfaceUnresolved
+    else
+        null;
+    defer if (resolved_interface) |name| allocator.free(name);
+    const script = try node_apply.renderResolved(allocator, projection, resolved_interface);
     defer allocator.free(script);
     try runChecked(io, allocator, &.{ "/bin/sh", "-c", script });
+}
+
+fn interfaceNameByMac(io: std.Io, allocator: std.mem.Allocator, expected_mac: []const u8) !?[]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io, "/sys/class/net", .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "lo")) continue;
+        const address_path = try std.fmt.allocPrint(allocator, "/sys/class/net/{s}/address", .{entry.name});
+        defer allocator.free(address_path);
+        const address = std.Io.Dir.cwd().readFileAlloc(io, address_path, allocator, .limited(64)) catch continue;
+        defer allocator.free(address);
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, address, " \t\r\n"), expected_mac))
+            return try allocator.dupe(u8, entry.name);
+    }
+    return null;
 }
 
 fn execInit(io: std.Io) noreturn {
@@ -298,7 +322,7 @@ fn runChecked(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8
             return error.SubprocessFailed;
         },
         else => {
-            std.debug.print("nodeforge-agent: 子进程异常终止: {s}\n", .{result.stderr });
+            std.debug.print("nodeforge-agent: 子进程异常终止: {s}\n", .{result.stderr});
             return error.SubprocessFailed;
         },
     }

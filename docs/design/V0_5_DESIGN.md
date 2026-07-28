@@ -119,7 +119,9 @@ v0.4 升级前已创建的 active/recoverable BootConfig v3 session 继续消费
   materialization mode。主机内存等 Node 特性只参与 readiness/实测预算，不反向改写或自动选择 mode。
 - v0.2 不存在该字段（单值无选择意义，同 v0.1 `connectivity.mode` 逻辑）；v0.5 迁移时默认补
   `squashfs_overlay`，旧配置无 mode 字段等价于 `squashfs_overlay`。
-- v0.2 起 rootfs manifest 就必须记录 `uncompressed_size`；v0.5 将它提升为 BootConfig v4 的 required field，
+- v0.2 的外部 rootfs 可将 `uncompressed_size` 留为 unknown（此时只告警并跳过
+  容量硬校验）；v0.5 若要将它提升为 BootConfig v4 的 required field，必须先提供
+  可重测量/回填的迁移流程，
   缺失 manifest 的旧 artifact 必须重新 deep validate/补可信 manifest，不能按压缩大小猜测。
 - `diskless.overlay.tmpfs_percent` 在 `squashfs_overlay` 下继续控制 upper 预算；在 `ram_rootfs` 下控制展开后
   writable root 可占 `MemAvailable` 的最大比例。这样既有字段不被静默忽略，范围仍为 10-80。

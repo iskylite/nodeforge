@@ -63,11 +63,16 @@ pub fn build(b: *std.Build) void {
 
     // nodeforge-initrd：v0.2 diskless 启动 init（PID 1），运行在 dracut userspace。
     //
-    // single_threaded=true：Zig stdlib 在 link_libc=true 时默认引用 pthread 符号
+    // single_threaded=true 只约束早期启动二进制，不影响 daemon/CLI。Zig stdlib
+    // 在 link_libc=true 时默认引用 pthread 符号
     // （如 pthread_create/pthread_mutex_init）。glibc >= 2.34 将 pthread 合并入 libc，
     // 但 Rocky 9 / Ubuntu 22.04 等可能使用 glibc < 2.34 的 sysroot 交叉编译，
     // 导致链接产物包含 NEEDED libpthread.so.0。最小 initrd 环境中不包含该库，
     // 二进制无法加载。single_threaded=true 阻止 stdlib 引入任何 pthread 符号。
+    // 代价是该程序及其依赖不能创建线程或依赖线程同步；当前 PID 1 是顺序状态机。
+    // 此设置不降低 GLIBC symbol version：CentOS 7 仍须用 gnu.2.17 sysroot 构建。
+    // 若未来取消，构建器必须从目标 ISO/sysroot 注入 interpreter + 递归
+    // DT_NEEDED（glibc < 2.34 包括 libpthread.so.0），严禁复制宿主库。
     //
     // strip=true：ReleaseSafe/ReleaseFast 时 strip 调试信息。initrd 二进制通过
     // TFTP/HTTP 传输到节点，体积直接影响启动延迟。Debug 模式保留符号便于开发调试。
@@ -85,8 +90,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(initrd);
 
     // nodeforge-agent：v0.2 切根后 pre-init / first-boot。
-    // single_threaded=true 和 strip=true 的理由与 nodeforge-initrd 相同
-    // （见上方注释）。agent 同样运行在最小 rootfs 环境中，避免 pthread 依赖。
+    // single_threaded=true 和 strip=true 的理由与 nodeforge-initrd 相同。未来若
+    // agent 确需并行下载/心跳，可只对 agent 启用线程并消费完整目标 rootfs 闭包，
+    // 无需同时扩大最早期 /init 的 ABI 依赖面。
     const agent = b.addExecutable(.{
         .name = "nodeforge-agent",
         .root_module = b.createModule(.{

@@ -4,6 +4,9 @@
 
 ## 现行设计总纲
 
+- [CLI HTTP 诊断与响应缓冲设计](design/CLI_HTTP_DIAGNOSTICS_AND_BUFFERING.md)：定义 management 响应容量、`--debug` 诊断、安全预览和后续开发约束。
+- [当前 CLI 全面优化与收敛方案](design/CURRENT_CLI_OPTIMIZATION_PLAN.md)：以当前代码和运行时事实为基线，统一正常工作流、同步/后台任务、CAS/force、clone、boot preview、retry、命令分层以及代码/注释/文档迁移。
+- [日志与安装计划摘要约定](design/LOGGING_AND_INSTALL_PLAN_DIGEST.md)：定义 HTTP 错误日志、request_id、setup 日志等级覆盖，以及 install plan digest 不一致的诊断和安全边界。
 - [v0.1 设计与修复计划](design/V0_1_DESIGN.md)：M0-M4 及进入 v0.2 前必须完成的修复，当前权威设计。
 - [v0.2 总纲](design/V0_2_DESIGN.md)：diskless 版本边界、跨域不变式、分册导航、实现切片与完成标准。所有 v0.2 工作先从这里进入。
 - [v0.3 设计：PXELINUX/BIOS install](design/V0_3_DESIGN.md)：`firmware.mode` schema v5、BIOS PXELINUX、发行版版本矩阵与 `install-post` phase。

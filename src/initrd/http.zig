@@ -154,6 +154,32 @@ pub fn get(
     defer allocator.free(resp.raw);
 
     if (resp.status < 200 or resp.status >= 300) {
+        // 非 2xx 响应：尽力读取 body 中的错误信封并打印到串口日志，
+        // 帮助 PXE 启动排障时区分"凭证失败（401 diskless.token_expired/
+        // diskless.unauthorized）vs 服务端故障（500）vs 路由不存在（404）"。
+        //
+        // 安全考量：body 只用于日志预览，不返回给调用方（initrd main 只拿到
+        // error.HttpError），避免错误信封中的 request_id 等字段进入后续逻辑。
+        // 预览上限 1024 字节，足以容纳服务端的标准错误信封（code+message+
+        // request_id 约 200 字节），超过此大小的响应体不读取。
+        //
+        // Content-Length 缺失或 > 1024 时退化为只打印状态码，与旧行为一致。
+        if (resp.content_length) |cl| {
+            if (cl <= 1024) {
+                var err_body: [1024]u8 = undefined;
+                // 按实际 Content-Length 截取切片，避免读取过多或过少。
+                const preview = err_body[0..@intCast(cl)];
+                // readSliceAll 失败表示响应被截断（网络中断等），
+                // 单独打印 truncated 提示，不吞掉错误。
+                reader.interface.readSliceAll(preview) catch {
+                    log("[nodeforge-initrd] GET → {d} (error body truncated)\n", .{resp.status});
+                    return error.HttpError;
+                };
+                log("[nodeforge-initrd] GET → {d} (error): {s}\n", .{ resp.status, preview });
+                return error.HttpError;
+            }
+        }
+        // Content-Length 缺失或响应体过大：只打印状态码，不尝试读取 body。
         log("[nodeforge-initrd] GET → {d} (error)\n", .{resp.status});
         return error.HttpError;
     }

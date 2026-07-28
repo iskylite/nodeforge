@@ -196,7 +196,8 @@ fn resolveInstall(
 /// kind 必须为 `.kernel`，initrd asset kind 必须为 `.nodeforge_initrd`。
 ///
 /// cmdline 生成：`nodeforge.config_url=http://<server>:<port>/api/v1/nodes/<node>/boot-config`
-/// `nodeforge.node=<node_id>`；aarch64 同时启用 `ttyAMA0`（QEMU/串口）和
+/// `nodeforge.node=<node_id>`，并把 DHCP 已确认的 lease/prefix/router 作为
+/// initrd bootstrap 网络参数交给 PID 1；aarch64 同时启用 `ttyAMA0`（QEMU/串口）和
 /// `tty0`（VMware/物理显示控制台）。session 由
 /// capsule 文件提供，不在 cmdline 中（initrd 从 `/capsule/session` 读取 fallback）。
 /// Profile 级 `kernel_args` 追加到末尾。
@@ -208,9 +209,6 @@ fn resolveDiskless(
     http_port: u16,
     cmdline_buf: []u8,
 ) ?BootTarget {
-    _ = identity.mac;
-    _ = identity.lease_ip;
-
     const profile = lookup.findProfile(catalog, identity.profileName()) orelse lookup.findProfile(config, identity.profileName()) orelse return null;
     if (profile.kind != .diskless) return null;
 
@@ -226,11 +224,21 @@ fn resolveDiskless(
     const kernel_path = toGrubPath(kernel_asset.path) orelse return null;
     const initrd_path = toGrubPath(initrd_asset.path) orelse return null;
 
-    const base = std.fmt.bufPrint(
-        cmdline_buf,
-        "nodeforge.config_url=http://{s}:{d}/api/v1/nodes/{s}/boot-config nodeforge.node={s} console=ttyAMA0 console=tty0",
-        .{ server_ip, http_port, identity.nodeId(), identity.nodeId() },
-    ) catch return null;
+    const slash = std.mem.lastIndexOfScalar(u8, config.dhcp.subnet, '/') orelse return null;
+    const prefix = config.dhcp.subnet[slash + 1 ..];
+    const lease = identity.lease_ip;
+    const base = if (config.dhcp.router) |router|
+        std.fmt.bufPrint(
+            cmdline_buf,
+            "ip=dhcp nodeforge.config_url=http://{s}:{d}/api/v1/nodes/{s}/boot-config nodeforge.node={s} nodeforge.mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} nodeforge.ip={d}.{d}.{d}.{d} nodeforge.prefix={s} nodeforge.gateway={s} console=ttyAMA0 console=tty0",
+            .{ server_ip, http_port, identity.nodeId(), identity.nodeId(), identity.mac[0], identity.mac[1], identity.mac[2], identity.mac[3], identity.mac[4], identity.mac[5], (lease >> 24) & 0xff, (lease >> 16) & 0xff, (lease >> 8) & 0xff, lease & 0xff, prefix, router },
+        ) catch return null
+    else
+        std.fmt.bufPrint(
+            cmdline_buf,
+            "ip=dhcp nodeforge.config_url=http://{s}:{d}/api/v1/nodes/{s}/boot-config nodeforge.node={s} nodeforge.mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} nodeforge.ip={d}.{d}.{d}.{d} nodeforge.prefix={s} console=ttyAMA0 console=tty0",
+            .{ server_ip, http_port, identity.nodeId(), identity.nodeId(), identity.mac[0], identity.mac[1], identity.mac[2], identity.mac[3], identity.mac[4], identity.mac[5], (lease >> 24) & 0xff, (lease >> 16) & 0xff, (lease >> 8) & 0xff, lease & 0xff, prefix },
+        ) catch return null;
 
     const cmdline = appendKernelArgs(cmdline_buf, base, profile.kernel_args) orelse {
         log.warn("kernel cmdline overflow (node={s}, kernel_args_len={d})", .{ identity.nodeId(), profile.kernel_args.?.len });
