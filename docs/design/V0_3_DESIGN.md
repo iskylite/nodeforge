@@ -1,18 +1,20 @@
 # NodeForge v0.3 设计：PXELINUX/BIOS install
 
 状态：设计冻结，实现未开始。本文定义 v0.3 范围，与 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §2 版本表一致。
-v0.3 在 v0.2 diskless 主流程完成后启动。实现细节与状态机见
+v0.3 在 v0.2.1 Ubuntu 收口和 v0.2.2 operability 门禁完成后启动。跨版本顺序见
+[`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md)，实现细节与状态机见
 [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md)，共用 CLI 契约见 [`V0_2_CLI.md`](V0_2_CLI.md) §0，
 程序边界见 [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md) §7。
 
 ## 1. 进入条件
 
-v0.3 必须基于 v0.2 diskless 主流程完成：
+v0.3 必须基于 v0.2.1/v0.2.2 完成：
 
 - v0.2 schema v4（`ProfileKind = install|diskless`）冻结，canonical BootSession 状态机、
   DHCP/TFTP/HTTP 协议栈与 effective compiler/readiness/validator 三项核心闭环已落地并通过验收。
-- `install-post|rootfs-build|first-boot` canonical phase、四类 action（managed-file/archive/script/package）
-  与八步执行契约已统一（v0.2 实现 `rootfs-build`/`first-boot`）。
+- v0.2 schema v4 已存在的受限 `install-post` 兼容 runner 回归通过；`rootfs-build|first-boot`
+  四类 action 与八步执行契约已统一，v0.3 在此基础上扩展 install-post。
+- v0.2.2 的持久状态升级兼容、durable operation、CLI 收口与固定回归矩阵全部通过。
 - v0.1 install 侧 PXE/adapter/effective 在 v0.2 期间保持回归通过。
 
 任何一项未完成时，v0.3 只能做隔离 spike，不能合入主产品路径。
@@ -27,7 +29,7 @@ v0.3 聚焦 **BIOS PXELINUX install 与发行版版本矩阵**，对应 M6（BIO
 | 发行版版本矩阵 | 是 | Rocky/RHEL 系与 Ubuntu 后续 LTS 的显式 adapter capability matrix |
 | bootloader/版本差异/错误分类 | 是 | 长期运行回归 |
 | 最小功能并发/失败恢复 | 是 | 大规模容量压测延后 v0.4 |
-| `install-post` phase | 是 | 安装器（Kickstart `%post`/Autoinstall `late-commands`）执行，无 agent |
+| `install-post` canonical 扩展 | 是 | phase/受限兼容 runner 已存在；v0.3 补四类 action、callback/journal 与完成闸 |
 
 v0.3 **不**包含：多 NIC/VLAN/bonding、PXE 阶段纯静态、下载后切换地址/子网、大规模容量压测（-> v0.4）；
 install 侧 first-boot agent（-> v0.4）；reconciliation/远程控制（永久非目标）。
@@ -52,7 +54,8 @@ install 侧 first-boot agent（-> v0.4）；reconciliation/远程控制（永久
 - 新增 Node direct `firmware.mode=uefi|bios`（schema v5）；**不**放入 Profile 或 `overrides`。
 - schema v4 到 v5 既有 Node migration 默认物化 `uefi`；新认领 Node 必须由管理员确认 desired `firmware.mode`。
 - migration transaction finalize 前可由 journal 回滚到完整 v4；finalize 后只有所有 Node 均为 `uefi`、不存在
-  `install-post` v5-only item 且其他资源均可由 v4 表达时才允许 downgrade。任一 `firmware.mode=bios` 或 v5-only phase
+  install-post v5-only canonical item 且其他资源均可由 v4 表达时才允许 downgrade。任一
+  `firmware.mode=bios` 或 v5-only install-post item
   返回 `migration.non_representable`，并列出 resource/path/reason；活动 v4/v5 snapshot 不随 catalog 迁移重编译。
 - DHCP observed firmware 只用于 mismatch/readiness 检查，不自动改写 desired property。
 - partition policy 仍用 v0.1 逻辑磁盘角色，由 effective compiler 结合 firmware 生成 ESP/biosboot 要求。
@@ -82,7 +85,7 @@ install 侧 first-boot agent（-> v0.4）；reconciliation/远程控制（永久
 | 失败语义 | retryable step 只在同一 installer execution 内按声明自动重试；耗尽后令 deployment 进入 `install.failed` |
 
 - 复用 v0.1 已有最小 install-post provision bundle（managed-file asset 驱动），**不改变其 Assets owner**。
-- v0.3 扩展为完整四类 action（managed-file/archive/script/package）与 `install-post` phase；旧 `repository`/
+- v0.3 将既有 phase 扩展为完整四类 action（managed-file/archive/script/package）；旧 `repository`/
   `standard_packages` 按 v0.2 §5.2 迁移表退出，不新增同义 action。
 - package action 只引用 pinned effective software/capability，经本地 repository 解析校验、幂等。
 - archive 规则与 v0.2 一致：顶层 `./install.sh` 则解压到临时目录执行；否则解压到 `/`。
@@ -130,6 +133,8 @@ nodeforge assets provision-bundle item add <bundle> steps \
 nodeforge node postprocess show <node> --phase install-post [--generation <id>]
 ```
 
+- `profile set ... install.post_install.bundle` 与 provision-bundle owner 沿用 v0.2 现有入口；
+  v0.3 新增的是 canonical action 接受范围、generation status/callback 和 BIOS 属性。
 - `firmware.mode` 是 Node direct 字段，不经 `overrides`；不适用 BIOS 的属性返回 `property.not_applicable`。
 - `postprocess` 统一命名（同 v0.2）：install 侧的 install-post phase 也用 `node postprocess show` 查询，
   不用 `postinstall`，避免与 diskless 命名分叉。省略 `--generation` 时查询最近一个 install generation；无历史时
@@ -137,8 +142,9 @@ nodeforge node postprocess show <node> --phase install-post [--generation <id>]
 - `node list`/`node show` 增加 `FIRMWARE` 列（`uefi`/`bios`）；`node show` 输出 `firmware.mode` direct 字段。
 - BIOS readiness 在 `node readiness --stage boot` 中增加 PXELINUX capability 检查、BIOS bootloader 资产存在性、
   `http_accel` 对 BIOS fail-closed 校验；diskless BIOS 直接 not-applicable。不通过时返回逐项 reason + `next_command`。
-- `install-post` phase item 复用 v0.2 的四类 action 与 per-action 字段矩阵（见 `V0_2_CLI.md` §3）；
-  `steps[].phase=install-post` 在 v0.2 parser 中被拒绝，v0.3 才接受。
+- `install-post` phase token 在 schema v4/parser 中已经存在，且兼容 runner 支持 repository、
+  standard-packages 与 managed-file 子集；v0.3 才接受 archive/script/package 等 canonical 新形态，
+  同时给旧形态明确迁移与拒绝边界。
 - v0.3 不提供多 NIC/VLAN/bonding、容量压测、install 侧 agent 的 CLI（属 v0.4/永久非目标）。
 
 ## 8. 明确非目标（v0.3 增量）

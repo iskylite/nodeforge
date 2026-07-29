@@ -1,10 +1,10 @@
 //! # v0.2 rootfs OS 层构建器
 //!
 //! `V0_2_DESIGN.md` §5.2 / `DISKLESS_FINAL.md` §4。rootfs 的 OS 层由发行版原生
-//! install-root 工具从 install source 受管 repository 构建到只读 lower：
-//! RHEL/Rocky 用 `dnf --installroot`，Ubuntu 设计上用 `debootstrap`。OS 层只引用
-//! 本地 nodeforged 受管源，不接触外部 mirror（与 first-boot package action 的
-//! pinned 源约束一致）。
+//! install-root 工具从 install source 受管 repository 构建到只读 lower。
+//! 当前生产实现只有 RHEL/Rocky `dnf --installroot`；Ubuntu 返回
+//! `AptOsLayerUnsupported`。v0.2.1 的目标路径是从同源 ISO 物化 casper
+//! squashfs layer closure，不是隐式回退宿主 apt/debootstrap。
 //!
 //! OS 层实际构建属环境相关执行边界（仅 Linux/root 构建主机可用，与 initrd/
 //! first_boot/rootfs_build_executor 一致），本模块不在单元测试覆盖内。叠加
@@ -32,7 +32,8 @@ pub fn buildOsLayer(
     if (repository_urls.len == 0) return error.NoManagedRepository;
     switch (package_manager) {
         .dnf => try buildDnf(io, allocator, staging, version, repository_urls),
-        // Ubuntu OS 层使用 debootstrap；v1 仅在 dnf/RHEL 链路验证，apt 留作后续保真项。
+        // v0.2.1 尚未把 ISO casper layer discovery/materialization 接到本入口；
+        // 在此之前必须 fail closed，不能用宿主 apt/debootstrap 猜测目标 rootfs。
         .apt => return error.AptOsLayerUnsupported,
     }
 }

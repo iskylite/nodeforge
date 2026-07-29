@@ -1,19 +1,29 @@
 # NodeForge 文档导航
 
-本文是 `docs/` 的统一入口。判断当前范围、接口和完成状态时，先看版本设计；`archive/` 只用于追溯历史决策，不能作为当前实现或版本边界的事实源。
+本文是 `docs/` 的统一入口。先用“当前实现审计”判断代码已经做到哪里，再用版本设计
+判断目标行为；`archive/` 只用于追溯历史决策，不能作为当前事实源。
 
 ## 现行设计总纲
 
+- [当前实现与设计对齐审查](audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)：基于
+  `e1af4e0` 的实现状态、P0/P1 发现、文档漂移和发布顺序。
+- [v0.2.1+ 实施路线图](design/V0_2_1_PLUS_ROADMAP.md)：v0.2.1-v0.5 的依赖、
+  schema/DTO 演进、跨版本不变式和完成闸。
 - [CLI HTTP 诊断与响应缓冲设计](design/CLI_HTTP_DIAGNOSTICS_AND_BUFFERING.md)：定义 management 响应容量、`--debug` 诊断、安全预览和后续开发约束。
 - [当前 CLI 全面优化与收敛方案](design/CURRENT_CLI_OPTIMIZATION_PLAN.md)：以当前代码和运行时事实为基线，统一正常工作流、同步/后台任务、CAS/force、clone、boot preview、retry、命令分层以及代码/注释/文档迁移。
 - [日志与安装计划摘要约定](design/LOGGING_AND_INSTALL_PLAN_DIGEST.md)：定义 HTTP 错误日志、request_id、setup 日志等级覆盖，以及 install plan digest 不一致的诊断和安全边界。
 - [v0.1 设计与修复计划](design/V0_1_DESIGN.md)：M0-M4 及进入 v0.2 前必须完成的修复，当前权威设计。
 - [v0.2 总纲](design/V0_2_DESIGN.md)：diskless 版本边界、跨域不变式、分册导航、实现切片与完成标准。所有 v0.2 工作先从这里进入。
+- [v0.2.1 Ubuntu diskless](design/V0_2_1_UBUNTU_DISKLESS.md)：casper layer
+  productization；目标设计冻结，正式 rootfs builder 尚未完成。
+- [v0.2.2 可运营性与矩阵](design/V0_2_2_OPERABILITY.md)：持久化升级、
+  durable builder operation、CLI 收敛、readiness 和固定发布矩阵。
 - [v0.3 设计：PXELINUX/BIOS install](design/V0_3_DESIGN.md)：`firmware.mode` schema v5、BIOS PXELINUX、发行版版本矩阵与 `install-post` phase。
 - [v0.4 设计：延后增强项](design/V0_4_DESIGN.md)：多 NIC/VLAN/bonding、容量压测、临时 PXE rootfs 构建节点与 install 侧 first-boot agent（无 reconciliation）。
 - [v0.5 设计：可切换 rootfs 形态](design/V0_5_DESIGN.md)：`ram_rootfs` 全内存模式与 `diskless.overlay.mode` 字段。
 
-v0.3（PXELINUX/BIOS install）与 v0.4（延后增强项）的设计在 v0.2 启动后展开；reconciliation/远程控制为永久非目标。
+版本实施顺序固定为 v0.2.1 -> v0.2.2 -> v0.3 -> v0.4 -> v0.5；
+reconciliation/远程控制为永久非目标。
 
 ## v0.2 分册
 
@@ -34,7 +44,7 @@ v0.3（PXELINUX/BIOS install）与 v0.4（延后增强项）的设计在 v0.2 �
 ## 审计与验证
 
 - [`audits/V0_2_V0_5_DESIGN_REVIEW.md`](audits/V0_2_V0_5_DESIGN_REVIEW.md)：基于 v0.1 M0-M4.13
-  代码事实的 v0.2-v0.5 差距、版本依赖与推荐实施顺序。
+  代码事实的历史设计审计；其“代码待实现”清单已被当前实现审计取代。
 - [`audits/V0_2_V0_5_CLI_GAP_AUDIT.md`](audits/V0_2_V0_5_CLI_GAP_AUDIT.md)：v0.2-v0.5 CLI、认证、恢复和迁移契约的查漏补缺记录。
 
 - [`audits/`](audits/)：代码事实、设计对齐和缺口审计。
@@ -54,5 +64,6 @@ v0.3（PXELINUX/BIOS install）与 v0.4（延后增强项）的设计在 v0.2 �
 
 - [`assets/`](assets/)：文档使用的图片等静态资源。
 
-文档发生冲突时，先按版本总纲的职责矩阵定位领域分册；设计与实现状态不一致时，设计定义目标行为，当前代码、
-审计和验证记录定义“已经实现到哪里”。历史归档不作为当前事实源。
+文档发生冲突时，先按版本总纲的职责矩阵定位领域分册；设计定义目标行为，
+当前代码与最新基线审计定义“已经实现到哪里”，validation 只证明其记录的候选和环境。
+历史审计/归档不作为当前实现清单。

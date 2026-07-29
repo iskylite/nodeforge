@@ -198,7 +198,7 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try renderCloudUser(w, allocator, "root", system.ssh.root_password, false, &.{}, bootstrap_key, system.ssh.root_authorized_keys, password_scope);
     for (system.users) |user| try renderCloudUser(w, allocator, user.name, user.password, user.sudo, user.groups, bootstrap_key, user.ssh_authorized_keys, password_scope);
     try w.writeAll("  early-commands:\n");
-    const facts_command = try std.fmt.allocPrint(allocator, "nf_fact() {{ test -r /sys/class/dmi/id/$1 && head -c 256 /sys/class/dmi/id/$1 | tr -d '\\r\\n' | sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g'; }}; s=$(nf_fact product_serial); u=$(nf_fact product_uuid); v=$(nf_fact sys_vendor); m=$(nf_fact product_name); d=$(printf '{{\"serial_number\":\"%s\",\"product_uuid\":\"%s\",\"vendor\":\"%s\",\"model\":\"%s\"}}' \"$s\" \"$u\" \"$v\" \"$m\"); curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d \"$d\" {s} || true", .{ token, session, facts_url });
+    const facts_command = try std.fmt.allocPrint(allocator, "nf_fact() {{ test -r /sys/class/dmi/id/$1 && head -c 256 /sys/class/dmi/id/$1 | tr -d '\\r\\n' | sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g'; }}; s=$(nf_fact product_serial); u=$(nf_fact product_uuid); v=$(nf_fact sys_vendor); m=$(nf_fact product_name); k=$(awk '$1 == \"MemTotal:\" {{ print $2; exit }}' /proc/meminfo); case \"$k\" in ''|*[!0-9]*) k=0;; esac; b=$((k * 1024)); d=$(printf '{{\"serial_number\":\"%s\",\"product_uuid\":\"%s\",\"vendor\":\"%s\",\"model\":\"%s\",\"memory_bytes\":%s}}' \"$s\" \"$u\" \"$v\" \"$m\" \"$b\"); curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d \"$d\" {s} || true", .{ token, session, facts_url });
     defer allocator.free(facts_command);
     try w.writeAll("    - ");
     try render.yamlQuote(w, facts_command);
@@ -675,6 +675,7 @@ test "M4.1 autoinstall renders target defaults and static network" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "servers:\n    - 'ntp.nodeforge.local'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "early-commands") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "http://facts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"memory_bytes\":%s") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "product_serial") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "error-commands") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--data-urlencode \"summary=$SUMMARY\"") != null);

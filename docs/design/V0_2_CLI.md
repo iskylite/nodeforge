@@ -6,6 +6,11 @@
 资源-动作树、typed PropertySpec/CollectionSpec/ItemSpec、统一 OutputDocument 和 optimistic concurrency；
 预留 enum、help 或空 handler 不算实现。
 
+> 本文同时包含当前接口与后续目标接口；不得据此假定每个命令已经实现。当前代码可用命令及缺口以
+> [`../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)
+> §4 为准，durable operation、boot preview 与 CLI 收口归入
+> [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md)。
+
 本文不规定内部模块如何实现命令；流程分册可以摘录命令，但不能改变这里的接口契约。
 
 ## 0. 共用约定

@@ -1,10 +1,13 @@
 # v0.2.1 设计：Ubuntu Casper Squashfs Diskless
 
-状态：**设计更新中**。本文是 v0.2.1 的唯一设计入口，负责版本边界、方案选型、风险分析和实现范围。
+状态：**目标设计冻结，产品实现未完成**。本文是 v0.2.1 的唯一设计入口，负责版本边界、方案选型、
+风险分析和实现范围。
 总纲与跨版本不变式以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文不重复 v0.2 已冻结的架构、
 程序边界和 CLI 契约，只定义 v0.2.1 新增的 Ubuntu diskless 能力及其与 v0.2 的差异。
+当前实现差距以 [`../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)
+为准，后续版本闸以 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md) 为准。
 
-日期：2026-07-25
+日期：2026-07-29
 
 > 2026-07-28 实现基线：本文后半部分保留部分历史实验记录；发生冲突时以本段和
 > §2.3.2 为准。当前 `nodeforge-initrd` 本身直接成为追加层的 `/init`，使用原生
@@ -16,9 +19,9 @@
 
 | 版本 | 范围 | 状态 |
 |---|---|---|
-| v0.2 | Rocky/RHEL diskless（`dnf --installroot` OS 层 + squashfs overlay） | 设计冻结，已验证 |
-| **v0.2.1** | **Ubuntu diskless（casper squashfs 叠加方案 + 跨发行版宿主支持）** | **本文** |
-| v0.2.2 | 异架构/实机 diskless 验证矩阵（原 v0.2.1 保留项） | 保留 |
+| v0.2.0 | Rocky/RHEL diskless（`dnf --installroot` OS 层 + squashfs overlay） | 已实现并通过 QEMU/VMware 验证 |
+| **v0.2.1** | **Ubuntu diskless（casper squashfs 叠加方案 + 跨发行版宿主支持）** | **目标冻结；手工 smoke 已通过，产品路径未完成** |
+| v0.2.2 | 持久化兼容、durable operation、CLI 收口与固定验证矩阵 | [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md) |
 | v0.3 | PXELINUX/BIOS install | 设计阶段 |
 
 v0.2.1 是 v0.2 的**增量补充**，不修改 v0.2 的 schema、catalog、BootSession 或 rootfs overlay 架构。
@@ -30,7 +33,7 @@ v0.2 的 diskless 已验证 Rocky 9.7 aarch64 闭环（`dnf --installroot` → s
 但 Ubuntu diskless 存在以下 gap：
 
 1. **OS 层构建不支持**：`rootfs_os_builder.zig` 对 apt 返回 `AptOsLayerUnsupported`；
-   `first_boot.zig` apt 分支未实现 `installroot` 跨根安装。
+   `rootfs_build_executor.zig` 仍会把 apt package action 交给未隔离目标根的 runner，不能用于生产。
 2. **跨发行版宿主限制**：`apt-get`/`dpkg`/`debootstrap` 在 Rocky/RHEL 宿主机上不可用，
    无法在 Rocky 宿主机上用原生 apt 工具链构建 Ubuntu rootfs。
 3. **Ubuntu ISO 资源未利用**：Ubuntu live-server ISO 的 casper squashfs 已包含完整的
@@ -62,18 +65,21 @@ casper 通过解析 dotted 文件名递归推导所有父层，将三层 squashf
 
 #### 2.3.1 rootfs 构建
 
-NodeForge 用 `nodeforge-initrd` 实现等价的 squashfs 叠加：
+正式 builder 从只读挂载的 source ISO 物化等价的 squashfs 叠加：
 
 ```text
-1. unsquashfs -d <staging> <iso>/casper/ubuntu-server-minimal.squashfs
-2. unsquashfs -d <staging> -f <iso>/casper/...ubuntu-server.squashfs  || true
-3. unsquashfs -d <staging> -f <iso>/casper/...installer.squashfs     || true
-4. 注入 nodeforge-agent + firstboot.service
-5. mksquashfs <staging> <rootfs.squashfs> -noappend -comp zstd
+1. 在 source asset 中唯一识别 installer top layer；歧义或缺层立即失败
+2. 按 dotted parent chain 从 base 到 top 得到有序 layer manifest
+3. 逐层 unsquashfs 到隔离 staging；任一未分类错误立即失败
+4. 校验 /sbin/init、systemd、apt、sshd 与目标架构
+5. 注入 nodeforge-agent、pre-init/first-boot unit 与 Profile rootfs-build 结果
+6. mksquashfs <staging> <rootfs.squashfs> -noappend -comp zstd
+7. 把 layer path/size/SHA-256、最终 SHA-512 与工具版本写入 artifact manifest
 ```
 
-`|| true` 处理叠加层的设备节点冲突（如 `lxd-installer` char device）——这是非致命错误，
-文件内容正确写入。
+禁止用 `|| true` 吞掉 `unsquashfs` 错误。若已知设备节点冲突需要兼容，必须按稳定错误类别显式处理，
+并以最终 manifest 校验补强；无法分类或校验不一致一律 fail closed。有序 layer manifest 必须参与
+`rootfs_input_digest`，同一 candidate 的重建才能被证明可复现。
 
 #### 2.3.2 initrd 构建：复用 casper initrd（关键设计修正）
 
@@ -87,7 +93,7 @@ NodeForge 用 `nodeforge-initrd` 实现等价的 squashfs 叠加：
 
 ```text
 1. base = ISO /casper/initrd                    # 不解包、不重打包
-2. overlay/init = nodeforge-initrd              # ELF 直接作为 PID 1
+2. overlay/init = nodeforge-initrd              # 目标架构 ELF，直接作为 PID 1
 3. overlay/usr/sbin/nodeforge-agent = target agent
 4. overlay 只允许 NodeForge 自有文件和纯文本 hook
 5. final = base bytes || encoded overlay member
@@ -143,9 +149,9 @@ debootstrap/apt 方案保留为未来选项（v0.3+ 可考虑），但 v0.2.1 �
 
 ### 2.5 与当前 diskless 运行期对齐
 
-- casper 层只提供 ISO 匹配的共享 lower。rootfs 构建与目标系统均只使用当前
-  nodeforged 发布的受管 HTTP APT source，不生成 `file://` repo；agent 即使没有
-  package delta 也要持久化该 HTTP source。
+- casper 层只提供 ISO 匹配的共享 lower。服务端 builder 为避免回调自身 HTTP handler，
+  只把同一受管 repository closure 以只读 `file://` 路径挂入隔离 staging；目标节点中的
+  first-boot package action 与最终 APT 配置仍使用 nodeforged 的受管 HTTP source。
 - AgentPlan 仍以节点 MAC 为网卡身份。`network.interface_name` 未配置时，agent 在
   Ubuntu 目标根的 `/sys/class/net` 按 MAC 解析实际名称。NetworkManager 文件名、
   connection id、`interface-name` 以及 Netplan 设备键、`set-name` 全部使用该名称；
@@ -153,7 +159,7 @@ debootstrap/apt 方案保留为未来选项（v0.3+ 可考虑），但 v0.2.1 �
   统一 adapter 会同时验证 `/etc/netplan` 与目标 `netplan` 可执行能力，满足时才选择
   Netplan；完整选择顺序见 `V0_2_DESIGN.md` R15.1。
 - Ubuntu 与 Rocky 共享同一 `diskless_delivery.Session` 列表投影：
-  `ARMED=created_at`、`INSTALL=initrd_started`、`FINISHED=terminal`。
+  `ARMED=armed_at`、`INSTALL=install_at`、`FINISHED=terminal`。
 - 当前代码的 `AptOsLayerUnsupported` 表明 casper layer discovery/materialization
   尚需正式接入 `rootfs_os_builder`。完成标准必须包含 NodeForge CLI 构建、manifest
   校验和 VMware/QEMU 启动，不能只引用手工 smoke 脚本。
@@ -169,9 +175,8 @@ debootstrap/apt 方案保留为未来选项（v0.3+ 可考虑），但 v0.2.1 �
 | 工具 | 用途 | Rocky/RHEL 可用性 |
 |---|---|---|
 | `squashfs-tools`（unsquashfs/mksquashfs） | 解压/打包 squashfs | ✅ EPEL 提供 |
-| `cpio` | 打包 initramfs cpio 镜像 | ✅ 系统自带 |
-| `zstd` | 解压/压缩 casper initrd | ✅ 系统自带 |
-| `python3` | catalog 注入 | ✅ 系统自带 |
+| `cpio` | 兼容性检查与诊断；正式 builder 由 Zig 编码 NodeForge cpio overlay | ✅ 系统自带 |
+| `zstd` | vendor initrd 格式检查；正式路径不改写 vendor prefix | ✅ 系统自带 |
 | `mount` + `losetup` | 挂载 ISO | ✅ 系统自带 |
 | `zig` 0.16+ | 编译二进制 | ✅ 静态安装 |
 | `qemu-kvm` | 验证启动 | ✅ 系统自带 |
@@ -187,17 +192,17 @@ debootstrap/apt 方案保留为未来选项（v0.3+ 可考虑），但 v0.2.1 �
 
 ```text
 1. Zig 二进制（nodeforged/nodeforge/nodeforge-initrd/nodeforge-agent）
-   ← zig build（静态链接，架构原生编译或交叉编译）
+   ← zig build（目标架构构建；运行期依赖必须由相同 target/sysroot 契约满足）
 
 2. rootfs.squashfs
    ← mount ISO → unsquashfs 3 层 → 注入 agent/service → mksquashfs
    ← 仅需 squashfs-tools + mount
    ← 注意：rootfs 的 /lib/modules/ 为空，内核模块不在 rootfs 中
 
-3. initramfs.img（含 nodeforge-initrd + 5.15.0-119-generic .ko）
-   ← zstd 解压 ISO 的 /casper/initrd → cpio 提取 → 注入 nodeforge-initrd → 替换 /init → cpio+zstd 重新打包
-   ← 仅需 zstd + cpio
-   ← .ko vermagic 与 /casper/vmlinuz 完全匹配（同源 ISO）
+3. initramfs.img（vendor casper initrd prefix + NodeForge overlay）
+   ← 原样保留 ISO /casper/initrd 字节，追加 gzip/newc member
+   ← overlay 只含 /init、nodeforge-agent 与 NodeForge 自有纯文本文件
+   ← vendor prefix 中的 .ko 与 /casper/vmlinuz 完全匹配（同源 ISO）
 
 4. 内核（vmlinuz）
    ← 从 Ubuntu ISO /casper/vmlinuz 提取（gzip 压缩的 EFI signed kernel）
@@ -297,7 +302,7 @@ wget ✓  busybox ✓  ip ✓  modprobe ✓  switch_root ✓  mount ✓
 
 **残留注意点**：
 - casper initrd 的 `/init` 脚本是 casper 专用的 live-boot 逻辑，必须替换为
-  nodeforge-initrd 的引导流程（§2.3.2 步骤 5）。
+  NodeForge overlay 中后出现的 `/init`（§2.3.2）；不得改写 vendor prefix。
 - casper initrd 体积较大（349MB 解压后），最终打包的 initrd.img 应保持 zstd 压缩。
 
 ### 4.4 风险 R3：casper initrd 用户态工具来源差异（低）
@@ -308,12 +313,13 @@ wget ✓  busybox ✓  ip ✓  modprobe ✓  switch_root ✓  mount ✓
 
 **影响**：
 - 工具行为与 rootfs 一致（同源 Ubuntu），无跨发行版差异。
-- `nodeforge-initrd` 和 `nodeforge-agent` 静态链接，不依赖任何 glibc。
+- `nodeforge-initrd` 和 `nodeforge-agent` 的 libc/loader 依赖必须由相同 target/sysroot
+  构建契约满足；`single_threaded=true` 只消除 pthread 依赖，不等于静态链接。
 - casper initrd 的 `/init` 脚本需替换为 nodeforge-initrd wrapper（§2.3.2）。
 
 **结论**：低风险，仅需替换 `/init` 脚本。
 
-### 4.4 风险 R4：casper squashfs 层完整性依赖（中）
+### 4.5 风险 R4：casper squashfs 层完整性依赖（中）
 
 **描述**：casper squashfs 叠加方案依赖 Ubuntu ISO 的 casper 分层结构。如果未来 Ubuntu ISO
 改变分层命名或结构，叠加脚本需要同步更新。
@@ -323,11 +329,11 @@ wget ✓  busybox ✓  ip ✓  modprobe ✓  switch_root ✓  mount ✓
 - 但非 LTS（如 25.10、26.04）可能引入新层或改变命名。
 
 **缓解措施**：
-1. ISO import 阶段检测 casper squashfs 层结构，记录到 catalog。
-2. 如果检测到的层结构与预期不符，`nodeforge assets import` 输出告警。
-3. 叠加脚本以配置化方式声明层列表，而非硬编码文件名。
+1. ISO import/build 阶段检测 casper squashfs 层结构，歧义时拒绝而不是只告警。
+2. 逐层 path/size/digest 写入 build plan 与 artifact manifest，并参与 input digest。
+3. discovery 根据 dotted parent chain 推导层列表，不硬编码特定 Ubuntu point release 文件名。
 
-### 4.5 风险 R5：apt rootfs-build package action 未实现（中）
+### 4.6 风险 R5：apt rootfs-build package action 未实现（高）
 
 **描述**：`first_boot.zig` 的 apt 分支未实现 `installroot` 跨根安装（dnf 分支已实现）。
 v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase 的 package action
@@ -338,11 +344,13 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
   需要 rootfs 内有完整的 apt 工具链（casper squashfs 已包含）。
 - chroot 执行不依赖宿主机有 apt，但需要 `/dev`/`/proc`/`/sys` bind-mount（apt 需要 /dev/null 等）。
 
-**缓解措施**：
-1. rootfs-build phase 的 apt package action 在 chroot 上下文执行（非 `--installroot`）。
-2. builder 提供 chroot 环境 + bind-mount `/dev`/`/proc`/`/sys`。
-3. 使用 rootfs 内的 apt（来自 casper squashfs），从 nodeforged 受管本地 APT 源安装。
-4. 这与 dnf 的 `--installroot`（host 上下文，不 chroot）路径不同，需单独实现和测试。
+**生产约束**：
+1. apt package action 必须在 mount/PID namespace 隔离的 chroot 内运行，禁止落到宿主根。
+2. `/dev`、`/proc`、`/sys` 与受管 repository closure 只按最小权限挂载；安装期间使用
+   `policy-rc.d` 阻止 daemon 启动。
+3. 使用 rootfs 内的 apt 与 pinned source，只允许当前 InstallSource closure；公网源必须禁用。
+4. namespace 退出负责自动清理 mount，任何残留 mount、进程或源漂移令 operation 失败。
+5. 这与 dnf 的 `--installroot` 路径不同，必须有“宿主零写入”回归测试。
 
 ## 5. CLI 提示
 
@@ -395,11 +403,11 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
 
 | 模块 | 变更 | 说明 |
 |---|---|---|
-| `src/catalog/iso_import.zig` | 新增 casper squashfs 层 + casper initrd 检测 | ISO import 时识别 casper 分层结构和 `/casper/initrd`，记录到 catalog |
+| `src/catalog/iso_import.zig` | 完成 casper squashfs 层 + casper initrd 检测 | 当前只验证 squashfs 存在；需唯一识别有序层链，细节写 build/artifact manifest |
 | `src/provision/rootfs_os_builder.zig` | 新增 `buildCasperOverlay` 分支 | apt 分支调用 casper squashfs 叠加（而非返回 `AptOsLayerUnsupported`） |
-| `src/provision/initrd_builder.zig` | 新增 `buildCasperInitrd` 分支 | 从 ISO `/casper/initrd` 提取 → 注入 nodeforge-initrd → 替换 /init → 重新打包 |
+| `src/provision/initrd_build_executor.zig` | 固化 vendor-prefix + overlay 路径 | 当前已能原样保留 vendor initrd 并追加 NodeForge gzip/newc overlay；补 Ubuntu manifest/回归 |
 | `src/provision/first_boot.zig` | apt package action 在 chroot 上下文执行 | 使用 rootfs 内的 apt，从受管 APT 源安装 |
-| `src/provision/rootfs_build_executor.zig` | apt 分支 chroot 执行 + bind-mount | 与 dnf 的 `--installroot` 路径不同 |
+| `src/provision/rootfs_build_executor.zig` | apt 分支隔离 chroot 执行 + namespace/mount | 当前只安全支持 dnf `--installroot`，apt 必须先补宿主零写入闸 |
 | `src/cli/` | 新增风险提示 | Ubuntu diskless 在非 Ubuntu 宿主机上的构建提示 + initrd 来源不一致检测 |
 | `tests/v0_2_1_ubuntu_casper_smoke.sh` | 新增正式 smoke test | 从 `v0_2_ubuntu_qemu_smoke.sh` 演进，使用 Ubuntu kernel + casper initrd |
 
@@ -412,34 +420,36 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
 
 ### 6.3 完成标准
 
-1. `nodeforge assets import <ubuntu-iso>` 正确识别 casper 分层结构 + casper initrd 并记录到 catalog。
+1. `nodeforge assets import <ubuntu-iso>` 正确识别 casper 分层结构 + casper initrd；有序层 manifest
+   进入 rootfs build plan/input digest/artifact manifest。
 2. `nodeforge profile rootfs build <ubuntu-diskless-profile>` 在 Rocky/RHEL 宿主机上
    成功构建 Ubuntu rootfs（casper squashfs 叠加 + rootfs-build phase）。
 3. rootfs-build phase 的 package action 在 chroot 上下文从受管 APT 源安装 userspace 包成功。
-4. initrd 构建：从 ISO `/casper/initrd` 提取 → 注入 `nodeforge-initrd` → 替换 `/init` → 重新打包成功。
+4. initrd 构建：ISO `/casper/initrd` 前缀逐字节不变，追加的 NodeForge cpio overlay 可复现且 manifest 可审计。
 5. QEMU smoke 验证：**Ubuntu kernel** (`/casper/vmlinuz`) + **casper initrd**（注入 nodeforge-initrd）
    + Ubuntu rootfs（squashfs 叠加）→ switch_root → systemd → first-boot → `diskless.running`。
 6. CLI 风险提示在适用场景下正确输出（非 Ubuntu 宿主机构建 rootfs-build、initrd 来源不一致）。
 7. 内核相关包的风险在文档和 CLI 中明确声明（风险提示，不锁死）。
-8. `zig build test` 全量通过。
+8. 同一 release candidate 上 Rocky + Ubuntu 均通过 QEMU 和 VMware 完整产品 CLI PXE 闭环。
+9. apt builder 宿主零写入、异常清理、源固定与重试回归通过。
+10. roadmap Gate 0 的旧状态迁移 fixture 在发布前置门禁通过；`zig build test` 全量通过。
 
 ### 6.4 不纳入 v0.2.1 的项
 
-- Ubuntu 宿主机上的完整构建验证（消除所有内核不匹配风险）→ v0.2.2 验证矩阵。
+- 更大范围发行版/架构/实机矩阵 → v0.2.2；Ubuntu 与 Rocky 的基本 QEMU/VMware 产品闭环属于 v0.2.1。
 - apt `--installroot` 跨根安装（替代 casper squashfs 方案）→ 未来版本评估。
 - 从 rootfs 构建 initrd（chroot + apt install linux-image + mkinitramfs）→ 已验证可行但复杂度高（见 §9），保留为未来优化选项。
-- 真正 QEMU PXE 网络启动验证（DHCP → TFTP → kernel+initrd）→ v0.2.2 验证矩阵。
 - 临时 PXE rootfs 构建节点（在真实 Ubuntu 内核态构建）→ v0.4。
 
 ## 7. 版本规划变更
 
-原 v0.2.1（异架构/实机验证矩阵保留项）重编号为 **v0.2.2**，
-新的 **v0.2.1** 专用于 Ubuntu casper squashfs diskless 方案的设计和落地实现。
+原 v0.2.1 的验证矩阵扩展并入 **v0.2.2 可运营性收口**，新的 **v0.2.1**
+专用于 Ubuntu casper squashfs diskless 方案的设计和产品化。
 
 | 版本 | 原编号 | 新编号 | 范围 |
 |---|---|---|---|
 | v0.2 | v0.2 | v0.2 | Rocky/RHEL diskless（不变） |
-| — | v0.2.1 | **v0.2.2** | 异架构/实机验证矩阵保留项 |
+| — | v0.2.1 | **v0.2.2** | 固定验证矩阵 + 持久化/operation/CLI/readiness 收口 |
 | — | — | **v0.2.1** | Ubuntu casper squashfs diskless（本文） |
 
 ## 8. 验证证据
@@ -452,7 +462,7 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
 |---|---|---|
 | casper squashfs 3 层叠加在 Rocky 9.8 上 | ✅ | `/sbin/init` symlink + `/usr/sbin/sshd` ELF aarch64 |
 | Rocky 上 mksquashfs 重新打包 | ✅ | 947MB squashfs |
-| Zig 4 二进制在 Rocky 上编译 | ✅ | 全部静态链接 ELF aarch64 |
+| Zig 4 二进制在 Rocky 上编译 | ✅ | 目标架构 ELF aarch64；依赖闭包来自目标 sysroot 契约 |
 | casper manpage `layerfs-path=` 官方文档 | ✅ | 20.04/22.04/24.04 三个 LTS 均记录 |
 | livecd-rootfs 构建脚本 `lb binary_layered` | ✅ | Launchpad Git 官方源码 |
 
@@ -526,7 +536,7 @@ NODEFORGE_UBUNTU_CASPER_VALIDATION_DONE
 
 **initrd 体积**：103MB（gzip 压缩后）
 
-### 8.5 对比 Rocky diskless 方案和代码
+### 8.4 对比 Rocky diskless 方案和代码
 
 检查了 `src/initrd.zig` 中的 nodeforge-initrd 代码，Rocky diskless **不存在类似问题**：
 
@@ -728,7 +738,7 @@ v0.2 交付中，`nodeforge-initrd` 已经使用**原生 Zig HTTP 客户端**（
 
 | 调用点 | 函数 | 用途 | HTTP 方法 |
 |---|---|---|---|
-| 行 66 | `http.getWithRetry()` | 拉取 BootConfig v2 JSON（含 rootfs URL/SHA-512/agent_plan），3 次重试 | GET |
+| 行 66 | `http.getWithRetry()` | 拉取 BootConfig v3 JSON（含 rootfs URL/SHA-512/agent_plan/facts URL），3 次重试 | GET |
 | 行 294 | `http.headWithRetry()` | HEAD 请求校验 rootfs 元数据（Content-Length/ETag/Accept-Ranges），3 次重试 | HEAD |
 | 行 315 | `rangeOnce()` | 分块 Range 下载 rootfs.squashfs（4MiB/块，断点续传） | GET + Range |
 | 行 245 | `http.post()` | 上报 lifecycle 事件（diskless.initrd_started 等），best-effort | POST |
@@ -774,35 +784,8 @@ v0.2 交付中，`nodeforge-initrd` 已经使用**原生 Zig HTTP 客户端**（
 
 
 
-#### 9.7.3（已过时）为什么用文件拷贝而非 chroot apt install curl？
+#### 9.7.3 历史 curl 分支（撤销）
 
-**注**：v0.2 已实现原生 HTTP 客户端，不再依赖 curl。本节保留为历史记录，说明
-方案 A 原本需要拷贝 curl 的原因。
-
-**先澄清：方案 A 确实需要拷贝 curl——这不是可选的。**
-
-casper initrd **不包含 curl**（只有 `wget`），而 `nodeforge-initrd` 运行时必须调用 curl
-（见 §9.7.1）。因此方案 A 的 initrd 构建步骤中，**从 rootfs 拷贝 curl 到 initrd 是必需的**。
-
-这里说的是"拷贝 vs apt install"的选择，而非"是否需要 curl"：
-
-| 方式 | 说明 |
-|---|---|
-| **拷贝文件（方案 A 原采用）** | 从 rootfs 的 `/usr/bin/curl` 和 `/lib/*/libcurl*.so` 拷贝到 initrd |
-| **chroot apt install** | 在 initrd-root 中执行 apt install curl（但 initrd-root 没有 apt/dpkg） |
-
-选择拷贝文件的原因：
-
-1. **curl 已在 rootfs 中**：Ubuntu casper squashfs 已包含 curl（`/usr/bin/curl`）
-   及其全部依赖库。无需安装，只需拷贝到 initrd。
-2. **initrd-root 没有 apt/dpkg**：casper initrd 是最小引导环境，不包含 apt、dpkg
-   等包管理工具。无法在 initrd-root 中执行 `apt install`。
-3. **不需要网络**：文件拷贝是纯本地操作，不需要 apt 源可达，不需要 nodeforged 运行。
-4. **更简单**：`cp -L` + `ldd` 解析依赖比设置 pinned apt 源 + update + install 简单得多。
-5. **`chroot rootfs apt install curl` 也是可行方案**：在 rootfs（而非 initrd-root）中
-   用 nodeforged 受管源执行 apt install curl 也是可以的，但 curl 已经存在于 rootfs 中，
-   apt install 只会确认它已安装（`0 newly installed`），不会改变任何文件。
-   因此这一步完全多余——直接拷贝即可。
-
-**总结**：v0.2.2（原生 HTTP）之后，方案 A **不再需要** 拷贝 curl。方案 B（mkinitramfs）
-构建的 initrd 也不需要注入 curl，因为 `nodeforge-initrd` 使用原生 HTTP 客户端，不再依赖任何外部工具。
+早期实验曾从 rootfs 向 initrd 拷贝 curl 及动态库。该分支已被 v0.2.0 的原生 Zig HTTP
+客户端彻底替代，既不是 v0.2.1 依赖，也不得重新进入 builder。vendor initrd prefix 必须保持不变，
+NodeForge overlay 不携带宿主或目标 rootfs 的 curl/libc/loader。

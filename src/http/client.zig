@@ -474,7 +474,8 @@ pub fn rootfsRegister(io: std.Io, port: u16, name: []const u8, file_path: []cons
 
 /// `profile rootfs build`：从 Profile build projection 构建内容寻址 rootfs 制品
 /// （OS 层 + rootfs-build phase 步骤 + mksquashfs + 登记）。`if_input_digest` 非空时
-/// 作为防漂移约束（仅当当前 rootfs input digest 匹配才构建）。
+/// 作为防漂移约束。daemon 返回 202 后按 Location 轮询持久化 Operation；
+/// CLI 只有观察到 succeeded 才返回成功，避免把“已入队”误报为“已构建”。
 pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, reason_buf: []u8) Mutation {
     if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
     var body: [1024]u8 = undefined;
@@ -486,8 +487,48 @@ pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]
             return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs build request is too large") };
     var path: [256]u8 = undefined;
     const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name}) catch return .{ .reachable = false, .healthy = false };
-    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
-    return managementMutation(io, port, "POST", route, rendered, revision, reason_buf);
+    var response: [16 * 1024]u8 = undefined;
+    var location: [256]u8 = undefined;
+    var reply = managementPostJson(io, port, route, rendered, null, &response, &location) catch |err|
+        return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+    if (reply.status == 0) return .{ .reachable = false, .healthy = false };
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body|
+            return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body) };
+        return .{ .reachable = true, .healthy = false, .reason = formatHttpStatus(reason_buf, reply.status) };
+    }
+    // 200 表示内容寻址缓存已经 ready；202 必须跟踪同一个 operation 到终态。
+    if (reply.status != 202) return .{ .reachable = true, .healthy = true };
+    const initial_location = reply.location orelse
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.invalid_response", "accepted rootfs build has no Location") };
+    var operation_path: [256]u8 = undefined;
+    if (initial_location.len > operation_path.len)
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.invalid_response", "operation Location is too long") };
+    @memcpy(operation_path[0..initial_location.len], initial_location);
+    const operation_route = operation_path[0..initial_location.len];
+
+    // 四小时硬上限覆盖常见大型镜像构建，同时避免客户端永久悬挂。
+    var attempts: usize = 0;
+    while (attempts < 4 * 60 * 60 * 4) : (attempts += 1) {
+        const operation_body = reply.body orelse
+            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.invalid_response", "operation response has no body") };
+        switch (operationState(operation_body) orelse
+            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.invalid_response", "operation response is malformed") }) {
+            .succeeded => return .{ .reachable = true, .healthy = true },
+            .failed => return .{ .reachable = true, .healthy = false, .reason = operationFailureReason(reason_buf, operation_body) },
+            .pending => {},
+        }
+        std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
+        reply = getReply(io, port, operation_route, &response, null) catch |err|
+            return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+        if (reply.status == 0) return .{ .reachable = false, .healthy = false };
+        if (reply.status < 200 or reply.status >= 300) {
+            if (reply.body) |err_body|
+                return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body) };
+            return .{ .reachable = true, .healthy = false, .reason = formatHttpStatus(reason_buf, reply.status) };
+        }
+    }
+    return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.timeout", "rootfs build did not finish within four hours") };
 }
 
 /// v0.2: 为 diskless 节点创建交付 session（POST boot-prepare）。
@@ -786,8 +827,8 @@ pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) 
     var response: [16 * 1024]u8 = undefined;
     var location: [256]u8 = undefined;
     var reply = try managementPostJson(io, port, "/api/v1/management/install-sources", body_writer.written(), request.idempotency_key, &response, &location);
-    // daemon 当前同步完成，202 body 已是 terminal 状态，循环只执行一次；仅当
-    // daemon 改为异步（返回 queued/running）时才按 Location 轮询 terminal 状态。
+    // 当前 ISO import handler 在隔离 worker 完成后返回 terminal；仍按通用
+    // Operation 合约轮询，避免未来改为真正异步时改变 CLI 成功语义。
     var attempts: usize = 0;
     while (attempts < 1200) : (attempts += 1) {
         const body = reply.body orelse return null;
@@ -827,6 +868,15 @@ fn operationState(body: []const u8) ?OperationState {
 }
 
 const OperationState = enum { succeeded, failed, pending };
+
+fn operationFailureReason(out: []u8, body: []const u8) []const u8 {
+    const Envelope = struct { result: struct { error_code: []const u8 } };
+    const parsed = std.json.parseFromSlice(Envelope, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return formatPlain(out, "operation.failed", "rootfs build operation failed");
+    defer parsed.deinit();
+    const code = if (parsed.value.result.error_code.len == 0) "operation.failed" else parsed.value.result.error_code;
+    return formatPlain(out, code, "rootfs build operation failed");
+}
 
 /// 检查 canonical path/header token。M4.5 不再用它拼接资产导入 query；这里只
 /// 保护 node/name path segment、digest 和 Idempotency-Key header。
@@ -934,6 +984,8 @@ test "operationState parses terminal and pending states" {
     try std.testing.expect(operationState("not json") == null);
     const imported = operationImportResult("{\"ok\":true,\"result\":{\"state\":\"succeeded\",\"result\":\"rocky-9.7-aarch64-iso\"}}").?;
     try std.testing.expectEqualStrings("rocky-9.7-aarch64-iso", imported.name());
+    var reason: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("rootfs.RootfsDigestDrift: rootfs build operation failed", operationFailureReason(&reason, "{\"ok\":true,\"result\":{\"state\":\"failed\",\"error_code\":\"rootfs.RootfsDigestDrift\"}}"));
 }
 
 /// 向指定 IPv4:port 发送轻量探针并严格解析三位状态码。

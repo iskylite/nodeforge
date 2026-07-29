@@ -4401,6 +4401,8 @@ fn nodeReadinessHandler(ctx: zli.CommandContext) !void {
             rootfs_input_digest: []const u8,
             desired_plan_digest: []const u8,
             memory: ?[]const u8 = null,
+            memory_bytes: ?u64 = null,
+            memory_reported_at: ?i64 = null,
             required_min_memory_bytes: ?u64 = null,
         },
     };
@@ -4412,7 +4414,17 @@ fn nodeReadinessHandler(ctx: zli.CommandContext) !void {
     defer parsed.deinit();
     const result = parsed.value.result;
     const human = if (result.required_min_memory_bytes) |required|
-        try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}\nmemory: {s}\nrequired_min_memory_bytes: {d}", .{ result.node_id, result.stage, if (result.ready) "true" else "false", result.rootfs_input_digest, result.desired_plan_digest, result.memory orelse "unknown", required })
+        try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}\nmemory: {s}\nmemory_bytes: {s}\nmemory_reported_at: {s}\nrequired_min_memory_bytes: {d}", .{
+            result.node_id,
+            result.stage,
+            if (result.ready) "true" else "false",
+            result.rootfs_input_digest,
+            result.desired_plan_digest,
+            result.memory orelse "unknown",
+            if (result.memory_bytes) |value| try std.fmt.allocPrint(ctx.allocator, "{d}", .{value}) else "-",
+            if (result.memory_reported_at) |value| try std.fmt.allocPrint(ctx.allocator, "{d}", .{value}) else "-",
+            required,
+        })
     else
         try std.fmt.allocPrint(ctx.allocator, "node: {s}\nstage: {s}\nready: {s}\nrootfs_input_digest: {s}\ndesired_plan_digest: {s}", .{ result.node_id, result.stage, if (result.ready) "true" else "false", result.rootfs_input_digest, result.desired_plan_digest });
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
@@ -4803,7 +4815,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
                 successful_generation: u64,
                 deployed_at: i64,
             },
-            inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, reported_at: i64, deployment_generation: u64 = 0, session_created_at: i64, boot_session_id: []const u8 },
+            inventory: ?struct { serial_number: ?[]const u8, product_uuid: ?[]const u8, vendor: ?[]const u8, model: ?[]const u8, memory_bytes: ?u64 = null, reported_at: i64, deployment_generation: u64 = 0, session_created_at: i64, boot_session_id: []const u8 },
         },
     };
     var parsed = std.json.parseFromSlice(Response, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
@@ -4821,6 +4833,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     const install_intent = if (result.deployment) |deployment| deployment.install_intent else "-";
     const drift_state = if (result.deployment) |deployment| deployment.drift_state else "-";
     const inventory_serial = if (result.inventory) |inventory| inventory.serial_number orelse "-" else "-";
+    const inventory_memory = if (result.inventory) |inventory| if (inventory.memory_bytes) |bytes| try std.fmt.allocPrint(ctx.allocator, "{d}", .{bytes}) else "-" else "-";
     const additional_disks = if (stored_node.storage.additional_disks.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.storage.additional_disks);
     const network_dns = if (stored_node.network.dns.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.network.dns);
     const search_domains = if (stored_node.network.search_domains.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.network.search_domains);
@@ -4836,7 +4849,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
         .{ .key = "effective.install.storage.boot_disk", .value = storage.boot_disk, .section = "effective", .json_path = "storage.effective.boot_disk" },                                                                                          .{ .key = "effective.system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },                                                                        .{ .key = "effective.system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },                               .{ .key = "effective.system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
         .{ .key = "effective.system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "true" else "false", .section = "effective", .json_path = "effective_system.ssh.enabled" },                                                     .{ .key = "effective.system.security.firewall", .value = @tagName(result.effective_system.security.firewall), .section = "effective", .json_path = "effective_system.security.firewall" },                                                                    .{ .key = "effective.system.security.selinux", .value = @tagName(result.effective_system.security.selinux), .section = "effective", .json_path = "effective_system.security.selinux" },                                    .{ .key = "effective.system.security.apparmor", .value = @tagName(result.effective_system.security.apparmor), .section = "effective", .json_path = "effective_system.security.apparmor" },
         .{ .key = "runtime.phase", .value = status_phase, .section = "runtime", .json_path = "status.phase" },                                                                                                                                      .{ .key = "runtime.reason", .value = status_reason, .section = "runtime", .json_path = "status.reason" },                                                                                                                                                     .{ .key = "runtime.install_intent", .value = install_intent, .section = "runtime", .json_path = "deployment.install_intent" },                                                                                             .{ .key = "runtime.drift_state", .value = drift_state, .section = "runtime", .json_path = "deployment.drift_state" },
-        .{ .key = "runtime.serial_number", .value = inventory_serial, .section = "runtime", .json_path = "inventory.serial_number" },                                                                                                               .{ .key = "runtime.profile_kind", .value = result.profile.kind, .section = "runtime", .json_path = "profile.kind" },                                                                                                                                          .{ .key = "runtime.boot_bundle", .value = result.profile.boot_bundle orelse "-", .section = "runtime", .json_path = "profile.boot_bundle" },
+        .{ .key = "runtime.serial_number", .value = inventory_serial, .section = "runtime", .json_path = "inventory.serial_number" },                                                                                                               .{ .key = "runtime.memory_bytes", .value = inventory_memory, .section = "runtime", .json_path = "inventory.memory_bytes" },                                                                                                                                   .{ .key = "runtime.profile_kind", .value = result.profile.kind, .section = "runtime", .json_path = "profile.kind" },                                                                                                       .{ .key = "runtime.boot_bundle", .value = result.profile.boot_bundle orelse "-", .section = "runtime", .json_path = "profile.boot_bundle" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Node {s}", .{stored_node.id});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });

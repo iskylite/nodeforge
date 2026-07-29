@@ -24,7 +24,7 @@ pub const model = @import("model.zig");
 pub const paths = @import("paths.zig");
 /// 安装初始化、reset 与 systemd unit 生成。
 pub const setup = @import("setup.zig");
-/// 项目版本字符串，从 build.zon 注入。
+/// 项目版本与构建溯源信息，由 build.zig 通过 build_options 注入。
 pub const version = @import("version.zig");
 /// Catalog 查找工具：按名称查找 distro/profile/asset/repository 等对象。
 pub const catalog = @import("catalog.zig");
@@ -66,7 +66,7 @@ pub const boot_session_store = @import("state/boot_session_store.zig");
 pub const diskless_session = @import("state/diskless_session.zig");
 /// v0.2 diskless 分域 scoped capability token（hash-only、有界、一次性）。
 pub const diskless_credential = @import("state/diskless_credential.zig");
-/// v0.2 diskless delivery DTOs：BootConfig v2 与 AgentPlan v1。
+/// v0.2 diskless delivery DTOs：BootConfig v3 与 AgentPlan v1。
 pub const http_diskless_dto = @import("http/diskless_dto.zig");
 /// v0.2 rootfs builder core：制品记录、构建状态机、DeliveryManifest、local-only 检查。
 pub const provision_rootfs_build = @import("provision/rootfs_build.zig");
@@ -154,7 +154,9 @@ pub const adapter_capabilities = @import("profile/capabilities.zig");
 pub const admin_key = @import("server/admin_key.zig");
 pub const kickstart = @import("profile/adapter/kickstart.zig");
 pub const ubuntu_autoinstall = @import("profile/adapter/ubuntu.zig");
-/// M4 受限 install_post provisioning 渲染器。
+/// 当前 schema v4 的受限 install-post 渲染器：只执行既有
+/// repository/standard_packages/managed_file 兼容动作；v0.3 规划的四类
+/// canonical action、generation callback 和完成闸尚未由此模块实现。
 pub const provision_runner = @import("provision/runner.zig");
 pub const provision_first_boot = @import("provision/first_boot.zig");
 /// 错误渲染器：将 Zig error set 映射为人类可读的审计消息。

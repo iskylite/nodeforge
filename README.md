@@ -57,10 +57,14 @@ NodeForge/
 - **`vendor/zli/`**：CLI 框架依赖，`build.zig` 编译时直接链接，是运行时必需组件。
 - **`vendor/dhcp/`**：ISC DHCP（dhcp-4.4.3）的 C 源码，**本项目中未使用、不参与编译**，仅保留为 DHCPv4 协议实现的参考资料。NodeForge 的 DHCP 服务端（`src/dhcp/`）是基于 RFC 2131/2132 的 Zig 原生实现，不依赖此目录中的任何代码。
 
-两个二进制共享同一核心模块（`src/root.zig`），避免 CLI 与 daemon 行为分叉：
+管理面两个程序共享同一核心模块（`src/root.zig`），diskless 节点侧另有两个
+最小执行器；构建共输出四个程序：
 
 - **`nodeforged`**：守护进程，承载 DHCP/TFTP/HTTP 服务和本机管理接口。
 - **`nodeforge`**：管理客户端，通过 `127.0.0.1` 调用 daemon 的管理 API。
+- **`nodeforge-initrd`**：diskless initramfs 中的 PID 1，负责网络、下载、
+  校验、overlay 和 switch_root。
+- **`nodeforge-agent`**：目标 rootfs 内的 pre-init/first-boot 执行器。
 
 默认安装根为 `/opt/nodeforge`。`nodeforge setup` 会生成 `/etc/profile.d/nodeforge.sh`，新登录 shell
 自动将 `/opt/nodeforge/bin` 加入 `PATH`；当前 shell 可执行 `source /etc/profile.d/nodeforge.sh` 立即生效。
@@ -69,10 +73,15 @@ NodeForge/
 
 详细设计、审计和验证记录位于 [`docs/`](docs/)，入口见 [文档导航](docs/README.md)：
 
-- [v0.1 最终设计](docs/design/V0_1_DESIGN.md)：当前权威设计，定义已实现的所有权模型和完成标准。
-- [v0.2 设计总纲](docs/design/V0_2_DESIGN.md)：diskless 无盘启动主流程，已实现并通过 aarch64 QEMU 完整闭环验证。
-- [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu casper squashfs 叠加方案，支持 Rocky/RHEL 宿主构建 Ubuntu 无盘系统。
-- [v0.2.2 保留项](docs/validation/V0_2_2_RESERVED.md)：异架构/实机验证矩阵（x86_64 UEFI smoke、VMware compute_use），当前暂不验证。
+- [当前实现对齐审查](docs/audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)：基于
+  `e1af4e0` 的代码、测试、持久化和文档差距清单。
+- [v0.2 设计总纲](docs/design/V0_2_DESIGN.md)：Rocky/RHEL diskless 主流程。
+- [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu
+  casper 方案；运行时与 smoke 已验证，生产 rootfs builder 尚待实现。
+- [v0.2.2 可运营性设计](docs/design/V0_2_2_OPERABILITY.md)：持久化兼容、
+  durable builder operation、CLI 收敛和固定验证矩阵。
+- [v0.2.1+ 路线图](docs/design/V0_2_1_PLUS_ROADMAP.md)：v0.2.1-v0.5 的依赖、
+  schema/DTO 演进与完成闸。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
 - [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录（含 [Phase 8 QEMU 全量验证](docs/validation/V0_2_PHASE8_VALIDATION.md)）。
 
@@ -114,7 +123,7 @@ NodeForge 是单进程服务，在同一端口上复用 HTTP 健康检查、管�
 
 ## 规划
 
-### v0.1（当前）
+### v0.1（已完成基线）
 
 IPv4 PXE 无人值守安装产品已完成；所有权模型、typed property registry、软件能力索引和 schema v3 迁移均已收口。主要里程碑：
 
@@ -126,15 +135,19 @@ IPv4 PXE 无人值守安装产品已完成；所有权模型、typed property re
 | M4.12 | 存储 override | 已由 canonical Node/Profile 所有权模型取代旧 fallback |
 | M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 已完成 |
 
-### v0.2（进行中）
+### v0.2（当前产品线）
 
-当前已落地 schema v4、diskless Profile、rootfs 制品登记、BootConfig v2 /
-AgentPlan v1、分域 capability、严格 HEAD + Range 下载、tmpfs overlay、node-apply
-与 aarch64 Rocky 9.7 完整 OS QEMU 启动闭环。尚未达到 v0.2 完成标准，主要剩余
-content-addressed first-boot payload、失败恢复/负向矩阵、x86_64/UEFI 与实机验证。
+v0.2.0 已落地 schema v4、diskless Profile、rootfs 制品登记、BootConfig v3 /
+AgentPlan v1、四域 capability、严格 HEAD + Range 下载、tmpfs overlay、node-apply、
+first-boot content-addressed payload 与 aarch64 Rocky QEMU/VMware UEFI PXE 完整闭环。
 
-- **v0.2**：内存无盘启动（固定 squashfs overlay）及 node-apply/first-boot
-- **v0.3+**：BIOS PXELINUX、更多发行版和后续 rootfs 形态，详见各版本设计
+后续按以下边界推进：
+
+- **v0.2.1**：把已验证的 Ubuntu casper 方案接入正式 `profile rootfs build`
+  产品链，并补齐 apt rootfs-build 隔离执行；
+- **v0.2.2**：持久化升级兼容、durable builder operation、CLI 收敛、
+  x86_64/aarch64 双架构与故障恢复矩阵；
+- **v0.3+**：BIOS PXELINUX、多 NIC/topology、后续 rootfs 形态。
 
 IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是项目永久非目标。
 
@@ -173,7 +186,8 @@ make dist-linux-amd64   # 交叉编译并打包 Linux x86_64
 make dist-linux-arm64   # 交叉编译并打包 Linux aarch64
 ```
 
-构建产物位于 `zig-out/bin/`，包含 `nodeforge` 和 `nodeforged` 两个二进制。
+构建产物位于 `zig-out/bin/`，包含 `nodeforge`、`nodeforged`、
+`nodeforge-initrd` 和 `nodeforge-agent` 四个程序。
 
 产品版本统一定义在 `build.zig` 文件级常量 `nodeforge_version` 中；发布新版本时同时更新
 `build.zig.zon` 的包版本。构建时间由 Zig 标准库读取实时时钟并格式化为 RFC 3339 UTC，格式为
@@ -193,9 +207,6 @@ make dist-linux-arm64   # 交叉编译并打包 Linux aarch64
 > ```bash
 > rm -rf .zig-cache
 > ```
-
-可运行 `zig run -lc examples/time_format_demo.zig` 验证时间转换边界：构建所用的纯 Zig
-`std.time.epoch` 输出 UTC 日历时间，libc `localtime_r`/`strftime` 输出宿主本地时间。
 
 ## 部署
 
@@ -226,8 +237,8 @@ systemctl start nodeforged
 
 ```text
 /opt/nodeforge/
-├── bin/            # nodeforge / nodeforged
-├── config/         # config.json (schema 3)
+├── bin/            # nodeforge / nodeforged / nodeforge-initrd / nodeforge-agent
+├── config/         # config.json (schema 4)
 ├── catalog/        # manifest.json + entity files
 ├── assets/
 │   ├── iso/        # ISO 镜像

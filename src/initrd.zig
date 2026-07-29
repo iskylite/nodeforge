@@ -1,7 +1,7 @@
 //! # nodeforge-initrd（v0.2 diskless 启动 init）
 //!
 //! `V0_2_DESIGN.md` §4.3 boot-time 序列。作为 dracut initrd 的 PID 1，在获得网络后：
-//! 从 per-session credential capsule 读取 config token -> 有界重试拉取 BootConfig v2 ->
+//! 从 per-session credential capsule 读取 config token -> 有界重试拉取 BootConfig v3 ->
 //! 下载并 SHA-512 校验 rootfs -> loop 挂载只读 lower + tmpfs upper -> overlay 合并 ->
 //! 写 `/var/lib/nodeforge/boot.json` handoff（AgentPlan locator 与 agent/event token）->
 //! 清除 config/rootfs token -> `switch_root` 执行 `nodeforge-agent --pre-init`。
@@ -191,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
     const event_token = try readToken(io, allocator, capsule_event_token_path);
     defer allocator.free(event_token);
 
-    // 拉取 BootConfig v2（config:read token，有界重放，3 次重试）。
+    // 拉取 BootConfig v3（config:read token，有界重放，3 次重试）。
     // session 优先从 cmdline 读取（direct boot / QEMU -append 模式）；
     // 不在 cmdline 时从 capsule 文件读取（PXE boot 模式，GRUB cmdline
     // 不含 session，由 capsule 文件提供 diskless session ID）。
@@ -233,6 +233,9 @@ pub fn main(init: std.process.Init) !void {
     const meminfo = try captureRun(io, allocator, &.{ "cat", "/proc/meminfo" });
     defer allocator.free(meminfo);
     const available_budget = try memory.memAvailableBytes(meminfo);
+    const memory_bytes = try memory.memTotalBytes(meminfo);
+    postMemoryFacts(io, allocator, bc.facts_url, event_token, session, memory_bytes) catch |err|
+        log("[nodeforge-initrd] WARNING: authenticated memory facts upload failed: {t}\n", .{err});
     const scaled_upper = std.math.mul(u64, available_budget, bc.tmpfs_percent) catch return error.MemoryBudgetOverflow;
     const upper_limit = if (bc.rootfs_uncompressed_size) |uncompressed_size|
         try memory.upperLimit(.{
@@ -521,7 +524,7 @@ fn writeHandoff(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfig,
     try mustRun(io, allocator, &.{ "chmod", "0400", event_token_path });
 }
 
-/// 服务端 BootConfig v2 解析结果（per-Node 短时 DTO）。字符串字段由 `parseBootConfig`
+/// 服务端 BootConfig v3 解析结果（per-Node 短时 DTO）。字符串字段由 `parseBootConfig`
 /// dupe 到 arena 之外，必须经 `freeBootConfig` 释放。
 const BootConfig = struct {
     rootfs_url: []u8,
@@ -529,6 +532,7 @@ const BootConfig = struct {
     agent_plan_url: []u8,
     agent_plan_digest: []u8,
     event_url: []u8,
+    facts_url: []u8,
     /// rootfs 字节大小，HEAD 与最终落盘大小都须与之精确相等。
     rootfs_size: u64,
     /// null 表示外部 rootfs 未提供展开大小；此时跳过容量硬校验。
@@ -543,9 +547,10 @@ const BootConfig = struct {
     node_payload_size: u64,
 };
 
-/// 从 BootConfig v2 JSON 解析 rootfs/overlay/agent_plan/event 定位与内存预算字段。
+/// 从 BootConfig v3 JSON 解析 rootfs/overlay/agent_plan/event/facts 定位与内存预算。
 fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
     const Parsed = struct {
+        schema_version: u32,
         rootfs: struct { url: []const u8, sha512: []const u8, size: u64, uncompressed_size: ?u64 = null },
         overlay: struct {
             tmpfs_percent: u8,
@@ -555,15 +560,18 @@ fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
         },
         agent_plan: struct { url: []const u8, digest: []const u8 },
         event_url: []const u8,
+        facts_url: []const u8,
     };
     const p = try std.json.parseFromSlice(Parsed, allocator, json, .{ .ignore_unknown_fields = true });
     defer p.deinit();
+    if (p.value.schema_version != 3) return error.UnsupportedBootConfigSchema;
     return .{
         .rootfs_url = try allocator.dupe(u8, p.value.rootfs.url),
         .rootfs_sha512 = try allocator.dupe(u8, p.value.rootfs.sha512),
         .agent_plan_url = try allocator.dupe(u8, p.value.agent_plan.url),
         .agent_plan_digest = try allocator.dupe(u8, p.value.agent_plan.digest),
         .event_url = try allocator.dupe(u8, p.value.event_url),
+        .facts_url = try allocator.dupe(u8, p.value.facts_url),
         .rootfs_size = p.value.rootfs.size,
         .rootfs_uncompressed_size = p.value.rootfs.uncompressed_size,
         .tmpfs_percent = p.value.overlay.tmpfs_percent,
@@ -580,6 +588,19 @@ fn freeBootConfig(allocator: std.mem.Allocator, bc: *const BootConfig) void {
     allocator.free(bc.agent_plan_url);
     allocator.free(bc.agent_plan_digest);
     allocator.free(bc.event_url);
+    allocator.free(bc.facts_url);
+}
+
+test "BootConfig v3 requires authenticated facts URL" {
+    const json =
+        \\{"schema_version":3,"rootfs":{"url":"http://s/rootfs","sha512":"ab","size":10,"uncompressed_size":20},"overlay":{"tmpfs_percent":50,"minimum_free_bytes":1,"safety_margin_bytes":2,"node_payload_size":3},"agent_plan":{"url":"http://s/plan","digest":"cd"},"event_url":"http://s/events","facts_url":"http://s/facts"}
+    ;
+    const parsed = try parseBootConfig(std.testing.allocator, json);
+    defer freeBootConfig(std.testing.allocator, &parsed);
+    try std.testing.expectEqualStrings("http://s/facts", parsed.facts_url);
+    try std.testing.expectError(error.UnsupportedBootConfigSchema, parseBootConfig(std.testing.allocator,
+        \\{"schema_version":2,"rootfs":{"url":"u","sha512":"a","size":1},"overlay":{"tmpfs_percent":50,"minimum_free_bytes":1,"safety_margin_bytes":1},"agent_plan":{"url":"u","digest":"d"},"event_url":"u","facts_url":"u"}
+    ));
 }
 
 /// 读取并校验 capsule 中的 capability token：必须为 64 位十六进制，校验通过后删除
@@ -613,6 +634,22 @@ fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, toke
         .{ .name = "X-NodeForge-Session", .value = session },
         .{ .name = "Content-Type", .value = "application/json" },
     }, body) catch {};
+}
+
+/// event capability 同时是本 session 的 telemetry 写凭据；facts 写入不消耗或
+/// 推进 lifecycle event_seq。失败不削弱当前启动的本地 MemAvailable 硬闸。
+fn postMemoryFacts(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, memory_bytes: u64) !void {
+    const body = try std.fmt.allocPrint(allocator, "{{\"memory_bytes\":{d}}}\n", .{memory_bytes});
+    defer allocator.free(body);
+    const facts_url = try http.Url.parse(url);
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    defer allocator.free(auth);
+    const status = try http.post(io, allocator, facts_url, &.{
+        .{ .name = "Authorization", .value = auth },
+        .{ .name = "X-NodeForge-Session", .value = session },
+        .{ .name = "Content-Type", .value = "application/json" },
+    }, body);
+    if (status < 200 or status >= 300) return error.FactsUploadRejected;
 }
 
 /// 用内建 SHA-512 流式校验下载产物，不依赖最小 initramfs 未必携带的

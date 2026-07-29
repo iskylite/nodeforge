@@ -322,12 +322,11 @@ pub const DistroFamily = enum { rhel, ubuntu };
 /// 标准自动安装适配器。由 [`installAdapterForFamily`] 从 family 派生。
 pub const InstallAdapter = enum { kickstart, autoinstall };
 
-/// 引导类型。v0.1 只支持 install 引导；diskless 属于 v0.2 范围。
-/// Profile 的部署类型。v0.2 扩展为 tagged union `install | diskless`。
+/// Profile 的部署类型。schema v4 支持 `install | diskless`。
 /// 设计文档中的 `ProfileKind` 等价于此枚举（代码沿用 `BootKind`）。
 pub const BootKind = enum {
     install,
-    /// 内存无盘启动（v0.2 范围）。完整 diskless 链路尚未接入前所有路径 fail-closed。
+    /// 内存无盘启动；当前固定为 squashfs lower + tmpfs overlay upper。
     diskless,
 };
 
@@ -580,7 +579,7 @@ pub const ReinstallPolicy = enum {
     always,
 };
 
-/// v0.1 install profile 配置。
+/// schema v4 的 install/diskless 共用 Profile 配置。
 ///
 /// Profile 是可复用、可版本化的部署期望模板。它描述多台节点共享的安装策略，
 /// 不含物理设备选择器（`boot_disk` 等已迁移到 [`NodeConfig.storage`]）。
@@ -1260,8 +1259,8 @@ pub const BootloaderInstallConfig = struct {
     install: bool = true,
 };
 
-/// 后处理执行阶段。M4 只实现 `install_post`（安装后）；
-/// 后续阶段（如 `first_boot`、`runtime`）在 M7 补充。
+/// 后处理执行阶段。schema v4 同时保存 install-post、rootfs-build 和
+/// first-boot；三者的执行者与允许动作由 validator/runner 分别约束。
 pub const ProvisionPhase = enum {
     /// 安装后阶段。在 `%post`（Kickstart）或 `late-commands`（Autoinstall）中执行。
     install_post,
@@ -1271,8 +1270,9 @@ pub const ProvisionPhase = enum {
     first_boot,
 };
 
-/// 后处理动作类型。M4 只实现这三种受约束动作；
-/// 任意脚本执行在 M7 作为 `script` 动作补充。
+/// 后处理动作类型。`repository`/`standard_packages` 只服务既有受限
+/// install-post 兼容路径；diskless rootfs-build/first-boot 使用
+/// managed_file/archive/script/package 四类 canonical action。
 pub const ProvisionAction = enum {
     /// 写入受管文件（使用 heredoc 创建指定路径的文件）。
     managed_file,
@@ -1300,7 +1300,7 @@ pub const ProvisionStep = struct {
     timeout_s: u32 = 300,
     /// 基础设施失败是否可在本次启动内按 failure policy 重试。
     retryable: bool = false,
-    /// 执行阶段；M4 只支持 `install_post`。
+    /// 执行阶段；validator 会按 phase 限制允许的 action/字段矩阵。
     phase: ProvisionPhase = .install_post,
     /// 动作类型；决定使用哪些字段以及生成何种 shell 命令。
     action: ProvisionAction,
@@ -1321,7 +1321,7 @@ pub const ProvisionStep = struct {
     owner: []const u8 = "root",
     /// `managed_file` 写入文件的属组。默认 `root`。
     group: []const u8 = "root",
-    /// Runtime-only immutable delivery projection。Schema v3 DTOs never persist it。
+    /// Runtime-only immutable delivery projection；catalog schema v4 不持久化。
     /// 由 daemon 在下发 answer file 时填充，指向 HTTP 可下载的内容 URL。
     content_url: ?[]const u8 = null,
     /// content_url 对应内容的 SHA-256 摘要。安装器下载后校验完整性。

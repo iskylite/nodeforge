@@ -119,8 +119,35 @@ pub const DiskEntry = struct {
     requested_by: RequestSource = .initial,
 };
 
-/// 持久化文件格式。schema_version 1/2/3 均可加载；schema 3 新增 plan digest 字段。
-pub const File = struct { schema_version: u32 = 3, revision: u64 = 0, entries: []const DiskEntry = &.{} };
+/// 持久化文件格式。schema 4 将生命周期字段规范为
+/// `armed_at`/`install_at`；schema 1/2/3 由显式 legacy DTO 升级。
+pub const File = struct { schema_version: u32 = 4, revision: u64 = 0, entries: []const DiskEntry = &.{} };
+
+const LegacyDiskEntry = struct {
+    node_id: []const u8,
+    node_id_len: u8 = 0,
+    next_generation: u64 = 1,
+    armed_generation: ?u64 = null,
+    consumed_generation: ?u64 = null,
+    terminal_generation: ?u64 = null,
+    requested_revision: u64 = 0,
+    consumed_revision: u64 = 0,
+    applied_revision: u64 = 0,
+    requested_plan_digest: ?[]const u8 = null,
+    consumed_plan_digest: ?[]const u8 = null,
+    applied_plan_digest: ?[]const u8 = null,
+    requested_at: ?i64 = null,
+    started_at: ?i64 = null,
+    armed_at: ?i64 = null,
+    install_at: ?i64 = null,
+    finished_at: i64 = 0,
+    deployed_generation: u64 = 0,
+    deployed_at: i64 = 0,
+    requested_by: RequestSource = .initial,
+};
+
+const LegacyFile = struct { schema_version: u32, revision: u64 = 0, entries: []const LegacyDiskEntry = &.{} };
+const FileHeader = struct { schema_version: u32 };
 
 /// `rearm` 操作的返回结果。`changed=false` 表示幂等复用；`changed=true` 表示
 /// 创建了新 generation 或替换了待执行的 generation。持久化失败时调用方使用
@@ -496,19 +523,39 @@ pub const Store = struct {
 };
 
 /// 从持久化文件加载 deployment-control 状态到内存 store。
-/// 支持 schema 1/2/3；schema 3 新增 plan digest 字段。加载后更新 effective 容量。
+/// 支持 schema 1/2/3/4；schema 3 新增 plan digest，schema 4 规范生命周期字段名。
+/// 加载后更新 effective 容量。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
-    const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    if ((parsed.value.schema_version < 1 or parsed.value.schema_version > 3) or parsed.value.entries.len > max_entries) return error.InvalidDeploymentControl;
+    const header = try std.json.parseFromSlice(FileHeader, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    switch (header.value.schema_version) {
+        1...3 => {
+            const parsed = try std.json.parseFromSlice(LegacyFile, allocator, bytes, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            if (parsed.value.entries.len > max_entries) return error.InvalidDeploymentControl;
+            var upgraded: [max_entries]DiskEntry = undefined;
+            for (parsed.value.entries, 0..) |entry, index| upgraded[index] = try upgradeLegacyEntry(entry, parsed.value.schema_version);
+            try restoreEntries(store, parsed.value.revision, upgraded[0..parsed.value.entries.len]);
+        },
+        4 => {
+            const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            try restoreEntries(store, parsed.value.revision, parsed.value.entries);
+        },
+        else => return error.InvalidDeploymentControl,
+    }
+}
+
+fn restoreEntries(store: *Store, revision: u64, disk_entries: []const DiskEntry) !void {
+    if (disk_entries.len > max_entries) return error.InvalidDeploymentControl;
     lock(&store.mutex);
     defer store.mutex.unlock();
     store.entries = [_]Entry{.{}} ** max_entries;
-    store.revision = parsed.value.revision;
+    store.revision = revision;
     var count: usize = 0;
-    for (parsed.value.entries) |disk_entry| {
+    for (disk_entries) |disk_entry| {
         // Version-1 固定数组文件包含 256 条记录。空记录的字符串为 96 字节
         // NUL，因此其字符串长度并非 node ID 长度；`node_id_len` 是旧版和
         // 紧凑编码共用的权威判别字段。
@@ -527,11 +574,9 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         entry.requested_revision = disk_entry.requested_revision;
         entry.consumed_revision = disk_entry.consumed_revision;
         entry.applied_revision = disk_entry.applied_revision;
-        if (parsed.value.schema_version == 3) {
-            entry.requested_plan_digest = try parseDigest(disk_entry.requested_plan_digest);
-            entry.consumed_plan_digest = try parseDigest(disk_entry.consumed_plan_digest);
-            entry.applied_plan_digest = try parseDigest(disk_entry.applied_plan_digest);
-        }
+        entry.requested_plan_digest = try parseDigest(disk_entry.requested_plan_digest);
+        entry.consumed_plan_digest = try parseDigest(disk_entry.consumed_plan_digest);
+        entry.applied_plan_digest = try parseDigest(disk_entry.applied_plan_digest);
         entry.armed_at = disk_entry.armed_at;
         entry.install_at = disk_entry.install_at;
         entry.finished_at = disk_entry.finished_at;
@@ -544,6 +589,40 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         count += 1;
     }
     store.effective = @max(store.effective, count);
+}
+
+fn upgradeLegacyEntry(item: LegacyDiskEntry, schema_version: u32) !DiskEntry {
+    return .{
+        .node_id = item.node_id,
+        .node_id_len = item.node_id_len,
+        .next_generation = item.next_generation,
+        .armed_generation = item.armed_generation,
+        .consumed_generation = item.consumed_generation,
+        .terminal_generation = item.terminal_generation,
+        .requested_revision = item.requested_revision,
+        .consumed_revision = item.consumed_revision,
+        .applied_revision = item.applied_revision,
+        .requested_plan_digest = if (schema_version == 3) item.requested_plan_digest else null,
+        .consumed_plan_digest = if (schema_version == 3) item.consumed_plan_digest else null,
+        .applied_plan_digest = if (schema_version == 3) item.applied_plan_digest else null,
+        .armed_at = try renamedDeploymentTimestamp(item.requested_at, item.armed_at),
+        .install_at = try renamedDeploymentTimestamp(item.started_at, item.install_at),
+        .finished_at = item.finished_at,
+        .deployed_generation = item.deployed_generation,
+        .deployed_at = item.deployed_at,
+        .requested_by = item.requested_by,
+    };
+}
+
+fn renamedDeploymentTimestamp(legacy: ?i64, current: ?i64) !i64 {
+    if (legacy) |old| {
+        if (current) |new| {
+            if (old != new) return error.InvalidDeploymentControl;
+            return new;
+        }
+        return old;
+    }
+    return current orelse 0;
 }
 
 /// 解析 64 字符小写十六进制 plan digest。null 或长度不为 64 返回错误。
@@ -845,7 +924,7 @@ test "schema 2 pending arm is readable but cannot authorize a digest" {
     try std.testing.expect(!digestSet(store.view("node-01").?.requested_plan_digest));
 }
 
-test "schema 3 persists and restores full plan digests" {
+test "schema 4 persists and restores full plan digests" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/deployment-control.json", .{tmp.sub_path});
@@ -857,4 +936,42 @@ test "schema 3 persists and restores full plan digests" {
     try load(std.testing.io, std.testing.allocator, path, &after);
     try std.testing.expect(after.isArmedForDigest("node-01", test_digest_1));
     try std.testing.expectEqualSlices(u8, &test_digest_1, &after.view("node-01").?.requested_plan_digest);
+}
+
+test "schema 3 lifecycle names upgrade to schema 4 and survive reload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/deployment-control-v3.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const legacy = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":3,\"revision\":9,\"entries\":[{{\"node_id\":\"node-01\",\"node_id_len\":7,\"next_generation\":2,\"armed_generation\":1,\"requested_revision\":42,\"requested_plan_digest\":\"{s}\",\"requested_at\":111,\"started_at\":222,\"finished_at\":333}}]}}",
+        .{&test_digest_1},
+    );
+    defer std.testing.allocator.free(legacy);
+    try dhcp_store.atomicWrite(std.testing.io, path, legacy);
+
+    var upgraded: Store = .{};
+    try load(std.testing.io, std.testing.allocator, path, &upgraded);
+    const first = upgraded.view("node-01") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 111), first.armed_at);
+    try std.testing.expectEqual(@as(i64, 222), first.install_at);
+    try std.testing.expectEqual(@as(i64, 333), first.finished_at);
+    try std.testing.expectEqualSlices(u8, &test_digest_1, &first.requested_plan_digest);
+
+    try save(std.testing.io, std.testing.allocator, path, &upgraded);
+    const latest = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(latest);
+    const parsed = try std.json.parseFromSlice(File, std.testing.allocator, latest, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 4), parsed.value.schema_version);
+    try std.testing.expectEqual(@as(i64, 111), parsed.value.entries[0].armed_at);
+    try std.testing.expectEqual(@as(i64, 222), parsed.value.entries[0].install_at);
+
+    var reloaded: Store = .{};
+    try load(std.testing.io, std.testing.allocator, path, &reloaded);
+    const final = reloaded.view("node-01") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 111), final.armed_at);
+    try std.testing.expectEqual(@as(i64, 222), final.install_at);
+    try std.testing.expectEqual(@as(i64, 333), final.finished_at);
 }

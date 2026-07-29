@@ -1,14 +1,15 @@
 //! # v0.2 无盘投递会话 + 作用域令牌存储
 //!
 //! 自包含的 diskless 交付子系统：按 session 持有节点/profile/rootfs 定位器、
-//! 固定的 AgentPlan（immutable bytes + digest）以及 config/agent/event 三类
+//! 固定的 AgentPlan（immutable bytes + digest）以及 config/rootfs/agent/event 四类
 //! scoped token 的 HMAC hash + claim。raw token 只返回给调用方（capsule/响应），
-//! 内存只持 [`diskless_credential.hashOf`]。session 持久化到
+//! 持久化只保存 [`diskless_credential.hashOf`]；raw token 仅驻进程内存并可由
+//! master secret + claim 确定性重建。session 持久化到
 //! `diskless-delivery.json`，跨 daemon 重启可验证（HMAC secret 也持久化）。
 //!
 //! 这是 install [`boot_session.Store`] 之外的独立 diskless 通路：install session
-//! 与 DHCP 耦合，diskless 用 capsule 交付的 config-token 引导，两者不混用。统一
-//! 到单一 boot_session 是后续设计收敛项（见 V0_2_V0_5_DESIGN_REVIEW §5）。
+//! 与 DHCP 耦合，diskless 用 capsule 交付的 scoped token 引导。两类 store 的
+//! persistence/credential 语义不同；管理投影在 node list/show 层统一。
 const std = @import("std");
 const cred = @import("diskless_credential.zig");
 const lifecycle = @import("diskless_session.zig");
@@ -24,7 +25,10 @@ pub const name_cap = 128;
 pub const kernel_cap = 64;
 pub const agent_plan_cap = 16384;
 pub const default_ttl_seconds: i64 = 2 * 60 * 60;
-pub const persistence_schema_version: u32 = 1;
+/// schema 2 renamed lifecycle timestamps to their canonical task-column names.
+/// Reader compatibility for schema 1 is explicit because both the historical
+/// (`created_at`/`started_at`) and the briefly emitted renamed shape used v1.
+pub const persistence_schema_version: u32 = 2;
 
 /// 加载或首次创建 diskless capability master secret。文件保存 32-byte secret
 /// 的 64 位小写 hex，权限固定 0600；格式损坏时拒绝启动，绝不静默换密钥使活动
@@ -145,13 +149,31 @@ pub const Store = struct {
             else => return err,
         };
         defer self.allocator.free(bytes);
-        const parsed = try std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always });
-        defer parsed.deinit();
-        if (parsed.value.schema_version != persistence_schema_version) return error.InvalidDisklessDeliveryStore;
-        self.revision = parsed.value.revision;
-        if (parsed.value.sessions.len > max_sessions) return error.InvalidDisklessDeliveryStore;
+        const header = try std.json.parseFromSlice(PersistedHeader, self.allocator, bytes, .{ .ignore_unknown_fields = true });
+        defer header.deinit();
+        switch (header.value.schema_version) {
+            1 => {
+                const parsed = try std.json.parseFromSlice(PersistedFileV1, self.allocator, bytes, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                if (parsed.value.sessions.len > max_sessions) return error.InvalidDisklessDeliveryStore;
+                var upgraded: [max_sessions]PersistedSession = undefined;
+                for (parsed.value.sessions, 0..) |item, index| upgraded[index] = try upgradePersistedSessionV1(item);
+                return self.restorePersisted(parsed.value.revision, upgraded[0..parsed.value.sessions.len], now_mono, now_utc);
+            },
+            persistence_schema_version => {
+                const parsed = try std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                return self.restorePersisted(parsed.value.revision, parsed.value.sessions, now_mono, now_utc);
+            },
+            else => return error.InvalidDisklessDeliveryStore,
+        }
+    }
+
+    fn restorePersisted(self: *Store, revision: u64, items: []const PersistedSession, now_mono: i64, now_utc: i64) !usize {
+        if (items.len > max_sessions) return error.InvalidDisklessDeliveryStore;
+        self.revision = revision;
         var restored: usize = 0;
-        for (parsed.value.sessions) |item| {
+        for (items) |item| {
             // capability TTL 到期只淘汰未完成的 delivery。running/failed/expired
             // 是节点长期运行事实，必须跨 daemon 重启保留给 node list 投影。
             if (item.expires_at <= now_utc and !item.phase.isTerminal()) continue;
@@ -475,7 +497,8 @@ const PersistedSession = struct {
     rootfs_input_digest: []const u8,
     rootfs_sha512: []const u8,
     rootfs_size: u64,
-    /// schema v1 旧记录缺少该字段；恢复时临时回退 rootfs_size。
+    /// schema v1 早期记录可能缺少该字段；缺失时保持 unknown(0)，不能把
+    /// 压缩大小冒充展开大小。
     rootfs_uncompressed_size: u64 = 0,
     tmpfs_percent: u8,
     minimum_free_bytes: u64,
@@ -484,7 +507,7 @@ const PersistedSession = struct {
     agent_plan_json: []const u8,
     agent_plan_digest: []const u8,
     armed_at: i64,
-    /// schema v1 旧记录没有生命周期时间，缺省为 0 可向后兼容恢复。
+    /// 进入 initrd 的生命周期时间；0 表示尚未进入。
     install_at: i64 = 0,
     finished_at: i64 = 0,
     expires_at: i64,
@@ -495,11 +518,90 @@ const PersistedSession = struct {
     event_token: PersistedSlot,
 };
 
+/// Schema 1 existed in two field-name shapes. Optional aliases let the reader
+/// distinguish them without relying on permissive unknown-field/default rules.
+const PersistedSessionV1 = struct {
+    session_id: []const u8,
+    node_id: []const u8,
+    profile: []const u8,
+    rootfs_input_digest: []const u8,
+    rootfs_sha512: []const u8,
+    rootfs_size: u64,
+    rootfs_uncompressed_size: u64 = 0,
+    tmpfs_percent: u8,
+    minimum_free_bytes: u64,
+    safety_margin_bytes: u64,
+    kernel_release: []const u8,
+    agent_plan_json: []const u8,
+    agent_plan_digest: []const u8,
+    created_at: ?i64 = null,
+    started_at: ?i64 = null,
+    armed_at: ?i64 = null,
+    install_at: ?i64 = null,
+    finished_at: i64 = 0,
+    expires_at: i64,
+    phase: lifecycle.Phase,
+    config_token: PersistedSlot,
+    rootfs_token: PersistedSlot,
+    agent_token: PersistedSlot,
+    event_token: PersistedSlot,
+};
+
+const PersistedHeader = struct {
+    schema_version: u32,
+};
+
+const PersistedFileV1 = struct {
+    schema_version: u32,
+    revision: u64 = 0,
+    sessions: []const PersistedSessionV1 = &.{},
+};
+
 const PersistedFile = struct {
     schema_version: u32 = persistence_schema_version,
     revision: u64 = 0,
     sessions: []const PersistedSession = &.{},
 };
+
+fn upgradePersistedSessionV1(item: PersistedSessionV1) !PersistedSession {
+    return .{
+        .session_id = item.session_id,
+        .node_id = item.node_id,
+        .profile = item.profile,
+        .rootfs_input_digest = item.rootfs_input_digest,
+        .rootfs_sha512 = item.rootfs_sha512,
+        .rootfs_size = item.rootfs_size,
+        .rootfs_uncompressed_size = item.rootfs_uncompressed_size,
+        .tmpfs_percent = item.tmpfs_percent,
+        .minimum_free_bytes = item.minimum_free_bytes,
+        .safety_margin_bytes = item.safety_margin_bytes,
+        .kernel_release = item.kernel_release,
+        .agent_plan_json = item.agent_plan_json,
+        .agent_plan_digest = item.agent_plan_digest,
+        .armed_at = try renamedTimestamp(item.created_at, item.armed_at, true),
+        .install_at = try renamedTimestamp(item.started_at, item.install_at, false),
+        .finished_at = item.finished_at,
+        .expires_at = item.expires_at,
+        .phase = item.phase,
+        .config_token = item.config_token,
+        .rootfs_token = item.rootfs_token,
+        .agent_token = item.agent_token,
+        .event_token = item.event_token,
+    };
+}
+
+fn renamedTimestamp(legacy: ?i64, current: ?i64, required: bool) !i64 {
+    if (legacy) |old| {
+        if (current) |new| {
+            if (old != new) return error.InvalidDisklessDeliveryStore;
+            return new;
+        }
+        return old;
+    }
+    if (current) |new| return new;
+    if (required) return error.InvalidDisklessDeliveryStore;
+    return 0;
+}
 
 /// 将内存中的 token slot 投影为可持久化形式（只存 hash+claim，不含 raw token）。
 fn persistedSlot(slot: *const TokenSlot) PersistedSlot {
@@ -733,6 +835,90 @@ test "delivery checkpoint restores session and reconstructs raw capabilities" {
         0,
         11,
     ));
+}
+
+test "schema 1 lifecycle names upgrade to schema 2 and survive reload" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/diskless-delivery-v1.json", .{path});
+    defer std.testing.allocator.free(checkpoint);
+    const secret = [_]u8{0x61} ** 32;
+
+    var before = Store.init(std.testing.allocator, &secret, "");
+    const session = try before.begin(
+        std.testing.io,
+        "node-v1",
+        "profile-v1",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        4096,
+        16384,
+        "5.14.0",
+        50,
+        64,
+        32,
+        100,
+        1000,
+    );
+    const session_id = session.session_id;
+    try before.pinAgentPlan(std.testing.io, &session_id, "{\"schema_version\":1}");
+    try before.markBootConfigFetched(std.testing.io, &session_id);
+    try before.issue(std.testing.io, &session_id, .event);
+    _ = try before.advanceEvent(std.testing.io, &session_id, .boot_config_fetched, .diskless_initrd_started, 0, 1100);
+
+    const current = before.find(&session_id) orelse return error.TestExpectedEqual;
+    var legacy_sessions = [_]PersistedSessionV1{.{
+        .session_id = &current.session_id,
+        .node_id = current.nodeId(),
+        .profile = current.profileName(),
+        .rootfs_input_digest = current.rootfsInputDigest(),
+        .rootfs_sha512 = current.rootfsSha512(),
+        .rootfs_size = current.rootfs_size,
+        .rootfs_uncompressed_size = current.rootfs_uncompressed_size,
+        .tmpfs_percent = current.tmpfs_percent,
+        .minimum_free_bytes = current.minimum_free_bytes,
+        .safety_margin_bytes = current.safety_margin_bytes,
+        .kernel_release = current.kernelRelease(),
+        .agent_plan_json = current.agentPlanJson(),
+        .agent_plan_digest = current.agentPlanDigest(),
+        .created_at = current.armed_at,
+        .started_at = current.install_at,
+        .finished_at = current.finished_at,
+        .expires_at = current.expires_at,
+        .phase = current.phase,
+        .config_token = persistedSlot(&current.config_token),
+        .rootfs_token = persistedSlot(&current.rootfs_token),
+        .agent_token = persistedSlot(&current.agent_token),
+        .event_token = persistedSlot(&current.event_token),
+    }};
+    const legacy_json = try std.json.Stringify.valueAlloc(std.testing.allocator, PersistedFileV1{
+        .schema_version = 1,
+        .revision = 7,
+        .sessions = &legacy_sessions,
+    }, .{ .emit_null_optional_fields = false });
+    defer std.testing.allocator.free(legacy_json);
+    try atomicWrite(std.testing.io, checkpoint, legacy_json);
+
+    var upgraded = Store.init(std.testing.allocator, &secret, checkpoint);
+    try std.testing.expectEqual(@as(usize, 1), try upgraded.load(std.testing.io, 200, 1200));
+    const restored = upgraded.find(&session_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 1000), restored.armed_at);
+    try std.testing.expectEqual(@as(i64, 1100), restored.install_at);
+    try upgraded.persist(std.testing.io);
+
+    const latest = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(latest);
+    const header = try std.json.parseFromSlice(PersistedHeader, std.testing.allocator, latest, .{ .ignore_unknown_fields = true });
+    defer header.deinit();
+    try std.testing.expectEqual(persistence_schema_version, header.value.schema_version);
+
+    var reloaded = Store.init(std.testing.allocator, &secret, checkpoint);
+    try std.testing.expectEqual(@as(usize, 1), try reloaded.load(std.testing.io, 300, 1300));
+    const final = reloaded.find(&session_id) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 1000), final.armed_at);
+    try std.testing.expectEqual(@as(i64, 1100), final.install_at);
 }
 
 test "diskless event CAS is ordered and exact retry is idempotent" {

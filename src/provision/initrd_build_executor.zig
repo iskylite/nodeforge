@@ -8,7 +8,7 @@
 //! 4. 注入与 initrd 同一构建版本的 `nodeforge-agent`
 //! 5. 将 `nodeforge-initrd` 直接安装为 `/init`，避免 PID 1 启动依赖 `/bin/sh`
 //! 6. 创建空 `/capsule` 目录（真实 credential 由 TFTP 多-initrd 内存交付）
-//! 6. 重包 initramfs（find | cpio | gzip）
+//! 7. 重包 NodeForge overlay（find | cpio | gzip）；vendor initrd 字节保持前缀不变
 //!
 //! 构建属环境相关执行边界（仅 Linux/root 构建主机可用，与 rootfs_os_builder 一致），
 //! 本模块不在单元测试覆盖内。

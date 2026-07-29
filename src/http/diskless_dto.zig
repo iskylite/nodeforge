@@ -1,20 +1,21 @@
 //! # v0.2 diskless 投递 DTO
 //!
-//! `V0_2_DESIGN.md` §2.3 / §4.3 的 BootConfig v2 与 AgentPlan v1。两者均为独立
+//! `V0_2_DESIGN.md` §2.3 / §4.3 的 BootConfig v3 与 AgentPlan v1。两者均为独立
 //! 命名空间（`schema_version` 各自计数，见 `V0_2_IMPL_DETAILS.md` §5）。
 //!
-//! - BootConfig v2：initrd 用 config:read token 拉取的固定 immutable 快照，引用
+//! - BootConfig v3：initrd 用 config:read token 拉取的固定 immutable 快照，引用
 //!   rootfs 与 AgentPlan 的 URL/digest/size，不携带任何 token（token 经 per-session
-//!   credential capsule 交付）。相同 token/相同 config digest 重复 GET 返回相同 bytes。
+//!   credential capsule 交付）；v3 增加已认证 memory facts 上报 URL。相同 token/
+//!   相同 config digest 重复 GET 返回相同 bytes。
 //! - AgentPlan v1：agent pre-init 用 agent:read token 拉取的 immutable 运行根计划，
 //!   列出 content-addressed payload path/digest/size 供 agent 校验后清零 token。
 const std = @import("std");
 const model = @import("../model.zig");
 
-pub const boot_config_schema_version: u32 = 2;
+pub const boot_config_schema_version: u32 = 3;
 pub const agent_plan_schema_version: u32 = 1;
 
-/// BootConfig v2 中引用的 rootfs 定位器。
+/// BootConfig v3 中引用的 rootfs 定位器。
 pub const RootfsLocator = struct {
     url: []const u8,
     /// rootfs 内容 SHA-512（immutable ETag）。
@@ -24,7 +25,7 @@ pub const RootfsLocator = struct {
     uncompressed_size: ?u64 = null,
 };
 
-/// BootConfig v2 中引用的 AgentPlan 定位器。
+/// BootConfig v3 中引用的 AgentPlan 定位器。
 pub const AgentPlanLocator = struct {
     url: []const u8,
     digest: []const u8,
@@ -38,7 +39,7 @@ pub const OverlayBudget = struct {
     node_payload_size: u64 = 0,
 };
 
-/// BootConfig v2。initrd 下载 rootfs 并交接 agent_plan locator 的最小 DTO。
+/// BootConfig v3。initrd 下载 rootfs、上报可信 memory fact 并交接 agent_plan。
 pub const BootConfig = struct {
     schema_version: u32 = boot_config_schema_version,
     node_id: []const u8,
@@ -53,6 +54,7 @@ pub const BootConfig = struct {
     overlay: OverlayBudget,
     agent_plan: AgentPlanLocator,
     event_url: []const u8,
+    facts_url: []const u8,
     /// 过期时刻（Unix 秒）。
     expires_at: i64,
 };
@@ -120,8 +122,9 @@ pub const NodeApplyProjection = struct {
     software_transaction: SoftwareTransaction = .{},
 };
 
-/// AgentPlan v1 内联的 first-boot 步骤；切根后由 agent 一次性按固定顺序重放。
-/// 步骤内容当前为内联（`content`）；content-addressed payload blob 下发为后续增强。
+/// AgentPlan v1 的 first-boot 步骤；切根后由 agent 一次性按固定顺序重放。
+/// 小内容可内联；资产内容以 `payload_path` 引用 AgentPlan 中按
+/// path/digest/size 固定的 content-addressed payload。
 pub const FirstBootStep = struct {
     id: []const u8 = "",
     idempotency_key: []const u8 = "",
@@ -150,7 +153,7 @@ pub const AgentPlan = struct {
     first_boot_bundle: ?[]const u8 = null,
     /// content-addressed payload 列表；相同 token 只能访问此处明列的 path。
     payload: []const PayloadEntry = &.{},
-    /// first-boot 步骤（内联）；agent 切根后按固定顺序一次性重放（Phase 8）。
+    /// first-boot 步骤；内容可内联或引用上方已固定的 payload。
     steps: []const FirstBootStep = &.{},
     /// package action 使用的固定仓库：默认包含 InstallSource 由 nodeforged
     /// 发布的仓库，并合并 CLI 明确配置的 Yum/APT 源。
@@ -162,7 +165,7 @@ pub const AgentPlan = struct {
     expires_at: i64,
 };
 
-/// 渲染 BootConfig v2 为 JSON。
+/// 渲染 BootConfig v3 为 JSON。
 pub fn renderBootConfig(allocator: std.mem.Allocator, config: BootConfig) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, config, .{ .whitespace = .indent_2 });
 }
@@ -195,7 +198,7 @@ fn sha256Hex(bytes: []const u8) [64]u8 {
     return out;
 }
 
-test "boot config v2 renders stable canonical digest" {
+test "boot config v3 renders stable canonical digest and facts endpoint" {
     const cfg: BootConfig = .{
         .node_id = "n1",
         .session_id = "s1",
@@ -207,6 +210,7 @@ test "boot config v2 renders stable canonical digest" {
         .overlay = .{ .tmpfs_percent = 50, .minimum_free_bytes = 64, .safety_margin_bytes = 32 },
         .agent_plan = .{ .url = "https://srv/api/v1/nodes/n1/boot-sessions/s1/agent-plan/d", .digest = "d", .size = 50 },
         .event_url = "https://srv/api/v1/nodes/n1/events",
+        .facts_url = "https://srv/api/v1/nodes/n1/facts",
         .expires_at = 1234,
     };
     const first = try bootConfigDigest(std.testing.allocator, cfg);
@@ -217,6 +221,7 @@ test "boot config v2 renders stable canonical digest" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"schema_version\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"sha512\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"ab\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"facts_url\"") != null);
 }
 
 test "agent plan v1 lists payload entries" {

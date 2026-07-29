@@ -1,7 +1,15 @@
 # NodeForge v0.2 设计范围
 
-状态：开发中（实现进行中）。本文是 v0.2 的**唯一总纲入口**，负责版本边界、跨分册不变式、实现切片和完成标准。
+状态：v0.2.0 设计冻结，Rocky/RHEL 主链已实现；v0.2.1/v0.2.2 按独立增量设计继续。
+本文是 v0.2 的**唯一总纲入口**，负责版本边界、跨分册不变式、实现切片和完成标准。
 具体架构、程序、实现、CLI 和操作细节由下列分册各自负责，本文不重复维护其完整细节。
+
+> 2026-07-29 实现基线：config/catalog 为 v4-only，BootConfig v3、AgentPlan v1、
+> Rocky aarch64 QEMU/VMware UEFI diskless 和 content-addressed first-boot payload
+> 已完成。rootfs durable operation、旧状态迁移与可信 memory inventory/readiness
+> 已落地；Ubuntu casper 正式 builder、其余 CLI 收敛与 x86_64 固定矩阵尚未完成。详见
+> [`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)；
+> 后续顺序见 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md)。
 
 ## 实现修订记录
 
@@ -372,8 +380,8 @@ mutation handler）、`src/http/client.zig`（5 个 mutation client 函数新增
    TTL 已过期也保留；同节点下一次 delivery 原位替换旧终态，避免无界增长。
    checkpoint 自带单调 `revision`，并进入 `node list.view_revision.diskless`，使客户端
    能识别仅由无盘生命周期引起的视图变化。
-3. rootfs builder 只消费 daemon 本机 `repos_dir` 的受管 `file://` repository URL，
-   避免同步 management handler 内的包管理器回连同一 HTTP listener 而自死锁；目标系统
+3. rootfs 后台 worker 只消费 daemon 本机 `repos_dir` 的受管 `file://` repository URL，
+   不依赖或回连 HTTP listener；目标系统
    只消费 nodeforged 发布的受管 HTTP repository URL。目标 AgentPlan 即使没有
    install/remove package delta，也必须持久化同一组 HTTP repo。构建结束时删除 dnf/apt
    带入的 vendor repo，任何目录遍历或删除失败均使构建失败，禁止留下公网源后继续发布。
@@ -510,9 +518,9 @@ v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不�
 
 | 版本 | 范围 | 对应里程碑 |
 |---|---|---|
-| v0.2 | diskless only | M5 内存无盘启动 + M7 diskless 后处理（`rootfs-build`/`first-boot`） |
-| v0.2.1 | Ubuntu diskless | Ubuntu casper squashfs 叠加方案，支持 Rocky/RHEL 宿主构建 Ubuntu 无盘系统，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
-| v0.2.2 | 验证矩阵和可运营性 | Computer Use/VMware 实机闭环纳入每轮验收；继续扩展 x86_64 UEFI、故障恢复与并发矩阵 |
+| v0.2.0 | Rocky/RHEL diskless | M5 内存无盘启动 + M7 diskless 后处理；aarch64 QEMU/VMware 已验证 |
+| v0.2.1 | Ubuntu diskless | Ubuntu casper productization，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
+| v0.2.2 | 可运营性和固定矩阵 | 持久化兼容、durable builder、CLI 收敛、memory readiness、x86_64/aarch64 UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md) |
 | v0.3 | PXELINUX/BIOS install | M6 BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v5 + M7 `install-post`，见 `V0_3_DESIGN.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 | v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
@@ -993,8 +1001,9 @@ feature mismatch、过期 token、越权 Range、switch_root 失败进入稳定 
 
 交付给 initrd 的 BootConfig DTO 使用与 `ProfileKind` 一致的 `kind` 判别字段，废弃 legacy `mode="diskless"` 写法；
 install 与 diskless 共用同一判别字段，install 交付内容（config/event URL、capability）不变，仅把判别字段对齐为
-`kind`。diskless BootConfig 的 `schema_version` 提升到 v2（BootConfig DTO 自身版本，与 catalog `schema_version`
-v3/v4 分属不同命名空间）并携带上文的 DTO 字段。`required_features` 按 consumer 分为
+`kind`。diskless BootConfig 当前 `schema_version` 为 v3（BootConfig DTO 自身版本，与 catalog `schema_version`
+v4 分属不同命名空间）；v3 在 v2 基础上增加 session-authenticated `facts_url`，供 initrd 上报 MemTotal。
+`required_features` 按 consumer 分为
 `{initrd:[...],agent:[...]}`：initrd 集合至少含 `node-identity-handoff-v1`/`agent-plan-handoff-v1`，agent 集合至少含覆盖完整
 TargetSystem/software transaction 的 `node-apply-v1`，静态目标网络另需 agent 的 `static-network-v1`。boot bundle initrd manifest 与
 rootfs agent manifest 分别声明支持集合；旧 consumer 缺失或冲突时必须在 readiness/切根前以稳定 error code 拒绝，
@@ -1318,25 +1327,27 @@ PropertySpec/CollectionSpec/ItemSpec 再给 handler；预留 enum/空 handler �
 `node boot preview`、`node diskless retry`、`node postprocess show`、
 `node trace`、`runtime dhcp-leases|tftp-sessions`、`events list|follow|types`、`nodeforge status`、`preflight diskless-builder`。
 
-**v0.3（PXELINUX/BIOS install）**：`node set firmware.mode=bios`（schema v5，仅 install）、
-`profile set install.post_install.bundle`、`install-post` phase item、`node postprocess show --phase install-post --generation`。
+**v0.3（PXELINUX/BIOS install）**：`node set firmware.mode=bios`（schema v5，仅 install）；
+既有 `install.post_install.bundle`/`install-post` 从 schema v4 的受限 managed-file
+兼容形态扩展为四类 canonical action、generation callback 和完成闸；增加
+`node postprocess show --phase install-post --generation`。
 
 **v0.4（延后增强项）**：Node direct network topology ItemSpec、builder placement + 临时 PXE rootfs 构建 operation、
 大规模容量压测与 install 侧 agent generation 查询随其设计落地；
 reconciliation/远程控制为永久非目标，无对应 CLI（见 §7）。v0.2/v0.3 不提供这些命令的 help/handler，预留 enum 不算实现。
 
-## 6. 对当前 v0.2 脚手架的代码影响
+## 6. 当前 v0.2 实现状态
 
-| 当前代码 | 结论 | v0.2 变更 |
+| 领域 | 当前结论 | 后续增量 |
 |---|---|---|
-| `model.ProfileConfig`、`BootKind` | v3 Profile 和 BootKind 都只有 install；`ProfileMode` 已不存在，legacy diskless 只保留为迁移 blocker | schema v4 基于冻结 v3 新增 tagged kind（设计名 `ProfileKind` = 代码 `BootKind` `model.zig:329`，v0.2 扩 `install|diskless`）；不恢复旧 mode/nullable source |
-| `AssetKind.kernel/nodeforge_initrd/rootfs`、`BootBundleConfig` | `kernel` 当前语义是 installer kernel；`BootBundleConfig.rootfs` 会造成 Profile -> plan -> rootfs -> bundle 构建环 | v4 新增 `runtime_kernel` kind；bundle 删除 rootfs ref，固定 source+runtime kernel+initrd revisions；DeliveryManifest 绑定派生输出 |
-| `boot/target.zig:resolve` | 当前无 `resolveDiskless`，`resolve` 只调用 `resolveInstall`；文件中的 diskless 注释是过时说明 | 新增只消费 session DisklessEffectivePlan snapshot 的明确分支并补负向验证 |
-| `http/server.zig:bootConfig`、`http/routes.zig` | BootKind 仅 install，handler 无 diskless payload 分支，route table 无 node-bound rootfs artifact 路由 | 增强类型 DTO、node-bound rootfs route、Range/ETag/auth |
-| `provision/runner.zig` M4 install_post | repository/`standard_packages` owner 冲突，且没有 M7 phase/status/retry | v0.1 先迁为 managed-file bundle；M7 在同一 ItemSpec/resource 上扩展 tagged action、phase 和运行态 |
-| `AssetKind`/`ProvisionAction`（仅 `managed_file` 等） | 缺 `archive`/`script` asset kind 与 `archive`/`script`/`package` action，无统一 build/runtime 执行差异 | 增 §5.4 四类 action 的 tagged ItemSpec、`archive`/`script` asset kind 与 import CLI |
-| `main.zig` 通用 asset import | 可接受预留 kind，但无 rootfs/initrd/boot-bundle/diskless resource-action tree | 复用 command modules、spec help 和 OutputDocument，不回到直接 writer |
-| `boot_session.Phase`/`node_status.Phase` 中混排的 install/diskless enum | 只有预留标签，`node_status.running` 无 kind，可能形成两个投影或错误拼接 | 建 `NodeCurrentState` tagged union + 唯一 reducer/映射；每 Node 单 active session，历史仅 trace；补冲突/换 kind E2E |
+| Profile/model | schema v4 `install|diskless`、boot bundle、三投影/两摘要已实现 | v0.3 才增加 firmware schema |
+| boot target | install/diskless UEFI GRUB 分支已接线 | BIOS/PXELINUX 属 v0.3 |
+| HTTP delivery | BC v3/AP v1、rootfs/payload/agent/event/facts route 与四域 token 已实现 | v0.2.2 补 restart/abuse 矩阵 |
+| rootfs builder | Rocky dnf 路径已实现；持久 queued/running operation + 有界 worker，重启确定性 interrupted | Ubuntu casper 属 v0.2.1；initrd builder 异步化仍属 v0.2.2 |
+| initrd builder | vendor initrd 不变前缀 + NodeForge overlay、generic dracut fallback 已实现 | Ubuntu 需正式 CLI 产品链验收 |
+| provision | rootfs-build/first-boot 四动作、payload、journal/retry 已实现；install-post 仍为受限兼容 runner | v0.3 扩展 install-post canonical action/callback |
+| status/readiness | inventory schema 2 保存认证 memory；30 天 freshness；服务端与 initrd 共享公式，unknown/stale 仍由 initrd 硬闸 | 固定矩阵与更多 failure injection 属 v0.2.2 |
+| CLI | 当前细粒度命令可走完整流程 | clone/preview/unified retry/reference 收敛属 v0.2.2 |
 
 ## 7. 明确非目标
 
@@ -1512,14 +1523,14 @@ owner 或 v0.2 进入条件。
 不分裂 rootfs cache；补通用 opaque operation show/wait、stdout/stderr 与 exit code 边界，删除 `preflight --scope` 双语法；
 修复 managed-file 字段矩阵与 BootConfig config digest 自引用、session supersede CAS。v0.3 将 BIOS 范围限定为 install，
 install-post 以 install generation 标识并只在 installer 内自动 retry。v0.4 网络改为 ItemSpec topology +
-BootConfig v3 bootstrap transport + AgentPlan v2 target topology，
+BootConfig v4 bootstrap transport + AgentPlan v2 target topology，
 节点构建收敛为临时 PXE rootfs 构建 operation，install first-boot 补磁盘 handoff/journal，容量验收补 workload/SLO 证据。
-v0.5 固定复用同一 squashfs 传输制品，BootConfig 升 v4，mode 只改变 desired/delivery digest、不改变 rootfs input digest。
+v0.5 固定复用同一 squashfs 传输制品，BootConfig 升 v5，mode 只改变 desired/delivery digest、不改变 rootfs input digest。
 
 **第二十三轮（实现契约与认证复审）**：恢复 v0.1 冻结的 Assets import owner/参数顺序与 provision-bundle `steps`
 collection；Profile boot effective 只输出可证明 requirements，resolved projection 归 Node，`postprocess show` 改为
 active-first。v0.3 补 generation-bound callback credential。v0.4 topology 增 `routes` 并冻结无损迁移，全部新 delivery
-统一使用 BootConfig v3 + AgentPlan v2；临时构建节点补 BuilderBootAttempt、boot-slot 互斥、scoped upload claim 和 digest 边界，install
+统一使用 BootConfig v4 + AgentPlan v2；临时构建节点补 BuilderBootAttempt、boot-slot 互斥、scoped upload claim 和 digest 边界，install
 first-boot 补一次性 bootstrap token 交换。v0.5 冻结 ram_rootfs 双预算公式、feature 适用性与 unsquashfs metadata 保真。
 
 **第二十四轮（可执行性复核）**：v0.3 明确 install callback raw token 通过 per-generation credential capsule 以 0400

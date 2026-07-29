@@ -1,16 +1,18 @@
 # NodeForge v0.4 设计：延后增强项
 
-状态：设计草案，实现未开始。本文定义 v0.4 范围，与 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §2 版本表一致。
+状态：设计草案，实现未开始。本文定义 v0.4 范围，与 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §2 版本表及
+[`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md) 的版本门禁一致。
 v0.4 在 v0.3 完成后启动，收纳 VMware 难以验证或非主流程的增强项。**reconciliation/远程控制为永久非目标**
 （全版本，见 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §7），v0.4 不实现任何远程主动控制。
 
 ## 1. 进入条件
 
-v0.4 必须基于 v0.3 完成：
+v0.4 必须基于 v0.2.2 operability 与 v0.3 完成：
 
 - v0.3 schema v5（`firmware.mode`）、BIOS PXELINUX、发行版版本矩阵与 `install-post` phase 已落地并通过验收。
 - v0.2/v0.3 diskless 与 install 主流程在 UEFI/BIOS 双模式下回归通过。
-- 三程序（`nodeforged`/`nodeforge-initrd`/`nodeforge-agent`）边界稳定。
+- 四个产品二进制（CLI `nodeforge` + `nodeforged`/`nodeforge-initrd`/`nodeforge-agent`
+  三个运行角色）边界稳定。
 
 ## 2. 范围
 
@@ -74,11 +76,11 @@ v0.4 **不**包含：可切换 rootfs 形态（-> v0.5）；NFS root/iPXE/IPv6�
   egress interface；成功才 commit，失败则 rollback 目标 topology、保留 bootstrap 并终止 boot。ping 不能作为唯一成功证据。
   agent 必须在任何 topology 切换前清除 `agent:read` token；成功后 exec 真正 init，distro renderer adopt 已提交 topology，确认 adopt 后才删除 bootstrap address；adopt 失败
   继续保留 bootstrap 并报告失败，不能留下半切换网络。initrd 不包含第二套 NM/Netplan/topology renderer。
-- BootConfig v3 仍是给 initrd 的最小 DTO，只在 v2 的 `bootstrap_network` 上增加 `bootstrap_interface_id` 与静态
+- BootConfig v4 仍是给 initrd 的最小 DTO，只在 v3 的 `bootstrap_network` 上增加 `bootstrap_interface_id` 与静态
   bootstrap transport 字段；完整 `interfaces/vlans/bonds/routes` target topology 进入 AgentPlan v2，并要求对应 agent
-  feature token。**全部 v0.4 新 delivery 统一使用 BootConfig v3 + AgentPlan v2**：单 NIC target 也编码为单元素
-  topology，不保留双 renderer。旧 active session 继续消费自己的 immutable BootConfig v2/AgentPlan v1 snapshot 到终态；
-  新 v0.4 session 的 boot bundle/initrd 不支持 BootConfig v3，或 rootfs agent 不支持 AgentPlan v2 时 readiness 失败。
+  feature token。**全部 v0.4 新 delivery 统一使用 BootConfig v4 + AgentPlan v2**：单 NIC target 也编码为单元素
+  topology，不保留双 renderer。旧 active session 继续消费自己的 immutable BootConfig v3/AgentPlan v1 snapshot 到终态；
+  新 v0.4 session 的 boot bundle/initrd 不支持 BootConfig v4，或 rootfs agent 不支持 AgentPlan v2 时 readiness 失败。
   v0.4 不改变 rootfs materialization 字段，仍固定 squashfs_overlay。
 - v5 -> v6 migration 将旧单 NIC scalar 原子物化为一个 `network.interfaces` item，令
   `network.bootstrap_interface_id` 指向它，并把每个既有 `network.routes[]` item 原 identity/顺序迁移到新 route
@@ -86,7 +88,7 @@ v0.4 **不**包含：可切换 rootfs 形态（-> v0.5）；NFS root/iPXE/IPv6�
   journal rollback 恢复完整 v5 single-NIC scalar、DNS/search domain 和 routes shape，不得丢字段或把 route 编成
   逗号串。finalize 后 downgrade 到 v5 必须先做 representability preflight：仅一个物理 L3 interface、无 bond/VLAN、
   无 multi-NIC 或 logical-link L3 等 v6-only 状态时才可降级；否则返回 `migration.non_representable` 并列出
-  resource/path/reason/target_schema。迁移期间 active/recoverable BootConfig v2/v3 与 AgentPlan v1/v2 snapshot 均继续按创建时内容到终态。
+  resource/path/reason/target_schema。迁移期间 active/recoverable BootConfig v3/v4 与 AgentPlan v1/v2 snapshot 均继续按创建时内容到终态。
 
 ## 5. 容量与压测
 

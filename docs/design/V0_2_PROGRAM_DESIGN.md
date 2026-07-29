@@ -1,7 +1,7 @@
 # NodeForge v0.2 程序边界设计
 
 状态：v0.2 程序分册，核心实现已落地并持续按验证结果收口。总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文只定义
-三个编译产物的职责、生命周期、信任边界和凭据所有权。CLI 见 [`V0_2_CLI.md`](V0_2_CLI.md)，
+四个可执行产物的职责、生命周期、信任边界和凭据所有权。CLI 见 [`V0_2_CLI.md`](V0_2_CLI.md)，
 diskless 时序见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，状态机/协议栈见
 [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md)。
 
@@ -22,18 +22,19 @@ diskless 时序见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，状态机/协议�
   `zig build -Dbuild-time=2026-07-29T00:00:00Z`。正式发布构建可省略该选项以记录真实构建时间。
   若 `.zig-cache` 已膨胀，可安全删除（`.gitignore` 已忽略该目录）。
 
-## 1. 三程序总览
+## 1. 四产物、三运行角色总览
 
 | 产物 | 角色 | 运行阶段 | 身份/凭据 | v0.2 是否实现 |
 |---|---|---|---|---|
+| `nodeforge` | 管理 CLI：本地只读校验与经管理 API 的资源操作 | 管理端按需运行 | daemon `admin_key`；不持有 boot/session token | 是 |
 | `nodeforged` | 单进程守护进程：DHCP/TFTP/HTTP 协议栈 + 本机管理 API + 服务端 rootfs builder | 服务端常驻 | daemon 管理 API 自身鉴权 | 是（v0.1 已有 daemon，v0.2 扩 diskless/builder） |
 | `nodeforge-initrd` | dracut 引导程序：拉最小 BootConfig、下载/校验/挂载 rootfs、交接 AgentPlan locator、switch_root | initrd（switch_root 前） | node-bound boot/rootfs capability token | 是 |
 | `nodeforge-agent` | 单次启动执行框架：从服务端拉 immutable AgentPlan/payload，pre-init 应用全部 Node override 并 exec 真正 init；systemd 后执行 first-boot | 切根后 pre-init + 运行期 | session-bound `agent:read` + `event:append` token，无 enrollment | 是（仅 diskless） |
 
-三者共享核心模块（`src/root.zig` 为 `nodeforge` 模块），避免行为分叉；当前 `build.zig` 产出
+四个产物共享核心模块（`src/root.zig` 为 `nodeforge` 模块），避免行为分叉；当前 `build.zig` 产出
 `nodeforge`、`nodeforged`、`nodeforge-initrd` 与 `nodeforge-agent`，四个可执行文件复用同一 core module。
 
-### 1.2 setup 与宿主环境边界
+### 1.1 setup 与宿主环境边界
 
 默认安装根 `/opt/nodeforge` 的初始化和 reconfigure 会原子生成 `/etc/profile.d/nodeforge.sh`，固定权限
 `0644 root:root`，幂等地把 `/opt/nodeforge/bin` 加入登录 shell 的 `PATH`。脚本不覆盖已有 PATH，也不会重复插入；
@@ -42,7 +43,7 @@ diskless 时序见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，状态机/协议�
 `setup` 只发布环境脚本和 `/opt/nodeforge/systemd/nodeforged.service` 事实文件；systemd 的 daemon-reload、enable、
 restart 仍是显式运维动作，避免 reconfigure 在无确认时改变服务生命周期。
 
-### 1.1 启动阶段与写入边界
+### 1.2 启动阶段与写入边界
 
 | 阶段 | 切根关系 | 从服务端取得 | 允许配置/写入 | 明确不做 |
 |---|---|---|---|---|
@@ -103,7 +104,7 @@ initrd 内完成上述职责；它不链接 TargetSystem/effective runner，不�
    capsule 读取一次性 config token；token 不进入 `/proc/cmdline`。
 2. 经 `config:read` token 从 `config_url` 拉取 BootConfig，再使用 rootfs 专用 `artifact:read` token。
 3. 校验 BootConfig：`required_features.initrd` 是 initrd manifest 子集、`required_features.agent` 是已挂载 rootfs
-   agent manifest 子集，并校验 `schema_version` v2 与 digest；缺失或冲突以稳定 error code 拒绝，不回退降级，
+   agent manifest 子集，并校验 `schema_version` v3 与 digest；缺失或冲突以稳定 error code 拒绝，不回退降级，
    也不让 initrd 代行 agent feature。
 4. 做内存预算闸，下载到 `.part`，严格校验 ETag/Content-Range/size，完整 SHA-512 成功后才挂载
    rootfs lower（HTTP GET/HEAD/Range 恢复）。
@@ -206,7 +207,7 @@ agent **仅服务 diskless**，是消费服务端 immutable AgentPlan 的一次�
 - **enrollment**（运行期节点认证 secret）已永久移除，与上述 token 无关：token 仅是 boot 期 initrd/agent 的
   有界传输鉴权，agent 身份由 node/session、BootConfig snapshot 与 token claim 三方相等共同证明。
 
-## 6. 三者协作时序
+## 6. 三运行角色协作时序
 
 ```text
 nodeforged 生成 BootConfig（per immutable DisklessEffectivePlan snapshot）

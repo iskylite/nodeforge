@@ -15,7 +15,7 @@
 //!
 //! | 方法   | 响应体目标 | 重试 | 用途                           |
 //! |--------|-----------|------|--------------------------------|
-//! | GET    | 内存      | 是   | 拉取 BootConfig v2 JSON          |
+//! | GET    | 内存      | 是   | 拉取 BootConfig v3 JSON          |
 //! | HEAD   | 无        | 是   | rootfs 传输契约的元数据校验      |
 //! | POST   | 丢弃      | 否   | lifecycle 事件上报（best-effort）|
 //! | GET    | 文件      | 否*  | 分块 Range 下载 rootfs            |

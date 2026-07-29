@@ -1,4 +1,4 @@
-//! 节点状态的持久化投影（M3.1）。
+//! 节点运行状态的持久化投影。
 //!
 //! `node-status.json` 是 HTTP node-status 投影的唯一持久化事实源。
 //! 它使用独立的 I/O 锁，与 DHCP checkpoint 锁分离，使 HTTP 状态转换
@@ -11,7 +11,7 @@ const dhcp_store = @import("dhcp_store.zig");
 const boot_session = @import("boot_session.zig");
 const deployment_control = @import("deployment_control.zig");
 
-/// M4.8 紧凑磁盘记录。运行时仍使用固定缓冲区以避免锁内分配，磁盘格式只写
+/// 紧凑磁盘记录。运行时仍使用固定缓冲区以避免锁内分配，磁盘格式只写
 /// 实际字符串，避免把 2048 个空槽和每条记录的 NUL padding 序列化。
 pub const DiskStatus = struct {
     node_id: []const u8,
@@ -27,7 +27,7 @@ pub const DiskStatus = struct {
     session_active: bool = false,
 };
 
-/// M4.9b `node-status.json` schema 5。
+/// `node-status.json` schema 5；版本独立于 config/catalog schema。
 pub const StatusFile = struct {
     schema_version: u32 = 5,
     revision: u64 = 0,
@@ -160,5 +160,3 @@ test "schema 4 status snapshot serializes only used compact records" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"model_revision\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"deployment_generation\":5") != null);
 }
-
-

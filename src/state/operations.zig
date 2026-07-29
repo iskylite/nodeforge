@@ -7,8 +7,8 @@ const model_transaction = @import("model_transaction.zig");
 pub const max_operations = 128;
 /// 终态条目的保留时间（24 小时）。超过此时间的终态条目可被新操作复用槽位。
 pub const retention_seconds: i64 = 24 * 60 * 60;
-/// 操作类型。`install_source_import` 为 ISO 导入。
-pub const Kind = enum { install_source_import };
+/// 操作类型。长任务必须先持久化 operation，再由 worker 执行。
+pub const Kind = enum { install_source_import, rootfs_build };
 /// 操作状态机。
 pub const State = enum { queued, running, succeeded, failed };
 
@@ -56,10 +56,10 @@ pub const Entry = struct {
 
 /// 磁盘上的操作记录。字符串借用自 JSON 缓冲区。
 const DiskEntry = struct { id: []const u8, idempotency_key: []const u8, request_digest: ?[]const u8 = null, kind: Kind, state: State, created_at: i64, updated_at: i64, result: ?[]const u8 = null, error_code: ?[]const u8 = null };
-const File = struct { schema_version: u32 = 1, entries: []const DiskEntry = &.{} };
-/// `begin` / `beginRequest` 的返回值。`reused=true` 表示命中已有终态操作，
-/// 调用方应直接返回缓存的 result/error；`reused=false` 表示创建了新操作，
-/// 调用方应执行实际工作并调用 `succeed`/`fail`。
+const File = struct { schema_version: u32 = 2, entries: []const DiskEntry = &.{} };
+/// `begin` / `beginRequest` 的返回值。`reused=true` 表示命中已有成功或在途操作：
+/// 成功态调用方直接返回缓存 result，queued/running 则返回同一 operation 并且
+/// 不得重复入队；`reused=false` 表示创建了新操作，调用方负责实际工作及终态写入。
 pub const BeginResult = struct { entry: Entry, reused: bool };
 
 /// 进程内操作存储。固定 128 槽位，mutex 保护所有读写。
@@ -68,8 +68,8 @@ pub const Store = struct {
     entries: [max_operations]Entry = [_]Entry{.{}} ** max_operations,
     mutex: std.atomic.Mutex = .unlocked,
 
-    /// 开始一个幂等操作。key 长度 1-128。若 key 已存在且为终态，直接返回
-    /// 缓存的 entry；若为 interrupted failed，则替换为新 operation。
+    /// 开始一个幂等操作。key 长度 1-128。若 key 已存在且为成功或在途状态，
+    /// 直接返回同一 entry；failed（包括重启恢复出的 interrupted）创建后继。
     pub fn begin(self: *Store, io: std.Io, key: []const u8, kind: Kind, now: i64) !BeginResult {
         return self.beginRequest(io, key, "", kind, now);
     }
@@ -78,14 +78,26 @@ pub const Store = struct {
     /// 标识一个请求摘要。被中断的尝试是异常情况：
     /// 相同 key/请求创建后继，使重试可安全恢复工作。
     pub fn beginRequest(self: *Store, io: std.Io, key: []const u8, request_digest: []const u8, kind: Kind, now: i64) !BeginResult {
+        return self.beginRequestWithState(io, key, request_digest, kind, .running, now);
+    }
+
+    /// 创建持久 queued operation。调用方保存快照并成功入队后，由 worker
+    /// 通过 `start` 原子推进到 running。
+    pub fn beginQueuedRequest(self: *Store, io: std.Io, key: []const u8, request_digest: []const u8, kind: Kind, now: i64) !BeginResult {
+        return self.beginRequestWithState(io, key, request_digest, kind, .queued, now);
+    }
+
+    fn beginRequestWithState(self: *Store, io: std.Io, key: []const u8, request_digest: []const u8, kind: Kind, initial_state: State, now: i64) !BeginResult {
         if (key.len == 0 or key.len > 128) return error.InvalidIdempotencyKey;
         if (request_digest.len > 64) return error.InvalidRequestDigest;
         lock(&self.mutex);
         defer self.mutex.unlock();
         for (&self.entries) |*entry| if (entry.used() and std.mem.eql(u8, entry.keySlice(), key)) {
-            if (!std.mem.eql(u8, entry.requestDigestSlice(), request_digest)) return error.IdempotencyConflict;
-            // 成功的终态重用（幂等保证）；失败的终态允许重试（暂时性条件可恢复）。
-            if (entry.state == .succeeded)
+            if (!std.mem.eql(u8, entry.requestDigestSlice(), request_digest) or entry.kind != kind) return error.IdempotencyConflict;
+            // 成功与在途操作重用同一 id；失败终态允许以新 operation 重试。
+            // 特别是 queued/running 不能被第二个 HTTP 请求覆盖，否则 worker
+            // 完成时将找不到原 operation，且同一输入会被重复执行。
+            if (entry.state != .failed)
                 return .{ .entry = entry.*, .reused = true };
             entry.* = .{}; // 失败终态由其持久后继替换
             break;
@@ -102,13 +114,27 @@ pub const Store = struct {
             }
         }
         const entry = target orelse return error.OperationCapacityExhausted;
-        entry.* = .{ .kind = kind, .state = .running, .created_at = now, .updated_at = now };
+        entry.* = .{ .kind = kind, .state = initial_state, .created_at = now, .updated_at = now };
         try boot_session.generateId(io, &entry.id);
         @memcpy(entry.key[0..key.len], key);
         entry.key_len = @intCast(key.len);
         @memcpy(entry.request_digest[0..request_digest.len], request_digest);
         entry.request_digest_len = @intCast(request_digest.len);
         return .{ .entry = entry.*, .reused = false };
+    }
+
+    /// queued -> running。重复 start running 是幂等；终态不可重新启动。
+    pub fn start(self: *Store, id: []const u8, now: i64) !Entry {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| if (entry.used() and std.mem.eql(u8, entry.idSlice(), id)) {
+            if (entry.state == .running) return entry.*;
+            if (entry.state != .queued) return error.OperationNotStartable;
+            entry.state = .running;
+            entry.updated_at = now;
+            return entry.*;
+        };
+        return error.OperationNotFound;
     }
 
     /// 标记操作为成功并记录 result 文本（长度 <=128）。
@@ -134,9 +160,11 @@ pub const Store = struct {
             if (state == .succeeded) {
                 @memcpy(entry.result[0..text.len], text);
                 entry.result_len = @intCast(text.len);
+                entry.error_len = 0;
             } else {
                 @memcpy(entry.error_code[0..text.len], text);
                 entry.error_len = @intCast(text.len);
+                entry.result_len = 0;
             }
             return entry.*;
         };
@@ -179,14 +207,15 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     try chmod(io, allocator, "600", path);
 }
 
-/// 从磁盘加载操作快照。schema 1 为当前格式。loading 时会将 queued/running
-/// 状态的操作强制转为 failed + `operation.interrupted`，使调用方可以安全重试。
+/// 从磁盘加载操作快照。schema 2 增加 `rootfs_build` kind；schema 1 的字段布局
+/// 相同且历史上仅包含 install_source_import，因此显式兼容读取。loading 时会将
+/// queued/running 强制转为 failed + `operation.interrupted`，提供确定性恢复语义。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store, now: i64) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(2 * 1024 * 1024));
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    if (parsed.value.schema_version != 1 or parsed.value.entries.len > max_operations) return error.InvalidOperationsState;
+    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 2) or parsed.value.entries.len > max_operations) return error.InvalidOperationsState;
     for (parsed.value.entries, 0..) |disk, index| {
         if (!boot_session.validId(disk.id) or disk.idempotency_key.len == 0 or disk.idempotency_key.len > 128) return error.InvalidOperationsState;
         if ((disk.state == .queued or disk.state == .running)) {
@@ -262,10 +291,40 @@ test "running operation is durably recovered as interrupted" {
     try std.testing.expectEqualStrings("operation.interrupted", restored.errorSlice());
 }
 
+test "queued operation starts exactly once and is interrupted on restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-operations.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    var before: Store = .{};
+    const begun = try before.beginQueuedRequest(std.testing.io, "rootfs-key", "digest", .rootfs_build, 10);
+    try std.testing.expectEqual(State.queued, begun.entry.state);
+    const running = try before.start(begun.entry.idSlice(), 11);
+    try std.testing.expectEqual(State.running, running.state);
+    try std.testing.expectEqual(State.running, (try before.start(begun.entry.idSlice(), 12)).state);
+    try save(std.testing.io, std.testing.allocator, path, &before);
+    var after: Store = .{};
+    try load(std.testing.io, std.testing.allocator, path, &after, 20);
+    const restored = after.get(begun.entry.idSlice(), 20).?;
+    try std.testing.expectEqual(State.failed, restored.state);
+    try std.testing.expectEqualStrings("operation.interrupted", restored.errorSlice());
+    try std.testing.expectError(error.OperationNotStartable, after.start(begun.entry.idSlice(), 21));
+}
+
 test "same idempotency key rejects a different request" {
     var store: Store = .{};
     _ = try store.beginRequest(std.testing.io, "key", "aaaa", .install_source_import, 1);
     try std.testing.expectError(error.IdempotencyConflict, store.beginRequest(std.testing.io, "key", "bbbb", .install_source_import, 2));
+}
+
+test "duplicate queued request reuses active operation without replacement" {
+    var store: Store = .{};
+    const first = try store.beginQueuedRequest(std.testing.io, "rootfs-key", "digest", .rootfs_build, 1);
+    const repeated = try store.beginQueuedRequest(std.testing.io, "rootfs-key", "digest", .rootfs_build, 2);
+    try std.testing.expect(repeated.reused);
+    try std.testing.expectEqualStrings(first.entry.idSlice(), repeated.entry.idSlice());
+    try std.testing.expectEqual(State.queued, repeated.entry.state);
+    try std.testing.expectError(error.IdempotencyConflict, store.beginQueuedRequest(std.testing.io, "rootfs-key", "digest", .install_source_import, 3));
 }
 
 test "expired terminal operation is no longer queryable" {

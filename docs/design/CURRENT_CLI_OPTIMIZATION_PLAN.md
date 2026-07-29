@@ -996,8 +996,10 @@ exit/error mapping
 
 ### P1：长任务与输出
 
-1. rootfs/initrd/ISO import 使用 durable operation。
-2. 默认 follow、可选 detach。
+1. rootfs/initrd/ISO import 使用 durable operation。当前 rootfs 已完成 queued/running/
+   terminal worker 与 restart→interrupted；initrd 和 ISO handler 异步化仍待完成。
+2. 默认 follow、可选 detach。当前 rootfs CLI 已默认 follow 到 terminal，`--detach`
+   与统一三类 builder 语义仍待完成。
 3. operation progress event。
 4. 统一错误/exit mapping。
 5. 共用 checks schema。

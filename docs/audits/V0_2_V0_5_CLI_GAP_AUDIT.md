@@ -166,11 +166,11 @@ flag 专项盘点后的保留/收敛决定：
 | 47 | v0.3 BIOS 对 diskless 的适用性不明 | P1 | v0.3 仅 install BIOS；diskless BIOS readiness fail closed |
 | 48 | install-post status/retry 错套 boot session | P0 | 使用 install generation；只在 installer execution 内自动 retry |
 | 49 | v0.4 多 NIC 用平铺 scalar，不能表达多对象 | P0 | 改为 interfaces/vlans/bonds/routes ItemSpec + 引用图验证 |
-| 50 | v0.4 bootstrap/target 网络切换无字段与迁移 | P1 | 补 bootstrap_interface_id、BootConfig v3、v5->v6 逐字段迁移 |
+| 50 | v0.4 bootstrap/target 网络切换无字段与迁移 | P1 | 补 bootstrap_interface_id、BootConfig v4、v5->v6 逐字段迁移 |
 | 51 | v0.4 临时构建节点可能仅就地使用 | P0 | 禁止就地分叉，产物必须原子发布服务端 cache |
 | 52 | install first-boot 普通重启的一次性证据缺失 | P0 | generation-bound 磁盘 handoff/journal + 短时 token 交换 |
 | 53 | 容量“生产级”没有可验证目标 | P1 | 强制版本化 workload、资源预算、p95/p99 SLO 与原始指标 |
-| 54 | v0.5 mode 无法由 BootConfig v2 表达 | P0 | v0.4 bootstrap transport 升 BootConfig v3、target topology 升 AgentPlan v2，v0.5 materialization 升 BootConfig v4 |
+| 54 | v0.5 mode 无法由当前 BootConfig 表达 | P0 | v0.4 bootstrap transport 升 BootConfig v4、target topology 升 AgentPlan v2，v0.5 materialization 升 BootConfig v5 |
 | 55 | mode 是否分裂 rootfs cache 未定义 | P0 | mode 进 desired/delivery，不进 rootfs input；复用同一 squashfs |
 | 56 | ram_rootfs 下 tmpfs_percent 被静默忽略 | P1 | 定义为 expanded writable root 的最大 MemAvailable 比例 |
 | 57 | v0.2 profile/node remove 被过度提升为永久非目标 | P1 | 降为 v0.2 非目标，后续版本保留 tombstone 设计空间 |
@@ -185,7 +185,7 @@ flag 专项盘点后的保留/收敛决定：
 | 61 | `postprocess show` 默认最近终态会掩盖运行中的 first-boot | P1 | 改为 active-first，无 active 才回退最近终态 |
 | 62 | v0.3 install-post callback 仅凭 node/generation 关联，缺少认证和重放边界 | P0 | 增 generation-bound、hash-only、append-only credential，绑定 plan/path/method/expiry 与单调 event_seq |
 | 63 | v0.4 topology 缺 route identity，v5->v6 迁移可能丢 route/DNS/search domain | P0 | 增 `network.routes[]`、稳定 id/order/interface_id，并冻结无损迁移 |
-| 64 | v0.4 若仅复杂网络升级 schema，单 NIC delivery 会继续产生双协议 | P0 | 全部 v0.4 新 delivery 统一使用 BootConfig v3 + AgentPlan v2；单 NIC target 也使用单元素 topology，既有 v2/v1 session 消费原 snapshot |
+| 64 | v0.4 若仅复杂网络升级 schema，单 NIC delivery 会继续产生双协议 | P0 | 全部 v0.4 新 delivery 统一使用 BootConfig v4 + AgentPlan v2；单 NIC target 也使用单元素 topology，既有 v3/v1 session 消费原 snapshot |
 | 65 | 临时构建节点缺 boot-slot 互斥、token claim 和 cache-key 边界 | P0 | 增 operation-owned BuilderBootAttempt、唯一 boot slot、hash-only upload claim，并拆 placement/capability/physical node digest 归属 |
 | 66 | install first-boot bootstrap 只描述 handoff，缺一次性认证交换 | P0 | 增至少 256-bit bootstrap token、hash-only 存储、0400 落盘、原子 spent 后换 event token 及负向测试 |
 | 67 | ram_rootfs 内存公式、feature 适用性和展开保真未形成可验收契约 | P0 | 冻结双预算公式与 u64 checked arithmetic；按 mode 要求 feature，并验证 unsquashfs metadata 保真 |
@@ -235,8 +235,8 @@ flag 专项盘点后的保留/收敛决定：
 | `V0_2_DESIGN.md` | §5.5 补命令；§7 将 remove 限定为 v0.2 非目标；§9.3 拆 phase-specific retry；补 SSH/profile password/Node override 不变式与设计轨迹 |
 | `V0_2_DISKLESS_WORKFLOW.md` | preflight、asset import、`steps` ItemSpec 命令统一；补 Profile baseline、Node node-apply 与 SSH 域语义 |
 | `V0_3_DESIGN.md` | §7 `postinstall` -> `postprocess`；补 FIRMWARE 列/BIOS readiness/install-post 字段矩阵与 generation-bound callback credential |
-| `V0_4_DESIGN.md` | 补可承载 L3 的四 collection topology、static bootstrap session、事务网络切换、BootConfig v3 + AgentPlan v2、PXE builder 恢复和 install token exchange |
-| `V0_5_DESIGN.md` | 固定共享 squashfs artifact、BootConfig v4、digest/cache/双公式内存预算、临时制品删除、旧 v3 session 与 downgrade 边界 |
+| `V0_4_DESIGN.md` | 补可承载 L3 的四 collection topology、static bootstrap session、事务网络切换、BootConfig v4 + AgentPlan v2、PXE builder 恢复和 install token exchange |
+| `V0_5_DESIGN.md` | 固定共享 squashfs artifact、BootConfig v5、digest/cache/双公式内存预算、临时制品删除、旧 v4 session 与 downgrade 边界 |
 
 ## 5. 未修复的已知实现差距（设计已覆盖，代码待实现）
 
@@ -253,7 +253,7 @@ flag 专项盘点后的保留/收敛决定：
 - diskless effective compiler 补 `profile_build_projection`/仅含 kernel/transport 的 `node_boot_projection`/唯一运行根 `node_apply_projection`；Node override 不改 rootfs digest，全部 target-system/software/service/security 与可选 Node first-boot descriptor 由 agent pre-init 按 session snapshot 重放
 - schema v3 -> v4 migration（tagged Profile kind + tagged action/phase）
 - canonical BootSession 状态机 reducer、delivery record 持久化
-- node-bound rootfs/AgentPlan/payload HTTP route、最小 BootConfig DTO v2、AgentPlan DTO v1、分域 scoped token
+- node-bound rootfs/AgentPlan/payload HTTP route、最小 BootConfig DTO v3、AgentPlan DTO v1、分域 scoped token
 
 ## 6. 遗留关注项（实现时需确认）
 
@@ -279,11 +279,11 @@ flag 专项盘点后的保留/收敛决定：
    per-action 字段矩阵。
 4. **输出可读性**：为 `preflight`/`boot preview`/`node status`/`runtime`/`status --component`/
    `rootfs plan` 补 human/JSON 输出格式。
-5. **版本边界可验证**：v0.3 install generation、v0.4 BootConfig v3/PXE builder、v0.5 BootConfig v4/cache 语义闭环。
+5. **版本边界可验证**：v0.3 install generation、v0.4 BootConfig v4/PXE builder、v0.5 BootConfig v5/cache 语义闭环。
 6. **保留演进空间**：remove 只作为 v0.2 非目标；未来必须经 tombstone/retention 设计。
 7. **认证与构建边界闭环**：install callback、first-boot bootstrap 和 PXE builder 都使用有界、hash-only、不可升级的
    一次性能力；物理 builder identity 不污染共享 rootfs cache key。
-8. **跨版本 DTO 可迁移**：v0.4 全量使用 BootConfig v3 承载 bootstrap transport、AgentPlan v2 承载四 collection target topology；v0.5 再以 BootConfig v4 承载 materialization，
+8. **跨版本 DTO 可迁移**：v0.4 全量使用 BootConfig v4 承载 bootstrap transport、AgentPlan v2 承载四 collection target topology；v0.5 再以 BootConfig v5 承载 materialization，
    active session 始终消费创建时 immutable snapshot。
 9. **恢复边界可证明**：XID alias、bounded replay、hash-only capsule 中断和鉴权失败归责均有确定状态/错误语义，
    外部探测不能推进或隔离受害 session。

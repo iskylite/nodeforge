@@ -199,7 +199,8 @@ credential。`/var/lib/nodeforge/boot.json` 只保存 plan/config digest 与非 
 `event:append` token 单独保存于 `/var/lib/nodeforge/credentials/event.token`，mode 0400，不能进入 boot.json、
 日志或进程 argv。initrd 在 `switch_root` 前清零 config/rootfs-artifact token；agent 在预取并校验全部输入后、修改
 目标系统前清零 agent token，first-boot 结束后清零 event token。
-BootConfig DTO 自身 `schema_version` v2（与 catalog schema v4 分属不同命名空间），
+BootConfig DTO 自身 `schema_version` v3（与 catalog schema v4 分属不同命名空间）；
+v3 增加 `facts_url`，initrd 以 event/telemetry capability 上报 `MemTotal`，
 使用 `kind` 判别字段（与 `ProfileKind` 一致），废弃 legacy `mode="diskless"`。
 
 `required_features` 按 consumer 分成 `initrd`/`agent` 两个排序去重集合。initrd 至少需要
@@ -208,14 +209,14 @@ BootConfig DTO 自身 `schema_version` v2（与 catalog schema v4 分属不同�
 TargetSystem/software transaction 的 `node-apply-v1`，静态目标网络时另需 `static-network-v1`。initrd manifest 与 rootfs 内
 agent manifest 分别声明支持集合；任一缺失或冲突都在 `switch_root` 前拒绝，不得让 initrd 实现 agent feature 或回退降级。
 
-### 5.1 BootConfig v2 最小契约
+### 5.1 BootConfig v3 最小契约
 
 BootConfig 是签名/认证通道内的 canonical JSON；字段排序不参与 digest，digest 对 RFC 8785 风格的 canonical
 JSON 计算 SHA-256。未知顶层字段默认拒绝，只有 `extensions` 容器允许前向扩展。
 
 | 字段 | 约束 |
 |---|---|
-| `schema_version` / `kind` | 固定 `2` / `diskless` |
+| `schema_version` / `kind` | 固定 `3` / `diskless` |
 | `node_id` / `boot_session_id` | 必须与 cmdline、token claim 和服务端活动 session 全部相等 |
 | `plan_digest` / `config_digest` | 64 位小写 hex；plan 与 session snapshot 相等；config 对省略 `config_digest` 自身且把 capability token 规范化为空值后的 canonical DTO 计算，避免自引用且不把 secret 纳入日志可见标识 |
 | `issued_at` / `not_before` / `expires_at` | 服务端 UTC 秒；允许最大 120 秒时钟偏差，窗口最长 2 小时 |
@@ -223,6 +224,7 @@ JSON 计算 SHA-256。未知顶层字段默认拒绝，只有 `extensions` 容�
 | `overlay` | v0.2 固定 `tmpfs_percent`、`minimum_free_bytes`；不存在 mode 字段 |
 | `bootstrap_network` | 仅启动 NIC MAC、PXE 地址/lease 与 server endpoint；目标 renderer/topology 在 AgentPlan |
 | `agent_plan` | URL、digest、size、expiry 与 feature 摘要；完整内容由 agent 切根后按 `agent:read` 获取，不由 initrd 解析 |
+| `facts_url` | 固定到本 node 的 facts POST；只接受本 session event/telemetry capability，memory 上报不推进 lifecycle event_seq |
 | `required_features` | `{initrd:[...],agent:[...]}`；分别是 initrd manifest 与 rootfs agent manifest features 的子集 |
 | `artifacts` / `events` | rootfs/AgentPlan/event URL 与 credential slot 引用；raw config/rootfs/agent/event token 只在 credential capsule/0400 文件，不进入 DTO；URL host 必须是配置的 `server_ip` 字面地址 |
 

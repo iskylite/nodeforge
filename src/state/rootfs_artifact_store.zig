@@ -1,7 +1,7 @@
 //! # v0.2 rootfs 制品存储
 //!
 //! 持久化已构建 rootfs 制品记录，按 `rootfs_input_digest` 内容寻址。bootConfig
-//! v2 交付据此解析节点 diskless Profile 的 rootfs locator（url/sha512/size）。
+//! v3 交付据此解析节点 diskless Profile 的 rootfs locator（url/sha512/size）。
 //!
 //! 制品记录只增不删（v0.2 不做 rootfs GC，见 `V0_2_IMPL_DETAILS.md` §7）；
 //! 同一 `rootfs_input_digest` 重复登记仅在不可变元数据一致时幂等；
@@ -34,12 +34,13 @@ const StoreFile = struct {
     artifacts: []const Artifact = &.{},
 };
 
-/// 内存 + 持久 rootfs 制品登记。非线程安全；调用方持有 model gate（与其它
-/// catalog mutation 串行），或在外层加锁。
+/// 内存 + 持久 rootfs 制品登记。后台 builder 与 HTTP reader 可并发访问；
+/// 内部 mutex 保护 ArrayList、metadata 补全及持久化事务。
 pub const Store = struct {
     allocator: std.mem.Allocator,
     path: []const u8,
     artifacts: std.ArrayList(Artifact),
+    mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) Store {
         return .{ .allocator = allocator, .path = path, .artifacts = .empty };
@@ -69,6 +70,8 @@ pub const Store = struct {
     /// 内存变更和持久化是一个提交单元：持久化失败时恢复原内存状态，避免
     /// 当前进程可见、重启后消失的“幽灵制品”。
     pub fn register(self: *Store, io: std.Io, artifact: Artifact) !RegisterResult {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
         for (self.artifacts.items) |*existing| {
             if (std.mem.eql(u8, existing.rootfs_input_digest, artifact.rootfs_input_digest)) {
                 if (!std.mem.eql(u8, existing.content_sha512, artifact.content_sha512)) return error.RootfsDigestDrift;
@@ -102,10 +105,14 @@ pub const Store = struct {
 
     /// 按 rootfs_input_digest 查找 ready 制品。
     pub fn find(self: *const Store, rootfs_input_digest: []const u8) ?Artifact {
+        const mutable: *Store = @constCast(self);
+        lock(&mutable.mutex);
+        defer mutable.mutex.unlock();
         for (self.artifacts.items) |item| if (std.mem.eql(u8, item.rootfs_input_digest, rootfs_input_digest)) return item;
         return null;
     }
 
+    /// 仅供 daemon 启动完成前或外部已停止并发访问的诊断使用。
     pub fn list(self: *const Store) []const Artifact {
         return self.artifacts.items;
     }
@@ -121,6 +128,10 @@ pub const Store = struct {
         try atomicWrite(io, self.path, bytes);
     }
 };
+
+fn lock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
+}
 
 pub const RegisterResult = enum { registered, already_present, metadata_updated };
 

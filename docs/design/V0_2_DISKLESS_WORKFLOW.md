@@ -259,6 +259,10 @@ desired plan 未漂移。`node deploy true` 由服务端原子使用执行时最
 `uncompressed_bytes=null`、`required_min_memory_bytes=null` 和 warning，initrd 跳过容量硬闸；
 unknown 不代表“预算已通过”，只表示没有足够证据做硬拒绝。
 
+安装器与 diskless initrd 均通过当前 session capability 上报 `memory_bytes`。服务端只接受非旧
+session/generation，inventory freshness 固定 30 天；过期时显示 `memory=stale` 并回到上述
+initrd 硬闸。fresh memory 明确不足则 readiness 返回 `readiness.memory_insufficient`，不会启用 PXE。
+
 若操作员修改 Profile/Node/bundle/source revision，desired plan 改变：新 DHCP bootfile 立即被 readiness gate 阻止，
 旧 active session 按自己的 delivery snapshot 完成；新 rootfs build/validation 完成后才能重新启用。
 

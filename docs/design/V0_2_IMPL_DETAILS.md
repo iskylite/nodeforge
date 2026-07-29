@@ -251,10 +251,10 @@ v0.2 `squashfs_overlay` 的内存预算统一使用 `available_budget`：服务�
 `inventory.memory_bytes - kernel_initrd_bytes`（checked subtraction）计算；initrd 直接使用当时的 `MemAvailable`，
 不能再次扣 kernel/initrd。令 `upper_limit=floor(available_budget*tmpfs_percent/100)`，必须同时满足
 `minimum_free_bytes <= upper_limit` 与
-`compressed_size + node_firstboot_payload_size + upper_limit + safety_margin <= available_budget`；无 Node bundle override 时
+`compressed_size + uncompressed_size + node_firstboot_payload_size + upper_limit + safety_margin <= available_budget`；无 Node bundle override 时
 `node_firstboot_payload_size=0`。面向 inventory
 总内存的保守下界为
-`kernel_initrd_bytes + ceil_div((compressed_size+node_firstboot_payload_size+safety_margin)*100, 100-tmpfs_percent)`，所有加乘、减法和 ceil-div
+`kernel_initrd_bytes + exact_min_available(compressed_size+uncompressed_size+node_firstboot_payload_size+safety_margin,tmpfs_percent,minimum_free_bytes)`，所有加乘、减法和边界求解
 均用 `u64` checked arithmetic；inventory 未知时输出该 `required_min_memory_bytes` 和 `memory=unknown`，由 initrd 硬闸。
 Node payload 虽由 agent 切根后下载，仍落在同一 `/run` tmpfs，因此 initrd 必须根据 BootConfig 中受 digest 保护的 size
 摘要预留这部分峰值，agent 下载时再次核对实际 size。
@@ -305,7 +305,8 @@ manifest、event 或日志都不得包含 private key bytes。
 
 - catalog `schema_version`：v4（v0.2 唯一标准，同时新增 tagged kind
   `ProfileKind = install|diskless` 与 `rootfs-build|first-boot` tagged action/phase）。v0.1 的 v3 已废弃，不存在版本迁移 CLI 命令。
-- BootConfig DTO `schema_version` v2（独立命名空间）。
+- BootConfig DTO `schema_version` v3（独立命名空间；v3 增加 capability-authenticated
+  `facts_url`，由 initrd 上报 `MemTotal`）。
 - AgentPlan DTO `schema_version` v1（独立命名空间）；v0.4 target topology 升 v2，v0.5 保持 v2。
 - v0.3 `firmware.mode`/`install-post` schema v5；v0.4 schema v6；v0.5 rootfs 形态 schema v7，见
   [`V0_5_DESIGN.md`](V0_5_DESIGN.md)。

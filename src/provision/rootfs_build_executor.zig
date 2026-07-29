@@ -24,7 +24,7 @@ pub const BuildCommand = struct {
     body: []const u8,
     timeout_s: u32,
     /// managed_file/archive/script 在 chroot 内执行（写绝对路径到 staging lower）；
-    /// package 以 `--installroot` 在 host 上下文执行（无需 bind-mount /dev/proc/sys）。
+    /// 只有 dnf package 可用 `--installroot` 在 host 上下文执行。
     chroot: bool = true,
 };
 
@@ -98,6 +98,11 @@ pub fn buildPlan(
     for (steps) |step| {
         if (step.phase != .rootfs_build) return error.PhaseNotRootfsBuild;
         if (!allowedAction(step.action)) return error.ActionNotAllowedInRootfsBuild;
+        // apt renderer ignores `installroot`; allowing it here would execute
+        // apt-get against the builder host. Reject before allocating or
+        // rendering any command until the isolated Ubuntu chroot exists.
+        if (step.action == .package and package_manager == .apt)
+            return error.AptRootfsBuildUnsupported;
     }
     var commands: std.ArrayList(BuildCommand) = .empty;
     errdefer {
@@ -114,8 +119,10 @@ pub fn buildPlan(
             const fb = try toFirstBootStep(step, payload_paths[i]);
             var body: std.Io.Writer.Allocating = .init(allocator);
             errdefer body.deinit();
-            // package 以 --installroot 在 host 上下文安装，并消费 nodeforged 受管
-            // HTTP 源；其余动作 chroot 写 staging lower。
+            // dnf package 以 --installroot 在 host 上下文安装，并消费本机受管
+            // file:// 源；其余动作 chroot 写 staging lower。apt 当前不会消费
+            // installroot，Ubuntu rootfs-build package 必须在 v0.2.1 接入前
+            // fail closed/补齐隔离 builder，不能视为已支持。
             const installroot: ?[]const u8 = if (step.action == .package) staging else null;
             try first_boot.renderStep(&body.writer, fb, package_manager, repository_urls, true, installroot);
             const script_path = try std.fmt.allocPrint(allocator, "{s}{d}.sh", .{ script_prefix, index });
@@ -137,8 +144,8 @@ pub fn buildPlan(
 
 /// 在 staging 目录内执行构建计划（fail-closed，任一退出码非 0 即放弃）：
 /// managed_file/archive/script 把 body 写入 staging 内脚本后 chroot 执行（写绝对
-/// 路径到 staging lower）；package 直接在 host 上下文以 `--installroot` 安装（无需
-/// chroot/bind-mount）。执行属环境相关边界（仅 Linux/root 构建主机可用）。
+/// 路径到 staging lower）；当前只有 dnf package 可直接在 host 上下文以
+/// `--installroot` 安装。执行属环境相关边界（仅 Linux/root 构建主机可用）。
 pub fn execute(io: std.Io, allocator: std.mem.Allocator, staging: []const u8, plan: BuildPlan) !void {
     for (plan.commands) |cmd| {
         if (cmd.chroot) {
@@ -147,7 +154,11 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, staging: []const u8, pl
             try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_script, .data = cmd.body });
             try runChecked(io, allocator, &.{ "chroot", staging, "/bin/sh", cmd.script_path });
         } else {
-            // package: --installroot 已嵌入 body，host 上下文执行。
+            // Defense in depth: a manually constructed BuildPlan must not turn
+            // this host-context branch into a generic shell executor.
+            if (plan.package_manager != .dnf or !std.mem.startsWith(u8, cmd.body, "dnf -y --installroot="))
+                return error.UnsafeHostBuildCommand;
+            // dnf package: --installroot 已嵌入 body，host 上下文执行。
             try runChecked(io, allocator, &.{ "sh", "-c", cmd.body });
         }
     }
@@ -240,4 +251,32 @@ test "buildPlan package step reuses first_boot dnf source isolation" {
     try std.testing.expect(std.mem.indexOf(u8, body, "install 'tmux' 'vim'") != null);
     // rootfs-build package action 与 OS 层一致使用 --nogpgcheck（本地受管受信源）。
     try std.testing.expect(std.mem.indexOf(u8, body, "--nogpgcheck") != null);
+}
+
+test "apt rootfs-build package is rejected before host command generation" {
+    const steps = [_]model.ProvisionStep{
+        .{ .name = "p", .phase = .rootfs_build, .action = .package, .packages = &.{"curl"} },
+    };
+    try std.testing.expectError(
+        error.AptRootfsBuildUnsupported,
+        buildPlan(std.testing.allocator, &steps, .apt, &.{"file:///managed/apt"}, &.{null}, "/staging"),
+    );
+}
+
+test "execute refuses non-dnf host-context commands" {
+    const commands = [_]BuildCommand{.{
+        .script_path = "/tmp/never-runs.sh",
+        .body = "apt-get install curl",
+        .timeout_s = 30,
+        .chroot = false,
+    }};
+    const plan: BuildPlan = .{
+        .commands = &commands,
+        .package_manager = .apt,
+        .repository_urls = &.{"file:///managed/apt"},
+    };
+    try std.testing.expectError(
+        error.UnsafeHostBuildCommand,
+        execute(std.testing.io, std.testing.allocator, "/staging", plan),
+    );
 }
