@@ -9,3 +9,4 @@ zig-pkg/
 .DS_Store
 config.json
 dist
+.claude
