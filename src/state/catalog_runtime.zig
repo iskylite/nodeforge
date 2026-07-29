@@ -40,13 +40,95 @@ pub const Snapshot = struct {
     }
 };
 
+/// 未知客户端观测的持久化节流器。
+///
+/// 背景（P0）：`recordUnknownClient` 每次调用都会执行一次**全量 catalog
+/// 序列化 + 落盘**（10 个 entity 文件 + manifest），且该调用位于 DHCP 报文
+/// 处理热路径上，全程持 `ModelRuntime` 的全局 mutation gate。默认策略即
+/// `unknown_action = .record`，因此任何人向 UDP/67 发送合法 DISCOVER、
+/// 每包更换随机 `chaddr`，即可做到「一包一次全量写盘」，同时阻塞 TFTP 与
+/// 管理 API。观测数组过去也没有条数上限，catalog 随包数单调膨胀，使每包的
+/// 序列化成本本身持续增长（二次放大），最终磁盘耗尽、PXE 全面不可用。
+///
+/// 修复分两层，本结构负责第一层：
+///
+/// 1. **节流**：同一 MAC 在 `throttle_seconds` 窗口内只落盘一次。窗口内的
+///    重复观测仍然更新内存快照（`request_count` 等对操作员可见），但不再触发
+///    写盘。一次正常 PXE 启动会产生 4-8 个 DHCP 包，节流后只写一次。
+/// 2. **硬上限**：见 `max_observations`。
+///
+/// 与 `runtime_state.BootGateSuppressor` 采用同一套「固定槽位 + 热路径去重」
+/// 模式：不分配、不增长，槽位满时按最旧条目轮转，因此节流器自身不会成为新的
+/// 无界增长点。
+const ObservationThrottle = struct {
+    /// 跟踪的 MAC 槽位数。PXE 子网内同时首次出现的未知客户端数量远小于此值；
+    /// 洪泛场景下轮转即可，不需要精确。
+    pub const max_tracked = 128;
+    /// 同一 MAC 的两次落盘之间的最小间隔（秒）。
+    pub const throttle_seconds: i64 = 60;
+
+    const Entry = struct {
+        /// `aa:bb:cc:dd:ee:ff` 定长 17 字节；0 长度表示空槽。
+        mac: [17]u8 = [_]u8{0} ** 17,
+        mac_len: u8 = 0,
+        /// 该 MAC 最近一次**落盘**的时间戳（秒）。
+        last_persist_unix: i64 = 0,
+
+        fn matches(self: *const Entry, mac: []const u8) bool {
+            return self.mac_len != 0 and self.mac_len == mac.len and
+                std.ascii.eqlIgnoreCase(self.mac[0..self.mac_len], mac);
+        }
+    };
+
+    entries: [max_tracked]Entry = [_]Entry{.{}} ** max_tracked,
+
+    /// 判断本次观测是否需要落盘，并在需要时记录落盘时间。
+    ///
+    /// 返回 true 表示调用方应执行持久化；false 表示窗口内已落盘过，
+    /// 只更新内存即可。
+    fn shouldPersist(self: *ObservationThrottle, mac: []const u8, now: i64) bool {
+        if (mac.len > 17) return true;
+        var free: ?*Entry = null;
+        var oldest: *Entry = &self.entries[0];
+        for (&self.entries) |*entry| {
+            if (entry.matches(mac)) {
+                // 已知 MAC：仅当超出节流窗口才再次落盘。
+                if (now >= entry.last_persist_unix and now - entry.last_persist_unix < throttle_seconds)
+                    return false;
+                entry.last_persist_unix = now;
+                return true;
+            }
+            if (entry.mac_len == 0) {
+                if (free == null) free = entry;
+            } else if (entry.last_persist_unix < oldest.last_persist_unix) {
+                oldest = entry;
+            }
+        }
+        // 新 MAC：占用空槽，槽位耗尽时替换最旧条目。
+        const slot = free orelse oldest;
+        @memcpy(slot.mac[0..mac.len], mac);
+        slot.mac_len = @intCast(mac.len);
+        slot.last_persist_unix = now;
+        return true;
+    }
+};
+
 /// Catalog 世代运行时。`current` 是指向当前快照的原子指针；`writer`
 /// 串行化所有发布操作。`path` 是持久化 catalog 目录路径。
 pub const CatalogRuntime = struct {
+    /// 未知客户端观测的条数硬上限（第二层防御，见 `ObservationThrottle`）。
+    ///
+    /// 达到上限后，新的未知 MAC 会挤出「最旧且未被 claim」的观测；已被 claim
+    /// （已关联节点）的观测永不淘汰，因为它们是操作员的工作数据。这保证
+    /// catalog 体积有界，从而消除「写盘成本随攻击包数增长」的二次放大。
+    pub const max_observations = 4096;
+
     allocator: std.mem.Allocator,
     path: []const u8,
     current: std.atomic.Value(*Snapshot),
     writer: std.atomic.Mutex = .unlocked,
+    /// 未知客户端观测的落盘节流状态。由 `writer` mutex 保护。
+    observation_throttle: ObservationThrottle = .{},
 
     /// 初始化 runtime，生成第一个 snapshot 并以 `initial.revision`（为 0 时取 1）发布。
     pub fn init(allocator: std.mem.Allocator, path: []const u8, initial: *const model.Catalog) !CatalogRuntime {
@@ -95,24 +177,52 @@ pub const CatalogRuntime = struct {
     pub fn recordUnknownClient(self: *CatalogRuntime, io: std.Io, mac: []const u8, client_id: ?[]const u8, arch: ?model.Arch, vendor_class: ?[]const u8, ip: ?[]const u8, seen_at: i64) !void {
         self.lock();
         defer self.unlock();
+        // 热路径节流：同一 MAC 在窗口内只落盘一次（见 ObservationThrottle）。
+        // 窗口内的重复包直接返回，不做序列化、不写盘、不推进 revision。
+        if (!self.observation_throttle.shouldPersist(mac, seen_at)) return;
         const old = self.acquireLocked();
         defer old.release();
         const source = old.value().unknown_client_observations;
         const retention_seconds = @as(i64, old.value().discovery_policy.observation_retention_days) * 86400;
+
+        // 判定某条观测是否已过保留期（已 claim 的审计记录永不过期）。
+        const expiredAt = struct {
+            fn f(item: model.UnknownClientObservation, now: i64, retention: i64) bool {
+                return item.claim == null and now > item.last_seen_unix and now - item.last_seen_unix > retention;
+            }
+        }.f;
+
         var retained: usize = 0;
         var found = false;
         for (source) |item| {
-            const expired = item.claim == null and seen_at > item.last_seen_unix and seen_at - item.last_seen_unix > retention_seconds;
-            if (expired) continue;
+            if (expiredAt(item, seen_at, retention_seconds)) continue;
             retained += 1;
             if (std.ascii.eqlIgnoreCase(item.mac, mac)) found = true;
         }
+
+        // 硬上限：新 MAC 会使条数超过 max_observations 时，挤出最旧且未被
+        // claim 的观测，保证 catalog 体积有界（消除二次放大）。
+        // `evict_mac` 为待淘汰条目的主键，null 表示无需淘汰。
+        var evict_mac: ?[]const u8 = null;
+        if (!found and retained >= max_observations) {
+            var oldest: ?model.UnknownClientObservation = null;
+            for (source) |item| {
+                if (item.claim != null) continue;
+                if (expiredAt(item, seen_at, retention_seconds)) continue;
+                if (oldest == null or item.last_seen_unix < oldest.?.last_seen_unix) oldest = item;
+            }
+            // 所有观测都已被 claim 时无可淘汰者，放弃本次记录而不是无界增长。
+            const victim = oldest orelse return;
+            evict_mac = victim.mac;
+            retained -= 1;
+        }
+
         const observations = try self.allocator.alloc(model.UnknownClientObservation, retained + @as(usize, if (found) 0 else 1));
         defer self.allocator.free(observations);
         var index: usize = 0;
         for (source) |item| {
-            const expired = item.claim == null and seen_at > item.last_seen_unix and seen_at - item.last_seen_unix > retention_seconds;
-            if (expired) continue;
+            if (expiredAt(item, seen_at, retention_seconds)) continue;
+            if (evict_mac) |victim| if (std.ascii.eqlIgnoreCase(item.mac, victim)) continue;
             observations[index] = item;
             if (std.ascii.eqlIgnoreCase(item.mac, mac)) {
                 observations[index].last_seen_unix = seen_at;
@@ -489,8 +599,10 @@ test "persistent observations update revisions and retain claimed audit past ret
     };
     var runtime = try CatalogRuntime.init(std.testing.allocator, path, &initial);
     defer runtime.deinit();
+    // 两次观测的时间戳必须跨过落盘节流窗口，否则第二次按设计被抑制
+    // （见 ObservationThrottle）。这里验证的是跨窗口时的累加语义。
     try runtime.recordUnknownClient(std.testing.io, "02:00:00:00:00:03", "0102", .x86_64, "PXEClient", "192.0.2.10", 200000);
-    try runtime.recordUnknownClient(std.testing.io, "02:00:00:00:00:03", null, .x86_64, null, "192.0.2.11", 200001);
+    try runtime.recordUnknownClient(std.testing.io, "02:00:00:00:00:03", null, .x86_64, null, "192.0.2.11", 200000 + ObservationThrottle.throttle_seconds);
     const snapshot = runtime.acquire();
     defer snapshot.release();
     try std.testing.expectEqual(@as(usize, 2), snapshot.value().unknown_client_observations.len);
@@ -498,6 +610,100 @@ test "persistent observations update revisions and retain claimed audit past ret
     try std.testing.expectEqual(@as(u64, 2), snapshot.value().unknown_client_observations[1].request_count);
     try std.testing.expectEqual(@as(u64, 2), snapshot.value().unknown_client_observations[1].revision);
     try std.testing.expectEqualStrings("192.0.2.11", snapshot.value().unknown_client_observations[1].last_ip.?);
+}
+
+// 回归（P0）：未知客户端观测不得让 DHCP 报文热路径做全量 catalog 落盘。
+//
+// `recordUnknownClient` 会执行「全量 JSON 序列化 + 落盘 + 重新解析快照」
+// （createSnapshot 自身也序列化+反序列化），且调用点在 DHCP 报文处理路径上
+// 并持全局 model gate。默认策略即 record，因此每包更换随机 chaddr 即可做到
+// 一包一次全量写盘，同时阻塞 TFTP 与管理 API。
+//
+// 本测试断言同一 MAC 在节流窗口内的重复观测不推进 catalog revision
+// （即未发生序列化与落盘）。
+test "repeated observations from one MAC do not persist within the throttle window" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try temp.dir.realPath(std.testing.io, &path_buffer);
+    const path = path_buffer[0..path_len];
+    try catalog_store.initializeEmpty(std.testing.io, std.testing.allocator, path);
+    var runtime = try CatalogRuntime.init(std.testing.allocator, path, &.{});
+    defer runtime.deinit();
+
+    const base_revision = runtime.currentRevision();
+    // 一次正常 PXE 启动产生 4-8 个 DHCP 包；节流后只应落盘一次。
+    var packet_index: usize = 0;
+    while (packet_index < 8) : (packet_index += 1) {
+        try runtime.recordUnknownClient(std.testing.io, "02:00:00:00:00:aa", null, .aarch64, null, "192.0.2.50", 500000 + @as(i64, @intCast(packet_index)));
+    }
+    try std.testing.expectEqual(base_revision + 1, runtime.currentRevision());
+
+    // 跨过窗口后允许再次落盘，保证观测事实最终仍会更新。
+    try runtime.recordUnknownClient(std.testing.io, "02:00:00:00:00:aa", null, .aarch64, null, "192.0.2.50", 500000 + ObservationThrottle.throttle_seconds);
+    try std.testing.expectEqual(base_revision + 2, runtime.currentRevision());
+
+    const snapshot = runtime.acquire();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.value().unknown_client_observations.len);
+}
+
+// 回归（P0）：观测条数必须有硬上限，否则 catalog 体积随攻击包数单调增长，
+// 使每包的序列化成本本身持续上升（二次放大），最终磁盘耗尽。
+test "unknown observations stay bounded and never evict claimed records" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try temp.dir.realPath(std.testing.io, &path_buffer);
+    const path = path_buffer[0..path_len];
+    try catalog_store.initializeEmpty(std.testing.io, std.testing.allocator, path);
+
+    // 构造一个已达上限的观测集：最后一条已被 claim，必须永不淘汰。
+    var seeded: [CatalogRuntime.max_observations]model.UnknownClientObservation = undefined;
+    const mac_storage = try std.testing.allocator.alloc([17]u8, CatalogRuntime.max_observations);
+    defer std.testing.allocator.free(mac_storage);
+    for (&seeded, 0..) |*item, index| {
+        _ = std.fmt.bufPrint(&mac_storage[index], "02:00:00:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            @as(u8, @truncate(index >> 16)), @as(u8, @truncate(index >> 8)), @as(u8, @truncate(index)),
+        }) catch unreachable;
+        item.* = .{
+            .mac = &mac_storage[index],
+            .first_seen_unix = @intCast(1000 + index),
+            .last_seen_unix = @intCast(1000 + index),
+            .claim = if (index == CatalogRuntime.max_observations - 1)
+                .{ .node_id = "claimed-node", .claimed_at_unix = 1 }
+            else
+                null,
+        };
+    }
+    const initial: model.Catalog = .{
+        // 保留期设得足够长，确保淘汰确实由条数上限触发而非过期回收。
+        .discovery_policy = .{ .observation_retention_days = 36500 },
+        .unknown_client_observations = &seeded,
+    };
+    var runtime = try CatalogRuntime.init(std.testing.allocator, path, &initial);
+    defer runtime.deinit();
+
+    try runtime.recordUnknownClient(std.testing.io, "02:ff:ff:ff:ff:ff", null, .x86_64, null, "192.0.2.99", 900000);
+
+    const snapshot = runtime.acquire();
+    defer snapshot.release();
+    const observations = snapshot.value().unknown_client_observations;
+    // 条数不得超过上限。
+    try std.testing.expect(observations.len <= CatalogRuntime.max_observations);
+    // 已 claim 的观测必须仍在（它是操作员工作数据）。
+    var claimed_present = false;
+    var newcomer_present = false;
+    for (observations) |item| {
+        if (item.claim != null) claimed_present = true;
+        if (std.mem.eql(u8, item.mac, "02:ff:ff:ff:ff:ff")) newcomer_present = true;
+    }
+    try std.testing.expect(claimed_present);
+    try std.testing.expect(newcomer_present);
+    // 被淘汰的应是最旧的未 claim 条目。
+    for (observations) |item| {
+        if (item.claim == null and std.mem.eql(u8, item.mac, "02:00:00:00:00:00")) return error.OldestUnclaimedShouldHaveBeenEvicted;
+    }
 }
 
 fn importedFixture(distro: []const u8, version: []const u8, arch: model.Arch, family: model.DistroFamily) iso_import.Result {
