@@ -211,10 +211,20 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
             try w.writeAll("    - ");
             var command: std.Io.Writer.Allocating = .init(allocator);
             defer command.deinit();
-            try command.writer.writeAll("cat > /target/etc/hosts <<'NODEFORGE_HOSTS_EOF'\n");
-            try command.writer.writeAll(hosts);
-            if (hosts.len == 0 or hosts[hosts.len - 1] != '\n') try command.writer.writeByte('\n');
-            try command.writer.writeAll("NODEFORGE_HOSTS_EOF\nchmod 0644 /target/etc/hosts");
+            // Encode content as base64 to avoid YAML newline folding.
+            // YAML single-quoted flow scalars fold literal newlines into spaces,
+            // so heredocs and multi-line content must be encoded.
+            const content = if (hosts.len > 0 and hosts[hosts.len - 1] != '\n')
+                try std.fmt.allocPrint(allocator, "{s}\n", .{hosts})
+            else
+                try allocator.dupe(u8, hosts);
+            defer allocator.free(content);
+            const encoder = std.base64.standard;
+            const encoded_len = encoder.Encoder.calcSize(content.len);
+            const encoded = try allocator.alloc(u8, encoded_len);
+            defer allocator.free(encoded);
+            _ = encoder.Encoder.encode(encoded, content);
+            try command.writer.print("printf '%s' '{s}' | base64 -d > /target/etc/hosts && chmod 0644 /target/etc/hosts", .{encoded});
             try render.yamlQuote(w, command.written());
             try w.writeByte('\n');
         }
