@@ -114,11 +114,19 @@ pub const CapsuleStore = struct {
         self.entries[index] = entry;
     }
 
+    /// 取出指定 node+session 的 capsule 内容。
+    ///
+    /// 已交付（`delivered`）的 capsule 不再返回：capsule 携带四域 scoped
+    /// token，设计契约是**单次下载**。`markDelivered` 只在
+    /// `transferVirtualCapsule` 传输成功后调用，因此传输失败的客户端仍可重试，
+    /// 而成功取走后的重复请求一律拒绝——否则同一 boot session 有效期内
+    /// 凭据可被无限次重放，且当 DHCP 地址被复用、另一台主机继承该 session
+    /// 时，它能取走前一节点的全部 scope token。
     fn copy(self: *CapsuleStore, node_id: []const u8, session: []const u8, out: *[capsule_max_bytes]u8) ?[]const u8 {
         while (!self.mutex.tryLock()) std.Thread.yield() catch {};
         defer self.mutex.unlock();
         for (&self.entries) |*entry| {
-            if (!entry.active or !std.mem.eql(u8, &entry.session, session) or !std.mem.eql(u8, entry.node[0..entry.node_len], node_id)) continue;
+            if (!entry.active or entry.delivered or !std.mem.eql(u8, &entry.session, session) or !std.mem.eql(u8, entry.node[0..entry.node_len], node_id)) continue;
             const len = entry.archive_len;
             @memcpy(out[0..len], entry.archive[0..len]);
             return out[0..len];
@@ -621,6 +629,32 @@ test "capsule store never overwrites an undelivered session at capacity" {
     try store.put("node", "ffffffffffffffffffffffffffffffff", archive);
     var out: [capsule_max_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(archive, store.copy("node", "ffffffffffffffffffffffffffffffff", &out).?);
+}
+
+// 回归：credential capsule 必须单次下载。
+//
+// capsule 携带 config/rootfs/agent/event 四域 scoped token。历史实现的
+// `copy` 只检查 `active` 而不检查 `delivered`（而 `pendingSession` 检查了，
+// 属明显遗漏），因此同一 boot session 有效期内凭据可被无限次重放；若 DHCP
+// 地址被复用、另一台主机继承该 session，它能取走前一节点的全部 scope token。
+test "delivered credential capsule cannot be replayed" {
+    var store: CapsuleStore = .{};
+    const archive = "070701";
+    const session = "c107a1039ff51ba52b9e81a04b7d1f18";
+    try store.put("node-a", session, archive);
+
+    var out: [capsule_max_bytes]u8 = undefined;
+    // 首次取用成功（传输成功后才会 markDelivered）。
+    try std.testing.expectEqualStrings(archive, store.copy("node-a", session, &out).?);
+    // 传输失败时不标记，允许客户端重试——重传语义不得被破坏。
+    try std.testing.expectEqualStrings(archive, store.copy("node-a", session, &out).?);
+
+    store.markDelivered("node-a", session);
+    // 交付完成后一律拒绝重放。
+    try std.testing.expect(store.copy("node-a", session, &out) == null);
+    // 交付后也不应再作为该节点的待交付 session 暴露。
+    var pending: [32]u8 = undefined;
+    try std.testing.expect(store.pendingSession("node-a", &pending) == null);
 }
 
 fn transferVirtualCapsule(

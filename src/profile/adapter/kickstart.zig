@@ -473,3 +473,4 @@ test "M4.1 kickstart static target network uses Anaconda netmask syntax" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "timesource --ntp-server=ntp.nodeforge.local") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "server ntp.nodeforge.local iburst") != null);
 }
+

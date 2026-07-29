@@ -96,7 +96,12 @@ pub fn verify(
     const computed = hashOf(raw_token, secret);
     // 使用常量时间比较 hash，防止时序侧信道攻击。
     if (!std.crypto.timing_safe.eql([hash_len]u8, computed, stored_hash[0..hash_len].*)) return .invalid_token;
-    if (now_mono > claim.expires_mono) return .expired;
+    // TTL 判定必须 fail-closed。`boot_session.monotonicNow()` 在
+    // `clock_gettime(CLOCK_MONOTONIC)` 失败时返回 0（见该函数注释），而
+    // `0 > expires_mono` 恒为 false，会让**所有已过期 token 重新生效**。
+    // 单调时钟不可读属于灾难性系统状态，此时唯一安全的语义是拒绝，
+    // 而不是把无法判定当作「未过期」。
+    if (now_mono <= 0 or now_mono > claim.expires_mono) return .expired;
     if (claim.scope != request_scope) return .scope_mismatch;
     if (!std.mem.eql(u8, claim.node_id, request_node)) return .node_mismatch;
     if (claim.path_allowlist.len != 0 and !contains(claim.path_allowlist, request_path)) return .path_not_allowed;
@@ -131,6 +136,23 @@ test "expired token is rejected" {
     const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
     const stored = hashOf(raw, "s");
     try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .config_read, "n1", "", "", 0, 200));
+}
+
+// 回归：单调时钟不可读时 TTL 判定必须 fail-closed。
+//
+// `boot_session.monotonicNow()` 在 clock_gettime 失败时返回 0。若 TTL 判定
+// 仅为 `now_mono > expires_mono`，则 `0 > 100` 为 false，**所有已过期
+// token 全部复活**。这里固定该语义：now_mono <= 0 一律视为过期。
+test "unreadable monotonic clock fails closed instead of reviving tokens" {
+    const claim: Claim = .{ .scope = .config_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .expires_mono = 100 };
+    const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+    const stored = hashOf(raw, "s");
+    // monotonicNow() 的失败返回值。
+    try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .config_read, "n1", "", "", 0, 0));
+    // 防御性：负值同样不可用于判定。
+    try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .config_read, "n1", "", "", 0, -1));
+    // 正常时钟下仍必须放行，避免修复引入误伤。
+    try std.testing.expectEqual(Decision.ok, verify(raw, "s", &stored, &claim, .config_read, "n1", "", "", 0, 50));
 }
 
 test "scope mismatch and cross-node rootfs access are rejected" {
