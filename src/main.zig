@@ -3581,7 +3581,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
     const rows = try a.alloc(nodeforge.cli_table.Row, items.items.len);
     const jsonl = try a.alloc([]const u8, items.items.len);
     for (items.items, 0..) |item, index| {
-        var start_buf: [20]u8 = undefined;
+        var armed_buf: [20]u8 = undefined;
         var install_buf: [20]u8 = undefined;
         var finished_buf: [20]u8 = undefined;
         cells[index] = .{
@@ -3592,7 +3592,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
             if (item.deploy) "true" else "false",
             item.install_intent,
             item.status orelse "-",
-            try a.dupe(u8, views.formatTimestamp(&start_buf, item.armed_at orelse 0)),
+            try a.dupe(u8, views.formatTimestamp(&armed_buf, item.armed_at orelse 0)),
             try a.dupe(u8, views.formatTimestamp(&install_buf, item.install_at orelse 0)),
             try a.dupe(u8, views.formatTimestamp(&finished_buf, item.finished_at orelse 0)),
             item.serial_number orelse "-",
@@ -4796,8 +4796,8 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
                 desired_plan_digest: ?[]const u8,
                 drifted: bool,
                 drift_state: []const u8,
-                requested_by: []const u8,
-                start_at: i64,
+                requested_by: ?[]const u8,
+                armed_at: i64,
                 install_at: i64,
                 finished_at: i64,
                 successful_generation: u64,

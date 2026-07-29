@@ -3593,7 +3593,7 @@ Ubuntu：
 - `password_authentication` 映射为 `ssh.allow-pw`；每个用户 key 必须进入对应用户的
   `authorized_keys`，不能全部塞给 identity 用户后丢失归属。
 - `root_login`、root password/key 和确定性的 sshd 策略通过目标系统文件
-  `/etc/ssh/sshd_config.d/60-nodeforge.conf` 与 root account 配置落地；写文件使用受约束 renderer/runner，
+  `/etc/ssh/sshd_config.d/00-nodeforge.conf` 与 root account 配置落地；写文件使用受约束 renderer/runner，
   不拼接未转义自由 shell。
 - 默认 root password `asdf1234` 从明文事实源转换为 Ubuntu shadow/installer 接受的 crypt hash；安装完成后
   必须实际验证 `ssh root@<node>` 的密码认证，而不能只检查 sshd_config 文本。
@@ -3605,7 +3605,7 @@ Rocky：
 - `%packages` 显式包含 `openssh-server`，并渲染 `services --enabled=sshd`。
 - 普通用户使用 `user`，用户 key 使用 `sshkey --username=<name>`；root key 明确使用 root 目标。
 - root password 使用 Kickstart `rootpw --iscrypted` 的 `$6$` 形式；普通用户 password 同样使用
-  `--iscrypted`；`sshd_config.d/60-nodeforge.conf` 使用与 Ubuntu 相同的
+  `--iscrypted`；`sshd_config.d/00-nodeforge.conf` 使用与 Ubuntu 相同的
   `PermitRootLogin`/`PasswordAuthentication` 语义。
 - `security.firewall=disabled` 映射为禁用并 mask firewalld；`security.selinux=disabled` 映射为 Kickstart
   `selinux --disabled` 和目标 `/etc/selinux/config`。安装后分别以 `systemctl is-enabled firewalld` 和
@@ -3809,11 +3809,11 @@ NodeDeploymentControl {
   node_id,
   install_generation,
   consumed_generation,
-  requested_at,
+  armed_at,
   requested_by,
   config_revision,
   // 当前 generation 生命周期时间戳
-  started_at,
+  install_at,
   finished_at,
   // 最近一次成功事实（跨 retry 保留）
   deployed_generation,
@@ -3821,7 +3821,7 @@ NodeDeploymentControl {
 }
 ```
 
-`started_at`/`finished_at` 属于当前 generation：`rearm` 时清零，`consume`/`markTerminal` 在本 generation
+`install_at`/`finished_at` 属于当前 generation：`rearm` 时清零，`consume`/`markTerminal` 在本 generation
 内仅首次写入。`deployed_at`/`deployed_generation` 是最近一次成功事实，retry 和失败不得清零；下一次成功
 才原子替换。管理查询必须用 `armed_generation orelse consumed_generation` 作为当前代，并只展示同时匹配
 该 generation 与 config revision 的 node status，禁止把旧 profile 的 completed 与新 desired profile 拼接。
@@ -3940,7 +3940,7 @@ F3 扩展 M3 §8.4 的 ISO 导入 family 白名单和 `--distro` 覆盖语义；
 - `reinstall_policy=always` 仍须经过 generation。它只能在上一 attempt 已终态且新的 DHCP DISCOVER 创建新
   BootSession 时自动 rearm；REQUEST/renewal、同 XID 重传、活动 installer session 和重复 RRQ 均不得绕过。
 - `install retry` 的幂等请求只在真正创建或替换 generation 时写 `install.retry.requested`；事件记录实际
-  generation、config revision、请求时间和本机操作来源。deployment control 同步持久化 requested_at/by。
+  generation、config revision、武装时间和本机操作来源。deployment control 同步持久化 armed_at/by。
 - `local-only` profile 引用的 repository URL 必须是当前 NodeForge `server.server_ip:http_port` 下的受管
   `/repos/` 路径；声明外部 HTTP(S) mirror 时返回 `ExternalEndpointForbidden`，不能把 catalog URL 原样写入 answer。
 - `time_sync=true` 必须把全部显式 `ntp_servers` 写入 Ubuntu 与 Rocky 目标配置，并关闭 vendor fallback；
@@ -4563,15 +4563,15 @@ profile/repository 写操作、distro 派生索引诊断和 PXELINUX 留 M6；pr
 session 创建序号和 facts digest；更高 generation 胜出，同 generation 只接受当前未 superseded session，同 session
 后到值覆盖。旧 generation/session 的迟到请求返回 `inventory.stale_source` 且不覆盖；相同 digest 重试幂等且不刷新时间。
 
-部署控制维护 requested/install-started/finished/deployed 时间：`requested_at` 是整个部署任务的 Start；
-内部 `started_at` 是 `install.started` 的破坏性 generation 消费边界，对外显示为 Install；`finished_at`
+部署控制维护 armed/install/finished/deployed 时间：`armed_at` 是整个部署任务的 Start；
+`install_at` 是 `install.started` 的破坏性 generation 消费边界，对外显示为 Install；`finished_at`
 是任务 Finished。`deployed_at` 只在成功 completed 时更新，失败不覆盖。`rearm` 武装新 generation 时更新
-`requested_at` 并清零 started/finished，使新任务不残留上一代进度；`consume`/`markTerminal` 在本 generation
+`armed_at` 并清零 install/finished，使新任务不残留上一代进度；`consume`/`markTerminal` 在本 generation
 内保持“仅首次写入”幂等，`rollbackRearm` 原样恢复这些时间戳。
 管理 API 提供所有节点列表和单节点聚合投影。config/catalog 来自同一个 ModelSnapshotPair；status/deployment/inventory
 在各自锁内复制并携带独立 revision，响应返回完整 `view_revision` vector，不把多 store 顺序读取伪装成单一事务。
 `node list` 至少显示 ID/MAC/IP/profile/status/Armed/Install/Finished/SN：API 字段依次为
-`armed_at=requested_at`、`install_at=started_at`、`finished_at`。后续 diskless 继承 Armed/Finished 任务边界，
+`armed_at`、`install_at`、`finished_at`。后续 diskless 继承 Armed/Finished 任务边界，
 另行定义与 Install 并列的实际启动阶段。成功的 deployed_at 与 finished_at 重合，作为详情留给 `node show`；
 `node show` 显示完整 NodeConfig、profile/effective system、status、generation/revision/drift 和 inventory，secret 默认脱敏。
 所有 CLI human 输出时间统一渲染为 RFC 3339 UTC 可视化时间，不再直接打印裸 epoch 整数，未发生显示 `-`。

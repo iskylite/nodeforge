@@ -169,7 +169,7 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
         if (route.metric) |metric| try w.print(" {d}", .{metric});
         try w.writeAll("'\n");
     }
-    if (system.ssh.enabled) try w.print("mkdir -p /etc/ssh/sshd_config.d\nprintf '%s\\n' 'PermitRootLogin {s}' 'PasswordAuthentication {s}' > /etc/ssh/sshd_config.d/60-nodeforge.conf\n", .{ @tagName(system.ssh.root_login), if (system.ssh.password_authentication) "yes" else "no" });
+    if (system.ssh.enabled) try w.print("mkdir -p /etc/ssh/sshd_config.d\nprintf '%s\\n' 'PermitRootLogin {s}' 'PasswordAuthentication {s}' > /etc/ssh/sshd_config.d/00-nodeforge.conf\n", .{ @tagName(system.ssh.root_login), if (system.ssh.password_authentication) "yes" else "no" });
     if (system.security.firewall == .disabled) try w.writeAll("systemctl disable --now firewalld || true\nsystemctl mask firewalld || true\n");
     if (!system.connectivity.time_sync) {
         try w.writeAll("systemctl disable --now chronyd || true\n");

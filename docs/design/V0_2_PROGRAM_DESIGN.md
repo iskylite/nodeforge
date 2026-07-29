@@ -16,6 +16,11 @@ diskless 时序见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，状态机/协议�
   固定格式为 `YYYY-MM-DDTHH:MM:SSZ`；构建过程不依赖宿主 shell 或 `date`。
 - 可复现构建通过 `-Dbuild-time=<固定值>` 显式注入时间。运行时代码若需要本地时间，统一通过 libc
   `localtime_r`/`strftime`；结构化 API 与事件时间保持 UTC 语义。
+- **调试阶段务必固定 `build-time`**：`build_time` 经 `build_options` 注入编译图，参与 Zig 内容寻址
+  缓存的全局哈希。若每次构建都读取实时时钟，时间戳的秒级变化会导致全部下游产物缓存失效，`.zig-cache`
+  持续膨胀且每次全量重编（实测 14 天可累积至数十 GB）。调试期间推荐始终使用固定时间戳：
+  `zig build -Dbuild-time=2026-07-29T00:00:00Z`。正式发布构建可省略该选项以记录真实构建时间。
+  若 `.zig-cache` 已膨胀，可安全删除（`.gitignore` 已忽略该目录）。
 
 ## 1. 三程序总览
 

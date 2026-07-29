@@ -432,8 +432,8 @@ inventory 原子写入独立文件，daemon 启动恢复。服务端不接受客
 
 这些字段随 generation 一起恢复，重复事件必须幂等，不得刷新首次 install/terminal 时间。
 
-per-generation 语义要求：`rearm` 武装一个新 generation 时更新 `requested_at`（新的 Armed），并清零上一 generation 的
-`started_at`/`finished_at`（新的 Install/Finished 尚未发生）。`deployed_at` 明确定义为最近一次成功时间，
+per-generation 语义要求：`rearm` 武装一个新 generation 时更新 `armed_at`（新的 Armed），并清零上一 generation 的
+`install_at`/`finished_at`（新的 Install/Finished 尚未发生）。`deployed_at` 明确定义为最近一次成功时间，
 必须与 `deployed_generation` 一起跨 retry/失败保留，直到下一 generation 成功后才替换。
 `consume`/`markTerminal` 在本 generation 内保持幂等，不重复刷新。
 `consumed_generation`/`terminal_generation` 作为历史不清零，由后续 consume/markTerminal
@@ -462,7 +462,7 @@ runtime store 是带各自 revision 的观察值。实现不得把依次读取�
 ID  MAC  IP  PROFILE  STATUS  ARMED  INSTALL  FINISHED  SN
 ```
 
-列表 `armed_at` 取 deployment_control 的 `requested_at`，`install_at` 取内部 `started_at`/`install.started`，
+列表 `armed_at` 取 deployment_control 的 `armed_at`，`install_at` 取 `install_at`/`install.started`，
 `finished_at` 来自 per-generation terminal 时间。三者明确区分任务边界与安装阶段；后续 diskless 复用
 Start/Finished 任务边界，并为其实际启动阶段定义与 Install 并列的字段，不能重新解释 Start；
 成功的 `deployed_at` 与 `finished_at` 重合，作为详情留给 `node show`，列表不再单独列出，

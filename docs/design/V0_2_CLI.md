@@ -501,7 +501,7 @@ quarantine 状态。JSON 输出 `current` tagged union + `history` 最近 sessio
 `NODE MAC FILENAME BYTES TRANSFERRED STATUS SESSION`。`events list --limit` 默认 100，`--until` 与 `--since`
 均为包含边界，构成闭区间，与 v0.1 本地 event reader 契约一致。`events types` 列出全部已注册事件类型（继承 v0.1）。
 `node list` human 输出列：`ID MAC IP PROFILE DEPLOY INSTALL_INTENT STATUS ARMED INSTALL FINISHED SN`。
-`ARMED` 取 deployment_control 的 `requested_at`（generation 武装时刻），`INSTALL` 取内部 `started_at`/`install.started`，
+`ARMED` 取 deployment_control 的 `armed_at`（generation 武装时刻），`INSTALL` 取 `install_at`/`install.started`，
 `FINISHED` 取首次 terminal/`finished_at`。management API JSON 返回 `armed_at`/`install_at`/`finished_at`，
 并在详情中保留最近成功的 `deployed_at`。
 

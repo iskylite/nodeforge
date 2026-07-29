@@ -404,14 +404,25 @@ fn renderSsh(w: *std.Io.Writer, allocator: std.mem.Allocator, ssh: dto.AgentSsh)
     var content: std.Io.Writer.Allocating = .init(allocator);
     defer content.deinit();
     try content.writer.print("PermitRootLogin {s}\nPasswordAuthentication {s}\nPubkeyAuthentication yes\n", .{ @tagName(ssh.root_login), if (ssh.password_authentication) "yes" else "no" });
-    try emitFile(w, "/etc/ssh/sshd_config.d/60-nodeforge.conf", content.written(), 0o600);
+    // OpenSSH keeps the first value it reads for most scalar options.  Use an
+    // early drop-in so the effective NodeForge policy wins over the rootfs
+    // safety default and vendor drop-ins such as 50-redhat.conf.
+    try emitFile(w, "/etc/ssh/sshd_config.d/00-nodeforge.conf", content.written(), 0o600);
     // rootfs 是共享只读 squashfs lower，不包含 per-node SSH host key。
     // 切根后在 volatile overlay 上生成 host key（ssh-keygen -A）。
     // 已存在时 ssh-keygen -A 跳过，幂等。
     try w.writeAll("ssh-keygen -A 2>/dev/null || true\n");
     // sshd/ssh 单元可能尚未安装（由 software transaction 或 first-boot 安装，或在最小 rootfs 中缺失）。
     // 与 disable 分支一致地 best-effort：启用失败不阻断 node-apply（readiness 阶段已对正式部署校验 sshd 存在）。
-    try w.writeAll(if (ssh.enabled) "systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true\n" else "systemctl disable sshd 2>/dev/null || systemctl disable ssh || true\n");
+    if (ssh.enabled) {
+        try w.writeAll("systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true\n");
+        // diskless node-apply runs after the rootfs has started systemd.  Merely
+        // enabling the unit does not make the running daemon reread the newly
+        // written policy or generated host keys.
+        try w.writeAll("systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true\n");
+    } else {
+        try w.writeAll("systemctl disable --now sshd 2>/dev/null || systemctl disable --now ssh 2>/dev/null || true\n");
+    }
 }
 
 fn renderNtp(w: *std.Io.Writer, allocator: std.mem.Allocator, connectivity: model.ConnectivityPolicy) !void {
@@ -487,6 +498,9 @@ test "renderer contains no plaintext password and writes effective identity" {
     try std.testing.expect(std.mem.indexOf(u8, script, "/etc/hostname") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "$6$salt$user") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "authorized_keys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/ssh/sshd_config.d/00-nodeforge.conf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/ssh/sshd_config.d/60-nodeforge.conf") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "systemctl restart sshd") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "nodeforge-diskless") == null);
 }
 

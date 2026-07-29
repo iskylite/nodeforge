@@ -50,7 +50,7 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
-fn readHostHosts(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
+pub fn readHostHosts(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     var file = try std.Io.Dir.cwd().openFile(io, "/etc/hosts", .{ .follow_symlinks = true });
     defer file.close(io);
     const stat = try file.stat(io);

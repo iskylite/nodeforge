@@ -179,6 +179,21 @@ make dist-linux-arm64   # 交叉编译并打包 Linux aarch64
 `build.zig.zon` 的包版本。构建时间由 Zig 标准库读取实时时钟并格式化为 RFC 3339 UTC，格式为
 `YYYY-MM-DDTHH:MM:SSZ`，不依赖宿主 shell 或 `date`。可复现构建使用 `-Dbuild-time=<固定值>` 覆盖。
 
+> **调试阶段务必固定 `build-time`**：`build_time` 通过 `build_options` 注入编译图，参与 Zig
+> 内容寻址缓存的全局哈希。若不固定，每次构建的时间戳都不同，导致**所有下游产物全部缓存失效**，
+> `.zig-cache` 持续膨胀且每次全量重编。调试期间推荐始终使用固定时间戳：
+>
+> ```bash
+> zig build -Dbuild-time=2026-07-29T00:00:00Z
+> ```
+>
+> 正式发布构建可省略该选项以记录真实构建时间，或显式注入 `-Dbuild-time` 保证可复现。
+> 若 `.zig-cache` 已膨胀，可安全删除（`.gitignore` 已忽略该目录）：
+>
+> ```bash
+> rm -rf .zig-cache
+> ```
+
 可运行 `zig run -lc examples/time_format_demo.zig` 验证时间转换边界：构建所用的纯 Zig
 `std.time.epoch` 输出 UTC 日历时间，libc `localtime_r`/`strftime` 输出宿主本地时间。
 

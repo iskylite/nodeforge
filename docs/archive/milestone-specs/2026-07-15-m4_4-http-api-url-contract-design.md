@@ -240,7 +240,7 @@ RFC 3339 UTC，revision/digest 为不透明字符串，枚举值必须在 schema
 | `ProfileSummary` | `name, mode, distro, version, arch, install_source?, node_count, valid` |
 | `ProfileDetail` | `profile, capability, install_source?, repositories, assets, effective_system, safety, node_ids, validation, view_revision` |
 | `InstallSourceDetail` | `name, display_name?, family, distro, version, arch, media_kind, media_tree_url?, repositories, assets, sha256, profile_refs, view_revision` |
-| `Deployment` | `generation, revision, plan_digest?, plan_drift, requested_at?, started_at?, finished_at?, deployed_at?` |
+| `Deployment` | `generation, revision, plan_digest?, plan_drift, armed_at?, install_at?, finished_at?, deployed_at?` |
 | `Runtime` | `phase, session_active, boot_session_id?, last_event_at?, last_error?, last_reason?` |
 | `Inventory` | `serial_number?, product_uuid?, vendor?, model?, reported_at?, source?, deployment_generation?, boot_session_id?` |
 | `Generation` | `node_id, generation, armed_at, reason?, state` |

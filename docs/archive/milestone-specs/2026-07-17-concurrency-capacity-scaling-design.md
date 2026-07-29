@@ -181,7 +181,7 @@ nodeforged: capacity derived
 - `/16` 派生 65534，但实际安全天花板仍是 2048。启动日志必须同时输出 derived/effective/ceiling，
   不能把 clamp 前的派生值误报为实际容量。
 - profile 修改触发 daemon reload 时，旧 schema 3 状态快照加载失败会使 Runtime Phase 变成 `-`；同时
-  list/show 把新 desired profile、旧 consumed generation 和新 requested_at 拼到一行。紧凑 schema 4 只解决
+  list/show 把新 desired profile、旧 consumed generation 和新 armed_at 拼到一行。紧凑 schema 4 只解决
   “丢状态”，聚合层还必须要求 status 的 `model_revision`/`deployment_generation` 与当前视图一致。
 - `deployed_at` 定义为最近一次成功时间，不能在 retry 时清零。当前尝试只清零 started/finished；CLI 分开显示
   current generation 与 last successful generation，inventory 也显示其来源 generation，避免把历史硬件观测误认为

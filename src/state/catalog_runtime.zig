@@ -12,6 +12,7 @@ const std = @import("std");
 const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
 const validate = @import("../config/validate.zig");
+const profile_mutation = @import("../config/profile_mutation.zig");
 const iso_import = @import("../catalog/iso_import.zig");
 const config_runtime = @import("config_runtime.zig");
 
@@ -301,9 +302,14 @@ pub const CatalogRuntime = struct {
         const profiles = try self.allocator.alloc(model.ProfileConfig, value.profiles.len + 1);
         defer self.allocator.free(profiles);
         @memcpy(profiles[0..value.profiles.len], value.profiles);
+        const host_hosts = profile_mutation.readHostHosts(io, self.allocator) catch null;
+        defer if (host_hosts) |content| self.allocator.free(content);
+        var default_system: model.TargetSystemConfig = .{};
+        default_system.hosts_content = host_hosts;
         profiles[value.profiles.len] = .{
             .name = imported.install_source.name,
             .install_source = imported.install_source.name,
+            .system = default_system,
         };
         var candidate = value.*;
         candidate.revision = old.revision + 1;
@@ -587,6 +593,9 @@ test "first install source publication persists and projects its derived distro"
     try std.testing.expectEqual(@as(usize, 1), live_catalog.value().profiles.len);
     try std.testing.expectEqualStrings("fixture-source", live_catalog.value().profiles[0].name);
     try std.testing.expectEqualStrings("fixture-source", live_catalog.value().profiles[0].install_source);
+    try std.testing.expect(live_catalog.value().profiles[0].system.import_host_hosts);
+    try std.testing.expect(live_catalog.value().profiles[0].system.hosts_content != null);
+    try std.testing.expect(std.mem.indexOf(u8, live_catalog.value().profiles[0].system.hosts_content.?, "localhost") != null);
     try std.testing.expectEqual(@as(usize, 4), live_catalog.value().assets.len);
     try std.testing.expectEqualStrings("efi/grubaa64.efi", live_catalog.value().assets[3].path);
     try std.testing.expectEqualStrings("rocky", live_catalog.value().distros[0].name);

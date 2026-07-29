@@ -97,7 +97,7 @@ pub fn nodes(writer: *std.Io.Writer, rows: []const NodeRow) !void {
 /// 渲染节点列表表格（带选项）。超过 256 行返回 `error.TooManyRows`。
 pub fn nodesWithOptions(writer: *std.Io.Writer, rows: []const NodeRow, options: table.Options) !void {
     // Armed/Install/Finished 分别映射 generation 武装、实际安装阶段开始和任务终态，
-    // 避免把内部 requested_at/started_at 字段名误当成用户语义。
+    // 生命周期时间字段在 store、API 和 CLI 间统一为 armed_at/install_at/finished_at。
     const columns = [_]table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "armed_at", .title = "ARMED" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
     var cells: [256][11][]const u8 = undefined;
     var table_rows: [256]table.Row = undefined;

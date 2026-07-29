@@ -372,8 +372,9 @@ mutation handler）、`src/http/client.zig`（5 个 mutation client 函数新增
    TTL 已过期也保留；同节点下一次 delivery 原位替换旧终态，避免无界增长。
    checkpoint 自带单调 `revision`，并进入 `node list.view_revision.diskless`，使客户端
    能识别仅由无盘生命周期引起的视图变化。
-3. rootfs builder 和目标系统都只消费 nodeforged 发布的受管 HTTP repository URL。
-   构建器不得把 daemon 本机路径改写成 `file://`；目标 AgentPlan 即使没有
+3. rootfs builder 只消费 daemon 本机 `repos_dir` 的受管 `file://` repository URL，
+   避免同步 management handler 内的包管理器回连同一 HTTP listener 而自死锁；目标系统
+   只消费 nodeforged 发布的受管 HTTP repository URL。目标 AgentPlan 即使没有
    install/remove package delta，也必须持久化同一组 HTTP repo。构建结束时删除 dnf/apt
    带入的 vendor repo，任何目录遍历或删除失败均使构建失败，禁止留下公网源后继续发布。
 4. MAC 是网卡稳定身份，`network.interface_name` 是可选强制值。未指定时 agent 在切根后、
@@ -1070,7 +1071,8 @@ lorax/livecd/mkksiso 只有 adapter 明确声明为等价实现时才允许使�
 构建在与目标 distro/version/arch/
 kernel_release 一致的环境中运行。builder 固定 software capability revision，消费与 Profile 查询相同的
 environment/group/task/package selection（metapackage 仍按 `software.packages.include` 选择），并按 local-only 不变式
-移除/禁用公网 mirror、metalink、GeoIP 和 vendor NTP，只引用本地 repository。OS 层可按 software capability revision
+移除/禁用公网 mirror、metalink、GeoIP 和 vendor NTP，只引用 daemon 本机 `repos_dir`
+的受管 `file://` repository；该构建期 URL 不进入目标系统。OS 层可按 software capability revision
 内部缓存复用；build manifest 记录 builder image/environment digest、构建工具版本与命令、module/firmware 清单、
 generated locales、available timezones/keyboards、完整共享账号基线（passwd/group/shadow/home/shell/sudo membership/
 authorized_keys）、capability revision、Profile system/software digest 和输出 squashfs digest/size/uncompressed size。
@@ -1108,6 +1110,8 @@ readiness 只读、不暗中构建。`profile rootfs status <profile>` / `assets
 > Stage 5 SSH 信任基线（ed25519 client keypair + sshd host key + authorized_keys + sshd_config.d drop-in）→
 > Stage 6 mksquashfs 压缩（zstd）+ 流式 SHA-512 + 原子发布。`--new-ssh-keys` 的端到端流程尚在实现中；
 > 当前每次 rootfs build 均在 Stage 5 重新生成密钥。`/etc/ssh/ssh_known_hosts` 的自动生成为后续完善点。
+> Stage 1 与 rootfs-build package action 使用本机受管 `file://` repository；安装计划和
+> AgentPlan 对目标系统继续发布受管 HTTP URL，两者不得混用。
 
 **构建期与启动期边界**（只读 lower vs agent pre-init 写 per-boot overlay upper）：
 

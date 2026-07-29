@@ -2126,6 +2126,13 @@ fn managementBootBundleCreate(request: zap.Request, context: *RouteContext, meta
     try bundles_list.appendSlice(context.allocator, loaded.value.boot_bundles);
     try bundles_list.append(context.allocator, new_bundle);
     loaded.value.boot_bundles = bundles_list.items;
+    // Validate the complete candidate before the catalog transaction is
+    // persisted.  Publishing after save is intentionally not the first
+    // validation boundary: otherwise a rejected cross-distro kernel/initrd
+    // tuple leaves an invalid catalog on disk while the daemon keeps serving
+    // the previous in-memory snapshot.
+    const projected = model.projectCatalog(context.config.*, &loaded.value);
+    config_validate.validate(&projected, &loaded.value) catch |err| return validationError(request, err, meta);
     @import("../catalog/store.zig").save(context.io, context.allocator, context.catalog.path, &loaded.value) catch |err| return assetInputError(request, @errorName(err), meta);
     applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"boot bundle persisted but snapshot publish failed\"}}\n", meta);
     var response: [512]u8 = undefined;
@@ -2541,8 +2548,8 @@ fn installGenerations(request: zap.Request, context: *const RouteContext, node_i
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced session termination\"}}\n", meta);
     }
     const desired_digest = desiredPlanDigest(context, node_id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"cannot compute desired node plan digest\"}}\n", meta);
-    const requested_at = unixNow();
-    const rearm = context.deployments.rearm(node_id, desired_digest, requested_at, .operator) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot rearm install generation\"}}\n", meta);
+    const armed_at = unixNow();
+    const rearm = context.deployments.rearm(node_id, desired_digest, armed_at, .operator) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot rearm install generation\"}}\n", meta);
     if (rearm.changed) {
         deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch {
             context.deployments.rollbackRearm(node_id, rearm);
@@ -2550,12 +2557,12 @@ fn installGenerations(request: zap.Request, context: *const RouteContext, node_i
         };
         var generation_text: [24]u8 = undefined;
         var revision_text: [24]u8 = undefined;
-        var requested_at_text: [24]u8 = undefined;
+        var armed_at_text: [24]u8 = undefined;
         const fields = [_]events.Field{
             .{ .key = "node_id", .value = node_id },
             .{ .key = "generation", .value = std.fmt.bufPrint(&generation_text, "{d}", .{rearm.generation}) catch "0" },
             .{ .key = "config_revision", .value = std.fmt.bufPrint(&revision_text, "{d}", .{context.config_revision}) catch "0" },
-            .{ .key = "requested_at", .value = std.fmt.bufPrint(&requested_at_text, "{d}", .{requested_at}) catch "0" },
+            .{ .key = "armed_at", .value = std.fmt.bufPrint(&armed_at_text, "{d}", .{armed_at}) catch "0" },
             .{ .key = "requested_by", .value = "operator" },
             .{ .key = "replaced_stale_revision", .value = if (rearm.replaced) "true" else "false" },
         };
@@ -3134,7 +3141,11 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     const build_steps = diskless.rootfsBuildSteps(context.allocator, context.config, catalog, profile) catch |err| return validationError(request, err, meta);
     defer if (build_steps.len != 0) context.allocator.free(build_steps);
 
-    const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
+    // The build runs synchronously inside the management HTTP handler. Pointing
+    // dnf back at nodeforged's HTTP endpoint deadlocks: the handler waits for
+    // dnf while dnf waits for this same server thread. The repositories are
+    // managed local files, so server-side builds consume them directly.
+    const base = try std.fmt.allocPrint(context.allocator, "file://{s}", .{paths.require().repos_dir});
     defer context.allocator.free(base);
     var repo_closure = buildRepositoryClosure(context.allocator, catalog, profile, install_source, base) catch |err| return validationError(request, err, meta);
     defer repo_closure.deinit(context.allocator);
@@ -3432,8 +3443,9 @@ const RepoClosure = struct {
 };
 
 /// 合并 install source 与 Profile software 的受管 repository 引用，去重后把每个
-/// repository 的 `/artifacts/repositories/**` 路径重新绑定到当前 nodeforged
-/// endpoint（与 boot-prepare session 流程一致，避免 catalog 中过期的 authority）。
+/// repository 的 `/artifacts/repositories/**` 路径重新绑定到 nodeforged 本机
+/// 受管 repository 根。rootfs build 在 management handler 内同步执行，不能
+/// 回连同一 HTTP listener，否则包管理器与 handler 会互相等待。
 fn buildRepositoryClosure(allocator: std.mem.Allocator, catalog: *const model.Catalog, profile: *const model.ProfileConfig, install_source: *const model.InstallSourceConfig, base: []const u8) !RepoClosure {
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(allocator);
@@ -3462,13 +3474,35 @@ fn buildRepositoryClosure(allocator: std.mem.Allocator, catalog: *const model.Ca
         if (package_manager != null and package_manager.? != manager) return error.RepositoryManagerMismatch;
         package_manager = manager;
         const marker_index = std.mem.indexOf(u8, repository.base_url, repository_marker) orelse return error.ExternalEndpointForbidden;
-        const managed_path = repository.base_url[marker_index..];
-        try urls.append(allocator, try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, managed_path }));
+        const managed_relative = repository.base_url[marker_index + repository_marker.len ..];
+        if (managed_relative.len == 0) return error.ExternalEndpointForbidden;
+        try urls.append(allocator, try managedRepositoryBuildUrl(allocator, base, managed_relative));
     }
     return .{
         .package_manager = package_manager,
         .repository_urls = try urls.toOwnedSlice(allocator),
     };
+}
+
+fn managedRepositoryBuildUrl(allocator: std.mem.Allocator, base: []const u8, relative: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{
+        std.mem.trimEnd(u8, base, "/"),
+        std.mem.trimStart(u8, relative, "/"),
+    });
+}
+
+test "rootfs build repository URL uses the local managed repository root" {
+    const allocator = std.testing.allocator;
+    const url = try managedRepositoryBuildUrl(
+        allocator,
+        "file:///opt/nodeforge/assets/repos/",
+        "/rocky-9.7-aarch64-minimal/Minimal",
+    );
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "file:///opt/nodeforge/assets/repos/rocky-9.7-aarch64-minimal/Minimal",
+        url,
+    );
 }
 
 /// 流式拷贝文件（固定缓冲，不整块读入内存）。
@@ -4064,8 +4098,8 @@ fn writeDisklessSession(writer: *std.Io.Writer, session: *const diskless_deliver
         session.rootfs_size,
     });
     if (session.rootfs_uncompressed_size == 0) try writer.writeAll("null") else try writer.print("{d}", .{session.rootfs_uncompressed_size});
-    try writer.print(",\"created_at\":{d},\"expires_at\":{d},\"capabilities\":{{\"config\":{s},\"rootfs\":{s},\"agent\":{s},\"event\":{s}}}}}", .{
-        session.created_at,
+    try writer.print(",\"armed_at\":{d},\"expires_at\":{d},\"capabilities\":{{\"config\":{s},\"rootfs\":{s},\"agent\":{s},\"event\":{s}}}}}", .{
+        session.armed_at,
         session.expires_at,
         if (session.config_token.issued) "true" else "false",
         if (session.rootfs_token.issued) "true" else "false",
@@ -4702,8 +4736,8 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
                 try output.writer.print(",\"drifted\":{s},\"drift_state\":{f}", .{ if (drift == .drifted) "true" else "false", std.json.fmt(@tagName(drift), .{}) });
             } else try output.writer.writeAll(",\"drifted\":false,\"drift_state\":\"unavailable\"");
         } else if (diskless_session) |session| {
-            try output.writer.print(",\"armed_at\":{d},\"install_at\":", .{session.created_at});
-            if (session.started_at != 0) try output.writer.print("{d}", .{session.started_at}) else try output.writer.writeAll("null");
+            try output.writer.print(",\"armed_at\":{d},\"install_at\":", .{session.armed_at});
+            if (session.install_at != 0) try output.writer.print("{d}", .{session.install_at}) else try output.writer.writeAll("null");
             try output.writer.writeAll(",\"finished_at\":");
             if (session.finished_at != 0) try output.writer.print("{d}", .{session.finished_at}) else try output.writer.writeAll("null");
             try output.writer.writeAll(",\"deployed_at\":null,\"drifted\":false,\"drift_state\":\"not-applicable\"");
@@ -4836,7 +4870,7 @@ fn deploymentPhaseFallback(view: deployment_control.View) ?[]const u8 {
     const consumed = view.consumed_generation orelse return null;
     if (view.terminal_generation == consumed)
         return if (view.deployed_generation == consumed) "completed" else "failed";
-    if (view.started_at != 0) return "install_started";
+    if (view.install_at != 0) return "install_started";
     return null;
 }
 
@@ -4882,8 +4916,8 @@ test "install intent distinguishes initial retry stale and consumed states" {
         .requested_revision = 42,
         .requested_plan_digest = digest_42,
         .applied_revision = 0,
-        .requested_at = 1,
-        .started_at = 0,
+        .armed_at = 1,
+        .install_at = 0,
         .finished_at = 0,
         .deployed_at = 0,
         .requested_by = .initial,
@@ -4909,7 +4943,7 @@ const DeploymentTimes = struct { armed_at: i64, install_at: i64, finished_at: i6
 /// Install 是 install.started 的阶段点。M5 添加 diskless 阶段时必须扩展并列
 /// 字段，不能改变这三个字段的既有含义。
 fn deploymentTimes(view: deployment_control.View) DeploymentTimes {
-    return .{ .armed_at = view.requested_at, .install_at = view.started_at, .finished_at = view.finished_at };
+    return .{ .armed_at = view.armed_at, .install_at = view.install_at, .finished_at = view.finished_at };
 }
 
 test "deployment time projection maps task and install boundaries" {
@@ -4920,8 +4954,8 @@ test "deployment time projection maps task and install boundaries" {
         .terminal_generation = 1,
         .requested_revision = 42,
         .applied_revision = 42,
-        .requested_at = 10,
-        .started_at = 20,
+        .armed_at = 10,
+        .install_at = 20,
         .finished_at = 30,
         .deployed_at = 30,
         .requested_by = .operator,
@@ -4940,8 +4974,8 @@ test "management node fallback stays on the current generation" {
         .terminal_generation = 4,
         .requested_revision = 2,
         .applied_revision = 1,
-        .requested_at = 10,
-        .started_at = 0,
+        .armed_at = 10,
+        .install_at = 0,
         .finished_at = 0,
         .deployed_generation = 4,
         .deployed_at = 9,
@@ -4950,7 +4984,7 @@ test "management node fallback stays on the current generation" {
     try std.testing.expectEqualStrings("pending", deploymentPhaseFallback(view).?);
     view.armed_generation = null;
     view.consumed_generation = 5;
-    view.started_at = 11;
+    view.install_at = 11;
     try std.testing.expectEqualStrings("install_started", deploymentPhaseFallback(view).?);
     view.terminal_generation = 5;
     try std.testing.expectEqualStrings("failed", deploymentPhaseFallback(view).?);
@@ -4967,8 +5001,8 @@ test "legacy terminal status is adopted only when deployment facts corroborate i
         .terminal_generation = 5,
         .requested_revision = 42,
         .applied_revision = 42,
-        .requested_at = 10,
-        .started_at = 15,
+        .armed_at = 10,
+        .install_at = 15,
         .finished_at = 20,
         .deployed_generation = 5,
         .deployed_at = 20,
@@ -5090,7 +5124,7 @@ fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node
     });
     if (deployment) |value| {
         const drift = context.deployments.drift(node_id, desired_digest);
-        try output.writer.print(",\"deployment\":{{\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"desired_plan_digest\":{f},\"drifted\":{s},\"drift_state\":{f},\"requested_at\":{d},\"requested_by\":{f}}}", .{
+        try output.writer.print(",\"deployment\":{{\"armed_generation\":{f},\"consumed_generation\":{f},\"terminal_generation\":{f},\"requested_revision\":{d},\"applied_revision\":{d},\"desired_revision\":{d},\"desired_plan_digest\":{f},\"drifted\":{s},\"drift_state\":{f},\"armed_at\":{d},\"requested_by\":{f}}}", .{
             std.json.fmt(value.armed_generation, .{}),
             std.json.fmt(value.consumed_generation, .{}),
             std.json.fmt(value.terminal_generation, .{}),
@@ -5100,10 +5134,10 @@ fn managementNodeStatus(request: zap.Request, context: *const RouteContext, node
             std.json.fmt(desired_digest[0..], .{}),
             if (drift == .drifted) "true" else "false",
             std.json.fmt(@tagName(drift), .{}),
-            value.requested_at,
+            value.armed_at,
             std.json.fmt(@tagName(value.requested_by), .{}),
         });
-        try output.writer.print(",\"deployment_armed_at\":{d},\"deployment_install_at\":{d},\"deployment_finished_at\":{d},\"deployed_at\":{d}", .{ value.requested_at, value.started_at, value.finished_at, value.deployed_at });
+        try output.writer.print(",\"deployment_armed_at\":{d},\"deployment_install_at\":{d},\"deployment_finished_at\":{d},\"deployed_at\":{d}", .{ value.armed_at, value.install_at, value.finished_at, value.deployed_at });
     }
     try output.writer.writeAll("}}\n");
     try json(request, .ok, output.written(), meta);

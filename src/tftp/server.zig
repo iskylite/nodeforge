@@ -1450,7 +1450,7 @@ test "TFTP worker retries a lost final ACK and releases its global slot" {
         .capsules = null,
         .active = &active,
     };
-    const started_at = boot_session.monotonicNow();
+    const begin_tick = boot_session.monotonicNow();
     const thread = std.Thread.spawn(.{}, runTransferWorker, .{context}) catch |err| {
         context.pair.release();
         std.testing.allocator.free(datagram);
@@ -1474,7 +1474,7 @@ test "TFTP worker retries a lost final ACK and releases its global slot" {
     // 最后一次重传后仍等待 4s，累计预算约 7s，随后乐观完成并释放 worker slot。
     thread.join();
     joined = true;
-    try std.testing.expect(boot_session.monotonicNow() - started_at >= 6);
+    try std.testing.expect(boot_session.monotonicNow() - begin_tick >= 6);
     try std.testing.expectEqual(@as(u16, 0), active.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), runtime.tftp.started.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), runtime.tftp.completed.load(.monotonic));

@@ -75,9 +75,9 @@ pub const Entry = struct {
     consumed_plan_digest: Digest = empty_digest,
     applied_plan_digest: Digest = empty_digest,
     /// 当前 generation 被武装的时间；CLI/API 将其显示为整个部署任务的 Start。
-    requested_at: i64 = 0,
+    armed_at: i64 = 0,
     /// 安装器报告 `install.started`、generation 被消费的时间；CLI/API 显示为 Install。
-    started_at: i64 = 0,
+    install_at: i64 = 0,
     /// 当前 generation 首次进入 terminal 的时间；CLI/API 显示为 Finished。
     finished_at: i64 = 0,
     /// 最近一次成功部署所属 generation；与当前 armed/consumed generation 分离。
@@ -111,8 +111,8 @@ pub const DiskEntry = struct {
     requested_plan_digest: ?[]const u8 = null,
     consumed_plan_digest: ?[]const u8 = null,
     applied_plan_digest: ?[]const u8 = null,
-    requested_at: i64 = 0,
-    started_at: i64 = 0,
+    armed_at: i64 = 0,
+    install_at: i64 = 0,
     finished_at: i64 = 0,
     deployed_generation: u64 = 0,
     deployed_at: i64 = 0,
@@ -133,12 +133,12 @@ pub const RearmResult = struct {
     previous_next_generation: u64 = 1,
     previous_requested_revision: u64 = 0,
     previous_requested_plan_digest: Digest = empty_digest,
-    previous_requested_at: i64 = 0,
+    previous_armed_at: i64 = 0,
     previous_requested_by: RequestSource = .initial,
     /// rearm 前该条目记录的 per-generation 生命周期时间戳。rearm 会为新
     /// generation 清零这些字段；持久化失败回滚时必须原样恢复，否则一次
     /// 失败的 retry 会清空历史部署时间。
-    previous_started_at: i64 = 0,
+    previous_install_at: i64 = 0,
     previous_finished_at: i64 = 0,
     previous_deployed_at: i64 = 0,
 };
@@ -172,8 +172,8 @@ pub const View = struct {
     applied_revision: u64,
     requested_plan_digest: Digest = empty_digest,
     applied_plan_digest: Digest = empty_digest,
-    requested_at: i64,
-    started_at: i64,
+    armed_at: i64,
+    install_at: i64,
     finished_at: i64,
     deployed_generation: u64 = 0,
     deployed_at: i64,
@@ -212,7 +212,7 @@ pub const Store = struct {
 
     /// 首次观测武装 generation 1。已有条目永远不会
     /// 被 config 重载自动重新武装。
-    pub fn ensureInitial(self: *Store, node_id: []const u8, digest: Digest, requested_at: i64) !void {
+    pub fn ensureInitial(self: *Store, node_id: []const u8, digest: Digest, armed_at: i64) !void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         const entry = try self.findOrCreateLocked(node_id);
@@ -221,7 +221,7 @@ pub const Store = struct {
             entry.next_generation += 1;
             entry.requested_revision = 0;
             entry.requested_plan_digest = digest;
-            entry.requested_at = requested_at;
+            entry.armed_at = armed_at;
             entry.requested_by = .initial;
         }
     }
@@ -263,7 +263,7 @@ pub const Store = struct {
         entry.consumed_generation = generation;
         entry.consumed_revision = entry.requested_revision;
         entry.consumed_plan_digest = entry.requested_plan_digest;
-        if (entry.started_at == 0 and timestamp != 0) entry.started_at = timestamp;
+        if (entry.install_at == 0 and timestamp != 0) entry.install_at = timestamp;
         entry.finished_at = 0;
         entry.armed_generation = null;
         return result;
@@ -277,7 +277,7 @@ pub const Store = struct {
     /// 否则新 generation 尚未开始时会错误地抹掉上一次成功部署记录。
     /// consumed/terminal generation 作为历史不在此处清零，由后续 consume/
     /// markTerminal 为新 generation 覆盖。
-    pub fn rearm(self: *Store, node_id: []const u8, digest: Digest, requested_at: i64, requested_by: RequestSource) !RearmResult {
+    pub fn rearm(self: *Store, node_id: []const u8, digest: Digest, armed_at: i64, requested_by: RequestSource) !RearmResult {
         lock(&self.mutex);
         defer self.mutex.unlock();
         const entry = try self.findOrCreateLocked(node_id);
@@ -291,9 +291,9 @@ pub const Store = struct {
                 .previous_next_generation = entry.next_generation,
                 .previous_requested_revision = entry.requested_revision,
                 .previous_requested_plan_digest = entry.requested_plan_digest,
-                .previous_requested_at = entry.requested_at,
+                .previous_armed_at = entry.armed_at,
                 .previous_requested_by = entry.requested_by,
-                .previous_started_at = entry.started_at,
+                .previous_install_at = entry.install_at,
                 .previous_finished_at = entry.finished_at,
                 .previous_deployed_at = entry.deployed_at,
             };
@@ -301,26 +301,26 @@ pub const Store = struct {
             entry.next_generation += 1;
             entry.requested_revision = 0;
             entry.requested_plan_digest = digest;
-            entry.requested_at = requested_at;
+            entry.armed_at = armed_at;
             entry.requested_by = requested_by;
-            entry.started_at = 0;
+            entry.install_at = 0;
             entry.finished_at = 0;
             return previous;
         }
         const generation = entry.next_generation;
         const previous_next = entry.next_generation;
-        const previous_started = entry.started_at;
+        const previous_install = entry.install_at;
         const previous_finished = entry.finished_at;
         const previous_deployed = entry.deployed_at;
         entry.next_generation += 1;
         entry.armed_generation = generation;
         entry.requested_revision = 0;
         entry.requested_plan_digest = digest;
-        entry.requested_at = requested_at;
+        entry.armed_at = armed_at;
         entry.requested_by = requested_by;
-        entry.started_at = 0;
+        entry.install_at = 0;
         entry.finished_at = 0;
-        return .{ .generation = generation, .changed = true, .previous_next_generation = previous_next, .previous_requested_revision = entry.consumed_revision, .previous_requested_plan_digest = entry.consumed_plan_digest, .previous_started_at = previous_started, .previous_finished_at = previous_finished, .previous_deployed_at = previous_deployed };
+        return .{ .generation = generation, .changed = true, .previous_next_generation = previous_next, .previous_requested_revision = entry.consumed_revision, .previous_requested_plan_digest = entry.consumed_plan_digest, .previous_install_at = previous_install, .previous_finished_at = previous_finished, .previous_deployed_at = previous_deployed };
     }
 
     /// 回滚一次 `consume` 操作。当原子状态写入失败时，将 consumed generation
@@ -349,9 +349,9 @@ pub const Store = struct {
             entry.next_generation = result.previous_next_generation;
             entry.requested_revision = result.previous_requested_revision;
             entry.requested_plan_digest = result.previous_requested_plan_digest;
-            entry.requested_at = result.previous_requested_at;
+            entry.armed_at = result.previous_armed_at;
             entry.requested_by = result.previous_requested_by;
-            entry.started_at = result.previous_started_at;
+            entry.install_at = result.previous_install_at;
             entry.finished_at = result.previous_finished_at;
             entry.deployed_at = result.previous_deployed_at;
             return;
@@ -442,8 +442,8 @@ pub const Store = struct {
             .applied_revision = entry.applied_revision,
             .requested_plan_digest = entry.requested_plan_digest,
             .applied_plan_digest = entry.applied_plan_digest,
-            .requested_at = entry.requested_at,
-            .started_at = entry.started_at,
+            .armed_at = entry.armed_at,
+            .install_at = entry.install_at,
             .finished_at = entry.finished_at,
             .deployed_generation = entry.deployed_generation,
             .deployed_at = entry.deployed_at,
@@ -532,8 +532,8 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
             entry.consumed_plan_digest = try parseDigest(disk_entry.consumed_plan_digest);
             entry.applied_plan_digest = try parseDigest(disk_entry.applied_plan_digest);
         }
-        entry.requested_at = disk_entry.requested_at;
-        entry.started_at = disk_entry.started_at;
+        entry.armed_at = disk_entry.armed_at;
+        entry.install_at = disk_entry.install_at;
         entry.finished_at = disk_entry.finished_at;
         entry.deployed_generation = if (disk_entry.deployed_generation == 0 and disk_entry.deployed_at != 0)
             disk_entry.terminal_generation orelse 0
@@ -657,8 +657,8 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
             .requested_plan_digest = if (digestSet(entry.requested_plan_digest)) &entry.requested_plan_digest else null,
             .consumed_plan_digest = if (digestSet(entry.consumed_plan_digest)) &entry.consumed_plan_digest else null,
             .applied_plan_digest = if (digestSet(entry.applied_plan_digest)) &entry.applied_plan_digest else null,
-            .requested_at = entry.requested_at,
-            .started_at = entry.started_at,
+            .armed_at = entry.armed_at,
+            .install_at = entry.install_at,
             .finished_at = entry.finished_at,
             .deployed_generation = entry.deployed_generation,
             .deployed_at = entry.deployed_at,
@@ -706,8 +706,8 @@ test "current generation prefers armed work over the previous consumed generatio
         .terminal_generation = 4,
         .requested_revision = 2,
         .applied_revision = 1,
-        .requested_at = 10,
-        .started_at = 0,
+        .armed_at = 10,
+        .install_at = 0,
         .finished_at = 0,
         .deployed_generation = 4,
         .deployed_at = 9,
@@ -774,14 +774,14 @@ test "retry resets current attempt timestamps but preserves last successful depl
     _ = (try store.consumeAt("node-01", 100)).?;
     _ = store.markTerminalAt("node-01", true, 200);
     const first = store.view("node-01").?;
-    try std.testing.expectEqual(@as(i64, 100), first.started_at);
+    try std.testing.expectEqual(@as(i64, 100), first.install_at);
     try std.testing.expectEqual(@as(i64, 200), first.finished_at);
     try std.testing.expectEqual(@as(u64, 1), first.deployed_generation);
     try std.testing.expectEqual(@as(i64, 200), first.deployed_at);
 
     _ = try store.rearm("node-01", test_digest_1, 300, .operator);
     const rearmed = store.view("node-01").?;
-    try std.testing.expectEqual(@as(i64, 0), rearmed.started_at);
+    try std.testing.expectEqual(@as(i64, 0), rearmed.install_at);
     try std.testing.expectEqual(@as(i64, 0), rearmed.finished_at);
     try std.testing.expectEqual(@as(u64, 1), rearmed.deployed_generation);
     try std.testing.expectEqual(@as(i64, 200), rearmed.deployed_at);
@@ -790,7 +790,7 @@ test "retry resets current attempt timestamps but preserves last successful depl
     _ = (try store.consumeAt("node-01", 400)).?;
     _ = store.markTerminalAt("node-01", true, 500);
     const retried = store.view("node-01").?;
-    try std.testing.expectEqual(@as(i64, 400), retried.started_at);
+    try std.testing.expectEqual(@as(i64, 400), retried.install_at);
     try std.testing.expectEqual(@as(i64, 500), retried.finished_at);
     try std.testing.expectEqual(@as(u64, 2), retried.deployed_generation);
     try std.testing.expectEqual(@as(i64, 500), retried.deployed_at);
@@ -804,7 +804,7 @@ test "rearm rollback restores per-generation deployment timestamps" {
     const result = try store.rearm("node-01", test_digest_2, 300, .operator);
     store.rollbackRearm("node-01", result);
     const restored = store.view("node-01").?;
-    try std.testing.expectEqual(@as(i64, 100), restored.started_at);
+    try std.testing.expectEqual(@as(i64, 100), restored.install_at);
     try std.testing.expectEqual(@as(i64, 200), restored.finished_at);
     try std.testing.expectEqual(@as(i64, 200), restored.deployed_at);
 }

@@ -249,7 +249,7 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     }
     if (system.ssh.enabled) {
         const root_login = @tagName(system.ssh.root_login);
-        const sshd = try std.fmt.allocPrint(allocator, "printf '%s\\n' 'PermitRootLogin {s}' 'PasswordAuthentication {s}' > /target/etc/ssh/sshd_config.d/60-nodeforge.conf", .{ root_login, if (system.ssh.password_authentication) "yes" else "no" });
+        const sshd = try std.fmt.allocPrint(allocator, "printf '%s\\n' 'PermitRootLogin {s}' 'PasswordAuthentication {s}' > /target/etc/ssh/sshd_config.d/00-nodeforge.conf", .{ root_login, if (system.ssh.password_authentication) "yes" else "no" });
         defer allocator.free(sshd);
         try w.writeAll("    - ");
         try render.yamlQuote(w, sshd);

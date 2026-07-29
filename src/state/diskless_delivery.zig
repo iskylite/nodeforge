@@ -80,9 +80,9 @@ pub const Session = struct {
     agent_plan_buf: [agent_plan_cap]u8 = [_]u8{0} ** agent_plan_cap,
     agent_plan_len: u32 = 0,
     agent_plan_digest: [digest_len]u8 = [_]u8{0} ** digest_len,
-    created_at: i64 = 0,
+    armed_at: i64 = 0,
     /// 节点首次进入 initrd 阶段的 UTC 时间；供 node list 的 INSTALL 列投影。
-    started_at: i64 = 0,
+    install_at: i64 = 0,
     /// 进入 running/failed/expired 终态的 UTC 时间；0 表示尚未结束。
     finished_at: i64 = 0,
     expires_at: i64 = 0,
@@ -208,7 +208,7 @@ pub const Store = struct {
         }
         const slot = replacement orelse self.findFree() orelse return error.DisklessSessionCapacity;
         const previous_session = self.sessions[slot];
-        var s: Session = .{ .active = true, .created_at = now_utc, .expires_at = now_utc + default_ttl_seconds };
+        var s: Session = .{ .active = true, .armed_at = now_utc, .expires_at = now_utc + default_ttl_seconds };
         try generateId(io, &s.session_id);
         s.node_len = @intCast(@min(node_id.len, name_cap));
         @memcpy(s.node_buf[0..s.node_len], node_id[0..s.node_len]);
@@ -355,8 +355,8 @@ pub const Store = struct {
         for (&self.sessions) |*s| {
             if (!s.active or !std.mem.eql(u8, s.nodeId(), node_id)) continue;
             // 历史 checkpoint 可能保留同节点的终态会话；列表和强制终止均选择
-            // created_at 最新的一次，不能由固定数组槽位顺序决定运行态。
-            if (latest == null or s.created_at > latest.?.created_at) latest = s;
+            // armed_at 最新的一次，不能由固定数组槽位顺序决定运行态。
+            if (latest == null or s.armed_at > latest.?.armed_at) latest = s;
         }
         return latest;
     }
@@ -407,17 +407,17 @@ pub const Store = struct {
         if (expected != session.phase) return error.DisklessExpectedPhaseMismatch;
         const previous_phase = session.phase;
         const previous_seq = session.event_token.event_seq;
-        const previous_started_at = session.started_at;
+        const previous_install_at = session.install_at;
         const previous_finished_at = session.finished_at;
         session.phase = try lifecycle.advance(session.phase, target);
         session.event_token.event_seq = std.math.add(u64, previous_seq, 1) catch return error.DisklessEventSequenceOverflow;
         // INSTALL 对无盘节点表示真正开始执行 initrd，而不是服务端 prepare。
-        if (target == .diskless_initrd_started and session.started_at == 0) session.started_at = now_utc;
+        if (target == .diskless_initrd_started and session.install_at == 0) session.install_at = now_utc;
         if (target.isTerminal() and session.finished_at == 0) session.finished_at = now_utc;
         self.persist(io) catch |err| {
             session.phase = previous_phase;
             session.event_token.event_seq = previous_seq;
-            session.started_at = previous_started_at;
+            session.install_at = previous_install_at;
             session.finished_at = previous_finished_at;
             return err;
         };
@@ -483,9 +483,9 @@ const PersistedSession = struct {
     kernel_release: []const u8,
     agent_plan_json: []const u8,
     agent_plan_digest: []const u8,
-    created_at: i64,
+    armed_at: i64,
     /// schema v1 旧记录没有生命周期时间，缺省为 0 可向后兼容恢复。
-    started_at: i64 = 0,
+    install_at: i64 = 0,
     finished_at: i64 = 0,
     expires_at: i64,
     phase: lifecycle.Phase,
@@ -529,8 +529,8 @@ fn persistedSession(session: *const Session) PersistedSession {
         .kernel_release = session.kernelRelease(),
         .agent_plan_json = session.agentPlanJson(),
         .agent_plan_digest = session.agentPlanDigest(),
-        .created_at = session.created_at,
-        .started_at = session.started_at,
+        .armed_at = session.armed_at,
+        .install_at = session.install_at,
         .finished_at = session.finished_at,
         .expires_at = session.expires_at,
         .phase = session.phase,
@@ -559,8 +559,8 @@ fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session 
         .tmpfs_percent = item.tmpfs_percent,
         .minimum_free_bytes = item.minimum_free_bytes,
         .safety_margin_bytes = item.safety_margin_bytes,
-        .created_at = item.created_at,
-        .started_at = item.started_at,
+        .armed_at = item.armed_at,
+        .install_at = item.install_at,
         .finished_at = item.finished_at,
         .expires_at = item.expires_at,
         .phase = item.phase,
@@ -772,7 +772,7 @@ test "diskless event CAS is ordered and exact retry is idempotent" {
         0,
         101,
     ));
-    try std.testing.expectEqual(@as(i64, 100), store.find(&id).?.started_at);
+    try std.testing.expectEqual(@as(i64, 100), store.find(&id).?.install_at);
     try std.testing.expectError(error.DisklessEventSequenceMismatch, store.advanceEvent(
         std.testing.io,
         &id,

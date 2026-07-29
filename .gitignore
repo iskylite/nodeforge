@@ -6,5 +6,6 @@ zig-pkg/
 .vscode
 .zcode
 .kiro
+.DS_Store
 config.json
 dist

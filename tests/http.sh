@@ -334,6 +334,13 @@ code=$(curl --silent -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/arti
 test "$code" = 404
 
 "$cli" assets provision-bundle remove base-site >"$tmp/bundle-remove"
+
+# An armed deployment returns a non-null deployment object. Keep the CLI DTO
+# aligned with the daemon's canonical `armed_at` field.
+"$cli" node retry contract-node --force >"$tmp/node-retry"
+"$cli" node show contract-node -o json >"$tmp/node-show-armed"
+jq -e '.ok and .result.deployment.install_intent == "retry-armed" and (.result.deployment.armed_at > 0)' "$tmp/node-show-armed" >/dev/null
+
 "$cli" catalog validate >"$tmp/validate"
 grep -Fq 'catalog valid' "$tmp/validate"
 

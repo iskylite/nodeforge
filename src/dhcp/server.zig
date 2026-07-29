@@ -227,10 +227,10 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
         break;
     };
     if (!always or !deployments.canAutoRearm(node_id)) return;
-    const requested_at = now();
+    const armed_at = now();
     const digest = persistencePlanDigest(p, node_id);
     if (!deployment_control.digestSet(digest)) return;
-    const rearm = deployments.rearm(node_id, digest, requested_at, .policy_always) catch |err| {
+    const rearm = deployments.rearm(node_id, digest, armed_at, .policy_always) catch |err| {
         observe_log.err("dhcp: automatic install generation unavailable: {t}", .{err});
         return;
     };
@@ -242,14 +242,14 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
     };
     var generation_text: [24]u8 = undefined;
     var revision_text: [24]u8 = undefined;
-    var requested_at_text: [24]u8 = undefined;
+    var armed_at_text: [24]u8 = undefined;
     const fields = [_]events.Field{
         .{ .key = "node_id", .value = node_id },
         .{ .key = "generation", .value = std.fmt.bufPrint(&generation_text, "{d}", .{rearm.generation}) catch "0" },
         // 历史事件字段名保持兼容；M4.9 后其值是联合 desired model revision，
         // 不是 config-only revision。新状态接口使用 requested/desired_revision。
         .{ .key = "config_revision", .value = std.fmt.bufPrint(&revision_text, "{d}", .{persistenceRevision(p)}) catch "0" },
-        .{ .key = "requested_at", .value = std.fmt.bufPrint(&requested_at_text, "{d}", .{requested_at}) catch "0" },
+        .{ .key = "armed_at", .value = std.fmt.bufPrint(&armed_at_text, "{d}", .{armed_at}) catch "0" },
         .{ .key = "requested_by", .value = "policy_always" },
     };
     p.writer.appendWithFields(io, p.allocator, p.events_path, "install.retry.requested", "always policy armed a new terminal-following generation", &fields) catch |err|
@@ -380,8 +380,8 @@ fn emitInstallNotArmed(io: std.Io, persistence: ?*const Persistence, node_id: []
         .terminal_generation = null,
         .requested_revision = 0,
         .applied_revision = 0,
-        .requested_at = 0,
-        .started_at = 0,
+        .armed_at = 0,
+        .install_at = 0,
         .finished_at = 0,
         .deployed_generation = 0,
         .deployed_at = 0,

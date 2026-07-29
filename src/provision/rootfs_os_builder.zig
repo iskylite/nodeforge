@@ -13,7 +13,9 @@ const std = @import("std");
 const model = @import("../model.zig");
 
 /// 在 staging 目录内用发行版原生 install-root 工具构建 OS 层。
-/// `repository_urls` 为 nodeforged 受管源 URL（IP-based，构建主机可达）。
+/// `repository_urls` 为 nodeforged 本机受管源的 `file://` URL。构建发生在
+/// management handler 内，禁止回连同一 HTTP listener；目标系统获得的仓库
+/// 仍由 AgentPlan/安装计划绑定为 nodeforged 的 HTTP URL。
 /// `version` 为 install source 版本（如 "9.7"）；dnf 取主版本作 `--releasever`。
 ///
 /// v1：安装最小可 chroot 基线（bash/coreutils/tar + 包管理器），足以叠加

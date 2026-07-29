@@ -74,11 +74,12 @@ rootfs = OS 层 + rootfs-build phase 业务内容 + Profile target-system 骨架
   明确声明时使用），在与目标
   distro/version/arch/`kernel_release` 一致的环境中运行。builder 消费与 Profile 查询相同
   的 environment/group/task/package selection，按 local-only 移除公网 mirror/metalink/
-  GeoIP/vendor NTP，只引用本地 repository。OS 层可按 software capability revision 内部
+  GeoIP/vendor NTP，只引用 daemon 本机 `repos_dir` 的受管 `file://` repository。该
+  构建期地址不写入目标 rootfs；目标系统仍使用 AgentPlan 固定的受管 HTTP URL。OS 层可按 software capability revision 内部
   缓存复用，但对设计透明、不作为独立 Resource。
 
   多 variant ISO（如 Rocky 10.2 DVD 的 AppStream + BaseOS）的 install source 引用多个
-  repository，`buildRepositoryClosure` 自动合并所有 variant 的 repository URL，dnf 在
+  repository，`buildRepositoryClosure` 自动合并所有 variant 的本机 `file://` URL，dnf 在
   `--installroot` 时同时消费 AppStream 和 BaseOS 的包元数据。
 - **rootfs-build phase**：在 OS 层之上向只读 lower 追加业务内容（managed-file、archive、
   受控 script、经本地 repo 解析的 package）。由服务端 rootfs builder 执行（无节点 agent），
