@@ -13,12 +13,12 @@
 
 | 版本 | 主目标 | schema/DTO | 当前状态 |
 |---|---|---|---|
-| v0.2.0 | Rocky/RHEL UEFI diskless + first-boot | catalog v4 / BC v3 / AP v1 | 主链已实现；可运营补丁继续回合 |
+| v0.2.0 | Rocky/RHEL UEFI diskless + first-boot | catalog v4 / BC v3 / AP v1 | 已实现；安全审计通过（2026-07-29） |
 | v0.2.1 | Ubuntu casper diskless 产品化 | 保持 catalog v4 / BC v3 / AP v1 | 设计冻结，生产 builder 未完成 |
 | v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 持久化/rootfs operation/memory 已实现，其余进行中 |
 | v0.3 | x86 BIOS/PXELINUX install + install-post canonical 扩展 | catalog v5；BC/AP 不因 BIOS 无盘升级 | 设计冻结，实现未开始 |
-| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v6 / BC v4 / AP v2 | 草案 |
-| v0.5 | `ram_rootfs` materialization | catalog v7 / BC v5 / AP v2 | 草案 |
+| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v6 / BC v4 / AP v2 | 设计冻结，实现未开始 |
+| v0.5 | `ram_rootfs` materialization | catalog v7 / BC v5 / AP v2 | 设计冻结，实现未开始 |
 
 BC = BootConfig，AP = AgentPlan。catalog、节点 DTO、install callback、operation 和
 各 state file 是独立 schema namespace，绝不能因为版本号相同而共用升级判断。

@@ -1,6 +1,6 @@
 # NodeForge v0.4 设计：延后增强项
 
-状态：设计草案，实现未开始。本文定义 v0.4 范围，与 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §2 版本表及
+状态：设计冻结，实现未开始。本文定义 v0.4 范围，与 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §2 版本表及
 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md) 的版本门禁一致。
 v0.4 在 v0.3 完成后启动，收纳 VMware 难以验证或非主流程的增强项。**reconciliation/远程控制为永久非目标**
 （全版本，见 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §7），v0.4 不实现任何远程主动控制。

@@ -1,6 +1,6 @@
 # NodeForge v0.5 设计：可切换 rootfs 形态
 
-状态：设计草案，实现未开始。本文定义 v0.5 的 rootfs 形态切换，只能在 v0.4 完成后进入；
+状态：设计冻结，实现未开始。本文定义 v0.5 的 rootfs 形态切换，只能在 v0.4 完成后进入；
 版本门禁见 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md)。
 v0.2 已固定 `squashfs_overlay` 为唯一形态（见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)）；
 v0.5 引入 `ram_rootfs` 全内存模式与 `diskless.overlay.mode` 字段。与
