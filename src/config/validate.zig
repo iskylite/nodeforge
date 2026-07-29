@@ -62,6 +62,7 @@ pub const ValidationError = error{
     MissingProfile,
     InvalidNodeIpv4,
     InvalidNodeMac,
+    InvalidNodeHostname,
     DuplicateNodeId,
     DuplicateNodeMac,
     InvalidUnknownNodePolicy,
@@ -134,6 +135,9 @@ pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void 
     for (catalog.nodes, 0..) |node, index| {
         if (!validNodeId(node.id)) return error.InvalidLogicalId;
         if (!validMac(node.mac)) return error.InvalidNodeMac;
+        // 与 validateNodes 同一约束，但在 catalog 形状校验阶段即拒绝，
+        // 覆盖绕过 CLI 直接改写 catalog 文件的路径。
+        if (node.hostname) |name| if (!validHostname(name)) return error.InvalidNodeHostname;
         for (catalog.nodes[index + 1 ..]) |other| {
             if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
             if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
@@ -342,6 +346,54 @@ test "M4.3 logical ids are canonical path-safe lowercase ASCII" {
     try std.testing.expect(!validLogicalId("Rocky-9"));
     try std.testing.expect(!validLogicalId("../rocky"));
     try std.testing.expect(!validLogicalId("岩石-9"));
+}
+
+// 回归：Node.hostname 直接进入安装器主机名字段，必须拒绝控制字符。
+//
+// 未修复时 `h\nrootpw --plaintext pwned` 会在 Kickstart 渲染出独立的
+// `rootpw` 行，Anaconda 以攻击者口令设置 root，构成目标系统完全接管。
+test "node hostname rejects installer directive injection" {
+    try std.testing.expect(validHostname("r97n1"));
+    try std.testing.expect(validHostname("node-01.lab.example"));
+    // 换行注入安装器指令。
+    try std.testing.expect(!validHostname("h\nrootpw --plaintext pwned"));
+    // 其余控制字符与分隔符同样不得通过。
+    try std.testing.expect(!validHostname("h\r\nlang zh_CN"));
+    try std.testing.expect(!validHostname("h name"));
+    try std.testing.expect(!validHostname("h'\";id"));
+    try std.testing.expect(!validHostname("h%end"));
+    try std.testing.expect(!validHostname(""));
+
+    // 端到端：带注入 hostname 的 catalog 必须在形状校验阶段即被拒绝。
+    const injected: model.Catalog = .{
+        .nodes = &.{.{
+            .id = "node-a",
+            .mac = "02:aa:bb:cc:dd:ee",
+            .arch = .aarch64,
+            .profile = "install",
+            .hostname = "h\nrootpw --plaintext pwned",
+        }},
+    };
+    try std.testing.expectError(error.InvalidNodeHostname, validateCatalogShape(&injected));
+}
+
+// 回归：locale 的修饰符形式不得成为任意字符串通道。
+//
+// 未修复时 `validLocale` 对含 `@` 的取值只检查「非空且含 @」，因此
+// `en_US.UTF-8@x\n%post --nochroot\n...\n%end` 通过校验，并经 `lang {s}`
+// 在 Kickstart 中注入独立 `%post` 段，导致 Anaconda 执行任意命令。
+test "locale modifier form cannot smuggle control characters" {
+    // 合法形式必须继续接受。
+    try std.testing.expect(validLocale("C"));
+    try std.testing.expect(validLocale("C.UTF-8"));
+    try std.testing.expect(validLocale("en_US.UTF-8"));
+    try std.testing.expect(validLocale("sr_RS@latin"));
+    try std.testing.expect(validLocale("de_DE.UTF-8@euro"));
+    // 注入形式必须拒绝。
+    try std.testing.expect(!validLocale("en_US.UTF-8@x\n%post --nochroot\necho PWNED\n%end"));
+    try std.testing.expect(!validLocale("@"));
+    try std.testing.expect(!validLocale("a@b@c"));
+    try std.testing.expect(!validLocale("en_US@lat in"));
 }
 
 test "node id must be a canonical logical id" {
@@ -646,6 +698,9 @@ fn validateNodes(config: *const model.AppConfig, catalog: *const model.Catalog) 
     for (config.nodes, 0..) |node, i| {
         if (!validNodeId(node.id)) return error.InvalidLogicalId;
         if (!validMac(node.mac)) return error.InvalidNodeMac;
+        // hostname 会直接进入 Kickstart/Autoinstall 的主机名字段；必须限制在
+        // RFC 1123 字母表内，否则换行可注入独立安装器指令（见 validHostname）。
+        if (node.hostname) |name| if (!validHostname(name)) return error.InvalidNodeHostname;
         const profile_name = node.profile orelse {
             if (node.deploy) return error.MissingProfile;
             continue;
@@ -837,6 +892,20 @@ fn validNetworkName(value: []const u8) bool {
     return true;
 }
 
+/// 校验目标系统主机名（RFC 1123 允许的字母表 + 长度上界）。
+///
+/// `Node.hostname` 会经 `render.hostname()` 直接写入 Kickstart 的
+/// `network --hostname={s}` 与 Ubuntu Autoinstall 的 identity/hostname 字段。
+/// 历史实现对该字段**没有任何校验**，因此
+/// `h\nrootpw --plaintext pwned` 会在 Kickstart 中渲染出独立的 `rootpw` 行，
+/// 使 Anaconda 以攻击者指定的口令设置 root——目标系统被完全接管。
+///
+/// 这里复用 `validNetworkName` 的字母表（字母数字、`-`、`.`），它天然排除
+/// 换行、空格、引号和 `%`，因此渲染期无需再逐点转义。
+fn validHostname(value: []const u8) bool {
+    return validNetworkName(value);
+}
+
 fn validIdentifier(value: []const u8) bool {
     if (value.len == 0 or value.len > 128) return false;
     for (value) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return false;
@@ -861,8 +930,21 @@ fn validMountPath(value: []const u8) bool {
     for (value) |c| if (!(std.ascii.isAlphanumeric(c) or c == '/' or c == '_' or c == '-' or c == '.')) return false;
     return true;
 }
+/// 校验 locale 标识符。
+///
+/// 除固定的 `C`/`C.UTF-8` 与常规 identifier 外，还需接受带修饰符的形式
+/// （如 `sr_RS@latin`、`de_DE.UTF-8@euro`）。历史实现对含 `@` 的取值只检查
+/// 「非空且含 `@`」，未约束其余字符，因此
+/// `en_US.UTF-8@x\n%post --nochroot\n...\n%end` 可通过校验，并在 Kickstart
+/// 渲染时以 `lang {s}` 注入独立的 `%post` 段，导致 Anaconda 执行任意命令。
+/// 现改为对 `@` 前后两段分别施加 identifier 字母表，控制字符无法进入。
 fn validLocale(value: []const u8) bool {
-    return std.mem.eql(u8, value, "C") or std.mem.eql(u8, value, "C.UTF-8") or validIdentifier(value) or (value.len != 0 and std.mem.indexOfScalar(u8, value, '@') != null);
+    if (std.mem.eql(u8, value, "C") or std.mem.eql(u8, value, "C.UTF-8")) return true;
+    if (validIdentifier(value)) return true;
+    const at = std.mem.indexOfScalar(u8, value, '@') orelse return false;
+    // 只允许单个 `@`，且 base 与 modifier 两段都必须是合法 identifier。
+    if (std.mem.indexOfScalarPos(u8, value, at + 1, '@') != null) return false;
+    return validIdentifier(value[0..at]) and validIdentifier(value[at + 1 ..]);
 }
 fn validTimezone(value: []const u8) bool {
     if (std.mem.eql(u8, value, "UTC")) return true;
