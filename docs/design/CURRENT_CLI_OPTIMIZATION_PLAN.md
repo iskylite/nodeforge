@@ -976,48 +976,52 @@ exit/error mapping
 
 ## 16. 实施顺序
 
+本节保留最初的依赖排序，但实施状态以
+[`V0_2_POST_RELEASE_BACKLOG.md`](V0_2_POST_RELEASE_BACKLOG.md) 为准。已完成项不得
+因下列原始列表仍存在而重新计为残留；P2 也不构成 v0.2.2 发布阻断。
+
 ### P0：修正关键数据与原子边界
 
 1. Profile provenance/revision/time。
 2. Profile SSH identity 持久化，移除 build-time 随机 identity。
 3. rootfs digest 纳入 identity revision/fingerprint。
-4. daemon 原子 `profile clone`。
-5. daemon 原子、按 kind 分发的 `node retry`。
-6. content asset daemon-owned publication。
+4. daemon 原子 `profile clone`。（基础 desired clone 已完成；identity/provenance 待补）
+5. daemon 原子、按 kind 分发的 `node retry`。（已完成）
+6. content asset daemon-owned publication。（已完成）
 
 ### P0：完成主流程
 
-1. `profile clone` CLI。
+1. `profile clone` CLI。（基础入口已完成）
 2. clone `--new-ssh-keys`。
 3. clone `--build [--detach]`。
-4. 抽取严格只读 boot projection/preview compiler。
-5. `node boot preview` install/diskless。
-6. 从普通 help/workflow 移除 boot-prepare。
+4. 抽取严格只读 boot projection/preview compiler。（已完成）
+5. `node boot preview` install/diskless。（已完成）
+6. 从普通 help/workflow 移除 boot-prepare。（已完成）
 
 ### P1：长任务与输出
 
-1. rootfs/initrd/ISO import 使用 durable operation。当前 rootfs 已完成 queued/running/
-   terminal worker 与 restart→interrupted；initrd 和 ISO handler 异步化仍待完成。
-2. 默认 follow、可选 detach。当前 rootfs CLI 已默认 follow 到 terminal，`--detach`
-   与统一三类 builder 语义仍待完成。
-3. operation progress event。
+1. rootfs/initrd/ISO import 使用 durable operation。rootfs/initrd 已完成
+   queued/running/terminal worker、restart→interrupted 和原子发布；ISO 已有 durable
+   operation 记录，但 handler 仍同步 join，真后台执行列入发布后收口。
+2. 默认 follow、可选 detach。rootfs/initrd 已完成；ISO 随后台执行收口。
+3. operation progress event。（`V02-D09`，未排期可观测性候选）
 4. 统一错误/exit mapping。
-5. 共用 checks schema。
+5. 共用 checks schema。（`V02-D10`，仅在后续 DTO 升级时重新评估）
 
 ### P1：CLI 与文档重基线
 
-1. 建立 `docs/cli/REFERENCE.md`。
+1. 建立 `docs/cli/REFERENCE.md`。（已完成）
 2. 建立 primary workflow 和 troubleshooting。
 3. 给现有命令标记 visibility/stability。
 4. 更新全部设计分册和代码注释。
-5. command tree snapshot 与文档一致性测试。
+5. command tree/help 契约与文档一致性测试。（已完成当前公开主流程）
 
 ### P2：进一步体验优化
 
-1. 声明式 CommandSpec 和文档生成。
+1. 声明式 CommandSpec 和文档生成。（`V02-D08`，未排期且不阻塞 v0.2.2/v0.2.3）
 2. 更完整 operation list/follow 过滤。
 3. boot preview section/filter 优化。
-4. 若确有需求，再设计 Profile history 与 `--from-revision`。
+4. 若确有需求，再设计 Profile history 与 `--from-revision`（`V02-D12`）。
 
 ---
 

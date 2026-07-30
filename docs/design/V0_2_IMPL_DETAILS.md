@@ -310,9 +310,11 @@ manifest、event 或日志都不得包含 private key bytes。
   inventory 供后续 readiness 预检，当前启动仍必须以本机 `/proc/meminfo` 的
   `MemAvailable` 执行硬闸；facts 上报失败只记录 warning，不能把成功 POST 误判为容量通过。
 - AgentPlan DTO `schema_version` v1（独立命名空间）；v0.4 target topology 升 v2，v0.5 保持 v2。
-- v0.3 `firmware.mode`/`install-post` schema v5；v0.4 schema v6；v0.5 rootfs 形态 schema v7，见
+- v0.2.3 Profile identity/provenance 使用 catalog schema v5；v0.3
+  `firmware.mode`/`install-post` schema v6；v0.4 schema v7；v0.5 rootfs 形态 schema v8，见
   [`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
-- v0.2 不提供 `catalog migrate` CLI 命令；schema v4 是唯一标准。后续版本（v0.3-v0.5）新增 schema 变更时，rollback 只指 migration transaction finalize 前，按 durable migration journal
+- v0.2.2 不提供 `catalog migrate` CLI 命令；schema v4 是其唯一标准。后续版本
+  （v0.2.3-v0.5）新增 schema 变更时，rollback 只指 migration transaction finalize 前，按 durable migration journal
   恢复 pre-migration snapshot；它不承诺任意已写入新特性后的版本 downgrade。
 - schema downgrade 必须先做 representability preflight。任一资源包含目标旧 schema 无法表达的 kind/field/item 时返回
   `migration.non_representable`，JSON 至少列出 `resource_type/resource_id/path/reason/target_schema`；不得通过 nullable、
@@ -390,7 +392,7 @@ diskless/install 共用一个 tagged lifecycle 投影；install 终态为 `insta
 | 越权 Range / 跨 Node rootfs 访问 | 拒绝 + failed |
 | facts 成功但实际 `MemAvailable` 不足 | initrd 输出完整预算与 deficit，终止于 `memory.capacity_gate` |
 | facts 上传失败但本地容量足够 | console warning；本地容量闸继续执行，不因 inventory 写入失败中止 |
-| API 建连/空闲，rootfs 或 payload 慢速持续传输 | 建连暂用内核 TCP 有界超时（Zig 0.16 connect deadline 会 panic）；API 空闲 30 秒；制品空闲 120 秒；持续有进展不受总时长限制 |
+| API 建连/空闲，rootfs 或 payload 慢速持续传输 | 建连暂用内核 TCP 有界超时（Zig 0.16 connect deadline 会 panic，见 `V02-D07`）；API 空闲 30 秒；制品空闲 120 秒；持续有进展不受总时长限制 |
 | initrd/agent 任一关键步骤失败 | console 必须包含稳定 stage 和 error；initrd 还包含 node/session |
 | lifecycle 已到 `diskless.running`，但控制台停在最后一行启动日志 | 分别检查 systemd/SSH/getty；Ubuntu 删除 casper 的 `/lib/systemd/system/getty@tty1.service -> /dev/null` 和 Subiquity drop-in，恢复 tty1；冷启动必须自然出现 login prompt |
 | 过期 token / feature mismatch / hash mismatch | failed + quarantine 计数 |

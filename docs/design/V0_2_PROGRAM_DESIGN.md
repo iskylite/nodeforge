@@ -228,7 +228,7 @@ install Profile 的 BootSession 在 `boot_config_fetched` 完成交付后终止�
 ## 7. v0.3/v0.4/v0.5 的程序边界
 
 - v0.3（PXELINUX/BIOS install）：增加 `install-post` phase，由安装器（Kickstart `%post`/
-  Autoinstall `late-commands`）执行，无 nodeforge-agent；`firmware.mode` schema v5。
+  Autoinstall `late-commands`）执行，无 nodeforge-agent；`firmware.mode` catalog v6。
 - v0.4（延后增强项）：install 侧 first-boot agent（install generation + 磁盘 journal，一次性）；临时 PXE rootfs 构建节点
   operation 驱动节点构建 rootfs（不远程重启、不向运行中 agent 下发任务）；多 NIC/VLAN/bonding 令 BootConfig
   DTO 升 v3；以及容量压测。reconciliation/通用远程控制仍为永久非目标。

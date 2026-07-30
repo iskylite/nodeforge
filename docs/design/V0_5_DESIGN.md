@@ -126,7 +126,7 @@ v0.4 升级前已创建的 active/recoverable BootConfig v4 session 继续消费
   缺失 manifest 的旧 artifact 必须重新 deep validate/补可信 manifest，不能按压缩大小猜测。
 - `diskless.overlay.tmpfs_percent` 在 `squashfs_overlay` 下继续控制 upper 预算；在 `ram_rootfs` 下控制展开后
   writable root 可占 `MemAvailable` 的最大比例。这样既有字段不被静默忽略，范围仍为 10-80。
-- schema 版本：v0.5 rootfs 形态字段对应 catalog schema v7（v0.4 使用 v6）；BootConfig DTO 从 v4 升 v5，
+- schema 版本：v0.5 rootfs 形态字段对应 catalog schema v8（v0.4 使用 v7）；BootConfig DTO 从 v4 升 v5，
   与 catalog schema、`firmware.mode` v5 分属不同命名空间。
 - `diskless.overlay.mode` 进入 `desired_plan_digest` 和 `delivery_digest`，但不进入 `rootfs_input_digest`：两种 mode
   消费同一 squashfs cache artifact。mode 改变需要重新 readiness/enable，不需要重建 rootfs。
@@ -152,7 +152,7 @@ nodeforge profile rootfs status <profile>   # 显示所选交付形态/digest/un
   `required_min_memory_bytes`。
 - `boot preview` 的 capsule/kernel/initrd 路径不变，但 JSON 必须显示 `bootconfig_schema=5`、`overlay_mode`、
   `required_features` 和内存预算摘要，不能声称输出完全不受影响。
-- v0.4 -> v0.5 迁移：schema v6 到 v7 的 plan/apply 将现有 diskless Profile 默认补
+- v0.4 -> v0.5 迁移：schema v7 到 v8 的 plan/apply 将现有 diskless Profile 默认补
   `diskless.overlay.mode=squashfs_overlay`；旧配置无 mode 字段等价于 `squashfs_overlay`，迁移无副作用。
   transaction finalize 前 journal rollback 恢复完整 v6。finalize 后 downgrade 到 v6 必须做 representability preflight：
   仅所有 Profile 都为 `squashfs_overlay` 且不存在其他 v7-only state 时允许；任一 `ram_rootfs` 返回
@@ -174,6 +174,6 @@ nodeforge profile rootfs status <profile>   # 显示所选交付形态/digest/un
   `MemAvailable` 不重复扣 kernel/initrd、ceil-div/加乘溢出、inventory unknown、initrd 实测不足和 safety margin 负向测试。
 - 两种形态的 BootSession canonical 状态机、事件、脱敏、quarantine 语义一致。
 - `ram_rootfs` 在 handoff 前删除压缩 `.part` 并证明无 loop/fd 引用；删除失败不能进入 steady-state budget。
-- v6 -> v7 正向迁移、finalize 前 rollback、全 `squashfs_overlay` 可表示 downgrade、含 `ram_rootfs` 不可表示 downgrade
+- v7 -> v8 正向迁移、finalize 前 rollback、全 `squashfs_overlay` 可表示 downgrade、含 `ram_rootfs` 不可表示 downgrade
   和 active v4 session 跨升级均有 fixture。
 - v0.5 不引入 NFS root/iPXE/持久化 overlay/跨重启 rootfs partial（永久非目标不变）。

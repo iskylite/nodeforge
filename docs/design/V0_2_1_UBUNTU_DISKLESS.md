@@ -25,8 +25,8 @@
 > 到达 `diskless.running`。后续又以同一候选完成 Rocky 9.7、Rocky 10.2 与
 > Ubuntu 22.04.5 冷启动回归，并修复/复验 Ubuntu 标准 tty1 登录控制台。
 > v0.2.2 的现行完成闸只要求当前可用的 aarch64 VMware 矩阵。QEMU 为可选补充；
-> x86_64 VMware 归入 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md)，
-> 不阻塞版本完成。
+> x86_64 VMware 归入 `V02-D01` / `ENV-X86-VMWARE`，详见
+> [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md)，不阻塞版本完成。
 
 ## 0. 版本定位
 
@@ -146,7 +146,8 @@ casper initrd 已包含引导所需的一切：
 - **mkinitramfs 缺少 modprobe**：casper initrd 有，mkinitramfs 没有，需额外注入
 
 **v0.2.1 采用 casper initrd 复用方案**（方案 A），理由见 §9.5 结论。
-从 rootfs 构建 initrd 的路径保留为未来优化选项（方案 B）。
+从 rootfs 构建 initrd 的方案 B 仅保留为历史实验记录；现行裁决 `V02-D03`
+明确不实施，不是未来优化待办。
 
 ### 2.4 为什么不用 debootstrap/apt
 
@@ -439,11 +440,13 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
    成功构建 Ubuntu rootfs（casper squashfs 叠加 + rootfs-build phase）。
 3. rootfs-build phase 的 package action 在 chroot 上下文从受管 APT 源安装 userspace 包成功。
 4. initrd 构建：ISO `/casper/initrd` 前缀逐字节不变，追加的 NodeForge cpio overlay 可复现且 manifest 可审计。
-5. QEMU smoke 验证：**Ubuntu kernel** (`/casper/vmlinuz`) + **casper initrd**（注入 nodeforge-initrd）
-   + Ubuntu rootfs（squashfs 叠加）→ switch_root → systemd → first-boot → `diskless.running`。
+5. 当前可用 aarch64 VMware 验证：**Ubuntu kernel** (`/casper/vmlinuz`) +
+   **casper initrd**（注入 nodeforge-initrd）+ Ubuntu rootfs（squashfs 叠加）→
+   switch_root → systemd → first-boot → `diskless.running`。QEMU 只作可选补充。
 6. CLI 风险提示在适用场景下正确输出（非 Ubuntu 宿主机构建 rootfs-build、initrd 来源不一致）。
 7. 内核相关包的风险在文档和 CLI 中明确声明（风险提示，不锁死）。
-8. 同一 release candidate 上 Rocky + Ubuntu 均通过 QEMU 和 VMware 完整产品 CLI PXE 闭环。
+8. 同一 release candidate 上 Rocky + Ubuntu 均通过当前可用 aarch64 VMware
+   完整产品 CLI PXE 闭环；x86_64 VMware 按不可验证清单管理。
 9. apt builder 宿主零写入、异常清理、源固定与重试回归通过。
 10. roadmap Gate 0 的旧状态迁移 fixture 在发布前置门禁通过；`zig build test` 全量通过。
 
@@ -453,7 +456,8 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
   VMware 产品闭环属于 v0.2.1 已有证据。QEMU 不作为重复完成闸，x86_64 VMware
   按不可验证清单管理。
 - apt `--installroot` 跨根安装（替代 casper squashfs 方案）→ 未来版本评估。
-- 从 rootfs 构建 initrd（chroot + apt install linux-image + mkinitramfs）→ 已验证可行但复杂度高（见 §9），保留为未来优化选项。
+- 从 rootfs 构建 initrd（chroot + apt install linux-image + mkinitramfs）→
+  仅保留历史实验记录，不进入当前产品路线图；除非未来出现独立需求并重新立项。
 - 临时 PXE rootfs 构建节点（在真实 Ubuntu 内核态构建）→ v0.4。
 
 ## 7. 版本规划变更
@@ -669,7 +673,8 @@ casper 还会把 `getty@tty1.service` vendor-mask 到 `/dev/null`，并用 drop-
 自行输出登录提示。
 
 验证脚本（`v0_2_1_mkinitramfs_smoke_v2.sh`）中未使用此机制，直接使用了 rootfs 自带的公网源
-（`ports.ubuntu.com`），这是验证脚本的缺陷。正式实现方案 B 时必须使用 nodeforged 受管源。
+（`ports.ubuntu.com`），这是验证脚本的历史缺陷。只有未来通过新设计推翻 `V02-D03`
+并重新立项时，才需要使用 nodeforged 受管源；本文不构成实现承诺。
 
 **注意**：即使使用受管源解决版本漂移，方案 B 的其他问题（§9.3.2 rootfs 膨胀、§9.3.3 modprobe 缺失）
 依然存在，不影响方案 A 作为 v0.2.1 默认方案的结论。
@@ -749,12 +754,13 @@ mkinitramfs 默认输出 zstd 压缩的 cpio 镜像（与 casper initrd 格式�
 4. **无 rootfs 膨胀风险**：不需要 apt install，不需要清理
 5. **更广泛的宿主机兼容性**：仅需 zstd + cpio
 
-方案 B（mkinitramfs）在以下场景有价值：
+方案 B（mkinitramfs）曾被认为在以下场景有实验价值：
 - 需要使用比 ISO 更新的内核版本（安全补丁等）
 - ISO 不可用但 rootfs 可用（如从已有 diskless 节点复制）
 - 未来 v0.3+ 如果转向 debootstrap 方案
 
-**方案 B 的额外复杂度（apt 依赖 + 后清理 + 版本漂移风险）使其不适合作为 v0.2.1 的默认方案。**
+**现行裁决 `V02-D03`：方案 B 的额外复杂度（apt 依赖 + 后清理 + 版本漂移风险）
+使其不进入生产路线，不实施。**
 
 ### 9.6 验证脚本
 
@@ -802,7 +808,7 @@ v0.2 交付中，`nodeforge-initrd` 与 `nodeforge-agent` 共享**原生 Zig HTT
 | 功能 | 实现 | 说明 |
 |---|---|---|
 | TCP 连接 | `std.Io.net.IpAddress.parseIp4` + `connect` | 仅支持 IPv4 地址（PXE 提供的 IP） |
-| 超时 | 内核 TCP connect + socket `SO_RCVTIMEO/SO_SNDTIMEO` | Zig 0.16 暂不设置会 panic 的 connect deadline；API 30 秒空闲；制品 120 秒空闲；无总下载时长 |
+| 超时 | 内核 TCP connect + socket `SO_RCVTIMEO/SO_SNDTIMEO` | Zig 0.16 暂不设置会 panic 的 connect deadline（`V02-D07`）；API 30 秒空闲；制品 120 秒空闲；无总下载时长 |
 | GET 请求 | 构造 `GET {path} HTTP/1.1` + 发送 + 读取 body | body 可读取到内存或写入文件 |
 | HEAD 请求 | 构造 `HEAD {path} HTTP/1.1` + 发送 + 读取 headers | 返回原始响应头文本 |
 | Range 请求 | 构造 `Range: bytes=N-M` + `If-Range: ETag` + 发送 + 读取 | 响应体写入临时文件 |

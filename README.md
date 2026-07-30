@@ -82,6 +82,8 @@ NodeForge/
   durable builder operation、CLI 收敛和当前环境验证矩阵。
 - [当前环境不可验证项](docs/design/LOCAL_VALIDATION_DEFERRED.md)：集中记录
   x86_64 VMware 等当前无法执行的目标环境验证；QEMU 只作可选补充。
+- [v0.2 暂不做与发布后收口索引](docs/design/V0_2_POST_RELEASE_BACKLOG.md)：用稳定
+  `V02-Dxx` 标识区分环境延后、拒绝路径、后续版本和永久非目标，避免被再次误报为残留。
 - [v0.2.1+ 路线图](docs/design/V0_2_1_PLUS_ROADMAP.md)：v0.2.1-v0.5 的依赖、
   schema/DTO 演进与完成闸。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
@@ -150,9 +152,10 @@ Ubuntu 22.04.5 aarch64 VMware 冷启动回归。
 
 后续按以下边界推进：
 
-- **v0.2.2**：持久化升级兼容、durable builder operation、CLI 收敛、
-  当前可用 aarch64 VMware 固定矩阵与故障恢复验证；x86_64 VMware 单独记录为
-  当前环境不可验证项，QEMU 为可选补充；
+- **v0.2.2**：持久化升级兼容、durable builder operation、CLI 收敛与当前可用
+  aarch64 VMware固定矩阵已完成；
+- **v0.2.3**：Profile稳定SSH identity/provenance、完整clone、capability restart
+  语义、ISO后台operation和CLI exit mapping收口；
 - **v0.3+**：BIOS PXELINUX、多 NIC/topology、后续 rootfs 形态。
 
 IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是项目永久非目标。

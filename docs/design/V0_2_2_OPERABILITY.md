@@ -83,7 +83,11 @@ queued -> running -> succeeded | failed
 - kind-aware `node retry`：服务端原子决定 deploy/rearm/cancel/supersede；
 - `node postprocess show`；
 - `boot-prepare` 降为 advanced/internal transition；
-- CommandSpec 生成 help snapshot 与 `docs/cli/REFERENCE.md`。
+- 正式 `docs/cli/REFERENCE.md`，并以实际 command tree/help 契约测试防止漂移。
+
+完整声明式 CommandSpec 与自动文档生成按 `V02-D08` 列为未排期 CLI P2 候选，
+不进入 v0.2.2 产品完成闸。v0.2 发布后的真实差异与明确移出项统一见
+[`V0_2_POST_RELEASE_BACKLOG.md`](V0_2_POST_RELEASE_BACKLOG.md)。
 
 preview 与 prepare 必须使用不同 handler/type。preview 不能写 state、创建 operation、
 消耗 generation 或签发 credential。
@@ -148,8 +152,9 @@ BootConfig v3 `facts_url` 上报 MemTotal，安装器 facts 同样携带该字�
 每次发布记录候选 commit、四产物 digest、测试脚本版本、虚拟机配置、事件链和
 失败注入结果。单独手工 smoke 不能替代矩阵。
 
-x86_64 VMware 当前无法在本地环境执行，不进入 v0.2.2 完成闸；QEMU 为可选诊断和
-故障注入工具，VMware 产品链已经通过时不要求重复执行 QEMU。不可验证项和解除条件统一见
+x86_64 VMware（`V02-D01` / `ENV-X86-VMWARE`）当前无法在本地环境执行，不进入
+v0.2.2 完成闸；QEMU（`V02-D02`）为可选诊断和故障注入工具，VMware 产品链已经
+通过时不要求重复执行。不可验证项和解除条件统一见
 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md)。
 
 ## 8. 完成标准

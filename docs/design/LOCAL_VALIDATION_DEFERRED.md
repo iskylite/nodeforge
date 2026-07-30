@@ -18,18 +18,18 @@
 
 ## 2. 当前不可验证项
 
-| 项目 | 当前限制 | 当前可保留证据 | 解除条件 |
-|---|---|---|---|
-| x86_64 VMware UEFI install/diskless | 当前 Apple Silicon + VMware Fusion 环境不能创建或运行 x86_64 guest | x86_64 交叉编译、协议/架构 fixture、静态审计 | 在 x86_64 VMware/物理机环境完成真实 PXE 产品链 |
-| x86_64 VMware Rocky/Ubuntu 矩阵 | 同上，无法建立目标 guest | catalog/adapter/build 侧测试 | Rocky/RHEL family 与 Ubuntu 至少各完成一次目标环境 E2E |
-| 依赖目标专用硬件的后续能力 | 本地无对应硬件或虚拟设备 | 模型、DTO、负向测试 | 在具备对应设备的环境建立专项验证记录 |
+| ID | 对应范围 ID | 项目 | 当前限制 | 当前可保留证据 | 解除条件 |
+|---|---|---|---|---|---|
+| `ENV-X86-VMWARE` | `V02-D01` | x86_64 VMware UEFI install/diskless 与 Rocky/Ubuntu 矩阵 | 当前 Apple Silicon + VMware Fusion 环境不能创建或运行 x86_64 guest | x86_64 交叉编译、协议/架构 fixture、catalog/adapter/build 测试和静态审计 | 在 x86_64 VMware/物理机环境完成真实 PXE 产品链，且 Rocky/RHEL family 与 Ubuntu 至少各完成一次目标环境 E2E |
+| `ENV-TARGET-HARDWARE` | 由所属版本另行分配 | 依赖目标专用硬件的后续能力 | 本地无对应硬件或虚拟设备 | 模型、DTO、负向测试 | 在具备对应设备的环境建立专项验证记录 |
 
 ## 3. v0.2.2 本地发布边界
 
 v0.2.2 当前必验环境为可用的 aarch64 VMware UEFI。Rocky/RHEL family 与 Ubuntu
 产品链、重启/中断/内存/token/operation 等可在该环境或不依赖 guest 架构的自动化中完成。
 
-x86_64 VMware 不进入 v0.2.2 完成闸；QEMU 不属于必验环境。已有 QEMU 记录继续作为
+x86_64 VMware（`ENV-X86-VMWARE` / `V02-D01`）不进入 v0.2.2 或 v0.2.3 完成闸；
+QEMU（`V02-D02`）不属于必验环境。已有 QEMU 记录继续作为
 历史诊断和补充证据保留，但不要求每个 release candidate 重跑 QEMU 矩阵。
 
 ## 4. 不改变的产品事实

@@ -19,13 +19,17 @@
   productization；目标设计冻结，正式 rootfs builder 尚未完成。
 - [v0.2.2 可运营性与矩阵](design/V0_2_2_OPERABILITY.md)：持久化升级、
   durable builder operation、CLI 收敛、readiness 和固定发布矩阵。
+- [v0.2.3 Profile identity 与恢复收口](design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)：
+  catalog v5、稳定 SSH identity/provenance、完整 clone、recovery 与 ISO operation。
 - [当前环境不可验证项](design/LOCAL_VALIDATION_DEFERRED.md)：集中记录不进入当前
   版本完成闸的目标环境验证，包含 x86_64 VMware；QEMU 只作可选补充证据。
-- [v0.3 设计：PXELINUX/BIOS install](design/V0_3_DESIGN.md)：`firmware.mode` schema v5、BIOS PXELINUX、发行版版本矩阵与 `install-post` phase。
+- [v0.2 发布后收口清单](design/V0_2_POST_RELEASE_BACKLOG.md)：区分真实实现差异、
+  已完成项和明确暂不做项；第 2 节稳定 ID 是非阻断范围的唯一权威索引。
+- [v0.3 设计：PXELINUX/BIOS install](design/V0_3_DESIGN.md)：`firmware.mode` catalog v6、BIOS PXELINUX、发行版版本矩阵与 `install-post` phase。
 - [v0.4 设计：延后增强项](design/V0_4_DESIGN.md)：多 NIC/VLAN/bonding、容量压测、临时 PXE rootfs 构建节点与 install 侧 first-boot agent（无 reconciliation）。
 - [v0.5 设计：可切换 rootfs 形态](design/V0_5_DESIGN.md)：`ram_rootfs` 全内存模式与 `diskless.overlay.mode` 字段。
 
-版本实施顺序固定为 v0.2.1 -> v0.2.2 -> v0.3 -> v0.4 -> v0.5；
+版本实施顺序固定为 v0.2.1 -> v0.2.2 -> v0.2.3 -> v0.3 -> v0.4 -> v0.5；
 reconciliation/远程控制为永久非目标。
 
 ## v0.2 分册

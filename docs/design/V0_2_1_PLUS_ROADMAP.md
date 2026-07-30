@@ -1,7 +1,7 @@
 # NodeForge v0.2.1+ 实施路线图
 
 状态：现行跨版本路线图
-基线：产品 v0.2.1 / config+catalog schema v4 / BootConfig v3 / AgentPlan v1
+基线：产品 v0.2.2 / config+catalog schema v4 / BootConfig v3 / AgentPlan v1
 更新日期：2026-07-30
 
 本文只定义版本依赖、实施顺序、schema/DTO 演进和完成闸。每个版本的领域细节仍由
@@ -15,10 +15,11 @@
 |---|---|---|---|
 | v0.2.0 | Rocky/RHEL UEFI diskless + first-boot | catalog v4 / BC v3 / AP v1 | 已实现；安全审计通过（2026-07-29） |
 | v0.2.1 | Ubuntu casper diskless 产品化 | 保持 catalog v4 / BC v3 / AP v1 | 已完成；fresh CLI 与 Rocky 9.7/10.2、Ubuntu aarch64 VMware 冷启动回归通过 |
-| v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 持久化/rootfs operation/memory 已实现，其余进行中 |
-| v0.3 | x86 BIOS/PXELINUX install + install-post canonical 扩展 | catalog v5；BC/AP 不因 BIOS 无盘升级 | 设计冻结，实现未开始 |
-| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v6 / BC v4 / AP v2 | 设计冻结，实现未开始 |
-| v0.5 | `ram_rootfs` materialization | catalog v7 / BC v5 / AP v2 | 设计冻结，实现未开始 |
+| v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 已完成并通过当前 aarch64 VMware 发布矩阵 |
+| v0.2.3 | Profile identity/provenance、recovery、ISO operation、exit mapping 收口 | catalog v5 / BC v3 / AP v1 | 设计冻结，待实现 |
+| v0.3 | x86 BIOS/PXELINUX install + install-post canonical 扩展 | catalog v6；BC/AP 不因 BIOS 无盘升级 | 设计冻结，实现未开始 |
+| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v7 / BC v4 / AP v2 | 设计冻结，实现未开始 |
+| v0.5 | `ram_rootfs` materialization | catalog v8 / BC v5 / AP v2 | 设计冻结，实现未开始 |
 
 BC = BootConfig，AP = AgentPlan。catalog、节点 DTO、install callback、operation 和
 各 state file 是独立 schema namespace，绝不能因为版本号相同而共用升级判断。
@@ -57,13 +58,27 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 这一步把 v0.2 系列变成可长期维护的稳定底座。v0.3 不得绕过 v0.2.2，
 否则 BIOS 分支会建立在同步 builder、漂移 CLI 和不完整 restart 语义上。
 
-### Gate 3：v0.3-v0.5 schema 演进
+### Gate 3：v0.2.3 Profile identity 与恢复收口
+
+在 catalog firmware shape 之前完成：
+
+- catalog v5 Profile metadata与 daemon-owned SSH identity；
+- v4→v5 migration、rollback和旧 artifact边界；
+- clone patch、`--new-ssh-keys`、`--build/--detach`；
+- capability确定性重构原token与安全负测；
+- ISO真后台operation；
+- CLI exit mapping。
+
+非目标与完成闸见
+[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)。
+
+### Gate 4：v0.3-v0.5 schema 演进
 
 每版只引入自己需要的持久 shape：
 
-- v0.3：Node `firmware.mode` 与 install-post canonical action/callback；
-- v0.4：target topology、bootstrap transport、builder placement；
-- v0.5：rootfs materialization mode。
+- v0.3 / catalog v6：Node `firmware.mode` 与 install-post canonical action/callback；
+- v0.4 / catalog v7：target topology、bootstrap transport、builder placement；
+- v0.5 / catalog v8：rootfs materialization mode。
 
 每次迁移都必须区分 transaction finalize 前 rollback 与 finalize 后 representable
 downgrade；active immutable delivery snapshot 不重编译。
@@ -111,9 +126,18 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 - current CLI reference 从 command spec/实际 tree 生成；
 - 当前环境必验矩阵与 workload 证据纳入发布清单；QEMU 为可选补充。
 
+### v0.2.3
+
+- catalog v4→v5 Profile identity/provenance迁移和rollback fixture；
+- rebuild identity稳定，clone默认复用或显式换key；
+- restart只重构原capability，异常进入`recovery_incomplete`；
+- ISO import由daemon后台operation执行；
+- exit code 0–6契约稳定；
+- 当前aarch64 VMware定向回归；x86_64 VMware和重复QEMU不阻断。
+
 ### v0.3
 
-- schema v4->v5 migration/rollback/downgrade；
+- schema v5->v6 migration/rollback/downgrade；
 - x86_64 BIOS install 完整闭环，diskless BIOS 明确拒绝；
 - install-post 从既有受限形态扩展为四 canonical action；
 - generation-bound callback credential、step journal 和完成闸；
@@ -121,7 +145,7 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 ### v0.4
 
-- topology v5->v6 无损迁移；
+- topology v6->v7 无损迁移；
 - BC v4/AP v2 与旧 BC v3/AP v1 active snapshot 共存；
 - static/DHCP bootstrap、事务切网、容量 SLO；
 - PXE builder boot slot/upload claim/recovery；
@@ -129,10 +153,10 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 ### v0.5
 
-- catalog v7/BC v5；
+- catalog v8/BC v5；
 - `squashfs_overlay` 与 `ram_rootfs` 共用 artifact；
 - 双内存预算公式、metadata 保真和 `.part` 删除；
-- v6->v7 migration 与 representable downgrade；
+- v7->v8 migration 与 representable downgrade；
 - 不引入新的远程控制或 rootfs 传输变体。
 
 ## 5. 变更管理

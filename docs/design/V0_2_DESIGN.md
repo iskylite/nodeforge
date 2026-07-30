@@ -8,7 +8,7 @@
 > Rocky aarch64 QEMU/VMware UEFI diskless 和 content-addressed first-boot payload
 > 已完成。rootfs durable operation、旧状态迁移与可信 memory inventory/readiness
 > 已落地；Ubuntu casper 正式 builder 已完成，其余 CLI 收敛仍在进行。当前环境无法
-> 执行的 x86_64 VMware 验证单独跟踪，不阻塞 v0.2.2。详见
+> 执行的 x86_64 VMware 验证按 `V02-D01` / `ENV-X86-VMWARE` 单独跟踪，不阻塞 v0.2.2。详见
 > [`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)；
 > 后续顺序见 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md)。
 
@@ -235,7 +235,7 @@ overlay 挂载、handoff 写入等）在切根后无法查看，事后排障困�
    events 和 HEAD 的 socket 空闲收发上限 30 秒；rootfs Range 连续 120 秒无
    收发进展才超时，持续传输不限制总时长。AgentPlan 和 agent events 使用
    30 秒空闲收发上限；payload 使用 120 秒空闲收发上限，也不限制总时长。
-   Zig 0.16 POSIX Threaded Io 的 connect deadline 尚未实现且会 panic，当前建连
+   Zig 0.16 POSIX Threaded Io 的 connect deadline 尚未实现且会 panic（`V02-D07`），当前建连
    使用内核 TCP 有界超时；升级到可安全设置 deadline 的 Zig/runtime 后再落实
    10 秒显式建连上限，不能为满足配置值重新引入 daemon 崩溃。
 7. `diskless.running` 只证明 initrd、rootfs、切根、node-apply 和 first-boot
@@ -540,7 +540,7 @@ v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不�
 | v0.2.0 | Rocky/RHEL diskless | M5 内存无盘启动 + M7 diskless 后处理；aarch64 QEMU/VMware 已验证 |
 | v0.2.1 | Ubuntu diskless | Ubuntu casper productization，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
 | v0.2.2 | 可运营性和当前环境矩阵 | 持久化兼容、durable builder、CLI 收敛、memory readiness、aarch64 VMware UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md)；本地不可验证项见 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) |
-| v0.3 | PXELINUX/BIOS install | M6 BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v5 + M7 `install-post`，见 `V0_3_DESIGN.md` |
+| v0.3 | PXELINUX/BIOS install | M6 BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v6 + M7 `install-post`，见 `V0_3_DESIGN.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 | v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
 
@@ -571,7 +571,7 @@ users/packages/network 默认值。凡是描述“最终运行系统”的 syste
 
 IPv6 是项目永久非目标，不进入 M6 或后续 schema。BIOS 与更多发行版版本彼此独立，不能捆绑实现。
 
-M6 整体属 v0.3（BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v5），不属 v0.2 diskless 主流程；
+M6 整体属 v0.3（BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v6），不属 v0.2 diskless 主流程；
 diskless 最小功能并发已在 M5（v0.2）验证。其中 PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网，
 以及大规模容量压测，在 VMware 难以有效验证且不属主流程，**延后到 v0.4**（需显式 consumer feature、schema 和验收）。
 
@@ -1355,7 +1355,7 @@ PropertySpec/CollectionSpec/ItemSpec 再给 handler；预留 enum/空 handler �
 `node boot preview`、`node diskless retry`、`node postprocess show`、
 `node trace`、`runtime dhcp-leases|tftp-sessions`、`events list|follow|types`、`nodeforge status`、`preflight diskless-builder`。
 
-**v0.3（PXELINUX/BIOS install）**：`node set firmware.mode=bios`（schema v5，仅 install）；
+**v0.3（PXELINUX/BIOS install）**：`node set firmware.mode=bios`（schema v6，仅 install）；
 既有 `install.post_install.bundle`/`install-post` 从 schema v4 的受限 managed-file
 兼容形态扩展为四类 canonical action、generation callback 和完成闸；增加
 `node postprocess show --phase install-post --generation`。
@@ -1462,7 +1462,7 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
 
 ### 9.2 M6（v0.3）
 
-- schema v5 migration/rollback 将全部 v4 Node 显式物化 `firmware.mode=uefi`，活动 session 保护和 digest 预览通过。
+- schema v6 migration/rollback 将全部 v5 Node 显式物化 `firmware.mode=uefi`，活动 session 保护和 digest 预览通过。
 - `firmware.mode` migration、claim/config、DHCP observed mismatch、readiness 和 digest 覆盖完整。
 - BIOS x86 PXELINUX DHCP/TFTP/config、kernel/initrd/cmdline、install generation gate 和 diskless 适用性通过 QEMU
   smoke；`http_accel` 对 BIOS fail closed。
@@ -1471,7 +1471,7 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
 
 ### 9.3 M7（rootfs-build/first-boot -> v0.2；install-post -> v0.3；install-agent -> v0.4；reconciliation 永久非目标）
 
-- schema v4 migration/rollback 将 v3 managed-file bundle 无损映射到 canonical tagged action/phase；v0.3 schema v5
+- schema v4 migration/rollback 将 v3 managed-file bundle 无损映射到 canonical tagged action/phase；v0.3 schema v6
   仅增加 `install-post` 适用性，不另建 bundle owner；同一 Assets owner 扩展后的
   tagged ItemSpec 拒绝 action/phase 非法字段组合。
 - bundle CRUD、ordered item mutation、atomic file replacement、plan/apply/status、phase-specific retry、If-Match 和幂等键通过并发及
@@ -1578,7 +1578,7 @@ representability 契约；v0.2 squashfs 内存预算与 v0.5 共用 available-bu
 保留与 install 相同的 effective merge，切根后由 agent `node-apply` 重放，不进入公共 rootfs；diskless Profile password hash 改为按
 credential revision 固定，避免 per-session salt 破坏可复现 rootfs；mandatory Profile client key 与 effective-hosts
 known_hosts 重算保证标准路径的域内互信。统一 rootfs cache key、BootConfig 挂载/投影顺序和 agent session/token 身份；
-v0.5 mode 固定为 Profile-only，schema v7 下两种取值均显式表达。
+v0.5 mode 固定为 Profile-only，schema v8 下两种取值均显式表达。
 
 **第二十七轮（initrd / Node override 边界复审）**：删除 initrd 内静态配置 projector 的设计残留。nodeforged 只编译
 immutable `node_apply_projection`；initrd 只 transport/verify/mount/handoff，并以 rootfs 内

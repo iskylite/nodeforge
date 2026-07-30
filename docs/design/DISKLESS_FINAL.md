@@ -139,7 +139,8 @@ initramfs、装载内核模块）须 bind-mount `/dev`/`/proc`/`/sys` 并使用�
 - **Profile 共享 password hash**：明文 password 仍按 v0.1 desired 契约配置，但 diskless Profile credential revision
   只生成一次带 CSPRNG salt 的 `$6$` hash 并安全持久化；普通重建复用同一 hash，避免同输入 rootfs 因 per-session salt
   失去可复现性。显式改密码才发布新 Profile revision/input digest；install Profile 的 v0.1 行为不变。
-- **重建时换全部 SSH keys**：`profile rootfs build --new-ssh-keys` 可在一次操作中重新生成 Profile client/host
+- **重建时换全部 SSH keys（待实现）**：目标接口
+  `profile rootfs build --new-ssh-keys` 可在一次操作中重新生成 Profile client/host
   公钥私钥、重算 `authorized_keys`/`ssh_known_hosts`、发布新 Profile revision 并构建新 rootfs；自动化需锁定已预览
   输入时再加 `--if-input-digest <current>`。旧 artifact/active session 不变；新旧 rootfs 混跑时双向免密不保证，
   host fingerprint 也会变化。

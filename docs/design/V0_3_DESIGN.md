@@ -10,7 +10,7 @@ v0.3 在 v0.2.1 Ubuntu 收口和 v0.2.2 operability 门禁完成后启动。跨�
 
 v0.3 必须基于 v0.2.1/v0.2.2 完成：
 
-- v0.2 schema v4（`ProfileKind = install|diskless`）冻结，canonical BootSession 状态机、
+- v0.2.3 catalog schema v5（`ProfileKind = install|diskless`、Profile identity/provenance）冻结，canonical BootSession 状态机、
   DHCP/TFTP/HTTP 协议栈与 effective compiler/readiness/validator 三项核心闭环已落地并通过验收。
 - v0.2 schema v4 已存在的受限 `install-post` 兼容 runner 回归通过；`rootfs-build|first-boot`
   四类 action 与八步执行契约已统一，v0.3 在此基础上扩展 install-post。
@@ -25,7 +25,7 @@ v0.3 聚焦 **BIOS PXELINUX install 与发行版版本矩阵**，对应 M6（BIO
 
 | 项 | v0.3 范围 | 说明 |
 |---|---|---|
-| BIOS x86 PXELINUX | 是 | `firmware.mode=bios` Node direct 属性，schema v5 |
+| BIOS x86 PXELINUX | 是 | `firmware.mode=bios` Node direct 属性，schema v6 |
 | 发行版版本矩阵 | 是 | Rocky/RHEL 系与 Ubuntu 后续 LTS 的显式 adapter capability matrix |
 | bootloader/版本差异/错误分类 | 是 | 长期运行回归 |
 | 最小功能并发/失败恢复 | 是 | 大规模容量压测延后 v0.4 |
@@ -51,8 +51,8 @@ install 侧 first-boot agent（-> v0.4）；reconciliation/远程控制（永久
 
 ### 4.1 firmware.mode
 
-- 新增 Node direct `firmware.mode=uefi|bios`（schema v5）；**不**放入 Profile 或 `overrides`。
-- schema v4 到 v5 既有 Node migration 默认物化 `uefi`；新认领 Node 必须由管理员确认 desired `firmware.mode`。
+- 新增 Node direct `firmware.mode=uefi|bios`（schema v6）；**不**放入 Profile 或 `overrides`。
+- schema v5 到 v6 既有 Node migration 默认物化 `uefi`；新认领 Node 必须由管理员确认 desired `firmware.mode`。
 - migration transaction finalize 前可由 journal 回滚到完整 v4；finalize 后只有所有 Node 均为 `uefi`、不存在
   install-post v5-only canonical item 且其他资源均可由 v4 表达时才允许 downgrade。任一
   `firmware.mode=bios` 或 v5-only install-post item
@@ -122,7 +122,7 @@ install 侧 first-boot agent（-> v0.4）；reconciliation/远程控制（永久
 > 完整 CLI 约定见 [`V0_2_CLI.md`](V0_2_CLI.md) §0；本节给 v0.3 新增。
 
 ```text
-nodeforge node set <node> firmware.mode=bios              # schema v5
+nodeforge node set <node> firmware.mode=bios              # schema v6
 nodeforge profile set <profile> install.post_install.bundle=<bundle>
 nodeforge assets provision-bundle item add <bundle> steps \
   id=<id> phase=install-post action=managed-file content_asset=<asset> destination=/etc/motd \
@@ -158,7 +158,7 @@ nodeforge node postprocess show <node> --phase install-post [--generation <id>]
 
 ## 9. 完成标准
 
-- schema v5 migration 将全部 v4 Node 显式物化 `firmware.mode=uefi`；finalize 前 journal rollback、可表示 downgrade、
+- schema v6 migration 将全部 v5 Node 显式物化 `firmware.mode=uefi`；finalize 前 journal rollback、可表示 downgrade、
   BIOS/install-post 不可表示 downgrade、活动 snapshot 保护和 digest 预览通过。
 - `firmware.mode` migration、claim/config、DHCP observed mismatch、readiness 和 digest 覆盖完整。
 - BIOS x86 PXELINUX 引导、安装、登录、事件、install generation 重试/drift 与 daemon restart-resume 回归通过；
