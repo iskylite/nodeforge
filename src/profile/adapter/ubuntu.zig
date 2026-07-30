@@ -206,6 +206,22 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"installer_started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
     try w.writeAll("  late-commands:\n");
+    // Subiquity's offline-install fallback may restore Ubuntu's public mirrors
+    // in the target even when mirror-selection points at NodeForge. Persist the
+    // imported repository explicitly from the ISO's signed Release metadata so
+    // the installed system has the same local-only repository contract as the
+    // effective plan and the diskless node-apply path.
+    if (apt_primary_url) |url| {
+        const apt_source = try std.fmt.allocPrint(
+            allocator,
+            "set -eu; d=''; for x in /cdrom/dists/*; do test -f \"$x/Release\" && d=\"$x\" && break; done; test -n \"$d\"; suite=$(basename \"$d\"); components=$(awk '/^Components:/ {{ $1=\"\"; sub(/^ /,\"\"); print; exit }}' \"$d/Release\"); test -n \"$components\"; mkdir -p /target/etc/apt/sources.list.d; rm -f /target/etc/apt/sources.list /target/etc/apt/sources.list.d/*.list /target/etc/apt/sources.list.d/*.sources; printf 'deb [trusted=yes] {s} %s %s\\n' \"$suite\" \"$components\" > /target/etc/apt/sources.list.d/nodeforge.list; chmod 0644 /target/etc/apt/sources.list.d/nodeforge.list",
+            .{url},
+        );
+        defer allocator.free(apt_source);
+        try w.writeAll("    - ");
+        try render.yamlQuote(w, apt_source);
+        try w.writeByte('\n');
+    }
     if (system.import_host_hosts) {
         if (system.hosts_content) |hosts| {
             try w.writeAll("    - ");
@@ -633,6 +649,9 @@ test "autoinstall has NoCloud header and late event hook" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "mirror-selection:") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "fallback: offline-install") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "geoip: false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/apt/sources.list.d/nodeforge.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "deb [trusted=yes] http://repo %s %s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/cdrom/dists/*") != null);
     // disable_suites 不在 Subiquity autoinstall schema 中，不能出现在输出里
     try std.testing.expect(std.mem.indexOf(u8, bytes, "disable_suites") == null);
     // 隔离网段防超时配置

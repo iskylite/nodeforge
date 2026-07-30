@@ -79,7 +79,9 @@ NodeForge/
 - [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu
   casper 方案；运行时与 smoke 已验证，生产 rootfs builder 尚待实现。
 - [v0.2.2 可运营性设计](docs/design/V0_2_2_OPERABILITY.md)：持久化兼容、
-  durable builder operation、CLI 收敛和固定验证矩阵。
+  durable builder operation、CLI 收敛和当前环境验证矩阵。
+- [当前环境不可验证项](docs/design/LOCAL_VALIDATION_DEFERRED.md)：集中记录
+  x86_64 VMware 等当前无法执行的目标环境验证；QEMU 只作可选补充。
 - [v0.2.1+ 路线图](docs/design/V0_2_1_PLUS_ROADMAP.md)：v0.2.1-v0.5 的依赖、
   schema/DTO 演进与完成闸。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
@@ -135,7 +137,7 @@ IPv4 PXE 无人值守安装产品已完成；所有权模型、typed property re
 | M4.12 | 存储 override | 已由 canonical Node/Profile 所有权模型取代旧 fallback |
 | M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 已完成 |
 
-### v0.2.1（当前版本）
+### v0.2.2（当前版本）
 
 v0.2.0 已落地 schema v4、diskless Profile、rootfs 制品登记、BootConfig v3 /
 AgentPlan v1、四域 capability、严格 HEAD + Range 下载、tmpfs overlay、node-apply、
@@ -149,7 +151,8 @@ Ubuntu 22.04.5 aarch64 VMware 冷启动回归。
 后续按以下边界推进：
 
 - **v0.2.2**：持久化升级兼容、durable builder operation、CLI 收敛、
-  x86_64/aarch64、QEMU/VMware 固定矩阵与故障恢复验证；
+  当前可用 aarch64 VMware 固定矩阵与故障恢复验证；x86_64 VMware 单独记录为
+  当前环境不可验证项，QEMU 为可选补充；
 - **v0.3+**：BIOS PXELINUX、多 NIC/topology、后续 rootfs 形态。
 
 IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是项目永久非目标。
@@ -340,6 +343,10 @@ nodeforge assets initrd build rocky-9.7-nodeforge-initrd \
   --from-install-source rocky-9.7-aarch64-dvd \
   --kernel-release 5.14.0-611.5.1.el9_7.aarch64
 
+# 长任务默认提交 durable operation 后跟随到终态；自动化可使用 --detach，
+# 再通过 operation list/show/follow 恢复观察。
+nodeforge operation list
+
 # 统一发布到 assets/diskless/initrd/<name>/<uname-r>/initrd.img；
 # source/tuple provenance 由 catalog 保存，不再重复形成多层目录。
 #
@@ -374,6 +381,7 @@ nodeforge profile rootfs register rocky-9.7-aarch64-dvd-diskless \
 # 4. 绑定节点、检查 readiness、打开 deploy gate。
 nodeforge node set node-01 profile=rocky-9.7-aarch64-dvd-diskless
 nodeforge node readiness node-01 --stage boot
+nodeforge node boot preview node-01
 nodeforge node deploy node-01 true
 
 # 5. PXE 启动节点。启动中 console 会输出 nodeforge session id；

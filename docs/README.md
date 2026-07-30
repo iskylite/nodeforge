@@ -11,6 +11,7 @@
   schema/DTO 演进、跨版本不变式和完成闸。
 - [CLI HTTP 诊断与响应缓冲设计](design/CLI_HTTP_DIAGNOSTICS_AND_BUFFERING.md)：定义 management 响应容量、`--debug` 诊断、安全预览和后续开发约束。
 - [当前 CLI 全面优化与收敛方案](design/CURRENT_CLI_OPTIMIZATION_PLAN.md)：以当前代码和运行时事实为基线，统一正常工作流、同步/后台任务、CAS/force、clone、boot preview、retry、命令分层以及代码/注释/文档迁移。
+- [v0.2.2 CLI Reference](cli/REFERENCE.md)：当前正式公开命令树与工作流边界。
 - [日志与安装计划摘要约定](design/LOGGING_AND_INSTALL_PLAN_DIGEST.md)：定义 HTTP 错误日志、request_id、setup 日志等级覆盖，以及 install plan digest 不一致的诊断和安全边界。
 - [v0.1 设计与修复计划](design/V0_1_DESIGN.md)：M0-M4 及进入 v0.2 前必须完成的修复，当前权威设计。
 - [v0.2 总纲](design/V0_2_DESIGN.md)：diskless 版本边界、跨域不变式、分册导航、实现切片与完成标准。所有 v0.2 工作先从这里进入。
@@ -18,6 +19,8 @@
   productization；目标设计冻结，正式 rootfs builder 尚未完成。
 - [v0.2.2 可运营性与矩阵](design/V0_2_2_OPERABILITY.md)：持久化升级、
   durable builder operation、CLI 收敛、readiness 和固定发布矩阵。
+- [当前环境不可验证项](design/LOCAL_VALIDATION_DEFERRED.md)：集中记录不进入当前
+  版本完成闸的目标环境验证，包含 x86_64 VMware；QEMU 只作可选补充证据。
 - [v0.3 设计：PXELINUX/BIOS install](design/V0_3_DESIGN.md)：`firmware.mode` schema v5、BIOS PXELINUX、发行版版本矩阵与 `install-post` phase。
 - [v0.4 设计：延后增强项](design/V0_4_DESIGN.md)：多 NIC/VLAN/bonding、容量压测、临时 PXE rootfs 构建节点与 install 侧 first-boot agent（无 reconciliation）。
 - [v0.5 设计：可切换 rootfs 形态](design/V0_5_DESIGN.md)：`ram_rootfs` 全内存模式与 `diskless.overlay.mode` 字段。

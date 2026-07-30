@@ -55,6 +55,8 @@ const diskless_dto = @import("diskless_dto.zig");
 const rootfs_build_executor = @import("../provision/rootfs_build_executor.zig");
 const rootfs_os_builder = @import("../provision/rootfs_os_builder.zig");
 const initrd_memory = @import("../initrd/memory.zig");
+const initrd_build_executor = @import("../provision/initrd_build_executor.zig");
+const artifact_layout = @import("../provision/artifact_layout.zig");
 const password_hash = @import("../profile/password_hash.zig");
 const routes = @import("routes.zig");
 const log = std.log.scoped(.http);
@@ -62,6 +64,7 @@ const log = std.log.scoped(.http);
 const max_rootfs_build_jobs = 8;
 const rootfs_profile_cap = 128;
 const rootfs_digest_len = 64;
+const initrd_field_cap = 192;
 
 const RootfsBuildJob = struct {
     active: bool = false,
@@ -103,6 +106,50 @@ const RootfsBuildWorker = struct {
     }
 };
 
+const InitrdBuildJob = struct {
+    active: bool = false,
+    operation_id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
+    name: [initrd_field_cap]u8 = [_]u8{0} ** initrd_field_cap,
+    name_len: u8 = 0,
+    source: [initrd_field_cap]u8 = [_]u8{0} ** initrd_field_cap,
+    source_len: u8 = 0,
+    kernel_release: [initrd_field_cap]u8 = [_]u8{0} ** initrd_field_cap,
+    kernel_release_len: u8 = 0,
+};
+
+const InitrdBuildWorker = struct {
+    jobs: [max_rootfs_build_jobs]InitrdBuildJob = [_]InitrdBuildJob{.{}} ** max_rootfs_build_jobs,
+    mutex: std.atomic.Mutex = .unlocked,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn submit(self: *InitrdBuildWorker, operation_id: []const u8, name: []const u8, source: []const u8, kernel_release: []const u8) !void {
+        if (operation_id.len != boot_session.id_len or name.len == 0 or name.len > initrd_field_cap or source.len == 0 or source.len > initrd_field_cap or kernel_release.len == 0 or kernel_release.len > initrd_field_cap)
+            return error.InvalidInitrdBuildJob;
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (&self.jobs) |*job| if (!job.active) {
+            job.* = .{ .active = true, .name_len = @intCast(name.len), .source_len = @intCast(source.len), .kernel_release_len = @intCast(kernel_release.len) };
+            @memcpy(&job.operation_id, operation_id);
+            @memcpy(job.name[0..name.len], name);
+            @memcpy(job.source[0..source.len], source);
+            @memcpy(job.kernel_release[0..kernel_release.len], kernel_release);
+            return;
+        };
+        return error.InitrdBuildQueueFull;
+    }
+
+    fn take(self: *InitrdBuildWorker) ?InitrdBuildJob {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (&self.jobs) |*job| if (job.active) {
+            const result = job.*;
+            job.* = .{};
+            return result;
+        };
+        return null;
+    }
+};
+
 const RouteContext = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -119,6 +166,7 @@ const RouteContext = struct {
     inventories: *node_inventory.Store,
     operations: *operations.Store,
     rootfs_worker: *RootfsBuildWorker,
+    initrd_worker: *InitrdBuildWorker,
     rootfs_artifacts: *rootfs_artifact_store.Store,
     diskless_store: *diskless_delivery.Store,
     config_revision: u64,
@@ -220,6 +268,7 @@ pub fn serve(
     const config = initial_pair.config.value();
 
     var rootfs_worker: RootfsBuildWorker = .{};
+    var initrd_worker: InitrdBuildWorker = .{};
     var context = RouteContext{
         .io = io,
         .allocator = allocator,
@@ -236,6 +285,7 @@ pub fn serve(
         .inventories = inventories,
         .operations = operation_store,
         .rootfs_worker = &rootfs_worker,
+        .initrd_worker = &initrd_worker,
         .rootfs_artifacts = rootfs_artifacts,
         .diskless_store = diskless_store,
         .config_revision = config_revision,
@@ -247,9 +297,12 @@ pub fn serve(
         .config_path = config_path,
     };
     var rootfs_thread = try std.Thread.spawn(.{}, runRootfsBuildWorker, .{ &context, &rootfs_worker });
+    var initrd_thread = try std.Thread.spawn(.{}, runInitrdBuildWorker, .{ &context, &initrd_worker });
     defer {
         rootfs_worker.stop.store(true, .release);
+        initrd_worker.stop.store(true, .release);
         rootfs_thread.join();
+        initrd_thread.join();
     }
     if (active_context != null) return error.HttpAlreadyRunning;
     active_context = &context;
@@ -399,6 +452,7 @@ fn route(request: zap.Request) !void {
         config_validate.validate(context.config, catalog_snapshot.value()) catch |err| return validationError(request, err, meta);
         return json(request, .ok, "{\"ok\":true,\"result\":{}}\n", meta);
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/initrds/build")) return managementInitrdBuild(request, context, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/nodes")) return managementNodeAdd(request, context, meta);
     if (std.mem.eql(u8, method, "POST")) if (claimPath(path)) |node_id| return managementNodeClaim(request, context, node_id, meta);
     if (nodePath(path, "/api/v1/management/nodes/")) |node_id| {
@@ -413,6 +467,8 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST")) if (installGenerationsPath(path)) |node_id| return installGenerations(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/boot-prepare")) |node_id| return managementBootPrepare(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/readiness")) |node_id| return managementNodeReadiness(request, context, node_id, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/boot-preview")) |node_id| return managementNodeBootPreview(request, context, node_id, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/retry")) |node_id| return managementNodeRetry(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime")) {
         return runtimeSummary(request, context, meta);
     }
@@ -431,6 +487,7 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/build")) |name| return managementRootfsBuild(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs")) |name| return managementRootfsStatus(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfileCreate(request, context, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/clone")) |name| return managementProfileClone(request, context, name, meta);
     if (std.mem.eql(u8, method, "DELETE")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfileRemove(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfile(request, context, name, meta);
     if (std.mem.eql(u8, path, "/api/v1/management/discovery/policy")) {
@@ -2755,6 +2812,7 @@ fn runtimeSummary(request: zap.Request, context: *const RouteContext, meta: Requ
 const NodeAddRequest = dto.Node;
 
 const ProfileCreateRequest = struct { name: []const u8, install_source: []const u8, kind: ?[]const u8 = null, boot_bundle: ?[]const u8 = null };
+const ProfileCloneRequest = struct { target: []const u8 };
 const ValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, values: []const []const u8 = &.{}, mutations: []const scalar_mutation.Mutation = &.{} };
 const ItemValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, identity: []const u8, field: []const u8, values: []const []const u8 = &.{} };
 
@@ -3176,6 +3234,34 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
     return json(request, .created, rendered, meta);
 }
 
+fn managementProfileClone(request: zap.Request, context: *RouteContext, source: []const u8, meta: RequestMeta) !void {
+    if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.clone_invalid\",\"message\":\"target is required\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(ProfileCloneRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.clone_invalid\",\"message\":\"target is required\"}}\n", meta);
+    defer parsed.deinit();
+    if (!config_validate.validLogicalId(source) or !config_validate.validLogicalId(parsed.value.target))
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.clone_invalid\",\"message\":\"source and target must be canonical logical identifiers\"}}\n", meta);
+    while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+    defer config_mutation_mutex.unlock();
+    context.models.lock();
+    defer context.models.unlock();
+    if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+    @import("../config/profile_mutation.zig").cloneProfile(context.io, context.allocator, context.config, context.catalog.path, source, parsed.value.target) catch |err| switch (err) {
+        error.ProfileNotFound => return notFound(request, meta),
+        error.ProfileAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.already_exists\",\"message\":\"target profile already exists\"}}\n", meta),
+        error.InvalidProfileName => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.clone_invalid\",\"message\":\"target profile name is invalid\"}}\n", meta),
+        else => return validationError(request, err, meta),
+    };
+    applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"profile clone persisted but snapshot publish failed\"}}\n", meta);
+    var location: [320]u8 = undefined;
+    try request.setHeader("location", try std.fmt.bufPrint(&location, "/api/v1/management/profiles/{s}", .{parsed.value.target}));
+    var response: [512]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"source\":{f},\"target\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(source, .{}), std.json.fmt(parsed.value.target, .{}), context.catalog.currentRevision() });
+    try setRevisionEtag(request, context.catalog.currentRevision());
+    return json(request, .created, rendered, meta);
+}
+
 /// 处理 Profile 删除请求。mutation mutex、model gate 与 `If-Match` 一起保证
 /// 引用检查、持久化和内存 snapshot 发布串行发生；有 Node 引用时稳定返回
 /// `profile.in_use`，不会隐式解绑或修改任何 Node。
@@ -3217,6 +3303,55 @@ fn applyCatalogFromDisk(context: *RouteContext) !void {
 }
 
 const RootfsBuildRequest = struct { if_input_digest: ?[]const u8 = null };
+const InitrdBuildRequest = struct {
+    name: []const u8,
+    install_source: []const u8,
+    kernel_release: []const u8,
+};
+
+fn managementInitrdBuild(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
+    const parsed = std.json.parseFromSlice(InitrdBuildRequest, context.allocator, request.body orelse "", .{ .allocate = .alloc_always }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"initrd.invalid\",\"message\":\"name, install_source and kernel_release are required\"}}\n", meta);
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (!config_validate.validLogicalId(value.name) or !config_validate.validLogicalId(value.install_source) or value.kernel_release.len == 0 or value.kernel_release.len > initrd_field_cap or std.mem.indexOfAny(u8, value.kernel_release, "/\\\x00") != null)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"initrd.invalid\",\"message\":\"initrd build inputs are invalid\"}}\n", meta);
+    const catalog = context.catalog_snapshot.value();
+    const source = lookup.findInstallSource(catalog, value.install_source) orelse return notFound(request, meta);
+    const installer = lookup.findAsset(catalog, source.installer_initrd) orelse return validationError(request, error.MissingAsset, meta);
+    if (installer.kind != .installer_initrd) return validationError(request, error.InvalidAssetKind, meta);
+    if (lookup.findAsset(catalog, value.name)) |existing| {
+        if (existing.kind == .nodeforge_initrd and optionalEqual(existing.distro, source.distro) and optionalEqual(existing.version, source.version) and existing.arch == source.arch and optionalEqual(existing.kernel_release, value.kernel_release))
+            return json(request, .ok, "{\"ok\":true,\"result\":{\"state\":\"already_present\"}}\n", meta);
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"initrd.name_conflict\",\"message\":\"initrd name already identifies different metadata\"}}\n", meta);
+    }
+    var digest_input: std.Io.Writer.Allocating = .init(context.allocator);
+    defer digest_input.deinit();
+    try digest_input.writer.print("{s}\x00{s}\x00{s}", .{ value.name, value.install_source, value.kernel_release });
+    var raw: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(digest_input.written(), &raw, .{});
+    var request_digest: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&request_digest, "{x}", .{raw}) catch unreachable;
+    var key_buffer: [128]u8 = undefined;
+    const key = request.getHeader("idempotency-key") orelse try std.fmt.bufPrint(&key_buffer, "initrd-{s}", .{request_digest[0..32]});
+    const begun = context.operations.beginQueuedRequest(context.io, key, &request_digest, .initrd_build, unixNow()) catch |err|
+        return json(request, .conflict, if (err == error.IdempotencyConflict)
+            "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for another initrd input\"}}\n"
+        else
+            "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create initrd operation\"}}\n", meta);
+    saveOperations(context) catch {
+        _ = context.operations.fail(begun.entry.idSlice(), "operation.persist_failed", unixNow()) catch {};
+        saveOperations(context) catch {};
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"operation.persist_failed\",\"message\":\"cannot persist initrd operation\"}}\n", meta);
+    };
+    if (!begun.reused) context.initrd_worker.submit(begun.entry.idSlice(), value.name, value.install_source, value.kernel_release) catch |err| {
+        _ = context.operations.fail(begun.entry.idSlice(), if (err == error.InitrdBuildQueueFull) "initrd.queue_full" else "initrd.invalid_job", unixNow()) catch {};
+        saveOperations(context) catch {};
+        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"initrd.queue_unavailable\",\"message\":\"initrd worker queue is unavailable\"}}\n", meta);
+    };
+    return operationResponse(request, begun.entry, true, meta);
+}
 
 /// `profile rootfs build`：从 Profile build projection 构建内容寻址 rootfs 制品。
 /// daemon 用发行版原生 install-root 工具从 install source 受管 repository 构建
@@ -3668,6 +3803,97 @@ fn runRootfsBuildWorker(shared_context: *RouteContext, worker: *RootfsBuildWorke
             saveOperations(shared_context) catch |save_err|
                 log.err("rootfs worker cannot persist terminal persistence failure for operation {s}: {t}", .{ operation_id, save_err });
         };
+    }
+}
+
+fn performInitrdBuild(context: *RouteContext, name: []const u8, source_name: []const u8, kernel_release: []const u8, operation_id: []const u8) !void {
+    const catalog = context.catalog_snapshot.value();
+    const source = lookup.findInstallSource(catalog, source_name) orelse return error.MissingInstallSource;
+    const installer = lookup.findAsset(catalog, source.installer_initrd) orelse return error.MissingAsset;
+    if (installer.kind != .installer_initrd) return error.InvalidAssetKind;
+    const relative = try artifact_layout.initrdRelative(context.allocator, name, kernel_release);
+    defer context.allocator.free(relative);
+    const destination = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ paths.require().initrd_dir, relative });
+    defer context.allocator.free(destination);
+    if (std.fs.path.dirname(destination)) |parent| try std.Io.Dir.cwd().createDirPath(context.io, parent);
+    if (std.Io.Dir.cwd().statFile(context.io, destination, .{ .follow_symlinks = false })) |_| return error.InitrdAlreadyExists else |err| if (err != error.FileNotFound) return err;
+    const part = try std.fmt.allocPrint(context.allocator, "{s}.part-{s}", .{ destination, operation_id });
+    defer context.allocator.free(part);
+    std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
+    errdefer std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
+    const base = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ context.config.tftp.asset_root, installer.path });
+    defer context.allocator.free(base);
+    const initrd_binary = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-initrd", .{paths.require().bin_dir});
+    defer context.allocator.free(initrd_binary);
+    const agent_binary = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-agent", .{paths.require().bin_dir});
+    defer context.allocator.free(agent_binary);
+    for ([_][]const u8{ initrd_binary, agent_binary }) |binary| {
+        const stat = try std.Io.Dir.cwd().statFile(context.io, binary, .{ .follow_symlinks = false });
+        if (stat.kind != .file) return error.MissingCompanionBinary;
+    }
+    try initrd_build_executor.buildFromInstaller(context.io, context.allocator, kernel_release, initrd_binary, base, part);
+    var checksum: [64]u8 = undefined;
+    try asset_validate.sha256File(context.io, std.fs.path.dirname(part) orelse return error.InvalidInitrdPath, std.fs.path.basename(part), &checksum);
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), part, std.Io.Dir.cwd(), destination, context.io);
+    errdefer std.Io.Dir.cwd().deleteFile(context.io, destination) catch {};
+    const asset: model.AssetConfig = .{
+        .name = name,
+        .kind = .nodeforge_initrd,
+        .path = relative,
+        .distro = source.distro,
+        .version = source.version,
+        .arch = source.arch,
+        .kernel_release = kernel_release,
+        .sha256 = &checksum,
+    };
+    context.models.lock();
+    defer context.models.unlock();
+    try context.catalog.addAsset(context.io, context.config, asset);
+    try applyCatalogFromDisk(context);
+}
+
+fn runInitrdBuildWorker(shared_context: *RouteContext, worker: *InitrdBuildWorker) void {
+    while (true) {
+        const job = worker.take() orelse {
+            if (worker.stop.load(.acquire)) return;
+            std.Io.sleep(shared_context.io, .fromMilliseconds(50), .awake) catch {};
+            continue;
+        };
+        const operation_id: []const u8 = &job.operation_id;
+        _ = shared_context.operations.start(operation_id, unixNow()) catch |err| {
+            log.err("initrd worker cannot start operation {s}: {t}", .{ operation_id, err });
+            continue;
+        };
+        saveOperations(shared_context) catch |err| {
+            log.err("initrd worker cannot persist running operation {s}: {t}", .{ operation_id, err });
+            _ = shared_context.operations.fail(operation_id, "operation.persist_failed", unixNow()) catch {};
+            saveOperations(shared_context) catch {};
+            continue;
+        };
+        const pair = shared_context.models.acquire();
+        var context = shared_context.*;
+        context.config = pair.config.value();
+        context.config_revision = pair.config.revision;
+        context.catalog_snapshot = pair.catalog;
+        const name = job.name[0..job.name_len];
+        const source = job.source[0..job.source_len];
+        const kernel_release = job.kernel_release[0..job.kernel_release_len];
+        performInitrdBuild(&context, name, source, kernel_release, operation_id) catch |err| {
+            pair.release();
+            var error_buffer: [96]u8 = undefined;
+            const error_code = std.fmt.bufPrint(&error_buffer, "initrd.{s}", .{@errorName(err)}) catch "initrd.build_failed";
+            log.err("initrd build operation {s} failed for {s}: {t}", .{ operation_id, name, err });
+            _ = shared_context.operations.fail(operation_id, error_code, unixNow()) catch {};
+            saveOperations(shared_context) catch {};
+            continue;
+        };
+        pair.release();
+        _ = shared_context.operations.succeed(operation_id, name, unixNow()) catch |err| {
+            log.err("initrd worker cannot complete operation {s}: {t}", .{ operation_id, err });
+            continue;
+        };
+        saveOperations(shared_context) catch |err|
+            log.err("initrd worker cannot persist completed operation {s}: {t}", .{ operation_id, err });
     }
 }
 
@@ -4419,6 +4645,105 @@ const NodeReadinessRequest = struct {
     stage: enum { build, boot } = .boot,
 };
 
+const NodeRetryRequest = struct { force: bool = false };
+
+/// 严格只读的启动投影。该 handler 只读取当前 immutable model pair 和制品索引，
+/// 不创建 session/operation，不签发 capability，也不修改 deploy/generation。
+fn managementNodeBootPreview(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
+    const catalog = context.catalog_snapshot.value();
+    const node = lookup.findNode(catalog, node_id) orelse return notFound(request, meta);
+    const profile_name = node.profile orelse
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"preview.profile_missing\",\"message\":\"node has no profile assigned\"}}\n", meta);
+    const profile = lookup.findProfile(catalog, profile_name) orelse return notFound(request, meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    if (profile.kind == .diskless) {
+        var plan = diskless.compile(context.allocator, context.config, catalog, node) catch |err| return validationError(request, err, meta);
+        defer plan.deinit();
+        const rootfs_digest: []const u8 = &plan.rootfs_input_digest;
+        const desired_digest: []const u8 = &plan.desired_plan_digest;
+        const bundle_name = profile.boot_bundle orelse return validationError(request, error.MissingBootBundle, meta);
+        const bundle = lookup.findBootBundle(catalog, bundle_name) orelse return validationError(request, error.MissingBootBundle, meta);
+        const rootfs_ready = context.rootfs_artifacts.find(rootfs_digest) != null;
+        try output.writer.print(
+            "{{\"ok\":true,\"result\":{{\"node\":{f},\"profile\":{f},\"kind\":\"diskless\",\"catalog_revision\":{d},\"deploy\":{s},\"would_boot\":{s},\"rootfs_input_digest\":{f},\"desired_plan_digest\":{f},\"boot_bundle\":{f},\"kernel\":{f},\"initrd\":{f},\"kernel_release\":{f},\"rootfs_state\":{f},\"tmpfs_percent\":{d},\"minimum_free_bytes\":{d},\"safety_margin_bytes\":{d}}}}}\n",
+            .{ std.json.fmt(node.id, .{}), std.json.fmt(profile.name, .{}), context.catalog_snapshot.revision, if (node.deploy) "true" else "false", if (node.deploy and rootfs_ready) "true" else "false", std.json.fmt(rootfs_digest, .{}), std.json.fmt(desired_digest, .{}), std.json.fmt(bundle.name, .{}), std.json.fmt(bundle.kernel, .{}), std.json.fmt(bundle.initrd, .{}), std.json.fmt(bundle.kernel_release, .{}), std.json.fmt(if (rootfs_ready) "ready" else "missing", .{}), plan.node_boot.tmpfs_percent, plan.node_boot.minimum_free_bytes, plan.node_boot.safety_margin_bytes },
+        );
+    } else {
+        var plan = effective_compiler.compile(context.allocator, catalog, node) catch |err| return validationError(request, err, meta);
+        defer plan.deinit();
+        const digest = desiredPlanDigest(context, node_id) catch return validationError(request, error.ModelRevisionUnavailable, meta);
+        try output.writer.print(
+            "{{\"ok\":true,\"result\":{{\"node\":{f},\"profile\":{f},\"kind\":\"install\",\"catalog_revision\":{d},\"deploy\":{s},\"would_boot\":{s},\"desired_plan_digest\":{f},\"install_source\":{f},\"arch\":{f}}}}}\n",
+            .{ std.json.fmt(node.id, .{}), std.json.fmt(profile.name, .{}), context.catalog_snapshot.revision, if (node.deploy) "true" else "false", if (node.deploy) "true" else "false", std.json.fmt(&digest, .{}), std.json.fmt(plan.install_source.name, .{}), std.json.fmt(@tagName(node.arch), .{}) },
+        );
+    }
+    return json(request, .ok, output.written(), meta);
+}
+
+/// Kind-aware retry。deploy gate、活动 session 处理和 install generation rearm
+/// 均由服务端决定；CLI 不再编排多个 management 请求。
+fn managementNodeRetry(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
+    const parsed = std.json.parseFromSlice(NodeRetryRequest, context.allocator, request.body orelse "{}", .{}) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"retry.invalid\",\"message\":\"expected {force:boolean}\"}}\n", meta);
+    defer parsed.deinit();
+    const catalog = context.catalog_snapshot.value();
+    const node = lookup.findNode(catalog, node_id) orelse return notFound(request, meta);
+    const profile = lookup.findProfile(catalog, node.profile orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.profile_unassigned\",\"message\":\"node has no bound profile\"}}\n", meta)) orelse return notFound(request, meta);
+    const mono_now = boot_session.monotonicNow();
+    const install_active = context.sessions.hasActiveNode(node_id, mono_now);
+    var diskless_active = false;
+    var diskless_snapshot: [diskless_delivery.max_sessions]diskless_delivery.Session = undefined;
+    for (context.diskless_store.snapshot(&diskless_snapshot)) |session| if (std.mem.eql(u8, session.nodeId(), node_id) and !session.phase.isTerminal()) {
+        diskless_active = true;
+        break;
+    };
+    if ((install_active or diskless_active) and !parsed.value.force)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"retry.session_active\",\"message\":\"active session cannot be retried; stop the target and use --force\"}}\n", meta);
+    if (parsed.value.force) {
+        if (install_active) {
+            _ = context.sessions.supersedeNode(node_id, mono_now, unixNow());
+            if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced session termination\"}}\n", meta);
+        }
+        if (diskless_active) {
+            while (context.diskless_store.findByNode(node_id)) |session| {
+                if (session.phase.isTerminal()) break;
+                var id: [boot_session.id_len]u8 = undefined;
+                @memcpy(&id, &session.session_id);
+                context.diskless_store.cancel(context.io, &id) catch
+                    return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist forced diskless session termination\"}}\n", meta);
+            }
+        }
+    }
+    if (!node.deploy) {
+        while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+        defer config_mutation_mutex.unlock();
+        context.models.lock();
+        defer context.models.unlock();
+        scalar_mutation.nodeBatch(context.io, context.allocator, context.config, context.catalog.path, node_id, &.{.{ .key = "deploy", .value = "true" }}) catch |err|
+            return validationError(request, err, meta);
+        applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"cannot enable node deployment gate\"}}\n", meta);
+    }
+    if (profile.kind == .diskless) {
+        var response: [256]u8 = undefined;
+        return json(request, .ok, try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"kind\":\"diskless\",\"deploy\":true,\"superseded\":{s},\"message\":\"ready for next PXE\"}}}}\n", .{ std.json.fmt(node_id, .{}), if (diskless_active) "true" else "false" }), meta);
+    }
+    // Enabling deploy publishes a new catalog generation. The request's pinned
+    // RouteContext intentionally remains on the old generation, so arming from it
+    // would persist the pre-mutation plan digest and DHCP would immediately reject
+    // the retry as install_not_armed. Pin the newly published pair and make the
+    // generation decision from exactly that model.
+    const current = context.models.acquire();
+    defer current.release();
+    var current_context = context.*;
+    current_context.config = current.config.value();
+    current_context.config_revision = current.config.revision;
+    current_context.catalog_snapshot = current.catalog;
+    return installGenerations(request, &current_context, node_id, meta);
+}
+
 fn writeDisklessSession(writer: *std.Io.Writer, session: *const diskless_delivery.Session) !void {
     try writer.print("{{\"session_id\":{f},\"node_id\":{f},\"profile\":{f},\"phase\":{f},\"rootfs_input_digest\":{f},\"agent_plan_digest\":{f},\"kernel_release\":{f},\"rootfs_size\":{d},\"rootfs_uncompressed_size\":", .{
         std.json.fmt(session.session_id[0..], .{}),
@@ -4524,6 +4849,18 @@ fn managementNodeReadiness(request: zap.Request, context: *RouteContext, node_id
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_file_missing\",\"message\":\"registered rootfs file is missing\"}}\n", meta);
     if (kernel_stat.kind != .file or initrd_stat.kind != .file or rootfs_stat.kind != .file or rootfs_stat.size != artifact.compressed_size)
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.artifact_drift\",\"message\":\"registered artifact metadata does not match managed files\"}}\n", meta);
+    var kernel_sha256: [64]u8 = undefined;
+    asset_validate.sha256File(context.io, context.config.tftp.asset_root, kernel.path, &kernel_sha256) catch
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.kernel_digest_unavailable\",\"message\":\"cannot validate registered kernel digest\"}}\n", meta);
+    var initrd_sha256: [64]u8 = undefined;
+    asset_validate.sha256File(context.io, paths.require().initrd_dir, initrd_asset.path, &initrd_sha256) catch
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.initrd_digest_unavailable\",\"message\":\"cannot validate registered initrd digest\"}}\n", meta);
+    if (!std.mem.eql(u8, &kernel_sha256, kernel.sha256.?) or !std.mem.eql(u8, &initrd_sha256, initrd_asset.sha256.?))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.boot_asset_digest_mismatch\",\"message\":\"kernel or initrd content digest does not match catalog identity\"}}\n", meta);
+    const rootfs_sha512 = sha512File(context.io, rootfs_path) catch
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_digest_unavailable\",\"message\":\"cannot validate registered rootfs digest\"}}\n", meta);
+    if (!std.mem.eql(u8, &rootfs_sha512, artifact.content_sha512))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_digest_mismatch\",\"message\":\"rootfs content digest does not match registered identity\"}}\n", meta);
     try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"stage\":\"boot\",\"ready\":true,\"rootfs_input_digest\":{f},\"desired_plan_digest\":{f},\"kernel_path\":{f},\"initrd_path\":{f},\"rootfs_file\":{f},\"compressed_bytes\":{d},\"uncompressed_bytes\":", .{
         std.json.fmt(node_id, .{}), std.json.fmt(rootfs_digest, .{}), std.json.fmt(desired_digest, .{}), std.json.fmt(kernel.path, .{}), std.json.fmt(initrd_asset.path, .{}), std.json.fmt(artifact.file, .{}), artifact.compressed_size,
     });
@@ -4571,6 +4908,25 @@ fn managementNodeReadiness(request: zap.Request, context: *RouteContext, node_id
         try output.writer.print("{d},\"initrd_bytes\":{d},\"kernel_bytes\":{d},\"node_payload_bytes\":{d},\"required_min_memory_bytes\":{d},\"memory_bytes\":null,\"memory\":\"unknown\",\"issues\":[],\"warnings\":[{{\"code\":\"readiness.memory_unknown\",\"message\":\"node inventory memory is unknown; initrd will enforce the hard memory gate\"}}]}}}}\n", .{ artifact.uncompressed_size, initrd_stat.size, kernel_stat.size, payload_size, required_total });
     }
     return json(request, .ok, output.written(), meta);
+}
+
+fn sha512File(io: std.Io, path: []const u8) ![128]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false });
+    defer file.close(io);
+    var hash = std.crypto.hash.sha2.Sha512.init(.{});
+    var buffer: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const count = try file.readPositionalAll(io, &buffer, offset);
+        if (count == 0) break;
+        hash.update(buffer[0..count]);
+        offset += count;
+    }
+    var raw: [64]u8 = undefined;
+    hash.final(&raw);
+    var encoded: [128]u8 = undefined;
+    _ = std.fmt.bufPrint(&encoded, "{x}", .{raw}) catch unreachable;
+    return encoded;
 }
 
 /// 计算 effective first-boot content_asset closure 的去重字节数。该值与

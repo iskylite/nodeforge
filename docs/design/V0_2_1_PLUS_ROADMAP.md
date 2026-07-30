@@ -51,7 +51,8 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 - no-side-effect preview 与统一 retry；
 - inventory memory/readiness；
 - session/persistence recovery；
-- x86_64 + aarch64 UEFI、Rocky + Ubuntu、QEMU + VMware 固定矩阵。
+- 当前可用 aarch64 VMware UEFI 上完成 Rocky + Ubuntu 固定矩阵；x86_64 VMware
+  归入当前环境不可验证清单，QEMU 只作可选补充证据。
 
 这一步把 v0.2 系列变成可长期维护的稳定底座。v0.3 不得绕过 v0.2.2，
 否则 BIOS 分支会建立在同步 builder、漂移 CLI 和不完整 restart 语义上。
@@ -96,8 +97,8 @@ downgrade；active immutable delivery snapshot 不重编译。
 - VMware Ubuntu aarch64 UEFI PXE 完整链；**已通过，并复验 tty1/SSH/systemd**
 - 同一候选版本的 Rocky 回归不退化；**Rocky 9.7/10.2 已通过**
 
-独立 QEMU launcher、x86_64/aarch64 双架构和 QEMU/VMware 固定矩阵属于 v0.2.2
-的可运营性发布矩阵，不再重复作为 v0.2.1 的阻断闸。现有
+独立 QEMU launcher 和 x86_64 VMware 不再作为版本阻断闸，统一按
+[`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) 管理。现有
 `tests/v0_2_1_ubuntu_casper_smoke.sh` 保留为实验室回归入口；它当前要求
 x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
@@ -108,7 +109,7 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 - preview 无副作用，retry 为服务端单事务；
 - readiness 可使用可信 memory inventory，unknown 仍由 initrd 硬闸；
 - current CLI reference 从 command spec/实际 tree 生成；
-- 固定矩阵与 workload 证据纳入发布清单。
+- 当前环境必验矩阵与 workload 证据纳入发布清单；QEMU 为可选补充。
 
 ### v0.3
 

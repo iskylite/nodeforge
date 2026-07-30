@@ -53,7 +53,7 @@
 
 ```text
 nodeforge operation show <id>
-nodeforge operation wait <id> [--timeout <seconds>]
+nodeforge operation follow <id> [--timeout <seconds>]
 ```
 
 operation JSON 至少含 `id/kind/resource/state/created_at/updated_at/result/error/revision`；`state` 固定为
@@ -505,7 +505,7 @@ JSON 输出关键字段（用于后续命令的 CAS）：
 
 ```text
 nodeforge node readiness <node> --stage boot
-nodeforge node boot-prepare <node>
+nodeforge node boot preview <node>
 nodeforge node deploy <node> true
 nodeforge node deploy <node> false
 ```
@@ -515,7 +515,8 @@ readiness 检查 rootfs ready、deep validation、delivery manifest、feature/ke
 MAC/IP、quarantine 和 session gate。
 
 `node deploy true` 是唯一启用入口；`node deploy false` 立即阻止新 PXE，但不终止正在下载/运行的 session。
-`node boot-prepare` 为 diskless 节点准备 boot session（签发 config token + agent plan），真实 per-session capsule
+`node boot preview` 严格只读地展示启动选择；真实 boot-prepare 是 daemon 内部
+transition（签发 config token + agent plan），真实 per-session capsule
 在 PXE 请求时随 BootSession/delivery snapshot 原子生成。
 
 ## 9. 阶段 8：唯一状态与观测

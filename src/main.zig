@@ -216,6 +216,10 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addDebugFlag(status);
 
     const operation = try zli.Command.init(init_options, .{ .name = "operation", .description = "Inspect and wait for durable management operations" }, showCurrentHelp);
+    const operation_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List retained durable operations" }, operationListHandler);
+    try addConfigPathFlag(operation_list);
+    try addOutputFlag(operation_list);
+    try addDebugFlag(operation_list);
     const operation_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show one durable operation", .usage = "nodeforge operation show <id> [options]" }, operationShowHandler);
     try operation_show.addPositionalArg(.{ .name = "id", .description = "Opaque operation identifier", .required = true });
     try addConfigPathFlag(operation_show);
@@ -227,7 +231,13 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(operation_wait);
     try addOutputFlag(operation_wait);
     try addDebugFlag(operation_wait);
-    try operation.addCommands(&.{ operation_show, operation_wait });
+    const operation_follow = try zli.Command.init(init_options, .{ .name = "follow", .description = "Follow one durable operation to a terminal state", .usage = "nodeforge operation follow <id> [--timeout <seconds>] [options]" }, operationWaitHandler);
+    try operation_follow.addPositionalArg(.{ .name = "id", .description = "Opaque operation identifier", .required = true });
+    try operation_follow.addFlag(.{ .name = "timeout", .description = "Maximum seconds to follow without cancelling; allowed range: 1..86400 (default: 300)", .type = .Int, .default_value = .{ .Int = 300 } });
+    try addConfigPathFlag(operation_follow);
+    try addOutputFlag(operation_follow);
+    try addDebugFlag(operation_follow);
+    try operation.addCommands(&.{ operation_list, operation_show, operation_follow, operation_wait });
 
     const config = try zli.Command.init(init_options, .{
         .name = "config",
@@ -356,9 +366,9 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addCatalogPathFlag(node_render);
     try addDebugFlag(node_render);
 
-    const node_retry = try zli.Command.init(init_options, .{ .name = "retry", .description = "Rearm the next PXE install generation" }, installRetryHandler);
-    try node_retry.addPositionalArg(.{ .name = "node_id", .description = "Registered install node", .required = true });
-    try node_retry.addFlag(.{ .name = "force", .description = "Supersede a stuck active session and enable deploy=true before rearming", .type = .Bool, .default_value = .{ .Bool = false } });
+    const node_retry = try zli.Command.init(init_options, .{ .name = "retry", .description = "Retry the current install or diskless deployment" }, installRetryHandler);
+    try node_retry.addPositionalArg(.{ .name = "node_id", .description = "Registered node", .required = true });
+    try node_retry.addFlag(.{ .name = "force", .description = "Supersede a stuck active install or diskless session", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(node_retry);
     try addOutputFlag(node_retry);
     try addDebugFlag(node_retry);
@@ -395,15 +405,13 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     });
     try addOutputFlag(node_trace);
 
-    const node_boot_prepare = try zli.Command.init(init_options, .{
-        .name = "boot-prepare",
-        .description = "Prepare a diskless boot session (issue config token + agent plan)",
-        .usage = "nodeforge node boot-prepare <node_id> [options]",
-    }, nodeBootPrepareHandler);
-    try node_boot_prepare.addPositionalArg(.{ .name = "node_id", .description = "Registered diskless node identifier", .required = true });
-    try addConfigPathFlag(node_boot_prepare);
-    try addOutputFlag(node_boot_prepare);
-    try addDebugFlag(node_boot_prepare);
+    const node_boot = try zli.Command.init(init_options, .{ .name = "boot", .description = "Inspect the next boot decision" }, showCurrentHelp);
+    const node_boot_preview = try zli.Command.init(init_options, .{ .name = "preview", .description = "Preview the next boot without creating a session or token" }, nodeBootPreviewHandler);
+    try node_boot_preview.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try addConfigPathFlag(node_boot_preview);
+    try addOutputFlag(node_boot_preview);
+    try addDebugFlag(node_boot_preview);
+    try node_boot.addCommands(&.{node_boot_preview});
 
     const node_readiness = try zli.Command.init(init_options, .{
         .name = "readiness",
@@ -432,8 +440,16 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(node_session_cancel);
     try addDebugFlag(node_session_cancel);
     try node_session.addCommands(&.{ node_session_list, node_session_show, node_session_cancel });
+    const node_postprocess = try zli.Command.init(init_options, .{ .name = "postprocess", .description = "Inspect post-deployment execution state" }, showCurrentHelp);
+    const node_postprocess_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show first-boot postprocess state for a node" }, nodePostprocessShowHandler);
+    try node_postprocess_show.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
+    try node_postprocess_show.addFlag(.{ .name = "phase", .description = "Postprocess phase; v0.2.2 supports first-boot", .type = .String, .default_value = .{ .String = "first-boot" } });
+    try addConfigPathFlag(node_postprocess_show);
+    try addOutputFlag(node_postprocess_show);
+    try addDebugFlag(node_postprocess_show);
+    try node_postprocess.addCommands(&.{node_postprocess_show});
 
-    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_deploy, node_trace, node_boot_prepare, node_readiness, node_session });
+    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_deploy, node_trace, node_boot, node_readiness, node_postprocess, node_session });
     try addValuesCommands(node, init_options, "node");
     try addItemCommands(node, init_options, "node");
     try addNodeSoftwareCommands(node, init_options);
@@ -469,6 +485,12 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_show);
     try addOutputFlag(profile_show);
     try addDebugFlag(profile_show);
+    const profile_clone = try zli.Command.init(init_options, .{ .name = "clone", .description = "Atomically clone a Profile desired configuration", .usage = "nodeforge profile clone <source> <target> [options]" }, profileCloneHandler);
+    try profile_clone.addPositionalArg(.{ .name = "source", .description = "Existing Profile name", .required = true });
+    try profile_clone.addPositionalArg(.{ .name = "target", .description = "New Profile name", .required = true });
+    try addConfigPathFlag(profile_clone);
+    try addOutputFlag(profile_clone);
+    try addDebugFlag(profile_clone);
     const profile_set = try zli.Command.init(init_options, .{
         .name = "set",
         .description = "Modify stored profile properties",
@@ -507,6 +529,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const profile_rootfs_build = try zli.Command.init(init_options, .{ .name = "build", .description = "Build a content-addressed rootfs artifact for a diskless profile from its build projection", .usage = "nodeforge profile rootfs build <profile> [--if-input-digest <hex>] [options]" }, profileRootfsBuildHandler);
     try profile_rootfs_build.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
     try profile_rootfs_build.addFlag(.{ .name = "if-input-digest", .description = "Only build if the current rootfs input digest matches (anti-drift)", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_build.addFlag(.{ .name = "detach", .description = "Return immediately with the durable operation id", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(profile_rootfs_build);
     try addOutputFlag(profile_rootfs_build);
     try addDebugFlag(profile_rootfs_build);
@@ -516,7 +539,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(profile_rootfs_status);
     try addDebugFlag(profile_rootfs_status);
     try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_build, profile_rootfs_register, profile_rootfs_status });
-    try profile.addCommands(&.{ profile_create, profile_remove, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
+    try profile.addCommands(&.{ profile_create, profile_clone, profile_remove, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
     try addValuesCommands(profile, init_options, "profile");
     try addItemCommands(profile, init_options, "profile");
     try addProfileSoftwareCommands(profile, init_options);
@@ -566,7 +589,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .description = "Build, publish, and register a NodeForge diskless initrd",
         .usage = "nodeforge assets initrd build <name> --from-install-source <source> --kernel-release <r> [options]",
         .help = "Prefer --from-install-source: preserves the ISO vendor initrd (including distro patches, firmware, and kernel modules) and appends a NodeForge overlay. Without it, --distro/--version/--arch select the generic dracut fallback. Publishes atomically to the managed initrd store and registers the result.",
-    }, initrdBuildHandler);
+    }, initrdBuildOperationHandler);
     try initrd_build.addPositionalArg(.{ .name = "name", .description = "Canonical initrd asset name", .required = true });
     try initrd_build.addFlags(&.{
         .{ .name = "distro", .description = "Distro name (for example rocky)", .type = .String, .default_value = .{ .String = "" } },
@@ -574,6 +597,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .{ .name = "arch", .description = archFlagHelp, .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "kernel-release", .description = "Installed kernel uname release used by dracut", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "from-install-source", .description = "Derive from this ISO install source's vendor installer initrd (recommended)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "detach", .description = "Return immediately with the durable operation id", .type = .Bool, .default_value = .{ .Bool = false } },
     });
     try addConfigPathFlag(initrd_build);
     try addOutputFlag(initrd_build);
@@ -1809,18 +1833,46 @@ fn statusHandler(ctx: zli.CommandContext) !void {
     setExitCode(ctx, if (view.ok) 0 else 1);
 }
 
-const OperationEnvelope = struct {
-    ok: bool,
-    result: struct {
-        id: []const u8,
-        kind: []const u8,
-        state: []const u8,
-        created_at: i64,
-        updated_at: i64,
-        result: []const u8,
-        error_code: []const u8,
-    },
+const OperationView = struct {
+    id: []const u8,
+    kind: []const u8,
+    state: []const u8,
+    created_at: i64,
+    updated_at: i64,
+    result: []const u8,
+    error_code: []const u8,
 };
+const OperationEnvelope = struct { ok: bool, result: OperationView };
+
+fn operationListHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 6);
+        return;
+    };
+    defer config.deinit();
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.operationsJson(ctx.io, config.value.server.http_port, response) catch null orelse {
+        try writeCommandError(ctx, "operation.unavailable", "daemon operation list is unavailable", 6);
+        return;
+    };
+    const Envelope = struct { ok: bool, result: struct { items: []const OperationView } };
+    const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try writeCommandError(ctx, "operation.invalid_response", "daemon returned a malformed operation list", 1);
+        return;
+    };
+    defer parsed.deinit();
+    var human: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer human.deinit();
+    if (parsed.value.result.items.len == 0) {
+        try human.writer.writeAll("No retained operations.");
+    } else {
+        try human.writer.writeAll("ID                                KIND                   STATE       UPDATED\n");
+        for (parsed.value.result.items) |op| try human.writer.print("{s}  {s}  {s}  {d}\n", .{ op.id, op.kind, op.state, op.updated_at });
+    }
+    try renderOutputDocument(ctx, .{ .human = .{ .text = std.mem.trimEnd(u8, human.written(), "\n") }, .json = body });
+}
 
 fn operationShowHandler(ctx: zli.CommandContext) !void {
     try operationRead(ctx, false);
@@ -1960,6 +2012,47 @@ fn catalogShowHandler(ctx: zli.CommandContext) !void {
 /// 文件打开、SHA-256 计算、候选模型校验及 catalog 原子发布均由 daemon
 /// 管理 API 完成。因此本命令要求 daemon 可达，不是 fresh setup 的离线写入口。
 /// daemon 拒绝或不可达时返回退出码 1，CLI 参数错误返回退出码 2。
+fn initrdBuildOperationHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const name = ctx.getArg("name") orelse return;
+    const source = ctx.flag("from-install-source", []const u8);
+    const kernel_release = ctx.flag("kernel-release", []const u8);
+    if (!nodeforge.config_validate.validLogicalId(name) or !nodeforge.config_validate.validLogicalId(source) or kernel_release.len == 0 or kernel_release.len > 192 or std.mem.indexOfAny(u8, kernel_release, "/\\\x00") != null) {
+        try writeCommandError(ctx, "initrd.invalid_input", "durable initrd build requires a safe name, --from-install-source and --kernel-release", 2);
+        return;
+    }
+    // Explicit tuple flags may be supplied by automation, but the install source is
+    // the authoritative tuple and the daemon validates it from one immutable model pair.
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    var reason: [256]u8 = undefined;
+    const detach = ctx.flag("detach", bool);
+    const body = nodeforge.management_client.initrdBuildJson(ctx.io, config.value.server.http_port, name, source, kernel_release, detach, response, &reason) catch null orelse {
+        const detail = std.mem.sliceTo(&reason, 0);
+        try writeCommandError(ctx, "initrd.build_failed", if (detail.len == 0) "initrd durable operation failed" else detail, 1);
+        return;
+    };
+    const Envelope = struct { ok: bool, result: OperationView };
+    const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        // Cache-hit response intentionally has no operation shape.
+        const human = try std.fmt.allocPrint(ctx.allocator, "initrd already present: {s}", .{name});
+        try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
+        return;
+    };
+    defer parsed.deinit();
+    const op = parsed.value.result;
+    const human = if (detach)
+        try std.fmt.allocPrint(ctx.allocator, "initrd build submitted: operation {s}", .{op.id})
+    else
+        try std.fmt.allocPrint(ctx.allocator, "initrd built and registered: {s} (operation {s})", .{ name, op.id });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
+}
+
 fn initrdBuildHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     const name = ctx.getArg("name") orelse return;
@@ -3903,6 +3996,26 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
     try renderCommandResult(ctx, human, .{ .profile = name, .mode = kind, .install_source = install_source, .boot_bundle = bundle_opt });
 }
 
+fn profileCloneHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const source = ctx.getArg("source") orelse return;
+    const target = ctx.getArg("target") orelse return;
+    if (!nodeforge.config_validate.validLogicalId(source) or !nodeforge.config_validate.validLogicalId(target)) {
+        try writeCommandError(ctx, "profile.clone_invalid", "source and target must be canonical logical identifiers", 2);
+        return;
+    }
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var reason: [256]u8 = undefined;
+    const result = nodeforge.management_client.profileClone(ctx.io, config.value.server.http_port, source, target, &reason);
+    if (!result.healthy) return reportMutationFailure(ctx, result, "profile clone failed");
+    const human = try std.fmt.allocPrint(ctx.allocator, "profile cloned: {s} -> {s}", .{ source, target });
+    try renderCommandResult(ctx, human, .{ .source = source, .target = target });
+}
+
 /// 通过本机 management API 删除一个零引用 Profile。所有错误均复用 mutation
 /// 信封，因此 `profile.in_use`、revision 冲突和 daemon 不可达具有一致退出码。
 fn profileRemoveHandler(ctx: zli.CommandContext) !void {
@@ -4065,6 +4178,26 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     const name = ctx.getArg("name") orelse return;
     const if_input_digest_raw = ctx.flag("if-input-digest", []const u8);
     const if_input_digest: ?[]const u8 = if (if_input_digest_raw.len == 0) null else if_input_digest_raw;
+    if (ctx.flag("detach", bool)) {
+        const response = try allocManagementResponse(ctx);
+        defer ctx.allocator.free(response);
+        var reason: [256]u8 = undefined;
+        const body = nodeforge.management_client.rootfsBuildDetachJson(ctx.io, config.value.server.http_port, name, if_input_digest, response, &reason) catch null orelse {
+            const detail = std.mem.sliceTo(&reason, 0);
+            try writeCommandError(ctx, "rootfs.build_failed", if (detail.len == 0) "rootfs operation submission failed" else detail, 1);
+            return;
+        };
+        const Envelope = struct { ok: bool, result: OperationView };
+        const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+            const human = try std.fmt.allocPrint(ctx.allocator, "rootfs already present for profile {s}", .{name});
+            try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
+            return;
+        };
+        defer parsed.deinit();
+        const human = try std.fmt.allocPrint(ctx.allocator, "rootfs build submitted: operation {s}", .{parsed.value.result.id});
+        try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
+        return;
+    }
     try errorWriter(ctx).print("Requesting rootfs build for profile {s}...\n", .{name});
     if (if_input_digest) |d| try errorWriter(ctx).print("Anti-drift digest: {s}\n", .{d});
     var reason: [256]u8 = undefined;
@@ -4518,6 +4651,44 @@ fn disklessSessionListHandler(ctx: zli.CommandContext) !void {
     try renderOutputDocument(ctx, .{ .human = .{ .text = std.mem.trimEnd(u8, human.written(), "\n") }, .json = body });
 }
 
+fn nodePostprocessShowHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const node_id = ctx.getArg("node_id") orelse return;
+    if (!std.mem.eql(u8, ctx.flag("phase", []const u8), "first-boot")) {
+        try writeCommandError(ctx, "postprocess.invalid_phase", "v0.2.2 supports only --phase first-boot", 2);
+        return;
+    }
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.disklessSessionsJson(ctx.io, config.value.server.http_port, null, response) catch null orelse {
+        try writeCommandError(ctx, "postprocess.unavailable", "cannot read diskless postprocess state", 1);
+        return;
+    };
+    const Envelope = struct { ok: bool, result: struct { items: []const DisklessSessionView } };
+    const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try writeCommandError(ctx, "postprocess.invalid_response", "daemon returned malformed postprocess state", 1);
+        return;
+    };
+    defer parsed.deinit();
+    var selected: ?DisklessSessionView = null;
+    for (parsed.value.result.items) |item| {
+        if (std.mem.eql(u8, item.node_id, node_id)) selected = item;
+    }
+    const item = selected orelse {
+        try writeCommandError(ctx, "postprocess.not_found", "no retained first-boot session exists for this node", 1);
+        return;
+    };
+    const state = if (std.mem.eql(u8, item.phase, "diskless_running")) "succeeded" else if (std.mem.eql(u8, item.phase, "failed")) "failed" else "pending";
+    const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = true, .result = .{ .node_id = node_id, .phase = "first-boot", .state = state, .session_id = item.session_id, .lifecycle_phase = item.phase } }, .{});
+    const human = try std.fmt.allocPrint(ctx.allocator, "Postprocess {s}\nphase: first-boot\nstate: {s}\nsession: {s}\nlifecycle: {s}", .{ node_id, state, item.session_id, item.phase });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = json });
+}
+
 fn disklessSessionShowHandler(ctx: zli.CommandContext) !void {
     try disklessSessionOne(ctx, false);
 }
@@ -4566,6 +4737,45 @@ fn disklessSessionOne(ctx: zli.CommandContext, cancel: bool) !void {
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body.? });
 }
 
+fn nodeBootPreviewHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const node_id = ctx.getArg("node_id") orelse return;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    var reason: [256]u8 = undefined;
+    const body = nodeforge.management_client.nodeBootPreviewJson(ctx.io, config.value.server.http_port, node_id, response, &reason) catch null orelse {
+        const detail = std.mem.sliceTo(&reason, 0);
+        try writeCommandError(ctx, "preview.unavailable", if (detail.len == 0) "boot preview is unavailable" else detail, 1);
+        return;
+    };
+    const Envelope = struct { ok: bool, result: struct {
+        node: []const u8,
+        profile: []const u8,
+        kind: []const u8,
+        deploy: bool,
+        would_boot: bool,
+        rootfs_state: ?[]const u8 = null,
+        boot_bundle: ?[]const u8 = null,
+        kernel: ?[]const u8 = null,
+        initrd: ?[]const u8 = null,
+    } };
+    const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try writeCommandError(ctx, "preview.invalid_response", "daemon returned a malformed boot preview", 1);
+        return;
+    };
+    defer parsed.deinit();
+    const r = parsed.value.result;
+    const human = try std.fmt.allocPrint(ctx.allocator, "Boot Preview: {s}\nprofile: {s}\nkind: {s}\ndeploy: {s}\nwould_boot: {s}\nboot_bundle: {s}\nkernel: {s}\ninitrd: {s}\nrootfs: {s}", .{
+        r.node, r.profile, r.kind, if (r.deploy) "true" else "false", if (r.would_boot) "yes" else "no", r.boot_bundle orelse "<install>", r.kernel orelse "<installer>", r.initrd orelse "<installer>", r.rootfs_state orelse "<not-applicable>",
+    });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
+}
+
 fn installRetryHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
@@ -4574,53 +4784,16 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     };
     defer config.deinit();
     const node_id = ctx.getArg("node_id") orelse return;
-    const force = ctx.flag("force", bool);
-    var catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, nodeforge.paths.require().catalog_dir) catch {
-        try writeCommandError(ctx, "catalog.unavailable", "cannot load the installed catalog", 1);
-        return;
-    };
-    defer catalog.deinit();
-    const node = nodeforge.catalog.findNode(&catalog.value, node_id) orelse {
-        try writeCommandError(ctx, "node.not_found", "node not found", 1);
-        return;
-    };
-    const profile = nodeforge.catalog.findProfile(&catalog.value, node.profile orelse {
-        try writeCommandError(ctx, "node.profile_unassigned", "node has no bound profile", 1);
-        return;
-    }) orelse {
-        try writeCommandError(ctx, "profile.not_found", "node profile not found", 1);
-        return;
-    };
-    if (profile.kind != .install) {
-        try writeCommandError(ctx, "profile.not_install", "node retry only rearms install profiles; diskless nodes boot again when deploy=true, and stuck diskless sessions can be cancelled with 'nodeforge node session cancel <session_id>'", 2);
-        return;
-    }
-    if (!node.deploy and !force) {
-        try ctx.writer.print("Node {s} currently has deploy=false. retry will enable deploy=true before rearming. Continue? [y/N]: ", .{node_id});
-        const answer = ctx.reader.takeDelimiter('\n') catch null;
-        if (answer == null or !(std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r"), "y") or std.ascii.eqlIgnoreCase(std.mem.trim(u8, answer.?, " \t\r"), "yes"))) {
-            try writeCommandError(ctx, "deploy.confirmation_required", "retry aborted; use --force to enable deploy=true without prompting", 2);
-            return;
-        }
-    }
-    // retry 的用户语义是“允许下一次 PXE 再执行”。若节点仍 deploy=false，单纯
-    // 增加 generation 仍会被 resolver 拒绝，因此先启用 deploy，再 rearm。
-    var deploy_reason: [256]u8 = undefined;
-    const deploy_result = nodeforge.management_client.scalarMutations(ctx.io, config.value.server.http_port, "node", node_id, &.{.{ .key = "deploy", .value = "true" }}, force, &deploy_reason);
-    if (!deploy_result.healthy) return reportMutationFailure(ctx, deploy_result, "retry could not enable deployment");
-    if (force) {
-        var reason: [256]u8 = undefined;
-        const result = nodeforge.management_client.installGenerationsForce(ctx.io, config.value.server.http_port, node_id, &reason);
-        if (!result.healthy) return reportMutationFailure(ctx, result, "forced install retry failed: daemon unreachable");
-        const human = try std.fmt.allocPrint(ctx.allocator, "active install session superseded; generation rearmed for {s}; waiting for next PXE", .{node_id});
-        try renderCommandResult(ctx, human, .{ .node_id = node_id, .deploy = true, .superseded_active_session = true });
-        return;
-    }
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
     var reason: [256]u8 = undefined;
-    const result = nodeforge.management_client.installGenerations(ctx.io, config.value.server.http_port, node_id, &reason);
-    if (!result.healthy) return reportMutationFailure(ctx, result, "install retry failed: daemon unreachable");
-    const human = try std.fmt.allocPrint(ctx.allocator, "install generation rearmed for {s}; waiting for next PXE", .{node_id});
-    try renderCommandResult(ctx, human, .{ .node_id = node_id, .deploy = true });
+    const body = nodeforge.management_client.nodeRetryJson(ctx.io, config.value.server.http_port, node_id, ctx.flag("force", bool), response, &reason) catch null orelse {
+        const detail = std.mem.sliceTo(&reason, 0);
+        try writeCommandError(ctx, "retry.failed", if (detail.len == 0) "node retry failed" else detail, 1);
+        return;
+    };
+    const human = try std.fmt.allocPrint(ctx.allocator, "deployment retry accepted for {s}; waiting for next PXE", .{node_id});
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
 }
 
 fn nodeDeployHandler(ctx: zli.CommandContext) !void {

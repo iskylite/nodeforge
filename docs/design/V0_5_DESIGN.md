@@ -136,7 +136,8 @@ v0.4 升级前已创建的 active/recoverable BootConfig v4 session 继续消费
 ```text
 nodeforge profile set <profile> diskless.overlay.mode=squashfs_overlay
 nodeforge profile set <profile> diskless.overlay.mode=ram_rootfs
-nodeforge node effective <node>             # 投影绑定 Profile 的 rootfs mode 与节点内存预算
+nodeforge node show <node>                  # Effective 分区展示绑定 Profile 的 rootfs mode
+nodeforge node boot preview <node>          # 展示本次启动选择与节点内存预算
 nodeforge profile rootfs status <profile>   # 显示所选交付形态/digest/uncompressed_size（复用 v0.2 命令）
 ```
 

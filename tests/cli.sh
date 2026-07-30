@@ -6,7 +6,7 @@ daemon=$2
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 direct_writes=$(grep -Ec 'ctx\.writer\.(writeAll|print|writeByte)\(' "$root/src/main.zig" || true)
-test "$direct_writes" -eq 8
+test "$direct_writes" -eq 7
 test "$(grep -Fc 'ctx.writer.print("This will permanently purge NodeForge state' "$root/src/main.zig")" -eq 1
 test "$(grep -Fc 'ctx.writer.print("This will back up and reset NodeForge startup configuration' "$root/src/main.zig")" -eq 1
 test "$(grep -Fc 'ctx.writer.print("This will modify {s}. Continue?' "$root/src/main.zig")" -eq 1
@@ -141,7 +141,7 @@ grep -Fq '1..32' "$tmp/node-set-help-full"
 "$cli" node unset --help >"$tmp/node-unset-help"
 grep -Fq 'overrides.* scalar keys' "$tmp/node-unset-help"
 "$cli" node retry --help >"$tmp/node-retry-help"
-grep -Fq 'Supersede a stuck active session' "$tmp/node-retry-help"
+grep -Fq 'Supersede a stuck active install or diskless session' "$tmp/node-retry-help"
 "$cli" node render --help >"$tmp/node-render-help"
 if grep -Eq '^   .*--output' "$tmp/node-render-help"; then
     echo "node render emits an answer artifact and must not expose a view-format flag" >&2
@@ -196,8 +196,17 @@ grep -Fq -- '--uncompressed-size' "$tmp/profile-rootfs-register-help"
 grep -Fq -- '--path' "$tmp/profile-rootfs-register-help"
 "$cli" profile rootfs status --help >"$tmp/profile-rootfs-status-help"
 grep -Fq 'registered rootfs artifact' "$tmp/profile-rootfs-status-help"
-"$cli" node boot-prepare --help >"$tmp/node-boot-prepare-help"
-grep -Fq 'diskless boot session' "$tmp/node-boot-prepare-help"
+"$cli" node boot preview --help >"$tmp/node-boot-preview-help"
+grep -Fq 'without creating a session or token' "$tmp/node-boot-preview-help"
+if "$cli" node boot-prepare --help >"$tmp/node-boot-prepare-help" 2>&1; then
+    echo "boot-prepare must be an internal runtime transition, not a public CLI command" >&2
+    exit 1
+fi
+"$cli" profile clone --help >"$tmp/profile-clone-help"
+grep -Fq 'Atomically clone a Profile desired configuration' "$tmp/profile-clone-help"
+"$cli" operation list --help >"$tmp/operation-list-help"
+"$cli" operation follow --help >"$tmp/operation-follow-help"
+grep -Fq 'without cancelling' "$tmp/operation-follow-help"
 
 "$cli" assets import --help >"$tmp/assets-import-help"
 grep -Fq -- '--qualifier' "$tmp/assets-import-help"
@@ -279,9 +288,9 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-"$cli" --version | grep -Eq '^nodeforge 0\.2\.1 \(commit [0-9a-f]{12}|unknown'
+"$cli" --version | grep -Eq '^nodeforge 0\.2\.2 \(commit [0-9a-f]{12}|unknown'
 "$cli" -v | grep -Fq 'built '
-"$daemon" --version | grep -Eq '^nodeforged 0\.2\.1 \(commit [0-9a-f]{12}|unknown'
+"$daemon" --version | grep -Eq '^nodeforged 0\.2\.2 \(commit [0-9a-f]{12}|unknown'
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then

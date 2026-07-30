@@ -419,6 +419,17 @@ pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []
     return managementMutation(io, port, "POST", "/api/v1/management/profiles", rendered, revision, reason_buf);
 }
 
+pub fn profileClone(io: std.Io, port: u16, source: []const u8, target: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(source) or !querySafe(target)) return .{ .reachable = false, .healthy = false };
+    var body: [384]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&body, "{{\"target\":{f}}}", .{std.json.fmt(target, .{})}) catch
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.clone_invalid", "profile clone request is too large") };
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/clone", .{source}) catch return .{ .reachable = false, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", route, rendered, revision, reason_buf);
+}
+
 /// 删除未被 Node 引用的 Profile。客户端先读取当前 catalog revision，并通过
 /// `If-Match` 提交 DELETE，确保检查引用关系和删除发生在同一 generation 上。
 pub fn profileRemove(io: std.Io, port: u16, name: []const u8, reason_buf: []u8) Mutation {
@@ -533,6 +544,63 @@ pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]
     return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.timeout", "rootfs build did not finish within four hours") };
 }
 
+pub fn rootfsBuildDetachJson(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, output: []u8, reason_buf: []u8) !?[]const u8 {
+    if (!querySafe(name)) return null;
+    var body: [1024]u8 = undefined;
+    const rendered = if (if_input_digest) |digest|
+        try std.fmt.bufPrint(&body, "{{\"if_input_digest\":{f}}}", .{std.json.fmt(digest, .{})})
+    else
+        try std.fmt.bufPrint(&body, "{{}}", .{});
+    var path: [256]u8 = undefined;
+    const route = try std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name});
+    const reply = try managementPostJson(io, port, route, rendered, null, output, null);
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body| _ = formatErrorReason(reason_buf, err_body);
+        return null;
+    }
+    return reply.body;
+}
+
+/// 提交 initrd durable operation。`detach=true` 返回初始 operation；否则跟随
+/// Location 到终态。返回的 JSON 始终位于调用方提供的 `output` 中。
+pub fn initrdBuildJson(io: std.Io, port: u16, name: []const u8, install_source: []const u8, kernel_release: []const u8, detach: bool, output: []u8, reason_buf: []u8) !?[]const u8 {
+    if (!querySafe(name) or !querySafe(install_source)) return null;
+    var body: [1024]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&body, "{{\"name\":{f},\"install_source\":{f},\"kernel_release\":{f}}}", .{ std.json.fmt(name, .{}), std.json.fmt(install_source, .{}), std.json.fmt(kernel_release, .{}) }) catch return null;
+    var location: [256]u8 = undefined;
+    var reply = try managementPostJson(io, port, "/api/v1/management/initrds/build", rendered, null, output, &location);
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body| _ = formatErrorReason(reason_buf, err_body);
+        return null;
+    }
+    if (reply.status != 202 or detach) return reply.body;
+    const initial_location = reply.location orelse {
+        _ = formatPlain(reason_buf, "operation.invalid_response", "accepted initrd build has no Location");
+        return null;
+    };
+    var operation_path: [256]u8 = undefined;
+    if (initial_location.len > operation_path.len) return null;
+    @memcpy(operation_path[0..initial_location.len], initial_location);
+    const operation_route = operation_path[0..initial_location.len];
+    var attempts: usize = 0;
+    while (attempts < 60 * 60 * 4) : (attempts += 1) {
+        const operation_body = reply.body orelse return null;
+        switch (operationState(operation_body) orelse return null) {
+            .succeeded => return operation_body,
+            .failed => {
+                _ = operationFailureReason(reason_buf, operation_body);
+                return null;
+            },
+            .pending => {},
+        }
+        std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
+        reply = try getReply(io, port, operation_route, output, null);
+        if (reply.status < 200 or reply.status >= 300) return null;
+    }
+    _ = formatPlain(reason_buf, "operation.timeout", "initrd build did not finish within one hour");
+    return null;
+}
+
 /// v0.2: 为 diskless 节点创建交付 session（POST boot-prepare）。
 /// 返回 capsule 交付所需的 config_token、session_id、agent_plan_digest 等。
 pub fn bootPrepareJson(io: std.Io, port: u16, node_id: []const u8, output: []u8, reason_buf: []u8) !?[]const u8 {
@@ -567,11 +635,41 @@ pub fn nodeReadinessJson(io: std.Io, port: u16, node_id: []const u8, stage: []co
     return reply.body;
 }
 
+pub fn nodeBootPreviewJson(io: std.Io, port: u16, node_id: []const u8, output: []u8, reason_buf: []u8) !?[]const u8 {
+    if (!querySafe(node_id)) return null;
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/boot-preview", .{node_id}) catch return null;
+    const reply = try managementPostJson(io, port, route, "{}", null, output, null);
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body| _ = formatErrorReason(reason_buf, err_body);
+        return null;
+    }
+    return reply.body;
+}
+
+pub fn nodeRetryJson(io: std.Io, port: u16, node_id: []const u8, force: bool, output: []u8, reason_buf: []u8) !?[]const u8 {
+    if (!querySafe(node_id)) return null;
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/retry", .{node_id}) catch return null;
+    var body: [32]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&body, "{{\"force\":{s}}}", .{if (force) "true" else "false"});
+    const reply = try managementPostJson(io, port, route, rendered, null, output, null);
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body| _ = formatErrorReason(reason_buf, err_body);
+        return null;
+    }
+    return reply.body;
+}
+
 pub fn operationJson(io: std.Io, port: u16, operation_id: []const u8, output: []u8) !?[]const u8 {
     if (!querySafe(operation_id)) return null;
     var path: [256]u8 = undefined;
     const route = std.fmt.bufPrint(&path, "/api/v1/management/operations/{s}", .{operation_id}) catch return null;
     return managementJson(io, port, route, output);
+}
+
+pub fn operationsJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    return managementJson(io, port, "/api/v1/management/operations", output);
 }
 
 pub fn disklessSessionsJson(io: std.Io, port: u16, session_id: ?[]const u8, output: []u8) !?[]const u8 {

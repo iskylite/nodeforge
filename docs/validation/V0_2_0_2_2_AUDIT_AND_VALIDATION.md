@@ -246,3 +246,36 @@ r97n1 login:
 因此最终验收结论是：Ubuntu diskless 的受管生命周期、systemd/SSH 运行态和
 VMware tty1 交互控制台三项均通过。后续回归不得只以 lifecycle running 替代
 控制台可用性检查。
+
+## 2026-07-30 v0.2.2 fresh CLI 发布候选复验
+
+候选 `2086355aaaba`（工作树包含本轮 v0.2.2 改动）在 r97n0 从空数据执行 setup，
+所有产品配置与制品均由公开 CLI 创建。四个 aarch64 ReleaseSafe 产物摘要为：
+
+```text
+nodeforge         92a447066bf39a63c6ca2abc167841c49230aae9c6d8a59edb3ae26a58077206
+nodeforged        02d057b75eaa6ef45c151f42d7f4c16c8216e22c0c13ff70b7931bcc4c0eed03
+nodeforge-initrd  0414194a4632dadd9fef15a483f125c82110fd2316dc613bd6ceb316e8e5ec02
+nodeforge-agent   37cbd665eb36237c43a1a477c4bea9d259a1a51762cd3eedfa2201d11b07cda9
+```
+
+Rocky 9.7 Minimal、Rocky 10.2 DVD 与 Ubuntu 22.04.5 ISO import operation 均
+成功；三套 initrd build 与三套 rootfs build operation 均为 `succeeded`。六个
+install/diskless Profile 均通过 catalog 校验。
+
+VMware Fusion aarch64 r97n1 的复验结果：
+
+- Ubuntu 22.04.5 install generation 2 完成；
+- Rocky 9.7 install generation 3 完成，applied/desired plan digest 一致；
+- Rocky 9.7 diskless session `63da1b2cd8b1406d48123b927c357924` 到达
+  `diskless_running`；
+- Ubuntu diskless session `2a402a4d7322ca66bbae83d264a96e73` event_seq 0–6
+  连续并到达 `diskless_running`；
+- 两套 diskless 的 readiness/boot preview 均通过，preview 未创建 session；
+- Ubuntu diskless first-boot postprocess 为 `succeeded`，trace 无 gap；
+- guest hostname、`/etc/hosts`、NodeForge-only repository 与 root SSH
+  authentication 均符合 effective plan。
+
+本地 `zig build test --summary all` 为 397/397 通过，CLI、HTTP 与 setup shell
+契约步骤全部成功。x86_64 VMware 仍按
+`docs/design/LOCAL_VALIDATION_DEFERRED.md` 不进入本地完成闸。

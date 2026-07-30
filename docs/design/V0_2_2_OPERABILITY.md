@@ -16,7 +16,7 @@ v0.2.2 不增加新的部署形态。它把 v0.2.0/v0.2.1 已有能力收敛为�
 | CLI | primary/advanced/internal 分层、preview、统一 retry、正式 reference |
 | readiness | 可信 memory inventory、制品 deep validation、统一预算公式 |
 | recovery | session/capsule/operation restart、expiry、partial artifact 处理 |
-| matrix | arch/distro/hypervisor/fault 固定发布矩阵 |
+| matrix | 当前可用 VMware 环境中的 distro/lifecycle/fault 固定发布矩阵 |
 | capacity | v0.2 规模内的有界并发与资源预算；大规模生产压测仍属 v0.4 |
 
 不包含 BIOS/PXELINUX（v0.3）、多 NIC/topology（v0.4）、ram_rootfs（v0.5）。
@@ -79,7 +79,6 @@ queued -> running -> succeeded | failed
 以 `CURRENT_CLI_OPTIMIZATION_PLAN.md` 为目标，v0.2.2 至少落地：
 
 - `profile clone`（无运行时继承）；
-- `profile effective` / `node effective`；
 - `node boot preview`：编译目标、路径、feature、memory budget，但不创建 session/token；
 - kind-aware `node retry`：服务端原子决定 deploy/rearm/cancel/supersede；
 - `node postprocess show`；
@@ -88,6 +87,10 @@ queued -> running -> succeeded | failed
 
 preview 与 prepare 必须使用不同 handler/type。preview 不能写 state、创建 operation、
 消耗 generation 或签发 credential。
+
+`profile show` / `node show` 已按 Stored / Overrides / Effective / Runtime 展示事实，
+因此不再增加重复的 `profile effective` / `node effective` 命令。需要启动决策投影时使用
+职责独立、严格只读的 `node boot preview`。
 
 ## 5. Readiness 与 inventory
 
@@ -127,15 +130,15 @@ BootConfig v3 `facts_url` 上报 MemTotal，安装器 facts 同样携带该字�
 - terminal/cancel/expiry 立即撤销全部 scope；
 - operation/session retention 有明确数量/时间上限。
 
-## 7. 固定发布矩阵
+## 7. 当前环境发布矩阵
 
-最低矩阵：
+最低必测矩阵：
 
 | 维度 | 必测 |
 |---|---|
-| arch | aarch64、x86_64 |
+| arch | 当前 VMware 可运行的 aarch64；x86_64 交叉编译与自动化检查 |
 | distro | Rocky/RHEL family、Ubuntu 22.04 LTS |
-| environment | QEMU UEFI、VMware UEFI |
+| environment | VMware UEFI |
 | network | DHCP DORA、Range 中断恢复、daemon restart |
 | memory | 等号边界、低于阈值、unknown inventory |
 | lifecycle | running、first-boot failure/retry/journal、cancel/expiry |
@@ -145,6 +148,10 @@ BootConfig v3 `facts_url` 上报 MemTotal，安装器 facts 同样携带该字�
 每次发布记录候选 commit、四产物 digest、测试脚本版本、虚拟机配置、事件链和
 失败注入结果。单独手工 smoke 不能替代矩阵。
 
+x86_64 VMware 当前无法在本地环境执行，不进入 v0.2.2 完成闸；QEMU 为可选诊断和
+故障注入工具，VMware 产品链已经通过时不要求重复执行 QEMU。不可验证项和解除条件统一见
+[`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md)。
+
 ## 8. 完成标准
 
 - P0 state schema rename 兼容问题关闭；
@@ -152,5 +159,5 @@ BootConfig v3 `facts_url` 上报 MemTotal，安装器 facts 同样携带该字�
 - preview 无副作用、retry 单事务、CLI reference 与实际 tree 一致；
 - memory inventory/readiness 与 initrd 公式 fixture 一致；
 - restart、partial、expiry、token recovery 负向测试通过；
-- 固定矩阵由同一发布候选完成；
+- 当前环境必验矩阵由同一发布候选完成；
 - v0.3 进入条件所需的稳定 schema v4/BC v3/AP v1 基线冻结。

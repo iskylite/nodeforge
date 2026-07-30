@@ -249,7 +249,7 @@ builder 的固定过程（6 阶段流水线，对应 `src/http/server.zig` `mana
 
 ```text
 nodeforge node readiness c001 --stage boot
-nodeforge node boot-prepare c001
+nodeforge node boot preview c001
 nodeforge node deploy c001 true
 nodeforge node show c001
 ```

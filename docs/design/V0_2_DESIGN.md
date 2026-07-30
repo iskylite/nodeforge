@@ -7,7 +7,8 @@
 > 2026-07-29 实现基线：config/catalog 为 v4-only，BootConfig v3、AgentPlan v1、
 > Rocky aarch64 QEMU/VMware UEFI diskless 和 content-addressed first-boot payload
 > 已完成。rootfs durable operation、旧状态迁移与可信 memory inventory/readiness
-> 已落地；Ubuntu casper 正式 builder、其余 CLI 收敛与 x86_64 固定矩阵尚未完成。详见
+> 已落地；Ubuntu casper 正式 builder 已完成，其余 CLI 收敛仍在进行。当前环境无法
+> 执行的 x86_64 VMware 验证单独跟踪，不阻塞 v0.2.2。详见
 > [`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)；
 > 后续顺序见 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md)。
 
@@ -538,7 +539,7 @@ v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不�
 |---|---|---|
 | v0.2.0 | Rocky/RHEL diskless | M5 内存无盘启动 + M7 diskless 后处理；aarch64 QEMU/VMware 已验证 |
 | v0.2.1 | Ubuntu diskless | Ubuntu casper productization，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
-| v0.2.2 | 可运营性和固定矩阵 | 持久化兼容、durable builder、CLI 收敛、memory readiness、x86_64/aarch64 UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md) |
+| v0.2.2 | 可运营性和当前环境矩阵 | 持久化兼容、durable builder、CLI 收敛、memory readiness、aarch64 VMware UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md)；本地不可验证项见 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) |
 | v0.3 | PXELINUX/BIOS install | M6 BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v5 + M7 `install-post`，见 `V0_3_DESIGN.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 | v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
@@ -1349,7 +1350,7 @@ revision，`retry` 只重跑明确 retryable 的失败 step。脱敏：token、A
 PropertySpec/CollectionSpec/ItemSpec 再给 handler；预留 enum/空 handler 不算实现。
 
 **v0.2（diskless）**：`operation show/wait`、`profile list/create --kind diskless`、`profile set diskless.provision.bundle/overlay.*/failure.*`、
-`profile effective`、`node add/set/effective`、`assets managed-file|archive|script import`、`assets provision-bundle create/list/item add/set/remove/move/replace-items`、
+`node add/set`、`profile show` / `node show` 的 Effective 分区、`assets managed-file|archive|script import`、`assets provision-bundle create/list/item add/set/remove/move/replace-items`、
 `assets nodeforge-initrd config/build`、`profile rootfs plan/build/status`、`node readiness --stage build|boot`、
 `node boot preview`、`node diskless retry`、`node postprocess show`、
 `node trace`、`runtime dhcp-leases|tftp-sessions`、`events list|follow|types`、`nodeforge status`、`preflight diskless-builder`。
@@ -1448,7 +1449,8 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
   `node_status` 不丢失早期诊断状态。
 - Node current state 是 `kind` tagged union；同一 Node 不可同时存在 install/diskless current projection 或两个
   active session。跨 kind 换绑仅在 `deploy=false` 且无 active/recoverable session 时允许，历史只进 trace。
-- `squashfs_overlay`（v0.2 唯一 rootfs 形态）通过 UEFI x86_64/aarch64 QEMU smoke + VMware 虚拟机部署（compute_use）
+- `squashfs_overlay`（v0.2 唯一 rootfs 形态）通过当前可用 aarch64 VMware UEFI
+  虚拟机部署；QEMU 为可选补充，x86_64 VMware 按不可验证清单管理
   实机代理验证；至少一架构完成断网恢复、switch_root、running event 和 retry 闭环，覆盖真机 NIC/firmware/内存差异。
   大镜像内存预算场景在 uncompressed size 已知时按统一 `available_budget` 计 squashfs compressed size +
   uncompressed size + 完整 upper limit + safety margin；readiness
@@ -1542,7 +1544,8 @@ v0.2 进入条件，且未触碰任何代码。
 daemon 依赖约定；补 `profile list`、`provision-bundle list/item remove`、per-action 字段矩阵、`preflight` human 输出、
 `rootfs plan` JSON digest 字段、`boot preview`/`node status`/`runtime`/`status --component` 输出格式、`postprocess` 默认 session
 与 `--include-output` 语义；新增 §13 digest 流转表与从零启用流程示例；统一 `preflight diskless-builder` 命令形式
-（`V0_2_DISKLESS_WORKFLOW.md` 同步）；补 `profile create` 默认 `--kind install`、`node effective` vs `node show` 区分、
+（`V0_2_DISKLESS_WORKFLOW.md` 同步）；补 `profile create` 默认 `--kind install`；后续
+CLI 收敛裁决不再新增 `node effective`，由 `node show` Effective 分区与 `node boot preview` 分担、
 `profile/node remove` 为 v0.2 非目标（§7）。`V0_3/V0_4` 的 `postinstall` 统一为 `postprocess`。全部改动未触碰代码、未改变 v0.1 冻结
 owner 或 v0.2 进入条件。
 

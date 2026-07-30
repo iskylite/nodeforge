@@ -339,7 +339,7 @@ test "$code" = 404
 # aligned with the daemon's canonical `armed_at` field.
 "$cli" node retry contract-node --force >"$tmp/node-retry"
 "$cli" node show contract-node -o json >"$tmp/node-show-armed"
-jq -e '.ok and .result.deployment.install_intent == "retry-armed" and (.result.deployment.armed_at > 0)' "$tmp/node-show-armed" >/dev/null
+jq -e '.ok and .result.deployment.install_intent == "retry-armed" and .result.deployment.pxe_ready == true and (.result.deployment.requested_plan_digest == .result.deployment.desired_plan_digest) and (.result.deployment.armed_at > 0)' "$tmp/node-show-armed" >/dev/null
 
 "$cli" catalog validate >"$tmp/validate"
 grep -Fq 'catalog valid' "$tmp/validate"

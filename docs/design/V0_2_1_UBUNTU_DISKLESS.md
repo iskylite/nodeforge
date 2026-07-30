@@ -24,7 +24,9 @@
 > ISO 产品 CLI rootfs 构建，并由 VMware Fusion `r97n1` 连续两次 UEFI PXE
 > 到达 `diskless.running`。后续又以同一候选完成 Rocky 9.7、Rocky 10.2 与
 > Ubuntu 22.04.5 冷启动回归，并修复/复验 Ubuntu 标准 tty1 登录控制台。
-> 独立 QEMU 与双架构固定矩阵归入 v0.2.2。
+> v0.2.2 的现行完成闸只要求当前可用的 aarch64 VMware 矩阵。QEMU 为可选补充；
+> x86_64 VMware 归入 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md)，
+> 不阻塞版本完成。
 
 ## 0. 版本定位
 
@@ -447,7 +449,9 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
 
 ### 6.4 不纳入 v0.2.1 的项
 
-- 更大范围发行版/架构/实机矩阵 → v0.2.2；Ubuntu 与 Rocky 的基本 QEMU/VMware 产品闭环属于 v0.2.1。
+- 更大范围发行版/架构/实机验证按当前环境能力执行；Ubuntu 与 Rocky 的 aarch64
+  VMware 产品闭环属于 v0.2.1 已有证据。QEMU 不作为重复完成闸，x86_64 VMware
+  按不可验证清单管理。
 - apt `--installroot` 跨根安装（替代 casper squashfs 方案）→ 未来版本评估。
 - 从 rootfs 构建 initrd（chroot + apt install linux-image + mkinitramfs）→ 已验证可行但复杂度高（见 §9），保留为未来优化选项。
 - 临时 PXE rootfs 构建节点（在真实 Ubuntu 内核态构建）→ v0.4。

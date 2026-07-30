@@ -98,6 +98,33 @@ pub fn removeProfile(io: std.Io, allocator: std.mem.Allocator, config: *const mo
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
+/// 原子克隆一个 Profile 的完整 desired 配置。
+///
+/// Profile 不包含 runtime/session/operation，因此只复制 catalog-owned desired
+/// shape。目标名称必须是 canonical logical id 且不存在；source 与 target 在同一
+/// catalog generation 中完成查找、校验和发布，不暴露半克隆状态。
+pub fn cloneProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, source_name: []const u8, target_name: []const u8) !void {
+    if (!validate.validLogicalId(target_name)) return error.InvalidProfileName;
+    var parsed = try catalog_store.load(io, allocator, catalog_path);
+    defer parsed.deinit();
+    var source: ?model.ProfileConfig = null;
+    for (parsed.value.profiles) |profile| {
+        if (std.mem.eql(u8, profile.name, target_name)) return error.ProfileAlreadyExists;
+        if (std.mem.eql(u8, profile.name, source_name)) source = profile;
+    }
+    var cloned = source orelse return error.ProfileNotFound;
+    cloned.name = target_name;
+    const profiles = try allocator.alloc(model.ProfileConfig, parsed.value.profiles.len + 1);
+    defer allocator.free(profiles);
+    @memcpy(profiles[0..parsed.value.profiles.len], parsed.value.profiles);
+    profiles[parsed.value.profiles.len] = cloned;
+    var candidate = parsed.value;
+    candidate.profiles = profiles;
+    const projected = model.projectCatalog(config.*, &candidate);
+    try validate.validate(&projected, &candidate);
+    try catalog_store.save(io, allocator, catalog_path, &candidate);
+}
+
 /// 修改已有 profile 的 kernel_args 字段。
 ///
 /// 执行 load-find-canonicalize-validate-save 事务。

@@ -8,7 +8,7 @@ pub const max_operations = 128;
 /// 终态条目的保留时间（24 小时）。超过此时间的终态条目可被新操作复用槽位。
 pub const retention_seconds: i64 = 24 * 60 * 60;
 /// 操作类型。长任务必须先持久化 operation，再由 worker 执行。
-pub const Kind = enum { install_source_import, rootfs_build };
+pub const Kind = enum { install_source_import, rootfs_build, initrd_build };
 /// 操作状态机。
 pub const State = enum { queued, running, succeeded, failed };
 
@@ -56,7 +56,7 @@ pub const Entry = struct {
 
 /// 磁盘上的操作记录。字符串借用自 JSON 缓冲区。
 const DiskEntry = struct { id: []const u8, idempotency_key: []const u8, request_digest: ?[]const u8 = null, kind: Kind, state: State, created_at: i64, updated_at: i64, result: ?[]const u8 = null, error_code: ?[]const u8 = null };
-const File = struct { schema_version: u32 = 2, entries: []const DiskEntry = &.{} };
+const File = struct { schema_version: u32 = 3, entries: []const DiskEntry = &.{} };
 /// `begin` / `beginRequest` 的返回值。`reused=true` 表示命中已有成功或在途操作：
 /// 成功态调用方直接返回缓存 result，queued/running 则返回同一 operation 并且
 /// 不得重复入队；`reused=false` 表示创建了新操作，调用方负责实际工作及终态写入。
@@ -215,7 +215,7 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    if ((parsed.value.schema_version != 1 and parsed.value.schema_version != 2) or parsed.value.entries.len > max_operations) return error.InvalidOperationsState;
+    if ((parsed.value.schema_version < 1 or parsed.value.schema_version > 3) or parsed.value.entries.len > max_operations) return error.InvalidOperationsState;
     for (parsed.value.entries, 0..) |disk, index| {
         if (!boot_session.validId(disk.id) or disk.idempotency_key.len == 0 or disk.idempotency_key.len > 128) return error.InvalidOperationsState;
         if ((disk.state == .queued or disk.state == .running)) {
