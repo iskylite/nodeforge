@@ -314,15 +314,14 @@ manifest、event 或日志都不得包含 private key bytes。
   `firmware.mode`/`install-post` schema v6；v0.4 schema v7；v0.5 rootfs 形态 schema v8，见
   [`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
 - v0.2.2 不提供 `catalog migrate` CLI 命令；schema v4 是其唯一标准。后续版本
-  （v0.2.3-v0.5）新增 schema 变更时，rollback 只指 migration transaction finalize 前，按 durable migration journal
-  恢复 pre-migration snapshot；它不承诺任意已写入新特性后的版本 downgrade。
-- schema downgrade 必须先做 representability preflight。任一资源包含目标旧 schema 无法表达的 kind/field/item 时返回
-  `migration.non_representable`，JSON 至少列出 `resource_type/resource_id/path/reason/target_schema`；不得通过 nullable、
-  默认值替换、丢字段或丢 collection identity/order 强行降级。
+  （v0.2.3-v0.5）新增 schema 变更时采用**直接替换**：代码中的版本校验从旧版本
+  改为新版本，旧 schema catalog 不被加载（`UnsupportedSchemaVersion`），操作员
+  需重新 `setup`。不实现迁移、rollback、downgrade 检查或 migration journal。
 - active/recoverable session、install generation 和 builder attempt 始终消费创建时 immutable delivery snapshot；catalog
-  migration apply/rollback/downgrade 不重编译、不改写或撤销这些 snapshot。迁移只能在持久引用仍可保留时 finalize。
-- 各版本迁移验收必须覆盖：正向 apply、finalize 前 journal rollback、可表示 downgrade、不可表示 downgrade 和活动
-  snapshot 跨迁移继续完成。旧 initrd 未声明 feature 时仅阻止新 readiness/delivery，不静默忽略，也不杀死旧 active snapshot。
+  schema 替换不重编译、不改写或撤销这些 snapshot。旧 rootfs artifact 按 digest
+  自然不会命中新 schema 的 build。
+- 各版本 schema 替换验收必须覆盖：新版本 catalog 正常加载、旧版本 catalog
+  被拒绝、活动 snapshot 跨版本替换继续完成。旧 initrd 未声明 feature 时仅阻止新 readiness/delivery，不静默忽略，也不杀死旧 active snapshot。
 
 ## 6. event 脱敏
 

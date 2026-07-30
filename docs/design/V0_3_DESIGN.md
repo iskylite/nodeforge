@@ -52,11 +52,8 @@ install 侧 first-boot agent（-> v0.4）；reconciliation/远程控制（永久
 ### 4.1 firmware.mode
 
 - 新增 Node direct `firmware.mode=uefi|bios`（schema v6）；**不**放入 Profile 或 `overrides`。
-- schema v5 到 v6 既有 Node migration 默认物化 `uefi`；新认领 Node 必须由管理员确认 desired `firmware.mode`。
-- migration transaction finalize 前可由 journal 回滚到完整 v4；finalize 后只有所有 Node 均为 `uefi`、不存在
-  install-post v5-only canonical item 且其他资源均可由 v4 表达时才允许 downgrade。任一
-  `firmware.mode=bios` 或 v5-only install-post item
-  返回 `migration.non_representable`，并列出 resource/path/reason；活动 v4/v5 snapshot 不随 catalog 迁移重编译。
+- schema v5 到 v6 采用直接替换（不迁移，见 v0.2.3 设计 §0）；旧 v5 catalog
+  不被加载，操作员需重新 `setup`，新认领 Node 必须由管理员确认 desired `firmware.mode`。
 - DHCP observed firmware 只用于 mismatch/readiness 检查，不自动改写 desired property。
 - partition policy 仍用 v0.1 逻辑磁盘角色，由 effective compiler 结合 firmware 生成 ESP/biosboot 要求。
 - `node.http_accel` 继续只适用于 UEFI GRUB；BIOS PXELINUX capability 必须报告 `property.not_applicable`，
@@ -158,9 +155,9 @@ nodeforge node postprocess show <node> --phase install-post [--generation <id>]
 
 ## 9. 完成标准
 
-- schema v6 migration 将全部 v5 Node 显式物化 `firmware.mode=uefi`；finalize 前 journal rollback、可表示 downgrade、
-  BIOS/install-post 不可表示 downgrade、活动 snapshot 保护和 digest 预览通过。
-- `firmware.mode` migration、claim/config、DHCP observed mismatch、readiness 和 digest 覆盖完整。
+- schema v6 直接替换（不迁移），旧 v5 catalog 不被加载；活动 snapshot
+  保护和 digest 预览通过。
+- `firmware.mode` claim/config、DHCP observed mismatch、readiness 和 digest 覆盖完整。
 - BIOS x86 PXELINUX 引导、安装、登录、事件、install generation 重试/drift 与 daemon restart-resume 回归通过；
   diskless BIOS readiness 负向测试稳定拒绝。
 - 显式 adapter capability matrix 覆盖目标 Rocky/RHEL 与 Ubuntu LTS；不适用 kind 返回 `property.not_applicable`。

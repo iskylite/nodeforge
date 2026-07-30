@@ -82,13 +82,10 @@ v0.4 **不**包含：可切换 rootfs 形态（-> v0.5）；NFS root/iPXE/IPv6�
   topology，不保留双 renderer。旧 active session 继续消费自己的 immutable BootConfig v3/AgentPlan v1 snapshot 到终态；
   新 v0.4 session 的 boot bundle/initrd 不支持 BootConfig v4，或 rootfs agent 不支持 AgentPlan v2 时 readiness 失败。
   v0.4 不改变 rootfs materialization 字段，仍固定 squashfs_overlay。
-- v6 -> v7 migration 将旧单 NIC scalar 原子物化为一个 `network.interfaces` item，令
-  `network.bootstrap_interface_id` 指向它，并把每个既有 `network.routes[]` item 原 identity/顺序迁移到新 route
-  ItemSpec，`interface_id` 指向该 interface。plan 必须显示旧 key 到新 item 的逐字段映射；transaction finalize 前的
-  journal rollback 恢复完整 v5 single-NIC scalar、DNS/search domain 和 routes shape，不得丢字段或把 route 编成
-  逗号串。finalize 后 downgrade 到 v5 必须先做 representability preflight：仅一个物理 L3 interface、无 bond/VLAN、
-  无 multi-NIC 或 logical-link L3 等 v6-only 状态时才可降级；否则返回 `migration.non_representable` 并列出
-  resource/path/reason/target_schema。迁移期间 active/recoverable BootConfig v3/v4 与 AgentPlan v1/v2 snapshot 均继续按创建时内容到终态。
+- v6 → v7 采用直接替换（不迁移，见 v0.2.3 设计 §0）；旧 v6 catalog 不被
+  加载，操作员需重新 `setup`。新 Profile 的 `network.interfaces` 和
+  `network.routes` 按 v7 schema 定义。active/recoverable BootConfig v3/v4 与
+  AgentPlan v1/v2 snapshot 均继续按创建时内容到终态。
 
 ## 5. 容量与压测
 
@@ -222,10 +219,8 @@ nodeforge node postprocess show <node> --phase first-boot [--generation <id>]
 
 - 多 NIC/VLAN/bonding 经显式 agent feature 与 schema 落地，readiness/handoff 前校验；agent pre-init 的 topology
   transaction 在真正 init 前完成，缺失/冲突 fail closed。
-- v6 -> v7 网络 migration/rollback 与可表示 downgrade 覆盖 single-NIC scalar、DNS/search domain 与全部 route
-  identity/顺序；bond/VLAN/multi-NIC 的不可表示 downgrade 返回结构化错误。拓扑引用/环/地址冲突、bond member L3
-  冲突、VLAN-on-bond、route 引用和 bootstrap 到 target topology 事务切换负向测试完整；active/recoverable v2/v3
-  snapshot 跨迁移继续到终态。
+- v6 → v7 直接替换（不迁移）；active/recoverable v2/v3
+  snapshot 跨版本替换继续到终态。
 - DHCP/static bootstrap 都能创建唯一 BootSession；static 路径覆盖冒认、source-IP mismatch、duplicate IP、首次请求重传
   与并发 CAS，preview 不泄漏 token；authenticated route proof 失败时保留 bootstrap 网络。
 - 大规模容量压测有版本化 workload、资源预算、SLO、原始指标与失败恢复证据，不改主流程语义。

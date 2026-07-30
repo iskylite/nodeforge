@@ -90,10 +90,11 @@ configuration。
 5. Profile 保存 origin、source、created/updated、cloned-from provenance；
 6. clone 支持同事务 property patch；
 7. `--build [--detach]` 明确采用“clone 已提交、build 提交结果单独返回”的组合语义；
-8. 旧 Profile 首次使用时进行确定性、可审计的 identity migration。
+8. 旧 Profile 首次使用时进行确定性、可审计的 identity 初始化。
 
-这是当前唯一成组的 v0.2 数据模型缺口。实现会改变 catalog/state shape，必须先冻结
-migration 和 rollback，再修改 CLI。
+这是当前唯一成组的 v0.2 数据模型缺口。实现会改变 catalog/state shape，
+catalog schema 采用直接替换（不迁移，见 v0.2.3 设计 §0），
+必须先冻结 identity 事务恢复，再修改 CLI。
 
 ### 3.2 Recovery 语义裁决
 

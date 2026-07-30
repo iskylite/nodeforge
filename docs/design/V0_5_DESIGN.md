@@ -152,12 +152,11 @@ nodeforge profile rootfs status <profile>   # 显示所选交付形态/digest/un
   `required_min_memory_bytes`。
 - `boot preview` 的 capsule/kernel/initrd 路径不变，但 JSON 必须显示 `bootconfig_schema=5`、`overlay_mode`、
   `required_features` 和内存预算摘要，不能声称输出完全不受影响。
-- v0.4 -> v0.5 迁移：schema v7 到 v8 的 plan/apply 将现有 diskless Profile 默认补
-  `diskless.overlay.mode=squashfs_overlay`；旧配置无 mode 字段等价于 `squashfs_overlay`，迁移无副作用。
-  transaction finalize 前 journal rollback 恢复完整 v6。finalize 后 downgrade 到 v6 必须做 representability preflight：
-  仅所有 Profile 都为 `squashfs_overlay` 且不存在其他 v7-only state 时允许；任一 `ram_rootfs` 返回
-  `migration.non_representable` 并列出 resource/path/reason/target_schema。active/recoverable BootConfig v4/v5 snapshot
-  不随 catalog migration 重编译。迁移 CLI 复用 `catalog migrate`（plan/apply/rollback），不新增专用命令。
+- v0.4 → v0.5 采用直接替换（不迁移，见 v0.2.3 设计 §0）；schema v7 到 v8
+  直接替换，旧 v7 catalog 不被加载，操作员需重新 `setup`。新 Profile 默认
+  `diskless.overlay.mode=squashfs_overlay`；旧配置无 mode 字段等价于
+  `squashfs_overlay`。active/recoverable BootConfig v4/v5 snapshot
+  不随 catalog schema 替换重编译。
 - v0.2/v0.3/v0.4 不提供 `diskless.overlay.mode` 的 help/handler；预留 enum 不算实现。
 
 ## 7. 验收不变式

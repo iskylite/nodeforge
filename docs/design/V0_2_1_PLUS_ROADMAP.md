@@ -63,7 +63,7 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 在 catalog firmware shape 之前完成：
 
 - catalog v5 Profile metadata与 daemon-owned SSH identity；
-- v4→v5 migration、rollback和旧 artifact边界；
+- v4→v5 直接替换（不迁移）和旧 artifact 边界；
 - clone patch、`--new-ssh-keys`、`--build/--detach`；
 - capability确定性重构原token与安全负测；
 - ISO真后台operation；
@@ -80,8 +80,9 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 - v0.4 / catalog v7：target topology、bootstrap transport、builder placement；
 - v0.5 / catalog v8：rootfs materialization mode。
 
-每次迁移都必须区分 transaction finalize 前 rollback 与 finalize 后 representable
-downgrade；active immutable delivery snapshot 不重编译。
+每次 schema 变更采用直接替换（见 v0.2.3 设计 §0）；旧版本 catalog
+不被加载，操作员需重新 `setup`。active immutable delivery snapshot
+不重编译。
 
 ## 3. 跨版本不变式
 
@@ -128,7 +129,7 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 ### v0.2.3
 
-- catalog v4→v5 Profile identity/provenance迁移和rollback fixture；
+- catalog v5 Profile identity/provenance schema 直接替换（不迁移）；
 - rebuild identity稳定，clone默认复用或显式换key；
 - restart只重构原capability，异常进入`recovery_incomplete`；
 - ISO import由daemon后台operation执行；
@@ -137,7 +138,7 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 ### v0.3
 
-- schema v5->v6 migration/rollback/downgrade；
+- schema v5→v6 直接替换（不迁移）；
 - x86_64 BIOS install 完整闭环，diskless BIOS 明确拒绝；
 - install-post 从既有受限形态扩展为四 canonical action；
 - generation-bound callback credential、step journal 和完成闸；
@@ -145,7 +146,7 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 ### v0.4
 
-- topology v6->v7 无损迁移；
+- topology v6→v7 直接替换（不迁移）；
 - BC v4/AP v2 与旧 BC v3/AP v1 active snapshot 共存；
 - static/DHCP bootstrap、事务切网、容量 SLO；
 - PXE builder boot slot/upload claim/recovery；
@@ -156,7 +157,7 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 - catalog v8/BC v5；
 - `squashfs_overlay` 与 `ram_rootfs` 共用 artifact；
 - 双内存预算公式、metadata 保真和 `.part` 删除；
-- v7->v8 migration 与 representable downgrade；
+- v7→v8 直接替换（不迁移）；
 - 不引入新的远程控制或 rootfs 传输变体。
 
 ## 5. 变更管理

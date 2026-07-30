@@ -656,11 +656,11 @@ v4-v7 复用 v0.1 已落地的 schema-v3 发布事务机制：plan/digest、jour
 现拒绝 `schema_version != 4`，后续各版本新增对应 parser 校验分支并把 config 与 catalog 的 `schema_version` 同步提升；
 旧 parser 不得接受半成品 nullable v0.2 shape。v0.2 不提供迁移 CLI 命令，schema v4 是唯一标准。
 
-这里的 rollback 只表示 migration transaction finalize 前从 durable journal 恢复 pre-migration snapshot，不等于允许
-任意版本 downgrade。已写入目标旧 schema 无法表达的新 kind/field/item 后，downgrade preflight 必须返回
-`migration.non_representable` 并列出 resource/path/reason；不得丢字段、改成 nullable 或丢 collection identity/order。
-active/recoverable session 始终消费创建时 immutable snapshot，不随 catalog apply/rollback/downgrade 重编译。统一细节见
-[`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) §5，v0.3-v0.5 迁移均复用该契约。
+catalog schema 变更采用直接替换（不迁移），见 v0.2.3 设计 §0。旧版本 catalog 不被加载
+（`UnsupportedSchemaVersion`），操作员需重新 `setup`。不实现 migration journal、
+rollback 或 downgrade preflight。active/recoverable session 始终消费创建时 immutable
+snapshot，不随 catalog schema 替换重编译。统一细节见
+[`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) §5，v0.3-v0.5 均复用该契约。
 
 ### 3.1 schema v3 到 v4 的唯一转换
 
@@ -676,9 +676,9 @@ active/recoverable session 始终消费创建时 immutable snapshot，不随 cat
 | schema v3 provision bundle | v4 一次迁移为 tagged action + canonical phase；v0.2 只允许 `rootfs-build|first-boot` | 依赖未来 schema 才能启动 v0.2 |
 | schema v3 effective/digest | v4 compiler 扩展 tagged branch，并保持一个 canonical digest 输入 | renderer/initrd/HTTP handler 各自补默认值 |
 
-v4 migration 只改变 Profile 的外层 discriminated shape；不能借机移动 v3 已冻结 owner。转换计划必须逐个列出
-Profile、引用它的 Node、旧/新 effective digest 和 active session 阻塞原因。事务 finalize 前 rollback 恢复完整 v3
-manifest；一旦 catalog 已写入 diskless Profile，降回 v3 必须以 `migration.non_representable` 拒绝，不能生成部分 nullable 数据。
+v4 采用直接替换（不迁移）；v3 catalog 不被加载，操作员需重新 `setup`。
+不能借机移动 v3 已冻结 owner。新 Profile 按 v4 tagged shape 定义；
+active session 始终消费创建时 immutable snapshot，不随 schema 替换重编译。
 
 ## 4. M5 具体继承与变更
 
@@ -1462,8 +1462,8 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
 
 ### 9.2 M6（v0.3）
 
-- schema v6 migration/rollback 将全部 v5 Node 显式物化 `firmware.mode=uefi`，活动 session 保护和 digest 预览通过。
-- `firmware.mode` migration、claim/config、DHCP observed mismatch、readiness 和 digest 覆盖完整。
+- schema v6 直接替换（不迁移），旧 v5 catalog 不被加载；活动 session 保护和 digest 预览通过。
+- `firmware.mode` claim/config、DHCP observed mismatch、readiness 和 digest 覆盖完整。
 - BIOS x86 PXELINUX DHCP/TFTP/config、kernel/initrd/cmdline、install generation gate 和 diskless 适用性通过 QEMU
   smoke；`http_accel` 对 BIOS fail closed。
 - 每个新增发行版版本逐项发布 adapter capability matrix，并通过 install answer、software index、默认值、
@@ -1471,7 +1471,7 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
 
 ### 9.3 M7（rootfs-build/first-boot -> v0.2；install-post -> v0.3；install-agent -> v0.4；reconciliation 永久非目标）
 
-- schema v4 migration/rollback 将 v3 managed-file bundle 无损映射到 canonical tagged action/phase；v0.3 schema v6
+- schema v4 直接替换（不迁移），v3 managed-file bundle 按 v4 canonical tagged action/phase 定义；v0.3 schema v6
   仅增加 `install-post` 适用性，不另建 bundle owner；同一 Assets owner 扩展后的
   tagged ItemSpec 拒绝 action/phase 非法字段组合。
 - bundle CRUD、ordered item mutation、atomic file replacement、plan/apply/status、phase-specific retry、If-Match 和幂等键通过并发及
@@ -1571,8 +1571,8 @@ first-boot 补一次性 bootstrap token 交换。v0.5 冻结 ram_rootfs 双预�
 
 **第二十五轮（协议恢复与迁移复核）**：DHCP 新 XID 改为 correlation-window transaction alias，不再自动误杀同次 PXE；
 BootConfig token 改为 single-purpose bounded replay，以 `diskless.initrd_started` config digest 确认；冻结 hash-only raw
-token 在 capsule 交付前/中的 restart 恢复边界和鉴权错误归责。统一 v0.2-v0.5 transaction rollback 与 schema downgrade
-representability 契约；v0.2 squashfs 内存预算与 v0.5 共用 available-budget 口径。
+token 在 capsule 交付前/中的 restart 恢复边界和鉴权错误归责。catalog schema 变更统一采用直接替换
+（不迁移，见 v0.2.3 设计 §0）；v0.2 squashfs 内存预算与 v0.5 共用 available-budget 口径。
 
 **第二十六轮（v0.2-v0.5 再复审）**：修正 workflow 遗留的旧 asset/item CLI；diskless Node software override
 保留与 install 相同的 effective merge，切根后由 agent `node-apply` 重放，不进入公共 rootfs；diskless Profile password hash 改为按
