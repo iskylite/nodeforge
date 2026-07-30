@@ -124,17 +124,25 @@ first-boot 适合：需要真实 kernel `/sys` 的本地驱动 finalization、�
 nodeforge assets initrd build rocky-initrd \
   --from-install-source rocky-9.7-x86_64 --kernel-release <r>
 
-nodeforge assets boot-bundle create rocky-9.7-diskless-x86_64 \
+nodeforge assets boot-bundle create rocky-9.7-x86_64 \
   --kernel <kernel-asset> --initrd <initrd-asset> \
   --distro rocky --version 9.7 --arch x86_64 --kernel-release <r>
-nodeforge assets boot-bundle show rocky-9.7-diskless-x86_64
+nodeforge assets boot-bundle show rocky-9.7-x86_64-diskless-bundle
 ```
 
-使用 `--from-install-source` 时，initrd 发布到
-`assets/boot/diskless/sources/<source>/<kernel-release>/<name>.img`；不绑定
-source 的通用构建发布到
-`assets/boot/diskless/manual/<distro>/<version>/<arch>/<kernel-release>/<name>.img`。
-这个结构把来源放在最前层，运维人员无需查询 catalog 即可定位制品所属 ISO/source。
+initrd 统一发布到
+`assets/diskless/initrd/<profile-or-name>/<kernel-release>/initrd.img`。
+source、distro、version、arch 与 kernel release provenance 已由 catalog asset
+持久化，不再在文件系统中重复嵌套 `sources/manual/distro/version/arch`。
+
+rootfs 发布到
+`assets/diskless/rootfs/<profile>/<rootfs-input-digest前16位>/<profile>.squashfs`。
+目录和文件名可直接识别 Profile，摘要前缀允许同一 Profile 的不同构建投影并存；
+完整 64 位摘要和 SHA-512 仍保存在 `rootfs-artifacts.json` 并参与不可变校验。
+当前仍为开发版本，只支持上述新布局，不提供旧目录探测、迁移或兼容读取。
+未来制品 GC、远端 object store、builder Node 上传与多副本实现必须以 state/catalog
+中的完整摘要和逻辑 asset identity 为接口，不能依赖当前本地目录层级或把 16 位前缀
+提升为内容身份；因此这些未实现能力无需再次改写 BootConfig URL 或 runtime 校验语义。
 
 用户提供的 `--kernel-release` 视为显式选择。它与 ISO installer kernel 中检测出的
 release 不一致时输出警告但不拒绝构建；initrd 与 BootBundle 的 release 一致性仍是
@@ -147,18 +155,16 @@ arch/source/repository revision 和 required feature 子集；它此时不要求
 ## 6. 阶段 4：创建 Profile 与 Node（保持禁用）
 
 ```text
-# profile name 可省略：省略时自动派生为 <source>-diskless（此处等价于 rocky-9.7-x86_64-diskless）
-# 这里显式指定 compute-diskless 以使用自定义名
-nodeforge profile create compute-diskless rocky-9.7-x86_64 \
-  --kind diskless --boot-bundle rocky-9.7-diskless-x86_64
-nodeforge profile set compute-diskless diskless.overlay.tmpfs_percent=40 \
+# CLI 根据完整 InstallSource、可选 qualifier 和 kind 生成规范名称。
+nodeforge profile create rocky-9.7-x86_64 --kind diskless
+nodeforge profile set rocky-9.7-x86_64-diskless diskless.overlay.tmpfs_percent=40 \
   diskless.failure.max_attempts=3 diskless.failure.backoff_seconds=30
-nodeforge profile add-values compute-diskless software.packages.include chrony
-nodeforge profile add-values compute-diskless system.ssh.root_authorized_keys <controller-public-key>
-nodeforge profile item add compute-diskless system.hosts \
+nodeforge profile add-values rocky-9.7-x86_64-diskless software.packages.include chrony
+nodeforge profile add-values rocky-9.7-x86_64-diskless system.ssh.root_authorized_keys <controller-public-key>
+nodeforge profile item add rocky-9.7-x86_64-diskless system.hosts \
   id=controller address=192.168.50.2 names=controller,controller.local
 
-nodeforge node add c001 mac=52:54:00:12:34:56 arch=x86_64 profile=compute-diskless deploy=false
+nodeforge node add c001 mac=52:54:00:12:34:56 arch=x86_64 profile=rocky-9.7-x86_64-diskless deploy=false
 nodeforge node set c001 pxe.ip_reservation=192.168.50.101 hostname=c001.example.test
 nodeforge node set c001 network.mode=static network.interface=eth0 \
   network.address=192.168.50.101 network.prefix_len=24 network.gateway=192.168.50.1
@@ -184,7 +190,7 @@ readiness 是只读准入检查，不是“准备动作”：不构建、不改�
 check id、稳定 reason 和下一条建议命令。
 
 ```text
-nodeforge profile rootfs plan compute-diskless --output json
+nodeforge profile rootfs plan rocky-9.7-x86_64-diskless --output json
 nodeforge node readiness c001 --stage build
 ```
 
@@ -202,10 +208,10 @@ add/remove package closure、pinned local repository revision/GPG policy、prote
 ## 8. 阶段 6：从零构建 rootfs
 
 ```text
-nodeforge profile rootfs build compute-diskless
+nodeforge profile rootfs build rocky-9.7-x86_64-diskless
 # 自动化需要保证配置仍等于之前 plan 的内容时，额外加：
 # --if-input-digest <rootfs_input_digest>
-nodeforge profile rootfs status compute-diskless
+nodeforge profile rootfs status rocky-9.7-x86_64-diskless
 ```
 
 外部 squashfs 可用 `profile rootfs register <profile> --path <file>
@@ -278,13 +284,49 @@ NIC PXE DHCPDISCOVER
  -> 有界重放地获取固定 BootConfig，校验后以 config digest 确认并撤销 token
  -> HEAD/Range 下载 rootfs.part，完整 SHA-512 校验
  -> loop(ro) lower + tmpfs upper/work + overlay merged
- -> 校验 AgentPlan locator/expected digest/size/agent feature 摘要，交接到 /var/lib/nodeforge/agent-handoff.json
+ -> 校验 AgentPlan locator/expected digest/size/agent feature 摘要，交接到 /var/lib/nodeforge/boot.json
  -> pre-switch 检查，move-mount /run，清 config/rootfs-artifact token，保留短时 agent/event token
  -> switch_root 到 nodeforge-agent --pre-init
  -> agent 以 bootstrap 网络从服务端拉取并校验 immutable AgentPlan + 全部 Node payload，写 /run 后清 agent token
  -> agent 应用全部 Node override，成功后 exec /sbin/init；renderer 接管同一 NIC/address
  -> systemd agent unit 上报 diskless.running，从 rootfs Profile payload 或 /run Node payload 执行 effective first-boot，删除 event token
 ```
+
+initrd 与 agent 共享 `src/initrd/http.zig` 的原生 HTTP/1.1 客户端，启动闭包不调用
+curl。Zig 0.16 POSIX Threaded Io 的 connect deadline 会 panic，当前建连使用内核
+TCP 有界超时；BootConfig、facts、events、HEAD、AgentPlan 等小型 API
+使用 30 秒 socket 无进展超时；rootfs Range 与 AgentPlan payload 使用 120 秒 socket
+无进展超时。超时是“连续无收发进展”而非总下载时长，因此低速但持续传输不会被
+固定 120 秒总时长误杀。
+制品 body 使用固定缓冲流式落盘；rootfs Range 在读取 body 前必须匹配 206 和请求
+区间长度，Agent payload 必须匹配计划中的 size，禁止按不可信 Content-Length
+一次性申请内存。
+
+### 运行终态与控制台终态
+
+服务端收到 `diskless.running` 表示受管启动生命周期已经成功，不代表本地 tty
+一定出现登录提示。验收时必须区分：
+
+1. **受管生命周期**：event_seq 连续到 running，daemon 没有重启；
+2. **系统运行态**：PID 1 为 systemd、`systemctl is-system-running` 正常、SSH 可达；
+3. **交互控制台**：目标 tty 的 getty active，VMware/物理控制台自然出现
+   `<hostname> login:`，不能通过人工向 `/dev/tty1` 写字代替冷启动验证。
+
+Ubuntu live-server casper rootfs 会携带 tty1 vendor mask 和 Subiquity getty
+drop-in。node-apply 必须在 exec systemd 前恢复标准 getty。aarch64 的
+`console=ttyAMA0` 只是内核日志路由，不保证虚拟机一定存在 `/dev/ttyAMA0`；
+serial-getty 必须以字符设备存在为启用条件。
+
+facts 在 rootfs 下载前上报 `MemTotal`，用于形成后续启动的可信 inventory 和服务端
+readiness 预检；它不替代本次启动的本地容量判断。本次启动以 `/proc/meminfo` 的
+`MemAvailable`、rootfs 压缩/展开大小、payload、tmpfs 比例、minimum-free 与 safety
+margin 计算硬闸。facts POST 失败仅输出 warning；容量不足则在
+`memory.capacity_gate` 输出 required/available/deficit 后 fail closed。
+
+所有启动关键步骤维护稳定 stage。initrd 顶层 fatal 至少输出 stage/error/node/session，
+agent pre-init 至少输出 stage/error；rootfs Range 逐块输出 offset/总量和失败重试范围。
+任何新增的 BootConfig、AgentPlan、rootfs 形态、远端制品或网络能力，都必须同时定义
+stage 名、console 诊断字段、重试边界与超时类型，不能只新增协议字段而留下静默 `try`。
 
 服务端只允许一个 `(node_id, active_session)`。同 XID 重传复用同 session；DHCP/TFTP 前缀中、plan 未变且仍在
 correlation window 内的新 XID 也只登记 transaction alias。只有 config 阶段后的新 DHCP 启动、窗口超时或其他可验证

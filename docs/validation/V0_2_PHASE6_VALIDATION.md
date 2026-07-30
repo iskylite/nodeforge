@@ -4,6 +4,12 @@
 > 验证机：`root@r97n0`，Rocky Linux 9.7 aarch64，`192.168.27.128`。
 > 本地构建机：macOS arm64，Zig 0.16.0；交叉编译 `aarch64-linux-gnu ReleaseSafe`。
 > 烟测虚拟化：r97n0 上 QEMU 10.1.0（`/usr/libexec/qemu-kvm`，TCG `-cpu max`，direct-kernel boot）。
+>
+> **历史快照说明**：本文记录 2026-07-23 Phase 6 当时的 BootConfig v2/curl
+> 实验链路，不描述当前生产实现。当前代码使用 BootConfig v3，并由
+> `nodeforge-initrd` 与 `nodeforge-agent` 共享原生 Zig HTTP 客户端；现行契约以
+> `V0_2_DESIGN.md`、`V0_2_DISKLESS_WORKFLOW.md` 和
+> `V0_2_1_UBUNTU_DISKLESS.md` §9.7 为准。
 
 ## 1. 范围
 

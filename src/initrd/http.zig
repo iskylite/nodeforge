@@ -1,26 +1,27 @@
-//! # nodeforge-initrd 原生 HTTP 客户端（替代 curl 依赖）
+//! # diskless initrd/agent 共享原生 HTTP 客户端（替代 curl 依赖）
 //!
 //! ## 设计动机
 //!
-//! v0.2 初期 nodeforge-initrd 依赖外部 `curl` 子进程与服务端通信。但
+//! v0.2 初期启动组件依赖外部 `curl` 子进程与服务端通信。但
 //! dracut/casper initrd 环境不一定预装 curl 及其依赖库（`libcurl.so.4`、
 //! `libnghttp2.so.14` 等），每次注入需从 rootfs 拷贝二进制和共享库、配置
 //! `LD_LIBRARY_PATH`，增加了跨发行版 initrd 构建的脆弱性。
 //!
-//! v0.2（原生 HTTP）：直接用 Zig 实现 HTTP/1.1 客户端，编译进
-//! `nodeforge-initrd` 单一二进制，不依赖任何外部共享库。支持
-//! GET/HEAD/POST/Range，响应体可写入文件或内存。
+//! v0.2（原生 HTTP）：直接用 Zig 实现 HTTP/1.1 客户端，同时编译进
+//! `nodeforge-initrd` 与 `nodeforge-agent`，不依赖目标 initrd/rootfs 中的
+//! curl 或其共享库。支持 GET/HEAD/POST/Range，响应体可写入文件或内存。
 //!
 //! ## 功能矩阵
 //!
 //! | 方法   | 响应体目标 | 重试 | 用途                           |
 //! |--------|-----------|------|--------------------------------|
-//! | GET    | 内存      | 是   | 拉取 BootConfig v3 JSON          |
-//! | HEAD   | 无        | 是   | rootfs 传输契约的元数据校验      |
-//! | POST   | 丢弃      | 否   | lifecycle 事件上报（best-effort）|
-//! | GET    | 文件      | 否*  | 分块 Range 下载 rootfs            |
+//! | GET    | 内存      | 是   | BootConfig / AgentPlan            |
+//! | HEAD   | 无        | 是   | rootfs 传输契约的元数据校验       |
+//! | POST   | 丢弃      | 否   | facts/events/agent-consumed        |
+//! | GET    | 文件      | 否*  | rootfs Range / AgentPlan payload   |
 //!
-//! *Range 下载的重试在 `initrd.zig:downloadRootfs` 中编排（5 次指数退避）。
+//! *rootfs Range 重试由 `initrd.zig:downloadRootfs` 编排；agent payload 的
+//! 完整性由 AgentPlan 中固定的 size/digest 校验，失败即阻止进入 systemd。
 //!
 //! ## 限制
 //!
@@ -29,6 +30,8 @@
 //! - 不跟随 HTTP 重定向（3xx），避免被引导到非预期地址。
 //! - 不支持 chunked transfer-encoding（`Transfer-Encoding: chunked`），
 //!   nodeforged 对所有响应显式设置 `Content-Length`。
+//! - 制品响应先校验调用方声明的状态码/长度，再以固定缓冲流式落盘；Range
+//!   必须在读取 body 前确认 206，避免异常 200 把完整 rootfs 拉入内存。
 //!
 //! ## 进度输出
 //!
@@ -82,6 +85,23 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     _ = std.c.write(2, msg.ptr, msg.len);
 }
 
+/// initrd/agent 的 HTTP 都是启动关键路径，不能允许 connect/read/write 永久阻塞。
+/// Zig 0.16 Threaded Io 的 POSIX connect timeout 尚未实现，传入 deadline 会直接
+/// panic 并杀死整个 nodeforged（TFTP loopback boot-prepare 也复用本模块）。
+/// 因此这里暂时使用内核有界 TCP connect，已连接 socket 再按请求类型设置空闲
+/// 收发超时（API/HEAD 30 秒、制品 Range 120 秒）。空闲超时会沿现有错误链进入
+/// 调用方的有界重试或 fail-closed 路径，最终由 PID 1 顶层打印具体 stage/error。
+/// 这里没有“总下载时长”上限：只要 socket 持续产生收发进展，慢速大文件可继续下载。
+fn connect(url: Url, io: std.Io, idle_timeout_seconds: isize) !std.Io.net.Stream {
+    const address = std.Io.net.IpAddress.parseIp4(url.host, url.port) catch return error.InvalidHost;
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return error.ConnectionFailed;
+    errdefer stream.close(io);
+    const timeout: std.posix.timeval = .{ .sec = idle_timeout_seconds, .usec = 0 };
+    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+    try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
+    return stream;
+}
+
 /// 读取 HTTP 响应头（状态行 + 所有头部，直到空行）。
 /// 返回 heap 分配的原始头文本，调用方负责释放。
 fn readResponseHeaders(allocator: std.mem.Allocator, reader: *std.Io.Reader) !struct { raw: []u8, status: u16, content_length: ?u64 } {
@@ -131,8 +151,7 @@ pub fn get(
 ) ![]u8 {
     log("[nodeforge-initrd] GET http://{s}:{d}{s}\n", .{ url.host, url.port, url.path });
 
-    const address = std.Io.net.IpAddress.parseIp4(url.host, url.port) catch return error.InvalidHost;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return error.ConnectionFailed;
+    var stream = try connect(url, io, 30);
     defer stream.close(io);
 
     // 发送请求
@@ -205,8 +224,7 @@ pub fn head(
 ) ![]u8 {
     log("[nodeforge-initrd] HEAD http://{s}:{d}{s}\n", .{ url.host, url.port, url.path });
 
-    const address = std.Io.net.IpAddress.parseIp4(url.host, url.port) catch return error.InvalidHost;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return error.ConnectionFailed;
+    var stream = try connect(url, io, 30);
     defer stream.close(io);
 
     // 发送请求
@@ -240,8 +258,7 @@ pub fn post(
 ) !u16 {
     log("[nodeforge-initrd] POST http://{s}:{d}{s} ({d} bytes)\n", .{ url.host, url.port, url.path, body.len });
 
-    const address = std.Io.net.IpAddress.parseIp4(url.host, url.port) catch return error.InvalidHost;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return error.ConnectionFailed;
+    var stream = try connect(url, io, 30);
     defer stream.close(io);
 
     // 发送请求
@@ -283,8 +300,7 @@ pub fn post(
 /// POST 并返回 2xx 响应体。daemon 的 TFTP worker 用它调用 loopback
 /// management boot-prepare；独立于 lifecycle `post` 的“丢弃 body”契约。
 pub fn postForBody(io: std.Io, allocator: std.mem.Allocator, url: Url, headers: []const Header, body: []const u8) ![]u8 {
-    const address = std.Io.net.IpAddress.parseIp4(url.host, url.port) catch return error.InvalidHost;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return error.ConnectionFailed;
+    var stream = try connect(url, io, 30);
     defer stream.close(io);
     {
         var send_buf: [8192]u8 = undefined;
@@ -316,11 +332,14 @@ pub fn getToFile(
     url: Url,
     headers: []const Header,
     dest: []const u8,
+    expected_status: ?u16,
+    expected_length: ?u64,
 ) ![]u8 {
     log("[nodeforge-initrd] GET http://{s}:{d}{s} → {s}\n", .{ url.host, url.port, url.path, dest });
 
-    const address = std.Io.net.IpAddress.parseIp4(url.host, url.port) catch return error.InvalidHost;
-    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return error.ConnectionFailed;
+    // rootfs/payload 等制品请求允许长时间持续传输；这里的 120 秒是 socket
+    // 连续无进展的空闲超时，不是整个响应必须在 120 秒内完成。
+    var stream = try connect(url, io, 120);
     defer stream.close(io);
 
     // 发送请求
@@ -345,13 +364,29 @@ pub fn getToFile(
         log("[nodeforge-initrd] GET → {d} (error)\n", .{resp.status});
         return error.HttpError;
     }
+    if (expected_status) |status| {
+        if (resp.status != status) return error.UnexpectedHttpStatus;
+    }
     const len = resp.content_length orelse return error.MissingContentLength;
+    if (expected_length) |expected| {
+        if (len != expected) return error.UnexpectedContentLength;
+    }
 
-    // 读取响应体到 heap buffer，然后写入文件
-    const body = try allocator.alloc(u8, len);
-    defer allocator.free(body);
-    reader.interface.readSliceAll(body) catch return error.TruncatedResponse;
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dest, .data = body });
+    // 不能按服务端 Content-Length 一次性申请内存：payload 可能很大，而异常的
+    // If-Range 响应甚至可能返回完整 rootfs。先校验调用方声明的 status/长度，
+    // 再用固定缓冲流式写临时文件，使内存占用与制品大小无关。
+    var file = try std.Io.Dir.cwd().createFile(io, dest, .{ .truncate = true });
+    defer file.close(io);
+    errdefer std.Io.Dir.cwd().deleteFile(io, dest) catch {};
+    var buffer: [256 * 1024]u8 = undefined;
+    var remaining = len;
+    while (remaining > 0) {
+        const count: usize = @intCast(@min(remaining, buffer.len));
+        reader.interface.readSliceAll(buffer[0..count]) catch return error.TruncatedResponse;
+        try file.writeStreamingAll(io, buffer[0..count]);
+        remaining -= count;
+    }
+    try file.sync(io);
 
     log("[nodeforge-initrd] GET → {d} ({d} bytes → {s})\n", .{ resp.status, len, dest });
     return resp.raw;

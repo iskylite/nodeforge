@@ -306,7 +306,9 @@ manifest、event 或日志都不得包含 private key bytes。
 - catalog `schema_version`：v4（v0.2 唯一标准，同时新增 tagged kind
   `ProfileKind = install|diskless` 与 `rootfs-build|first-boot` tagged action/phase）。v0.1 的 v3 已废弃，不存在版本迁移 CLI 命令。
 - BootConfig DTO `schema_version` v3（独立命名空间；v3 增加 capability-authenticated
-  `facts_url`，由 initrd 上报 `MemTotal`）。
+  `facts_url`，由 initrd 上报 `MemTotal`）。facts 不是启动进度确认：服务端持久化
+  inventory 供后续 readiness 预检，当前启动仍必须以本机 `/proc/meminfo` 的
+  `MemAvailable` 执行硬闸；facts 上报失败只记录 warning，不能把成功 POST 误判为容量通过。
 - AgentPlan DTO `schema_version` v1（独立命名空间）；v0.4 target topology 升 v2，v0.5 保持 v2。
 - v0.3 `firmware.mode`/`install-post` schema v5；v0.4 schema v6；v0.5 rootfs 形态 schema v7，见
   [`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
@@ -330,6 +332,14 @@ manifest、event 或日志都不得包含 private key bytes。
 ## 7. 制品保留（v0.2 不做 rootfs GC）
 
 - 已发布 rootfs object/manifest 只增不删，不提供 delete/GC CLI，不实现引用计数或 mark/sweep。
+- 当前唯一物理布局为
+  `assets/diskless/rootfs/<profile>/<rootfs_input_digest前16位>/<profile>.squashfs`；
+  完整 input digest、SHA-512、压缩/展开大小仍保存在 `rootfs-artifacts.json`。
+  摘要前缀只用于人工分组，不参与不可变校验。
+- initrd 唯一物理布局为
+  `assets/diskless/initrd/<profile-or-asset-name>/<kernel-release>/initrd.img`；
+  source/distro/version/arch provenance 由 catalog 保存。当前为开发版本，不探测、
+  迁移或兼容读取 `assets/boot/diskless`、`assets/rootfs` 等旧布局。
 - builder 可清理自己未发布的 staging `.part`；这不涉及 ready object。
 - `nodeforge status --component rootfs-cache` 报告 bytes/object count/剩余空间和阈值告警；空间不足时新 build
   fail closed，不删除旧对象自救。
@@ -378,6 +388,11 @@ diskless/install 共用一个 tagged lifecycle 投影；install 终态为 `insta
 | daemon 在 capsule 交付前/中重启 | raw token 未完整送达则 recovery_incomplete；已完整取得 token 才可续跑 |
 | 无效 token / 有效 claim 越权 / malformed Range | 不关联 session / 归责 claim session / 416 有界计数，不能远程推进 victim |
 | 越权 Range / 跨 Node rootfs 访问 | 拒绝 + failed |
+| facts 成功但实际 `MemAvailable` 不足 | initrd 输出完整预算与 deficit，终止于 `memory.capacity_gate` |
+| facts 上传失败但本地容量足够 | console warning；本地容量闸继续执行，不因 inventory 写入失败中止 |
+| API 建连/空闲，rootfs 或 payload 慢速持续传输 | 建连暂用内核 TCP 有界超时（Zig 0.16 connect deadline 会 panic）；API 空闲 30 秒；制品空闲 120 秒；持续有进展不受总时长限制 |
+| initrd/agent 任一关键步骤失败 | console 必须包含稳定 stage 和 error；initrd 还包含 node/session |
+| lifecycle 已到 `diskless.running`，但控制台停在最后一行启动日志 | 分别检查 systemd/SSH/getty；Ubuntu 删除 casper 的 `/lib/systemd/system/getty@tty1.service -> /dev/null` 和 Subiquity drop-in，恢复 tty1；冷启动必须自然出现 login prompt |
 | 过期 token / feature mismatch / hash mismatch | failed + quarantine 计数 |
 | initrd 或 rootfs agent 缺各自 required feature | readiness 失败，不发 bootfile；initrd 不代行 agent feature |
 | shared override registry set 与“v0.1 install 去除 `overrides.install.*` 再加 v0.2 shared additions”不相等 | contract test 失败；禁止以 diskless 小 allowlist 发布 |

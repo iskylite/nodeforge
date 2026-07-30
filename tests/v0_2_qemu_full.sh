@@ -11,7 +11,7 @@ work=/tmp/nodeforge-v02-qemu
 install_root=/tmp/nodeforge-v02-install
 port=18090
 node=nf-v02-full
-profile=nf-v02-diskless
+profile=rocky-9.7-aarch64-iso-v02-diskless
 
 cleanup() {
     if [[ -n "${qemu_pid:-}" ]]; then
@@ -176,7 +176,7 @@ cli assets register --type kernel --name nf-test-kernel \
 cli assets register --type nodeforge_initrd --name nf-test-initrd \
     --path rootfs-test/nf-test-initrd --distro rocky --version 9.7 --arch aarch64 \
     --kernel-release 5.14.0-362.13.1.el9.aarch64 --config "$config" --output json >/dev/null
-cli assets boot-bundle create nf-test-bundle \
+cli assets boot-bundle create rocky-9.7-aarch64-iso --qualifier v02 \
     --kernel nf-test-kernel --initrd nf-test-initrd \
     --distro rocky --version 9.7 --arch aarch64 \
     --kernel-release 5.14.0-362.13.1.el9.aarch64 --config "$config" --output json >/dev/null
@@ -216,8 +216,8 @@ cli assets provision-bundle item add nf-v02-firstboot steps \
     idempotency_key=qemu-degraded-v1 timeout_s=30 retryable=true \
     destination=/nodeforge-parent-does-not-exist/proof content_asset=nf-v02-proof \
     mode=0644 owner=root group=root --config "$config" --output json >/dev/null
-cli profile create "$profile" rocky-9.7-aarch64-iso \
-    --kind diskless --boot-bundle nf-test-bundle --config "$config" --output json >/dev/null
+cli profile create rocky-9.7-aarch64-iso --qualifier v02 \
+    --kind diskless --config "$config" --output json >/dev/null
 cli profile set "$profile" diskless.provision.bundle=nf-v02-firstboot \
     --config "$config" --output json >/dev/null
 cli profile set "$profile" diskless.failure.max_attempts=3 \

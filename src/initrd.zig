@@ -3,7 +3,8 @@
 //! `V0_2_DESIGN.md` §4.3 boot-time 序列。作为 dracut initrd 的 PID 1，在获得网络后：
 //! 从 per-session credential capsule 读取 config token -> 有界重试拉取 BootConfig v3 ->
 //! 下载并 SHA-512 校验 rootfs -> loop 挂载只读 lower + tmpfs upper -> overlay 合并 ->
-//! 写 `/var/lib/nodeforge/boot.json` handoff（AgentPlan locator 与 agent/event token）->
+//! 写 `/var/lib/nodeforge/boot.json` handoff（仅 AgentPlan locator 等非 secret 元数据），
+//! agent/event token 分别写入 0400 credential 文件 ->
 //! 清除 config/rootfs token -> `switch_root` 执行 `nodeforge-agent --pre-init`。
 //!
 //! ## initrd 环境约束与设计决策
@@ -33,7 +34,9 @@
 //! 替代 `basename` 命令，避免对 initrd 中可能不存在的 coreutils 的依赖。
 //!
 //! **HTTP 通信**：由内置 Zig 原生客户端实现（`initrd/http.zig`），不依赖
-//! 外部 `curl`。自身只编排与校验，不实现第二套挂载栈。
+//! 外部 `curl`。连接建立最多等待 10 秒；API 请求按 30 秒 socket 空闲超时，
+//! rootfs Range 按 120 秒 socket 空闲超时，持续有数据时不限制总下载时长。
+//! 自身只编排与校验，不实现第二套挂载栈。
 //!
 //! **安全**：切根前清零 capability；raw token 只驻内存（来自 capsule），不落盘。
 //! `switch_root` 以 `execve`（replace）接管 PID 1：子进程无法删除 PID-1 旧根。
@@ -78,6 +81,11 @@ const hardware_coldplug_script =
 /// R11: 同时追加写入 /run/initrd.log，用于 switch_root 前复制到无盘 overlay，
 /// 使 initrd 阶段的启动日志在切根后仍然可用用于后续分析。
 var initrd_log_fd: i32 = -1;
+/// 当前启动阶段。PID 1 的任意错误最终都会连同此阶段打印到控制台，避免
+/// `try` 直接冒泡后只留下上一条成功操作日志、误导为“卡在 HTTP 请求”。
+var current_stage: []const u8 = "process.start";
+var diagnostic_node: []const u8 = "(unknown)";
+var diagnostic_session: []const u8 = "(unknown)";
 
 fn log(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
@@ -139,7 +147,21 @@ const Cmdline = struct {
     gateway: ?[]const u8 = null,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    run(init) catch |err| {
+        log(
+            "\n[nodeforge-initrd] FATAL: diskless boot aborted\n" ++
+                "[nodeforge-initrd] FATAL: stage={s} error={t} node={s} session={s}\n" ++
+                "[nodeforge-initrd] FATAL: inspect the preceding [nodeforge-initrd] diagnostics for measured and required values\n",
+            .{ current_stage, err, diagnostic_node, diagnostic_session },
+        );
+        // PID 1 返回只会触发不透明的 kernel panic。保持控制台上的最终诊断，
+        // 让操作员能够抄录错误或通过虚拟机控制台复位。
+        while (true) std.Io.sleep(init.io, .fromSeconds(3600), .awake) catch {};
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const io = init.io;
 
@@ -147,7 +169,8 @@ pub fn main(init: std.process.Init) !void {
     // switch_root/losetup 等 /usr/sbin 下的命令可通过裸名调用。
     _ = setenv("PATH", initrd_path, 1);
 
-    log("[nodeforge-initrd] mounting /proc /sys /dev /run...\n", .{});
+    current_stage = "bootstrap.mounts";
+    log("[nodeforge-initrd] stage={s}: mounting /proc /sys /dev /run...\n", .{current_stage});
     // PID 1 must not depend on the vendor initrd's userspace loader before
     // /proc, /sys and /dev exist. Some installer initrds ship a dynamically
     // linked mount(8) whose early exec can fail even though its archive entry
@@ -158,7 +181,8 @@ pub fn main(init: std.process.Init) !void {
     // /run 需要 tmpfs 挂载：rootfs 下载的 .part/.chunk 文件写入此处。
     // initramfs 根可能是只读的（取决于 dracut 配置），必须显式挂载 tmpfs。
     try mustRun(io, allocator, &.{ "mkdir", "-p", "/run" });
-    mountBootstrap("tmpfs", "/run", "tmpfs", "mode=0755") catch {};
+    mountBootstrap("tmpfs", "/run", "tmpfs", "mode=0755") catch |err|
+        log("[nodeforge-initrd] WARNING: cannot mount dedicated /run tmpfs: {t}; continuing only if vendor initrd already provides writable /run\n", .{err});
     // R11: 打开 initrd 日志文件，用于 switch_root 前复制到无盘系统。
     // Zig 0.16 的 std.c.O 使用 ACCMODE 枚举（.WRONLY）+ CREAT/TRUNC 布尔字段，
     // 而非传统 POSIX 的 O_WRONLY/O_CREAT/O_TRUNC 前缀名。
@@ -178,7 +202,8 @@ pub fn main(init: std.process.Init) !void {
     defer freeCmdline(allocator, cmdline);
 
     // 基本网络：按 IP/MAC 复用 PXE 租约；旧启动参数才调用 vendor DHCP client。
-    log("[nodeforge-initrd] bringing up network...\n", .{});
+    current_stage = "network.configure";
+    log("[nodeforge-initrd] stage={s}: bringing up network...\n", .{current_stage});
     try bringUpNetwork(io, allocator, &cmdline);
     log("[nodeforge-initrd] network setup done\n", .{});
 
@@ -205,7 +230,10 @@ pub fn main(init: std.process.Init) !void {
     };
     defer allocator.free(session);
     const node = cmdline.node orelse return error.MissingNode;
+    diagnostic_node = node;
+    diagnostic_session = session;
     log("[nodeforge-initrd] session={s} node={s}\n", .{ session, node });
+    current_stage = "boot_config.fetch";
     log("[nodeforge-initrd] fetching BootConfig from {s}...\n", .{cmdline.config_url orelse "(none)"});
     const config_url_parsed = try http.Url.parse(cmdline.config_url orelse return error.MissingConfigUrl);
     const config_auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{config_token});
@@ -230,15 +258,22 @@ pub fn main(init: std.process.Init) !void {
     try postLifecycle(io, allocator, bc.event_url, event_token, session, next_event_seq, current_phase, "diskless.rootfs_downloading");
     next_event_seq += 1;
     current_phase = "diskless.rootfs_downloading";
+    current_stage = "memory.preflight";
     const meminfo = try captureRun(io, allocator, &.{ "cat", "/proc/meminfo" });
     defer allocator.free(meminfo);
     const available_budget = try memory.memAvailableBytes(meminfo);
     const memory_bytes = try memory.memTotalBytes(meminfo);
+    log(
+        "[nodeforge-initrd] stage={s}: MemTotal={d} MemAvailable={d} rootfs_compressed={d} rootfs_uncompressed={?d} payload={d} tmpfs_percent={d} minimum_free={d} safety_margin={d}\n",
+        .{ current_stage, memory_bytes, available_budget, bc.rootfs_size, bc.rootfs_uncompressed_size, bc.node_payload_size, bc.tmpfs_percent, bc.minimum_free_bytes, bc.safety_margin_bytes },
+    );
+    current_stage = "facts.upload_memory";
     postMemoryFacts(io, allocator, bc.facts_url, event_token, session, memory_bytes) catch |err|
         log("[nodeforge-initrd] WARNING: authenticated memory facts upload failed: {t}\n", .{err});
+    current_stage = "memory.capacity_gate";
     const scaled_upper = std.math.mul(u64, available_budget, bc.tmpfs_percent) catch return error.MemoryBudgetOverflow;
     const upper_limit = if (bc.rootfs_uncompressed_size) |uncompressed_size|
-        try memory.upperLimit(.{
+        memory.upperLimit(.{
             .available_budget = available_budget,
             .rootfs_size = bc.rootfs_size,
             .rootfs_uncompressed_size = uncompressed_size,
@@ -246,14 +281,32 @@ pub fn main(init: std.process.Init) !void {
             .tmpfs_percent = bc.tmpfs_percent,
             .minimum_free_bytes = bc.minimum_free_bytes,
             .safety_margin_bytes = bc.safety_margin_bytes,
-        })
+        }) catch |err| {
+            const required = memory.minimumAvailableBytes(.{
+                .available_budget = 0,
+                .rootfs_size = bc.rootfs_size,
+                .rootfs_uncompressed_size = uncompressed_size,
+                .node_payload_size = bc.node_payload_size,
+                .tmpfs_percent = bc.tmpfs_percent,
+                .minimum_free_bytes = bc.minimum_free_bytes,
+                .safety_margin_bytes = bc.safety_margin_bytes,
+            }) catch 0;
+            log(
+                "[nodeforge-initrd] ERROR: memory capacity gate rejected diskless boot: error={t} MemAvailable={d} required_min_available={d} deficit={d}\n",
+                .{ err, available_budget, required, if (required > available_budget) required - available_budget else 0 },
+            );
+            return err;
+        }
     else blk: {
         // 未知不等于 0 字节，也不能拿压缩大小冒充展开大小。继续启动并仅使用
         // Profile 配置的 tmpfs 百分比；实际分配失败仍由 mount/write 自然报告。
         log("[nodeforge-initrd] WARNING: rootfs uncompressed size is unknown; skipping hard memory-capacity check\n", .{});
         break :blk scaled_upper / 100;
     };
+    current_stage = "rootfs.download";
+    log("[nodeforge-initrd] stage={s}: starting rootfs download ({d} bytes)\n", .{ current_stage, bc.rootfs_size });
     try downloadRootfs(io, allocator, &bc, rootfs_token, session);
+    current_stage = "rootfs.verify";
     log("[nodeforge-initrd] rootfs downloaded, verifying SHA-512...\n", .{});
     verifySha512(io, rootfs_blob, bc.rootfs_sha512) catch return error.RootfsHashMismatch;
     log("[nodeforge-initrd] rootfs verified, mounting...\n", .{});
@@ -264,7 +317,8 @@ pub fn main(init: std.process.Init) !void {
 
     // 只读 lower（loop 挂载 squashfs）+ tmpfs upper/work（同一 tmpfs）+ overlay 合并。
     // squashfs/loop/overlay 模块已在 main() 开头加载，此处直接挂载。
-    log("[nodeforge-initrd] creating mount points...\n", .{});
+    current_stage = "rootfs.mount_overlay";
+    log("[nodeforge-initrd] stage={s}: creating mount points...\n", .{current_stage});
     try mustRun(io, allocator, &.{ "mkdir", "-p", lower_mnt, rw_mnt, merged_mnt });
     log("[nodeforge-initrd] mounting squashfs lower...\n", .{});
     // `mount -t squashfs -o loop` 需要 loop 模块和 squashfs 模块都已加载。
@@ -298,6 +352,8 @@ pub fn main(init: std.process.Init) !void {
     current_phase = "diskless.rootfs_mounted";
 
     // handoff：AgentPlan locator + agent/event token 交给 agent pre-init（写入新根 /var/lib）。
+    current_stage = "handoff.write";
+    log("[nodeforge-initrd] stage={s}: writing AgentPlan locator and credentials\n", .{current_stage});
     try writeHandoff(io, allocator, &bc, session, node, agent_token, event_token);
     try postLifecycle(io, allocator, bc.event_url, event_token, session, next_event_seq, current_phase, "diskless.switching_root");
     next_event_seq += 1;
@@ -317,13 +373,17 @@ pub fn main(init: std.process.Init) !void {
     // 直接通过内核 syscall 把 bootstrap mounts 交给新根并 chroot，避免 util-linux
     // mount 在移动 /run 后因无法更新 utab 返回 16，也避免依赖 vendor initrd 或
     // rootfs 中的 mount/chroot 命令及其 libc closure。replace 保持 agent 为 PID 1。
+    current_stage = "switch_root.move_mounts";
+    log("[nodeforge-initrd] stage={s}: moving kernel filesystems\n", .{current_stage});
     inline for (.{ "proc", "sys", "dev", "run" }) |mount_name| {
         const source = "/" ++ mount_name;
         const target = merged_mnt ++ "/" ++ mount_name;
         try moveMount(source, target);
     }
+    current_stage = "switch_root.enter";
     try enterRoot(merged_mnt);
-    log("[nodeforge-initrd] exec /usr/sbin/nodeforge-agent --pre-init in new root\n", .{});
+    current_stage = "switch_root.exec_agent";
+    log("[nodeforge-initrd] stage={s}: exec /usr/sbin/nodeforge-agent --pre-init in new root\n", .{current_stage});
     return std.process.replace(io, .{ .argv = &.{ "/usr/sbin/nodeforge-agent", "--pre-init" } });
 }
 
@@ -629,11 +689,16 @@ fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, toke
     const event_url = try http.Url.parse(url);
     const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     defer allocator.free(auth);
-    _ = http.post(io, allocator, event_url, &.{
+    const status = http.post(io, allocator, event_url, &.{
         .{ .name = "Authorization", .value = auth },
         .{ .name = "X-NodeForge-Session", .value = session },
         .{ .name = "Content-Type", .value = "application/json" },
-    }, body) catch {};
+    }, body) catch |err| {
+        log("[nodeforge-initrd] WARNING: lifecycle event upload failed: phase={s} seq={d} error={t}\n", .{ phase, seq, err });
+        return;
+    };
+    if (status < 200 or status >= 300)
+        log("[nodeforge-initrd] WARNING: lifecycle event rejected: phase={s} seq={d} status={d}\n", .{ phase, seq, status });
 }
 
 /// event capability 同时是本 session 的 telemetry 写凭据；facts 写入不消耗或
@@ -712,8 +777,13 @@ fn downloadRootfs(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfi
             rangeOnce(io, allocator, rootfs_url, auth, session, expected_etag, offset, end, bc.rootfs_size) catch |err| {
                 attempts += 1;
                 cwd.deleteFile(io, rootfs_chunk) catch {};
+                log(
+                    "[nodeforge-initrd] rootfs range failed: bytes={d}-{d} attempt={d}/5 error={t}\n",
+                    .{ offset, end, attempts, err },
+                );
                 if (attempts >= 5) return err;
                 const delay_ms: i64 = @as(i64, 1000) << @intCast(attempts - 1);
+                log("[nodeforge-initrd] retrying rootfs range after {d}ms\n", .{delay_ms});
                 std.Io.sleep(io, .fromMilliseconds(delay_ms), .awake) catch {};
                 continue;
             };
@@ -722,6 +792,8 @@ fn downloadRootfs(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfi
         // 追加 chunk 到 part 文件
         try mustRun(io, allocator, &.{ "sh", "-c", "cat /run/rootfs.squashfs.chunk >> /run/rootfs.squashfs.part" });
         offset = end + 1;
+        const percent = if (bc.rootfs_size == 0) 100 else (offset * 100) / bc.rootfs_size;
+        log("[nodeforge-initrd] rootfs download progress: {d}/{d} bytes ({d}%)\n", .{ offset, bc.rootfs_size, percent });
     }
     const completed = try cwd.statFile(io, rootfs_part, .{});
     if (completed.size != bc.rootfs_size) return error.RootfsSizeMismatch;
@@ -742,7 +814,7 @@ fn rangeOnce(io: std.Io, allocator: std.mem.Allocator, url: http.Url, auth: []co
         .{ .name = "Accept-Encoding", .value = "identity" },
         .{ .name = "Range", .value = range_value },
         .{ .name = "If-Range", .value = etag },
-    }, rootfs_chunk);
+    }, rootfs_chunk, 206, end - start + 1);
     defer allocator.free(headers);
     try download.validateRange(headers, start, end, total, etag);
     const stat = try std.Io.Dir.cwd().statFile(io, rootfs_chunk, .{});
@@ -786,8 +858,14 @@ fn captureRun(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8
     const result = try std.process.run(allocator, io, .{ .argv = argv });
     defer allocator.free(result.stderr);
     switch (result.term) {
-        .exited => |code| if (code != 0) return error.SubprocessFailed,
-        else => return error.SubprocessFailed,
+        .exited => |code| if (code != 0) {
+            log("[nodeforge-initrd] command failed while capturing output: {s} exit={d} stderr={s}\n", .{ argv[0], code, result.stderr });
+            return error.SubprocessFailed;
+        },
+        else => {
+            log("[nodeforge-initrd] command terminated abnormally while capturing output: {s}\n", .{argv[0]});
+            return error.SubprocessFailed;
+        },
     }
     return result.stdout;
 }
@@ -819,9 +897,17 @@ fn mustRun(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !
 
 /// 运行子进程但忽略其退出码（用于 best-effort 的网络 up 等幂等步骤）。
 fn runIgnore(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    const result = std.process.run(allocator, io, .{ .argv = argv }) catch return;
+    const result = std.process.run(allocator, io, .{ .argv = argv }) catch |err| {
+        log("[nodeforge-initrd] WARNING: optional command could not execute: {s}: {t}\n", .{ argv[0], err });
+        return;
+    };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0)
+            log("[nodeforge-initrd] WARNING: optional command failed: {s} exit={d} stderr={s}\n", .{ argv[0], code, result.stderr }),
+        else => log("[nodeforge-initrd] WARNING: optional command terminated abnormally: {s}\n", .{argv[0]}),
+    }
 }
 
 test "vendor coldplug delegates NIC selection to udev modalias" {

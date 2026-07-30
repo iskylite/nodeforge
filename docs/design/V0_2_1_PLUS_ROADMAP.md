@@ -1,8 +1,8 @@
 # NodeForge v0.2.1+ 实施路线图
 
 状态：现行跨版本路线图
-基线：产品 v0.2.0 / config+catalog schema v4 / BootConfig v3 / AgentPlan v1
-更新日期：2026-07-29
+基线：产品 v0.2.1 / config+catalog schema v4 / BootConfig v3 / AgentPlan v1
+更新日期：2026-07-30
 
 本文只定义版本依赖、实施顺序、schema/DTO 演进和完成闸。每个版本的领域细节仍由
 对应设计文档负责；当前实现状态以
@@ -14,7 +14,7 @@
 | 版本 | 主目标 | schema/DTO | 当前状态 |
 |---|---|---|---|
 | v0.2.0 | Rocky/RHEL UEFI diskless + first-boot | catalog v4 / BC v3 / AP v1 | 已实现；安全审计通过（2026-07-29） |
-| v0.2.1 | Ubuntu casper diskless 产品化 | 保持 catalog v4 / BC v3 / AP v1 | 设计冻结，生产 builder 未完成 |
+| v0.2.1 | Ubuntu casper diskless 产品化 | 保持 catalog v4 / BC v3 / AP v1 | 已完成；fresh CLI 与 Rocky 9.7/10.2、Ubuntu aarch64 VMware 冷启动回归通过 |
 | v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 持久化/rootfs operation/memory 已实现，其余进行中 |
 | v0.3 | x86 BIOS/PXELINUX install + install-post canonical 扩展 | catalog v5；BC/AP 不因 BIOS 无盘升级 | 设计冻结，实现未开始 |
 | v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v6 / BC v4 / AP v2 | 设计冻结，实现未开始 |
@@ -31,15 +31,17 @@ BC = BootConfig，AP = AgentPlan。catalog、节点 DTO、install callback、ope
 schema 的问题。diskless delivery schema 2、deployment-control schema 4 与 inventory
 schema 2 均已有旧 checkpoint→保存→重载 fixture。
 
-### Gate 1：v0.2.1 Ubuntu 产品化
+### Gate 1：v0.2.1 Ubuntu 产品化（已完成）
 
 只完成 Ubuntu casper 目标，不混入 CLI 大改或 schema v5：
 
-- 同源 ISO 的 casper layer closure；
-- vendor initrd 前缀保真；
-- Ubuntu rootfs-build 四动作，尤其 apt package 隔离执行；
-- `profile rootfs build` 到 PXE running 的产品 CLI 闭环；
-- Rocky/Ubuntu 双发行版固定回归。
+- 同源 ISO 的 casper layer closure；**已实现**（`iso_import.zig` `discoverCasperLayers`）
+- vendor initrd 前缀保真；**已实现**（沿用既有通用 vendor-overlay 路径）
+- Ubuntu rootfs-build 四动作，尤其 apt package 隔离执行；**已实现**（统一
+  `namespaced_chroot_executor`，dnf 与 apt 共用同一 namespace+chroot 原语）
+- `profile rootfs build` 到 PXE running 的产品 CLI 闭环；**已在 VMware
+  aarch64 UEFI 冷启动通过**
+- Rocky/Ubuntu 同候选回归；**Rocky 9.7、Rocky 10.2 与 Ubuntu 22.04.5 已通过**
 
 ### Gate 2：v0.2.2 可运营性收口
 
@@ -83,12 +85,21 @@ downgrade；active immutable delivery snapshot 不重编译。
 
 ### v0.2.1
 
+代码状态：casper layer 发现、`buildCasperOverlay`、统一 `namespaced_chroot_executor`
+（dnf 与 apt 共用同一 namespace+chroot 隔离原语）、CLI 风险提示（§5.1/§5.2）均已实现，
+`zig build test` 通过。完成闸如下：
+
 - Ubuntu source 通过普通 CLI 构建 rootfs/initrd/boot bundle；
 - builder 不访问公网、不借用宿主发行版 userspace；
 - kernel/initrd/modules 同源，vendor initrd prefix digest 不变；
 - apt rootfs-build package 不操作宿主根；
-- QEMU 与 VMware 至少各一条 Ubuntu UEFI PXE 完整链；
-- 同一候选版本的 Rocky 回归不退化。
+- VMware Ubuntu aarch64 UEFI PXE 完整链；**已通过，并复验 tty1/SSH/systemd**
+- 同一候选版本的 Rocky 回归不退化；**Rocky 9.7/10.2 已通过**
+
+独立 QEMU launcher、x86_64/aarch64 双架构和 QEMU/VMware 固定矩阵属于 v0.2.2
+的可运营性发布矩阵，不再重复作为 v0.2.1 的阻断闸。现有
+`tests/v0_2_1_ubuntu_casper_smoke.sh` 保留为实验室回归入口；它当前要求
+x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 ### v0.2.2
 

@@ -505,7 +505,8 @@ pub const AssetConfig = struct {
 /// 一个 install source 绑定 ISO、安装内核、initrd 和仓库引用，
 /// profile 通过 `install_source` 字段引用此对象。
 pub const InstallSourceConfig = struct {
-    /// 稳定短名称，用于 install profile 的 `install_source` 引用。
+    /// ISO basename 派生（或受控覆盖）的完整基础名，可追加导入限定符；
+    /// Profile 必须以它为前缀并显式携带 install/diskless 角色后缀。
     name: []const u8,
     /// M4.2 F3: 可选的操作员友好标签，用于 CLI 显示和日志关联。
     /// null 时回退到 name。
@@ -527,6 +528,20 @@ pub const InstallSourceConfig = struct {
     media_tree_url: ?[]const u8 = null,
     /// 关联仓库名称列表；每个名称必须能在 catalog.repositories 中找到。
     repositories: []const []const u8 = &.{},
+    /// Ubuntu casper OS 层 layer 清单（base→top 有序），供 rootfs-build 的
+    /// casper squashfs overlay 构建使用；仅 `distro_family == .ubuntu` 时非空。
+    /// 追加字段，默认空 slice，catalog schema v4 无需迁移即可兼容旧文件。
+    casper_layers: []const CasperLayer = &.{},
+};
+
+/// casper/ 目录下单个 squashfs layer 的身份信息（路径相对 casper/、大小、
+/// SHA-256），在 `assets import` 挂载 ISO 时一次性发现并记录；build 阶段
+/// ISO 已卸载，daemon 只能读取已发布的资产，不能重新扫描。
+pub const CasperLayer = struct {
+    /// casper/ 下的相对路径，如 "ubuntu-server-minimal.squashfs"。
+    path: []const u8,
+    size: u64,
+    sha256: []const u8,
 };
 
 /// 无盘启动的不可拆分版本组合（v0.2 范围）。
@@ -535,7 +550,8 @@ pub const InstallSourceConfig = struct {
 /// rootfs 是由 Profile build projection 派生的内容寻址制品，不能放进 bundle，
 /// 否则会形成「创建 Profile 需要 bundle、构建 rootfs 又需要 Profile」的环。
 pub const BootBundleConfig = struct {
-    /// 稳定短名称，用于 diskless profile 的 `boot_bundle` 引用。
+    /// 规范名称以完整 InstallSource 开头并以 `-diskless-bundle` 结尾；
+    /// 中间可有用途/内核限定符，与 diskless Profile 名明确区分。
     name: []const u8,
     /// 所属发行版名称。
     distro: []const u8,

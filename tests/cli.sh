@@ -112,7 +112,8 @@ grep -q -- "--purge-all" "$tmp/setup-help"
 grep -q -- "--log-level" "$tmp/setup-help"
 "$cli" profile create --help >"$tmp/profile-create-help"
 grep -Fq 'Create an install or diskless profile from an imported install source' "$tmp/profile-create-help"
-grep -Fq 'Derives distro, version, and architecture' "$tmp/profile-create-help"
+grep -Fq '<install-source>[-<qualifier>]-<install|diskless>' "$tmp/profile-create-help"
+grep -Fq -- '--qualifier' "$tmp/profile-create-help"
 "$cli" profile set --help >"$tmp/profile-set-help"
 grep -Fq 'exact mutable Profile PropertySpec key' "$tmp/profile-set-help"
 grep -Fq 'Collections require' "$tmp/profile-set-help"
@@ -199,6 +200,7 @@ grep -Fq 'registered rootfs artifact' "$tmp/profile-rootfs-status-help"
 grep -Fq 'diskless boot session' "$tmp/node-boot-prepare-help"
 
 "$cli" assets import --help >"$tmp/assets-import-help"
+grep -Fq -- '--qualifier' "$tmp/assets-import-help"
 grep -Fq 'Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso' "$tmp/assets-import-help"
 "$cli" assets install-source --help >"$tmp/install-source-help"
 grep -Fq 'software' "$tmp/install-source-help"
@@ -220,7 +222,7 @@ grep -Fq 'show' "$tmp/node-software-help"
 "$cli" node capabilities show --help >"$tmp/node-capabilities-help"
 grep -Fq 'adapter capability registry' "$tmp/node-capabilities-help"
 grep -Fq 'Override an unknown or ambiguous product id; e.g. rocky, kylin, ubuntu. Family still comes from ISO layout' "$tmp/assets-import-help"
-grep -Fq 'Override the ISO-basename-derived install-source/profile name' "$tmp/assets-import-help"
+grep -Fq 'Override only the ISO-basename-derived InstallSource base' "$tmp/assets-import-help"
 grep -Fq 'V10-SP3-2403-Release-20240426' "$tmp/assets-import-help"
 grep -Fq 'atomically publishes the distro tuple with the install source' "$tmp/assets-import-help"
 if grep -Fq 'relative to /opt/nodeforge/work/import' "$tmp/assets-import-help"; then
@@ -277,9 +279,9 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-"$cli" --version | grep -Eq '^nodeforge 0\.2\.0 \(commit [0-9a-f]{12}|unknown'
+"$cli" --version | grep -Eq '^nodeforge 0\.2\.1 \(commit [0-9a-f]{12}|unknown'
 "$cli" -v | grep -Fq 'built '
-"$daemon" --version | grep -Eq '^nodeforged 0\.2\.0 \(commit [0-9a-f]{12}|unknown'
+"$daemon" --version | grep -Eq '^nodeforged 0\.2\.1 \(commit [0-9a-f]{12}|unknown'
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then

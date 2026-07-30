@@ -344,7 +344,7 @@ pub const CatalogRuntime = struct {
     ///
     /// 这是 M4.10 fresh-deployment 的主路径：一个 ISO 同时创建 distro/
     /// version/arch tuple、iso/kernel/initrd asset、可选 bootloader、可选
-    /// repository、install source 以及同名默认 install profile。所有写入
+    /// repository、InstallSource 以及 `<source>-install` 默认 Profile。所有写入
     /// 在单一 manifest-last 事务中完成，使读者要么看到全部新增内容，
     /// 要么看到全部旧内容，不会出现中间态。
     ///
@@ -386,7 +386,9 @@ pub const CatalogRuntime = struct {
         // 同名异内容返回 DuplicateObjectName，绝不覆盖。
         for (imported.repositories) |repository| for (value.repositories) |existing| if (std.mem.eql(u8, existing.name, repository.name)) return error.DuplicateObjectName;
         for (value.install_sources) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
-        for (value.profiles) |existing| if (std.mem.eql(u8, existing.name, imported.install_source.name)) return error.DuplicateObjectName;
+        const default_profile_name = try @import("../profile/naming.zig").profileName(self.allocator, imported.install_source.name, null, .install);
+        defer self.allocator.free(default_profile_name);
+        for (value.profiles) |existing| if (std.mem.eql(u8, existing.name, default_profile_name)) return error.DuplicateObjectName;
         const addition_count = required_additions.len + @as(usize, if (bootloader_addition != null) 1 else 0);
         const assets = try self.allocator.alloc(model.AssetConfig, value.assets.len + addition_count);
         defer self.allocator.free(assets);
@@ -407,8 +409,8 @@ pub const CatalogRuntime = struct {
         @memcpy(sources[0..value.install_sources.len], value.install_sources);
         sources[value.install_sources.len] = imported.install_source;
         // M4.10 fresh-deployment 主路径：ISO publication 已拥有完整 tuple，
-        // 因而在同一 manifest-last transaction 中创建同名默认 install
-        // profile。显式 `profile create` 只用于从该 source 补充其他 profile。
+        // 因而在同一 manifest-last transaction 中创建 `<source>-install`
+        // 默认 Profile。角色后缀使 install/diskless 命名完全对称。
         const profiles = try self.allocator.alloc(model.ProfileConfig, value.profiles.len + 1);
         defer self.allocator.free(profiles);
         @memcpy(profiles[0..value.profiles.len], value.profiles);
@@ -417,7 +419,7 @@ pub const CatalogRuntime = struct {
         var default_system: model.TargetSystemConfig = .{};
         default_system.hosts_content = host_hosts;
         profiles[value.profiles.len] = .{
-            .name = imported.install_source.name,
+            .name = default_profile_name,
             .install_source = imported.install_source.name,
             .system = default_system,
         };
@@ -797,7 +799,7 @@ test "first install source publication persists and projects its derived distro"
     try std.testing.expectEqual(@as(usize, 1), live_catalog.value().distros.len);
     try std.testing.expectEqual(@as(usize, 1), live_catalog.value().install_sources.len);
     try std.testing.expectEqual(@as(usize, 1), live_catalog.value().profiles.len);
-    try std.testing.expectEqualStrings("fixture-source", live_catalog.value().profiles[0].name);
+    try std.testing.expectEqualStrings("fixture-source-install", live_catalog.value().profiles[0].name);
     try std.testing.expectEqualStrings("fixture-source", live_catalog.value().profiles[0].install_source);
     try std.testing.expect(live_catalog.value().profiles[0].system.import_host_hosts);
     try std.testing.expect(live_catalog.value().profiles[0].system.hosts_content != null);

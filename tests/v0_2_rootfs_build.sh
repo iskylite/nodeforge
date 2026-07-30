@@ -13,8 +13,8 @@ server_ip=${NODEFORGE_BUILD_SERVER_IP:-127.0.0.1}
 port=${NODEFORGE_BUILD_PORT:-18091}
 work=/tmp/nodeforge-rbtest
 install_root="$work/install"
-profile=nf-rbtest
-bundle=nf-rb-bundle
+profile=rocky-9.7-aarch64-iso-rbtest-diskless
+bundle=rocky-9.7-aarch64-iso-rbtest-diskless-bundle
 
 cleanup() {
     if [[ -n "${test_daemon_pid:-}" ]]; then
@@ -102,7 +102,7 @@ cli assets register --type kernel --name nf-test-kernel \
 cli assets register --type nodeforge_initrd --name nf-test-initrd \
     --path rootfs-test/nf-test-initrd --distro rocky --version 9.7 --arch aarch64 \
     --kernel-release 5.14.0-362.13.1.el9.aarch64 >/dev/null
-cli assets boot-bundle create nf-test-bundle \
+cli assets boot-bundle create rocky-9.7-aarch64-iso --qualifier rbtest \
     --kernel nf-test-kernel --initrd nf-test-initrd \
     --distro rocky --version 9.7 --arch aarch64 \
     --kernel-release 5.14.0-362.13.1.el9.aarch64 >/dev/null
@@ -133,7 +133,7 @@ cli assets provision-bundle item add "$bundle" steps \
     name=rb-package action=package phase=rootfs-build idempotency_key=rb-package-v1 timeout_s=120 retryable=true \
     packages=tree >/dev/null
 
-cli profile create "$profile" rocky-9.7-aarch64-iso --kind diskless --boot-bundle nf-test-bundle >/dev/null
+cli profile create rocky-9.7-aarch64-iso --qualifier rbtest --kind diskless >/dev/null
 cli profile set "$profile" diskless.provision.bundle="$bundle" >/dev/null
 
 echo "=== repo repodata reachability ==="

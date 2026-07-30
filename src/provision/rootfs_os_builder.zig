@@ -1,22 +1,30 @@
-//! # v0.2 rootfs OS 层构建器
+//! # v0.2/v0.2.1 rootfs OS 层构建器
 //!
-//! `V0_2_DESIGN.md` §5.2 / `DISKLESS_FINAL.md` §4。rootfs 的 OS 层由发行版原生
-//! install-root 工具从 install source 受管 repository 构建到只读 lower。
-//! 当前生产实现只有 RHEL/Rocky `dnf --installroot`；Ubuntu 返回
-//! `AptOsLayerUnsupported`。v0.2.1 的目标路径是从同源 ISO 物化 casper
-//! squashfs layer closure，不是隐式回退宿主 apt/debootstrap。
+//! `V0_2_DESIGN.md` §5.2 / `DISKLESS_FINAL.md` §4 / `V0_2_1_UBUNTU_DISKLESS.md` §2.3.1。
+//! rootfs 的 OS 层由发行版原生工具从 install source 受管 repository 构建到只读
+//! lower：RHEL/Rocky 走 `dnf install`（v0.2.1 起统一经
+//! `namespaced_chroot_executor` 在独立 namespace 内执行；空 staging 的 bootstrap
+//! 仍由 host dnf 使用 `--installroot`，后续 package 步骤才进入 chroot）；Ubuntu
+//! 走同源 ISO 的 casper squashfs 三层
+//! overlay（`buildCasperOverlay`），不隐式回退宿主 apt/debootstrap。
 //!
 //! OS 层实际构建属环境相关执行边界（仅 Linux/root 构建主机可用，与 initrd/
 //! first_boot/rootfs_build_executor 一致），本模块不在单元测试覆盖内。叠加
 //! `rootfs_build_executor` 的 rootfs-build phase 步骤后产出最终 rootfs。
 const std = @import("std");
 const model = @import("../model.zig");
+const dto = @import("../http/diskless_dto.zig");
+const namespaced_chroot_executor = @import("namespaced_chroot_executor.zig");
 
-/// 在 staging 目录内用发行版原生 install-root 工具构建 OS 层。
-/// `repository_urls` 为 nodeforged 本机受管源的 `file://` URL。构建发生在
-/// management handler 内，禁止回连同一 HTTP listener；目标系统获得的仓库
-/// 仍由 AgentPlan/安装计划绑定为 nodeforged 的 HTTP URL。
-/// `version` 为 install source 版本（如 "9.7"）；dnf 取主版本作 `--releasever`。
+/// 在 staging 目录内用发行版原生工具构建 OS 层。`repository_urls` 为
+/// nodeforged 本机受管源的 `file://` URL。构建发生在 management handler 内，
+/// 禁止回连同一 HTTP listener；目标系统获得的仓库仍由 AgentPlan/安装计划绑定
+/// 为 nodeforged 的 HTTP URL。`version` 为 install source 版本（如 "9.7"）；
+/// dnf 取主版本作 `--releasever`。
+///
+/// `casper_layers` 与 `casper_layer_paths`（已发布 casper squashfs 文件的绝对
+/// 路径，与 `casper_layers` 一一对应、base→top 有序）只在 `package_manager ==
+/// .apt` 时有意义；dnf 分支忽略。
 ///
 /// v1：安装最小可 chroot 基线（bash/coreutils/tar + 包管理器），足以叠加
 /// rootfs-build phase 的 managed_file/archive/script/package 步骤；Profile
@@ -28,14 +36,86 @@ pub fn buildOsLayer(
     package_manager: model.PackageManager,
     version: []const u8,
     repository_urls: []const []const u8,
+    casper_layer_paths: []const []const u8,
 ) !void {
-    if (repository_urls.len == 0) return error.NoManagedRepository;
     switch (package_manager) {
-        .dnf => try buildDnf(io, allocator, staging, version, repository_urls),
-        // v0.2.1 尚未把 ISO casper layer discovery/materialization 接到本入口；
-        // 在此之前必须 fail closed，不能用宿主 apt/debootstrap 猜测目标 rootfs。
-        .apt => return error.AptOsLayerUnsupported,
+        // dnf 从零 bootstrap 必须有受管仓库；casper OS 层直接来自已导入的
+        // squashfs，即使定制 ISO 没有完整 APT metadata 也应允许构建。
+        .dnf => {
+            if (repository_urls.len == 0) return error.NoManagedRepository;
+            try buildDnf(io, allocator, staging, version, repository_urls);
+        },
+        .apt => try buildCasperOverlay(io, allocator, staging, casper_layer_paths),
     }
+}
+
+/// 按 base→top 顺序物化 casper squashfs layer，构成 Ubuntu OS 层。
+/// 每层先解到独立临时目录，再把 squashfs 中的 `0:0` 字符设备按
+/// overlay whiteout 语义应用为“删除下层同名路径”，最后合并普通内容。
+/// 不能对同一 staging 直接连续 `unsquashfs -f`：Ubuntu 官方 layer
+/// 使用字符设备表达 whiteout，下层已有同名目录时 unsquashfs 会
+/// 返回非零。任一层解包或合并失败均整体失败，不吞错误码。
+/// 完成后校验最小可 chroot 基线文件存在，并复用 dnf 分支的 sshd 配置/
+/// default target helper（不调用 `generateSshKeys`：Stage 5 已经统一处理）。
+fn buildCasperOverlay(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    staging: []const u8,
+    casper_layer_paths: []const []const u8,
+) !void {
+    if (casper_layer_paths.len == 0) return error.MissingCasperLayers;
+    try std.Io.Dir.cwd().createDirPath(io, staging);
+    for (casper_layer_paths, 0..) |layer_path, index| {
+        const layer_dir = try std.fmt.allocPrint(allocator, "{s}.casper-layer-{d}", .{ staging, index });
+        defer allocator.free(layer_dir);
+        std.Io.Dir.cwd().deleteTree(io, layer_dir) catch {};
+        defer std.Io.Dir.cwd().deleteTree(io, layer_dir) catch {};
+
+        // 不加 `|| true`：任一层解包失败即整体失败。
+        try runChecked(io, allocator, &.{ "unsquashfs", "-d", layer_dir, layer_path });
+        try runChecked(io, allocator, &.{
+            "sh",
+            "-c",
+            \\set -eu
+            \\layer=$1
+            \\target=$2
+            \\find "$layer" -xdev -type c -exec sh -c '
+            \\  layer=$1; target=$2; shift 2
+            \\  for path do
+            \\    test "$(stat -c %t:%T "$path")" = 0:0 || continue
+            \\    relative=${path#"$layer"/}
+            \\    rm -rf -- "$target/$relative"
+            \\    rm -f -- "$path"
+            \\  done
+            \\' sh "$layer" "$target" {} +
+            \\cp -a "$layer/." "$target/"
+            ,
+            "nodeforge-casper-merge",
+            layer_dir,
+            staging,
+        });
+        std.Io.Dir.cwd().deleteTree(io, layer_dir) catch {};
+    }
+
+    for ([_][]const u8{
+        "sbin/init",
+        "usr/lib/systemd/systemd",
+        "usr/bin/apt",
+        "usr/sbin/sshd",
+    }) |rel| {
+        const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging, rel });
+        defer allocator.free(abs);
+        if (!fileExists(io, abs)) {
+            std.log.scoped(.rootfs_build).err("casper overlay missing expected baseline file: {s}", .{abs});
+            return error.CasperOverlayIncomplete;
+        }
+    }
+
+    // casper 安装器层的默认 target 可能指向安装器专用逻辑；覆盖为
+    // multi-user.target，与 dnf OS 层一致。sshd 配置同样是纯 staging 文件
+    // 操作，不依赖 apt；不调用 `generateSshKeys`（Stage 5 统一生成，避免重复）。
+    try writeDefaultSshdConfig(io, allocator, staging);
+    try ensureDefaultTarget(io, allocator, staging);
 }
 
 fn buildDnf(
@@ -45,27 +125,8 @@ fn buildDnf(
     version: []const u8,
     repository_urls: []const []const u8,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(a, "dnf");
-    try argv.append(a, try std.fmt.allocPrint(a, "--installroot={s}", .{staging}));
-    try argv.append(a, try std.fmt.allocPrint(a, "--releasever={s}", .{majorVersion(version)}));
-    try argv.append(a, "--setopt=install_weak_deps=False");
-    // `--repofrompath` only adds repositories; without this guard dnf also
-    // inherits enabled host repos (for example Rocky 9 EPEL) into a Rocky 10
-    // target build. Disable the host set first so the OS layer is sourced
-    // exclusively from the matching imported ISO repositories below.
-    try argv.append(a, "--disablerepo=*");
-    for (repository_urls, 0..) |url, index| {
-        try argv.append(a, try std.fmt.allocPrint(a, "--repofrompath=nodeforge-{d},{s}", .{ index, url }));
-        try argv.append(a, try std.fmt.allocPrint(a, "--enablerepo=nodeforge-{d}", .{index}));
-    }
-    try argv.append(a, "install");
-    try argv.append(a, "-y");
-    try argv.append(a, "--nogpgcheck");
+    _ = version;
+    try std.Io.Dir.cwd().createDirPath(io, staging);
     // 可启动且可由 nodeforge-agent 收敛的基线。不能只满足 chroot：node-apply
     // 固定使用 usermod/systemctl，切根后的系统还需要 init、网络与 SSH 服务。
     const baseline = [_][]const u8{
@@ -81,25 +142,14 @@ fn buildDnf(
         "openssh-server",
         "procps-ng",
     };
-    for (baseline) |pkg| try argv.append(a, pkg);
-
-    const result = try std.process.run(allocator, io, .{
-        .argv = argv.items,
-        // A real bootable baseline pulls substantially more packages than the
-        // old chroot-only baseline; dnf progress can exceed 64 KiB.
-        .stdout_limit = .limited(4 * 1024 * 1024),
-        .stderr_limit = .limited(4 * 1024 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    const failed = switch (result.term) {
-        .exited => |code| code != 0,
-        else => true,
-    };
-    if (failed) {
-        std.log.scoped(.rootfs_build).err("os-layer dnf installroot failed (exit): {s}", .{result.stderr});
+    // 空 staging 尚无 dnf/rpm，bootstrap 必须由 host dnf + --installroot 完成；
+    // 与旧实现的区别是该 host-context 被限制在独立 mount/PID namespace 中，并
+    // 显式为 staging bind-mount /dev、/proc、/sys。OS 层完成后的 package 步骤
+    // 才统一进入 chroot。
+    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &baseline, repository_urls, true, .installroot, 0) catch |err| {
+        std.log.scoped(.rootfs_build).err("os-layer dnf namespaced install failed: {t}", .{err});
         return error.OsLayerBuildFailed;
-    }
+    };
 
     // 构建期与运行期都只使用 nodeforged 发布的 HTTP repository。这里清除
     // dnf 带入的 vendor 公网源；节点启动时由 immutable AgentPlan 重写同一组
@@ -221,8 +271,10 @@ fn generateSshKeys(io: std.Io, allocator: std.mem.Allocator, staging: []const u8
 
 /// 检查文件是否存在（非符号链接）。
 fn fileExists(io: std.Io, path: []const u8) bool {
-    var file = std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false }) catch return false;
-    file.close(io);
+    // casper 中 `/sbin/init` 通常是指向 `/lib/systemd/systemd` 的绝对
+    // symlink。`openFile(... follow_symlinks=false)` 会把“链接存在”误判为
+    // 不存在；这里需要 lstat 语义，只验证 staging 内该入口存在。
+    _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
     return true;
 }
 

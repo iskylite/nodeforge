@@ -42,17 +42,39 @@
 //! agent 不取得/解释 BootConfig 字段，不写 Profile 共享基线（已烤入 lower）；只重放
 //! Node 运行根差量。payload digest/size 不符或拉取失败时真正 init 不启动，不使用本地旧
 //! plan fallback（§10 fail-closed）。
+//! AgentPlan、payload、agent-consumed 与 lifecycle event 均复用
+//! `initrd/http.zig` 原生客户端，diskless 启动闭包不要求目标 rootfs 安装 curl。
+//! AgentPlan/events 使用 30 秒 socket 空闲超时，payload 使用 120 秒 socket
+//! 空闲超时；payload 持续有数据时没有总时长上限。Zig 0.16 POSIX Threaded Io
+//! 尚不能安全设置 connect deadline，建连暂由内核 TCP 超时负责。
 const std = @import("std");
 const first_boot = @import("provision/first_boot.zig");
 const node_apply = @import("provision/node_apply.zig");
 const diskless_dto = @import("http/diskless_dto.zig");
+const http = @import("initrd/http.zig");
 
 const handoff_path = "/var/lib/nodeforge/boot.json";
 const payload_dir = "/var/lib/nodeforge/payload";
 const agent_token_path = "/var/lib/nodeforge/credentials/agent.token";
 const event_token_path = "/var/lib/nodeforge/credentials/event.token";
 
-pub fn main(init: std.process.Init) !void {
+var current_stage: []const u8 = "process.start";
+var running_as_pid1_pre_init = false;
+
+pub fn main(init: std.process.Init) void {
+    run(init) catch |err| {
+        std.debug.print(
+            "\n[nodeforge-agent] FATAL: pre-init/first-boot aborted stage={s} error={t}\n",
+            .{ current_stage, err },
+        );
+        // 只有 pre-init 是 PID 1，必须保留控制台诊断；systemd first-boot unit
+        // 则正常以非零语义结束，由 unit/journal 记录失败，不能永久占住服务。
+        if (running_as_pid1_pre_init)
+            while (true) std.Io.sleep(init.io, .fromSeconds(3600), .awake) catch {};
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const io = init.io;
 
@@ -61,14 +83,19 @@ pub fn main(init: std.process.Init) !void {
     const arg1 = args_iter.next();
     const pre_init = arg1 != null and std.mem.eql(u8, arg1.?, "--pre-init");
     if (pre_init) {
+        running_as_pid1_pre_init = true;
+        current_stage = "pre_init";
         try preInit(io, allocator);
+        current_stage = "exec_system_init";
         execInit(io);
     }
     // 无参数：作为 systemd unit 执行 effective first-boot。
+    current_stage = "first_boot";
     try firstBoot(io, allocator);
 }
 
 fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
+    current_stage = "handoff.read";
     const handoff = try readFile(io, allocator, handoff_path);
     defer allocator.free(handoff);
     const h = try parseHandoff(allocator, handoff);
@@ -78,11 +105,14 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
     const event_token = try readCredential(io, allocator, event_token_path, false);
     defer allocator.free(event_token);
 
+    current_stage = "lifecycle.agent_configuring";
     try postLifecycle(io, allocator, h.event_url, event_token, h.session, 5, "diskless.switching_root", "diskless.agent_configuring");
     errdefer postLifecycle(io, allocator, h.event_url, event_token, h.session, 6, "diskless.agent_configuring", "diskless.failed") catch {};
 
     // 拉取 AgentPlan v1（agent:read token，session-bound）。
-    const plan_json = try curlGet(io, allocator, h.agent_plan_url, agent_token, h.session);
+    current_stage = "agent_plan.download";
+    std.debug.print("[nodeforge-agent] stage={s}: downloading AgentPlan\n", .{current_stage});
+    const plan_json = try nativeGet(io, allocator, h.agent_plan_url, agent_token, h.session);
     defer allocator.free(plan_json);
     const parsed_plan = try std.json.parseFromSlice(diskless_dto.AgentPlan, allocator, plan_json, .{ .ignore_unknown_fields = false });
     defer parsed_plan.deinit();
@@ -95,14 +125,16 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
 
     // 拉取并校验全部 content-addressed payload。
     try std.Io.Dir.cwd().createDirPath(io, payload_dir);
-    for (plan.payload) |entry| {
+    current_stage = "payload.download";
+    for (plan.payload, 0..) |entry, index| {
+        std.debug.print("[nodeforge-agent] stage={s}: item={d}/{d} path={s} bytes={d}\n", .{ current_stage, index + 1, plan.payload.len, entry.path, entry.size });
         const dest = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ payload_dir, entry.path });
         defer allocator.free(dest);
         const parent = std.fs.path.dirname(dest) orelse payload_dir;
         try std.Io.Dir.cwd().createDirPath(io, parent);
         const url = try std.fmt.allocPrint(allocator, "{s}/payload/{s}", .{ h.agent_plan_url_root, entry.path });
         defer allocator.free(url);
-        try curlDownload(io, allocator, url, agent_token, h.session, dest);
+        try nativeDownload(io, allocator, url, agent_token, h.session, dest, entry.size);
         const payload_bytes = try readFile(io, allocator, dest);
         defer allocator.free(payload_bytes);
         if (payload_bytes.len != entry.size) return error.PayloadSizeMismatch;
@@ -112,16 +144,21 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
     }
     const consumed_url = try std.fmt.allocPrint(allocator, "{s}/agent-consumed", .{h.agent_plan_url_root});
     defer allocator.free(consumed_url);
-    try curlPostEmpty(io, allocator, consumed_url, agent_token, h.session);
+    current_stage = "agent_plan.consume";
+    try nativePostEmpty(io, allocator, consumed_url, agent_token, h.session);
     clearToken(agent_token);
 
     // node-apply：把 Node effective 运行根差量写入 overlay upper（真正 init 看到最终配置）。
+    current_stage = "node_apply";
+    std.debug.print("[nodeforge-agent] stage={s}: applying effective node configuration\n", .{current_stage});
     try nodeApply(io, allocator, plan, h.node);
 
     // 持久化已校验的 AgentPlan 到 boot.json（覆盖 handoff）。同时达成两件事：
     // (1) first-boot 在切根+systemd 后可直接读 boot.json 重放八步，无需远程控制；
     // (2) credential 文件已经在读取时 unlink，agent:read token 随后只剩内存副本并被清零。
+    current_stage = "handoff.persist_verified_plan";
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = handoff_path, .data = plan_json });
+    std.debug.print("[nodeforge-agent] pre-init completed successfully\n", .{});
 }
 
 fn nodeApply(io: std.Io, allocator: std.mem.Allocator, plan: *const diskless_dto.AgentPlan, handoff_node: []const u8) !void {
@@ -163,7 +200,8 @@ fn interfaceNameByMac(io: std.Io, allocator: std.mem.Allocator, expected_mac: []
 
 fn execInit(io: std.Io) noreturn {
     // exec /sbin/init：替换当前进程镜像，把 PID 1 交给真正 init。
-    std.process.replace(io, .{ .argv = &.{"/sbin/init"} }) catch {};
+    const err = std.process.replace(io, .{ .argv = &.{"/sbin/init"} });
+    std.debug.print("[nodeforge-agent] FATAL: exec /sbin/init failed: {t}\n", .{err});
     std.process.exit(1);
 }
 
@@ -172,17 +210,27 @@ fn firstBoot(io: std.Io, allocator: std.mem.Allocator) !void {
     // 校验过的 AgentPlan，内联 first-boot 步骤），按固定顺序一次性重放，失败只记日志、
     // 不阻断启动。package 访问 pinned nodeforged software repository 不属于远程
     // 任务控制；agent 仍无远程控制、无 reconciliation。
-    const plan_json = readFile(io, allocator, handoff_path) catch return;
+    const plan_json = readFile(io, allocator, handoff_path) catch |err| {
+        std.debug.print("[nodeforge-agent] WARNING: first-boot skipped: cannot read verified plan: {t}\n", .{err});
+        return;
+    };
     defer allocator.free(plan_json);
-    const parsed = std.json.parseFromSlice(diskless_dto.AgentPlan, allocator, plan_json, .{ .ignore_unknown_fields = false }) catch return;
+    const parsed = std.json.parseFromSlice(diskless_dto.AgentPlan, allocator, plan_json, .{ .ignore_unknown_fields = false }) catch |err| {
+        std.debug.print("[nodeforge-agent] WARNING: first-boot skipped: invalid verified plan: {t}\n", .{err});
+        return;
+    };
     defer parsed.deinit();
     const failures = first_boot.runFromPlanJson(io, allocator, plan_json);
     // first-boot 失败按冻结语义只令 postprocess degraded；真正 init 已启动，
     // diskless boot 仍进入 running。详细失败数保留在 firstboot.log。
     _ = failures;
-    const token = readFile(io, allocator, event_token_path) catch return;
+    const token = readFile(io, allocator, event_token_path) catch |err| {
+        std.debug.print("[nodeforge-agent] WARNING: cannot report diskless.running: event credential unavailable: {t}\n", .{err});
+        return;
+    };
     defer allocator.free(token);
-    postLifecycle(io, allocator, parsed.value.event_url, token, parsed.value.session_id, 6, "diskless.agent_configuring", "diskless.running") catch {};
+    postLifecycle(io, allocator, parsed.value.event_url, token, parsed.value.session_id, 6, "diskless.agent_configuring", "diskless.running") catch |err|
+        std.debug.print("[nodeforge-agent] WARNING: cannot report diskless.running: {t}\n", .{err});
     @memset(token, 0);
     std.Io.Dir.cwd().deleteFile(io, event_token_path) catch {};
 }
@@ -230,42 +278,60 @@ fn freeHandoff(allocator: std.mem.Allocator, h: *const Handoff) void {
     allocator.free(h.agent_plan_url_root);
 }
 
-fn curlGet(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8) ![]u8 {
-    const tmp = "/tmp/agentplan.json";
-    try curlToFile(io, allocator, url, token, session, tmp);
-    return readFile(io, allocator, tmp);
+fn nativeHeaders(allocator: std.mem.Allocator, token: []const u8, session: []const u8) !struct { auth: []u8, session: []u8 } {
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    const sess = try allocator.dupe(u8, session);
+    return .{ .auth = auth, .session = sess };
 }
 
-fn curlDownload(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, dest: []const u8) !void {
-    try curlToFile(io, allocator, url, token, session, dest);
+fn nativeGet(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8) ![]u8 {
+    const parsed = try http.Url.parse(url);
+    const headers = try nativeHeaders(allocator, token, session);
+    defer allocator.free(headers.auth);
+    defer allocator.free(headers.session);
+    return http.get(io, allocator, parsed, &.{
+        .{ .name = "Authorization", .value = headers.auth },
+        .{ .name = "X-NodeForge-Session", .value = headers.session },
+    });
 }
 
-fn curlToFile(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, dest: []const u8) !void {
-    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
-    defer allocator.free(auth);
-    const sess = try std.fmt.allocPrint(allocator, "X-NodeForge-Session: {s}", .{session});
-    defer allocator.free(sess);
-    try runChecked(io, allocator, &.{ "curl", "-fsS", "-H", auth, "-H", sess, "-o", dest, url });
+fn nativeDownload(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, dest: []const u8, expected_size: u64) !void {
+    const parsed = try http.Url.parse(url);
+    const headers = try nativeHeaders(allocator, token, session);
+    defer allocator.free(headers.auth);
+    defer allocator.free(headers.session);
+    const response_headers = try http.getToFile(io, allocator, parsed, &.{
+        .{ .name = "Authorization", .value = headers.auth },
+        .{ .name = "X-NodeForge-Session", .value = headers.session },
+    }, dest, 200, expected_size);
+    allocator.free(response_headers);
 }
 
 fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, seq: u64, expected: []const u8, phase: []const u8) !void {
     const body = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"session_id\":\"{s}\",\"event_seq\":{d},\"expected_phase\":\"{s}\",\"phase\":\"{s}\"}}\n", .{ session, seq, expected, phase });
     defer allocator.free(body);
-    const event_file = "/tmp/nodeforge-agent-event.json";
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = event_file, .data = body });
-    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
-    defer allocator.free(auth);
-    const session_header = try std.fmt.allocPrint(allocator, "X-NodeForge-Session: {s}", .{session});
-    defer allocator.free(session_header);
-    try runChecked(io, allocator, &.{ "curl", "-fsS", "-H", auth, "-H", session_header, "-H", "Content-Type: application/json", "--data-binary", "@/tmp/nodeforge-agent-event.json", url });
+    const parsed = try http.Url.parse(url);
+    const headers = try nativeHeaders(allocator, token, session);
+    defer allocator.free(headers.auth);
+    defer allocator.free(headers.session);
+    const status = try http.post(io, allocator, parsed, &.{
+        .{ .name = "Authorization", .value = headers.auth },
+        .{ .name = "X-NodeForge-Session", .value = headers.session },
+        .{ .name = "Content-Type", .value = "application/json" },
+    }, body);
+    if (status < 200 or status >= 300) return error.LifecycleEventRejected;
 }
 
-fn curlPostEmpty(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8) !void {
-    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
-    defer allocator.free(auth);
-    const session_header = try std.fmt.allocPrint(allocator, "X-NodeForge-Session: {s}", .{session});
-    defer allocator.free(session_header);
-    try runChecked(io, allocator, &.{ "curl", "-fsS", "-X", "POST", "-H", auth, "-H", session_header, "-o", "/dev/null", url });
+fn nativePostEmpty(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8) !void {
+    const parsed = try http.Url.parse(url);
+    const headers = try nativeHeaders(allocator, token, session);
+    defer allocator.free(headers.auth);
+    defer allocator.free(headers.session);
+    const status = try http.post(io, allocator, parsed, &.{
+        .{ .name = "Authorization", .value = headers.auth },
+        .{ .name = "X-NodeForge-Session", .value = headers.session },
+    }, "");
+    if (status < 200 or status >= 300) return error.AgentConsumedRejected;
 }
 
 fn sha256Hex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {

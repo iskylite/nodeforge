@@ -10,6 +10,7 @@ const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
 const config_load = @import("load.zig");
 const validate = @import("validate.zig");
+const naming = @import("../profile/naming.zig");
 
 /// 从已有 install source 创建安全默认 install profile。
 ///
@@ -26,8 +27,12 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
         break;
     };
     const selected = source orelse return error.InstallSourceNotFound;
+    // 名称必须保留 ISO import 生成的完整 InstallSource 身份；不能接受仅由
+    // distro/version 拼出的短名，否则补丁版本、架构和介质 variant 会丢失。
+    if (!naming.profileIsCanonical(name, selected.name, kind)) return error.NonCanonicalProfileName;
     if (kind == .diskless) {
         if (boot_bundle == null) return error.DisklessBootBundleRequired;
+        if (!naming.bootBundleIsCanonical(boot_bundle.?, selected.name)) return error.NonCanonicalBootBundleName;
     }
     const profiles = try allocator.alloc(model.ProfileConfig, parsed.value.profiles.len + 1);
     defer allocator.free(profiles);

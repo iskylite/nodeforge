@@ -97,6 +97,8 @@ pub const InstallSourceImport = struct {
     content_sha256: []const u8,
     idempotency_key: []const u8,
     name: ?[]const u8 = null,
+    /// 追加到 ISO 完整基础名后的用途限定符，不允许覆盖基础身份。
+    qualifier: ?[]const u8 = null,
     /// 可选的产品覆盖；daemon 在元数据无法识别产品时采用此值。
     distro: ?[]const u8 = null,
     /// 可选的版本覆盖；daemon 在元数据缺失版本时采用此值。
@@ -817,13 +819,13 @@ pub const InstallSourceImportResult = struct {
 
 pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) !?InstallSourceImportResult {
     if (!querySafe(request.filename) or request.content_sha256.len != 64 or request.idempotency_key.len == 0 or request.idempotency_key.len > 128 or !querySafe(request.idempotency_key)) return error.InvalidInstallSourceField;
-    inline for ([_]?[]const u8{ request.name, request.distro, request.version, request.arch }) |optional|
+    inline for ([_]?[]const u8{ request.name, request.qualifier, request.distro, request.version, request.arch }) |optional|
         if (optional) |value|
             if (!querySafe(value)) return error.InvalidInstallSourceField;
-    const Wire = struct { filename: []const u8, original_filename: []const u8, sha256: []const u8, name: ?[]const u8, distro: ?[]const u8, version: ?[]const u8, arch: ?[]const u8 };
+    const Wire = struct { filename: []const u8, original_filename: []const u8, sha256: []const u8, name: ?[]const u8, qualifier: ?[]const u8, distro: ?[]const u8, version: ?[]const u8, arch: ?[]const u8 };
     var body_writer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
     defer body_writer.deinit();
-    try std.json.Stringify.value(Wire{ .filename = request.filename, .original_filename = request.original_filename, .sha256 = request.content_sha256, .name = request.name, .distro = request.distro, .version = request.version, .arch = request.arch }, .{ .emit_null_optional_fields = true }, &body_writer.writer);
+    try std.json.Stringify.value(Wire{ .filename = request.filename, .original_filename = request.original_filename, .sha256 = request.content_sha256, .name = request.name, .qualifier = request.qualifier, .distro = request.distro, .version = request.version, .arch = request.arch }, .{ .emit_null_optional_fields = true }, &body_writer.writer);
     var response: [16 * 1024]u8 = undefined;
     var location: [256]u8 = undefined;
     var reply = try managementPostJson(io, port, "/api/v1/management/install-sources", body_writer.written(), request.idempotency_key, &response, &location);

@@ -191,6 +191,15 @@ fn buildInternal(
     std.log.scoped(.initrd_build).info("initrd build: stage 6/7 - creating /capsule directory", .{});
     const capsule_dir = try std.fmt.allocPrint(a, "{s}/capsule", .{initrd_root});
     try std.Io.Dir.cwd().createDirPath(io, capsule_dir);
+    // vendor initrd 不保证在 archive 中保留空的伪文件系统挂载点。
+    // nodeforge-initrd 作为 PID 1 会在任何用户态工具之前直接 mount(2)
+    // `/proc,/sys,/dev,/run`；目标目录缺失会以 ENOENT 报 MountFailed。
+    // 因此这四个目录必须由 NodeForge overlay 显式物化，不依赖
+    // 发行版 vendor archive 的偶然内容。
+    for ([_][]const u8{ "proc", "sys", "dev", "run" }) |mountpoint| {
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ initrd_root, mountpoint });
+        try std.Io.Dir.cwd().createDirPath(io, path);
+    }
 
     // 7. 发布。Vendor member 保持逐字节不变，NodeForge overlay 追加在后；
     // fallback 则重包成单一 gzip member。

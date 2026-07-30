@@ -6,7 +6,9 @@
 //! 制品记录只增不删（v0.2 不做 rootfs GC，见 `V0_2_IMPL_DETAILS.md` §7）；
 //! 同一 `rootfs_input_digest` 重复登记仅在不可变元数据一致时幂等；
 //! `uncompressed_size` 允许从未知补全为已知，其余漂移均拒绝。rootfs 文件本体存于
-//! `paths.rootfs_dir`（内容寻址 `<digest>.squashfs`），本模块只持记录。
+//! `paths.rootfs_dir`（`<profile>/<digest-prefix>/<profile>.squashfs`），本模块只持记录。
+//! 目录中的 digest-prefix 仅用于可读分组；完整 `rootfs_input_digest` 才是查询、
+//! 幂等登记与不可变校验依据，不能从文件名反推或截断比较。
 const std = @import("std");
 const atomicWrite = @import("dhcp_store.zig").atomicWrite;
 
@@ -23,7 +25,8 @@ pub const Artifact = struct {
     uncompressed_size: u64 = 0,
     /// 匹配的运行时内核 release（bootConfig kernel_release）。
     kernel_release: []const u8,
-    /// 相对 rootfs_dir 的 squashfs 文件名（`<digest>.squashfs`）。
+    /// 相对 rootfs_dir 的路径：
+    /// `<profile>/<digest-prefix>/<profile>.squashfs`。
     file: []const u8,
     /// Unix 创建时刻。
     created_at: i64,

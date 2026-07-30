@@ -1966,7 +1966,7 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
 /// 替换仅在完整候选存在后才被序列化。
 fn importInstallSource(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
-    const ImportRequest = struct { filename: []const u8, original_filename: []const u8, sha256: []const u8, name: ?[]const u8 = null, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null };
+    const ImportRequest = struct { filename: []const u8, original_filename: []const u8, sha256: []const u8, name: ?[]const u8 = null, qualifier: ?[]const u8 = null, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null };
     const body = request.body orelse return assetInputError(request, "missing body", meta);
     const parsed = std.json.parseFromSlice(ImportRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return assetInputError(request, "invalid JSON body", meta);
     defer parsed.deinit();
@@ -1975,6 +1975,8 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     if (declared_sha256.len != 64 or !allLowerHex(declared_sha256)) return assetInputError(request, "invalid sha256", meta);
     const name = parsed.value.name;
     if (name) |value| if (!config_validate.validLogicalId(value)) return assetInputError(request, "invalid logical name", meta);
+    const qualifier = parsed.value.qualifier;
+    if (qualifier) |value| if (!config_validate.validLogicalId(value)) return assetInputError(request, "invalid qualifier", meta);
     const distro = parsed.value.distro;
     const version = parsed.value.version;
     const arch = parsed.value.arch;
@@ -1982,7 +1984,7 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     const arch_text = if (arch) |value| @tagName(value) else null;
     const idempotency_key = request.getHeader("idempotency-key") orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_key_required\",\"message\":\"Idempotency-Key header is required\"}}\n", meta);
     var digest_buf: [32]u8 = undefined;
-    const digest_input = try std.fmt.allocPrint(context.allocator, "sha256={s}&original_filename={s}&name={s}&distro={s}&version={s}&arch={s}", .{ declared_sha256, parsed.value.original_filename, name orelse "", distro orelse "", version orelse "", arch_text orelse "" });
+    const digest_input = try std.fmt.allocPrint(context.allocator, "sha256={s}&original_filename={s}&name={s}&qualifier={s}&distro={s}&version={s}&arch={s}", .{ declared_sha256, parsed.value.original_filename, name orelse "", qualifier orelse "", distro orelse "", version orelse "", arch_text orelse "" });
     defer context.allocator.free(digest_input);
     std.crypto.hash.sha2.Sha256.hash(digest_input, &digest_buf, .{});
     var digest_hex: [64]u8 = undefined;
@@ -2000,7 +2002,9 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     if (!std.mem.eql(u8, &input_hash, declared_sha256)) return assetInputError(request, "ContentDigestMismatch", meta);
     context.catalog.lock();
     const catalog_snapshot = context.catalog.acquireLocked();
-    for (catalog_snapshot.value().assets) |asset| {
+    // 无限定符的重复导入按 ISO 内容自然幂等。显式提供 qualifier 表示要从同一
+    // 介质派生另一个标准 InstallSource，因此不能被内容去重提前吞掉。
+    if (qualifier == null) for (catalog_snapshot.value().assets) |asset| {
         if (asset.kind != .iso or asset.sha256 == null or !std.mem.eql(u8, asset.sha256.?, &input_hash)) continue;
         for (catalog_snapshot.value().install_sources) |source| if (std.mem.eql(u8, source.source_asset, asset.name)) {
             catalog_snapshot.release();
@@ -2010,7 +2014,7 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
             operation_done = true;
             return operationResponse(request, completed, true, meta);
         };
-    }
+    };
     if (name) |requested_name| for (catalog_snapshot.value().install_sources) |source| if (std.mem.eql(u8, source.name, requested_name)) {
         catalog_snapshot.release();
         context.catalog.unlock();
@@ -2030,7 +2034,7 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
         .io = context.io,
         .allocator = import_arena.allocator(),
         .config = context.config,
-        .request = .{ .filename = filename, .original_filename = parsed.value.original_filename, .name = name, .distro = distro, .version = version, .arch = arch },
+        .request = .{ .filename = filename, .original_filename = parsed.value.original_filename, .name = name, .qualifier = qualifier, .distro = distro, .version = version, .arch = arch },
     };
     const worker = std.Thread.spawn(.{}, runIsoImport, .{&task}) catch |err| {
         observe_log.err("ISO import worker could not start: {t}", .{err});
@@ -2208,6 +2212,18 @@ fn managementBootBundleCreate(request: zap.Request, context: *RouteContext, meta
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
     const catalog = context.catalog_snapshot.value();
     for (catalog.boot_bundles) |bb| if (std.mem.eql(u8, bb.name, parsed.value.name)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.already_exists\",\"message\":\"boot bundle name already exists\"}}\n", meta);
+    // BootBundle 没有独立的自由命名空间：它必须保留某个完整
+    // InstallSource 前缀并以 `-diskless-bundle` 结尾；中间可追加用途/内核限定符，
+    // 同时平台 tuple 必须与该 source 一致。
+    var canonical_source_found = false;
+    for (catalog.install_sources) |source| {
+        if (!@import("../profile/naming.zig").bootBundleIsCanonical(parsed.value.name, source.name)) continue;
+        if (std.mem.eql(u8, source.distro, parsed.value.distro) and
+            std.mem.eql(u8, source.version, parsed.value.version) and
+            source.arch == arch)
+            canonical_source_found = true;
+    }
+    if (!canonical_source_found) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.non_canonical_name\",\"message\":\"boot bundle name must retain the complete install-source prefix, end in -diskless-bundle, and match that source platform\"}}\n", meta);
     const kernel_asset = lookup.findAsset(catalog, parsed.value.kernel) orelse return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.asset_not_found\",\"message\":\"kernel asset not found\"}}\n", meta);
     if (kernel_asset.kind != .kernel) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"boot_bundle.asset_kind_mismatch\",\"message\":\"kernel asset must have kind=kernel\"}}\n", meta);
     if (kernel_asset.kernel_release) |detected_release| {
@@ -3147,6 +3163,8 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
         error.ProfileAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.already_exists\",\"message\":\"profile name already exists\"}}\n", meta),
         error.InstallSourceNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"profile.install_source_not_found\",\"message\":\"install source does not exist\"}}\n", meta),
         error.DisklessBootBundleRequired => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.boot_bundle_required\",\"message\":\"--kind diskless requires a boot bundle\"}}\n", meta),
+        error.NonCanonicalProfileName => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.non_canonical_name\",\"message\":\"profile name must be <complete-install-source>[-<qualifier>]-<install|diskless>\"}}\n", meta),
+        error.NonCanonicalBootBundleName => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.non_canonical_boot_bundle\",\"message\":\"diskless boot bundle name must retain the complete install-source prefix and end in -diskless-bundle\"}}\n", meta),
         else => return validationError(request, err, meta),
     };
     applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"profile persisted but snapshot publish failed\"}}\n", meta);
@@ -3265,6 +3283,19 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
 
 /// Worker-side rootfs build. It consumes a newly acquired immutable model pair,
 /// rechecks the submitted input digest, and never touches an HTTP request.
+/// 读取宿主 `/etc/os-release` 的 `ID_LIKE`/`ID`，判断构建主机是否为
+/// Debian/Ubuntu family（casper overlay 假设与目标 Ubuntu diskless rootfs 同源
+/// 工具链存在时的最佳情况；非 Debian family 宿主上 kernel-dependent 包仍可能
+/// 因内核版本不一致失败，见 §5.1 CLI 提示）。读取失败按"非 Debian family"处理
+/// （fail-closed 到"总是提示"，而不是静默假设安全）。
+fn hostIsDebianFamily(io: std.Io, allocator: std.mem.Allocator) bool {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, "/etc/os-release", allocator, .limited(16 * 1024)) catch return false;
+    defer allocator.free(content);
+    return std.mem.indexOf(u8, content, "ID_LIKE=debian") != null or
+        std.mem.indexOf(u8, content, "ID=debian") != null or
+        std.mem.indexOf(u8, content, "ID=ubuntu") != null;
+}
+
 fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest: []const u8, operation_id: []const u8) !void {
     const catalog = context.catalog_snapshot.value();
     const profile = lookup.findProfile(catalog, name) orelse return error.MissingProfile;
@@ -3299,9 +3330,38 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
     try std.Io.Dir.cwd().createDirPath(context.io, staging);
     defer std.Io.Dir.cwd().deleteTree(context.io, staging) catch {};
 
-    // 1. OS 层：发行版原生 install-root 工具从受管 repository 构建 chroot-able 基线。
+    // 1. OS 层：dnf 走统一 namespace+chroot 隔离原语从受管 repository 构建；
+    //    apt（Ubuntu）走同源 ISO 的 casper squashfs layer overlay。
     std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 1/6 - building OS layer (staging={s})", .{ name, staging });
-    rootfs_os_builder.buildOsLayer(context.io, context.allocator, staging, os_package_manager, install_source.version, repo_closure.repository_urls) catch |err| {
+    var casper_layer_paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (casper_layer_paths.items) |p| context.allocator.free(p);
+        casper_layer_paths.deinit(context.allocator);
+    }
+    if (os_package_manager == .apt) {
+        for (install_source.casper_layers) |layer| {
+            const abs = try std.fmt.allocPrint(context.allocator, "{s}/{s}/{s}", .{ context.config.http.repository_root, install_source.name, layer.path });
+            // catalog 中的完整 size/SHA-256 才是 layer 的不可变身份。不能只信
+            // 当前受管目录路径，否则磁盘损坏或人工覆盖会让相同 input digest
+            // 构建出不同 rootfs 内容。
+            try verifyCasperLayer(context.io, abs, layer.size, layer.sha256);
+            try casper_layer_paths.append(context.allocator, abs);
+        }
+        // §5.1：非 Ubuntu/Debian 宿主构建 Ubuntu diskless rootfs 时提示 kernel
+        // 依赖风险（rootfs-build phase 的 *-dkms/kernel-*/kmod 类包可能因宿主
+        // 内核版本与目标 casper 内核不一致而失败；纯用户态包不受影响）。
+        if (!hostIsDebianFamily(context.io, context.allocator)) {
+            std.log.scoped(.rootfs_build).warn(
+                "rootfs build [{s}]: WARNING building Ubuntu diskless rootfs on a non-Ubuntu/Debian host. " ++
+                    "OS layer uses the casper squashfs overlay (not apt/debootstrap from scratch); initrd is " ++
+                    "extracted from the ISO's casper/initrd (host dracut is not used). Packages requiring kernel " ++
+                    "headers/modules (*-dkms, kernel-*, kmod) may fail if the host kernel does not match the " ++
+                    "target Ubuntu kernel; pure userspace packages are unaffected.",
+                .{name},
+            );
+        }
+    }
+    rootfs_os_builder.buildOsLayer(context.io, context.allocator, staging, os_package_manager, install_source.version, repo_closure.repository_urls, casper_layer_paths.items) catch |err| {
         std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 1 FAILED - OS layer ({t})", .{ name, err });
         return err;
     };
@@ -3338,7 +3398,7 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
     //    managed_file/archive/script 仍
     //    chroot 执行（写绝对路径到 staging lower）。两者都不接触公网。
     std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 3/6 - executing rootfs-build steps ({d} step(s))", .{ name, build_steps.len });
-    const plan = try rootfs_build_executor.buildPlan(context.allocator, build_steps, dto_manager, repo_closure.repository_urls, payload_paths, staging);
+    const plan = try rootfs_build_executor.buildPlan(context.allocator, build_steps, dto_manager, repo_closure.repository_urls, payload_paths);
     defer plan.deinit(context.allocator);
     rootfs_build_executor.execute(context.io, context.allocator, staging, plan) catch |err| {
         std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 3 FAILED - rootfs-build steps ({t})", .{ name, err });
@@ -3509,10 +3569,11 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
     };
     const rootfs_dir = paths.require().rootfs_dir;
     try std.Io.Dir.cwd().createDirPath(context.io, rootfs_dir);
-    const file_name = try std.fmt.allocPrint(context.allocator, "{s}.squashfs", .{digest_hex});
+    const file_name = try @import("../provision/artifact_layout.zig").rootfsRelative(context.allocator, profile.name, digest_hex);
     defer context.allocator.free(file_name);
     const dest = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ rootfs_dir, file_name });
     defer context.allocator.free(dest);
+    if (std.fs.path.dirname(dest)) |parent| try std.Io.Dir.cwd().createDirPath(context.io, parent);
     const part = try std.fmt.allocPrint(context.allocator, "{s}.part-{s}", .{ dest, operation_id });
     defer context.allocator.free(part);
     std.Io.Dir.cwd().deleteFile(context.io, part) catch {};
@@ -3774,6 +3835,30 @@ fn streamCopy(io: std.Io, src: []const u8, dest: []const u8) !void {
     try out_file.sync(io);
 }
 
+/// 在解包前重新验证已发布 casper layer，保证 catalog 中记录的不可变输入身份
+/// 与磁盘实际内容一致。使用固定缓冲流式计算，避免大型 squashfs 占用堆内存。
+fn verifyCasperLayer(io: std.Io, path: []const u8, expected_size: u64, expected_sha256: []const u8) !void {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.kind != .file) return error.CasperLayerNotRegularFile;
+    if (stat.size != expected_size) return error.CasperLayerSizeMismatch;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (true) {
+        const count = try file.readPositionalAll(io, &buffer, offset);
+        if (count == 0) break;
+        hasher.update(buffer[0..count]);
+        offset += count;
+    }
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    var actual: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&actual, "{x}", .{raw}) catch unreachable;
+    if (!std.mem.eql(u8, &actual, expected_sha256)) return error.CasperLayerDigestMismatch;
+}
+
 /// 提交一个已经完整写入并同步到磁盘的 rootfs 临时文件。
 ///
 /// 相同输入摘要的检查、正式文件原子改名和制品存储持久化由同一把变更互斥锁
@@ -3897,10 +3982,11 @@ fn managementRootfsRegister(request: zap.Request, context: *RouteContext, name: 
     // 内容寻址目标文件（先写 .part 再原子 rename），仅持有固定缓冲。
     const rootfs_dir = paths.require().rootfs_dir;
     cwd.createDirPath(context.io, rootfs_dir) catch {};
-    const file_name = try std.fmt.allocPrint(context.allocator, "{s}.squashfs", .{digest_hex});
+    const file_name = try @import("../provision/artifact_layout.zig").rootfsRelative(context.allocator, profile.name, digest_hex);
     defer context.allocator.free(file_name);
     const dest = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ rootfs_dir, file_name });
     defer context.allocator.free(dest);
+    if (std.fs.path.dirname(dest)) |parent| try cwd.createDirPath(context.io, parent);
     const tmp = try std.fmt.allocPrint(context.allocator, "{s}.part-{s}", .{ dest, &meta.request_id });
     defer context.allocator.free(tmp);
     errdefer cwd.deleteFile(context.io, tmp) catch {};

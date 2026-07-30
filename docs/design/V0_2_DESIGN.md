@@ -224,9 +224,27 @@ overlay 挂载、handoff 写入等）在切根后无法查看，事后排障困�
    - initrd 阶段：`/var/lib/nodeforge/initrd.log` + `/var/lib/nodeforge/initrd-dmesg.log`
    - pre-init 阶段：console（串口），无持久化
    - first-boot 阶段：`/var/lib/nodeforge/firstboot.log` + systemd journal
+4. 所有关键步骤维护稳定 `stage` 名称。错误不得只通过 Zig `try` 冒泡：PID 1
+   顶层统一输出 `FATAL`、stage、error、node 和 session；内存硬闸额外输出
+   MemTotal、MemAvailable、required minimum、deficit、rootfs 压缩/展开大小、
+   payload、tmpfs 百分比和安全余量。Range 下载逐块打印进度、失败范围和重试。
+5. 切根后的 agent pre-init 使用相同的阶段化致命日志，并与 initrd 共享原生
+   Zig HTTP 客户端；diskless 启动闭包不依赖外部 curl。
+6. HTTP 超时按流量类型区分：BootConfig、facts、
+   events 和 HEAD 的 socket 空闲收发上限 30 秒；rootfs Range 连续 120 秒无
+   收发进展才超时，持续传输不限制总时长。AgentPlan 和 agent events 使用
+   30 秒空闲收发上限；payload 使用 120 秒空闲收发上限，也不限制总时长。
+   Zig 0.16 POSIX Threaded Io 的 connect deadline 尚未实现且会 panic，当前建连
+   使用内核 TCP 有界超时；升级到可安全设置 deadline 的 Zig/runtime 后再落实
+   10 秒显式建连上限，不能为满足配置值重新引入 daemon 崩溃。
+7. `diskless.running` 只证明 initrd、rootfs、切根、node-apply 和 first-boot
+   生命周期完成，不等价于“所有本地控制台均可登录”。发行版 rootfs 可能保留
+   installer 专用 getty mask/drop-in。产品验收必须同时检查 PID 1/systemd、
+   SSH、failed units 和实际 tty 登录提示；Ubuntu casper 由 node-apply 恢复
+   tty1 标准 getty，并仅在字符设备存在时启用 ARM serial getty。
 
-**影响范围**：`src/initrd.zig`（log 函数 + main switch_root 前日志复制）、`src/agent.zig`
-（文档注释更新日志位置说明）。
+**影响范围**：`src/initrd.zig`（阶段、容量诊断、下载进度、顶层 fatal）、
+`src/initrd/http.zig`（HTTP 诊断）、`src/agent.zig`（pre-init 阶段与超时）。
 
 ### R12. diskless 终态未同步终止 boot_session.Store 的 DHCP session
 
@@ -833,12 +851,12 @@ nodeforge profile capabilities show <profile>
 nodeforge node capabilities show <node>
 ```
 
-source 派生的 NodeForge initrd 存放在
-`assets/boot/diskless/sources/<source>/<kernel-release>/<name>.img`，手工 tuple
-构建则存放在
-`assets/boot/diskless/manual/<distro>/<version>/<arch>/<kernel-release>/<name>.img`。
-kernel release 同时进入文件名/目录和 asset manifest；RHEL 的 `uname -r` 本身含
-`.x86_64`/`.aarch64`，Ubuntu 的 `uname -r` 不含 arch，NodeForge 不擅自裁剪。
+NodeForge initrd 统一存放在
+`assets/diskless/initrd/<profile-or-name>/<kernel-release>/initrd.img`；rootfs 存放在
+`assets/diskless/rootfs/<profile>/<rootfs-input-digest前16位>/<profile>.squashfs`。
+来源 tuple、完整摘要和内容摘要均保留在 catalog/state，不再重复编码进多层目录。
+RHEL 的 `uname -r` 本身含 `.x86_64`/`.aarch64`，Ubuntu 的 `uname -r` 不含 arch，
+NodeForge 不擅自裁剪。
 
 rootfs manifest 的 files/features、initrd modules/features 和 boot-bundle compatibility constraints 若为 scalar
 collection，使用 values 命令；manifest entries 或 build steps 若为 structured collection，使用 item CRUD/
@@ -900,7 +918,7 @@ ISO import 一次原子生成：
 - vendor installer initrd（仅安装器使用的 `installer_initrd` asset）；
 - 零个、一个或多个 repository + media tree；
 - InstallSource；
-- 一个引用该 InstallSource 的默认 install Profile。
+- 一个名为 `<InstallSource>-install`、引用该 InstallSource 的默认 Profile。
 
 #### 多 variant ISO 的 repository 发现
 
@@ -930,6 +948,12 @@ ISO import 不生成 rootfs、NodeForge initrd、boot bundle 或 diskless Profil
   NodeForge initrd；多个 bundle/发行版/版本/架构可同时存在；
 - `profile create --kind diskless --boot-bundle` 创建 diskless Profile，并仍
   引用 InstallSource 以取得 repository/software capability；
+- ISO import 可接收可选 `qualifier`，但它只能追加到 ISO 派生/覆盖的基础名，
+  形成标准 InstallSource，不能替换基础身份；
+- Profile 名统一由 `<完整-install-source>[-<qualifier>]-<kind>` 生成，install
+  与 diskless 都必须带角色后缀；BootBundle 复用相同 source/qualifier 投影并固定
+  `diskless-bundle` 后缀，避免与 diskless Profile 同名。
+  CLI 不再接收自由 Profile/BootBundle 整名，management API 执行相同校验；
 - `profile rootfs build` 从 diskless Profile build projection 构建共享、
   内容寻址 rootfs。rootfs 不属于 boot bundle，启动时由 DeliveryManifest
   将选定 bundle revision 与 rootfs digest 固定为同一 session snapshot。
@@ -1236,7 +1260,10 @@ diskless**（diskless 无安装器，`node-apply`/`first-boot` 是其运行根�
 以 diskless 后处理为唯一 v0.2 目标。
 
 **agent 身份与生命周期**。agent 无 enrollment：节点身份由 cmdline node/session、BootConfig 和 token claim
-三方相等后固定为 session snapshot，initrd 写入 `/var/lib/nodeforge/boot.json` 与 `agent-handoff.json`（mode 0600，非 secret 摘要）。
+三方相等后固定为 session snapshot，initrd 只写单一
+`/var/lib/nodeforge/boot.json`（非 secret locator/摘要）；agent/event token 使用
+独立 0400 credential 文件并在读取后 unlink。未来 AgentPlan schema 扩展继续演进
+这一 handoff，不新增内容重复的第二份 JSON。
 `switch_root` 以 `nodeforge-agent --pre-init` 为入口；agent 校验身份，使用 `agent:read` 从服务端获取 expected digest 的
 AgentPlan/Node payload，清除读 token，应用 immutable `node_apply_projection` 后 exec 真正 init。systemd 启动后同一 binary
 的 first-boot unit 再读取 rootfs Profile payload 或 agent pre-init 预下载的 Node override payload，固定顺序
@@ -1589,11 +1616,12 @@ Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或�
    nodeforge assets register --type nodeforge_initrd --name <i> --path <p>
 
    # 4. 创建 boot bundle（仅绑定 kernel/initrd，派生 rootfs 不进入 bundle）
-   nodeforge assets boot-bundle create <name> --kernel <k> --initrd <i> \
+   nodeforge assets boot-bundle create <install-source> [--qualifier <value>] \
+     --kernel <k> --initrd <i> \
      --distro <d> --version <v> --arch <a> --kernel-release <r>
 
    # 5. 创建 diskless profile（引用 boot bundle）
-   nodeforge profile create <name> <install-source> --kind diskless --boot-bundle <name>
+   nodeforge profile create <install-source> [--qualifier <value>] --kind diskless
 
    # 6. 构建 Profile 派生 rootfs
    nodeforge profile rootfs build <diskless-profile>

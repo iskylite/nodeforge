@@ -111,8 +111,9 @@ initrd 内完成上述职责；它不链接 TargetSystem/effective runner，不�
 5. 建立 squashfs 只读 lower + tmpfs overlay upper。
 6. 只校验 AgentPlan locator envelope（URL host/path、expected digest/size、expiry、required agent feature 摘要），
    不下载或解析完整 plan；检查已挂载 rootfs 的 agent manifest 能满足 feature 摘要。
-7. 写 `/var/lib/nodeforge/boot.json` 与 `/var/lib/nodeforge/agent-handoff.json`（均 0600，仅含 node/session、URL、digest、size
-   和非 secret 摘要），将独立 `agent:read` 与 `event:append` token 写入 0400 credential 文件。
+7. 原子写单一 `/var/lib/nodeforge/boot.json` handoff（仅含 node/session、URL、
+   digest 和非 secret 元数据），将独立 `agent:read` 与 `event:append` token 写入
+   0400 credential 文件。不得再增加内容重复的 `agent-handoff.json`。
 8. pre-switch 检查通过后清零只属于 initrd 的 config/rootfs-artifact token，move-mount `/run`，保留 agent/event token，
    以 merged root 执行 `switch_root ... /usr/lib/nodeforge/nodeforge-agent --pre-init`。
 
@@ -142,8 +143,9 @@ agent **仅服务 diskless**，是消费服务端 immutable AgentPlan 的一次�
 
 ### 4.2 功能列表
 
-1. pre-init 读取 `/var/lib/nodeforge/boot.json` 和 `agent-handoff.json`，校验 node/session/plan identity、handoff
-   owner/mode、expected digest/size/expiry 与 `agent:read` claim。
+1. pre-init 读取 `/var/lib/nodeforge/boot.json`，校验 node/session/plan identity、
+   handoff owner/mode、expected digest 与 `agent:read` claim；凭据只从独立 0400
+   credential 文件读取并在读后 unlink，不得内联进 boot.json。
 2. 使用继承的 bootstrap 网络从精确 URL 拉取 immutable AgentPlan；只接受 expected digest 的 canonical bytes，禁止
    catalog list/get、latest、重定向到未声明 host 或服务端临时下发命令。
 3. 按 AgentPlan 的 immutable closure 预取 Node first-boot override payload 及其 assets/package payload；全部 size/digest/

@@ -97,7 +97,7 @@ nodeforge setup --install-root /opt/nodeforge --generate-systemd --install --yes
 systemctl enable --now nodeforged
 
 # 2. 导入 ISO（自动注册 install source + default install profile + bootloader）
-nodeforge assets import <iso-path>
+nodeforge assets import <iso-path> [--qualifier <value>]
 
 # 3. 注册 diskless 资产
 #    a) kernel — 已由 ISO 导入自动注册（<source>-kernel, kind=kernel），可直接用于 boot bundle
@@ -111,11 +111,11 @@ nodeforge assets initrd build <name> \
 nodeforge assets register --type nodeforge_initrd --name <i> --path <p> \
   --distro <d> --version <v> --arch <a> --kernel-release <r>
 # 4. 创建 boot bundle + diskless profile（bundle 不含派生 rootfs，避免创建环）
-nodeforge assets boot-bundle create <name> \
+nodeforge assets boot-bundle create <install-source> [--qualifier <value>] \
   --kernel <k> --initrd <i> \
   --distro <d> --version <v> --arch <a> --kernel-release <r>
 # profile name 可选：省略时自动派生为 <install-source>-diskless
-nodeforge profile create [<name>] <install-source> --kind diskless --boot-bundle <bundle>
+nodeforge profile create <install-source> [--qualifier <value>] --kind diskless
 
 # 5. 构建 Profile 派生 rootfs；外部构建时改用 register
 nodeforge profile rootfs build <diskless-profile> [--if-input-digest <digest>]
@@ -149,7 +149,8 @@ nodeforge node deploy <id> true
 ## 2. 阶段 1：导入本地 OS 源
 
 ```text
-nodeforge assets import <iso> [--name <source>] [--distro <id>] [--version <version>] [--arch <arch>]
+nodeforge assets import <iso> [--name <source-base>] [--qualifier <value>] \
+  [--distro <id>] [--version <version>] [--arch <arch>]
 nodeforge assets install-source list
 nodeforge assets install-source show <source>
 nodeforge assets install-source software list <source> [--kind package|group|environment|task|metapackage]
@@ -161,9 +162,11 @@ nodeforge assets repository software list <repository> [--kind package|group|env
 ```
 
 ISO import 成功必须原子发布 install source、installer kernel、media tree、本地 repositories 和 software index。
-默认 install source 及同名 profile 名称由完整 ISO basename 去掉 `.iso` 后规范化得到，因而适用于所有发行版，
-并自然保留 Kylin 等介质文件名中的 SP、发行批次和 Release 日期。`--name` 可覆盖该名称，`--version` 可覆盖
-媒体元数据中的 catalog 版本事实。Ubuntu point release（如 `22.04.5`）保留为 catalog 版本和资源身份；
+默认 InstallSource 由完整 ISO basename 去掉 `.iso` 后规范化得到；可选 `--qualifier`
+只追加到该基础名。导入事务同时创建 `<InstallSource>-install` 默认 Profile。
+因此所有发行版都保留 Kylin 等介质文件名中的 SP、发行批次和 Release 日期。
+`--name` 仅用于无法正确识别的介质基础名覆盖，`--version` 可覆盖媒体元数据中的
+catalog 版本事实。Ubuntu point release（如 `22.04.5`）保留为 catalog 版本和资源身份；
 APT Release 的 `Version` 校验使用对应 series（如 `22.04`），两者不得混为一个字段。每个 source 使用独立
 ISO、boot 和 repository 路径；导入不覆盖既有同名内容。
 
@@ -260,7 +263,7 @@ nodeforge assets initrd build <name> \
 nodeforge assets register --type nodeforge_initrd --name <i> --path <p> \
   --distro <d> --version <v> --arch <a> --kernel-release <r>
 
-nodeforge assets boot-bundle create <name> \
+nodeforge assets boot-bundle create <install-source> [--qualifier <value>] \
   --kernel <k> --initrd <i> \
   --distro <d> --version <v> --arch <a> --kernel-release <r>
 nodeforge assets boot-bundle list
@@ -270,9 +273,9 @@ nodeforge assets boot-bundle show <name>
 `assets initrd build` 优先使用 `--from-install-source`：保留 ISO vendor initrd（含发行版补丁、固件和内核模块）
 并追加 NodeForge overlay。无 `--from-install-source` 时使用 `--distro/--version/--arch` 选择通用 dracut fallback。
 原子发布到受管 initrd store 并注册结果。source 模式的物理路径为
-`assets/boot/diskless/sources/<source>/<kernel-release>/<name>.img`；通用模式为
-`assets/boot/diskless/manual/<distro>/<version>/<arch>/<kernel-release>/<name>.img`，
-因此只看目录即可区分 ISO/source 来源，且同名制品不会跨 source 冲突。
+`assets/diskless/initrd/<name>/<kernel-release>/initrd.img`；source/tuple provenance
+由 catalog 保存，不再通过 `sources/manual` 多层目录重复表达，
+目录直接表达操作员使用的制品名；精确 ISO/source 来源通过 asset show 查询。
 
 `--kernel-release` 是用户明确指定的目标 ABI，不做阻断式一致性校验。若 source 中
 installer kernel 已检测出 release 且与参数不同，CLI 输出警告并继续；后续
@@ -324,7 +327,7 @@ apparent size，不是 squashfs 文件大小；有值时进入 BootConfig 并参
 
 ```text
 nodeforge profile list
-nodeforge profile create [<profile>] <install-source> --kind diskless --boot-bundle <bundle>
+nodeforge profile create <install-source> [--qualifier <value>] --kind diskless
 nodeforge profile set <profile> FIELD=VALUE...
 nodeforge profile unset <profile> KEY...
 nodeforge profile add-values <profile> software.packages.include <package>...
@@ -339,10 +342,38 @@ nodeforge profile show <profile>
 nodeforge profile remove <profile>
 ```
 
-`--kind` 是 immutable discriminant，默认 `install`。`<profile>` 名参数可选：省略时从 install source 名派生默认名——
-diskless 派生为 `<source>-diskless`，install 派生为 `<source>`。显式传入 name 时必须符合 canonical logical identifier 规则。
+`--kind` 是 immutable discriminant，默认 `install`。Profile 名不再由用户手写，而由
+`<完整-install-source>[-<qualifier>]-<kind>` 唯一生成。例如 source 为
+`rocky-9.7-aarch64-minimal` 时，默认 install Profile 是
+`rocky-9.7-aarch64-minimal-install`，`--qualifier compute --kind diskless` 生成
+`rocky-9.7-aarch64-minimal-compute-diskless`。BootBundle 使用同一 source/qualifier
+投影并固定 `diskless-bundle` 后缀，因此对应名称为
+`rocky-9.7-aarch64-minimal-compute-diskless-bundle`。完整名称包含 ISO 探测出的
+补丁版本、架构和介质 variant；CLI 与
+HTTP API 使用同一服务端校验，不能绕过。
+
+ISO 导入的 `--qualifier` 只追加到 ISO basename 派生（或 `--name` 覆盖）的基础名，
+例如 `assets import rocky.iso --qualifier site-a` 生成 `<ISO标准基础名>-site-a`
+InstallSource，并自动创建 `<InstallSource>-install`。它不能替换或缩写 ISO 基础身份。
 一旦创建后 kind 不可改变；diskless 不接受 `install.*`，install Profile 不接受 `diskless.*`。
 `profile show` 必须提供可追溯 provenance，不要求额外 flag。
+
+### 5.1 旧短名称迁移
+
+已有无 `-install` 后缀或使用短 source 前缀的名称不得在 daemon 启动时静默改名：
+Profile 名被 Node 引用，BootBundle
+又参与 rootfs input digest 和运行中 session 快照，原地自动改写会破坏可追溯性。
+升级后旧对象可继续读取，但所有新建入口立即执行规范名称校验。迁移必须在节点
+`deploy=false` 且没有活动 session 时显式完成：
+
+1. 使用 `<完整-install-source>-diskless-bundle`（或保留完整 source 前缀的限定名称）
+   创建新的 BootBundle；
+2. 用同一完整 source 前缀创建新的 diskless Profile，并重新应用旧 Profile
+   的可变配置；
+3. 重新构建/注册新 Profile 的 rootfs；
+4. 将 Node 切换到新 Profile，完成 readiness 后再恢复 `deploy=true`；
+5. 确认零引用后删除旧 Profile。旧 BootBundle 在提供受引用保护的 remove
+   命令前保留为不可变历史对象，不手工编辑 catalog 删除。
 `profile remove` 只删除当前 catalog 中零 Node 引用的 Profile。有任何 Node 引用时返回 `profile.in_use`，
 不会隐式解绑、停用或修改 Node。
 list/set 类型必须使用对应 collection 命令（`add-values`/`remove-values`/`replace-values`/`item`）。

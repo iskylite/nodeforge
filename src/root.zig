@@ -49,6 +49,8 @@ pub const node_mutation = @import("config/node_mutation.zig");
 pub const profile_mutation = @import("config/profile_mutation.zig");
 /// v0.2 diskless effective compiler：三投影与两摘要。
 pub const profile_diskless = @import("profile/diskless.zig");
+/// Profile/BootBundle 从完整 InstallSource 派生的统一命名规则。
+pub const profile_naming = @import("profile/naming.zig");
 pub const value_mutation = @import("config/value_mutation.zig");
 pub const item_mutation = @import("config/item_mutation.zig");
 pub const scalar_mutation = @import("config/scalar_mutation.zig");
@@ -76,6 +78,8 @@ pub const provision_node_apply = @import("provision/node_apply.zig");
 pub const provision_rootfs_build_executor = @import("provision/rootfs_build_executor.zig");
 /// v0.2 rootfs OS-layer builder：用发行版原生 install-root 工具从受管 repository 构建 OS 层 lower。
 pub const provision_rootfs_os_builder = @import("provision/rootfs_os_builder.zig");
+/// v0.2.1 统一 namespace+chroot 隔离执行原语：dnf/apt package 步骤共用，替换 dnf --installroot host-context。
+pub const provision_namespaced_chroot_executor = @import("provision/namespaced_chroot_executor.zig");
 /// v0.2 initrd builder：用 dracut 构建最小 initramfs，注入 nodeforge-initrd 二进制和 /init 脚本。
 pub const provision_initrd_build_executor = @import("provision/initrd_build_executor.zig");
 pub const initrd_memory = @import("initrd/memory.zig");
@@ -85,11 +89,13 @@ test {
     _ = provision_node_apply;
     _ = provision_rootfs_build_executor;
     _ = provision_rootfs_os_builder;
+    _ = provision_namespaced_chroot_executor;
     _ = provision_initrd_build_executor;
     _ = initrd_memory;
     _ = initrd_download;
 }
 pub const node_inventory = @import("state/node_inventory.zig");
+pub const artifact_layout = @import("provision/artifact_layout.zig");
 /// v0.2 rootfs artifact store：已构建 rootfs 制品按 rootfs_input_digest 内容寻址登记。
 pub const state_rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
 /// v0.2 diskless delivery session + scoped token store（config/agent/event token）。

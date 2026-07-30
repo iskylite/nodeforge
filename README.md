@@ -135,18 +135,21 @@ IPv4 PXE 无人值守安装产品已完成；所有权模型、typed property re
 | M4.12 | 存储 override | 已由 canonical Node/Profile 所有权模型取代旧 fallback |
 | M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 已完成 |
 
-### v0.2（当前产品线）
+### v0.2.1（当前版本）
 
 v0.2.0 已落地 schema v4、diskless Profile、rootfs 制品登记、BootConfig v3 /
 AgentPlan v1、四域 capability、严格 HEAD + Range 下载、tmpfs overlay、node-apply、
 first-boot content-addressed payload 与 aarch64 Rocky QEMU/VMware UEFI PXE 完整闭环。
 
+v0.2.1 已把 Ubuntu casper 方案接入正式 `profile rootfs build` 产品链，补齐
+apt rootfs-build 隔离执行、原生 HTTP 诊断、制品路径规范、casper 运行态清理和
+标准 getty 恢复。已在 r97n0 fresh CLI 环境中完成 Rocky 9.7、Rocky 10.2 与
+Ubuntu 22.04.5 aarch64 VMware 冷启动回归。
+
 后续按以下边界推进：
 
-- **v0.2.1**：把已验证的 Ubuntu casper 方案接入正式 `profile rootfs build`
-  产品链，并补齐 apt rootfs-build 隔离执行；
 - **v0.2.2**：持久化升级兼容、durable builder operation、CLI 收敛、
-  x86_64/aarch64 双架构与故障恢复矩阵；
+  x86_64/aarch64、QEMU/VMware 固定矩阵与故障恢复验证；
 - **v0.3+**：BIOS PXELINUX、多 NIC/topology、后续 rootfs 形态。
 
 IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是项目永久非目标。
@@ -242,9 +245,9 @@ systemctl start nodeforged
 ├── catalog/        # manifest.json + entity files
 ├── assets/
 │   ├── iso/        # ISO 镜像
-│   ├── boot/       # TFTP 启动文件：efi/<source>/、install/<source>/、diskless/sources/<source>/<uname-r>/ 或 diskless/manual/<distro>/<version>/<arch>/<uname-r>/
+│   ├── boot/       # TFTP 安装启动文件：efi/<source>/、install/<source>/
+│   ├── diskless/   # initrd/<profile>/<uname-r>/ 与 rootfs/<profile>/<digest-prefix>/
 │   ├── repos/      # HTTP 发布的仓库
-│   ├── rootfs/     # HTTP 发布的 diskless squashfs
 │   └── keys/       # SSH 密钥
 ├── state/          # lease/status/session/provisioned
 ├── logs/           # 服务日志和事件审计流
@@ -310,7 +313,12 @@ nodeforge profile set rocky-9 $'system.hosts_content=127.0.0.1 localhost\n192.16
 ```
 
 Install 与 diskless 默认继承 Install Source 导入的受管 Yum/APT 仓库。Rocky 安装后只保留
-`/etc/yum.repos.d/nodeforge.repo`，Ubuntu 由 Subiquity 持久化 NodeForge APT primary。
+`/etc/yum.repos.d/nodeforge.repo`；Ubuntu install 由 Subiquity 持久化 NodeForge APT
+primary，Ubuntu diskless 的 node-apply 则删除 casper 自带的公网/CD-ROM 源，只生成
+`/etc/apt/sources.list.d/nodeforge.list`。diskless 同时离线 mask 仅适用于安装介质的
+snapd、multipathd 和 casper-md5check 单元，防止 overlay 根上的重启循环和虚假 failed unit。
+node-apply 还会移除 casper 对 `getty@tty1` 的 vendor mask 和 Subiquity getty
+drop-in，恢复标准本地登录控制台；存在 ARM 串口设备时同时启用对应 serial getty。
 可以查询介质的软件能力并选择 environment/group：
 
 ```bash
@@ -332,41 +340,39 @@ nodeforge assets initrd build rocky-9.7-nodeforge-initrd \
   --from-install-source rocky-9.7-aarch64-dvd \
   --kernel-release 5.14.0-611.5.1.el9_7.aarch64
 
-# source 模式发布到 assets/boot/diskless/sources/<source>/<uname-r>/<name>.img；
-# 无 source 的通用构建发布到
-# assets/boot/diskless/manual/<distro>/<version>/<arch>/<uname-r>/<name>.img。
+# 统一发布到 assets/diskless/initrd/<name>/<uname-r>/initrd.img；
+# source/tuple provenance 由 catalog 保存，不再重复形成多层目录。
 #
 # RHEL 的 uname -r 通常包含 .x86_64/.aarch64，Ubuntu 通常不包含。
 # 显式 --kernel-release 与 ISO 检测值不同时只警告，不阻止构建。
 
 # 2. 创建 boot bundle，并创建 diskless profile。
-nodeforge assets boot-bundle create rocky-9.7-diskless \
+nodeforge assets boot-bundle create rocky-9.7-aarch64-dvd \
   --kernel rocky-9.7-aarch64-dvd-kernel \
   --initrd rocky-9.7-nodeforge-initrd \
   --distro rocky --version 9.7 --arch aarch64 \
   --kernel-release 5.14.0-611.5.1.el9_7.aarch64
-nodeforge profile create rocky-9.7-diskless rocky-9.7-aarch64-dvd \
-  --kind diskless --boot-bundle rocky-9.7-diskless
+nodeforge profile create rocky-9.7-aarch64-dvd --kind diskless
 
 # 3. 构建并登记 rootfs。
-nodeforge profile rootfs plan rocky-9.7-diskless --output json
-nodeforge profile rootfs build rocky-9.7-diskless \
+nodeforge profile rootfs plan rocky-9.7-aarch64-dvd-diskless --output json
+nodeforge profile rootfs build rocky-9.7-aarch64-dvd-diskless \
   --if-input-digest <rootfs_input_digest>
-nodeforge profile rootfs status rocky-9.7-diskless
+nodeforge profile rootfs status rocky-9.7-aarch64-dvd-diskless
 
 # 外部 squashfs 也可直接登记；以下两种写法二选一，展开大小可选。
 # 未提供时会告警并跳过内存容量硬校验，但不会阻止登记或部署。
-nodeforge profile rootfs register rocky-9.7-diskless \
+nodeforge profile rootfs register rocky-9.7-aarch64-dvd-diskless \
   --path /path/to/rootfs.squashfs
 # 或者，若已有可信测量值，可启用严格内存预算：
-nodeforge profile rootfs register rocky-9.7-diskless \
+nodeforge profile rootfs register rocky-9.7-aarch64-dvd-diskless \
   --path /path/to/rootfs.squashfs --uncompressed-size <bytes>
 
 # 如果第一次登记时未提供展开大小，可对同一文件再次登记以补全元数据；
 # 成功状态为 metadata_updated。内容或已知元数据冲突不会覆盖现有制品。
 
 # 4. 绑定节点、检查 readiness、打开 deploy gate。
-nodeforge node set node-01 profile=rocky-9.7-diskless
+nodeforge node set node-01 profile=rocky-9.7-aarch64-dvd-diskless
 nodeforge node readiness node-01 --stage boot
 nodeforge node deploy node-01 true
 

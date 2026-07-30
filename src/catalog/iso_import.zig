@@ -35,6 +35,8 @@ pub const Request = struct {
     /// 原始 ISO basename，仅用于默认逻辑命名；文件访问始终使用 filename。
     original_filename: []const u8,
     name: ?[]const u8 = null,
+    /// 可选限定符，只能追加到 ISO 派生/覆盖的基础名之后，不能替换基础身份。
+    qualifier: ?[]const u8 = null,
     /// 可选的产品覆盖。family 始终由 ISO 布局决定；提供的值直接采用，
     /// 不与媒体元数据比对，用于已知布局但标签未知或元数据不完整的介质。
     distro: ?[]const u8 = null,
@@ -145,18 +147,16 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     defer if (mounted) unmountIso(io, allocator, mount_point) catch |err|
         observe_log.warn("iso import: cleanup unmount failed for {s}: {t}", .{ mount_point, err });
 
-    const detected = try detectMedia(io, allocator, mount_point, request);
+    const detected = detectMedia(io, allocator, mount_point, request) catch |err| {
+        observe_log.err("ISO import media detection failed: {t}", .{err});
+        return err;
+    };
     const media = detected.layout;
     try copyTree(io, allocator, mount_point, staged_repo);
     try unmountIso(io, allocator, mount_point);
     mounted = false;
 
-    const source_name = if (request.name) |name|
-        try allocator.dupe(u8, name)
-    else blk: {
-        const stem = request.original_filename[0 .. request.original_filename.len - ".iso".len];
-        break :blk try logicalComponent(allocator, stem);
-    };
+    const source_name = try canonicalSourceName(allocator, request.original_filename, request.name, request.qualifier);
     // 从 ISO 实际携带的 kernel/initrd 配对中检测 kernel release。仓库包名只作为
     // 最后的弱证据；无法唯一确定时宁可保留 null，也不把仓库中的另一个内核误认为
     // 安装器正在启动的内核。
@@ -167,7 +167,7 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
     const iso_rel = try std.fmt.allocPrint(allocator, "{s}.iso", .{source_name});
     const kernel_rel = try std.fmt.allocPrint(allocator, "install/{s}/{s}", .{ source_name, kernel_filename });
     const initrd_rel = try std.fmt.allocPrint(allocator, "install/{s}/initrd.img", .{source_name});
-    const bootloader_media_rel = findBootloaderMediaPath(io, staged_repo, detected.arch);
+    const bootloader_media_rel = findBootloaderMediaPath(io, allocator, staged_repo, detected.arch);
     // bootloader 路径在计算 SHA-256 后确定（内容寻址），见下方 bootloader_rel 赋值。
     const iso_destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.http.asset_root, iso_rel });
     defer allocator.free(iso_destination);
@@ -347,10 +347,36 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
         .kernel_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .kind = .kernel, .path = kernel_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .kernel_release = if (kernel_release) |kr| try allocator.dupe(u8, kr) else null, .sha256 = try allocator.dupe(u8, &kernel_hash) },
         .initrd_asset = .{ .name = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .kind = .installer_initrd, .path = initrd_rel, .distro = distro_name, .version = distro_version, .arch = detected.arch, .sha256 = try allocator.dupe(u8, &initrd_hash) },
         .repositories = repo_configs,
-        .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names },
+        .install_source = .{ .name = source_name, .source_label = detected.source_label, .distro = distro_name, .version = distro_version, .arch = detected.arch, .source_asset = try std.fmt.allocPrint(allocator, "{s}-image", .{source_name}), .installer_kernel = try std.fmt.allocPrint(allocator, "{s}-kernel", .{source_name}), .installer_initrd = try std.fmt.allocPrint(allocator, "{s}-installer-initrd", .{source_name}), .media_tree_url = media_tree_url, .repositories = repository_names, .casper_layers = detected.casper_layers },
     };
     retain_outputs = true;
     return result;
+}
+
+/// 从 ISO basename（或受控基础名覆盖）生成标准 InstallSource 名。
+/// qualifier 永远只能追加，不能替换 ISO 基础身份。
+fn canonicalSourceName(allocator: std.mem.Allocator, original_filename: []const u8, name_override: ?[]const u8, qualifier: ?[]const u8) ![]u8 {
+    const source_base = if (name_override) |name|
+        try allocator.dupe(u8, name)
+    else blk: {
+        const stem = original_filename[0 .. original_filename.len - ".iso".len];
+        break :blk try logicalComponent(allocator, stem);
+    };
+    defer allocator.free(source_base);
+    return if (qualifier) |value|
+        std.fmt.allocPrint(allocator, "{s}-{s}", .{ source_base, value })
+    else
+        allocator.dupe(u8, source_base);
+}
+
+test "ISO qualifier 只能追加到标准 InstallSource 基础名" {
+    const derived = try canonicalSourceName(std.testing.allocator, "Rocky-9.7-aarch64-minimal.iso", null, "site-a");
+    defer std.testing.allocator.free(derived);
+    try std.testing.expectEqualStrings("rocky-9.7-aarch64-minimal-site-a", derived);
+
+    const overridden = try canonicalSourceName(std.testing.allocator, "unknown.iso", "kylin-v10-sp3-aarch64", "gpu");
+    defer std.testing.allocator.free(overridden);
+    try std.testing.expectEqualStrings("kylin-v10-sp3-aarch64-gpu", overridden);
 }
 
 /// 在 catalog 候选校验或原子发布失败后移除未发布的输出。这些路径由
@@ -419,6 +445,8 @@ const DetectedMedia = struct {
     arch: model.Arch,
     source_label: ?[]const u8 = null,
     layout: MediaLayout,
+    /// Ubuntu casper OS 层 layer 清单（base→top 有序）；非 Ubuntu family 始终为空。
+    casper_layers: []const model.CasperLayer = &.{},
 };
 
 /// 从挂载的 ISO 检测 family/distro/version/arch 和媒体布局。
@@ -644,9 +672,14 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
     _ = try assets.verifyRegularFile(io, mount_point, "casper/initrd");
     // M3.6 介质完整性：没有 casper filesystem 的 live-server kernel/initrd
     // 无法在 ISO 被下载并挂载后进入 Subiquity 安装器。Ubuntu Server 22.04+
-    // 使用 ubuntu-server-minimal.squashfs 等非固定文件名，因此扫描目录
-    // 确认至少存在一个 .squashfs 文件。
-    if (!try casperHasSquashfs(io, mount_point)) return error.FileNotFound;
+    // 使用 ubuntu-server-minimal.squashfs 等非固定文件名，因此在 assets import
+    // 挂载期间一次性发现完整的有序 layer 清单（base→top），供 build 阶段的
+    // casper overlay 构建使用；build 阶段 ISO 已卸载，无法重新扫描。
+    const casper_layers = discoverCasperLayers(io, allocator, mount_point) catch |err| {
+        observe_log.err("Ubuntu casper layer discovery failed: {t}", .{err});
+        return err;
+    };
+    observe_log.info("Ubuntu casper default layer chain selected ({d} layer(s))", .{casper_layers.len});
     const info_path = try std.fmt.allocPrint(allocator, "{s}/.disk/info", .{mount_point});
     defer allocator.free(info_path);
     const info = try std.Io.Dir.cwd().readFileAlloc(io, info_path, allocator, .limited(64 * 1024));
@@ -670,6 +703,7 @@ fn detectUbuntuMedia(io: std.Io, allocator: std.mem.Allocator, mount_point: []co
             r[0] = try allocator.dupe(u8, "");
             break :blk r;
         } else null },
+        .casper_layers = casper_layers,
     };
 }
 
@@ -705,21 +739,208 @@ fn distroForRhelFamily(family: []const u8) ?[]const u8 {
     return null;
 }
 
-/// 检查 `casper/` 目录中是否存在至少一个 `.squashfs` 文件。
+/// 发现并按 base→top 顺序返回 `casper/` 目录下的 squashfs layer 清单。
 ///
-/// Ubuntu Server 22.04+ 不再使用固定文件名 `filesystem.squashfs`，
-/// 而是使用 `ubuntu-server-minimal.squashfs` 等多个命名 squashfs 文件。
-/// 此函数扫描 `casper/` 目录确认存在任意 `.squashfs` 后缀的常规文件。
-fn casperHasSquashfs(io: std.Io, mount_point: []const u8) !bool {
+/// Ubuntu Server 22.04+ 使用点号分隔的文件名表达 layer 的 parent 关系，例如
+/// `ubuntu-server-minimal.squashfs`（base）→
+/// `ubuntu-server-minimal.ubuntu-server.squashfs`（server）→
+/// `ubuntu-server-minimal.ubuntu-server.installer.squashfs`（installer/top）。
+/// 去掉最后一个点号分隔段即为 parent 的文件名。要求：
+///
+/// - 每个非 base layer 的 parent 必须存在于同一目录（否则
+///   `error.MissingCasperLayer`，fail-closed，不猜测缺失层）；
+/// - 必须能唯一确定一条从 base 到 top 的链——即恰好一个 layer 不是任何其他
+///   layer 的 parent（唯一的 "leaf"/顶层）。零个或多个这样的 leaf 都是
+///   `error.AmbiguousCasperLayers`；
+/// - 链必须覆盖 `casper/` 目录下发现的全部 `.squashfs` 文件，否则视为
+///   存在游离于链外的文件，同样 `error.AmbiguousCasperLayers`。
+///
+/// 该函数只在 `assets import` 挂载 ISO 期间调用一次；build 阶段 ISO 已卸载，
+/// 只能读取此处记录的清单，无法重新扫描。
+fn discoverCasperLayers(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8) ![]const model.CasperLayer {
     var root = try std.Io.Dir.openDirAbsolute(io, mount_point, .{ .access_sub_paths = true });
     defer root.close(io);
-    var casper = root.openDir(io, "casper", .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    var casper = root.openDir(io, "casper", .{ .iterate = true, .follow_symlinks = false }) catch return error.FileNotFound;
     defer casper.close(io);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
     var iterator = casper.iterate();
     while (try iterator.next(io)) |entry| {
-        if (std.mem.endsWith(u8, entry.name, ".squashfs")) return true;
+        // ISO9660/UDF 目录项常被底层报告为 `unknown`，不能像
+        // ext4 一样只接受 `.file`。后面会用 NOFOLLOW 重新打开并以
+        // `stat.kind == .file` 做权威校验，因此这里允许 unknown 是安全的。
+        if (entry.kind != .file and entry.kind != .unknown) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".squashfs")) continue;
+        try names.append(allocator, try allocator.dupe(u8, entry.name[0 .. entry.name.len - ".squashfs".len]));
     }
-    return false;
+    if (names.items.len == 0) return error.FileNotFound;
+
+    // Ubuntu 官方介质可同时携带 default/generic/generic-hwe 等多个
+    // 合法变体。这时不能按“全目录唯一 leaf”猜测，必须以
+    // casper/install-sources.yaml 中 default source 的 path 作为顶层。
+    // 自定义介质没有该 manifest 时才回退到唯一 leaf 规则。
+    const manifest_top = try defaultCasperSourcePath(io, allocator, mount_point);
+    defer if (manifest_top) |path| allocator.free(path);
+
+    // parent[i] = 名字在 names.items 中的索引，或 null（该层是 base）。
+    const parent_idx = try allocator.alloc(?usize, names.items.len);
+    defer allocator.free(parent_idx);
+    const is_parent_of_someone = try allocator.alloc(bool, names.items.len);
+    defer allocator.free(is_parent_of_someone);
+    @memset(is_parent_of_someone, false);
+
+    for (names.items, 0..) |name, i| {
+        const last_dot = std.mem.lastIndexOfScalar(u8, name, '.');
+        if (last_dot == null) {
+            parent_idx[i] = null;
+            continue;
+        }
+        const parent_name = name[0..last_dot.?];
+        var found: ?usize = null;
+        for (names.items, 0..) |other, j| {
+            if (i == j) continue;
+            if (std.mem.eql(u8, other, parent_name)) {
+                found = j;
+                break;
+            }
+        }
+        if (found == null) return error.MissingCasperLayer;
+        parent_idx[i] = found;
+        is_parent_of_someone[found.?] = true;
+    }
+
+    var top: ?usize = null;
+    if (manifest_top) |path| {
+        if (!std.mem.startsWith(u8, path, "casper/") or !std.mem.endsWith(u8, path, ".squashfs"))
+            return error.InvalidCasperManifest;
+        const selected = path["casper/".len .. path.len - ".squashfs".len];
+        for (names.items, 0..) |name, i| {
+            if (std.mem.eql(u8, name, selected)) {
+                top = i;
+                break;
+            }
+        }
+        if (top == null) return error.MissingCasperLayer;
+    } else {
+        for (is_parent_of_someone, 0..) |is_parent, i| {
+            if (is_parent) continue;
+            if (top != null) return error.AmbiguousCasperLayers;
+            top = i;
+        }
+    }
+    if (top == null) return error.AmbiguousCasperLayers;
+
+    var chain: std.ArrayList(usize) = .empty;
+    defer chain.deinit(allocator);
+    var cursor: ?usize = top;
+    while (cursor) |idx| {
+        try chain.append(allocator, idx);
+        cursor = parent_idx[idx];
+    }
+    // manifest 已明确选定变体时，目录中允许存在其他未选变体；
+    // 无 manifest 的回退路径仍要求链覆盖全部文件。
+    if (manifest_top == null and chain.items.len != names.items.len) return error.AmbiguousCasperLayers;
+
+    const layers = try allocator.alloc(model.CasperLayer, chain.items.len);
+    var out_i: usize = chain.items.len;
+    for (chain.items) |idx| {
+        out_i -= 1;
+        const filename = try std.fmt.allocPrint(allocator, "{s}.squashfs", .{names.items[idx]});
+        defer allocator.free(filename);
+        const rel_path = try std.fmt.allocPrint(allocator, "casper/{s}", .{filename});
+        errdefer allocator.free(rel_path);
+        const abs_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ mount_point, rel_path });
+        defer allocator.free(abs_path);
+        var file = try std.Io.Dir.cwd().openFile(io, abs_path, .{ .follow_symlinks = false });
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.NotRegularFile;
+        var raw_hash: [32]u8 = undefined;
+        try sha256Path(io, abs_path, &raw_hash);
+        var hex_hash: [64]u8 = undefined;
+        const hex_chars = "0123456789abcdef";
+        for (&raw_hash, 0..) |byte, i| {
+            hex_hash[i * 2] = hex_chars[byte >> 4];
+            hex_hash[i * 2 + 1] = hex_chars[byte & 0xf];
+        }
+        layers[out_i] = .{
+            .path = rel_path,
+            .size = stat.size,
+            .sha256 = try allocator.dupe(u8, &hex_hash),
+        };
+    }
+    return layers;
+}
+
+/// 读取 `casper/install-sources.yaml` 中唯一的 `default: true` source，
+/// 返回规范化后的 `casper/<path>`。这不是通用 YAML 解析器：只接受
+/// Subiquity 该 manifest 中顶层 list item 的 `default`/`path` 标量字段，
+/// 重复 default、缺 path 或带路径分隔符的值均 fail-closed。
+fn defaultCasperSourcePath(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8) !?[]const u8 {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/casper/install-sources.yaml", .{mount_point});
+    defer allocator.free(manifest_path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+
+    var selected: ?[]const u8 = null;
+    errdefer if (selected) |value| allocator.free(value);
+    var item_default = false;
+    var item_path: ?[]const u8 = null;
+    defer if (item_path) |value| allocator.free(value);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const trimmed = std.mem.trim(u8, raw_line, " \t\r");
+        if (std.mem.startsWith(u8, raw_line, "- ")) {
+            if (item_default) {
+                const value = item_path orelse return error.InvalidCasperManifest;
+                if (selected != null) return error.AmbiguousCasperLayers;
+                selected = try allocator.dupe(u8, value);
+            }
+            if (item_path) |value| allocator.free(value);
+            item_path = null;
+            item_default = false;
+        }
+        const field = if (std.mem.startsWith(u8, trimmed, "- ")) trimmed[2..] else trimmed;
+        if (std.mem.eql(u8, field, "default: true")) item_default = true;
+        if (std.mem.startsWith(u8, field, "path:")) {
+            const value = std.mem.trim(u8, field["path:".len..], " \t'\"");
+            if (value.len == 0 or std.mem.indexOfScalar(u8, value, '/') != null or std.mem.indexOfScalar(u8, value, '\\') != null)
+                return error.InvalidCasperManifest;
+            if (item_path) |old| allocator.free(old);
+            item_path = try allocator.dupe(u8, value);
+        }
+    }
+    if (item_default) {
+        const value = item_path orelse return error.InvalidCasperManifest;
+        if (selected != null) return error.AmbiguousCasperLayers;
+        selected = try allocator.dupe(u8, value);
+    }
+    const value = selected orelse return error.InvalidCasperManifest;
+    defer allocator.free(value);
+    selected = null; // ownership is handled by the defer above, not errdefer
+    // install-sources.yaml 的 default path 描述最终 server fsimage；
+    // live-server 介质还会在同根下提供一个不带 generic/HWE
+    // 后缀的 installer layer，其中包含 sshd 等 diskless 启动基线。
+    // 优先选它作为 top；并列 generic/generic-hwe 变体仍不猜。
+    if (std.mem.endsWith(u8, value, ".squashfs")) {
+        const stem = value[0 .. value.len - ".squashfs".len];
+        const installer_rel = try std.fmt.allocPrint(allocator, "casper/{s}.installer.squashfs", .{stem});
+        errdefer allocator.free(installer_rel);
+        if (assets.verifyRegularFile(io, mount_point, installer_rel)) |_| {
+            return installer_rel;
+        } else |_| {
+            allocator.free(installer_rel);
+        }
+    }
+    return try std.fmt.allocPrint(allocator, "casper/{s}", .{value});
 }
 
 fn ubuntuRepositoryComplete(io: std.Io, allocator: std.mem.Allocator, mount_point: []const u8, version: []const u8, arch: model.Arch) !bool {
@@ -946,7 +1167,7 @@ fn bootloaderFilename(arch: model.Arch) []const u8 {
 /// RHEL-family 与 Ubuntu Server ISO 通常都把 GRUB 放在 EFI/BOOT。
 /// ISO9660 使用全大写路径；UDF（部分新版 Ubuntu）保留原始小写路径。
 /// 四种大小写组合全部覆盖，确保两种文件系统都能命中。
-fn findBootloaderMediaPath(io: std.Io, root: []const u8, arch: model.Arch) ?[]const u8 {
+fn findBootloaderMediaPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8, arch: model.Arch) ?[]const u8 {
     const aarch64 = [_][]const u8{ "EFI/BOOT/grubaa64.efi", "EFI/BOOT/GRUBAA64.EFI", "efi/boot/grubaa64.efi", "efi/boot/GRUBAA64.EFI" };
     const x86_64 = [_][]const u8{ "EFI/BOOT/grubx64.efi", "EFI/BOOT/GRUBX64.EFI", "efi/boot/grubx64.efi", "efi/boot/GRUBX64.EFI" };
     const candidates: []const []const u8 = switch (arch) {
@@ -955,6 +1176,16 @@ fn findBootloaderMediaPath(io: std.Io, root: []const u8, arch: model.Arch) ?[]co
     };
     for (candidates) |path| {
         _ = assets.verifyRegularFile(io, root, path) catch continue;
+        const absolute = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, path }) catch continue;
+        defer allocator.free(absolute);
+        const image = std.Io.Dir.cwd().readFileAlloc(io, absolute, allocator, .limited(8 * 1024 * 1024)) catch continue;
+        defer allocator.free(image);
+        // Ubuntu live-server 的 ISO GRUB 内嵌 `(memdisk)/grub.cfg`，其内容
+        // 专用于搜索本地 ISO，不会向 TFTP 请求 NodeForge 的 per-MAC
+        // config，直接作为 option 67 会落到裸 `grub>`。这类介质
+        // bootloader 必须拒绝，让 DHCP 复用 catalog 中同架构的
+        // NodeForge-compatible 共享 GRUB（例如 Rocky 导入的网络 GRUB）。
+        if (std.mem.indexOf(u8, image, "normal (memdisk)/grub.cfg") != null) continue;
         return path;
     }
     return null;
@@ -1575,4 +1806,98 @@ test "Ubuntu disk metadata detects the profile tuple without CLI flags" {
     try std.testing.expectEqualStrings("22.04.5", tuple.version);
     try std.testing.expectEqualStrings("22.04", ubuntuSeries(tuple.version));
     try std.testing.expectEqual(model.Arch.aarch64, tuple.arch);
+}
+
+fn writeCasperLayer(temp: *std.testing.TmpDir, casper_dir: []const u8, name: []const u8, content: []const u8) !void {
+    const rel = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}", .{ casper_dir, name });
+    defer std.testing.allocator.free(rel);
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = rel, .data = content });
+}
+
+test "discoverCasperLayers orders base to top and computes digests" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "casper");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.squashfs", "base");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.ubuntu-server.squashfs", "server");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.ubuntu-server.installer.squashfs", "installer");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try temp.dir.realPath(std.testing.io, &root_buf);
+    const mount_point = root_buf[0..n];
+
+    const layers = try discoverCasperLayers(std.testing.io, std.testing.allocator, mount_point);
+    defer {
+        for (layers) |layer| {
+            std.testing.allocator.free(layer.path);
+            std.testing.allocator.free(layer.sha256);
+        }
+        std.testing.allocator.free(layers);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), layers.len);
+    try std.testing.expectEqualStrings("casper/ubuntu-server-minimal.squashfs", layers[0].path);
+    try std.testing.expectEqualStrings("casper/ubuntu-server-minimal.ubuntu-server.squashfs", layers[1].path);
+    try std.testing.expectEqualStrings("casper/ubuntu-server-minimal.ubuntu-server.installer.squashfs", layers[2].path);
+    try std.testing.expectEqual(@as(u64, "base".len), layers[0].size);
+}
+
+test "discoverCasperLayers follows install-sources default and ignores sibling variants" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "casper");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.squashfs", "base");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.ubuntu-server.squashfs", "server");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.ubuntu-server.installer.squashfs", "installer");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.ubuntu-server.installer.generic.squashfs", "generic");
+    try temp.dir.writeFile(std.testing.io, .{ .sub_path = "casper/install-sources.yaml", .data =
+        \\- id: ubuntu-server-minimal
+        \\  path: ubuntu-server-minimal.squashfs
+        \\- default: true
+        \\  id: ubuntu-server
+        \\  path: ubuntu-server-minimal.ubuntu-server.squashfs
+    });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try temp.dir.realPath(std.testing.io, &root_buf);
+    const layers = try discoverCasperLayers(std.testing.io, std.testing.allocator, root_buf[0..n]);
+    defer {
+        for (layers) |layer| {
+            std.testing.allocator.free(layer.path);
+            std.testing.allocator.free(layer.sha256);
+        }
+        std.testing.allocator.free(layers);
+    }
+    try std.testing.expectEqual(@as(usize, 3), layers.len);
+    try std.testing.expectEqualStrings("casper/ubuntu-server-minimal.squashfs", layers[0].path);
+    try std.testing.expectEqualStrings("casper/ubuntu-server-minimal.ubuntu-server.squashfs", layers[1].path);
+    try std.testing.expectEqualStrings("casper/ubuntu-server-minimal.ubuntu-server.installer.squashfs", layers[2].path);
+}
+
+test "discoverCasperLayers fails closed on missing parent" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "casper");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.ubuntu-server.squashfs", "server");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try temp.dir.realPath(std.testing.io, &root_buf);
+    const mount_point = root_buf[0..n];
+
+    try std.testing.expectError(error.MissingCasperLayer, discoverCasperLayers(std.testing.io, std.testing.allocator, mount_point));
+}
+
+test "discoverCasperLayers fails closed on ambiguous layer set" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.createDirPath(std.testing.io, "casper");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.squashfs", "base");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.ubuntu-server.squashfs", "server");
+    try writeCasperLayer(&temp, "casper", "ubuntu-server-minimal.other.squashfs", "other");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try temp.dir.realPath(std.testing.io, &root_buf);
+    const mount_point = root_buf[0..n];
+
+    try std.testing.expectError(error.AmbiguousCasperLayers, discoverCasperLayers(std.testing.io, std.testing.allocator, mount_point));
 }

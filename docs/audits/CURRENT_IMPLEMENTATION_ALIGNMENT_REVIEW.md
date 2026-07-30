@@ -67,7 +67,9 @@ zig build test --summary all
 v0.2.0 的 Rocky/aarch64 主链可标为完成；v0.2 系列继续开发不等于 v0.2.0
 主链仍处于脚手架状态。
 
-### 2.3 v0.2.1 尚未完成
+### 2.3 v0.2.1（2026-07-30 更新：生产 CLI builder 已接通）
+
+> 以下 5 点是本审计原始发现，历史保留；2026-07-30 起已全部解决，见本节末尾更新。
 
 Ubuntu 方向已有可行性证据和共用运行时，但生产 CLI builder 仍缺：
 
@@ -80,6 +82,17 @@ Ubuntu 方向已有可行性证据和共用运行时，但生产 CLI builder 仍
 
 vendor casper initrd 复用、原生 HTTP、node-apply Netplan/NM 选择和 Ubuntu smoke
 都是前置能力，不应被误写为 Ubuntu 产品路径已经完成。
+
+**2026-07-30 更新**：上述 1-3 已实现并通过 `zig build test`（393/393）：
+`rootfs_os_builder.buildCasperOverlay` 替换了 `AptOsLayerUnsupported`；
+`iso_import.discoverCasperLayers` 在 `assets import` 时发现并序化 casper layer
+清单（fail-closed 处理歧义/缺失 parent）；rootfs-build `package` 步骤（dnf 与
+apt 均适用）统一经新增的 `namespaced_chroot_executor.zig` 在独立
+mount/PID namespace + chroot 内执行，替换了 `AptRootfsBuildUnsupported`。
+环境执行状态已更新：2026-07-30 在 r97n0 root 环境完成真实 Ubuntu ISO 导入和
+casper rootfs 构建，并在 VMware `r97n1` 连续两次到达 `diskless.running`。
+第 4、5 点中的 `tests/v0_2_1_ubuntu_casper_smoke.sh` 独立 QEMU 路径和
+Rocky+Ubuntu 同候选回归矩阵仍待在目标环境补跑，不应被当作已验证。
 
 ### 2.4 当前 CLI 与目标 CLI 的边界
 
@@ -133,17 +146,20 @@ kernel/initrd boot bundle。
 
 现已写入 effective provisioning bundle name，并覆盖 Profile 默认与 Node override 测试。
 
-### 已处理安全边界、功能仍属 v0.2.1：Ubuntu rootfs-build package
+### 已处理安全边界、功能完成（v0.2.1）：Ubuntu rootfs-build package
 
 rootfs-build executor 对所有 package action 都传 `installroot=staging`，但
 `first_boot.renderStep()` 的 apt 分支不消费该参数。若仅接通 casper OS layer 而不修此处，
 Ubuntu `rootfs-build package` 会操作构建宿主而非目标 staging。
 
-当前 executor 在 plan 构造阶段拒绝 apt package，手工构造的非 dnf host command
-也被 `UnsafeHostBuildCommand` 拒绝，因此不会再越过 staging。v0.2.1 仍必须实现
-隔离执行模型；推荐在独立 mount/PID namespace 中 chroot，
-只读绑定受管 APT repository，并用 `policy-rc.d` 阻止包安装启动服务。不能把宿主
-apt/debootstrap fallback 当成“跨发行版支持”。
+**2026-07-30 更新**：已实现统一隔离执行模型，不再是"拒绝 apt package"的临时
+fail-closed。`namespaced_chroot_executor.zig` 用一次性 `unshare --mount --pid
+--fork` 子进程 + chroot 执行 dnf/apt 包安装（不再区分"dnf host-context / apt
+不支持"），只读绑定受管 repository，并用 `policy-rc.d` 阻止包安装启动服务；退出后
+校验挂载点已清理，未清理则整体失败而非静默放过。`rootfs_build_executor.
+BuildCommand.isolation` 枚举区分 `.chroot`（managed_file/archive/script）与
+`.namespaced_package`（package），手工构造的非法 isolation 声明仍被
+`UnsafeHostBuildCommand` 拒绝。
 
 ### 已处理 P1：同步 management handler 与构建 operation 语义不一致
 

@@ -58,11 +58,43 @@ fn renderManagedRepositories(w: *std.Io.Writer, allocator: std.mem.Allocator, tr
             try emitFile(w, "/etc/yum.repos.d/nodeforge.repo", content.written(), 0o644);
         },
         .apt => {
+            // casper layer 自带 ports.ubuntu.com/cdrom 源；diskless 运行根只能使用
+            // AgentPlan 固定的 NodeForge 受管仓库，不能在启动后重新暴露公网源。
+            try w.writeAll("rm -f /etc/apt/sources.list\nrm -rf /etc/apt/sources.list.d\nmkdir -p /etc/apt/sources.list.d\n");
             var content: std.Io.Writer.Allocating = .init(allocator);
             defer content.deinit();
             for (transaction.repository_urls) |url|
                 try content.writer.print("deb [trusted=yes] {s} ./\n", .{url});
             try emitFile(w, "/etc/apt/sources.list.d/nodeforge.list", content.written(), 0o644);
+            // Ubuntu live-server installer layer 包含 snapd/LXD、multipathd 和
+            // 依赖 /cdrom 的 casper-md5check。它们不在
+            // v0.2 diskless 最小运行根能力内：snapd 在 overlay root 上会反复执行
+            // install hook 并触发 systemd restart loop，multipathd 在无 multipath
+            // 设备的节点上进入 failed，casper-md5check 则会因无 /cdrom 失败。
+            // 切到真正 init 前离线 mask，避免无意义抖动和虚假 failed unit。
+            try w.writeAll(
+                \\mkdir -p /etc/systemd/system
+                \\for unit in snapd.service snapd.socket snapd.seeded.service multipathd.service multipathd.socket casper-md5check.service; do
+                \\  ln -sf /dev/null "/etc/systemd/system/$unit"
+                \\done
+                \\# live-server squashfs 在 vendor unit 目录（/lib，而不是 /etc）把
+                \\# getty@tty1.service 直接链接到 /dev/null，并用 drop-in 把标准 getty
+                \\# 改造成 Subiquity 启动器。只执行 `systemctl unmask` 无法移除这个
+                \\# vendor mask；必须删除确切链接和 installer drop-in，再从标准模板
+                \\# 重建 wants。否则 PID 1、SSH 和 NodeForge lifecycle 虽都已 running，
+                \\# VMware 控制台仍停在最后一行启动日志，看起来像“无盘启动卡住”。
+                \\rm -f /lib/systemd/system/getty@tty1.service
+                \\rm -f /lib/systemd/system/getty@.service.d/autologin.conf
+                \\rm -f /lib/systemd/system/serial-getty@.service.d/subiquity-serial.conf
+                \\mkdir -p /etc/systemd/system/getty.target.wants
+                \\ln -sf /lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty1.service
+                \\# ttyAMA0 并非所有 aarch64 虚拟机都存在。只在字符设备真实存在时
+                \\# 启用 serial-getty，避免 VMware 上产生无意义的 device dependency failure。
+                \\if [ -c /dev/ttyAMA0 ]; then
+                \\  ln -sf /lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyAMA0.service
+                \\fi
+                \\
+            );
         },
     }
 }
@@ -569,6 +601,38 @@ test "managed repository persists without package delta and resolved interface i
     defer encoded_netplan.deinit();
     try encodeOctal(&encoded_netplan.writer, "set-name: enp2s0");
     try std.testing.expect(std.mem.indexOf(u8, script, encoded_netplan.written()) != null);
+}
+
+test "apt runtime keeps only managed sources and masks installer-only services" {
+    const projection: dto.NodeApplyProjection = .{
+        .node_id = "n1",
+        .mac = "02:00:00:00:00:01",
+        .arch = .aarch64,
+        .hostname = null,
+        .network = .{},
+        .system = .{
+            .localization = .{},
+            .connectivity = .{},
+            .ssh = .{ .enabled = true, .password_authentication = true, .root_login = .yes },
+            .security = .{},
+            .users = &.{},
+        },
+        .software = .{},
+        .software_transaction = .{
+            .manager = .apt,
+            .repository_urls = &.{"http://192.0.2.1/ubuntu"},
+        },
+    };
+    const script = try renderResolved(std.testing.allocator, projection, "enp2s0");
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "rm -f /etc/apt/sources.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "rm -rf /etc/apt/sources.list.d") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/apt/sources.list.d/nodeforge.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "ln -sf /dev/null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "snapd.service snapd.socket snapd.seeded.service multipathd.service multipathd.socket casper-md5check.service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "rm -f /lib/systemd/system/getty@tty1.service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "getty.target.wants/getty@tty1.service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "getty.target.wants/serial-getty@ttyAMA0.service") != null);
 }
 
 test "encodeOctal round-trips arbitrary bytes through 3-digit octal" {

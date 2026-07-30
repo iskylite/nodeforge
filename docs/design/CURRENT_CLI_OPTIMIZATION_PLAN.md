@@ -687,11 +687,11 @@ Boot Preview: c001
 Decision
   would_boot             yes
   deploy                 true
-  profile                rocky-9.7-diskless
+  profile                rocky-9.7-aarch64-minimal-diskless
   kind                   diskless
 
 Artifacts
-  boot_bundle            rocky-9.7-diskless
+  boot_bundle            rocky-9.7-aarch64-minimal-diskless
   kernel                 rocky-9.7-kernel@1
   initrd                 rocky-9.7-initrd@2
   rootfs                 ready
@@ -1027,7 +1027,7 @@ exit/error mapping
 
 ```text
 nodeforge assets import rocky-9.7.iso
-nodeforge profile create rocky-compute rocky-9.7 --kind diskless --boot-bundle rocky-9.7
+nodeforge profile create rocky-9.7 --qualifier compute --kind diskless
 nodeforge profile rootfs build rocky-compute
 nodeforge node add c001 mac=... arch=aarch64 profile=rocky-compute deploy=false
 nodeforge node readiness c001

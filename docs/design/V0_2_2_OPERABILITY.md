@@ -57,6 +57,14 @@ queued -> running -> succeeded | failed
   `operation.interrupted`；相同 idempotency key 可创建后继重试，半成品绝不标 ready。
   若未来引入真正 resume，必须先增加 kind-specific journal，不得从 staging 猜测成功。
 
+> 2026-07-30 备注：v0.2.1 为 rootfs-build 的 package 步骤（dnf 与 apt 均适用）新增了
+> `src/provision/namespaced_chroot_executor.zig`，用一次性 `unshare --mount --pid --fork`
+> 子进程 + chroot 执行包管理器命令，退出后校验挂载点已清理。这是一个通用的"外部命令 +
+> 确定性清理校验"执行原语，v0.2.2 的 initrd durable operation 化在设计 worker 的
+> 执行/清理/失败语义时应参考其模式（尤其是"清理后必须显式校验，不能静默假设成功"这一点）。
+> 但 `namespaced_chroot_executor` 本身不是 operation 化——它仍在现有 `rootfs_build`
+> operation kind 内同步运行，不构成 v0.2.2 完成标准的一部分。
+
 ### 3.2 CLI
 
 交互式默认等待同一 operation；`--detach` 立即返回 opaque id。`operation show/wait`

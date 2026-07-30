@@ -35,7 +35,7 @@ pub const RepositoryRevision = struct {
 pub const ProfileBuildProjection = struct {
     /// Bump whenever the built-in OS-layer baseline or materialization logic
     /// changes, so stale rootfs objects cannot be returned as cache hits.
-    builder_revision: []const u8 = "rootfs-os-v4",
+    builder_revision: []const u8 = "rootfs-os-v5",
     profile_name: []const u8,
     kind: model.ProfileKind,
     install_source: []const u8,
@@ -53,6 +53,9 @@ pub const ProfileBuildProjection = struct {
     repository_revisions: []const RepositoryRevision,
     rootfs_build_steps: []const model.ProvisionStep,
     first_boot_fixed_steps: []const model.ProvisionStep,
+    /// Ubuntu casper OS 层 layer 清单（base→top 有序）；非 Ubuntu install source
+    /// 始终为空。同一 ISO 不同 layer 组合必须产生不同 `rootfs_input_digest`。
+    casper_layers: []const model.CasperLayer = &.{},
 };
 
 /// 只在 kernel/rootfs 之前生效的内容。
@@ -163,6 +166,7 @@ pub fn compile(allocator: std.mem.Allocator, config: *const model.AppConfig, cat
         .software = profile.software,
         .repository_revisions = repository_revisions,
         .rootfs_build_steps = rootfs_build_steps,
+        .casper_layers = source.casper_layers,
         .first_boot_fixed_steps = first_boot_fixed_steps,
     };
     const node_boot: NodeBootProjection = .{
@@ -236,6 +240,7 @@ pub fn rootfsInputDigest(allocator: std.mem.Allocator, config: *const model.AppC
         .software = profile.software,
         .repository_revisions = repository_revisions,
         .rootfs_build_steps = rootfs_build_steps,
+        .casper_layers = source.casper_layers,
         .first_boot_fixed_steps = first_boot_fixed_steps,
     };
     return digestOf(allocator, profile_build);
@@ -388,6 +393,26 @@ test "rootfsInputDigest matches compile without a node" {
     var plan = try compile(std.testing.allocator, &config, &catalog, &nodes[0]);
     defer plan.deinit();
     try std.testing.expectEqualSlices(u8, &direct, &plan.rootfs_input_digest);
+}
+
+test "casper_layers content changes rootfs input digest" {
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .http_port = 18080 } };
+    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "ubuntu", .version = "22.04", .arch = .x86_64, .kernel_release = "5.15.0", .kernel = "k", .initrd = "i" };
+    var source: model.InstallSourceConfig = .{ .name = "s", .distro = "ubuntu", .version = "22.04", .arch = .x86_64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
+    const profile: model.ProfileConfig = .{ .name = "p", .install_source = "s", .kind = .diskless, .boot_bundle = "bb" };
+    const nodes = [_]model.NodeConfig{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .x86_64, .profile = "p" }};
+
+    const layers_a = [_]model.CasperLayer{.{ .path = "casper/base.squashfs", .size = 1, .sha256 = "aaa" }};
+    source.casper_layers = &layers_a;
+    const catalog_a: model.Catalog = .{ .profiles = &.{profile}, .nodes = &nodes, .install_sources = &.{source}, .boot_bundles = &.{bundle} };
+    const digest_a = try rootfsInputDigest(std.testing.allocator, &config, &catalog_a, &profile);
+
+    const layers_b = [_]model.CasperLayer{.{ .path = "casper/base.squashfs", .size = 1, .sha256 = "bbb" }};
+    source.casper_layers = &layers_b;
+    const catalog_b: model.Catalog = .{ .profiles = &.{profile}, .nodes = &nodes, .install_sources = &.{source}, .boot_bundles = &.{bundle} };
+    const digest_b = try rootfsInputDigest(std.testing.allocator, &config, &catalog_b, &profile);
+
+    try std.testing.expect(!std.mem.eql(u8, &digest_a, &digest_b));
 }
 
 test "rootfsBuildSteps returns pinned profile-fixed rootfs-build steps" {

@@ -136,9 +136,30 @@ Rocky/VMware 启动证据仍来自上一节，下一次重建 boot bundle 时应
 
 ## v0.2.1 / v0.2.2 边界
 
-v0.2.1 仍需完成 Ubuntu 产品保真：apt/debootstrap OS-layer builder、
-Ubuntu initrd/kernel feature closure、双发行版固定回归。当前 Ubuntu
-casper smoke 已有，但不能等同于完整 Ubuntu rootfs builder。
+## 2026-07-30 Ubuntu v0.2.1 VMware 产品闭环
+
+构建端为 r97n0（Rocky Linux 9.8 aarch64，root），输入为真实
+`ubuntu-22.04.5-live-server-arm64.iso`。产品 CLI 完成 ISO import、casper layer
+发现、vendor initrd 派生、diskless Profile 与 rootfs build；最终 rootfs 为
+992,210,944 bytes。构建过程暴露并修复了 casper 绝对符号链接存在性误判和
+whiteout/逐层合并问题。
+
+VMware Fusion `r97n1`（aarch64 UEFI、MAC `00:50:56:2A:23:DB`）由 Computer
+Use 冷启动验证。首轮 session `ea35af44e17056a9dc5844179ab25cc2`、复验 session
+`f21d257aa538c12e5b914a504ac740e4` 均依次上报
+`initrd_started → rootfs_downloading → rootfs_verified → rootfs_mounted →
+switching_root → agent_configuring → running`。复验中 initrd 为 106,875,713
+bytes，rootfs Range 下载和校验约 10 秒完成；未出现新的产品故障。
+
+同时修正 smoke 夹具：旧 `tests/v0_2_1_ubuntu_casper_smoke.sh` 的 QEMU 段只等待
+事件、从未启动 guest。现强制提供 `NODEFORGE_QEMU_LAUNCHER`，校验其返回存活
+QEMU PID，并在 guest 提前退出时打印 console 后失败。独立 QEMU 产品 CLI
+闭环和同候选 Rocky 重建仍保留为待执行项，不以本次 VMware 结果替代。
+
+本段为早期验证记录；其后 v0.2.1 已完成 casper OS-layer builder、
+namespaced chroot apt 执行、Ubuntu initrd/kernel 同源闭包和 Rocky/Ubuntu
+同候选 VMware 回归。最终完成证据见后文 fresh CLI 三发行版复验及 Ubuntu
+控制台“假卡住”复验。独立 QEMU 与双架构固定矩阵归入 v0.2.2。
 
 v0.2.2 聚焦可运营性与矩阵扩展：
 
@@ -150,3 +171,78 @@ v0.2.2 聚焦可运营性与矩阵扩展：
 
 设计稿中仍属计划态的命令必须标注“计划中”，不得出现在生产 runbook 中冒充
 已实现能力。
+
+## 2026-07-30 fresh CLI 三发行版复验
+
+在 r97n0 停止并移除既有 nodeforged unit、`/opt/nodeforge` 配置/catalog/assets
+后，使用四个新交叉编译的 aarch64 ReleaseSafe 二进制，严格按 README 的
+`setup → assets import → assets initrd build → boot-bundle create → profile
+create → profile rootfs build → node add/set/readiness/deploy` CLI 流程从零重建。
+未导入旧配置或迁移旧制品；仅保留 `/root` 下三张原始 ISO 作为新输入。
+
+最终导入和构建 Rocky 9.7 minimal、Rocky 10.2 DVD、Ubuntu 22.04.5 live-server
+三套有效 install source/profile/bundle/rootfs。rootfs 使用
+`assets/diskless/rootfs/<profile>/<digest-prefix>/<profile>.squashfs`，initrd
+使用 `assets/diskless/initrd/<name>/<uname-r>/initrd.img`。r97n1 的
+`192.168.27.210` 来自 r97n0 `/etc/hosts`，节点以
+`pxe.ip_reservation` 登记；profile 导入的 hosts、受管仓库与 SSH 有效配置均符合
+CLI 投影。
+
+Computer Use 控制 VMware Fusion 逐一冷启动 Rocky 10.2、Rocky 9.7 和 Ubuntu。
+三者都上报连续的 event_seq 0–6 并进入 `diskless.running`，每轮
+nodeforged 均为 active、`NRestarts=0`。Ubuntu 最终实机检查为：
+
+- `5.15.0-119-generic`，根文件系统为 overlay；
+- `/etc/hosts` 含 r97n0/r97n1，SSH active；
+- APT 只剩 `/etc/apt/sources.list.d/nodeforge.list`，指向 NodeForge 受管 ISO 仓库；
+- `snapd.*`、`multipathd.*`、`casper-md5check.service` 全部 masked/inactive，
+  `NRestarts=0`，`systemctl --failed` 为空。
+
+本轮还发现 Zig 0.16 POSIX Threaded Io 对 connect deadline 会直接 panic，并可由
+TFTP loopback boot-prepare 路径杀死 nodeforged。当前显式使用 30 秒 API、120 秒
+制品 socket 空闲超时且不限制持续有进展的总下载时长；connect 暂由内核 TCP 有界
+超时承担，待 Zig/runtime 安全支持 deadline 后再落实显式 10 秒建连上限。
+
+### Ubuntu 控制台“假卡住”复验与修复
+
+上述 `diskless.running` 后继续观察 VMware，发现控制台停在
+`Reached target Cloud-init target` 附近，没有登录提示。独立检查确认这不是启动
+阻塞：
+
+- SSH 可登录，PID 1 为 `/sbin/init`，`systemctl is-system-running` 返回 `running`；
+- SSH 监听 IPv4/IPv6 22 端口，NodeForge session
+  `99b3fdef00a9d108484cedc5cbacf4c7` 已完整到达 event_seq 6；
+- `getty@tty1.service` 却为 masked/inactive，vendor mask 位于
+  `/lib/systemd/system/getty@tty1.service -> /dev/null`；
+- `getty@.service.d/autologin.conf` 和
+  `serial-getty@.service.d/subiquity-serial.conf` 仍把 getty 指向 Ubuntu
+  installer/Subiquity 行为。
+
+根因是 casper live-server rootfs 的 installer 控制台配置被原样带入 diskless
+运行根。它不会阻止 systemd、网络或 SSH，所以单看 `diskless.running` 会产生
+假阳性。
+
+修复在 Ubuntu node-apply pre-init 阶段完成：
+
+1. 删除 `/lib` vendor 目录中的 tty1 `/dev/null` mask；
+2. 删除 casper autologin 和 Subiquity serial-getty drop-in；
+3. 从标准 `getty@.service` 模板恢复 tty1 wants；
+4. 仅当 `/dev/ttyAMA0` 是真实字符设备时创建 ARM serial-getty wants，避免
+   VMware 没有该设备时出现 dependency failure。
+
+修复候选通过新 initrd、boot bundle、profile 和 rootfs 全部由产品 CLI 重建。
+首次启动 session `59dcfdf7d521b8cb07873f1c39ab9a44` 到达
+`diskless.running`，并确认 tty1 getty active。为排除人工向 tty1 写诊断文本的
+干扰，又执行一次 VMware 冷启动；最终 session
+`d92436ac457a0d8034492fcb6f57d7bc` event_seq 0–6 连续、nodeforged
+`NRestarts=0`，控制台自然显示：
+
+```text
+Ubuntu 22.04.5 LTS r97n1 tty1
+
+r97n1 login:
+```
+
+因此最终验收结论是：Ubuntu diskless 的受管生命周期、systemd/SSH 运行态和
+VMware tty1 交互控制台三项均通过。后续回归不得只以 lifecycle running 替代
+控制台可用性检查。

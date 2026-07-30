@@ -59,9 +59,11 @@ pub const Paths = struct {
     bootstrap_private_key_temp_path: []const u8,
     /// 公钥临时写入路径，用于原子替换。
     bootstrap_public_key_temp_path: []const u8,
-    /// Diskless initrd 目录（`<root>/assets/boot/diskless`），v0.2 无盘启动用。
+    /// Diskless initrd 唯一受管根（`<root>/assets/diskless/initrd`）。
+    /// 开发版本不扫描或迁移旧 `assets/boot/diskless`。
     initrd_dir: []const u8,
-    /// rootfs 目录（`<root>/assets/rootfs`），v0.2 无盘启动用。
+    /// Diskless rootfs 唯一受管根（`<root>/assets/diskless/rootfs`）。
+    /// 开发版本不扫描或迁移旧 `assets/rootfs`。
     rootfs_dir: []const u8,
     /// boot bundle 目录（`<root>/assets/bundles`），v0.2 无盘启动用。
     bundles_dir: []const u8,
@@ -280,8 +282,8 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .bootstrap_public_key_path = try join(allocator, root, "assets/keys/id_ed25519.pub"),
         .bootstrap_private_key_temp_path = try join(allocator, root, "assets/keys/id_ed25519.tmp"),
         .bootstrap_public_key_temp_path = try join(allocator, root, "assets/keys/id_ed25519.tmp.pub"),
-        .initrd_dir = try join(allocator, root, "assets/boot/diskless"),
-        .rootfs_dir = try join(allocator, root, "assets/rootfs"),
+        .initrd_dir = try join(allocator, root, "assets/diskless/initrd"),
+        .rootfs_dir = try join(allocator, root, "assets/diskless/rootfs"),
         .bundles_dir = try join(allocator, root, "assets/bundles"),
         .provisioned_dir = try join(allocator, root, "state/provisioned"),
         .run_dir = try join(allocator, root, "run"),

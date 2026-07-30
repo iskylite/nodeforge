@@ -77,6 +77,14 @@ pub fn main(init: std.process.Init) !void {
     var stdin_buffer: [1024]u8 = undefined;
     var stdin_file = std.Io.File.Reader.init(.stdin(), init.io, &stdin_buffer);
 
+    // `--version` 是纯构建溯源查询，不依赖安装根。必须和 daemon 一样在 paths
+    // bootstrap 前短路，否则尚未 setup 的发布包无法执行最基本的版本核验。
+    if (versionOnly(init.minimal.args)) {
+        try printVersion(out);
+        try out.flush();
+        return;
+    }
+
     nodeforge.paths.bootstrap(init.io, init.arena.allocator(), init.minimal.args) catch |err| {
         try out.print("error: install root bootstrap failed: {t}\n", .{err});
         try out.flush();
@@ -87,6 +95,15 @@ pub fn main(init: std.process.Init) !void {
     out.flush() catch {};
     err_out.flush() catch {};
     if (exit_code != 0) std.process.exit(exit_code);
+}
+
+/// 仅接受根命令的单独 `--version`/`-v`；嵌套命令中的同名参数仍交给 zli
+/// 按用法错误处理，不能借快速路径绕过正常命令校验。
+fn versionOnly(args: std.process.Args) bool {
+    var iterator = args.iterate();
+    _ = iterator.next();
+    const flag = iterator.next() orelse return false;
+    return (std.mem.eql(u8, flag, "--version") or std.mem.eql(u8, flag, "-v")) and iterator.next() == null;
 }
 
 /// 构建命令树并执行一次参数解析。
@@ -426,16 +443,16 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const profile_create = try zli.Command.init(init_options, .{
         .name = "create",
         .description = "Create an install or diskless profile from an imported install source",
-        .usage = "nodeforge profile create [name] <install-source> [options]",
-        .help = "Derives distro, version, and architecture from the imported source. When <name> is omitted, it defaults to the install-source name for install profiles, or <install-source>-diskless for diskless profiles. The profile is destructive, persistent, and explicit-retry by construction.",
+        .usage = "nodeforge profile create <install-source> [--qualifier <value>] [options]",
+        .help = "Derives the profile name as <install-source>[-<qualifier>]-<install|diskless>. The complete install-source identity and role suffix can no longer be omitted.",
     }, profileCreateHandler);
-    try profile_create.addPositionalArg(.{ .name = "name", .description = "Canonical profile name; omit to derive from install-source (-diskless suffix for diskless)", .required = false });
     try profile_create.addPositionalArg(.{ .name = "install-source", .description = "Imported install source name", .required = true });
     try addConfigPathFlag(profile_create);
     try addOutputFlag(profile_create);
     try addDebugFlag(profile_create);
     try profile_create.addFlag(.{ .name = "kind", .description = "Profile kind; allowed: install, diskless (default: install)", .type = .String, .default_value = .{ .String = "install" } });
-    try profile_create.addFlag(.{ .name = "boot-bundle", .description = "Boot bundle name (required for --kind diskless)", .type = .String, .default_value = .{ .String = "" } });
+    try profile_create.addFlag(.{ .name = "qualifier", .description = "Optional purpose/kernel qualifier inserted before the kind suffix; e.g. compute or kernel-6.8", .type = .String, .default_value = .{ .String = "" } });
+    try profile_create.addFlag(.{ .name = "boot-bundle", .description = "Override the derived diskless boot bundle reference; normally omitted", .type = .String, .default_value = .{ .String = "" } });
     // Profile 删除只开放零引用场景；引用保护由 daemon 在同一 catalog revision
     // 内执行，CLI 不做可能过期的本地预判。
     const profile_remove = try zli.Command.init(init_options, .{ .name = "remove", .description = "Remove an unreferenced profile" }, profileRemoveHandler);
@@ -586,13 +603,13 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const boot_bundle_create = try zli.Command.init(init_options, .{
         .name = "create",
         .description = "Create a boot bundle linking kernel and initrd assets",
-        .usage = "nodeforge assets boot-bundle create <name> --kernel <asset> --initrd <asset> --distro <d> --version <v> --arch <a> --kernel-release <r> [options]",
+        .usage = "nodeforge assets boot-bundle create <install-source> [--qualifier <value>] --kernel <asset> --initrd <asset> --distro <d> --version <v> --arch <a> --kernel-release <r> [options]",
         .help = "Links registered kernel and nodeforge_initrd assets into an immutable boot bundle. " ++
             "The bundle is referenced by diskless profiles via --boot-bundle. " ++
             "The Profile-derived rootfs is built or registered after the Profile exists. " ++
             "This command is part of the diskless CLI flow: setup -> assets import -> register initrd -> boot-bundle create -> profile create -> rootfs build -> node add.",
     }, bootBundleCreateHandler);
-    try boot_bundle_create.addPositionalArg(.{ .name = "name", .description = "Canonical boot bundle name", .required = true });
+    try boot_bundle_create.addPositionalArg(.{ .name = "install-source", .description = "Complete imported install source name", .required = true });
     try boot_bundle_create.addFlags(&.{
         .{ .name = "kernel", .description = "Kernel asset name (kind=kernel)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "initrd", .description = "NodeForge initrd asset name (kind=nodeforge_initrd)", .type = .String, .default_value = .{ .String = "" } },
@@ -600,6 +617,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .{ .name = "version", .description = "Distro version (e.g. 9.7, 24.04)", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "arch", .description = archFlagHelp, .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "kernel-release", .description = "Kernel uname release string (e.g. 5.14.0-611.5.1.el9_7.aarch64)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "qualifier", .description = "Optional purpose/kernel qualifier inserted before -diskless", .type = .String, .default_value = .{ .String = "" } },
     });
     try addConfigPathFlag(boot_bundle_create);
     try addOutputFlag(boot_bundle_create);
@@ -1683,7 +1701,8 @@ fn installSourceImportCommand(init_options: zli.InitOptions) !*zli.Command {
     try command.addPositionalArg(.{ .name = "iso-path", .description = "Readable local ISO path; e.g. /srv/iso/ubuntu-22.04.5-live-server-arm64.iso", .required = true });
     try command.addFlags(&.{
         .{ .name = "distro", .description = "Override an unknown or ambiguous product id; e.g. rocky, kylin, ubuntu. Family still comes from ISO layout", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "name", .description = "Override the ISO-basename-derived install-source/profile name; e.g. kylin-v10-sp3-2403", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "name", .description = "Override only the ISO-basename-derived InstallSource base for unrecognized media; e.g. kylin-v10-sp3-2403", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "qualifier", .description = "Append a canonical qualifier to the ISO-derived install-source name; e.g. gpu or site-a", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "version", .description = "Override auto-detected catalog version; e.g. V10-SP3-2403-Release-20240426. Empty = auto-detect", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "arch", .description = "Override auto-detected architecture; allowed: x86_64, aarch64; omit to auto-detect", .type = .String, .default_value = .{ .String = "" } },
     });
@@ -1958,6 +1977,7 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
     defer if (catalog) |*value| value.deinit();
     var base_initrd: ?[]const u8 = null;
     var source_kernel_release: ?[]const u8 = null;
+    var source_is_ubuntu = false;
     if (source_name.len != 0) {
         catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, nodeforge.paths.require().catalog_dir) catch {
             try writeCommandError(ctx, "initrd.catalog_unavailable", "cannot load the installed catalog", 1);
@@ -1984,6 +2004,7 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
             return;
         }
         source_kernel_release = source_kernel.kernel_release;
+        source_is_ubuntu = source.casper_layers.len != 0;
         if ((distro.len != 0 and !std.mem.eql(u8, distro, source.distro)) or
             (version.len != 0 and !std.mem.eql(u8, version, source.version)) or
             (arch_text.len != 0 and !std.mem.eql(u8, arch_text, @tagName(source.arch))))
@@ -2015,19 +2036,23 @@ fn initrdBuildHandler(ctx: zli.CommandContext) !void {
                 "WARNING: requested kernel release {s} differs from install source {s} kernel release {s}; continuing with the user-provided value.\n",
                 .{ kernel_release, source_name, detected_release },
             );
+        if (source_is_ubuntu)
+            try errorWriter(ctx).print(
+                "RISK: {s} is an Ubuntu diskless install source. The initrd MUST be extracted from " ++
+                    "the ISO's /casper/initrd (matching {s} .ko module vermagic) — the host's dracut is " ++
+                    "NOT supported for Ubuntu diskless. This build uses the casper initrd vendor overlay " ++
+                    "as long as --from-install-source is set; do not substitute a manually-built initrd.\n",
+                .{ source_name, detected_release },
+            );
     }
     if (!nodeforge.management_client.health(ctx.io, config.value.server.http_port).healthy) {
         try writeCommandError(ctx, "initrd.daemon_unavailable", "local daemon must be healthy before building and registering an initrd", 1);
         return;
     }
 
-    // source 派生的 initrd 在文件系统中显式保留 source + uname-r provenance；
-    // 手工构建则放入 manual namespace，避免相同 distro tuple 下不同 ISO 的产物
-    // 混在一起，也避免 source-derived 与 manual 同名冲突。
-    const relative = if (source_name.len != 0)
-        try std.fmt.allocPrint(ctx.allocator, "sources/{s}/{s}/{s}.img", .{ source_name, kernel_release, name })
-    else
-        try std.fmt.allocPrint(ctx.allocator, "manual/{s}/{s}/{s}/{s}/{s}.img", .{ distro, version, @tagName(arch), kernel_release, name });
+    // `name` 是 operator-facing diskless Profile/制品名，目录无需再重复
+    // sources/manual/distro/version/arch 等已由 catalog 保存的 provenance。
+    const relative = try nodeforge.artifact_layout.initrdRelative(ctx.allocator, name, kernel_release);
     const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ nodeforge.paths.require().initrd_dir, relative });
     const part = try std.fmt.allocPrint(ctx.allocator, "{s}.part", .{destination});
     const parent = std.fs.path.dirname(destination) orelse unreachable;
@@ -2148,8 +2173,8 @@ fn assetImportHandler(ctx: zli.CommandContext) !void {
 /// 3. 调用 `stageInstallIso` 将 ISO 原子复制到 daemon 受管的暂存目录
 /// 4. 通过管理 API 请求 daemon 执行 loop mount、介质检测和 catalog 发布
 /// 5. daemon 返回后，defer 清理暂存文件
-/// 6. M4.10：成功响应同时返回 canonical install source；daemon 在同一
-///    catalog publication 中创建同名默认 install profile
+/// 6. 成功响应同时返回 canonical InstallSource；daemon 在同一 catalog
+///    publication 中创建 `<source>-install` 默认 Profile
 ///
 /// 安全设计：CLI 永远不将任意宿主路径发送给 daemon，只发送暂存目录中的
 /// 不透明 basename。daemon 只在受管目录内操作，杜绝路径穿越攻击。
@@ -2165,6 +2190,7 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
     const iso_path = ctx.getArg("iso-path") orelse unreachable;
     const distro = ctx.flag("distro", []const u8);
     const name = ctx.flag("name", []const u8);
+    const qualifier = ctx.flag("qualifier", []const u8);
     const version = ctx.flag("version", []const u8);
     const arch = ctx.flag("arch", []const u8);
     if (distro.len != 0 and !nodeforge.config_validate.validLogicalId(distro)) {
@@ -2173,6 +2199,10 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
     }
     if (name.len != 0 and !nodeforge.config_validate.validLogicalId(name)) {
         try writeCommandError(ctx, "install-source.invalid_name", "invalid canonical --name", 2);
+        return;
+    }
+    if (qualifier.len != 0 and !nodeforge.config_validate.validLogicalId(qualifier)) {
+        try writeCommandError(ctx, "install-source.invalid_qualifier", "invalid canonical --qualifier", 2);
         return;
     }
     if (arch.len != 0 and std.meta.stringToEnum(nodeforge.model.Arch, arch) == null) {
@@ -2190,13 +2220,14 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
         ctx.allocator.free(staged.path);
     }
     try errorWriter(ctx).print("Staged ISO ({d} bytes) from {s}; validating and importing\n", .{ staged.size, iso_path });
-    const import_key = installImportKey(staged.sha256, if (name.len == 0) null else name, if (distro.len == 0) null else distro, if (version.len == 0) null else version, if (arch.len == 0) null else arch);
+    const import_key = installImportKey(staged.sha256, if (name.len == 0) null else name, if (qualifier.len == 0) null else qualifier, if (distro.len == 0) null else distro, if (version.len == 0) null else version, if (arch.len == 0) null else arch);
     const imported = nodeforge.management_client.importInstallSource(ctx.io, parsed_config.value.server.http_port, .{
         .filename = staged.filename,
         .original_filename = std.fs.path.basename(iso_path),
         .content_sha256 = &staged.sha256,
         .idempotency_key = &import_key,
         .name = if (name.len == 0) null else name,
+        .qualifier = if (qualifier.len == 0) null else qualifier,
         .distro = if (distro.len == 0) null else distro,
         .version = if (version.len == 0) null else version,
         .arch = if (arch.len == 0) null else arch,
@@ -2210,8 +2241,9 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
         return;
     }
     const source_name = imported.?.name();
+    const profile_name = try nodeforge.profile_naming.profileName(ctx.allocator, source_name, null, .install);
     const human = try std.fmt.allocPrint(ctx.allocator, "install source and default profile imported: {s}", .{source_name});
-    try renderCommandResult(ctx, human, .{ .path = iso_path, .install_source = source_name, .profile = source_name });
+    try renderCommandResult(ctx, human, .{ .path = iso_path, .install_source = source_name, .profile = profile_name });
 }
 
 /// 暂存 ISO 的结果：daemon 受管目录中的不透明文件名、完整路径和文件大小。
@@ -2252,9 +2284,9 @@ fn stageInstallIso(io: std.Io, allocator: std.mem.Allocator, source: []const u8)
     return .{ .filename = filename, .path = destination, .size = stat.size, .sha256 = checksum };
 }
 
-fn installImportKey(content_sha256: [64]u8, name: ?[]const u8, distro: ?[]const u8, version: ?[]const u8, arch: ?[]const u8) [64]u8 {
+fn installImportKey(content_sha256: [64]u8, name: ?[]const u8, qualifier: ?[]const u8, distro: ?[]const u8, version: ?[]const u8, arch: ?[]const u8) [64]u8 {
     var hash_state = std.crypto.hash.sha2.Sha256.init(.{});
-    inline for (.{ @as(?[]const u8, &content_sha256), name, distro, version, arch }) |value| {
+    inline for (.{ @as(?[]const u8, &content_sha256), name, qualifier, distro, version, arch }) |value| {
         if (value) |bytes| hash_state.update(bytes);
         hash_state.update(&.{0});
     }
@@ -3818,6 +3850,13 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
         return;
     }
     const kind = ctx.flag("kind", []const u8);
+    const qualifier_text = ctx.flag("qualifier", []const u8);
+    if (qualifier_text.len != 0 and !nodeforge.config_validate.validLogicalId(qualifier_text)) {
+        const output = outputFromContext(ctx) orelse return;
+        try cli_output.writeError(errorWriter(ctx), output, "profile.invalid_qualifier", "profile create: --qualifier must be a canonical logical identifier");
+        setExitCode(ctx, 2);
+        return;
+    }
     const boot_bundle = ctx.flag("boot-bundle", []const u8);
     if (!std.mem.eql(u8, kind, "install") and !std.mem.eql(u8, kind, "diskless")) {
         const output = outputFromContext(ctx) orelse return;
@@ -3825,34 +3864,30 @@ fn profileCreateHandler(ctx: zli.CommandContext) !void {
         setExitCode(ctx, 2);
         return;
     }
-    const bundle_opt: ?[]const u8 = if (boot_bundle.len == 0) null else boot_bundle;
-    if (std.mem.eql(u8, kind, "diskless") and bundle_opt == null) {
+    // Profile 名只能由完整 InstallSource、受约束限定符和 kind 生成；
+    // CLI 不再接受自由整名，从语法入口消除丢失 ISO 身份或角色后缀的可能。
+    const profile_kind = std.meta.stringToEnum(nodeforge.model.ProfileKind, kind).?;
+    const name = try nodeforge.profile_naming.profileName(ctx.allocator, install_source, if (qualifier_text.len == 0) null else qualifier_text, profile_kind);
+    // diskless 默认引用同 source/qualifier 投影生成的
+    // `<source>[-<qualifier>]-diskless-bundle`；仅在需要让多个 Profile
+    // 共享另一个规范 Bundle 时才显式传 --boot-bundle。
+    const derived_bundle_name = if (profile_kind == .diskless)
+        try nodeforge.profile_naming.bootBundleName(ctx.allocator, install_source, if (qualifier_text.len == 0) null else qualifier_text)
+    else
+        null;
+    const bundle_opt: ?[]const u8 = if (std.mem.eql(u8, kind, "diskless"))
+        if (boot_bundle.len == 0) derived_bundle_name.? else boot_bundle
+    else
+        null;
+    if (bundle_opt) |bundle_name| if (std.mem.eql(u8, kind, "diskless") and
+        !nodeforge.profile_naming.bootBundleIsCanonical(bundle_name, install_source))
+    {
         const output = outputFromContext(ctx) orelse return;
-        try cli_output.writeError(errorWriter(ctx), output, "profile.invalid", "profile create: --kind diskless requires --boot-bundle");
+        const message = try std.fmt.allocPrint(ctx.allocator, "profile create: boot bundle name must retain the complete install-source prefix and end in -diskless-bundle; default is {s}", .{derived_bundle_name.?});
+        try cli_output.writeError(errorWriter(ctx), output, "profile.non_canonical_boot_bundle", message);
         setExitCode(ctx, 2);
         return;
-    }
-    // 当 name 省略（未传或为 "-"）时，从 install source 名派生默认 Profile 名：
-    //   - diskless → <source>-diskless（如 rocky-9.7 → rocky-9.7-diskless）
-    //   - install  → <source>（install Profile 直接复用 source 名）
-    // 设计依据：V0_2_CLI.md §5「阶段 4：创建 diskless Profile」。
-    // 这确保 diskless rootfs 命名始终可追溯到源 ISO，操作员无需手敲名字即可
-    // 创建与 install Profile 同源的 diskless 变体。显式传入 name 时覆盖派生值。
-    const derived_name: []const u8 = if (std.mem.eql(u8, kind, "diskless"))
-        try std.fmt.allocPrint(ctx.allocator, "{s}-diskless", .{install_source})
-    else
-        install_source;
-    const explicit_name = ctx.getArg("name");
-    const name: []const u8 = if (explicit_name) |n| blk: {
-        if (n.len == 0 or std.mem.eql(u8, n, "-")) break :blk derived_name;
-        if (!nodeforge.config_validate.validLogicalId(n)) {
-            const output = outputFromContext(ctx) orelse return;
-            try cli_output.writeError(errorWriter(ctx), output, "profile.invalid", "profile create: name must be a canonical logical identifier");
-            setExitCode(ctx, 2);
-            return;
-        }
-        break :blk n;
-    } else derived_name;
+    };
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
@@ -3894,7 +3929,15 @@ fn bootBundleCreateHandler(ctx: zli.CommandContext) !void {
     // 调用 management API POST /api/v1/management/boot-bundles，daemon 校验
     // 资产类型匹配后原子写入 catalog。操作员无需手动编辑 catalog JSON。
     _ = outputFromContext(ctx) orelse return;
-    const name = ctx.getArg("name") orelse return;
+    const install_source = ctx.getArg("install-source") orelse return;
+    const qualifier_text = ctx.flag("qualifier", []const u8);
+    if (!nodeforge.config_validate.validLogicalId(install_source) or
+        (qualifier_text.len != 0 and !nodeforge.config_validate.validLogicalId(qualifier_text)))
+    {
+        try writeCommandError(ctx, "boot_bundle.invalid", "boot-bundle create: install-source and --qualifier must be canonical logical identifiers", 2);
+        return;
+    }
+    const name = try nodeforge.profile_naming.bootBundleName(ctx.allocator, install_source, if (qualifier_text.len == 0) null else qualifier_text);
     const kernel = ctx.flag("kernel", []const u8);
     const initrd = ctx.flag("initrd", []const u8);
     const distro = ctx.flag("distro", []const u8);

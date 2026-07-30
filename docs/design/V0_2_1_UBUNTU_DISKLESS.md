@@ -1,26 +1,37 @@
 # v0.2.1 设计：Ubuntu Casper Squashfs Diskless
 
-状态：**目标设计冻结，产品实现未完成**。本文是 v0.2.1 的唯一设计入口，负责版本边界、方案选型、
+状态：**已完成（产品 CLI 与 aarch64 VMware 冷启动验证通过）**。本文是 v0.2.1 的唯一设计入口，负责版本边界、方案选型、
 风险分析和实现范围。
 总纲与跨版本不变式以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文不重复 v0.2 已冻结的架构、
 程序边界和 CLI 契约，只定义 v0.2.1 新增的 Ubuntu diskless 能力及其与 v0.2 的差异。
 当前实现差距以 [`../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)
 为准，后续版本闸以 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md) 为准。
 
-日期：2026-07-29
+日期：2026-07-30
 
-> 2026-07-28 实现基线：本文后半部分保留部分历史实验记录；发生冲突时以本段和
-> §2.3.2 为准。当前 `nodeforge-initrd` 本身直接成为追加层的 `/init`，使用原生
-> HTTP/IPv4/mount/chroot 路径，不依赖 `/bin/sh`、curl 或 LD_LIBRARY_PATH。
-> `rootfs_os_builder` 的 apt/casper 生产分支仍未接线，现有 smoke 脚本不能等同于
-> NodeForge 已交付 Ubuntu rootfs builder。
+> 2026-07-30 实现更新：`nodeforge assets import` 已实现 casper layer 清单发现
+> （`discoverCasperLayers`，fail-closed 处理歧义/缺失 parent），`InstallSourceConfig.
+> casper_layers` 追加字段随 catalog 一并持久化；`profile rootfs build` 已接通
+> `buildCasperOverlay`（unsquashfs 逐层叠加、无 `|| true` 容错）替换旧的
+> `AptOsLayerUnsupported`。dnf 与 apt 的 package 安装（OS 层 bootstrap 与
+> rootfs-build phase 的 `package` action）统一经新增的
+> `src/provision/namespaced_chroot_executor.zig` 在独立 mount/PID namespace +
+> chroot（或 dnf OS 层 bootstrap 场景下的 `--installroot` host-context）内执行，
+> 替换了旧的 `AptRootfsBuildUnsupported`/`UnsafeHostBuildCommand` fail-closed
+> 判断。`zig build test` 393/393 通过。CLI 侧已接入 §5.1（非 Debian family 宿主
+> 构建 Ubuntu diskless rootfs 的 kernel 依赖风险提示）与 §5.2（initrd 来源不一致
+> 风险提示）。2026-07-30 已在 r97n0（Rocky 9.8 aarch64）完成真实 Ubuntu
+> ISO 产品 CLI rootfs 构建，并由 VMware Fusion `r97n1` 连续两次 UEFI PXE
+> 到达 `diskless.running`。后续又以同一候选完成 Rocky 9.7、Rocky 10.2 与
+> Ubuntu 22.04.5 冷启动回归，并修复/复验 Ubuntu 标准 tty1 登录控制台。
+> 独立 QEMU 与双架构固定矩阵归入 v0.2.2。
 
 ## 0. 版本定位
 
 | 版本 | 范围 | 状态 |
 |---|---|---|
 | v0.2.0 | Rocky/RHEL diskless（`dnf --installroot` OS 层 + squashfs overlay） | 已实现并通过 QEMU/VMware 验证 |
-| **v0.2.1** | **Ubuntu diskless（casper squashfs 叠加方案 + 跨发行版宿主支持）** | **目标冻结；手工 smoke 已通过，产品路径未完成** |
+| **v0.2.1** | **Ubuntu diskless（casper squashfs 叠加方案 + 跨发行版宿主支持）** | **已完成；fresh CLI 与三发行版 aarch64 VMware 冷启动回归通过** |
 | v0.2.2 | 持久化兼容、durable operation、CLI 收口与固定验证矩阵 | [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md) |
 | v0.3 | PXELINUX/BIOS install | 设计阶段 |
 
@@ -629,6 +640,30 @@ apt-get -y -o Dir::Etc::sourcelist=/tmp/nodeforge.sources.list \
 Ubuntu 22.04.5 live-server ISO 包含 `jammy` suite（不含 `jammy-updates`/`jammy-security`），
 使用受管源时 `linux-image-generic` 的版本会被固定在 ISO 发布时的版本，不会漂移。
 
+切根前的 node-apply 还必须把运行根收敛为同一模型：删除 casper layer 自带的
+`sources.list`/`sources.list.d`，只生成 NodeForge 受管源；并在 `/etc/systemd/system`
+离线 mask `snapd.*`、`multipathd.*` 与 `casper-md5check.service`。这些单元面向 live
+安装介质或持久块设备，在 overlay diskless 根上分别会形成 restart loop、无设备失败，
+或因不存在 `/cdrom` 产生虚假 failed unit，不属于 v0.2.1 的运行时能力。
+casper 还会把 `getty@tty1.service` vendor-mask 到 `/dev/null`，并用 drop-in
+把 serial-getty 改为 Subiquity 启动器。node-apply 必须删除这两类 installer
+覆盖，恢复标准 tty1 getty；检测到对应字符设备时再启用 ARM serial getty。
+否则 systemd 和 SSH 虽已正常，VMware 控制台仍会停留在最后一行启动日志，造成
+“diskless 卡住”的错误判断。
+
+这里存在三个容易混淆的信号，设计和测试不得互相替代：
+
+| 信号 | 能证明 | 不能单独证明 |
+|---|---|---|
+| `diskless.running` | NodeForge 受管启动闭包完成 | tty/getty 可交互 |
+| SSH 登录成功、systemd `running` | userspace 和网络服务正常 | VMware 控制台有登录提示 |
+| 冷启动后自然出现 `r97n1 login:` | tty1 getty 和显示链路正常 | 其他 lifecycle 制品校验均成功 |
+
+因此 Ubuntu VMware 验收必须同时保留 lifecycle trace、SSH/systemd 检查和控制台
+截图三类证据。向 `/dev/tty1` 临时写测试文本只能用于区分“显示链路损坏”和
+“getty 未启动”，不能作为最终通过证据；最终必须再次冷启动并等待标准 agetty
+自行输出登录提示。
+
 验证脚本（`v0_2_1_mkinitramfs_smoke_v2.sh`）中未使用此机制，直接使用了 rootfs 自带的公网源
 （`ports.ubuntu.com`），这是验证脚本的缺陷。正式实现方案 B 时必须使用 nodeforged 受管源。
 
@@ -731,22 +766,27 @@ mkinitramfs 默认输出 zstd 压缩的 cpio 镜像（与 casper initrd 格式�
 
 ### 9.7 HTTP 通信实现（v0.2 原生客户端）
 
-#### 9.7.1 HTTP 在 nodeforge-initrd 中的用途
+#### 9.7.1 HTTP 在 nodeforge-initrd/agent 中的用途
 
-v0.2 交付中，`nodeforge-initrd` 已经使用**原生 Zig HTTP 客户端**（`src/initrd/http.zig`），
-不再依赖外部 `curl` 子进程。该客户端在 4 处发起 HTTP 请求：
+v0.2 交付中，`nodeforge-initrd` 与 `nodeforge-agent` 共享**原生 Zig HTTP 客户端**
+（`src/initrd/http.zig`），不再依赖外部 `curl` 子进程。调用范围如下：
 
-| 调用点 | 函数 | 用途 | HTTP 方法 |
+| 组件 | 函数 | 用途 | HTTP 方法 |
 |---|---|---|---|
-| 行 66 | `http.getWithRetry()` | 拉取 BootConfig v3 JSON（含 rootfs URL/SHA-512/agent_plan/facts URL），3 次重试 | GET |
-| 行 294 | `http.headWithRetry()` | HEAD 请求校验 rootfs 元数据（Content-Length/ETag/Accept-Ranges），3 次重试 | HEAD |
-| 行 315 | `rangeOnce()` | 分块 Range 下载 rootfs.squashfs（4MiB/块，断点续传） | GET + Range |
-| 行 245 | `http.post()` | 上报 lifecycle 事件（diskless.initrd_started 等），best-effort | POST |
+| initrd | `http.getWithRetry()` | 拉取 BootConfig v3 JSON | GET |
+| initrd | `http.headWithRetry()` / `rangeOnce()` | 校验并分块下载 rootfs | HEAD / GET+Range |
+| initrd | `http.post()` | 上报 facts 与 lifecycle events | POST |
+| agent | `http.get()` / `http.getToFile()` | 拉取 AgentPlan 与 content-addressed payload | GET |
+| agent | `http.post()` | 上报 lifecycle event 与 agent-consumed | POST |
 
 原生 HTTP 客户端支持：
-- **GET/HEAD/POST/Range**：覆盖 nodeforge-initrd 的所有 HTTP 需求。
+- **GET/HEAD/POST/Range**：覆盖 initrd→agent 启动闭包的所有 HTTP 需求。
 - **重试机制**：GET/HEAD 支持有界重试（指数退避，1s/2s/4s/...），POST 为 best-effort。
-- **进度输出**：所有请求向 stderr (console) 输出类似 curl 的进度信息，在 PXE 启动中
+- **超时边界**：建连由内核 TCP 有界超时负责；API 30 秒 socket 空闲；rootfs/payload 120 秒 socket
+  空闲；持续有收发进展时没有总下载时长限制。
+- **流式制品写入**：rootfs Range/payload 先校验预期状态码与长度，再使用固定
+  缓冲落盘，不按响应大小分配堆内存。
+- **进度输出**：所有请求向 stderr (console) 输出请求/响应和分块进度，在 PXE 启动中
   可看到 `[nodeforge-initrd] GET ... → 200 (1234 bytes)` 等日志。
 - **断点续传**：Range 下载支持 `.part` 文件恢复，配合 5 次重试机制实现可靠传输。
 - **错误处理更精确**：直接返回 TCP/HTTP 错误类型，而非通用的 `SubprocessFailed`。
@@ -758,6 +798,7 @@ v0.2 交付中，`nodeforge-initrd` 已经使用**原生 Zig HTTP 客户端**（
 | 功能 | 实现 | 说明 |
 |---|---|---|
 | TCP 连接 | `std.Io.net.IpAddress.parseIp4` + `connect` | 仅支持 IPv4 地址（PXE 提供的 IP） |
+| 超时 | 内核 TCP connect + socket `SO_RCVTIMEO/SO_SNDTIMEO` | Zig 0.16 暂不设置会 panic 的 connect deadline；API 30 秒空闲；制品 120 秒空闲；无总下载时长 |
 | GET 请求 | 构造 `GET {path} HTTP/1.1` + 发送 + 读取 body | body 可读取到内存或写入文件 |
 | HEAD 请求 | 构造 `HEAD {path} HTTP/1.1` + 发送 + 读取 headers | 返回原始响应头文本 |
 | Range 请求 | 构造 `Range: bytes=N-M` + `If-Range: ETag` + 发送 + 读取 | 响应体写入临时文件 |
@@ -767,8 +808,6 @@ v0.2 交付中，`nodeforge-initrd` 已经使用**原生 Zig HTTP 客户端**（
 | 重试 | `getWithRetry`/`headWithRetry` 包裹，指数退避 | max_retries 可配置 |
 | 日志 | `std.c.write(2, ...)` 向 stderr 输出 | PXE 串口控制台可见 |
 | 断点续传 | `.part` 文件检查 + offset 恢复 | 原逻辑保持不变 |
-
-**代码行数**：~380 行 Zig 代码，包含完整的 HTTP/1.1 客户端、URL 解析器、重试逻辑和单元测试。
 
 **收益**：
 1. **消除 curl 外部依赖**：不再需要在 initrd 中注入 curl + 25 个依赖库 + LD_LIBRARY_PATH。

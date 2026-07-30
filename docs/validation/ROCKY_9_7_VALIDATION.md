@@ -72,7 +72,8 @@ r97n0 重新执行。
   migration backup 均无残留。
 - reconfigure 重新发布 canonical unit；命令完成后 `nodeforged` 仍为 inactive，证明服务生命周期只由
   随后的显式 systemctl 控制。
-- ISO import 返回 `install_source=rocky-9.7-aarch64-iso`，并在同一 catalog revision 自动创建同名默认 profile。
+- ISO import 返回 `install_source=rocky-9.7-aarch64-iso`，并在同一 catalog revision 自动创建
+  `rocky-9.7-aarch64-iso-install` 默认 Profile。
 - node add 后无需重启/retry，立即显示 `install_intent=initial-armed`、`pxe_ready=true`、
   `armed_generation=1`，requested/desired revision 相等。
 - `profile create rocky-9.7-alt rocky-9.7-aarch64-iso` 可补充第二个 profile。

@@ -180,7 +180,7 @@ scope token 完成。
 2. initrd 起后从 `config_url` 拉 BootConfig（单用途、仅容忍响应中断的有界重放 config token），校验 DTO、计划 snapshot、时钟窗口和
    feature，再取得 rootfs 专用 artifact token；agent/event token 已在 credential capsule 中分域，initrd 不使用其读权限。
 3. initrd 先完成 rootfs HEAD/Range 下载、整文件校验，再建立 lower/upper/work/merged；它只把 AgentPlan
-   URL/digest/size/expiry 写入 `/var/lib/nodeforge/agent-handoff.json`，不下载/解析 plan 或 Node first-boot payload，
+   URL/digest 等 locator 写入单一 `/var/lib/nodeforge/boot.json`，不下载/解析 plan 或 Node first-boot payload，
    也不写 merged root 的 target-system；lower 保持只读。
 4. initrd 做 pre-switch 验证，原子写交接目录，撤销并清零 config/rootfs-artifact token；把短时 `agent:read` 和
    `event:append` token 分别以 0400 文件交给切根后的 agent。
@@ -281,7 +281,8 @@ digest 内从安全检查点继续。具体顺序固定如下：
 7. **mount**：只读 loop 挂载 squashfs 到 `lower`；tmpfs 挂载到独立 `upper-tmpfs`，创建同一文件系统内的
    `upper`/`work`，以 `nodev,nosuid` 挂载 overlay 到 `merged`。lower 必须 `ro,nodev`。
 8. **handoff-agent**：校验 AgentPlan locator envelope 与 rootfs agent feature manifest，写
-   `/var/lib/nodeforge/agent-handoff.json`；不下载/解析 AgentPlan 或 Node payload，不写 merged root。
+   单一 `/var/lib/nodeforge/boot.json`；不下载/解析 AgentPlan 或 Node payload，不写 target-system。
+   agent/event token 只写独立 0400 credential 文件，不进入 JSON。
 9. **pre-switch**：确认 `/sbin/init` 与 `/usr/lib/nodeforge/nodeforge-agent` 可执行、modules ABI、挂载和 `/run`
    move-mount 可持续；写 boot.json、agent/event token 和 journal，均禁止跟随 symlink。target-system/DNS/账号/renderer 的
    最终验证属于 agent pre-init，不得在 initrd 复制一套 parser。
