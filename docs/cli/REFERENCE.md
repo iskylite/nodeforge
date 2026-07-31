@@ -1,4 +1,4 @@
-# NodeForge v0.2.2 CLI Reference
+# NodeForge v0.2.3 CLI Reference
 
 本文记录 v0.2.2 的正式公开命令树。命令自身的 `--help` 是参数、默认值和约束的
 唯一事实源；需要属性、集合或高级选项时使用 `--help-full`。
@@ -24,8 +24,10 @@ assets provision-bundle
 assets key-import|key-list|key-reload|key-show
 ```
 
-ISO 导入和 initrd 构建会创建 durable operation。默认跟随到终态；
-`--detach` 立即返回 operation，CLI 超时不会取消 daemon 中的任务。
+ISO 导入和 initrd 构建会创建 durable operation。ISO 导入由 daemon 的
+`IsoImportWorker` 后台执行（staging 按 operation id 隔离），CLI 默认跟随到
+终态，超时不会取消 daemon 中的任务。`assets initrd build --detach` 立即返回
+operation；CLI 超时均不取消 daemon 侧任务。
 
 ## Profile
 
@@ -40,6 +42,17 @@ profile rootfs plan|build|status|register
 
 `profile clone` 只复制 desired configuration，不继承 runtime、session 或 operation。
 `profile show` 已包含 Stored 与 Effective 投影，不另设 `profile effective`。
+`profile clone <source> <target> [KEY=VALUE...] [--new-ssh-keys] [--build] [--detach]`：
+- `--new-ssh-keys` 为克隆创建独立 SSH identity；缺省复用源 Profile 的 identity；
+- `[KEY=VALUE...]` 与 `profile set` 同范围的 property patch，与 clone 在同一
+  catalog 事务中校验并提交（不允许 patch `provenance`/`revision`/
+  `ssh_identity`）；
+- `--build` 在 clone 提交后追加 rootfs build operation（仅 diskless Profile，
+  install Profile 上返回 exit code 2）；build 提交失败不回滚 clone，
+  JSON 结果含 `profile_created=true, build_submitted=false`，exit code 5
+  （`rootfs.build_submit_failed`）；
+- `--detach` 仅与 `--build` 同用，立即返回 operation id（不 follow）；
+  单独使用返回 exit code 2。
 
 ## Node 与生命周期
 
@@ -101,3 +114,18 @@ setup -> assets import -> profile create|clone -> profile rootfs build
 ```
 
 完整示例和 fresh setup 约束见仓库根目录 `README.md`。
+
+## Exit code（v0.2.3 §8 冻结契约）
+
+| code | 类别 |
+|---:|---|
+| 0 | 命令成功 |
+| 1 | 本地数据、协议或未知产品错误（daemon 返回未知业务错误、JSON 解析失败） |
+| 2 | CLI 输入错误（参数缺失、格式错误、无效选项值） |
+| 3 | revision/idempotency 并发冲突（`catalog.revision_conflict`、`http.precondition_required`、`install_source.busy` 等） |
+| 4 | readiness 或前置条件不满足（`profile.not_diskless`、`rootfs.digest_drift`、install source 不存在） |
+| 5 | durable operation 终态 failed/interrupted |
+| 6 | daemon 不可达或等待超时 |
+
+错误信封（`error.code`）按 §8.3 唯一映射到 exit class；同一 code 不会被映射到
+不同 exit class。业务诊断写 stderr，JSON stdout 保持单一错误文档。

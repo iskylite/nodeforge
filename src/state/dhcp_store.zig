@@ -111,7 +111,9 @@ pub fn atomicWrite(io: std.Io, path: []const u8, content: []const u8) !void {
 
 /// 持久化 `rename` 创建的目录项，完成原子替换协议。
 /// 某些文件系统在文件数据到达磁盘后需要显式同步目录才能使 rename 生效。
-fn syncParentDirectory(io: std.Io, path: []const u8) !void {
+/// 供 `identity_store.atomicWriteSecret` 复用（私钥文件同样要求 rename 后目录项
+/// 落盘）。
+pub fn syncParentDirectory(io: std.Io, path: []const u8) !void {
     const parent_path = std.fs.path.dirname(path) orelse return;
     var parent = if (std.fs.path.isAbsolute(parent_path))
         try std.Io.Dir.openFileAbsolute(io, parent_path, .{ .allow_directory = true })

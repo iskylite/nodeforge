@@ -109,6 +109,60 @@ nodeforge node retry r97n1 --force   # 仅在已确认失败目标机停止后
 - `terminal_generation=3`、`successful_generation=3`、`drifted=false`、`pxe_ready=false`；
 - PXE-first 固件随后只获得无 bootfile lease，最终从本地 NVMe 启动到 Rocky Linux 9.7 login。
 
+## v0.2.3（2026-07-31）：aarch64 VMware Rocky diskless 定向回归
+
+目标：用最终 v0.2.3 ReleaseSafe 四产物（本地交叉编译 → 同步 r97n0 生产
+`/opt/nodeforge`）完成 Rocky diskless 全链路定向回归（`V0_2_3_…` §10 完成闸）。
+
+产物与部署：
+
+- `/opt/nodeforge` 生产 daemon 升级到 v0.2.3 四产物（部署脚本带备份/回滚，
+  备份在 `/root/nodeforge-bin-backups/nodeforge-bin-20260731-*.tar`）；
+- 新建 v0.2.3 profile `rocky-9.7-aarch64-minimal-v023-diskless`（create 时
+  生成 identity，store 落盘 `state/identities.json`）；
+- `profile rootfs build`：OS 层缓存命中，全链路含 `installIdentityKeys`
+  （identity store 密钥烤入）；解包 squashfs 比对
+  `/root/.ssh/id_ed25519.pub` 与 identity store `client_public_key` 完全一致；
+- 用最终二进制重建 initrd `rocky-9.7-nodeforge-initrd-v023`（overlay 内
+  agent md5 与生产 agent 一致）与 boot bundle
+  `rocky-9.7-aarch64-minimal-v023-diskless-bundle`，profile 原子切换
+  `diskless.boot_bundle`，rootfs 按新投影重建（`00adfe35…`）。
+
+节点 r97n1（VMware Fusion aarch64 UEFI PXE，`00:50:56:2a:23:db`）启动结果：
+
+- session `f7718edd82071af352d9f7f301b15310` 到达 `diskless.running`；
+  agent-plan 200 → agent-consumed 200（digest/parse 通过）；
+  config/rootfs/agent/event 四 capability 全部撤销；
+- `ssh root@192.168.27.210`（r97n0 bootstrap key）登录成功；
+  `uname -r` = `5.14.0-611.5.1.el9_7.aarch64`；
+  `systemctl is-system-running` = `running`；`/proc/mounts` 含 overlay；
+  节点 `/root/.ssh/id_ed25519{,.pub}` 与 identity store 一致。
+
+**Ubuntu 腿（同日）**：legacy ubuntu profile 无 `ssh_identity`，rootfs 重建会
+`IdentityNotFound`（backlog §3.1 item 8 未实现），故新建 v0.2.3 ubuntu
+profile `ubuntu-22.04.5-live-server-arm64-v023-diskless`：
+
+- 新名重建 initrd `ubuntu-22.04.5-nodeforge-initrd-v023`（overlay agent md5
+  与生产一致）+ v023 bundle + profile create（新 identity）；
+- `profile rootfs build`（casper/apt 路径）：squashfs 992,223,232B /
+  展开 2,281,841,009B，解包比对 client 公钥与 identity store 一致
+  （验证 `installIdentityKeys` casper 分支）；
+- r97n1 重指 + PXE：session `66c6f11e39866db7d31d1b069b5eea27` 到达
+  `diskless.running`，agent-consumed 200，四 capability 撤销；
+- SSH 登录 `root@192.168.27.210` 成功；`uname -r` =
+  `5.15.0-119-generic`；`systemctl is-system-running` = running；根为
+  overlay；节点 `/root/.ssh/id_ed25519{,.pub}` 与 identity store 一致。
+
+故障链与修复（本回归发现并修复的线上缺陷）：
+
+| 现象/证据 | 根因 | 修复与验证 |
+| --- | --- | --- |
+| daemon 启动 SIGSEGV（`boot_session.setEffective`/`identity_store.load`） | `app.zig` 把三个定长 Store（sessions ≈1MB、deployments、identities ≈4.4MB）放主线程栈 | 与 runtime/statuses 一致改为 `allocator.create` 堆分配；本地复现后修复 |
+| `profile create` 响应 200 空 body、daemon 日志 `NoSpaceLeft` | create 响应含 revision/provenance/ssh_identity 后 ~600B 超出 `[512]u8` 缓冲，`bufPrint` 失败 | 缓冲放大到 1536B；线上验证 201 + 533B 完整响应 |
+| 多 identity 持久化后文件出现三条相同 id/密钥记录（created_at 不同），重启拒载 `InvalidIdentityStore` | `persistLocked` 按值迭代槽位并把切片指向循环副本，循环结束后悬垂，序列化读到最后一轮 | 改为按指针迭代；新增多记录回归测试（还原代码下失败、修复后 435/435 通过） |
+| 节点 PXE 启动到 agent 阶段失败（plan 已 200、无 agent-consumed） | 13:08 旧 daemon 构建的 initrd 携带旧 agent，switch_root 前覆盖 rootfs 新 agent；且 `assets initrd build` 同名 already_present 只比 name/source/kernel，不校验 overlay 内容 | 用最终二进制以新资产名重建 initrd/bundle；同名缓存缺口记录为已知限制（重建 initrd 需换新名或后续让 already_present 校验内容） |
+| legacy ubuntu profile 无 `ssh_identity`，rootfs 重建 `IdentityNotFound` | backlog §3.1 item 8「旧 Profile identity 初始化」未实现（不在 v0.2.3 完成闸） | 已知限制；Ubuntu 腿用新建 v0.2.3 profile（casper 路径）完成并通过 |
+
 ## M4.3 系统级重新验收（待实现后执行）
 
 M4.3 会改动 ISO/catalog 身份、adapter 分派、ConfigRuntime、BootSession 认证恢复和 CLI，因此下列项目是新的

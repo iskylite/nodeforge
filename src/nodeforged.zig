@@ -191,6 +191,11 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
             try nodeforge.catalog_store.initializeEmpty(ctx.io, ctx.allocator, catalog_path);
             break :blk try nodeforge.catalog_store.load(ctx.io, ctx.allocator, catalog_path);
         },
+        error.UnsupportedSchemaVersion => {
+            // v0.2.3: 与 `InvalidCatalogManifest`（损坏）区分，指引操作员重建。
+            nodeforge.observe_log.err("catalog: schema version unsupported at {s}; re-run setup to recreate the catalog", .{catalog_path});
+            return err;
+        },
         else => {
             nodeforge.observe_log.err("catalog: cannot load {s}", .{catalog_path});
             if (debug) nodeforge.observe_log.debug("catalog: load cause={t}", .{err});

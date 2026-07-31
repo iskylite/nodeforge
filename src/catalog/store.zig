@@ -97,7 +97,11 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     var parsed_manifest = try std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{ .allocate = .alloc_always });
     defer parsed_manifest.deinit();
     const manifest = parsed_manifest.value;
-    if (manifest.layout_schema_version != layout_schema_version or manifest.catalog_schema_version != 5 or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != names.len)
+    // 版本先判，与 `config/validate.zig` 的 catalog schema 校验语义一致：
+    // v4 及更旧目录必须报 `UnsupportedSchemaVersion`（操作员需重新 setup），
+    // 而不是混进 `InvalidCatalogManifest` 变成"损坏"。
+    if (manifest.catalog_schema_version != 5) return error.UnsupportedSchemaVersion;
+    if (manifest.layout_schema_version != layout_schema_version or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != names.len)
         return error.InvalidCatalogManifest;
     var declared_tx: [64]u8 = undefined;
     try transactionId(manifest.catalog_revision, manifest.entities, &declared_tx);
@@ -125,7 +129,6 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     return std.json.parseFromSlice(model.Catalog, allocator, combined.written(), .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
 }
 
-
 fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, catalog: *const model.Catalog, crash: ?CrashPoint) !void {
     try std.Io.Dir.cwd().createDirPath(io, directory);
     try recover(io, allocator, directory);
@@ -135,7 +138,7 @@ fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
         error.FileNotFound => 0,
         else => return err,
     };
-    const revision = old_revision + 1;
+    const revision = std.math.add(u64, old_revision, 1) catch return error.CatalogRevisionOverflow;
 
     var contents: [names.len]Content = undefined;
     var initialized: usize = 0;
@@ -377,6 +380,36 @@ test "manifest load rejects entity digest mismatch" {
     try std.testing.expectError(error.CatalogDigestMismatch, load(std.testing.io, std.testing.allocator, root));
 }
 
+test "manifest store rejects catalog revision overflow" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const directory = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(directory);
+    try initializeEmpty(std.testing.io, std.testing.allocator, directory);
+
+    const manifest_path = try joinPath(std.testing.allocator, directory, "manifest.json");
+    defer std.testing.allocator.free(manifest_path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(Manifest, std.testing.allocator, bytes, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    var tx_id: [64]u8 = undefined;
+    try transactionId(std.math.maxInt(u64), parsed.value.entities, &tx_id);
+    const overflow_manifest: Manifest = .{
+        .layout_schema_version = parsed.value.layout_schema_version,
+        .catalog_schema_version = parsed.value.catalog_schema_version,
+        .catalog_revision = std.math.maxInt(u64),
+        .transaction_id = &tx_id,
+        .entities = parsed.value.entities,
+    };
+    const rendered = try std.json.Stringify.valueAlloc(std.testing.allocator, overflow_manifest, .{});
+    defer std.testing.allocator.free(rendered);
+    try atomic(std.testing.io, manifest_path, rendered);
+
+    var catalog = model.Catalog{};
+    try std.testing.expectError(error.CatalogRevisionOverflow, save(std.testing.io, std.testing.allocator, directory, &catalog));
+}
+
 test "v4 catalog round-trips diskless profile, boot bundle and rootfs_build step" {
     // v4 使用直接模型序列化，因此 diskless 专属字段（kind=diskless、
     // boot_bundle、rootfs_build 阶段、package 动作、runtime_kernel 资产）必须
@@ -389,7 +422,7 @@ test "v4 catalog round-trips diskless profile, boot bundle and rootfs_build step
     try initializeEmpty(std.testing.io, std.testing.allocator, root);
     const profiles = [_]model.ProfileConfig{.{ .name = "diskless-9", .install_source = "s", .kind = .diskless, .boot_bundle = "bb", .software = .{ .packages = .{ .include = &.{"curl"} } } }};
     const bundles = [_]model.BootBundleConfig{.{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i" }};
-    const steps = [_]model.ProvisionStep{.{ .name = "pkgs", .phase = .rootfs_build, .action = .@"package", .packages = &.{"vim"} }};
+    const steps = [_]model.ProvisionStep{.{ .name = "pkgs", .phase = .rootfs_build, .action = .package, .packages = &.{"vim"} }};
     const prov_bundles = [_]model.ProvisioningBundle{.{ .name = "pb", .steps = &steps }};
     const assets = [_]model.AssetConfig{.{ .name = "rk", .kind = .runtime_kernel, .path = "/rk" }};
     const candidate: model.Catalog = .{ .schema_version = 5, .profiles = &profiles, .boot_bundles = &bundles, .provisioning_bundles = &prov_bundles, .assets = &assets };
@@ -400,7 +433,7 @@ test "v4 catalog round-trips diskless profile, boot bundle and rootfs_build step
     try std.testing.expectEqual(model.ProfileKind.diskless, loaded.value.profiles[0].kind);
     try std.testing.expectEqualStrings("bb", loaded.value.profiles[0].boot_bundle.?);
     try std.testing.expectEqual(model.ProvisionPhase.rootfs_build, loaded.value.provisioning_bundles[0].steps[0].phase);
-    try std.testing.expectEqual(model.ProvisionAction.@"package", loaded.value.provisioning_bundles[0].steps[0].action);
+    try std.testing.expectEqual(model.ProvisionAction.package, loaded.value.provisioning_bundles[0].steps[0].action);
     try std.testing.expectEqual(model.AssetKind.runtime_kernel, loaded.value.assets[0].kind);
     // 幂等再次保存使 manifest 在 schema 5 下保持稳定（10 个实体）。
     try save(std.testing.io, std.testing.allocator, root, &loaded.value);

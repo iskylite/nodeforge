@@ -1,14 +1,15 @@
 # NodeForge v0.3 设计：PXELINUX/BIOS install
 
 状态：设计冻结，实现未开始。本文定义 v0.3 范围，与 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §2 版本表一致。
-v0.3 在 v0.2.1 Ubuntu 收口和 v0.2.2 operability 门禁完成后启动。跨版本顺序见
+v0.3 在 v0.2.3 完成（[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §10
+完成标准）后启动。跨版本顺序见
 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md)，实现细节与状态机见
 [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md)，共用 CLI 契约见 [`V0_2_CLI.md`](V0_2_CLI.md) §0，
 程序边界见 [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md) §7。
 
 ## 1. 进入条件
 
-v0.3 必须基于 v0.2.1/v0.2.2 完成：
+v0.3 必须基于 v0.2.1/v0.2.2/v0.2.3 完成：
 
 - v0.2.3 catalog schema v5（`ProfileKind = install|diskless`、Profile identity/provenance）冻结，canonical BootSession 状态机、
   DHCP/TFTP/HTTP 协议栈与 effective compiler/readiness/validator 三项核心闭环已落地并通过验收。

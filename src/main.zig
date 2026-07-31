@@ -485,9 +485,16 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_show);
     try addOutputFlag(profile_show);
     try addDebugFlag(profile_show);
-    const profile_clone = try zli.Command.init(init_options, .{ .name = "clone", .description = "Atomically clone a Profile desired configuration", .usage = "nodeforge profile clone <source> <target> [options]" }, profileCloneHandler);
+    const profile_clone = try zli.Command.init(init_options, .{ .name = "clone", .description = "Atomically clone a Profile desired configuration", .usage = "nodeforge profile clone <source> <target> [KEY=VALUE...] [--new-ssh-keys] [--build] [--detach]" }, profileCloneHandler);
     try profile_clone.addPositionalArg(.{ .name = "source", .description = "Existing Profile name", .required = true });
     try profile_clone.addPositionalArg(.{ .name = "target", .description = "New Profile name", .required = true });
+    try profile_clone.addPositionalArg(.{ .name = "properties", .description = "Optional key=value property patches applied atomically with the clone", .required = false, .variadic = true });
+    // v0.2.3 §5.2: 默认复用 source 的 SSH identity；--new-ssh-keys 创建独立 identity。
+    try profile_clone.addFlag(.{ .name = "new-ssh-keys", .description = "Create a new independent SSH identity instead of reusing the source profile's identity", .type = .Bool, .default_value = .{ .Bool = false } });
+    // v0.2.3 §5.2: --build 在 clone 提交后追加 rootfs build operation（仅
+    // diskless）；--detach 与 --build 同用，立即返回 operation id。
+    try profile_clone.addFlag(.{ .name = "build", .description = "Submit a rootfs build operation after the clone commits (diskless profiles only)", .type = .Bool, .default_value = .{ .Bool = false } });
+    try profile_clone.addFlag(.{ .name = "detach", .description = "Return the build operation id immediately instead of following it (requires --build)", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(profile_clone);
     try addOutputFlag(profile_clone);
     try addDebugFlag(profile_clone);
@@ -529,6 +536,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const profile_rootfs_build = try zli.Command.init(init_options, .{ .name = "build", .description = "Build a content-addressed rootfs artifact for a diskless profile from its build projection", .usage = "nodeforge profile rootfs build <profile> [--if-input-digest <hex>] [options]" }, profileRootfsBuildHandler);
     try profile_rootfs_build.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
     try profile_rootfs_build.addFlag(.{ .name = "if-input-digest", .description = "Only build if the current rootfs input digest matches (anti-drift)", .type = .String, .default_value = .{ .String = "" } });
+    // v0.2.3 §3.3: --new-ssh-keys 先轮换 identity/Profile 再以新投影构建。
+    try profile_rootfs_build.addFlag(.{ .name = "new-ssh-keys", .description = "Rotate the profile ssh identity (new immutable revision) before building", .type = .Bool, .default_value = .{ .Bool = false } });
     try profile_rootfs_build.addFlag(.{ .name = "detach", .description = "Return immediately with the durable operation id", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(profile_rootfs_build);
     try addOutputFlag(profile_rootfs_build);
@@ -1312,7 +1321,10 @@ fn itemValuesHandler(ctx: zli.CommandContext) !void {
     var reason: [512]u8 = undefined;
     const mutation = nodeforge.management_client.itemValuesMutation(ctx.io, config.value.server.http_port, owner_text, resource_identity, item_identity, operation, key, field, values, ctx.flag("force", bool), &reason);
     if (!mutation.healthy) {
-        try writeCommandError(ctx, "item.values_mutation_failed", if (mutation.reason.len == 0) "item values mutation failed" else mutation.reason, 1);
+        // v0.2.3 §8.3：与 reportMutationFailure 同一映射，避免硬编码 exit 1
+        // 把 revision 冲突/前置条件错误错归为本地错误。
+        const exit_code = if (!mutation.reachable) 6 else mapErrorToExitCode(mutation.http_status, mutation.error_code);
+        try writeCommandError(ctx, "item.values_mutation_failed", if (mutation.reason.len == 0) "item values mutation failed" else mutation.reason, exit_code);
         return;
     }
     try renderCommandResult(ctx, "item values updated", .{ .updated = true, .resource = resource_identity, .key = key, .item = item_identity, .field = field, .operation = operation });
@@ -2051,160 +2063,6 @@ fn initrdBuildOperationHandler(ctx: zli.CommandContext) !void {
     else
         try std.fmt.allocPrint(ctx.allocator, "initrd built and registered: {s} (operation {s})", .{ name, op.id });
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
-}
-
-fn initrdBuildHandler(ctx: zli.CommandContext) !void {
-    _ = outputFromContext(ctx) orelse return;
-    const name = ctx.getArg("name") orelse return;
-    var distro = ctx.flag("distro", []const u8);
-    var version = ctx.flag("version", []const u8);
-    var arch_text = ctx.flag("arch", []const u8);
-    const kernel_release = ctx.flag("kernel-release", []const u8);
-    const source_name = ctx.flag("from-install-source", []const u8);
-    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer config.deinit();
-    var catalog: ?std.json.Parsed(nodeforge.model.Catalog) = null;
-    defer if (catalog) |*value| value.deinit();
-    var base_initrd: ?[]const u8 = null;
-    var source_kernel_release: ?[]const u8 = null;
-    var source_is_ubuntu = false;
-    if (source_name.len != 0) {
-        catalog = nodeforge.catalog_store.load(ctx.io, ctx.allocator, nodeforge.paths.require().catalog_dir) catch {
-            try writeCommandError(ctx, "initrd.catalog_unavailable", "cannot load the installed catalog", 1);
-            return;
-        };
-        const source = nodeforge.catalog.findInstallSource(&catalog.?.value, source_name) orelse {
-            try writeCommandError(ctx, "initrd.install_source_not_found", "--from-install-source does not exist", 2);
-            return;
-        };
-        const installer = nodeforge.catalog.findAsset(&catalog.?.value, source.installer_initrd) orelse {
-            try writeCommandError(ctx, "initrd.installer_initrd_missing", "install source has no registered installer initrd", 1);
-            return;
-        };
-        if (installer.kind != .installer_initrd) {
-            try writeCommandError(ctx, "initrd.installer_initrd_invalid", "install source initrd has the wrong asset kind", 1);
-            return;
-        }
-        const source_kernel = nodeforge.catalog.findAsset(&catalog.?.value, source.installer_kernel) orelse {
-            try writeCommandError(ctx, "initrd.installer_kernel_missing", "install source has no registered kernel", 1);
-            return;
-        };
-        if (source_kernel.kind != .kernel) {
-            try writeCommandError(ctx, "initrd.installer_kernel_invalid", "install source kernel has the wrong asset kind", 1);
-            return;
-        }
-        source_kernel_release = source_kernel.kernel_release;
-        source_is_ubuntu = source.casper_layers.len != 0;
-        if ((distro.len != 0 and !std.mem.eql(u8, distro, source.distro)) or
-            (version.len != 0 and !std.mem.eql(u8, version, source.version)) or
-            (arch_text.len != 0 and !std.mem.eql(u8, arch_text, @tagName(source.arch))))
-        {
-            try writeCommandError(ctx, "initrd.source_tuple_mismatch", "explicit distro/version/arch conflicts with the install source", 2);
-            return;
-        }
-        distro = source.distro;
-        version = source.version;
-        arch_text = @tagName(source.arch);
-        base_initrd = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ config.value.tftp.asset_root, installer.path });
-    }
-    if (!nodeforge.config_validate.validLogicalId(name) or
-        !nodeforge.config_validate.validLogicalId(distro) or
-        !nodeforge.config_validate.validLogicalId(version) or
-        kernel_release.len == 0 or kernel_release.len > 160 or
-        std.mem.indexOfAny(u8, kernel_release, "/\\\x00") != null)
-    {
-        try writeCommandError(ctx, "initrd.invalid_input", "name, tuple (or --from-install-source), and kernel-release must be safe non-empty values", 2);
-        return;
-    }
-    const arch = std.meta.stringToEnum(nodeforge.model.Arch, arch_text) orelse {
-        try writeCommandError(ctx, "initrd.invalid_arch", "unsupported --arch", 2);
-        return;
-    };
-    if (source_kernel_release) |detected_release| {
-        if (!std.mem.eql(u8, detected_release, kernel_release))
-            try errorWriter(ctx).print(
-                "WARNING: requested kernel release {s} differs from install source {s} kernel release {s}; continuing with the user-provided value.\n",
-                .{ kernel_release, source_name, detected_release },
-            );
-        if (source_is_ubuntu)
-            try errorWriter(ctx).print(
-                "RISK: {s} is an Ubuntu diskless install source. The initrd MUST be extracted from " ++
-                    "the ISO's /casper/initrd (matching {s} .ko module vermagic) — the host's dracut is " ++
-                    "NOT supported for Ubuntu diskless. This build uses the casper initrd vendor overlay " ++
-                    "as long as --from-install-source is set; do not substitute a manually-built initrd.\n",
-                .{ source_name, detected_release },
-            );
-    }
-    if (!nodeforge.management_client.health(ctx.io, config.value.server.http_port).healthy) {
-        try writeCommandError(ctx, "initrd.daemon_unavailable", "local daemon must be healthy before building and registering an initrd", 1);
-        return;
-    }
-
-    // `name` 是 operator-facing diskless Profile/制品名，目录无需再重复
-    // sources/manual/distro/version/arch 等已由 catalog 保存的 provenance。
-    const relative = try nodeforge.artifact_layout.initrdRelative(ctx.allocator, name, kernel_release);
-    const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ nodeforge.paths.require().initrd_dir, relative });
-    const part = try std.fmt.allocPrint(ctx.allocator, "{s}.part", .{destination});
-    const parent = std.fs.path.dirname(destination) orelse unreachable;
-    try std.Io.Dir.cwd().createDirPath(ctx.io, parent);
-    if (std.Io.Dir.cwd().statFile(ctx.io, destination, .{ .follow_symlinks = false })) |_| {
-        try writeCommandError(ctx, "initrd.already_exists", "managed initrd destination already exists", 1);
-        return;
-    } else |err| if (err != error.FileNotFound) return err;
-    std.Io.Dir.cwd().deleteFile(ctx.io, part) catch {};
-    var published = false;
-    defer if (!published) std.Io.Dir.cwd().deleteFile(ctx.io, part) catch {};
-    const initrd_binary = try std.fmt.allocPrint(ctx.allocator, "{s}/nodeforge-initrd", .{nodeforge.paths.require().bin_dir});
-    const agent_binary = try std.fmt.allocPrint(ctx.allocator, "{s}/nodeforge-agent", .{nodeforge.paths.require().bin_dir});
-    for ([_][]const u8{ initrd_binary, agent_binary }) |companion| {
-        const stat = std.Io.Dir.cwd().statFile(ctx.io, companion, .{ .follow_symlinks = false }) catch {
-            try writeCommandError(ctx, "initrd.companion_missing", "nodeforge-initrd and nodeforge-agent must both be installed beside nodeforge", 1);
-            return;
-        };
-        if (stat.kind != .file) {
-            try writeCommandError(ctx, "initrd.companion_missing", "nodeforge-initrd and nodeforge-agent must both be regular files beside nodeforge", 1);
-            return;
-        }
-    }
-    try errorWriter(ctx).print("Building initrd {s} (kver={s}, arch={s}, mode={s})...\n", .{ name, kernel_release, @tagName(arch), if (base_initrd != null) "vendor-overlay" else "dracut-fallback" });
-    const build_result = if (base_initrd) |base|
-        nodeforge.provision_initrd_build_executor.buildFromInstaller(ctx.io, ctx.allocator, kernel_release, initrd_binary, base, part)
-    else
-        nodeforge.provision_initrd_build_executor.build(ctx.io, ctx.allocator, kernel_release, initrd_binary, part);
-    build_result catch |err| {
-        const message = try std.fmt.allocPrint(ctx.allocator, "initrd build failed ({t})", .{err});
-        try writeCommandError(ctx, "initrd.build_failed", message, 1);
-        return;
-    };
-    try errorWriter(ctx).print("Build complete, publishing to {s}...\n", .{relative});
-    std.Io.Dir.rename(std.Io.Dir.cwd(), part, std.Io.Dir.cwd(), destination, ctx.io) catch |err| {
-        const message = try std.fmt.allocPrint(ctx.allocator, "cannot atomically publish initrd ({t})", .{err});
-        try writeCommandError(ctx, "initrd.publish_failed", message, 1);
-        return;
-    };
-    published = true;
-
-    try errorWriter(ctx).print("Registering with daemon...\n", .{});
-    const imported = nodeforge.management_client.importAsset(ctx.io, config.value.server.http_port, .{
-        .name = name,
-        .kind = @tagName(nodeforge.model.AssetKind.nodeforge_initrd),
-        .path = relative,
-        .distro = distro,
-        .version = version,
-        .arch = @tagName(arch),
-        .kernel_release = kernel_release,
-    }) catch false;
-    if (!imported) {
-        std.Io.Dir.cwd().deleteFile(ctx.io, destination) catch {};
-        try writeCommandError(ctx, "initrd.register_failed", "daemon rejected the built initrd; unpublished file was removed", 1);
-        return;
-    }
-    try errorWriter(ctx).print("Initrd registered successfully.\n", .{});
-    const human = try std.fmt.allocPrint(ctx.allocator, "initrd built and registered: {s} ({s})", .{ name, relative });
-    try renderCommandResult(ctx, human, .{ .name = name, .path = relative, .arch = @tagName(arch), .kernel_release = kernel_release });
 }
 
 fn assetImportHandler(ctx: zli.CommandContext) !void {
@@ -4005,16 +3863,66 @@ fn profileCloneHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "profile.clone_invalid", "source and target must be canonical logical identifiers", 2);
         return;
     }
+    // v0.2.3 §5.2: [KEY=VALUE...] 与 `profile set` 同范围解析（cli_properties
+    // 模块）；集合键须走 values 命令；provenance/revision/ssh_identity 不在
+    // PropertySpec 内，天然被拒绝。patch 由 daemon 与 clone 在同一事务提交。
+    var mutations: std.ArrayList(nodeforge.scalar_mutation.Mutation) = .empty;
+    defer mutations.deinit(ctx.allocator);
+    for (ctx.positional_args[2..]) |assignment| {
+        const equal = std.mem.indexOfScalar(u8, assignment, '=') orelse return profilePropertyError(ctx, error.InvalidProfileProperty);
+        const key = assignment[0..equal];
+        const value = assignment[equal + 1 ..];
+        if (nodeforge.cli_properties.collection(.profile, key) != null) {
+            const message = try std.fmt.allocPrint(ctx.allocator, "use profile add-values/remove-values/replace-values/clear-values {s} {s}", .{ target, key });
+            try writeCommandError(ctx, "property.list_operation_required", message, 2);
+            return;
+        }
+        const spec = nodeforge.cli_properties.property(.profile, key) orelse return profilePropertyError(ctx, error.InvalidProfileProperty);
+        if (spec.mutability != .mutable) return profilePropertyError(ctx, error.InvalidProfileProperty);
+        try mutations.append(ctx.allocator, .{ .key = key, .value = value });
+    }
+    // v0.2.3 §5.2: --detach 仅与 --build 同用；单独使用是 CLI 输入错误
+    // （exit code 2），在连接 daemon 前校验。
+    const build = ctx.flag("build", bool);
+    const detach = ctx.flag("detach", bool);
+    if (detach and !build) {
+        try writeCommandError(ctx, "profile.clone_invalid", "--detach requires --build", 2);
+        return;
+    }
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
-    var reason: [256]u8 = undefined;
-    const result = nodeforge.management_client.profileClone(ctx.io, config.value.server.http_port, source, target, &reason);
-    if (!result.healthy) return reportMutationFailure(ctx, result, "profile clone failed");
-    const human = try std.fmt.allocPrint(ctx.allocator, "profile cloned: {s} -> {s}", .{ source, target });
-    try renderCommandResult(ctx, human, .{ .source = source, .target = target });
+    // v0.2.3 §5.2: --new-ssh-keys 时 daemon 创建独立 identity 并两阶段发布；
+    // --build 时 clone 提交后追加 rootfs build operation；--detach 仅与
+    // --build 同用（立即返回 operation id，不 follow）。
+    const new_ssh_keys = ctx.flag("new-ssh-keys", bool);
+    var reason: [512]u8 = undefined;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const result = nodeforge.management_client.profileClone(ctx.io, config.value.server.http_port, source, target, new_ssh_keys, build, detach, mutations.items, response, &reason);
+    if (!result.healthy) {
+        const output = outputFromContext(ctx) orelse return;
+        if (result.body.len != 0 and output.mode == .json) {
+            // §8.4: JSON 模式输出 daemon 单一文档（clone+build 复合错误含
+            // `result.profile_created`/`build_submitted`）；诊断写 stderr。
+            try renderOutputDocument(ctx, .{ .human = .{ .text = "" }, .json = result.body });
+            try errorWriter(ctx).print("error: {s}\n", .{result.reason});
+            setExitCode(ctx, if (!result.reachable) 6 else mapErrorToExitCode(result.http_status, result.error_code));
+        } else {
+            try reportMutationFailure(ctx, result, "profile clone failed");
+        }
+        return;
+    }
+    const human = if (build)
+        if (detach)
+            try std.fmt.allocPrint(ctx.allocator, "profile cloned: {s} -> {s}; rootfs build submitted (detached)", .{ source, target })
+        else
+            try std.fmt.allocPrint(ctx.allocator, "profile cloned: {s} -> {s}; rootfs build complete", .{ source, target })
+    else
+        try std.fmt.allocPrint(ctx.allocator, "profile cloned: {s} -> {s}", .{ source, target });
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = result.body });
 }
 
 /// 通过本机 management API 删除一个零引用 Profile。所有错误均复用 mutation
@@ -4179,11 +4087,13 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     const name = ctx.getArg("name") orelse return;
     const if_input_digest_raw = ctx.flag("if-input-digest", []const u8);
     const if_input_digest: ?[]const u8 = if (if_input_digest_raw.len == 0) null else if_input_digest_raw;
+    // v0.2.3 §3.3: --new-ssh-keys 时 daemon 先轮换 identity/Profile 再构建。
+    const new_ssh_keys = ctx.flag("new-ssh-keys", bool);
     if (ctx.flag("detach", bool)) {
         const response = try allocManagementResponse(ctx);
         defer ctx.allocator.free(response);
         var reason: [256]u8 = undefined;
-        const body = nodeforge.management_client.rootfsBuildDetachJson(ctx.io, config.value.server.http_port, name, if_input_digest, response, &reason) catch null orelse {
+        const body = nodeforge.management_client.rootfsBuildDetachJson(ctx.io, config.value.server.http_port, name, if_input_digest, new_ssh_keys, response, &reason) catch null orelse {
             const detail = std.mem.sliceTo(&reason, 0);
             try writeCommandError(ctx, "rootfs.build_failed", if (detail.len == 0) "rootfs operation submission failed" else detail, 1);
             return;
@@ -4202,7 +4112,7 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     try errorWriter(ctx).print("Requesting rootfs build for profile {s}...\n", .{name});
     if (if_input_digest) |d| try errorWriter(ctx).print("Anti-drift digest: {s}\n", .{d});
     var reason: [256]u8 = undefined;
-    const result = nodeforge.management_client.rootfsBuild(ctx.io, config.value.server.http_port, name, if_input_digest, &reason);
+    const result = nodeforge.management_client.rootfsBuild(ctx.io, config.value.server.http_port, name, if_input_digest, new_ssh_keys, &reason);
     if (!result.healthy) {
         try reportMutationFailure(ctx, result, "rootfs build failed: daemon unreachable");
         return;
@@ -4835,13 +4745,81 @@ fn nodeDeployHandler(ctx: zli.CommandContext) !void {
 
 // ── M4.2 节点 CRUD 处理器 ───────────────────────────────────────
 
+/// v0.2.3 §8.3：把 API error.code 与 HTTP status 映射为冻结 exit class。
+/// error.code 精确匹配优先（handler 不得把同一 code 映射到不同 exit class）；
+/// 未知 code 按 HTTP status 回退；成功响应（2xx）返回 0。
+fn mapErrorToExitCode(http_status: u16, error_code: []const u8) u8 {
+    // —— CLI 输入错误（exit 2）——
+    if (std.mem.eql(u8, error_code, "profile.invalid") or
+        std.mem.eql(u8, error_code, "profile.boot_bundle_required") or
+        std.mem.eql(u8, error_code, "profile.clone_invalid") or
+        std.mem.eql(u8, error_code, "rootfs.invalid")) return 2;
+    // —— revision/idempotency 并发冲突（exit 3）——
+    if (std.mem.eql(u8, error_code, "profile.already_exists") or
+        std.mem.eql(u8, error_code, "install_source.busy") or
+        std.mem.eql(u8, error_code, "install_source.name_conflict") or
+        std.mem.eql(u8, error_code, "catalog.revision_conflict") or
+        std.mem.eql(u8, error_code, "http.precondition_required")) return 3;
+    // —— readiness / 前置条件不满足（exit 4）——
+    if (std.mem.eql(u8, error_code, "profile.in_use") or
+        std.mem.eql(u8, error_code, "profile.not_diskless") or
+        std.mem.eql(u8, error_code, "profile.install_source_not_found") or
+        std.mem.eql(u8, error_code, "rootfs.digest_drift")) return 4;
+    // —— durable operation 终态失败（exit 5）——
+    if (std.mem.eql(u8, error_code, "rootfs.build_failed") or
+        std.mem.eql(u8, error_code, "rootfs.build_submit_failed") or
+        std.mem.eql(u8, error_code, "operation.interrupted")) return 5;
+    // —— HTTP status 回退（§8.3 表）——
+    if (http_status >= 200 and http_status < 300) return 0;
+    switch (http_status) {
+        404, 422 => return 4,
+        409, 428 => return 3,
+        else => return 1,
+    }
+}
+
 /// M4.5：把管理写请求的失败结果映射为 CLI 结构化错误。`result.reason` 非空时
 /// 直接输出服务端错误信封（code/message/request_id），否则（连接失败）输出
-/// `fallback`。始终置非零退出码。
+/// `fallback`。退出码按 v0.2.3 §8.1/§8.3 映射：连接失败归为 6，业务错误按
+/// error.code/HTTP status 映射，不再一律 exit 1。
 fn reportMutationFailure(ctx: zli.CommandContext, result: nodeforge.management_client.Mutation, fallback: []const u8) !void {
     const output = outputFromContext(ctx) orelse return;
     try cli_output.writeError(errorWriter(ctx), output, "mutation.failed", if (result.reason.len > 0) result.reason else fallback);
-    setExitCode(ctx, 1);
+    setExitCode(ctx, if (!result.reachable) 6 else mapErrorToExitCode(result.http_status, result.error_code));
+}
+
+test "v0.2.3: mapErrorToExitCode follows §8.3 frozen exit classes" {
+    // 成功与 daemon 内部错误。
+    try std.testing.expectEqual(@as(u8, 0), mapErrorToExitCode(200, ""));
+    try std.testing.expectEqual(@as(u8, 0), mapErrorToExitCode(201, ""));
+    try std.testing.expectEqual(@as(u8, 1), mapErrorToExitCode(500, ""));
+    try std.testing.expectEqual(@as(u8, 1), mapErrorToExitCode(503, ""));
+    // CLI 输入错误（error.code 精确映射，与 HTTP status 无关）。
+    try std.testing.expectEqual(@as(u8, 2), mapErrorToExitCode(400, "profile.invalid"));
+    try std.testing.expectEqual(@as(u8, 2), mapErrorToExitCode(400, "profile.boot_bundle_required"));
+    try std.testing.expectEqual(@as(u8, 2), mapErrorToExitCode(400, "profile.clone_invalid"));
+    try std.testing.expectEqual(@as(u8, 2), mapErrorToExitCode(400, "rootfs.invalid"));
+    // revision/idempotency 并发冲突。
+    try std.testing.expectEqual(@as(u8, 3), mapErrorToExitCode(409, "catalog.revision_conflict"));
+    try std.testing.expectEqual(@as(u8, 3), mapErrorToExitCode(409, "profile.already_exists"));
+    try std.testing.expectEqual(@as(u8, 3), mapErrorToExitCode(409, "install_source.busy"));
+    try std.testing.expectEqual(@as(u8, 3), mapErrorToExitCode(409, "install_source.name_conflict"));
+    try std.testing.expectEqual(@as(u8, 3), mapErrorToExitCode(428, "http.precondition_required"));
+    // readiness / 前置条件不满足。
+    try std.testing.expectEqual(@as(u8, 4), mapErrorToExitCode(400, "profile.not_diskless"));
+    try std.testing.expectEqual(@as(u8, 4), mapErrorToExitCode(400, "profile.in_use"));
+    try std.testing.expectEqual(@as(u8, 4), mapErrorToExitCode(404, "profile.install_source_not_found"));
+    try std.testing.expectEqual(@as(u8, 4), mapErrorToExitCode(409, "rootfs.digest_drift"));
+    // durable operation 终态失败。
+    try std.testing.expectEqual(@as(u8, 5), mapErrorToExitCode(500, "rootfs.build_failed"));
+    try std.testing.expectEqual(@as(u8, 5), mapErrorToExitCode(500, "rootfs.build_submit_failed"));
+    try std.testing.expectEqual(@as(u8, 5), mapErrorToExitCode(500, "operation.interrupted"));
+    // 未知 code 时按 HTTP status 回退（§8.3 表）。
+    try std.testing.expectEqual(@as(u8, 4), mapErrorToExitCode(404, ""));
+    try std.testing.expectEqual(@as(u8, 4), mapErrorToExitCode(422, ""));
+    try std.testing.expectEqual(@as(u8, 3), mapErrorToExitCode(409, ""));
+    try std.testing.expectEqual(@as(u8, 3), mapErrorToExitCode(428, ""));
+    try std.testing.expectEqual(@as(u8, 1), mapErrorToExitCode(400, ""));
 }
 
 fn nodeAddHandler(ctx: zli.CommandContext) !void {

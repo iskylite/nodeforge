@@ -96,11 +96,11 @@ pub const Store = struct {
     ///
     /// v0.2.3 前 diskless initrd 只上报 memory_bytes，daemon 的 `disklessFacts`
     /// 端点调用本函数以保留先前安装环境上报的 serial/uuid/vendor/model。
-    /// v0.2.3 起 initrd 同时采集 DMI，`disklessFacts` 统一使用完整 `put`
-    /// 存储。旧版 initrd 二进制只发 `{"memory_bytes":N}` 时，`put` 以 null
-    /// DMI 覆盖已有记录——这在纯 diskless 节点上不会丢失信息（无先前 DMI），
-    /// 属可接受的升级窗口行为。本函数不再被 diskless 路径调用，仅作为
-    /// API-level 保留供未来按字段部分更新的场景使用。
+    /// v0.2.3 起 initrd 同时采集 DMI，`disklessFacts` 改用 `putDiskless`（合并
+    /// DMI、保留 generation 高水位）。旧版 initrd 二进制只发
+    /// `{"memory_bytes":N}` 时不会丢失已有 DMI（`putDiskless` 对 null 字段保留
+    /// 旧值）。本函数不再被 diskless 路径调用，仅作为 API-level 保留供未来按
+    /// 字段部分更新的场景使用。
     pub fn putMemory(self: *Store, node_id: []const u8, session_id: []const u8, generation: u64, session_created_at: i64, memory_bytes: u64, reported_at: i64) !bool {
         if (memory_bytes == 0) return error.InvalidFacts;
         lock(&self.mutex);
@@ -123,6 +123,43 @@ pub const Store = struct {
         if (self.entries.items.len >= self.capacity) return error.InventoryCapacityExhausted;
         const facts: Facts = .{ .memory_bytes = memory_bytes };
         try self.entries.append(self.allocator, try ownedEntry(self.allocator, node_id, session_id, generation, session_created_at, facts, reported_at, digestFacts(facts)));
+        self.revision += 1;
+        return true;
+    }
+
+    /// diskless initrd 上报完整 facts（memory + 可选 DMI）。与 `putMemory` 同源：
+    /// 按 `session_created_at` 排序、保留 install generation 高水位；与 `put`
+    /// 不同，DMI 字段缺失（null）时保留既有值，不清空先前 install 环境上报的
+    /// SN/UUID/vendor/model，也不会因 generation=0 触发 install 防回退 409。
+    pub fn putDiskless(self: *Store, node_id: []const u8, session_id: []const u8, session_created_at: i64, incoming: Facts, reported_at: i64) !bool {
+        if (incoming.memory_bytes == null or incoming.memory_bytes.? == 0) return error.InvalidFacts;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |*entry| if (std.mem.eql(u8, entry.node_id, node_id)) {
+            if (session_created_at < entry.session_created_at or
+                (session_created_at == entry.session_created_at and !std.mem.eql(u8, entry.boot_session_id, session_id)))
+                return error.StaleSource;
+            // 合并：incoming 非 null 覆盖，null 保留旧值。
+            const merged: Facts = .{
+                .memory_bytes = incoming.memory_bytes,
+                .serial_number = incoming.serial_number orelse entry.serial_number,
+                .product_uuid = incoming.product_uuid orelse entry.product_uuid,
+                .vendor = incoming.vendor orelse entry.vendor,
+                .model = incoming.model orelse entry.model,
+            };
+            try validateFacts(merged);
+            const digest = digestFacts(merged);
+            const same_source = session_created_at == entry.session_created_at and std.mem.eql(u8, entry.boot_session_id, session_id);
+            if (same_source and std.crypto.timing_safe.eql([32]u8, digest, entry.digest)) return false;
+            const replacement = try ownedEntry(self.allocator, node_id, session_id, @max(0, entry.deployment_generation), session_created_at, merged, reported_at, digest);
+            freeEntry(self.allocator, entry);
+            entry.* = replacement;
+            self.revision += 1;
+            return true;
+        };
+        if (self.entries.items.len >= self.capacity) return error.InventoryCapacityExhausted;
+        try validateFacts(incoming);
+        try self.entries.append(self.allocator, try ownedEntry(self.allocator, node_id, session_id, 0, session_created_at, incoming, reported_at, digestFacts(incoming)));
         self.revision += 1;
         return true;
     }
@@ -351,4 +388,49 @@ test "new diskless memory report refreshes identical facts across install genera
     const refreshed = store.get("n1").?;
     try std.testing.expectEqual(@as(u64, 9), refreshed.deployment_generation);
     try std.testing.expectEqual(@as(i64, 20), refreshed.reported_at);
+}
+
+test "diskless facts merge preserves install DMI and generation high water" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    const install_session = "0123456789abcdef0123456789abcdef";
+    const diskless_session = "abcdef0123456789abcdef0123456789";
+    try std.testing.expect(try store.put("n1", install_session, 1, 10, .{ .serial_number = "SN1", .product_uuid = "UUID1", .vendor = "VEND", .model = "MODEL", .memory_bytes = 4096 }, 10));
+    // diskless 上报不带 DMI：generation 高水位保留，SN/UUID/vendor/model 不被清空。
+    try std.testing.expect(try store.putDiskless("n1", diskless_session, 20, .{ .memory_bytes = 8192 }, 20));
+    const entry = store.get("n1").?;
+    try std.testing.expectEqual(@as(u64, 1), entry.deployment_generation);
+    try std.testing.expectEqualStrings("SN1", entry.serial_number.?);
+    try std.testing.expectEqualStrings("UUID1", entry.product_uuid.?);
+    try std.testing.expectEqualStrings("VEND", entry.vendor.?);
+    try std.testing.expectEqualStrings("MODEL", entry.model.?);
+    try std.testing.expectEqual(@as(?u64, 8192), entry.memory_bytes);
+    // 覆盖场景：diskless 带 DMI 时覆盖对应字段，未上报字段保留旧值。
+    try std.testing.expect(try store.putDiskless("n1", diskless_session, 20, .{ .memory_bytes = 16384, .serial_number = "SN2" }, 21));
+    const updated = store.get("n1").?;
+    try std.testing.expectEqualStrings("SN2", updated.serial_number.?);
+    try std.testing.expectEqualStrings("UUID1", updated.product_uuid.?);
+    try std.testing.expectEqual(@as(?u64, 16384), updated.memory_bytes);
+}
+
+test "install generation gate still rejects old install session after diskless" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    const install_session = "0123456789abcdef0123456789abcdef";
+    try std.testing.expect(try store.put("n1", install_session, 1, 10, .{ .serial_number = "SN1", .memory_bytes = 4096 }, 10));
+    try std.testing.expect(try store.putDiskless("n1", "abcdef0123456789abcdef0123456789", 20, .{ .memory_bytes = 8192 }, 20));
+    // putDiskless 保留 generation=1 高水位：旧 install session（gen=1、同一
+    // created_at、不同 session id）仍被防回退拒绝。
+    try std.testing.expectError(error.StaleSource, store.put("n1", "11111111111111111111111111111111", 1, 10, .{ .serial_number = "LATE" }, 30));
+}
+
+test "older diskless report is rejected as stale and identical report is idempotent" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    const diskless_session = "abcdef0123456789abcdef0123456789";
+    try std.testing.expect(try store.putDiskless("n1", diskless_session, 20, .{ .memory_bytes = 8192 }, 20));
+    // 更早 session_created_at 的 diskless 上报 → StaleSource。
+    try std.testing.expectError(error.StaleSource, store.putDiskless("n1", "0123456789abcdef0123456789abcdef", 10, .{ .memory_bytes = 4096 }, 30));
+    // 同一 session 的幂等重报 → false（不重复写、不推进 revision）。
+    try std.testing.expect(!try store.putDiskless("n1", diskless_session, 20, .{ .memory_bytes = 8192 }, 25));
 }

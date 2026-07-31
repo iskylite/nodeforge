@@ -399,10 +399,22 @@ pub fn itemValuesJson(io: std.Io, port: u16, owner: []const u8, resource_identit
 /// M4.5：管理写请求结果。`reason` 在失败时指向调用方提供的 `reason_buf`，
 /// 形如 "code: message (request_id=...)"（§9.14.7：4xx/5xx 解析统一错误信封后
 /// 映射为 CLI 结构化错误）；成功或连接失败（无法解析）时为空，由调用方回退。
+/// `http_status`/`error_code` 供 v0.2.3 §8.3 的 `mapErrorToExitCode` 映射冻结
+/// exit class：error_code 稳定取自错误信封，解析失败时为空串，由调用方按
+/// HTTP status 回退。
 pub const Mutation = struct {
     reachable: bool,
     healthy: bool,
     reason: []const u8 = "",
+    /// 成功（2xx）时指向调用方输出缓冲区的 daemon JSON body；非 2xx 时指向
+    /// 错误信封 body（如 clone 复合错误的 `error+result` 单一文档）。仅在
+    /// `profileClone` 等直接读 body 的入口设置，其余入口保持空串。
+    body: []const u8 = "",
+    /// 非 2xx 响应的 HTTP 状态码；连接失败或请求构造失败时为 0。
+    http_status: u16 = 0,
+    /// 错误信封的稳定 `error.code`；未解析出信封时为空串。切片指向调用方
+    /// 提供的 `reason_buf`，与 `reason` 同生命周期。
+    error_code: []const u8 = "",
 };
 
 pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []const u8, kind: []const u8, boot_bundle: ?[]const u8, reason_buf: []u8) Mutation {
@@ -419,15 +431,91 @@ pub fn profileCreate(io: std.Io, port: u16, name: []const u8, install_source: []
     return managementMutation(io, port, "POST", "/api/v1/management/profiles", rendered, revision, reason_buf);
 }
 
-pub fn profileClone(io: std.Io, port: u16, source: []const u8, target: []const u8, reason_buf: []u8) Mutation {
+/// v0.2.3 §5.2 clone 扩展：
+/// - `new_ssh_keys`：请求 daemon 为克隆创建独立 identity；
+/// - `build`：clone 提交后追加 rootfs build operation（仅 diskless）；
+/// - `detach`：仅在 `build` 下有效，立即返回 operation id（不 follow）；
+/// - `properties`：与 clone 同一事务应用的 key=value patch。
+/// `build && !detach` 时跟随 Location 轮询到终态（4 小时上限）。成功时
+/// `Mutation.body` 指向调用方 `output` 中的 daemon JSON。
+pub fn profileClone(io: std.Io, port: u16, source: []const u8, target: []const u8, new_ssh_keys: bool, build: bool, detach: bool, properties: []const @import("../config/scalar_mutation.zig").Mutation, output: []u8, reason_buf: []u8) Mutation {
     if (!querySafe(source) or !querySafe(target)) return .{ .reachable = false, .healthy = false };
-    var body: [384]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&body, "{{\"target\":{f}}}", .{std.json.fmt(target, .{})}) catch
-        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "profile.clone_invalid", "profile clone request is too large") };
+    for (properties) |mutation| if (!querySafe(mutation.key)) return .{ .reachable = false, .healthy = false };
+    var request_body: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer request_body.deinit();
+    {
+        const writer = &request_body.writer;
+        writer.print("{{\"target\":{f},\"new_ssh_keys\":{s},\"build\":{s},\"detach\":{s},\"properties\":{{", .{ std.json.fmt(target, .{}), if (new_ssh_keys) "true" else "false", if (build) "true" else "false", if (detach) "true" else "false" }) catch return .{ .reachable = true, .healthy = false };
+        for (properties, 0..) |mutation, index| {
+            if (index != 0) writer.writeAll(",") catch return .{ .reachable = true, .healthy = false };
+            if (mutation.value) |value| {
+                writer.print("{f}:{f}", .{ std.json.fmt(mutation.key, .{}), std.json.fmt(value, .{}) }) catch return .{ .reachable = true, .healthy = false };
+            } else {
+                writer.print("{f}:null", .{std.json.fmt(mutation.key, .{})}) catch return .{ .reachable = true, .healthy = false };
+            }
+        }
+        writer.writeAll("}}") catch return .{ .reachable = true, .healthy = false };
+    }
     var path: [256]u8 = undefined;
     const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/clone", .{source}) catch return .{ .reachable = false, .healthy = false };
     const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
-    return managementMutation(io, port, "POST", route, rendered, revision, reason_buf);
+    var reply = postMutation(io, port, route, request_body.written(), revision, output, null) catch |err|
+        return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+    if (reply.status == 0) return .{ .reachable = false, .healthy = false };
+    if (reply.status < 200 or reply.status >= 300) {
+        if (reply.body) |err_body| {
+            const envelope = formatErrorReason(reason_buf, err_body);
+            return .{ .reachable = true, .healthy = false, .http_status = reply.status, .error_code = envelope.code, .reason = envelope.reason, .body = err_body };
+        }
+        return .{ .reachable = true, .healthy = false, .http_status = reply.status, .reason = formatHttpStatus(reason_buf, reply.status) };
+    }
+    const success_body = reply.body orelse return .{ .reachable = true, .healthy = true, .http_status = reply.status };
+    // 非 build 或 detach：clone 结果即终态。
+    if (!build or detach) return .{ .reachable = true, .healthy = true, .http_status = reply.status, .body = success_body };
+    // build follow：解析 clone 响应中的 operation id；无 operation
+    // （already_present 缓存命中）直接成功。
+    const CloneEnvelope = struct { result: struct { build_submitted: bool = false, operation: ?struct { id: []const u8 } = null } };
+    const parsed = std.json.parseFromSlice(CloneEnvelope, std.heap.page_allocator, success_body, .{ .ignore_unknown_fields = true }) catch
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.invalid_response", "clone response is malformed") };
+    defer parsed.deinit();
+    if (!parsed.value.result.build_submitted) return .{ .reachable = true, .healthy = true, .http_status = reply.status, .body = success_body };
+    // 以响应体 `operation.id` 为准：daemon 对所有 clone 响应都设置了 profile
+    // 的 Location 头，只有提交 operation 的响应才带 operation 对象；缺省时
+    // （already_present 缓存命中）视为 build 已成功、无需 follow。
+    var operation_path: [256]u8 = undefined;
+    const operation_id = (parsed.value.result.operation orelse
+        return .{ .reachable = true, .healthy = true, .http_status = reply.status, .body = success_body }).id;
+    if (operation_id.len > operation_path.len) return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.invalid_response", "operation id is too long") };
+    @memcpy(operation_path[0..operation_id.len], operation_id);
+    const operation_route = operation_path[0..operation_id.len];
+
+    // 四小时硬上限覆盖常见大型镜像构建，同时避免客户端永久悬挂。
+    var attempts: usize = 0;
+    while (attempts < 4 * 60 * 60 * 4) : (attempts += 1) {
+        const operation_body = reply.body orelse
+            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.invalid_response", "operation response has no body") };
+        switch (operationState(operation_body) orelse
+            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.invalid_response", "operation response is malformed") }) {
+            .succeeded => return .{ .reachable = true, .healthy = true, .http_status = 200, .body = operation_body },
+            .failed => {
+                const failure = operationFailure(reason_buf, operation_body);
+                return .{ .reachable = true, .healthy = false, .error_code = failure.code, .reason = failure.reason, .body = operation_body };
+            },
+            .pending => {},
+        }
+        std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
+        reply = getReply(io, port, operation_route, output, null) catch |err|
+            return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+        if (reply.status == 0) return .{ .reachable = false, .healthy = false };
+        if (reply.status < 200 or reply.status >= 300) {
+            if (reply.body) |err_body| {
+                const envelope = formatErrorReason(reason_buf, err_body);
+                return .{ .reachable = true, .healthy = false, .http_status = reply.status, .error_code = envelope.code, .reason = envelope.reason, .body = err_body };
+            }
+            return .{ .reachable = true, .healthy = false, .http_status = reply.status, .reason = formatHttpStatus(reason_buf, reply.status) };
+        }
+    }
+    return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.timeout", "rootfs build did not finish within four hours") };
 }
 
 /// 删除未被 Node 引用的 Profile。客户端先读取当前 catalog revision，并通过
@@ -487,16 +575,17 @@ pub fn rootfsRegister(io: std.Io, port: u16, name: []const u8, file_path: []cons
 
 /// `profile rootfs build`：从 Profile build projection 构建内容寻址 rootfs 制品
 /// （OS 层 + rootfs-build phase 步骤 + mksquashfs + 登记）。`if_input_digest` 非空时
-/// 作为防漂移约束。daemon 返回 202 后按 Location 轮询持久化 Operation；
-/// CLI 只有观察到 succeeded 才返回成功，避免把“已入队”误报为“已构建”。
-pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, reason_buf: []u8) Mutation {
+/// 作为防漂移约束。v0.2.3 §3.3：`new_ssh_keys` 为 true 时 daemon 先轮换
+/// identity/Profile 再以新投影构建。daemon 返回 202 后按 Location 轮询持久化
+/// Operation；CLI 只有观察到 succeeded 才返回成功，避免把“已入队”误报为“已构建”。
+pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, new_ssh_keys: bool, reason_buf: []u8) Mutation {
     if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
     var body: [1024]u8 = undefined;
     const rendered = if (if_input_digest) |digest|
-        std.fmt.bufPrint(&body, "{{\"if_input_digest\":{f}}}", .{std.json.fmt(digest, .{})}) catch
+        std.fmt.bufPrint(&body, "{{\"if_input_digest\":{f},\"new_ssh_keys\":{s}}}", .{ std.json.fmt(digest, .{}), if (new_ssh_keys) "true" else "false" }) catch
             return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs build request is too large") }
     else
-        std.fmt.bufPrint(&body, "{{}}", .{}) catch
+        std.fmt.bufPrint(&body, "{{\"new_ssh_keys\":{s}}}", .{if (new_ssh_keys) "true" else "false"}) catch
             return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs build request is too large") };
     var path: [256]u8 = undefined;
     const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name}) catch return .{ .reachable = false, .healthy = false };
@@ -507,7 +596,7 @@ pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]
     if (reply.status == 0) return .{ .reachable = false, .healthy = false };
     if (reply.status < 200 or reply.status >= 300) {
         if (reply.body) |err_body|
-            return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body) };
+            return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body).reason };
         return .{ .reachable = true, .healthy = false, .reason = formatHttpStatus(reason_buf, reply.status) };
     }
     // 200 表示内容寻址缓存已经 ready；202 必须跟踪同一个 operation 到终态。
@@ -537,20 +626,20 @@ pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]
         if (reply.status == 0) return .{ .reachable = false, .healthy = false };
         if (reply.status < 200 or reply.status >= 300) {
             if (reply.body) |err_body|
-                return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body) };
+                return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body).reason };
             return .{ .reachable = true, .healthy = false, .reason = formatHttpStatus(reason_buf, reply.status) };
         }
     }
     return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.timeout", "rootfs build did not finish within four hours") };
 }
 
-pub fn rootfsBuildDetachJson(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, output: []u8, reason_buf: []u8) !?[]const u8 {
+pub fn rootfsBuildDetachJson(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, new_ssh_keys: bool, output: []u8, reason_buf: []u8) !?[]const u8 {
     if (!querySafe(name)) return null;
     var body: [1024]u8 = undefined;
     const rendered = if (if_input_digest) |digest|
-        try std.fmt.bufPrint(&body, "{{\"if_input_digest\":{f}}}", .{std.json.fmt(digest, .{})})
+        try std.fmt.bufPrint(&body, "{{\"if_input_digest\":{f},\"new_ssh_keys\":{s}}}", .{ std.json.fmt(digest, .{}), if (new_ssh_keys) "true" else "false" })
     else
-        try std.fmt.bufPrint(&body, "{{}}", .{});
+        try std.fmt.bufPrint(&body, "{{\"new_ssh_keys\":{s}}}", .{if (new_ssh_keys) "true" else "false"});
     var path: [256]u8 = undefined;
     const route = try std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name});
     const reply = try managementPostJson(io, port, route, rendered, null, output, null);
@@ -749,23 +838,67 @@ fn managementMutation(io: std.Io, port: u16, method: []const u8, path: []const u
         return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
     };
     debugResponse(method, path, reply);
-    if (reply.status >= 200 and reply.status < 300) return .{ .reachable = true, .healthy = true };
-    if (reply.body) |err_body|
-        return .{ .reachable = true, .healthy = false, .reason = formatErrorReason(reason_buf, err_body) };
-    return .{ .reachable = true, .healthy = false, .reason = formatHttpStatus(reason_buf, reply.status) };
+    if (reply.status >= 200 and reply.status < 300) return .{ .reachable = true, .healthy = true, .http_status = reply.status };
+    if (reply.body) |err_body| {
+        const envelope = formatErrorReason(reason_buf, err_body);
+        return .{ .reachable = true, .healthy = false, .http_status = reply.status, .error_code = envelope.code, .reason = envelope.reason };
+    }
+    return .{ .reachable = true, .healthy = false, .http_status = reply.status, .reason = formatHttpStatus(reason_buf, reply.status) };
 }
 
-/// 把服务端错误信封格式化为 "code: message (request_id=<id>)" 写入 `out` 并
-/// 返回其切片。解析失败退回通用提示；`reason` 在解析 arena `deinit` 前已写入
-/// `out`，不依赖 arena 生命周期。
-fn formatErrorReason(out: []u8, body: []const u8) []const u8 {
+/// 带 `If-Match` 的 POST（mutation 端点）：`managementMutation` 的变体，把
+/// 成功 body 写入调用方 `output` 并捕获 Location（clone `--build` follow）。
+fn postMutation(io: std.Io, port: u16, path: []const u8, body: []const u8, revision: u64, output: []u8, location_out: ?[]u8) !HttpReply {
+    const address = std.Io.net.IpAddress.parseIp4(management.client_ip, port) catch return no_reply;
+    debugRequest("POST", path, port);
+    var stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+        debugConnectFailure(port, err);
+        return no_reply;
+    };
+    defer stream.close(io);
+    var send_buffer: [8192]u8 = undefined;
+    var writer = stream.writer(io, &send_buffer);
+    try writer.interface.print("POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nIf-Match: \"{d}\"\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ path, revision, body.len, body });
+    try writer.interface.flush();
+    var recv_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(io, &recv_buffer);
+    const reply = readHttpResponse(&reader.interface, output, location_out) catch |err| {
+        debugPrint("response_failed method=POST path={s} capacity={d} cause={t}", .{ path, output.len, err });
+        return err;
+    };
+    debugResponse("POST", path, reply);
+    return reply;
+}
+
+/// v0.2.3 §8.3：服务端错误信封的解析结果。`reason` 是
+/// "code: message (request_id=<id>)" 的稳定切片；`code` 是信封 `error.code`
+/// 的稳定切片，供 exit class 映射使用。
+const ErrorReason = struct {
+    reason: []const u8,
+    code: []const u8,
+};
+
+/// 把服务端错误信封格式化为 "code: message (request_id=<id>)" 写入 `out`。
+/// 稳定 `error.code` 复制到 `out` 头部（NUL 分隔），使 `code` 在解析 arena
+/// `deinit` 后仍然有效；`reason` 指向分隔符之后的完整格式化字符串，同样
+/// 不依赖 arena 生命周期。解析失败退回通用提示，`code` 为空串。
+fn formatErrorReason(out: []u8, body: []const u8) ErrorReason {
     const Envelope = struct { @"error": struct { code: []const u8, message: []const u8, request_id: ?[]const u8 = null } };
     const parsed = std.json.parseFromSlice(Envelope, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch
-        return formatPlain(out, "http", "non-2xx response with unparseable body");
+        return .{ .reason = formatPlain(out, "http", "non-2xx response with unparseable body"), .code = "" };
     defer parsed.deinit();
     const e = parsed.value.@"error";
-    return std.fmt.bufPrint(out, "{s}: {s} (request_id={s})", .{ e.code, e.message, e.request_id orelse "" }) catch
-        formatPlain(out, e.code, e.message);
+    const code_len = @min(e.code.len, out.len);
+    @memcpy(out[0..code_len], e.code);
+    if (code_len == out.len)
+        return .{ .reason = out[0..code_len], .code = out[0..code_len] };
+    out[code_len] = 0;
+    const reason_region = out[code_len + 1 ..];
+    return .{
+        .reason = std.fmt.bufPrint(reason_region, "{s}: {s} (request_id={s})", .{ e.code, e.message, e.request_id orelse "" }) catch
+            formatPlain(reason_region, e.code, e.message),
+        .code = out[0..code_len],
+    };
 }
 
 fn formatPlain(out: []u8, code: []const u8, message: []const u8) []const u8 {
@@ -927,10 +1060,11 @@ pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) 
     var response: [16 * 1024]u8 = undefined;
     var location: [256]u8 = undefined;
     var reply = try managementPostJson(io, port, "/api/v1/management/install-sources", body_writer.written(), request.idempotency_key, &response, &location);
-    // 当前 ISO import handler 在隔离 worker 完成后返回 terminal；仍按通用
-    // Operation 合约轮询，避免未来改为真正异步时改变 CLI 成功语义。
+    // v0.2.3 §7：handler 持久化 queued operation 后立即返回 202，由 daemon
+    // 的 IsoImportWorker 后台执行。CLI 默认 follow 到终态；轮询预算与 rootfs
+    // build 一致（4 小时），超时只停止等待，不取消 daemon 侧 operation。
     var attempts: usize = 0;
-    while (attempts < 1200) : (attempts += 1) {
+    while (attempts < 4 * 60 * 60 * 4) : (attempts += 1) {
         const body = reply.body orelse return null;
         switch (operationState(body) orelse return null) {
             .succeeded => return operationImportResult(body),
@@ -938,7 +1072,7 @@ pub fn importInstallSource(io: std.Io, port: u16, request: InstallSourceImport) 
             .pending => {},
         }
         const next = reply.location orelse return null;
-        std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+        std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
         reply = try getReply(io, port, next, &response, &location);
     }
     return null;
@@ -976,6 +1110,27 @@ fn operationFailureReason(out: []u8, body: []const u8) []const u8 {
     defer parsed.deinit();
     const code = if (parsed.value.result.error_code.len == 0) "operation.failed" else parsed.value.result.error_code;
     return formatPlain(out, code, "rootfs build operation failed");
+}
+
+/// 从 Operation 失败信封提取稳定 `error_code` 与诊断文本（与
+/// `formatErrorReason` 同构，但读取 `result.error_code`）。`code` 复制进
+/// `out` 头部（NUL 分隔），使 `code` 在解析 arena deinit 后仍有效。
+fn operationFailure(out: []u8, body: []const u8) ErrorReason {
+    const Envelope = struct { result: struct { error_code: []const u8 = "" } };
+    const parsed = std.json.parseFromSlice(Envelope, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return .{ .reason = formatPlain(out, "operation.failed", "rootfs build operation failed"), .code = "" };
+    defer parsed.deinit();
+    const code = if (parsed.value.result.error_code.len == 0) "operation.failed" else parsed.value.result.error_code;
+    const code_len = @min(code.len, out.len);
+    @memcpy(out[0..code_len], code);
+    if (code_len == out.len)
+        return .{ .reason = out[0..code_len], .code = out[0..code_len] };
+    out[code_len] = 0;
+    const reason_region = out[code_len + 1 ..];
+    return .{
+        .reason = formatPlain(reason_region, code, "rootfs build operation failed"),
+        .code = out[0..code_len],
+    };
 }
 
 /// 检查 canonical path/header token。M4.5 不再用它拼接资产导入 query；这里只
@@ -1072,9 +1227,24 @@ test "readHttpResponse handles 204 empty body and captures Location" {
 test "formatErrorReason renders code/message/request_id from error envelope" {
     var out: [256]u8 = undefined;
     const body = "{\"ok\":false,\"error\":{\"code\":\"asset.name_conflict\",\"message\":\"asset name already identifies different canonical metadata\",\"request_id\":\"0000000000000000000000000000000a\"}}\n";
-    try std.testing.expectEqualStrings("asset.name_conflict: asset name already identifies different canonical metadata (request_id=0000000000000000000000000000000a)", formatErrorReason(&out, body));
-    try std.testing.expectEqualStrings("http.bad: oops (request_id=)", formatErrorReason(&out, "{\"ok\":false,\"error\":{\"code\":\"http.bad\",\"message\":\"oops\"}}"));
-    try std.testing.expectEqualStrings("http: non-2xx response with unparseable body", formatErrorReason(&out, "not json"));
+    const parsed = formatErrorReason(&out, body);
+    try std.testing.expectEqualStrings("asset.name_conflict: asset name already identifies different canonical metadata (request_id=0000000000000000000000000000000a)", parsed.reason);
+    try std.testing.expectEqualStrings("asset.name_conflict", parsed.code);
+    const second = formatErrorReason(&out, "{\"ok\":false,\"error\":{\"code\":\"http.bad\",\"message\":\"oops\"}}");
+    try std.testing.expectEqualStrings("http.bad: oops (request_id=)", second.reason);
+    try std.testing.expectEqualStrings("http.bad", second.code);
+    const fallback = formatErrorReason(&out, "not json");
+    try std.testing.expectEqualStrings("http: non-2xx response with unparseable body", fallback.reason);
+    try std.testing.expectEqualStrings("", fallback.code);
+}
+
+test "v0.2.3: formatErrorReason code slice stays valid after envelope arena is freed" {
+    // code 必须复制进 reason_buf（NUL 分隔）而不是借用解析 arena 切片，
+    // 否则 §8.3 exit mapping 会在 arena deinit 后读到悬垂内存。
+    var out: [256]u8 = undefined;
+    const envelope = formatErrorReason(&out, "{\"ok\":false,\"error\":{\"code\":\"catalog.revision_conflict\",\"message\":\"catalog changed\"}}");
+    try std.testing.expectEqualStrings("catalog.revision_conflict", envelope.code);
+    try std.testing.expectEqualStrings("catalog.revision_conflict: catalog changed (request_id=)", envelope.reason);
 }
 
 test "operationState parses terminal and pending states" {

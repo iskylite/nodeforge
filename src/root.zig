@@ -54,6 +54,8 @@ pub const profile_naming = @import("profile/naming.zig");
 pub const value_mutation = @import("config/value_mutation.zig");
 pub const item_mutation = @import("config/item_mutation.zig");
 pub const scalar_mutation = @import("config/scalar_mutation.zig");
+/// v0.2.3 §5.4 扫描契约测试（仅测试用，不进入公共 API）。
+const revision_scan = @import("config/revision_scan.zig");
 pub const provision_bundle_mutation = @import("config/provision_bundle_mutation.zig");
 /// 启动前预检：检查端口可用性、目录权限和必需的系统 capability。
 pub const preflight = @import("preflight.zig");
@@ -204,6 +206,7 @@ test {
     _ = value_mutation;
     _ = item_mutation;
     _ = scalar_mutation;
+    _ = revision_scan;
     _ = provision_bundle_mutation;
     _ = preflight;
     _ = runtime_state;

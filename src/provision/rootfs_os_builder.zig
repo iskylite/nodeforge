@@ -15,6 +15,7 @@ const std = @import("std");
 const model = @import("../model.zig");
 const dto = @import("../http/diskless_dto.zig");
 const namespaced_chroot_executor = @import("namespaced_chroot_executor.zig");
+const identity_store = @import("../state/identity_store.zig");
 
 /// 在 staging 目录内用发行版原生工具构建 OS 层。`repository_urls` 为
 /// nodeforged 本机受管源的 `file://` URL。构建发生在 management handler 内，
@@ -37,15 +38,17 @@ pub fn buildOsLayer(
     version: []const u8,
     repository_urls: []const []const u8,
     casper_layer_paths: []const []const u8,
+    identities: *identity_store.Store,
+    profile: *const model.ProfileConfig,
 ) !void {
     switch (package_manager) {
         // dnf 从零 bootstrap 必须有受管仓库；casper OS 层直接来自已导入的
         // squashfs，即使定制 ISO 没有完整 APT metadata 也应允许构建。
         .dnf => {
             if (repository_urls.len == 0) return error.NoManagedRepository;
-            try buildDnf(io, allocator, staging, version, repository_urls);
+            try buildDnf(io, allocator, staging, version, repository_urls, identities, profile);
         },
-        .apt => try buildCasperOverlay(io, allocator, staging, casper_layer_paths),
+        .apt => try buildCasperOverlay(io, allocator, staging, casper_layer_paths, identities, profile),
     }
 }
 
@@ -56,12 +59,15 @@ pub fn buildOsLayer(
 /// 使用字符设备表达 whiteout，下层已有同名目录时 unsquashfs 会
 /// 返回非零。任一层解包或合并失败均整体失败，不吞错误码。
 /// 完成后校验最小可 chroot 基线文件存在，并复用 dnf 分支的 sshd 配置/
-/// default target helper（不调用 `generateSshKeys`：Stage 5 已经统一处理）。
+/// default target helper 与 `installIdentityKeys`（v0.2.3 起两分支一致从
+/// identity store 安装共享 SSH 资产，构建期不再 `ssh-keygen`）。
 fn buildCasperOverlay(
     io: std.Io,
     allocator: std.mem.Allocator,
     staging: []const u8,
     casper_layer_paths: []const []const u8,
+    identities: *identity_store.Store,
+    profile: *const model.ProfileConfig,
 ) !void {
     if (casper_layer_paths.len == 0) return error.MissingCasperLayers;
     try std.Io.Dir.cwd().createDirPath(io, staging);
@@ -113,8 +119,10 @@ fn buildCasperOverlay(
 
     // casper 安装器层的默认 target 可能指向安装器专用逻辑；覆盖为
     // multi-user.target，与 dnf OS 层一致。sshd 配置同样是纯 staging 文件
-    // 操作，不依赖 apt；不调用 `generateSshKeys`（Stage 5 统一生成，避免重复）。
+    // 操作，不依赖 apt。v0.2.3 起 SSH 资产与 dnf 分支一致从 identity store
+    // 安装（installIdentityKeys，构建期不再 ssh-keygen）。
     try writeDefaultSshdConfig(io, allocator, staging);
+    try installIdentityKeys(io, allocator, staging, identities, profile);
     try ensureDefaultTarget(io, allocator, staging);
 }
 
@@ -124,6 +132,8 @@ fn buildDnf(
     staging: []const u8,
     version: []const u8,
     repository_urls: []const []const u8,
+    identities: *identity_store.Store,
+    profile: *const model.ProfileConfig,
 ) !void {
     _ = version;
     try std.Io.Dir.cwd().createDirPath(io, staging);
@@ -157,9 +167,10 @@ fn buildDnf(
     try cleanupDefaultRepos(io, allocator, staging);
     // 写入基础 sshd 配置：允许 root 密钥登录、禁用密码认证。
     try writeDefaultSshdConfig(io, allocator, staging);
-    // 生成 Profile 级共享 SSH client keypair + sshd host keys，并配置自身免密。
+    // v0.2.3 §3.3: 从 identity store 按 (ssh_identity.id, revision) 复合键读取
+    // Profile 级共享 SSH keys 并写入 staging（不再在构建期 ssh-keygen）。
     // 同 Profile 节点共享这些 keys，因而可相互免密且 host fingerprint 一致。
-    try generateSshKeys(io, allocator, staging);
+    try installIdentityKeys(io, allocator, staging, identities, profile);
     // 确保 systemd 默认启动目标为 multi-user.target。
     try ensureDefaultTarget(io, allocator, staging);
 }
@@ -197,74 +208,64 @@ fn writeDefaultSshdConfig(io: std.Io, allocator: std.mem.Allocator, staging: []c
     });
 }
 
-/// 生成 Profile 级共享 SSH keys 并配置自身免密。
+/// v0.2.3 §3.3: 从 identity store 按 `(ssh_identity.id, revision)` 复合键读取
+/// Profile 级共享 SSH keys 并写入 staging，替代构建期 `ssh-keygen`。
 ///
-/// 按 V0_2_DESIGN.md §4.4，每个 diskless Profile 的 rootfs build 自动生成并固定
-/// Profile 级 SSH client keypair 和 sshd host keys。同 Profile 节点共享这些 keys，
-/// 因而可相互免密且 host fingerprint 一致。
-///
-/// 生成内容：
+/// 写入内容：
 /// - sshd host keys（ed25519）：`/etc/ssh/ssh_host_ed25519_key{,.pub}`
 /// - root client keypair（ed25519）：`/root/.ssh/id_ed25519{,.pub}`
 /// - `/root/.ssh/authorized_keys`：包含 client public key
 /// - `/etc/ssh/ssh_known_hosts`：包含 host public key（localhost + 127.0.0.1）
-fn generateSshKeys(io: std.Io, allocator: std.mem.Allocator, staging: []const u8) !void {
-    // ── 1. 生成 sshd host keys ──────────────────────────────────────────
+/// - 权限保持私钥 0600、公钥/authorized_keys/known_hosts 0644、`.ssh` 0700。
+///
+/// 未命中（identity 缺失或引用为空）→ `IdentityNotFound` fail closed：绝不在
+/// build 期静默生成与 catalog 引用不一致的替代密钥。
+fn installIdentityKeys(io: std.Io, allocator: std.mem.Allocator, staging: []const u8, identities: *identity_store.Store, profile: *const model.ProfileConfig) !void {
+    var identity: identity_store.IdentityRecord = undefined;
+    if (!identities.copy(profile.ssh_identity.id, profile.ssh_identity.revision, &identity)) return error.IdentityNotFound;
+
+    // ── 1. host keys：写入 sshd host keypair ───────────────────────────
     const ssh_dir = try std.fmt.allocPrint(allocator, "{s}/etc/ssh", .{staging});
     defer allocator.free(ssh_dir);
     std.Io.Dir.cwd().createDirPath(io, ssh_dir) catch {};
     const host_key = try std.fmt.allocPrint(allocator, "{s}/ssh_host_ed25519_key", .{ssh_dir});
     defer allocator.free(host_key);
-    // ssh-keygen -t ed25519 -f <path> -N "" -C "nodeforge-host" 生成无密码 host key。
-    // 幂等：已存在时 ssh-keygen 返回错误，但我们忽略它。
-    if (!fileExists(io, host_key)) {
-        try runChecked(io, allocator, &.{
-            "ssh-keygen", "-t", "ed25519", "-f", host_key, "-N", "", "-C", "nodeforge-host",
-        });
-    }
+    const host_pub_path = try std.fmt.allocPrint(allocator, "{s}.pub", .{host_key});
+    defer allocator.free(host_pub_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = host_key, .data = identity.hostPrivateKey() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = host_pub_path, .data = identity.hostPublicKey() });
 
-    // ── 2. 生成 root client keypair ────────────────────────────────────
+    // ── 2. root client keypair ─────────────────────────────────────────
     const root_ssh = try std.fmt.allocPrint(allocator, "{s}/root/.ssh", .{staging});
     defer allocator.free(root_ssh);
     std.Io.Dir.cwd().createDirPath(io, root_ssh) catch {};
     const client_key = try std.fmt.allocPrint(allocator, "{s}/id_ed25519", .{root_ssh});
     defer allocator.free(client_key);
-    if (!fileExists(io, client_key)) {
-        try runChecked(io, allocator, &.{
-            "ssh-keygen", "-t", "ed25519", "-f", client_key, "-N", "", "-C", "nodeforge-client",
-        });
-    }
-
-    // ── 3. 读取 client public key 并写入 authorized_keys ───────────────
     const client_pub_path = try std.fmt.allocPrint(allocator, "{s}.pub", .{client_key});
     defer allocator.free(client_pub_path);
-    const client_pub = try std.Io.Dir.cwd().readFileAlloc(io, client_pub_path, allocator, .limited(8192));
-    defer allocator.free(client_pub);
-    // authorized_keys 包含自身的 client public key，使 root 可免密 SSH 到自身
-    // 和同 Profile 的其他节点（它们共享同一 rootfs 和 client keypair）。
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = client_key, .data = identity.clientPrivateKey() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = client_pub_path, .data = identity.clientPublicKey() });
+
+    // ── 3. authorized_keys 包含自身的 client public key ───────────────
+    // 使 root 可免密 SSH 到自身和同 Profile 的其他节点（共享同一 rootfs 与
+    // client keypair）。
     const authorized_keys_path = try std.fmt.allocPrint(allocator, "{s}/authorized_keys", .{root_ssh});
     defer allocator.free(authorized_keys_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = authorized_keys_path, .data = client_pub });
-    // 设置权限：私钥 0600，公钥和 authorized_keys 0644，.ssh 目录 0700。
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = authorized_keys_path, .data = identity.clientPublicKey() });
+    // 权限：私钥 0600，公钥/authorized_keys 0644，.ssh 目录 0700。
     try runChecked(io, allocator, &.{ "chmod", "0600", client_key });
     try runChecked(io, allocator, &.{ "chmod", "0644", client_pub_path });
     try runChecked(io, allocator, &.{ "chmod", "0644", authorized_keys_path });
     try runChecked(io, allocator, &.{ "chmod", "0700", root_ssh });
 
-    // ── 4. 读取 host public key 并写入 ssh_known_hosts ─────────────────
-    const host_pub_path = try std.fmt.allocPrint(allocator, "{s}.pub", .{host_key});
-    defer allocator.free(host_pub_path);
-    const host_pub = try std.Io.Dir.cwd().readFileAlloc(io, host_pub_path, allocator, .limited(8192));
-    defer allocator.free(host_pub);
-    // ssh_known_hosts 包含 host public key，绑定到 localhost / 127.0.0.1 / * 通配符，
-    // 使同 Profile 节点首次连接也无需人工确认 host key。
-    // host_pub 格式为 "ssh-ed25519 AAAA... nodeforge-host\n"，直接在前面加 host 列表。
+    // ── 4. ssh_known_hosts 包含 host public key ────────────────────────
+    // 绑定 localhost / 127.0.0.1 / * 通配符，使同 Profile 节点首次连接也无需
+    // 人工确认 host key。
     const known_hosts_path = try std.fmt.allocPrint(allocator, "{s}/ssh_known_hosts", .{ssh_dir});
     defer allocator.free(known_hosts_path);
     var kh: std.Io.Writer.Allocating = .init(allocator);
     defer kh.deinit();
-    // 通配符 * 使同 Profile 任意节点 IP/hostname 都能匹配，实现域内互信。
-    try kh.writer.print("localhost,127.0.0.1,* {s}", .{host_pub});
+    try kh.writer.print("localhost,127.0.0.1,* {s}", .{identity.hostPublicKey()});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = known_hosts_path, .data = kh.written() });
     try runChecked(io, allocator, &.{ "chmod", "0644", known_hosts_path });
 }

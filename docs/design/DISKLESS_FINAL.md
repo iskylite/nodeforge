@@ -120,30 +120,37 @@ initramfs、装载内核模块）须 bind-mount `/dev`/`/proc`/`/sys` 并使用�
   要长期保留的配置必须进入 Profile/rootfs build/AgentPlan，业务数据必须使用另行管理的外部存储。
 - **跨重启 rootfs partial**：`rootfs.part` 只允许在同一 BootSession、同一次 initrd 运行中通过 HTTP Range 断点续传。
   节点重启后内存中的 partial 不存在，新 session 从头下载；这不影响 daemon 重启后继续服务同一尚存活 session。
-- **Profile 共享 SSH keys**：Profile create/clone 的 rootfs-build preparation 自动生成并固定用于节点主动登录的
-  SSH client 公钥/私钥，以及 sshd 完成服务端握手必需的 host keys，并全部写入共享 rootfs。client public key 与
-  Profile 配置的管理/其他节点公钥合并到
-  `authorized_keys`，使同 Profile 节点相互免密且重启后保持一致。这是 Profile 信任域的显式产品语义。
-  host fingerprint 是共享 host public key 的 SHA256 摘要；同 Profile 节点 fingerprint 相同，这是信任整个 Profile
-  域的预期行为，不承担 Node 唯一身份。rootfs 同时写 `/etc/ssh/ssh_known_hosts`，将 Profile `system.hosts` 声明的全部 address/names/aliases
-  绑定到该共享 host public key，域内首次连接也无需人工确认。自动生成的 client public key 是 mandatory 域内 key，
-  标准 Node `authorized_keys.remove` 不能删除它；Node hosts override 会以 effective hosts 和同一 host public key 重算
+- **Profile 共享 SSH keys**：Profile create/clone 的 rootfs-build preparation 生成并固定用于节点主动登录的
+  SSH client 公钥/私钥，以及 sshd 完成服务端握手必需的 host keys，并全部写入共享 rootfs。client public key 作为
+  mandatory 域内 key 写入共享 rootfs 的 `authorized_keys`；Profile 配置的管理/其他节点公钥由 node-apply 以
+  Node effective 计划合并写入节点 `authorized_keys`，使同 Profile 节点相互免密且重启后保持一致。这是
+  Profile 信任域的显式产品语义。host fingerprint 是共享 host public key 的 SHA256 摘要；同 Profile 节点
+  fingerprint 相同，这是信任整个 Profile 域的预期行为，不承担 Node 唯一身份。rootfs 同时写
+  `/etc/ssh/ssh_known_hosts`，将 localhost/127.0.0.1 与 `*` 通配绑定到该共享 host public key，域内首次连接
+  也无需人工确认。自动生成的 client public key 是 mandatory 域内 key，标准 Node `authorized_keys.remove`
+  只作用于 effective 计划中的操作员公钥；Node hosts override 以 effective hosts 和同一 host public key 重算
   该节点 `ssh_known_hosts`。若 Profile hosts 覆盖 100 个节点且没有显式后处理破坏 SSH 文件，这 100 个节点彼此均免密，
   并看到同一个 Profile host fingerprint。
 
-  > **实现现状**：rootfs builder 的 Stage 5/6 已实现自动生成 ed25519 client keypair 和 sshd host key，
-  > 合并 `system.ssh.root_authorized_keys` 与自动生成的 client public key 到 `authorized_keys`，
-  > 并写入 `sshd_config.d/00-nodeforge.conf` 启用 `PubkeyAuthentication`。
-  > `/etc/ssh/ssh_known_hosts` 的自动生成（绑定 Profile hosts 到共享 host public key）为后续完善点。
-  > `--new-ssh-keys` flag 的端到端流程尚在实现中；当前每次 rootfs build 均重新生成密钥。
+  > **实现现状（v0.2.3 已更新）**：rootfs builder 的 Stage 5 SSH 信任基线已改为从 identity store 按
+  > `(ssh_identity.id, revision)` 复合键读取（`rootfs_os_builder.installIdentityKeys`，dnf 与 casper/apt
+  > 两分支一致），写入 client/host ed25519 keypair、`/root/.ssh/authorized_keys`（含 mandatory client
+  > public key）、`/etc/ssh/ssh_known_hosts`（`localhost,127.0.0.1,*` 绑定共享 host public key）与
+  > `sshd_config.d/50-nodeforge-default.conf` drop-in（`PubkeyAuthentication`、`PermitRootLogin
+  > prohibit-password`）。构建期不再调用 `ssh-keygen`；identity 缺失/引用为空返回 `IdentityNotFound`
+  > fail closed。将 Profile `system.hosts` 声明的全部 address/names/aliases 显式绑定到
+  > `ssh_known_hosts`、以及 Node hosts override 以 effective hosts 重算节点 `ssh_known_hosts`
+  > 为后续完善点（当前以 `*` 通配覆盖）。
 - **Profile 共享 password hash**：明文 password 仍按 v0.1 desired 契约配置，但 diskless Profile credential revision
   只生成一次带 CSPRNG salt 的 `$6$` hash 并安全持久化；普通重建复用同一 hash，避免同输入 rootfs 因 per-session salt
   失去可复现性。显式改密码才发布新 Profile revision/input digest；install Profile 的 v0.1 行为不变。
-- **重建时换全部 SSH keys（待实现）**：目标接口
-  `profile rootfs build --new-ssh-keys` 可在一次操作中重新生成 Profile client/host
-  公钥私钥、重算 `authorized_keys`/`ssh_known_hosts`、发布新 Profile revision 并构建新 rootfs；自动化需锁定已预览
-  输入时再加 `--if-input-digest <current>`。旧 artifact/active session 不变；新旧 rootfs 混跑时双向免密不保证，
-  host fingerprint 也会变化。
+- **重建时换全部 SSH keys（v0.2.3 已实现）**：`profile rootfs build --new-ssh-keys` 在 identity store 中创建
+  新 identity revision（同 `id`、`revision + 1`，旧 revision 保持不可变），发布递增 `ssh_identity.revision`
+  的 Profile revision，再以新投影构建新 rootfs（`authorized_keys`/`ssh_known_hosts` 随新 keypair 重算）；
+  自动化需锁定已预览输入时再加 `--if-input-digest <current>`。失败边界区分
+  `identity.create_failed`/`catalog.publish_failed`/`rootfs.build_submit_failed`（见
+  [`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §3.3）。旧
+  artifact/active session 不变；新旧 rootfs 混跑时双向免密不保证，host fingerprint 也会变化。
 
 ## 5. BootConfig 与启动时序
 

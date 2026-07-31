@@ -29,6 +29,7 @@ const events = @import("../state/events.zig");
 const paths = @import("../paths.zig");
 const boot_session = @import("../state/boot_session.zig");
 const node_status = @import("../state/node_status.zig");
+const identity_store = @import("../state/identity_store.zig");
 const auth = @import("auth.zig");
 const lookup = @import("../catalog.zig");
 const asset_validate = @import("../assets/validate.zig");
@@ -65,6 +66,10 @@ const max_rootfs_build_jobs = 8;
 const rootfs_profile_cap = 128;
 const rootfs_digest_len = 64;
 const initrd_field_cap = 192;
+/// ISO 导入 job 的文本字段上限：staged 不透明文件名（24 hex + 原 basename）
+/// 与 logical id（≤128）都远小于此。
+const iso_field_cap = 256;
+const iso_id_cap = 128;
 
 const RootfsBuildJob = struct {
     active: bool = false,
@@ -150,6 +155,59 @@ const InitrdBuildWorker = struct {
     }
 };
 
+const IsoImportJob = struct {
+    active: bool = false,
+    operation_id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
+    filename: [iso_field_cap]u8 = [_]u8{0} ** iso_field_cap,
+    filename_len: u16 = 0,
+    original_filename: [iso_field_cap]u8 = [_]u8{0} ** iso_field_cap,
+    original_filename_len: u16 = 0,
+    name: [iso_id_cap]u8 = [_]u8{0} ** iso_id_cap,
+    name_len: u16 = 0,
+    qualifier: [iso_id_cap]u8 = [_]u8{0} ** iso_id_cap,
+    qualifier_len: u16 = 0,
+    distro: [iso_id_cap]u8 = [_]u8{0} ** iso_id_cap,
+    distro_len: u16 = 0,
+    version: [iso_id_cap]u8 = [_]u8{0} ** iso_id_cap,
+    version_len: u16 = 0,
+    arch: ?model.Arch = null,
+};
+
+/// v0.2.3 §7.3：ISO 导入 worker。队列容量为 1，保持"同一时刻最多一个 ISO
+/// import"的既有语义（替代 handler 级 `iso_import_mutex`）；rootfs、initrd、
+/// ISO 三类任务彼此并行，各自队列有固定容量。catalog/state 发布仍通过
+/// model gate、catalog lock 和 operation-store mutex 串行化，不因 worker
+/// 并行绕过。
+const IsoImportWorker = struct {
+    jobs: [1]IsoImportJob = [_]IsoImportJob{.{}} ** 1,
+    mutex: std.atomic.Mutex = .unlocked,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn submit(self: *IsoImportWorker, job: IsoImportJob) !void {
+        if (job.operation_id.len != boot_session.id_len or job.filename_len == 0 or job.original_filename_len == 0)
+            return error.InvalidIsoImportJob;
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (&self.jobs) |*slot| if (!slot.active) {
+            slot.* = job;
+            slot.active = true;
+            return;
+        };
+        return error.IsoImportQueueFull;
+    }
+
+    fn take(self: *IsoImportWorker) ?IsoImportJob {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (&self.jobs) |*slot| if (slot.active) {
+            const result = slot.*;
+            slot.* = .{};
+            return result;
+        };
+        return null;
+    }
+};
+
 const RouteContext = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -167,8 +225,10 @@ const RouteContext = struct {
     operations: *operations.Store,
     rootfs_worker: *RootfsBuildWorker,
     initrd_worker: *InitrdBuildWorker,
+    iso_worker: *IsoImportWorker,
     rootfs_artifacts: *rootfs_artifact_store.Store,
     diskless_store: *diskless_delivery.Store,
+    identities: *identity_store.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     /// M4.2 F5：来自配置和状态目录的额外 SSH 公钥。
@@ -198,9 +258,6 @@ const RequestMeta = struct {
 // 单进程、单 listener 设备，因此此指针在 `zap.start` 的整个阻塞生命周期内
 // 保持有效，且之后永远不会被修改。
 var active_context: ?*RouteContext = null;
-/// ISO 导入互斥锁。ISO 导入需要 loop-mount 能力并发布多对象 catalog 候选，
-/// 限制为 daemon 范围内单一 worker，防止并发本地 CLI 请求耗尽 mount 或竞争发布。
-var iso_import_mutex: std.atomic.Mutex = .unlocked;
 var config_mutation_mutex: std.atomic.Mutex = .unlocked;
 /// operation store 允许多个执行路径并发更新内存，但磁盘快照的 atomicWrite
 /// 仍需串行化；否则 ISO handler 与 rootfs worker 可交错 rename 同一状态文件。
@@ -253,6 +310,7 @@ pub fn serve(
     operation_store: *operations.Store,
     rootfs_artifacts: *rootfs_artifact_store.Store,
     diskless_store: *diskless_delivery.Store,
+    identities: *identity_store.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     additional_keys: []const []const u8,
@@ -269,6 +327,12 @@ pub fn serve(
 
     var rootfs_worker: RootfsBuildWorker = .{};
     var initrd_worker: InitrdBuildWorker = .{};
+    var iso_worker: IsoImportWorker = .{};
+    // v0.2.3 §7.4：daemon 启动时清理上次崩溃遗留的 ISO import 工作树。
+    // 工作树按 operation id 命名（`work/iso-import-<id>`）；queued/running
+    // operation 已在 operations.load 中确定性转为 failed + interrupted，
+    // 孤儿目录不再有对应执行者，直接删除。
+    iso_import.cleanupOrphanStaging(io, allocator);
     var context = RouteContext{
         .io = io,
         .allocator = allocator,
@@ -286,8 +350,10 @@ pub fn serve(
         .operations = operation_store,
         .rootfs_worker = &rootfs_worker,
         .initrd_worker = &initrd_worker,
+        .iso_worker = &iso_worker,
         .rootfs_artifacts = rootfs_artifacts,
         .diskless_store = diskless_store,
+        .identities = identities,
         .config_revision = config_revision,
         .bootstrap_key = bootstrap_key,
         .additional_keys = additional_keys,
@@ -298,11 +364,14 @@ pub fn serve(
     };
     var rootfs_thread = try std.Thread.spawn(.{}, runRootfsBuildWorker, .{ &context, &rootfs_worker });
     var initrd_thread = try std.Thread.spawn(.{}, runInitrdBuildWorker, .{ &context, &initrd_worker });
+    var iso_thread = try std.Thread.spawn(.{}, runIsoImportWorker, .{ &context, &iso_worker });
     defer {
         rootfs_worker.stop.store(true, .release);
         initrd_worker.stop.store(true, .release);
+        iso_worker.stop.store(true, .release);
         rootfs_thread.join();
         initrd_thread.join();
+        iso_thread.join();
     }
     if (active_context != null) return error.HttpAlreadyRunning;
     active_context = &context;
@@ -1566,9 +1635,10 @@ fn normalizeFacts(facts: *node_inventory.Facts) void {
 /// CAS 与 inventory 幂等摘要保持独立。
 ///
 /// v0.2.3 起 initrd 同时上报 memory_bytes + DMI 字段（serial/uuid/vendor/
-/// model），daemon 用完整 `put` 存储而非 `putMemory`，使纯 diskless 节点
-/// 也有 SN/UUID 等硬件信息。memory_bytes 是必需字段（内存闸依据），DMI
-/// 字段可选（某些固件/容器无 DMI 时为空）。
+/// model），daemon 用 `putDiskless` 存储：合并 DMI（null 保留既有值）并保留
+/// install generation 高水位，纯 diskless 节点也有 SN/UUID 等硬件信息且不会
+/// 因 generation=0 触发 install 防回退 409。memory_bytes 是必需字段（内存闸
+/// 依据），DMI 字段可选（某些固件/容器无 DMI 时为空）。
 fn disklessFacts(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const token = parseBearer(request.getHeader("authorization")) orelse
         return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"event token is required\"}}\n", meta);
@@ -1591,9 +1661,9 @@ fn disklessFacts(request: zap.Request, context: *const RouteContext, node_id: []
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"invalid facts body\"}}\n", meta);
     defer parsed.deinit();
     // memory_bytes 是 diskless 启动的必需字段（内存闸依据），DMI 字段可选
-    // （某些固件/容器无 DMI）。initrd 从 /sys/class/dmi/id/ 读取并和 memory_bytes
-    // 一起上报，daemon 用完整 put 存储而非 putMemory，使纯 diskless 节点也
-    // 有 SN/UUID/vendor/model。
+    // （某些固件/容器无 DMI）。initrd 从 /sys/class/dmi/id/ 读取并和
+    // memory_bytes 一起上报，daemon 用 putDiskless 合并 DMI 并保留 generation
+    // 高水位，纯 diskless 节点也有 SN/UUID/vendor/model。
     if (parsed.value.memory_bytes == null or parsed.value.memory_bytes.? == 0)
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"memory_bytes is required for diskless facts\"}}\n", meta);
     var facts: node_inventory.Facts = .{
@@ -1604,7 +1674,7 @@ fn disklessFacts(request: zap.Request, context: *const RouteContext, node_id: []
         .model = parsed.value.model,
     };
     normalizeFacts(&facts);
-    _ = context.inventories.put(node_id, session_id, 0, session.armed_at, facts, unixNow()) catch |err| switch (err) {
+    _ = context.inventories.putDiskless(node_id, session_id, session.armed_at, facts, unixNow()) catch |err| switch (err) {
         error.StaleSource => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"inventory.stale_source\",\"message\":\"facts came from a stale session\"}}\n", meta),
         else => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"facts rejected\"}}\n", meta),
     };
@@ -2035,11 +2105,12 @@ fn importAsset(request: zap.Request, context: *const RouteContext, meta: Request
     try json(request, .created, response, meta);
 }
 
-/// M3.6：本地管理请求等待一个有界 import worker，但昂贵的 mount/copy/hash
-/// 工作本身永远不在 HTTP callback 线程上执行。等待中的 handler 占用两个
-/// HTTP worker 之一，而 daemon 范围内的 import mutex 拒绝并发 import 并
-/// 保留另一个 worker 供数据面请求使用。Publication 保留在此处，使 catalog
-/// 替换仅在完整候选存在后才被序列化。
+/// M3.6 / v0.2.3 §7：ISO 导入 handler。完成输入校验、request digest 与
+/// queued operation 持久化后立即 submit 给 daemon-owned `IsoImportWorker`
+/// 并返回 202；昂贵的 mount/copy/hash 与 catalog 发布全部在 worker 线程
+/// 执行，HTTP callback 不再等待。队列容量为 1，submit 失败（已有导入在途）
+/// 保持既有 `install_source.busy` 409 语义。内容去重与 name 冲突检查仍在
+/// handler 内基于当前 catalog 快照完成，避免已知重复/冲突进入 worker。
 fn importInstallSource(request: zap.Request, context: *const RouteContext, meta: RequestMeta) !void {
     if (!jsonRequest(request)) return unsupportedMediaType(request, meta);
     const ImportRequest = struct { filename: []const u8, original_filename: []const u8, sha256: []const u8, name: ?[]const u8 = null, qualifier: ?[]const u8 = null, distro: ?[]const u8 = null, version: ?[]const u8 = null, arch: ?model.Arch = null };
@@ -2065,7 +2136,7 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     std.crypto.hash.sha2.Sha256.hash(digest_input, &digest_buf, .{});
     var digest_hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&digest_hex, "{x}", .{digest_buf}) catch unreachable;
-    const begun = context.operations.beginRequest(context.io, idempotency_key, &digest_hex, .install_source_import, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for a different request\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create durable operation\"}}\n", meta);
+    const begun = context.operations.beginQueuedRequest(context.io, idempotency_key, &digest_hex, .install_source_import, unixNow()) catch |err| return json(request, .conflict, if (err == error.IdempotencyConflict) "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for a different request\"}}\n" else "{\"ok\":false,\"error\":{\"code\":\"operation.unavailable\",\"message\":\"cannot create durable operation\"}}\n", meta);
     saveOperations(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"operation.persist_failed\",\"message\":\"cannot persist operation\"}}\n", meta);
     if (begun.reused) return operationResponse(request, begun.entry, true, meta);
     var operation_done = false;
@@ -2076,6 +2147,8 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     var input_hash: [64]u8 = undefined;
     asset_validate.sha256File(context.io, paths.require().import_dir, filename, &input_hash) catch |err| return assetInputError(request, @errorName(err), meta);
     if (!std.mem.eql(u8, &input_hash, declared_sha256)) return assetInputError(request, "ContentDigestMismatch", meta);
+    if (filename.len > iso_field_cap or parsed.value.original_filename.len > iso_field_cap)
+        return assetInputError(request, "invalid filename length", meta);
     context.catalog.lock();
     const catalog_snapshot = context.catalog.acquireLocked();
     // 无限定符的重复导入按 ISO 内容自然幂等。显式提供 qualifier 表示要从同一
@@ -2098,57 +2171,41 @@ fn importInstallSource(request: zap.Request, context: *const RouteContext, meta:
     };
     catalog_snapshot.release();
     context.catalog.unlock();
-    if (!iso_import_mutex.tryLock()) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install_source.busy\",\"message\":\"another ISO import is running\"}}\n", meta);
-    defer iso_import_mutex.unlock();
-    // importMedia 会构造大量彼此共享切片的临时 Result（例如 source_name 同时被
-    // InstallSource/Profile 引用）。CatalogRuntime 发布时会深拷贝为独立 snapshot，
-    // 因此用每次请求独立 arena 承载 import Result：成功、校验失败或回滚后统一释放，
-    // 避免长生命周期 daemon allocator 随 ISO 导入次数增长。
-    var import_arena = std.heap.ArenaAllocator.init(context.allocator);
-    defer import_arena.deinit();
-    var task: IsoImportTask = .{
-        .io = context.io,
-        .allocator = import_arena.allocator(),
-        .config = context.config,
-        .request = .{ .filename = filename, .original_filename = parsed.value.original_filename, .name = name, .qualifier = qualifier, .distro = distro, .version = version, .arch = arch },
-    };
-    const worker = std.Thread.spawn(.{}, runIsoImport, .{&task}) catch |err| {
-        observe_log.err("ISO import worker could not start: {t}", .{err});
-        return assetInputError(request, "ImportWorkerUnavailable", meta);
-    };
-    worker.join();
-    const imported = task.result orelse {
-        const err = task.failure orelse error.ImportWorkerFailed;
-        observe_log.err("ISO import failed: {t}", .{err});
-        return assetInputError(request, @errorName(err), meta);
-    };
-    // ISO 扫描阶段已经拥有完整、稳定的软件能力索引，因此在 catalog 发布前
-    // 生成内容寻址 blob。最终 InstallPlan 仍需等 Node/profile/generation 确定，
-    // 但同一索引从此可被所有 profile、节点和 boot session 共享。
-    for (imported.repositories) |repository| {
-        const blob = repository_index_blob.publish(context.io, context.allocator, paths.require().repository_indexes_dir, repository.software_index) catch |err| {
-            observe_log.err("ISO repository index blob publication failed: repository={s} error={t}", .{ repository.name, err });
-            return assetInputError(request, "RepositoryIndexBlobPublishFailed", meta);
-        };
-        observe_log.info(
-            "ISO repository index blob published: repository={s} digest={s} bytes={d} capabilities={d}",
-            .{ repository.name, blob.digest[0..12], blob.bytes, repository.software_index.capabilities.len },
-        );
+    // 构造受限 job 并提交给 daemon-owned ISO worker；operation_id 同时作为
+    // staging 目录名（`work/iso-import-<id>`，§7.4）。
+    var job: IsoImportJob = .{};
+    @memcpy(&job.operation_id, begun.entry.idSlice());
+    job.filename_len = @intCast(filename.len);
+    @memcpy(job.filename[0..filename.len], filename);
+    job.original_filename_len = @intCast(parsed.value.original_filename.len);
+    @memcpy(job.original_filename[0..parsed.value.original_filename.len], parsed.value.original_filename);
+    if (name) |value| {
+        job.name_len = @intCast(value.len);
+        @memcpy(job.name[0..value.len], value);
     }
-    context.models.lock();
-    defer context.models.unlock();
-    context.catalog.publishInstallSource(context.io, context.configs, context.config, context.config_revision, imported) catch |err| {
-        // importMedia 已经将不可变文件复制到受管根目录。
-        // 被拒绝的候选不得积累不可访问的 public-root 孤儿文件
-        //（例如，ISO 覆盖产生了与既有同名 distro 不一致的 family）。
-        iso_import.cleanupPublishedOutputs(context.io, context.allocator, context.config, &imported);
-        observe_log.err("ISO catalog publication failed: {t}", .{err});
-        return assetInputError(request, @errorName(err), meta);
+    if (qualifier) |value| {
+        job.qualifier_len = @intCast(value.len);
+        @memcpy(job.qualifier[0..value.len], value);
+    }
+    if (distro) |value| {
+        job.distro_len = @intCast(value.len);
+        @memcpy(job.distro[0..value.len], value);
+    }
+    if (version) |value| {
+        job.version_len = @intCast(value.len);
+        @memcpy(job.version[0..value.len], value);
+    }
+    job.arch = arch;
+    context.iso_worker.submit(job) catch |err| {
+        // 队列容量 1：已有导入在途。保持既有 409 `install_source.busy` 语义，
+        // 并把刚创建的 queued operation 确定性落为失败（§8.3 映射 exit 3）。
+        observe_log.warn("ISO import queue busy: {t}", .{err});
+        _ = context.operations.fail(begun.entry.idSlice(), "install_source.busy", unixNow()) catch {};
+        saveOperations(context) catch {};
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install_source.busy\",\"message\":\"another ISO import is running\"}}\n", meta);
     };
-    const completed = try context.operations.succeed(begun.entry.idSlice(), imported.source_name, unixNow());
-    try saveOperations(context);
     operation_done = true;
-    try operationResponse(request, completed, true, meta);
+    return operationResponse(request, begun.entry, true, meta);
 }
 
 fn managementOperation(request: zap.Request, context: *const RouteContext, operation_id: []const u8, meta: RequestMeta) !void {
@@ -2689,22 +2746,6 @@ fn writeOperation(writer: *std.Io.Writer, operation: operations.Entry) !void {
     try writer.print("{{\"id\":{f},\"kind\":{f},\"state\":{f},\"created_at\":{d},\"updated_at\":{d},\"result\":{f},\"error_code\":{f}}}", .{ std.json.fmt(operation.idSlice(), .{}), std.json.fmt(@tagName(operation.kind), .{}), std.json.fmt(@tagName(operation.state), .{}), operation.created_at, operation.updated_at, std.json.fmt(operation.resultSlice(), .{}), std.json.fmt(operation.errorSlice(), .{}) });
 }
 
-const IsoImportTask = struct {
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    config: *const model.AppConfig,
-    request: iso_import.Request,
-    result: ?iso_import.Result = null,
-    failure: ?anyerror = null,
-};
-
-fn runIsoImport(task: *IsoImportTask) void {
-    task.result = iso_import.importMedia(task.io, task.allocator, task.config, task.request) catch |err| {
-        task.failure = err;
-        return;
-    };
-}
-
 fn assetInputError(request: zap.Request, message: []const u8, meta: RequestMeta) !void {
     var buffer: [256]u8 = undefined;
     const body = try std.fmt.bufPrint(&buffer, "{{\"ok\":false,\"error\":{{\"code\":\"asset.invalid\",\"message\":{f}}}}}\n", .{std.json.fmt(message, .{})});
@@ -2831,7 +2872,19 @@ fn runtimeSummary(request: zap.Request, context: *const RouteContext, meta: Requ
 const NodeAddRequest = dto.Node;
 
 const ProfileCreateRequest = struct { name: []const u8, install_source: []const u8, kind: ?[]const u8 = null, boot_bundle: ?[]const u8 = null };
-const ProfileCloneRequest = struct { target: []const u8 };
+/// v0.2.3 §5.2 clone 扩展：
+/// - `new_ssh_keys`：创建独立 identity（不复用 source）；
+/// - `build`：clone 提交后追加 rootfs build operation（仅 diskless）；
+/// - `detach`：与 `build` 同用时立即返回 operation id；
+/// - `properties`：与 clone 同一 catalog 事务应用的 key=value patch
+///   （范围与 `profile set` 相同）。
+const ProfileCloneRequest = struct {
+    target: []const u8,
+    new_ssh_keys: bool = false,
+    build: bool = false,
+    detach: bool = false,
+    properties: ?std.json.Value = null,
+};
 const ValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, values: []const []const u8 = &.{}, mutations: []const scalar_mutation.Mutation = &.{} };
 const ItemValuesMutationRequest = struct { operation: value_mutation.Operation, key: []const u8, identity: []const u8, field: []const u8, values: []const []const u8 = &.{} };
 
@@ -3236,7 +3289,30 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    @import("../config/profile_mutation.zig").addInstallProfile(context.io, context.allocator, context.config, context.catalog.path, parsed.value.name, parsed.value.install_source, kind, boot_bundle) catch |err| switch (err) {
+    // v0.2.3 §5.1: 先按 §4.2 两阶段协议创建 identity（prepared journal 先于
+    // identity 持久化），再发布引用它的 catalog，最后 commit 删除 journal。
+    // 任何失败都幂等回滚（移除该 revision + journal），绝不留下"有 Profile、
+    // 无 identity"的半成品；catalog 持久化成功后的 snapshot 发布失败不触发
+    // 回滚（journal 已提交，磁盘状态一致，重启恢复即可收尾）。
+    const now = std.Io.Clock.real.now(context.io).toSeconds();
+    var tx: identity_store.IdentityTx = .{
+        .old_catalog_revision = context.catalog.currentRevision(),
+        .profile_name = parsed.value.name,
+        .created_at = now,
+    };
+    const identity = context.identities.create(context.io, context.allocator, now, &tx) catch |err| switch (err) {
+        error.IdentityStoreCapacity => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.capacity\",\"message\":\"identity store capacity exhausted\"}}\n", meta),
+        error.IdentityStagingDirUnset => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.staging_unset\",\"message\":\"identity staging directory is not configured\"}}\n", meta),
+        else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.create_failed\",\"message\":\"cannot create profile ssh identity\"}}\n", meta),
+    };
+    errdefer if (tx.transaction_id) |tx_id| context.identities.rollback(context.io, context.allocator, tx_id) catch {};
+    const ssh_identity: model.ProfileSshIdentityRef = .{
+        .id = identity.id,
+        .revision = identity.revision,
+        .client_public_fingerprint = identity.client_public_fingerprint,
+        .host_public_fingerprint = identity.host_public_fingerprint,
+    };
+    @import("../config/profile_mutation.zig").addInstallProfile(context.io, context.allocator, context.config, context.catalog.path, parsed.value.name, parsed.value.install_source, kind, boot_bundle, ssh_identity) catch |err| switch (err) {
         error.ProfileAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.already_exists\",\"message\":\"profile name already exists\"}}\n", meta),
         error.InstallSourceNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"profile.install_source_not_found\",\"message\":\"install source does not exist\"}}\n", meta),
         error.DisklessBootBundleRequired => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.boot_bundle_required\",\"message\":\"--kind diskless requires a boot bundle\"}}\n", meta),
@@ -3244,11 +3320,22 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
         error.NonCanonicalBootBundleName => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.non_canonical_boot_bundle\",\"message\":\"diskless boot bundle name must retain the complete install-source prefix and end in -diskless-bundle\"}}\n", meta),
         else => return validationError(request, err, meta),
     };
+    if (tx.transaction_id) |tx_id| {
+        // catalog 已持久化，此后绝不能再由 errdefer 删除其 identity；若 journal
+        // 删除失败，保留 journal 供启动恢复按 catalog 引用安全收尾。
+        tx.transaction_id = null;
+        context.identities.commit(context.io, context.allocator, tx_id) catch
+            return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.commit_failed\",\"message\":\"profile persisted but identity transaction cleanup failed\"}}\n", meta);
+    }
     applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"profile persisted but snapshot publish failed\"}}\n", meta);
     var location: [320]u8 = undefined;
     try request.setHeader("location", try std.fmt.bufPrint(&location, "/api/v1/management/profiles/{s}", .{parsed.value.name}));
-    var response: [512]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"name\":{f},\"mode\":{f},\"kind\":{f},\"install_source\":{f},\"boot_bundle\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(parsed.value.name, .{}), std.json.fmt(@tagName(kind), .{}), std.json.fmt(@tagName(kind), .{}), std.json.fmt(parsed.value.install_source, .{}), std.json.fmt(boot_bundle, .{}), context.catalog.currentRevision() });
+    // v0.2.3 §5.1: 响应含 revision/provenance/ssh_identity 后可达 ~600B（profile
+    // 名 128 + 两个 59B 指纹 + 32B id + 结构开销）；512B 缓冲会在 bufPrint 返回
+    // NoSpaceLeft，zap 随后回 200 空 body，破坏契约。放大到 1536B。
+    var response: [1536]u8 = undefined;
+    // §5.1: 响应增加 provenance 与 ssh_identity（identity 引用与指纹）。
+    const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"name\":{f},\"mode\":{f},\"kind\":{f},\"install_source\":{f},\"boot_bundle\":{f},\"revision\":{d},\"provenance\":{{\"origin\":{f},\"install_source_revision\":{d}}},\"ssh_identity\":{{\"id\":{f},\"revision\":{d},\"client_public_fingerprint\":{f},\"host_public_fingerprint\":{f}}}}}\n", .{ std.json.fmt(parsed.value.name, .{}), std.json.fmt(@tagName(kind), .{}), std.json.fmt(@tagName(kind), .{}), std.json.fmt(parsed.value.install_source, .{}), std.json.fmt(boot_bundle, .{}), context.catalog.currentRevision(), std.json.fmt(@tagName(model.ProfileProvenanceOrigin.create), .{}), context.catalog.currentRevision(), std.json.fmt(identity.id, .{}), identity.revision, std.json.fmt(identity.client_public_fingerprint, .{}), std.json.fmt(identity.host_public_fingerprint, .{}) });
     try setRevisionEtag(request, context.catalog.currentRevision());
     return json(request, .created, rendered, meta);
 }
@@ -3261,24 +3348,137 @@ fn managementProfileClone(request: zap.Request, context: *RouteContext, source: 
     defer parsed.deinit();
     if (!config_validate.validLogicalId(source) or !config_validate.validLogicalId(parsed.value.target))
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.clone_invalid\",\"message\":\"source and target must be canonical logical identifiers\"}}\n", meta);
+    // v0.2.3 §5.2: `--detach` 必须与 `--build` 同用；单独使用是 CLI 输入错误。
+    if (parsed.value.detach and !parsed.value.build)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.clone_invalid\",\"message\":\"detach requires build\"}}\n", meta);
+    // v0.2.3 §5.2: property patch 范围与 `profile set` 相同——只接受 mutable
+    // 标量 key；集合键须走 values 命令；provenance/revision/ssh_identity 不在
+    // PropertySpec 内，天然被拒绝。patch 在 clone 事务内应用（见 cloneProfile）。
+    var patch_mutations: std.ArrayListUnmanaged(scalar_mutation.Mutation) = .empty;
+    defer patch_mutations.deinit(context.allocator);
+    if (parsed.value.properties) |properties_value| {
+        if (properties_value != .object)
+            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_value\",\"message\":\"properties must be a JSON object\"}}\n", meta);
+        const properties = properties_value.object;
+        for (properties.keys(), properties.values()) |key, value| {
+            if (cli_properties.collection(.profile, key) != null)
+                return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.list_operation_required\",\"message\":\"structured collection keys require profile add-values/remove-values/replace-values/clear-values\"}}\n", meta);
+            const spec = cli_properties.property(.profile, key) orelse
+                return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown scalar profile property\"}}\n", meta);
+            if (spec.mutability != .mutable)
+                return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown scalar profile property\"}}\n", meta);
+            try patch_mutations.append(context.allocator, .{
+                .key = key,
+                .value = switch (value) {
+                    .string => |text| text,
+                    .null => null,
+                    else => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_value\",\"message\":\"property values must be strings\"}}\n", meta),
+                },
+            });
+        }
+    }
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
     context.models.lock();
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
-    @import("../config/profile_mutation.zig").cloneProfile(context.io, context.allocator, context.config, context.catalog.path, source, parsed.value.target) catch |err| switch (err) {
+    // v0.2.3 §5.2: `--build` 仅对 diskless Profile 有意义（target 继承 source
+    // 的 kind）；install source 上显式 `--build` 是 CLI 输入错误（exit 2）。
+    if (parsed.value.build) {
+        const source_profile = lookup.findProfile(context.catalog_snapshot.value(), source) orelse return notFound(request, meta);
+        if (source_profile.kind != .diskless)
+            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.clone_invalid\",\"message\":\"clone --build requires a diskless source profile\"}}\n", meta);
+    }
+    // v0.2.3 §5.2: `--new-ssh-keys` 时先按 §4.2 创建独立 identity 再克隆，
+    // 失败幂等回滚；默认复用 source 的 identity 引用（null override）。
+    var tx_opt: ?identity_store.IdentityTx = null;
+    var identity_override: ?model.ProfileSshIdentityRef = null;
+    if (parsed.value.new_ssh_keys) {
+        const now = std.Io.Clock.real.now(context.io).toSeconds();
+        var tx: identity_store.IdentityTx = .{
+            .old_catalog_revision = context.catalog.currentRevision(),
+            .profile_name = parsed.value.target,
+            .created_at = now,
+        };
+        const identity = context.identities.create(context.io, context.allocator, now, &tx) catch |err| switch (err) {
+            error.IdentityStoreCapacity => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.capacity\",\"message\":\"identity store capacity exhausted\"}}\n", meta),
+            error.IdentityStagingDirUnset => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.staging_unset\",\"message\":\"identity staging directory is not configured\"}}\n", meta),
+            else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.create_failed\",\"message\":\"cannot create clone ssh identity\"}}\n", meta),
+        };
+        identity_override = .{
+            .id = identity.id,
+            .revision = identity.revision,
+            .client_public_fingerprint = identity.client_public_fingerprint,
+            .host_public_fingerprint = identity.host_public_fingerprint,
+        };
+        tx_opt = tx;
+    }
+    errdefer if (tx_opt) |tx| if (tx.transaction_id) |tx_id| context.identities.rollback(context.io, context.allocator, tx_id) catch {};
+    @import("../config/profile_mutation.zig").cloneProfile(context.io, context.allocator, context.config, context.catalog.path, source, parsed.value.target, identity_override, patch_mutations.items) catch |err| switch (err) {
         error.ProfileNotFound => return notFound(request, meta),
         error.ProfileAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.already_exists\",\"message\":\"target profile already exists\"}}\n", meta),
         error.InvalidProfileName => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.clone_invalid\",\"message\":\"target profile name is invalid\"}}\n", meta),
+        error.UnknownProperty => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.unknown\",\"message\":\"unknown scalar profile property\"}}\n", meta),
+        error.InvalidPropertyValue => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.invalid_value\",\"message\":\"property value does not match PropertySpec\"}}\n", meta),
+        error.PropertyRequired => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"property.required\",\"message\":\"required scalar cannot be unset\"}}\n", meta),
         else => return validationError(request, err, meta),
+    };
+    if (tx_opt) |*tx| if (tx.transaction_id) |tx_id| {
+        tx.transaction_id = null;
+        context.identities.commit(context.io, context.allocator, tx_id) catch
+            return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.commit_failed\",\"message\":\"profile clone persisted but identity transaction cleanup failed\"}}\n", meta);
     };
     applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"profile clone persisted but snapshot publish failed\"}}\n", meta);
     var location: [320]u8 = undefined;
     try request.setHeader("location", try std.fmt.bufPrint(&location, "/api/v1/management/profiles/{s}", .{parsed.value.target}));
-    var response: [512]u8 = undefined;
-    const rendered = try std.fmt.bufPrint(&response, "{{\"ok\":true,\"result\":{{\"source\":{f},\"target\":{f},\"revision\":{d}}}}}\n", .{ std.json.fmt(source, .{}), std.json.fmt(parsed.value.target, .{}), context.catalog.currentRevision() });
+    // §5.2/§8.4: 响应包含 `profile_created`/`build_submitted`；`--build` 时在
+    // clone 提交后追加 rootfs build operation（提交失败不回滚 clone）。
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    if (!parsed.value.build) {
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"source\":{f},\"target\":{f},\"revision\":{d},\"new_ssh_keys\":{s},\"profile_created\":true,\"build_submitted\":false}}}}\n", .{ std.json.fmt(source, .{}), std.json.fmt(parsed.value.target, .{}), context.catalog.currentRevision(), if (parsed.value.new_ssh_keys) "true" else "false" });
+        try setRevisionEtag(request, context.catalog.currentRevision());
+        return json(request, .created, output.written(), meta);
+    }
+    const catalog = context.catalog_snapshot.value();
+    const profile = lookup.findProfile(catalog, parsed.value.target) orelse
+        return cloneBuildSubmitFailed(request, meta, "clone committed but target profile is missing");
+    const digest = diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile) catch
+        return cloneBuildSubmitFailed(request, meta, "cannot compute rootfs input digest after clone");
+    const digest_hex: []const u8 = digest[0..];
+    // 缓存命中：内容寻址制品已 ready，build 视为已提交（幂等，不建 operation）。
+    if (context.rootfs_artifacts.find(digest_hex)) |existing| {
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"source\":{f},\"target\":{f},\"revision\":{d},\"new_ssh_keys\":{s},\"profile_created\":true,\"build_submitted\":true,\"state\":\"already_present\",\"content_sha512\":{f},\"compressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}}}}}\n", .{ std.json.fmt(source, .{}), std.json.fmt(parsed.value.target, .{}), context.catalog.currentRevision(), if (parsed.value.new_ssh_keys) "true" else "false", std.json.fmt(existing.content_sha512, .{}), existing.compressed_size, std.json.fmt(existing.kernel_release, .{}), std.json.fmt(existing.file, .{}) });
+        try setRevisionEtag(request, context.catalog.currentRevision());
+        return json(request, .created, output.written(), meta);
+    }
+    var idempotency_key_buffer: [80]u8 = undefined;
+    const idempotency_key = try std.fmt.bufPrint(&idempotency_key_buffer, "rootfs-{s}", .{digest_hex});
+    const begun = context.operations.beginQueuedRequest(context.io, idempotency_key, digest_hex, .rootfs_build, unixNow()) catch
+        return cloneBuildSubmitFailed(request, meta, "cannot create rootfs build operation");
+    saveOperations(context) catch return cloneBuildSubmitFailed(request, meta, "cannot persist rootfs build operation");
+    if (!begun.reused) {
+        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex) catch |err| {
+            _ = context.operations.fail(begun.entry.idSlice(), if (err == error.RootfsBuildQueueFull) "rootfs.queue_full" else "rootfs.invalid_job", unixNow()) catch {};
+            saveOperations(context) catch {};
+            return cloneBuildSubmitFailed(request, meta, "rootfs build worker queue is unavailable");
+        };
+    }
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"source\":{f},\"target\":{f},\"revision\":{d},\"new_ssh_keys\":{s},\"profile_created\":true,\"build_submitted\":true,\"operation\":{{\"id\":{f},\"kind\":\"rootfs_build\",\"state\":{f},\"created_at\":{d},\"updated_at\":{d},\"result\":{f},\"error_code\":{f}}}}}}}\n", .{ std.json.fmt(source, .{}), std.json.fmt(parsed.value.target, .{}), context.catalog.currentRevision(), if (parsed.value.new_ssh_keys) "true" else "false", std.json.fmt(begun.entry.idSlice(), .{}), std.json.fmt(@tagName(begun.entry.state), .{}), begun.entry.created_at, begun.entry.updated_at, std.json.fmt(begun.entry.resultSlice(), .{}), std.json.fmt(begun.entry.errorSlice(), .{}) });
+    var operation_location: [256]u8 = undefined;
+    try request.setHeader("location", try std.fmt.bufPrint(&operation_location, "/api/v1/management/operations/{s}", .{begun.entry.idSlice()}));
     try setRevisionEtag(request, context.catalog.currentRevision());
-    return json(request, .created, rendered, meta);
+    return json(request, .created, output.written(), meta);
+}
+
+/// v0.2.3 §8.4: clone 已提交但 build operation 提交失败时的复合响应：
+/// `profile_created=true, build_submitted=false` + 稳定 error code
+/// `rootfs.build_submit_failed`（CLI exit code 5）。不回滚已成功的 clone。
+fn cloneBuildSubmitFailed(request: zap.Request, meta: RequestMeta, detail: []const u8) !void {
+    var buffer: [1024]u8 = undefined;
+    const body = std.fmt.bufPrint(&buffer, "{{\"ok\":false,\"error\":{{\"code\":\"rootfs.build_submit_failed\",\"message\":{f}}},\"result\":{{\"profile_created\":true,\"build_submitted\":false}}}}\n", .{std.json.fmt(detail, .{})}) catch
+        "{\"ok\":false,\"error\":{\"code\":\"rootfs.build_submit_failed\",\"message\":\"clone committed but build submission failed\"},\"result\":{\"profile_created\":true,\"build_submitted\":false}}\n";
+    return json(request, .service_unavailable, body, meta);
 }
 
 /// 处理 Profile 删除请求。mutation mutex、model gate 与 `If-Match` 一起保证
@@ -3321,7 +3521,9 @@ fn applyCatalogFromDisk(context: *RouteContext) !void {
     context.catalog.publishPreparedLocked(catalog_next);
 }
 
-const RootfsBuildRequest = struct { if_input_digest: ?[]const u8 = null };
+/// v0.2.3 §3.3: `new_ssh_keys` 为 true 时先轮换 identity revision 并发布
+/// Profile（ssh_identity 引用 + revision+1），再以新投影提交 build。
+const RootfsBuildRequest = struct { if_input_digest: ?[]const u8 = null, new_ssh_keys: bool = false };
 const InitrdBuildRequest = struct {
     name: []const u8,
     install_source: []const u8,
@@ -3391,6 +3593,58 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
             return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"invalid request body\"}}\n", meta);
     }
     const if_input_digest = if (parsed_request) |parsed| parsed.value.if_input_digest else null;
+    const new_ssh_keys = if (parsed_request) |parsed| parsed.value.new_ssh_keys else false;
+
+    if (new_ssh_keys) {
+        // v0.2.3 §3.3 操作序列：先创建新 identity revision（同 id，revision+1，
+        // 旧 revision 保持不可变），再发布 Profile revision（ssh_identity 引用
+        // 递增 + updated_at），随后用新投影提交 build。失败边界：
+        // - identity 创建失败 → identity.create_failed（identity/Profile 均未发布）；
+        // - Profile 发布失败 → catalog.publish_failed（identity 已写入，事务
+        //   恢复立即回收该 revision）；
+        // - build 提交失败 → rootfs.build_submit_failed（Profile 已发布，旧
+        //   artifact 仍可消费，等价于"先改 Profile 再 build"普通序列）。
+        while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+        defer config_mutation_mutex.unlock();
+        context.models.lock();
+        defer context.models.unlock();
+        if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
+        const snapshot = context.catalog_snapshot.value();
+        const existing = lookup.findProfile(snapshot, name) orelse return notFound(request, meta);
+        if (existing.kind != .diskless)
+            return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs build is only available for diskless profiles\"}}\n", meta);
+        if (existing.ssh_identity.id.len != identity_store.id_len)
+            return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"identity.not_found\",\"message\":\"profile has no ssh identity to rotate\"}}\n", meta);
+        const now = std.Io.Clock.real.now(context.io).toSeconds();
+        var tx: identity_store.IdentityTx = .{
+            .old_catalog_revision = context.catalog.currentRevision(),
+            .profile_name = name,
+            .created_at = now,
+        };
+        const identity = context.identities.createRevision(context.io, context.allocator, existing.ssh_identity.id, now, &tx) catch |err| switch (err) {
+            error.IdentityNotFound => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"identity.not_found\",\"message\":\"identity referenced by profile is missing\"}}\n", meta),
+            error.IdentityStoreCapacity => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.capacity\",\"message\":\"identity store capacity exhausted\"}}\n", meta),
+            else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.create_failed\",\"message\":\"cannot create new ssh identity revision\"}}\n", meta),
+        };
+        errdefer if (tx.transaction_id) |tx_id| context.identities.rollback(context.io, context.allocator, tx_id) catch {};
+        const ssh_identity: model.ProfileSshIdentityRef = .{
+            .id = identity.id,
+            .revision = identity.revision,
+            .client_public_fingerprint = identity.client_public_fingerprint,
+            .host_public_fingerprint = identity.host_public_fingerprint,
+        };
+        @import("../config/profile_mutation.zig").rotateSshIdentity(context.io, context.allocator, context.config, context.catalog.path, name, ssh_identity) catch |err| switch (err) {
+            error.ProfileNotFound => return notFound(request, meta),
+            error.ProfileRevisionOverflow => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"profile.revision_overflow\",\"message\":\"profile revision overflow\"}}\n", meta),
+            else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"ssh identity rotation persisted but catalog publish failed\"}}\n", meta),
+        };
+        if (tx.transaction_id) |tx_id| {
+            tx.transaction_id = null;
+            context.identities.commit(context.io, context.allocator, tx_id) catch
+                return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.commit_failed\",\"message\":\"ssh identity rotation persisted but transaction cleanup failed\"}}\n", meta);
+        }
+        applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"ssh identity rotated but snapshot publish failed\"}}\n", meta);
+    }
 
     const catalog = context.catalog_snapshot.value();
     const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
@@ -3515,7 +3769,9 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
             );
         }
     }
-    rootfs_os_builder.buildOsLayer(context.io, context.allocator, staging, os_package_manager, install_source.version, repo_closure.repository_urls, casper_layer_paths.items) catch |err| {
+    // v0.2.3 §3.3: OS 层内从 identity store 按 profile 的 (id, revision) 读取
+    // SSH keys 写入 staging（fail closed，不再构建期 ssh-keygen）。
+    rootfs_os_builder.buildOsLayer(context.io, context.allocator, staging, os_package_manager, install_source.version, repo_closure.repository_urls, casper_layer_paths.items, context.identities, profile) catch |err| {
         std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 1 FAILED - OS layer ({t})", .{ name, err });
         return err;
     };
@@ -3616,94 +3872,16 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
 
     // ── Stage 5/6：Profile 共享 SSH 信任基线 ──────────────────────────
     // 设计依据：DISKLESS_FINAL.md §4「Profile 共享 SSH keys」、
-    //           V0_2_DESIGN.md §5.4 构建期与启动期边界表。
+    //           V0_2_DESIGN.md §5.4 构建期与启动期边界表、
+    //           V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md §3.3。
     //
-    // 本阶段在 squashfs 压缩前向只读 lower 写入三类 SSH 资产，使同 Profile 的全部
-    // 节点共享同一信任域：
-    //   1. client keypair（ed25519）→ /root/.ssh/id_ed25519
-    //      - 同 Profile 所有节点持有相同 client 私钥，彼此可免密 SSH 登录。
-    //      - 这是 Profile 信任域的显式产品语义，而非 Node 唯一身份。
-    //   2. authorized_keys → /root/.ssh/authorized_keys
-    //      - 合并 Profile `system.ssh.root_authorized_keys`（操作员手动配置的公钥）
-    //        和自动生成的 client public key，使 root 同时信任外部管理密钥和域内节点。
-    //   3. sshd host key（ed25519）→ /etc/ssh/ssh_host_ed25519_key
-    //      - 同 Profile 节点共享 host fingerprint，域内首次连接无需人工确认。
-    //      - 这是信任整个 Profile 域的预期行为，不承担 Node 唯一身份。
-    //
-    // 重建时若需换全部 SSH keys，使用 `profile rootfs build --new-ssh-keys`；
-    // 旧 artifact/active session 不变，新旧 rootfs 混跑时双向免密不保证。
-    //
-    // 注意：此处写入的密钥属于 Profile 级共享基线（只读 lower），不是 Node 级
-    // override。Node 级 SSH 差量（追加/删除 key）由 agent pre-init 写 overlay upper。
-    // mandatory Profile client key 不可由标准 Node `authorized_keys.remove` 删除。
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 5/6 - generating SSH keys + configuring passwordless SSH", .{name});
-    {
-        // 创建 root .ssh 目录（0700，SSH 强制要求）
-        const root_ssh_dir = try std.fmt.allocPrint(context.allocator, "{s}/root/.ssh", .{staging});
-        defer context.allocator.free(root_ssh_dir);
-        try std.Io.Dir.cwd().createDirPath(context.io, root_ssh_dir);
-        try runBuildCmd(context.io, context.allocator, &.{ "chmod", "0700", root_ssh_dir });
-
-        // 生成 SSH client keypair（ed25519，无密码）
-        // ed25519 比 RSA 更短更快，且不携带可追溯的随机数生成器指纹。
-        const client_key_path = try std.fmt.allocPrint(context.allocator, "{s}/root/.ssh/id_ed25519", .{staging});
-        defer context.allocator.free(client_key_path);
-        std.Io.Dir.cwd().deleteFile(context.io, client_key_path) catch {};
-        const client_pub_path = try std.fmt.allocPrint(context.allocator, "{s}.pub", .{client_key_path});
-        defer context.allocator.free(client_pub_path);
-        std.Io.Dir.cwd().deleteFile(context.io, client_pub_path) catch {};
-        try runBuildCmd(context.io, context.allocator, &.{ "ssh-keygen", "-t", "ed25519", "-f", client_key_path, "-N", "", "-q", "-C", "nodeforge-profile" });
-        try runBuildCmd(context.io, context.allocator, &.{ "chmod", "0600", client_key_path });
-
-        // 读取 client public key 用于合并到 authorized_keys
-        const pub_key_content = try std.Io.Dir.cwd().readFileAlloc(context.io, client_pub_path, context.allocator, .limited(8192));
-        defer context.allocator.free(pub_key_content);
-
-        // 写入 authorized_keys：合并 Profile 配置的 root_authorized_keys 和自动生成的 client public key。
-        // 顺序：先写操作员手动配置的外部公钥，再写自动生成的域内 client 公钥。
-        // mandatory client public key 放在最后，使 Node override 的 `remove` 操作
-        // 不影响它（标准 remove 从文件中删除匹配行，但不影响 Profile 级基线的重建）。
-        const authorized_keys_path = try std.fmt.allocPrint(context.allocator, "{s}/root/.ssh/authorized_keys", .{staging});
-        defer context.allocator.free(authorized_keys_path);
-        var auth_keys: std.Io.Writer.Allocating = .init(context.allocator);
-        defer auth_keys.deinit();
-        for (profile.system.ssh.root_authorized_keys) |key| {
-            try auth_keys.writer.writeAll(key);
-            try auth_keys.writer.writeByte('\n');
-        }
-        try auth_keys.writer.writeAll(pub_key_content);
-        if (pub_key_content.len > 0 and pub_key_content[pub_key_content.len - 1] != '\n') {
-            try auth_keys.writer.writeByte('\n');
-        }
-        try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = authorized_keys_path, .data = auth_keys.written() });
-        try runBuildCmd(context.io, context.allocator, &.{ "chmod", "0600", authorized_keys_path });
-
-        // 生成 sshd host key（ed25519）。
-        // 同 Profile 节点共享 host key/fingerprint 是信任整个 Profile 域的预期行为。
-        // 设计上 `/etc/ssh/ssh_known_hosts` 应将 Profile `system.hosts` 声明的全部
-        // address/names/aliases 绑定到该共享 host public key（后续完善点）。
-        const etc_ssh_dir = try std.fmt.allocPrint(context.allocator, "{s}/etc/ssh", .{staging});
-        defer context.allocator.free(etc_ssh_dir);
-        try std.Io.Dir.cwd().createDirPath(context.io, etc_ssh_dir);
-        const host_key_path = try std.fmt.allocPrint(context.allocator, "{s}/ssh_host_ed25519_key", .{etc_ssh_dir});
-        defer context.allocator.free(host_key_path);
-        std.Io.Dir.cwd().deleteFile(context.io, host_key_path) catch {};
-        const host_pub_path = try std.fmt.allocPrint(context.allocator, "{s}.pub", .{host_key_path});
-        defer context.allocator.free(host_pub_path);
-        std.Io.Dir.cwd().deleteFile(context.io, host_pub_path) catch {};
-        try runBuildCmd(context.io, context.allocator, &.{ "ssh-keygen", "-t", "ed25519", "-f", host_key_path, "-N", "", "-q", "-C", "nodeforge-host" });
-
-        // 创建 sshd_config.d drop-in，显式启用公钥认证并指定 authorized_keys 路径。
-        // 使用 drop-in 而非修改主 sshd_config，避免与发行版默认配置冲突。
-        const sshd_dropin_dir = try std.fmt.allocPrint(context.allocator, "{s}/etc/ssh/sshd_config.d", .{staging});
-        defer context.allocator.free(sshd_dropin_dir);
-        try std.Io.Dir.cwd().createDirPath(context.io, sshd_dropin_dir);
-        const sshd_dropin = try std.fmt.allocPrint(context.allocator, "{s}/00-nodeforge.conf", .{sshd_dropin_dir});
-        defer context.allocator.free(sshd_dropin);
-        try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = sshd_dropin, .data = "PubkeyAuthentication yes\n" ++
-            "AuthorizedKeysFile .ssh/authorized_keys\n" });
-    }
-    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 5/6 - SSH keys generated + passwordless SSH configured", .{name});
+    // v0.2.3 起 SSH 资产（client/host keypair、authorized_keys、
+    // ssh_known_hosts、sshd drop-in）由 OS 层构建器从 identity store 按
+    // `(ssh_identity.id, revision)` 复合键写入 staging
+    // （`rootfs_os_builder.buildOsLayer` → `installIdentityKeys`，dnf 与
+    // casper/apt 两分支一致），构建期不再调用 `ssh-keygen`；未命中返回
+    // `IdentityNotFound` fail closed。此处仅为阶段日志，不再重复生成密钥。
+    std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 5/6 - SSH identity baseline installed from identity store", .{name});
 
     // ── Stage 6/6：squashfs 压缩 + SHA-512 校验 + 原子发布 ──────────
     // 设计依据：DISKLESS_FINAL.md §4「共享 rootfs 构建模型」、
@@ -3916,6 +4094,100 @@ fn runInitrdBuildWorker(shared_context: *RouteContext, worker: *InitrdBuildWorke
     }
 }
 
+/// v0.2.3 §7.3：ISO 导入 worker 主循环。daemon 启动时 spawn、停止时 join；
+/// 队列容量为 1，worker 内保持 ISO 单并发（替代 handler 级互斥）。每次 job
+/// 从 models 获取不可变世代对后执行 `performIsoImport`，终态经 operation
+/// store 持久化；daemon restart 对 queued/running operation 统一恢复为
+/// `operation.interrupted`（不自动重跑），孤儿 staging 由启动扫描清理。
+fn runIsoImportWorker(shared_context: *RouteContext, worker: *IsoImportWorker) void {
+    while (true) {
+        const job = worker.take() orelse {
+            if (worker.stop.load(.acquire)) return;
+            std.Io.sleep(shared_context.io, .fromMilliseconds(50), .awake) catch {};
+            continue;
+        };
+        const operation_id: []const u8 = &job.operation_id;
+        _ = shared_context.operations.start(operation_id, unixNow()) catch |err| {
+            log.err("iso import worker cannot start operation {s}: {t}", .{ operation_id, err });
+            continue;
+        };
+        saveOperations(shared_context) catch |err| {
+            log.err("iso import worker cannot persist running operation {s}: {t}", .{ operation_id, err });
+            _ = shared_context.operations.fail(operation_id, "operation.persist_failed", unixNow()) catch {};
+            saveOperations(shared_context) catch {};
+            continue;
+        };
+        const pair = shared_context.models.acquire();
+        var context = shared_context.*;
+        context.config = pair.config.value();
+        context.config_revision = pair.config.revision;
+        context.catalog_snapshot = pair.catalog;
+        const source_name = performIsoImport(&context, &job, operation_id) catch |err| {
+            pair.release();
+            var error_buffer: [96]u8 = undefined;
+            const error_code = std.fmt.bufPrint(&error_buffer, "install_source.{s}", .{@errorName(err)}) catch "install_source.import_failed";
+            log.err("ISO import operation {s} failed: {t}", .{ operation_id, err });
+            _ = shared_context.operations.fail(operation_id, error_code, unixNow()) catch {};
+            saveOperations(shared_context) catch {};
+            continue;
+        };
+        pair.release();
+        _ = shared_context.operations.succeed(operation_id, source_name, unixNow()) catch |err| {
+            log.err("iso import worker cannot complete operation {s}: {t}", .{ operation_id, err });
+            continue;
+        };
+        saveOperations(shared_context) catch |err|
+            log.err("iso import worker cannot persist completed operation {s}: {t}", .{ operation_id, err });
+    }
+}
+
+/// v0.2.3 §7.2/§7.4：ISO worker 执行体。运行 `importMedia`（staging 目录按
+/// operation id 命名，`work/iso-import-<id>`），成功后发布 repository index
+/// blob 与 catalog；失败路径不留下公开幽灵 artifact：importMedia 内部 defer
+/// 清理未发布输出与 staging，catalog 发布失败调用 `cleanupPublishedOutputs`。
+/// 返回 source_name（arena 承载，`operations.succeed` 会拷贝进固定缓冲区）。
+fn performIsoImport(context: *RouteContext, job: *const IsoImportJob, operation_id: []const u8) ![]const u8 {
+    // importMedia 构造大量彼此共享切片的临时 Result；CatalogRuntime 发布时
+    // 深拷贝为独立 snapshot，因此每次 job 使用独立 arena，完成后统一释放，
+    // 避免长生命周期 daemon allocator 随 ISO 导入次数增长。
+    var import_arena = std.heap.ArenaAllocator.init(context.allocator);
+    defer import_arena.deinit();
+    const request = iso_import.Request{
+        .filename = job.filename[0..job.filename_len],
+        .original_filename = job.original_filename[0..job.original_filename_len],
+        .name = if (job.name_len == 0) null else job.name[0..job.name_len],
+        .qualifier = if (job.qualifier_len == 0) null else job.qualifier[0..job.qualifier_len],
+        .distro = if (job.distro_len == 0) null else job.distro[0..job.distro_len],
+        .version = if (job.version_len == 0) null else job.version[0..job.version_len],
+        .arch = job.arch,
+    };
+    const imported = try iso_import.importMedia(context.io, import_arena.allocator(), context.config, request, operation_id);
+    // ISO 扫描阶段已经拥有完整、稳定的软件能力索引，因此在 catalog 发布前
+    // 生成内容寻址 blob。最终 InstallPlan 仍需等 Node/profile/generation 确定，
+    // 但同一索引从此可被所有 profile、节点和 boot session 共享。
+    for (imported.repositories) |repository| {
+        const blob = repository_index_blob.publish(context.io, context.allocator, paths.require().repository_indexes_dir, repository.software_index) catch |err| {
+            observe_log.err("ISO repository index blob publication failed: repository={s} error={t}", .{ repository.name, err });
+            return error.RepositoryIndexBlobPublishFailed;
+        };
+        observe_log.info(
+            "ISO repository index blob published: repository={s} digest={s} bytes={d} capabilities={d}",
+            .{ repository.name, blob.digest[0..12], blob.bytes, repository.software_index.capabilities.len },
+        );
+    }
+    context.models.lock();
+    defer context.models.unlock();
+    context.catalog.publishInstallSource(context.io, context.configs, context.config, context.config_revision, imported) catch |err| {
+        // importMedia 已经将不可变文件复制到受管根目录。
+        // 被拒绝的候选不得积累不可访问的 public-root 孤儿文件
+        //（例如，ISO 覆盖产生了与既有同名 distro 不一致的 family）。
+        iso_import.cleanupPublishedOutputs(context.io, context.allocator, context.config, &imported);
+        observe_log.err("ISO catalog publication failed: {t}", .{err});
+        return err;
+    };
+    return imported.source_name;
+}
+
 const RepoClosure = struct {
     package_manager: ?diskless_dto.FirstBootPackageManager,
     /// 目标节点运行期使用当前 nodeforged HTTP endpoint；后台构建 worker 则
@@ -4004,6 +4276,38 @@ test "rootfs worker queue copies jobs and rejects overflow" {
 
     for (0..max_rootfs_build_jobs) |_| try worker.submit(operation_id, "profile-a", digest);
     try std.testing.expectError(error.RootfsBuildQueueFull, worker.submit(operation_id, "profile-a", digest));
+}
+
+test "v0.2.3: iso worker queue holds one job and rejects concurrent submit" {
+    var worker: IsoImportWorker = .{};
+    const operation_id = "0123456789abcdef0123456789abcdef";
+    var first: IsoImportJob = .{};
+    @memcpy(&first.operation_id, operation_id);
+    first.filename_len = 5;
+    @memcpy(first.filename[0..5], "a.iso");
+    first.original_filename_len = 5;
+    @memcpy(first.original_filename[0..5], "a.iso");
+    first.name_len = 3;
+    @memcpy(first.name[0..3], "src");
+    first.arch = .aarch64;
+    try worker.submit(first);
+    // 队列容量为 1：并发 submit 被拒绝（§7.5 单并发语义，handler 映射为
+    // 409 install_source.busy）。
+    try std.testing.expectError(error.IsoImportQueueFull, worker.submit(first));
+    const taken = worker.take() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(operation_id, &taken.operation_id);
+    try std.testing.expectEqualStrings("a.iso", taken.filename[0..taken.filename_len]);
+    try std.testing.expectEqualStrings("a.iso", taken.original_filename[0..taken.original_filename_len]);
+    try std.testing.expectEqualStrings("src", taken.name[0..taken.name_len]);
+    try std.testing.expectEqual(@as(?model.Arch, .aarch64), taken.arch);
+    try std.testing.expect(worker.take() == null);
+    // 取走后新 job 可入队。
+    try worker.submit(first);
+    _ = worker.take() orelse return error.TestExpectedEqual;
+    // 非法 job（缺 filename）被拒绝。
+    var invalid: IsoImportJob = .{};
+    @memcpy(&invalid.operation_id, operation_id);
+    try std.testing.expectError(error.InvalidIsoImportJob, worker.submit(invalid));
 }
 
 test "AgentPlan first-boot metadata follows profile default and node override" {

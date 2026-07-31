@@ -11,15 +11,21 @@ const catalog_store = @import("../catalog/store.zig");
 const config_load = @import("load.zig");
 const validate = @import("validate.zig");
 const naming = @import("../profile/naming.zig");
+const scalar_mutation = @import("scalar_mutation.zig");
 
-/// 从已有 install source 创建安全默认 install profile。
+/// 从已有 install source 创建安全默认 profile。
 ///
 /// 新 profile 使用与 ISO import 自动创建相同的默认安全基线（destructive=true,
 /// persistent_writes=true, reinstall_policy=explicit）。CLI 不接收任意 safety/storage JSON，
 /// 避免形成绕过模型校验的第二套创建语义。
-pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, install_source: []const u8, kind: model.ProfileKind, boot_bundle: ?[]const u8) !void {
+///
+/// v0.2.3 §5.1: `ssh_identity` 是调用方先在两阶段事务中创建的 identity 引用
+/// （handler 持有 identity store 与 journal），本函数只把它固化到新 profile；
+/// 绝不创建"有 Profile、无 identity"的半成品。
+pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, name: []const u8, install_source: []const u8, kind: model.ProfileKind, boot_bundle: ?[]const u8, ssh_identity: model.ProfileSshIdentityRef) !void {
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();
+    const now = std.Io.Clock.real.now(io).toSeconds();
     for (parsed.value.profiles) |profile| if (std.mem.eql(u8, profile.name, name)) return error.ProfileAlreadyExists;
     var source: ?model.InstallSourceConfig = null;
     for (parsed.value.install_sources) |candidate| if (std.mem.eql(u8, candidate.name, install_source)) {
@@ -47,6 +53,17 @@ pub fn addInstallProfile(io: std.Io, allocator: std.mem.Allocator, config: *cons
         .kind = kind,
         .boot_bundle = boot_bundle,
         .system = system,
+        // v0.2.3 §5.1: create 语义直接初始化 revision=1 与时间戳，不经过
+        // mutateProfileMetadata（create 不是对既有 profile 的 mutation）。
+        .revision = 1,
+        .created_at = now,
+        .updated_at = now,
+        .ssh_identity = ssh_identity,
+        .provenance = .{
+            .origin = .create,
+            .install_source_name = selected.name,
+            .install_source_revision = parsed.value.revision,
+        },
     };
     var candidate = parsed.value;
     candidate.profiles = profiles;
@@ -103,7 +120,13 @@ pub fn removeProfile(io: std.Io, allocator: std.mem.Allocator, config: *const mo
 /// Profile 不包含 runtime/session/operation，因此只复制 catalog-owned desired
 /// shape。目标名称必须是 canonical logical id 且不存在；source 与 target 在同一
 /// catalog generation 中完成查找、校验和发布，不暴露半克隆状态。
-pub fn cloneProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, source_name: []const u8, target_name: []const u8) !void {
+///
+/// v0.2.3 §5.2: `ssh_identity_override` 为 null 时复用 source 的 identity 引用；
+/// 非 null（`--new-ssh-keys` 新建的 identity）时替换为新引用。provenance 记录
+/// `cloned_from` 直接 source。`properties` 与 clone 在同一 catalog 事务中校验
+/// 并应用（范围与 `profile set` 相同，由 handler 预先按 PropertySpec 过滤；
+/// 不允许 patch `provenance`/`revision`/`ssh_identity`）。
+pub fn cloneProfile(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, source_name: []const u8, target_name: []const u8, ssh_identity_override: ?model.ProfileSshIdentityRef, properties: []const scalar_mutation.Mutation) !void {
     if (!validate.validLogicalId(target_name)) return error.InvalidProfileName;
     var parsed = try catalog_store.load(io, allocator, catalog_path);
     defer parsed.deinit();
@@ -114,6 +137,29 @@ pub fn cloneProfile(io: std.Io, allocator: std.mem.Allocator, config: *const mod
     }
     var cloned = source orelse return error.ProfileNotFound;
     cloned.name = target_name;
+    if (ssh_identity_override) |identity| cloned.ssh_identity = identity;
+    // §5.2: property patch 先于 provenance/时间戳应用，patch 对 install_source
+    // 的改写会反映到 `cloned_from` 外的 provenance 字段；patch 与 clone 在同一
+    // 事务中提交，任一校验失败整体回滚。
+    for (properties) |mutation| try scalar_mutation.applyProfile(&parsed.value, &cloned, mutation.key, mutation.value);
+    // v0.2.3 §5.2: clone target 的 revision 始终从 1 开始（不继承 source 的
+    // revision/provenance/时间戳），provenance 记录直接 source。
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    const clone_catalog_revision = std.math.add(u64, parsed.value.revision, 1) catch return error.CatalogRevisionOverflow;
+    cloned.revision = 1;
+    cloned.created_at = now;
+    cloned.updated_at = now;
+    cloned.provenance = .{
+        .origin = .clone,
+        .install_source_name = cloned.install_source,
+        .install_source_revision = parsed.value.revision,
+        .cloned_from = .{
+            .profile_name = source_name,
+            .profile_revision = source.?.revision,
+            .catalog_revision = clone_catalog_revision,
+            .cloned_at = now,
+        },
+    };
     const profiles = try allocator.alloc(model.ProfileConfig, parsed.value.profiles.len + 1);
     defer allocator.free(profiles);
     @memcpy(profiles[0..parsed.value.profiles.len], parsed.value.profiles);
@@ -134,9 +180,19 @@ pub fn setKernelArgs(io: std.Io, allocator: std.mem.Allocator, config: *const mo
     defer parsed.deinit();
     const profiles = try allocator.dupe(model.ProfileConfig, parsed.value.profiles);
     defer allocator.free(profiles);
+    // `canonicalizeKernelArgs` 会在候选投影上就地折叠空格（@constCast 写回），
+    // 因此必须持有可写副本，不能把调用方的 const 输入（可能位于只读段）直接
+    // 挂到 profile 上。
+    var owned_args: ?[]u8 = null;
+    defer if (owned_args) |args| allocator.free(args);
     var found = false;
     for (profiles) |*profile| if (std.mem.eql(u8, profile.name, profile_name)) {
-        profile.kernel_args = kernel_args;
+        if (kernel_args) |text| {
+            owned_args = try allocator.dupe(u8, text);
+            profile.kernel_args = owned_args.?;
+        } else {
+            profile.kernel_args = null;
+        }
         found = true;
         break;
     };
@@ -147,7 +203,63 @@ pub fn setKernelArgs(io: std.Io, allocator: std.mem.Allocator, config: *const mo
     config_load.canonicalizeKernelArgs(&projected);
     candidate.profiles = projected.profiles;
     try validate.validate(&projected, &candidate);
+    try mutateProfileMetadata(profiles, profile_name, std.Io.Clock.real.now(io).toSeconds());
     try catalog_store.save(io, allocator, catalog_path, &candidate);
+}
+
+/// v0.2.3 §3.3: `profile rootfs build --new-ssh-keys` 的 Profile 发布步。
+/// 把 `ssh_identity` 替换为调用方先在两阶段事务中创建的新 identity 引用，
+/// 并经过 `mutateProfileMetadata` 递增 revision / 更新 updated_at。
+/// identity 与 catalog 的原子性由调用方（handler 持有 identity store + journal）
+/// 保证；本函数只做 catalog 侧发布。
+pub fn rotateSshIdentity(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, catalog_path: []const u8, profile_name: []const u8, ssh_identity: model.ProfileSshIdentityRef) !void {
+    var parsed = try catalog_store.load(io, allocator, catalog_path);
+    defer parsed.deinit();
+    const profiles = try allocator.dupe(model.ProfileConfig, parsed.value.profiles);
+    defer allocator.free(profiles);
+    var found = false;
+    for (profiles) |*profile| if (std.mem.eql(u8, profile.name, profile_name)) {
+        profile.ssh_identity = ssh_identity;
+        found = true;
+        break;
+    };
+    if (!found) return error.ProfileNotFound;
+    var candidate = parsed.value;
+    candidate.profiles = profiles;
+    const projected = model.projectCatalog(config.*, &candidate);
+    try validate.validate(&projected, &candidate);
+    try mutateProfileMetadata(profiles, profile_name, std.Io.Clock.real.now(io).toSeconds());
+    try catalog_store.save(io, allocator, catalog_path, &candidate);
+}
+
+/// v0.2.3 §5.4: Profile revision 的统一 mutation 入口。在候选 catalog 校验
+/// 通过、持久化提交前执行：`revision = revision + 1`（溢出时事务失败）、
+/// `updated_at = now`；`created_at`、`provenance` 保持不变，除非操作本身是
+/// create/clone。所有 Profile mutation 入口必须经过该 helper，禁止 handler
+/// 各自递增；失败或 no-op 不递增（profile 不存在时返回 `ProfileNotFound`）。
+pub fn mutateProfileMetadata(profiles: []model.ProfileConfig, profile_name: []const u8, now: i64) !void {
+    for (profiles) |*profile| {
+        if (!std.mem.eql(u8, profile.name, profile_name)) continue;
+        profile.revision = std.math.add(u64, profile.revision, 1) catch return error.ProfileRevisionOverflow;
+        profile.updated_at = now;
+        return;
+    }
+    return error.ProfileNotFound;
+}
+
+test "mutateProfileMetadata bumps revision exactly once and no-ops on missing profile" {
+    var profiles = [_]model.ProfileConfig{.{ .name = "p1", .install_source = "s", .revision = 3, .created_at = 100, .updated_at = 100 }};
+    try mutateProfileMetadata(&profiles, "p1", 200);
+    try std.testing.expectEqual(@as(u64, 4), profiles[0].revision);
+    try std.testing.expectEqual(@as(i64, 200), profiles[0].updated_at);
+    // created_at / provenance 不被普通 mutation 触碰。
+    try std.testing.expectEqual(@as(i64, 100), profiles[0].created_at);
+    // 失败/no-op 不递增。
+    try std.testing.expectError(error.ProfileNotFound, mutateProfileMetadata(&profiles, "missing", 300));
+    try std.testing.expectEqual(@as(u64, 4), profiles[0].revision);
+    // 溢出时事务失败、不递增。
+    profiles[0].revision = std.math.maxInt(u64);
+    try std.testing.expectError(error.ProfileRevisionOverflow, mutateProfileMetadata(&profiles, "p1", 400));
 }
 
 test "profile kernel args mutation canonicalizes projected catalog data" {

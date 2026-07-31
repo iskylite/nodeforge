@@ -60,6 +60,14 @@ pub const ProfileBuildProjection = struct {
     /// 影响 rootfs-build package 步骤是否删除 casper 自带源，必须进入
     /// `rootfs_input_digest`，否则切换开关后可能复用旧缓存 rootfs。
     apt_preserve_sources_list: bool = false,
+    /// v0.2.3: Profile revision 与 SSH identity 引用进入构建投影。identity
+    /// 变更（--new-ssh-keys）必须产生不同 `rootfs_input_digest`，否则换 key
+    /// 后旧 rootfs 会被错误缓存命中。fingerprint 已含在 catalog reference。
+    profile_revision: u64,
+    ssh_identity_id: []const u8,
+    ssh_identity_revision: u64,
+    client_public_fingerprint: []const u8,
+    host_public_fingerprint: []const u8,
 };
 
 /// 只在 kernel/rootfs 之前生效的内容。
@@ -177,6 +185,11 @@ pub fn compile(allocator: std.mem.Allocator, config: *const model.AppConfig, cat
         .casper_layers = source.casper_layers,
         .first_boot_fixed_steps = first_boot_fixed_steps,
         .apt_preserve_sources_list = profile.install.apt.preserve_sources_list,
+        .profile_revision = profile.revision,
+        .ssh_identity_id = profile.ssh_identity.id,
+        .ssh_identity_revision = profile.ssh_identity.revision,
+        .client_public_fingerprint = profile.ssh_identity.client_public_fingerprint,
+        .host_public_fingerprint = profile.ssh_identity.host_public_fingerprint,
     };
     const node_boot: NodeBootProjection = .{
         .kernel_args = inner.kernel_args,
@@ -253,6 +266,11 @@ pub fn rootfsInputDigest(allocator: std.mem.Allocator, config: *const model.AppC
         .casper_layers = source.casper_layers,
         .first_boot_fixed_steps = first_boot_fixed_steps,
         .apt_preserve_sources_list = profile.install.apt.preserve_sources_list,
+        .profile_revision = profile.revision,
+        .ssh_identity_id = profile.ssh_identity.id,
+        .ssh_identity_revision = profile.ssh_identity.revision,
+        .client_public_fingerprint = profile.ssh_identity.client_public_fingerprint,
+        .host_public_fingerprint = profile.ssh_identity.host_public_fingerprint,
     };
     return digestOf(allocator, profile_build);
 }

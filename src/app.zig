@@ -36,6 +36,7 @@ const node_inventory = @import("state/node_inventory.zig");
 const operations = @import("state/operations.zig");
 const rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
 const diskless_delivery = @import("state/diskless_delivery.zig");
+const identity_store = @import("state/identity_store.zig");
 const model_transaction = @import("state/model_transaction.zig");
 const capacity = @import("state/capacity.zig");
 
@@ -77,9 +78,15 @@ pub fn run(
     var daemon_instance_id: [boot_session.id_len]u8 = undefined;
     try boot_session.generateId(io, &daemon_instance_id);
     try event_writer.setDaemonInstanceId(daemon_instance_id);
-    var sessions: boot_session.Store = .{};
+    // v0.2.3: Store 是 2048 项定长数组（~1MB），栈上分配会在 macOS 主线程
+    // 越界触发 SIGSEGV；与 runtime/statuses 一致改为堆分配。
+    const sessions = try allocator.create(boot_session.Store);
+    defer allocator.destroy(sessions);
+    sessions.* = .{};
     defer sessions.deinit();
-    var deployments: deployment_control.Store = .{};
+    const deployments = try allocator.create(deployment_control.Store);
+    defer allocator.destroy(deployments);
+    deployments.* = .{};
     var inventories = node_inventory.Store.init(allocator);
     defer inventories.deinit();
 
@@ -130,6 +137,33 @@ pub fn run(
     };
     if (restored_diskless != 0)
         observe_log.info("diskless-delivery: resumed {d} session(s)", .{restored_diskless});
+    // v0.2.3: SSH identity store。密钥生成/校验暂存目录先 mkdir 0700，再
+    // fail-closed load：文件损坏、schema/长度/复合键违规、fingerprint 不匹配
+    // 或 private/public 不成对时拒绝启动（与 diskless-secret 处理一致）。
+    // 随后在 serve 前恢复两阶段发布遗留的 journal（§4.2）：catalog 已引用且
+    // 指纹匹配则收尾提交，未引用则幂等回滚，已引用但缺失/不匹配则拒启。
+    // v0.2.3: IdentityRecord 每项含 4×4096B 密钥缓冲，256 项 Store 约 4.4MB，
+    // 与 sessions/deployments 一致改为堆分配，避免 macOS 主线程栈越界。
+    const identities = try allocator.create(identity_store.Store);
+    defer allocator.destroy(identities);
+    identities.* = identity_store.Store.init(allocator, paths.require().identity_store_path);
+    defer identities.deinit();
+    identities.staging_dir = paths.require().identity_staging_dir;
+    identities.transactions_dir = paths.require().identity_transactions_dir;
+    try identity_store.ensurePrivateDir(io, allocator, paths.require().identity_staging_dir);
+    try identity_store.ensurePrivateDir(io, allocator, paths.require().identity_transactions_dir);
+    identities.load(io) catch |err| {
+        observe_log.err("identity-store: refusing startup with invalid state: {t}", .{err});
+        return err;
+    };
+    const recovered_journals = identities.recoverPendingTransactions(io, allocator, catalog) catch |err| {
+        observe_log.err("identity-store: refusing startup with unrecoverable transaction: {t}", .{err});
+        return err;
+    };
+    if (recovered_journals != 0)
+        observe_log.warn("identity-store: recovered {d} pending transaction(s) at startup", .{recovered_journals});
+    if (identities.count != 0)
+        observe_log.info("identity-store: loaded {d} identity revision(s)", .{identities.count});
     const model_revision = try deployment_control.revisionForModel(allocator, config, catalog);
     const config_revision = model_revision.config;
     var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);
@@ -140,7 +174,7 @@ pub fn run(
     var live_catalog = try catalog_runtime.CatalogRuntime.init(allocator, catalog_path, catalog);
     defer live_catalog.deinit();
     var live_models = model_runtime.ModelRuntime.init(&live_config, &live_catalog);
-    deployment_control.load(io, allocator, paths.require().deployment_control_path, &deployments) catch |err| switch (err) {
+    deployment_control.load(io, allocator, paths.require().deployment_control_path, deployments) catch |err| switch (err) {
         error.FileNotFound => {},
         else => {
             observe_log.err("deployment-control: refusing startup with invalid state: {t}", .{err});
@@ -150,7 +184,7 @@ pub fn run(
     // M4.9：必须先加载 deployment-control，再恢复 capability。两个 checkpoint
     // 分别原子写但不构成跨文件事务，因此恢复破坏性安装 session 前必须验证它
     // 仍对应当时固定的 generation/revision，不能把旧 token 接到新 generation。
-    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, &deployments, &sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
+    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, deployments, sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
         error.FileNotFound => 0,
         else => {
             observe_log.err("boot-session: refusing invalid checkpoint: {t}", .{err});
@@ -161,7 +195,7 @@ pub fn run(
     // deployment/session/status 是同一个 M4.9b schema 窗口。旧 checkpoint
     // 读取成功后立即重写，而不是等待下一次 DHCP/HTTP 事件或有序关机；这样
     // 升级中途崩溃也不会长期留下混合 schema。旧 capability 已在 load 中丢弃。
-    try boot_session_store.save(io, allocator, paths.require().boot_sessions_path, &sessions, current_time);
+    try boot_session_store.save(io, allocator, paths.require().boot_sessions_path, sessions, current_time);
     var migrated_status_snapshot: [node_status.max_statuses]node_status.Status = undefined;
     statuses.snapshot(&migrated_status_snapshot);
     try status_store.save(io, allocator, paths.require().node_status_path, &migrated_status_snapshot, statuses.currentRevision(), current_time);
@@ -185,7 +219,7 @@ pub fn run(
         const digest = try @import("state/plan_digest.zig").forNode(allocator, config, catalog, delivery, node.id);
         deployments.ensureInitial(node.id, digest, current_time) catch |err| return err;
     };
-    try deployment_control.save(io, allocator, paths.require().deployment_control_path, &deployments);
+    try deployment_control.save(io, allocator, paths.require().deployment_control_path, deployments);
 
     // M3.1：leases.json 和 node-status.json 使用独立的 I/O 锁。
     // DHCP checkpoint worker 持有 leases.json；HTTP handler 持有
@@ -210,8 +244,8 @@ pub fn run(
         .allocator = allocator,
         .events_path = paths.require().events_path,
         .writer = &event_writer,
-        .sessions = &sessions,
-        .deployments = &deployments,
+        .sessions = sessions,
+        .deployments = deployments,
         .models = &live_models,
         .bootstrap_key = bootstrap_key,
         .additional_keys = additional_keys,
@@ -224,7 +258,7 @@ pub fn run(
     observe_log.info("dhcp: listening on udp://{s}:{d}", .{ config.server.server_ip, dhcp_server.port });
     const tftp_socket = try tftp_server.bind(io, config.server.server_ip);
     var capsule_store: tftp_server.CapsuleStore = .{};
-    var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, allocator, tftp_socket, &live_models, runtime, &event_writer, &sessions, &capsule_store, &stop_workers });
+    var tftp_thread = try std.Thread.spawn(.{}, runTftp, .{ io, allocator, tftp_socket, &live_models, runtime, &event_writer, sessions, &capsule_store, &stop_workers });
     observe_log.info("tftp: listening on udp://{s}:{d}", .{ config.server.server_ip, tftp_server.port });
 
     // M3.1：启动 DHCP lease checkpoint worker。它是 leases.json 的唯一写入者，
@@ -248,13 +282,14 @@ pub fn run(
         &live_models,
         runtime,
         &event_writer,
-        &sessions,
+        sessions,
         statuses,
-        &deployments,
+        deployments,
         &inventories,
         &operation_store,
         &rootfs_artifacts,
         &diskless_store,
+        identities,
         config_revision,
         bootstrap_key,
         additional_keys,
@@ -289,7 +324,7 @@ pub fn run(
 
     // 已签发 capability 的 delivery session 在有序重启前保存到权限为 0600
     // 的 checkpoint；下一实例继续使用同一 token 和 session 身份。
-    boot_session_store.save(io, allocator, paths.require().boot_sessions_path, &sessions, now()) catch |err|
+    boot_session_store.save(io, allocator, paths.require().boot_sessions_path, sessions, now()) catch |err|
         observe_log.err("boot-session: checkpoint failed: {t}", .{err});
 
     // worker 已退出后才终止活动 session，确保不会再有 DHCP/TFTP 事件引用它们；

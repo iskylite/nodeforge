@@ -105,6 +105,13 @@ pub const Paths = struct {
     /// v0.2.3: SSH identity store 文件路径（`<root>/state/identities.json`）。
     /// 存储 Profile SSH 密钥对，private key 不进入 catalog。
     identity_store_path: []const u8,
+    /// v0.2.3: SSH identity 密钥生成/校验暂存目录（`<root>/state/identity-staging`，
+    /// 0700）。私钥只在暂存目录中出现，绝不进入 `/tmp` 或工作目录。
+    identity_staging_dir: []const u8,
+    /// v0.2.3: SSH identity 两阶段事务 journal 目录（`<root>/state/identity-transactions`，
+    /// 0700）。create/clone `--new-ssh-keys` 的 prepared journal 存放于此，
+    /// daemon 启动时在 serve 前按 §4.2 恢复。
+    identity_transactions_dir: []const u8,
     /// 模型事务目录（`<root>/state/model-transactions`）。
     /// 存放 catalog mutation 等大事务的 before/after 快照。
     model_transactions_dir: []const u8,
@@ -303,6 +310,8 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .diskless_delivery_path = try join(allocator, root, "state/diskless-delivery.json"),
         .diskless_secret_path = try join(allocator, root, "state/diskless-secret"),
         .identity_store_path = try join(allocator, root, "state/identities.json"),
+        .identity_staging_dir = try join(allocator, root, "state/identity-staging"),
+        .identity_transactions_dir = try join(allocator, root, "state/identity-transactions"),
         .model_transactions_dir = try join(allocator, root, "state/model-transactions"),
         .events_path = try join(allocator, root, "logs/events.jsonl"),
         .service_log_path = try join(allocator, root, "logs/nodeforged.log"),

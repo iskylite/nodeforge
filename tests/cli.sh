@@ -204,6 +204,36 @@ if "$cli" node boot-prepare --help >"$tmp/node-boot-prepare-help" 2>&1; then
 fi
 "$cli" profile clone --help >"$tmp/profile-clone-help"
 grep -Fq 'Atomically clone a Profile desired configuration' "$tmp/profile-clone-help"
+# v0.2.3 §5.2: clone 扩展 flags（--build/--detach）与 property patch 参数。
+grep -Fq -- '--build' "$tmp/profile-clone-help"
+grep -Fq -- '--detach' "$tmp/profile-clone-help"
+grep -Fq 'KEY=VALUE' "$tmp/profile-clone-help"
+grep -Fq -- '--new-ssh-keys' "$tmp/profile-clone-help"
+# §5.2: --detach 单独使用是 CLI 输入错误（exit 2），连接 daemon 前拒绝。
+if "$cli" profile clone install diskless-copy --detach -o json >"$tmp/profile-clone-detach-alone" 2>&1; then
+    echo "clone --detach without --build unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+grep -Fq '"code":"profile.clone_invalid"' "$tmp/profile-clone-detach-alone"
+# §5.2: 不可 patch 的键（provenance/revision/ssh_identity 不在 PropertySpec）
+# 是 CLI 输入错误（exit 2）。
+if "$cli" profile clone install diskless-copy provenance.origin=create -o json >"$tmp/profile-clone-bad-property" 2>&1; then
+    echo "clone with non-patchable property unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+grep -Fq '"code":"profile.invalid_property"' "$tmp/profile-clone-bad-property"
+# §5.2: 集合键须走 values 命令（exit 2）。
+if "$cli" profile clone install diskless-copy install.storage.partitions=x -o json >"$tmp/profile-clone-collection-key" 2>&1; then
+    echo "clone with collection key unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+grep -Fq '"code":"property.list_operation_required"' "$tmp/profile-clone-collection-key"
 "$cli" operation list --help >"$tmp/operation-list-help"
 "$cli" operation follow --help >"$tmp/operation-follow-help"
 grep -Fq 'without cancelling' "$tmp/operation-follow-help"

@@ -3,8 +3,8 @@
 //! 自包含的 diskless 交付子系统：按 session 持有节点/profile/rootfs 定位器、
 //! 固定的 AgentPlan（immutable bytes + digest）以及 config/rootfs/agent/event 四类
 //! scoped token 的 HMAC hash + claim。raw token 只返回给调用方（capsule/响应），
-//! 持久化只保存 [`diskless_credential.hashOf`]；raw token 仅驻进程内存并可由
-//! master secret + claim 确定性重建。session 持久化到
+//! 持久化保存 [`diskless_credential.hashOf`] 及绑定完整 claim 的 MAC；raw token
+//! 仅驻进程内存并可由 master secret 确定性重建。session 持久化到
 //! `diskless-delivery.json`，跨 daemon 重启可验证（HMAC secret 也持久化）。
 //!
 //! 这是 install [`boot_session.Store`] 之外的独立 diskless 通路：install session
@@ -25,10 +25,11 @@ pub const name_cap = 128;
 pub const kernel_cap = 64;
 pub const agent_plan_cap = 16384;
 pub const default_ttl_seconds: i64 = 2 * 60 * 60;
-/// schema 2 renamed lifecycle timestamps to their canonical task-column names.
+/// schema 3 adds mandatory per-slot claim MACs and directly replaces v1/v2;
+/// the reader intentionally accepts only this latest schema.
 /// Reader compatibility for schema 1 is explicit because both the historical
 /// (`created_at`/`started_at`) and the briefly emitted renamed shape used v1.
-pub const persistence_schema_version: u32 = 2;
+pub const persistence_schema_version: u32 = 3;
 
 /// 加载或首次创建 diskless capability master secret。文件保存 32-byte secret
 /// 的 64 位小写 hex，权限固定 0600；格式损坏时拒绝启动，绝不静默换密钥使活动
@@ -60,6 +61,7 @@ pub const TokenSlot = struct {
     content_len: u8 = 0,
     expires_mono: i64 = 0,
     event_seq: u64 = 0,
+    claim_mac: [hash_len]u8 = [_]u8{0} ** hash_len,
 };
 
 pub const Session = struct {
@@ -158,14 +160,6 @@ pub const Store = struct {
         const header = try std.json.parseFromSlice(PersistedHeader, self.allocator, bytes, .{ .ignore_unknown_fields = true });
         defer header.deinit();
         switch (header.value.schema_version) {
-            1 => {
-                const parsed = try std.json.parseFromSlice(PersistedFileV1, self.allocator, bytes, .{ .allocate = .alloc_always });
-                defer parsed.deinit();
-                if (parsed.value.sessions.len > max_sessions) return error.InvalidDisklessDeliveryStore;
-                var upgraded: [max_sessions]PersistedSession = undefined;
-                for (parsed.value.sessions, 0..) |item, index| upgraded[index] = try upgradePersistedSessionV1(item);
-                return self.restorePersisted(parsed.value.revision, upgraded[0..parsed.value.sessions.len], now_mono, now_utc);
-            },
             persistence_schema_version => {
                 const parsed = try std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always });
                 defer parsed.deinit();
@@ -185,6 +179,7 @@ pub const Store = struct {
             if (item.expires_at <= now_utc and !item.phase.isTerminal()) continue;
             const slot_index = self.findFree() orelse return error.DisklessSessionCapacity;
             var session = try restoreSession(item, now_mono, now_utc);
+            try requireClaimMacs(&session);
             if (session.phase.isTerminal()) {
                 // v0.2.3: terminal phase session 保留长期状态投影给 node list，
                 // 但不重构四类 raw token。terminal session 的四个 slot 在内存中
@@ -198,6 +193,9 @@ pub const Store = struct {
                 // 任一重构 token 与合法长度 hash 不匹配时，不恢复任何 scope、
                 // 清零已重构 raw bytes 并设 recovery_incomplete；其他 session 继续。
                 try reconstructAllOrMarkIncomplete(self.secret, &session);
+                // token hash 不匹配维持 recovery_incomplete 语义；只有 token 本身
+                // 可重构时，claim MAC 不匹配才证明 checkpoint claim 被篡改。
+                if (!session.recovery_incomplete) try verifyClaimMacs(self.secret, &session);
             }
             self.sessions[slot_index] = session;
             restored += 1;
@@ -205,8 +203,8 @@ pub const Store = struct {
         return restored;
     }
 
-    /// 原子 checkpoint。只序列化 active session 的 immutable snapshot、claim 和
-    /// token HMAC；raw token 永不落盘。
+    /// 原子 checkpoint。只序列化 active session 的 immutable snapshot、claim、
+    /// token HMAC 与 claim MAC；raw token 永不落盘。
     pub fn persist(self: *Store, io: std.Io) !void {
         if (self.path.len == 0) return;
         const previous_revision = self.revision;
@@ -216,6 +214,7 @@ pub const Store = struct {
         var count: usize = 0;
         for (&self.sessions) |*session| {
             if (!session.active) continue;
+            refreshClaimMacs(self.secret, session);
             compact[count] = persistedSession(session);
             count += 1;
         }
@@ -505,6 +504,7 @@ const PersistedSlot = struct {
     scope: cred.Scope,
     content_digest: []const u8,
     event_seq: u64,
+    claim_mac: []const u8 = "",
 };
 
 const PersistedSession = struct {
@@ -535,43 +535,8 @@ const PersistedSession = struct {
     event_token: PersistedSlot,
 };
 
-/// Schema 1 existed in two field-name shapes. Optional aliases let the reader
-/// distinguish them without relying on permissive unknown-field/default rules.
-const PersistedSessionV1 = struct {
-    session_id: []const u8,
-    node_id: []const u8,
-    profile: []const u8,
-    rootfs_input_digest: []const u8,
-    rootfs_sha512: []const u8,
-    rootfs_size: u64,
-    rootfs_uncompressed_size: u64 = 0,
-    tmpfs_percent: u8,
-    minimum_free_bytes: u64,
-    safety_margin_bytes: u64,
-    kernel_release: []const u8,
-    agent_plan_json: []const u8,
-    agent_plan_digest: []const u8,
-    created_at: ?i64 = null,
-    started_at: ?i64 = null,
-    armed_at: ?i64 = null,
-    install_at: ?i64 = null,
-    finished_at: i64 = 0,
-    expires_at: i64,
-    phase: lifecycle.Phase,
-    config_token: PersistedSlot,
-    rootfs_token: PersistedSlot,
-    agent_token: PersistedSlot,
-    event_token: PersistedSlot,
-};
-
 const PersistedHeader = struct {
     schema_version: u32,
-};
-
-const PersistedFileV1 = struct {
-    schema_version: u32,
-    revision: u64 = 0,
-    sessions: []const PersistedSessionV1 = &.{},
 };
 
 const PersistedFile = struct {
@@ -579,46 +544,6 @@ const PersistedFile = struct {
     revision: u64 = 0,
     sessions: []const PersistedSession = &.{},
 };
-
-fn upgradePersistedSessionV1(item: PersistedSessionV1) !PersistedSession {
-    return .{
-        .session_id = item.session_id,
-        .node_id = item.node_id,
-        .profile = item.profile,
-        .rootfs_input_digest = item.rootfs_input_digest,
-        .rootfs_sha512 = item.rootfs_sha512,
-        .rootfs_size = item.rootfs_size,
-        .rootfs_uncompressed_size = item.rootfs_uncompressed_size,
-        .tmpfs_percent = item.tmpfs_percent,
-        .minimum_free_bytes = item.minimum_free_bytes,
-        .safety_margin_bytes = item.safety_margin_bytes,
-        .kernel_release = item.kernel_release,
-        .agent_plan_json = item.agent_plan_json,
-        .agent_plan_digest = item.agent_plan_digest,
-        .armed_at = try renamedTimestamp(item.created_at, item.armed_at, true),
-        .install_at = try renamedTimestamp(item.started_at, item.install_at, false),
-        .finished_at = item.finished_at,
-        .expires_at = item.expires_at,
-        .phase = item.phase,
-        .config_token = item.config_token,
-        .rootfs_token = item.rootfs_token,
-        .agent_token = item.agent_token,
-        .event_token = item.event_token,
-    };
-}
-
-fn renamedTimestamp(legacy: ?i64, current: ?i64, required: bool) !i64 {
-    if (legacy) |old| {
-        if (current) |new| {
-            if (old != new) return error.InvalidDisklessDeliveryStore;
-            return new;
-        }
-        return old;
-    }
-    if (current) |new| return new;
-    if (required) return error.InvalidDisklessDeliveryStore;
-    return 0;
-}
 
 /// 将内存中的 token slot 投影为可持久化形式（只存 hash+claim，不含 raw token）。
 fn persistedSlot(slot: *const TokenSlot) PersistedSlot {
@@ -628,6 +553,7 @@ fn persistedSlot(slot: *const TokenSlot) PersistedSlot {
         .scope = slot.scope,
         .content_digest = slot.content_digest[0..slot.content_len],
         .event_seq = slot.event_seq,
+        .claim_mac = &slot.claim_mac,
     };
 }
 
@@ -706,7 +632,7 @@ fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session 
 
 /// 从持久化 hash+claim 恢复 token slot（不含 raw token）；过期时间由调用方按 TTL 重算。
 fn restoreSlot(item: PersistedSlot, expires_mono: i64) !TokenSlot {
-    if (item.hash.len != hash_len or item.content_digest.len > sha512_len) return error.InvalidDisklessDeliveryStore;
+    if (item.hash.len != hash_len or item.content_digest.len > sha512_len or (item.claim_mac.len != 0 and item.claim_mac.len != hash_len)) return error.InvalidDisklessDeliveryStore;
     var slot: TokenSlot = .{
         .issued = item.issued,
         .scope = item.scope,
@@ -715,8 +641,71 @@ fn restoreSlot(item: PersistedSlot, expires_mono: i64) !TokenSlot {
         .event_seq = item.event_seq,
     };
     @memcpy(&slot.hash, item.hash);
+    if (item.claim_mac.len == hash_len) @memcpy(&slot.claim_mac, item.claim_mac);
     @memcpy(slot.content_digest[0..item.content_digest.len], item.content_digest);
     return slot;
+}
+
+fn updateClaimMac(hmac: *std.crypto.auth.hmac.sha2.HmacSha256, bytes: []const u8) void {
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, bytes.len, .big);
+    hmac.update(&length);
+    hmac.update(bytes);
+}
+
+fn claimMac(secret: []const u8, session: *const Session, kind: Store.SlotKind, slot: *const TokenSlot) [hash_len]u8 {
+    // claim MAC 使用 daemon master secret；恢复时先处理 token-hash mismatch，
+    // 因而 secret 变化仍进入 recovery_incomplete，单独 claim 篡改则 fail closed。
+    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(secret);
+    hmac.update("nodeforge-diskless-checkpoint-claim-v1\x00");
+    updateClaimMac(&hmac, &session.session_id);
+    updateClaimMac(&hmac, session.nodeId());
+    updateClaimMac(&hmac, session.rootfsInputDigest());
+    updateClaimMac(&hmac, session.rootfsSha512());
+    updateClaimMac(&hmac, session.agentPlanDigest());
+    updateClaimMac(&hmac, @tagName(kind));
+    updateClaimMac(&hmac, slot.scope.canonicalName());
+    updateClaimMac(&hmac, slot.content_digest[0..slot.content_len]);
+    updateClaimMac(&hmac, &slot.hash);
+    var scalars: [17]u8 = undefined;
+    scalars[0] = @intFromBool(slot.issued);
+    std.mem.writeInt(u64, scalars[1..9], slot.event_seq, .big);
+    std.mem.writeInt(i64, scalars[9..17], session.expires_at, .big);
+    hmac.update(&scalars);
+    var mac: [32]u8 = undefined;
+    hmac.final(&mac);
+    var encoded: [hash_len]u8 = undefined;
+    _ = std.fmt.bufPrint(&encoded, "{x}", .{mac}) catch unreachable;
+    return encoded;
+}
+
+fn refreshClaimMacs(secret: []const u8, session: *Session) void {
+    session.config_token.claim_mac = claimMac(secret, session, .config, &session.config_token);
+    session.rootfs_token.claim_mac = claimMac(secret, session, .rootfs, &session.rootfs_token);
+    session.agent_token.claim_mac = claimMac(secret, session, .agent, &session.agent_token);
+    session.event_token.claim_mac = claimMac(secret, session, .event, &session.event_token);
+}
+
+fn verifyClaimMacs(secret: []const u8, session: *const Session) !void {
+    try verifyClaimMac(secret, session, .config, &session.config_token);
+    try verifyClaimMac(secret, session, .rootfs, &session.rootfs_token);
+    try verifyClaimMac(secret, session, .agent, &session.agent_token);
+    try verifyClaimMac(secret, session, .event, &session.event_token);
+}
+
+fn requireClaimMacs(session: *const Session) !void {
+    if (std.mem.allEqual(u8, &session.config_token.claim_mac, 0) or
+        std.mem.allEqual(u8, &session.rootfs_token.claim_mac, 0) or
+        std.mem.allEqual(u8, &session.agent_token.claim_mac, 0) or
+        std.mem.allEqual(u8, &session.event_token.claim_mac, 0))
+        return error.InvalidDisklessDeliveryStore;
+}
+
+fn verifyClaimMac(secret: []const u8, session: *const Session, kind: Store.SlotKind, slot: *const TokenSlot) !void {
+    // Empty MAC is accepted only for the one-time schema-2 migration path.
+    if (std.mem.allEqual(u8, &slot.claim_mac, 0)) return;
+    const expected = claimMac(secret, session, kind, slot);
+    if (!std.crypto.timing_safe.eql([hash_len]u8, expected, slot.claim_mac)) return error.InvalidDisklessDeliveryStore;
 }
 
 /// 从 master secret + session_id + capability kind 确定性派生 raw token
@@ -884,88 +873,22 @@ test "delivery checkpoint restores session and reconstructs raw capabilities" {
     ));
 }
 
-test "schema 1 lifecycle names upgrade to schema 2 and survive reload" {
+test "checkpoint schema direct replacement rejects v1 and v2" {
     var temp = std.testing.tmpDir(.{});
     defer temp.cleanup();
-    const path = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(path);
-    const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/diskless-delivery-v1.json", .{path});
+    const dir = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/diskless-delivery.json", .{dir});
     defer std.testing.allocator.free(checkpoint);
     const secret = [_]u8{0x61} ** 32;
 
-    var before = Store.init(std.testing.allocator, &secret, "");
-    const session = try before.begin(
-        std.testing.io,
-        "node-v1",
-        "profile-v1",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        4096,
-        16384,
-        "5.14.0",
-        50,
-        64,
-        32,
-        100,
-        1000,
-    );
-    const session_id = session.session_id;
-    try before.pinAgentPlan(std.testing.io, &session_id, "{\"schema_version\":1}");
-    try before.markBootConfigFetched(std.testing.io, &session_id);
-    try before.issue(std.testing.io, &session_id, .event);
-    _ = try before.advanceEvent(std.testing.io, &session_id, .boot_config_fetched, .diskless_initrd_started, 0, 1100);
-
-    const current = before.find(&session_id) orelse return error.TestExpectedEqual;
-    var legacy_sessions = [_]PersistedSessionV1{.{
-        .session_id = &current.session_id,
-        .node_id = current.nodeId(),
-        .profile = current.profileName(),
-        .rootfs_input_digest = current.rootfsInputDigest(),
-        .rootfs_sha512 = current.rootfsSha512(),
-        .rootfs_size = current.rootfs_size,
-        .rootfs_uncompressed_size = current.rootfs_uncompressed_size,
-        .tmpfs_percent = current.tmpfs_percent,
-        .minimum_free_bytes = current.minimum_free_bytes,
-        .safety_margin_bytes = current.safety_margin_bytes,
-        .kernel_release = current.kernelRelease(),
-        .agent_plan_json = current.agentPlanJson(),
-        .agent_plan_digest = current.agentPlanDigest(),
-        .created_at = current.armed_at,
-        .started_at = current.install_at,
-        .finished_at = current.finished_at,
-        .expires_at = current.expires_at,
-        .phase = current.phase,
-        .config_token = persistedSlot(&current.config_token),
-        .rootfs_token = persistedSlot(&current.rootfs_token),
-        .agent_token = persistedSlot(&current.agent_token),
-        .event_token = persistedSlot(&current.event_token),
-    }};
-    const legacy_json = try std.json.Stringify.valueAlloc(std.testing.allocator, PersistedFileV1{
-        .schema_version = 1,
-        .revision = 7,
-        .sessions = &legacy_sessions,
-    }, .{ .emit_null_optional_fields = false });
-    defer std.testing.allocator.free(legacy_json);
-    try atomicWrite(std.testing.io, checkpoint, legacy_json);
-
-    var upgraded = Store.init(std.testing.allocator, &secret, checkpoint);
-    try std.testing.expectEqual(@as(usize, 1), try upgraded.load(std.testing.io, 200, 1200));
-    const restored = upgraded.find(&session_id) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(i64, 1000), restored.armed_at);
-    try std.testing.expectEqual(@as(i64, 1100), restored.install_at);
-    try upgraded.persist(std.testing.io);
-
-    const latest = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
-    defer std.testing.allocator.free(latest);
-    const header = try std.json.parseFromSlice(PersistedHeader, std.testing.allocator, latest, .{ .ignore_unknown_fields = true });
-    defer header.deinit();
-    try std.testing.expectEqual(persistence_schema_version, header.value.schema_version);
-
-    var reloaded = Store.init(std.testing.allocator, &secret, checkpoint);
-    try std.testing.expectEqual(@as(usize, 1), try reloaded.load(std.testing.io, 300, 1300));
-    const final = reloaded.find(&session_id) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(i64, 1000), final.armed_at);
-    try std.testing.expectEqual(@as(i64, 1100), final.install_at);
+    for ([_]u32{ 1, 2 }) |version| {
+        const bytes = try std.fmt.allocPrint(std.testing.allocator, "{{\"schema_version\":{d},\"revision\":0,\"sessions\":[]}}", .{version});
+        defer std.testing.allocator.free(bytes);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = bytes });
+        var store = Store.init(std.testing.allocator, &secret, checkpoint);
+        try std.testing.expectError(error.InvalidDisklessDeliveryStore, store.load(std.testing.io, 100, 1000));
+    }
 }
 
 test "diskless event CAS is ordered and exact retry is idempotent" {
@@ -1108,6 +1031,184 @@ test "terminal phase session restores without capability reconstruction" {
         0,
         11,
     ));
+}
+
+/// 构造一个已持久化为 terminal（diskless.running）的 checkpoint 并返回
+/// session id 与文件字节，供 §6.3 语义冻结负测篡改。
+fn terminalCheckpointBytes(io: std.Io, allocator: std.mem.Allocator, path: []const u8, secret: []const u8) !struct { session_id: [id_len]u8, bytes: []u8 } {
+    var before = Store.init(allocator, secret, path);
+    const session = try before.begin(
+        io,
+        "node-term",
+        "profile-term",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        4096,
+        16384,
+        "5.14.0",
+        50,
+        64,
+        32,
+        100,
+        1000,
+    );
+    const session_id = session.session_id;
+    try before.pinAgentPlan(io, &session_id, "{\"schema_version\":1}");
+    try before.issue(io, &session_id, .config);
+    try before.issue(io, &session_id, .event);
+    try before.markBootConfigFetched(io, &session_id);
+    try before.issue(io, &session_id, .event);
+    _ = try before.advanceEvent(io, &session_id, .boot_config_fetched, .diskless_initrd_started, 0, 1100);
+    _ = try before.advanceEvent(io, &session_id, .diskless_initrd_started, .diskless_rootfs_downloading, 1, 1200);
+    _ = try before.advanceEvent(io, &session_id, .diskless_rootfs_downloading, .diskless_rootfs_verified, 2, 1300);
+    _ = try before.advanceEvent(io, &session_id, .diskless_rootfs_verified, .diskless_rootfs_mounted, 3, 1400);
+    _ = try before.advanceEvent(io, &session_id, .diskless_rootfs_mounted, .diskless_switching_root, 4, 1500);
+    _ = try before.advanceEvent(io, &session_id, .diskless_switching_root, .diskless_agent_configuring, 5, 1600);
+    _ = try before.advanceEvent(io, &session_id, .diskless_agent_configuring, .diskless_running, 6, 1700);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+    return .{ .session_id = session_id, .bytes = bytes };
+}
+
+/// 篡改第 `occurrence` 个 `"hash": "` 后的 hash 内容；replacement 长度必须
+/// <= 64，其余字节填 'a' 以保持 JSON 结构。
+fn tamperHash(bytes: []u8, occurrence: usize, replacement: []const u8) !void {
+    if (replacement.len > hash_len) return error.TestUnexpectedResult;
+    // persist 使用 indent_2，Stringify 在冒号后输出一个空格。
+    const needle = "\"hash\": \"";
+    var found: usize = 0;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, search_from, needle)) |pos| {
+        if (found == occurrence) {
+            @memset(bytes[pos + needle.len .. pos + needle.len + hash_len], 'a');
+            @memcpy(bytes[pos + needle.len .. pos + needle.len + replacement.len], replacement);
+            return;
+        }
+        found += 1;
+        search_from = pos + needle.len;
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// 把第 `occurrence` 个 hash 的 64 字符值缩短为 `replacement`（保持 JSON
+/// 结构合法），返回重排后的新缓冲区。
+fn shortenHash(allocator: std.mem.Allocator, bytes: []const u8, occurrence: usize, replacement: []const u8) ![]u8 {
+    if (replacement.len >= hash_len) return error.TestUnexpectedResult;
+    const needle = "\"hash\": \"";
+    var found: usize = 0;
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, search_from, needle)) |pos| {
+        if (found == occurrence) {
+            const out = try allocator.alloc(u8, bytes.len - hash_len + replacement.len);
+            const head = bytes[0 .. pos + needle.len];
+            const tail = bytes[pos + needle.len + hash_len ..];
+            @memcpy(out[0..head.len], head);
+            @memcpy(out[head.len .. head.len + replacement.len], replacement);
+            @memcpy(out[head.len + replacement.len ..], tail);
+            return out;
+        }
+        found += 1;
+        search_from = pos + needle.len;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn shortenClaimMac(allocator: std.mem.Allocator, bytes: []const u8, replacement: []const u8) ![]u8 {
+    if (replacement.len >= hash_len) return error.TestUnexpectedResult;
+    const needle = "\"claim_mac\": \"";
+    const pos = std.mem.indexOf(u8, bytes, needle) orelse return error.TestUnexpectedResult;
+    const out = try allocator.alloc(u8, bytes.len - hash_len + replacement.len);
+    const head = bytes[0 .. pos + needle.len];
+    const tail = bytes[pos + needle.len + hash_len ..];
+    @memcpy(out[0..head.len], head);
+    @memcpy(out[head.len .. head.len + replacement.len], replacement);
+    @memcpy(out[head.len + replacement.len ..], tail);
+    return out;
+}
+
+test "v0.2.3: terminal session hash 内容篡改不 fail closed 且 capability 全拒" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/tamper-content.json", .{path});
+    defer std.testing.allocator.free(checkpoint);
+    const secret = [_]u8{0x6b} ** 32;
+    const helper = try terminalCheckpointBytes(std.testing.io, std.testing.allocator, checkpoint, &secret);
+    defer std.testing.allocator.free(helper.bytes);
+    // 内容篡改但保持 64 字节合法长度 → 不 fail closed。
+    try tamperHash(helper.bytes, 0, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = helper.bytes });
+
+    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1800));
+    const restored = after.find(&helper.session_id) orelse return error.TestExpectedEqual;
+    try std.testing.expect(restored.phase.isTerminal());
+    // 四 scope 全部拒绝（terminal session 不重构 capability，slots 不可认证）。
+    try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(&helper.session_id, &restored.config_token_raw, .config, "node-term", "", restored.rootfsSha512(), 0, 11));
+    try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(&helper.session_id, &restored.rootfs_token_raw, .rootfs, "node-term", "/rootfs.squashfs", restored.rootfsSha512(), 0, 11));
+    try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(&helper.session_id, &restored.agent_token_raw, .agent, "node-term", "", "", 0, 11));
+    try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(&helper.session_id, &restored.event_token_raw, .event, "node-term", "", "", 1, 11));
+}
+
+test "v0.2.3: terminal session hash 长度非法仍 fail closed" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/tamper-length.json", .{path});
+    defer std.testing.allocator.free(checkpoint);
+    const secret = [_]u8{0x6b} ** 32;
+    const helper = try terminalCheckpointBytes(std.testing.io, std.testing.allocator, checkpoint, &secret);
+    defer std.testing.allocator.free(helper.bytes);
+    // hash 长度 != 64 → restoreSlot 结构性损坏 → daemon 拒启。
+    const tampered = try shortenHash(std.testing.allocator, helper.bytes, 0, "aa");
+    defer std.testing.allocator.free(tampered);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = tampered });
+    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1800));
+}
+
+test "v0.2.3: non-terminal checkpoint claim tampering fails closed" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const dir = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/claim-tamper.json", .{dir});
+    defer std.testing.allocator.free(checkpoint);
+    const secret = [_]u8{0x4d} ** 32;
+    var before = Store.init(std.testing.allocator, &secret, checkpoint);
+    const session = try before.begin(std.testing.io, "node-claim", "profile-claim", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1, 2, "6.8.0", 50, 1, 1, 100, 1000);
+    const session_id = session.session_id;
+    try before.issue(std.testing.io, &session_id, .config);
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(bytes);
+    const needle = "\"scope\": \"config_read\"";
+    const pos = std.mem.indexOf(u8, bytes, needle) orelse return error.TestUnexpectedResult;
+    @memcpy(bytes[pos + "\"scope\": \"".len .. pos + "\"scope\": \"".len + "rootfs_read".len], "rootfs_read");
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = bytes });
+
+    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1010));
+}
+
+test "checkpoint schema v3 requires every claim MAC" {
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const dir = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing-mac.json", .{dir});
+    defer std.testing.allocator.free(checkpoint);
+    const secret = [_]u8{0x5e} ** 32;
+    var before = Store.init(std.testing.allocator, &secret, checkpoint);
+    _ = try before.begin(std.testing.io, "node-mac", "profile-mac", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1, 2, "6.8.0", 50, 1, 1, 100, 1000);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(bytes);
+    const missing = try shortenClaimMac(std.testing.allocator, bytes, "");
+    defer std.testing.allocator.free(missing);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = missing });
+    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1010));
 }
 
 test "master secret change causes recovery_incomplete for non-terminal session" {

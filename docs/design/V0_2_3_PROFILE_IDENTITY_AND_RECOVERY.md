@@ -1,6 +1,7 @@
 # NodeForge v0.2.3 设计：Profile Identity 与恢复语义收口
 
-状态：设计冻结，待实现  
+状态：设计冻结；Batch 1–5 已实现；aarch64 VMware Rocky/Ubuntu diskless
+定向回归均已通过（见 §10）
 前置：v0.2.2 `dd95376`  
 schema：catalog v4 → v5；BootConfig 保持 v3；AgentPlan 保持 v1
 
@@ -123,8 +124,16 @@ Zig `std.json.parseFromSlice` 默认 `.ignore_unknown_fields = true`，旧版 CL
 
 private key 不进入 catalog。daemon-owned identity store 独立持久化。
 
-**存储路径**：`<install-root>/state/identities.json`（由 `src/paths.zig` 新增
-`identity_store_path` 字段，与 `diskless_secret_path`、`operations_path` 同级）。
+**内存形态**：`identity_store.Store` 是 `max_identities(256)` 项定长数组，每项含
+4×4096B 密钥缓冲（约 4.4MB）。daemon 启动时由 `app.zig` **堆分配**（与
+`runtime`/`statuses` 一致），不得放回主线程栈——macOS 主线程 8MB 栈上同时容纳
+sessions/deployments/identities 三个定长 Store 会越界 SIGSEGV（`setEffective`/
+`load` 阶段已实测复现并修复）。
+
+**存储路径**：`<install-root>/state/identities.json`（`src/paths.zig` 的
+`identity_store_path`，与 `diskless_secret_path`、`operations_path` 同级）。
+**密钥生成/校验暂存目录**：`<install-root>/state/identity-staging`（0700，
+`identity_staging_dir`）；私钥只在暂存目录出现，绝不进入 `/tmp` 或工作目录。
 
 **文件格式**：
 
@@ -164,17 +173,22 @@ identity store 的逻辑主键是 **`(id, revision)` 复合键**，不是单独�
 **并发控制**：identity store 使用 `std.atomic.Mutex` 保护所有读写（与
   `operations.Store` 模式一致；`diskless_delivery.Store` 当前无自有 mutex，
   由 handler 层 `config_mutation_mutex` 外部串行化）。持久化使用
-  `dhcp_store.atomicWrite`（临时文件 + fsync + rename），与现有 state 文件原子写
-  策略一致。
+  `identity_store.atomicWriteSecret`（临时文件**创建时即 0600**、写入、fsync、
+  rename、fsync 父目录）：与 `dhcp_store.atomicWrite` 不同，私钥字节不会以默认
+  umask（通常 0644）短暂暴露在磁盘上；父目录 fsync 复用
+  `dhcp_store.syncParentDirectory`。
 
 **安全要求**：
 
 - 文件 0600、目录 0700（通过 `chmod` 子进程设置，与 `diskless_secret` 一致）；
 - private key 不进入日志、Event、operation result、manifest 或公开 API；
 - catalog 只保存 reference/revision/fingerprint（`ProfileSshIdentityRef`）；
-- identity 文件损坏、缺失、复合键重复、fingerprint 不匹配或 private/public key
-  不成对时 fail closed（加载时重新派生 public key 和 fingerprint 校验；daemon
-  拒绝启动，与 `loadOrCreateSecret` 对 `InvalidDisklessSecret` 的处理一致）；
+- identity 文件损坏、缺失、复合键重复、`revision == 0`、fingerprint 不匹配或
+  private/public key 不成对时 fail closed（`Store.load` 已实现：公钥指纹用纯
+  Zig 重算比对（`server/admin_key.zig` `fingerprint`，与 `ssh-keygen -lf` 一致），
+  private/public 用 `ssh-keygen -y` 派生比对，私钥写入暂存目录 0600 校验后立即
+  删除；daemon 拒绝启动，与 `loadOrCreateSecret` 对 `InvalidDisklessSecret` 的
+  处理一致）；
 - identity 写入临时文件并 fsync/rename 后，catalog 才能引用；
 - catalog publish 失败时回收尚未被引用的新 identity；
 - 已被 artifact 或 Profile 引用的 identity 不自动删除；
@@ -187,6 +201,11 @@ identity store 的逻辑主键是 **`(id, revision)` 复合键**，不是单独�
 两者不可合并：capability secret 是对称密钥，SSH identity 是非对称密钥对。
 
 ### 3.3 Rootfs identity
+
+**实现状态（2026-07-31）**：以下字段已加入 `ProfileBuildProjection`
+（`src/profile/diskless.zig`），`compile` 与 `rootfsInputDigest` 两个构造点
+同步填入，保证 digest 一致性；identity 变更（`--new-ssh-keys`）会产出新的
+`rootfs_input_digest`，不会命中旧缓存：
 
 `ProfileBuildProjection`（`src/profile/diskless.zig`）增加 Profile/identity 字段：
 
@@ -224,6 +243,18 @@ Profile revision + identity revision + 其他输入必然得到相同 `rootfs_in
 
 不再在 build 期间调用 `ssh-keygen` 生成普通构建 identity。
 
+**实现状态（2026-07-31）**：`installIdentityKeys` 已实现于
+`src/provision/rootfs_os_builder.zig`（`buildOsLayer` 的 `buildDnf` 与
+`buildCasperOverlay` 两分支均注入 `identities` + `profile`）：按
+`(ssh_identity.id, revision)` 复合键从 store 读取 client/host keypair 写入
+staging，`authorized_keys`/`ssh_known_hosts` 保留 ssh-keygen `.pub` 文件的
+尾随换行语义（与旧 `generateSshKeys` 字节级一致），未命中返回
+`IdentityNotFound` fail closed，构建期不再调用 `ssh-keygen`。`performRootfsBuild`
+的旧 Stage 5 `ssh-keygen` 路径已删除，仅保留阶段日志。
+`--new-ssh-keys` 操作序列已接入 `managementRootfsBuild`（`createRevision` →
+`rotateSshIdentity` → `commit` → `applyCatalogFromDisk`），失败边界按上表返回
+`identity.create_failed`/`catalog.publish_failed`/`rootfs.build_submit_failed`。
+
 **`--new-ssh-keys` 操作序列**（`profile rootfs build --new-ssh-keys`）：
 
 1. 在 identity store 中创建新 identity revision（同 `id`，`revision + 1`，旧
@@ -238,6 +269,7 @@ Profile revision + identity revision + 其他输入必然得到相同 `rootfs_in
 |---|---|---|
 | identity 创建失败 | `identity.create_failed` | identity/Profile 均未发布 |
 | Profile 发布失败 | `catalog.publish_failed` | identity 已写入但 catalog 未发布；事务恢复立即回收该 revision |
+| journal 收尾失败 | `identity.commit_failed` | Profile 与 identity 均已发布；保留 journal，启动恢复只做提交收尾 |
 | build operation 提交失败 | `rootfs.build_submit_failed` | Profile 已发布（含新 identity revision），但 build 未提交 |
 
 `--new-ssh-keys` 失败后 Profile revision 已递增但 rootfs 尚未重建。旧 rootfs
@@ -279,7 +311,8 @@ identity store 和 catalog。本文所称"原子发布"统一指以下可恢复�
    journal，记录旧 catalog revision、待增加的 `(id, revision)` 和目标 Profile；
 2. 原子发布包含新 immutable revision 的 `identities.json`；
 3. 原子发布引用该复合键的 catalog；
-4. 将 journal 标记 `committed` 后删除。
+4. 删除 journal 作为 committed 标记，并 fsync 父目录；删除或 fsync 失败必须
+   显式返回 `identity.commit_failed`，不得吞掉错误。
 
 daemon 启动时必须在接受管理请求前恢复未完成 journal：
 
@@ -288,6 +321,28 @@ daemon 启动时必须在接受管理请求前恢复未完成 journal：
 - catalog 已引用但 identity 缺失或不匹配：fail closed，禁止自动生成替代密钥。
 
 "identity-first"允许崩溃窗口中短暂存在不可见 orphan，但启动恢复后不得残留。
+
+**实现状态（2026-07-31）**：§4.2 协议文本不变；journal 基建已实现于
+`src/state/identity_store.zig`：`prepare`/`commit`/`rollback`（含幂等回滚）与
+`recoverPendingTransactions`（catalog 已引用且指纹匹配 → 收尾提交；未引用 →
+幂等回滚；已引用但缺失/不匹配 → `IdentityRecoveryFailed` fail closed）。
+`create`/`createRevision` 支持 `IdentityTx` 可选参数：prepared journal 在新
+记录持久化前写入，符合"journal 先于 identity 发布"的顺序。`daemon 启动序列`
+已完成：`app.zig` 在 serve 前加载 identity store（fail closed）、mkdir
+`identity-staging`/`identity-transactions` 0700、并调用
+`recoverPendingTransactions`（失败拒启）。Batch 3 的
+create/clone/`--new-ssh-keys` 生产者接线（调用 `create(…, &tx)` → catalog
+save → `commit`/`rollback`）已完成：`managementProfileCreate`、
+`managementProfileClone`（`--new-ssh-keys`）与 `managementRootfsBuild`
+（`--new-ssh-keys` 轮换）均在 handler 内 `create`/`createRevision`(…, `&tx`) →
+发布 catalog → 解除 rollback → `commit`。只有 catalog 尚未持久化时才允许
+`errdefer` 幂等 rollback；catalog 已持久化后即使 journal 删除失败也必须保留
+identity 与 journal，交给启动恢复按 catalog 引用收尾，禁止删除已被引用的
+identity。`commit`/恢复删除 journal 后均 fsync 父目录。
+
+identity 消费端不持有解锁后的 Store 内部槽位指针：`Store.copy` 在 mutex 内把
+完整 `IdentityRecord` 复制到调用方缓冲，避免并发 rollback 的 swap-remove 使
+rootfs build 或恢复校验观察到被移动/清零的记录。
 
 ### 4.3 fixture 要求
 
@@ -316,6 +371,13 @@ fixture 必须覆盖：
 
 **API 响应变更**：现有 `ProfileCreateRequest` 不变（不需要客户端传 identity
 信息）。响应 JSON 增加 `revision`、`provenance` 和 `ssh_identity` 字段。
+
+**实现状态（2026-07-31）**：`managementProfileCreate` 已按上述序列接线
+（`create(…, &tx)` → `addInstallProfile` → 解除 rollback → `commit` →
+`applyCatalogFromDisk`；仅 catalog 落盘前失败才幂等 rollback），错误码按 §3.3 表返回
+`identity.create_failed`/`identity.capacity`/`identity.staging_unset`；
+`addInstallProfile` 增加 `ssh_identity` 参数并初始化 `revision = 1` + 时间戳 +
+provenance，响应含 `revision`、`provenance`、`ssh_identity`。
 
 ### 5.2 Clone
 
@@ -391,6 +453,27 @@ install Profile 的 SSH identity 仅用于 catalog 审计和未来 install-side 
 **target name 校验**：与 `profile create` 相同，使用
   `config_validate.validLogicalId`。
 
+**实现状态（2026-07-31）**：`profile clone` 已支持 `--new-ssh-keys`：
+`cloneProfile` 增加 `ssh_identity_override` 参数（null 复用 source 引用，
+非 null 替换为新引用），`managementProfileClone` 先 `create(…, &tx)` 再克隆、
+失败回滚；target 深拷贝 desired 配置，`revision = 1` + 时间戳 + provenance
+（`cloned_from` 记录 source revision 与 clone 时 catalog revision）。
+`--build`/`--detach` 与 `[KEY=VALUE...]` property patch 已落地：
+
+- CLI：`profileCloneHandler` 用 `cli_properties` 解析 patch（范围与
+  `profile set` 相同；集合键与不可 patch 键在连接 daemon 前以 exit 2 拒绝；
+  `--detach` 单独使用 exit 2）；`--build` 仅 diskless source 有效；
+- API：`ProfileCloneRequest` 携带 `build`/`detach`/`properties`（对象）；
+  daemon 在 clone 事务内应用 patch（`cloneProfile` 复用
+  `scalar_mutation.applyProfile`，任一校验失败整体回滚）；
+- build 提交：clone 发布后 `beginQueuedRequest`→`saveOperations`→
+  `rootfs_worker.submit`；缓存命中返回 `state=already_present`（不建
+  operation）；提交失败返回 `rootfs.build_submit_failed` +
+  `profile_created=true, build_submitted=false`（exit 5，不回滚 clone）；
+- 客户端：`profileClone` 在 `--build` 且非 detach 时以响应体 `operation.id`
+  为路由轮询到终态（4 小时上限；`operation` 缺省即 already_present 缓存命中，
+  不建轮询），终态失败按 operation error code 映射 exit 5。
+
 ### 5.3 clone 链深度
 
 provenance 只记录直接 source（`cloned_from`），不递归追溯。多次 clone
@@ -421,6 +504,25 @@ Profile revision 不能只在 create/clone 接线。新增统一
 create 和 clone 创建 target 时直接初始化为 revision 1。失败或 no-op mutation 不递增。
 Batch 2 增加扫描/契约测试：对所有公开 Profile mutation 命令逐一断言“成功恰好 +1，
 失败/no-op +0”，避免新增入口绕过 helper。
+
+**实现状态（2026-07-31）**：`mutateProfileMetadata` 已实现于
+`src/config/profile_mutation.zig`（溢出返回 `ProfileRevisionOverflow`，profile
+不存在返回 `ProfileNotFound`，均不递增），并已接入：
+
+- scalar `profile set`/`unset`（`scalar_mutation.profileBatch`）；
+- collection values（`value_mutation.profile`）；
+- item add/set/remove/replace（`item_mutation.profile`/`profileUserValues`/
+  `replaceProfile`）；
+- kernel args（`profile_mutation.setKernelArgs`）。
+
+create（`addInstallProfile`）与 clone（`cloneProfile`）直接初始化 target
+`revision = 1` + 时间戳 + provenance（create/clone 语义，不经过 helper）。
+已全部落地：daemon 侧 `managementProfileCreate`/`managementProfileClone`/
+`managementRootfsBuild --new-ssh-keys` 均通过 helper 或 §5.1/§5.2 语义接线；
+CLI 级扫描契约测试位于 `src/config/revision_scan.zig`，对每个公开 Profile
+mutation 入口断言"成功恰好 +1、失败/no-op +0"（含 scalar set/unset、collection
+values、item add/replace、user values、kernel args、identity rotation 与 clone
+target revision=1 / source 不递增），避免新增入口绕过 helper。
 
 ## 6. Capability restart 语义
 
@@ -463,23 +565,24 @@ session 继续加载。JSON 结构错误、字段越界、非法 scope/claim 或
 
 ### 6.3 terminal 撤销恢复
 
-**当前代码事实**：`diskless_delivery` checkpoint 已是 schema v2；v2 将生命周期时间字段
+**历史事实与收口变更**：`diskless_delivery` checkpoint 原为 schema v2；v2 将生命周期时间字段
 从 schema v1 的 `created_at`/`started_at` 重命名为 canonical 任务列名
 `armed_at`/`install_at`（代码注释："schema 2 renamed lifecycle timestamps
 to their canonical task-column names"）。diskless Session
 没有独立 `terminal_reason`，终态由已经持久化的 canonical `phase` 表达：
 `diskless_running`、`failed`、`expired` 均满足 `phase.isTerminal()`。
 
-真实缺口不是“终态未持久化”，而是 `restorePersisted` 当前对 terminal phase
-仍调用 `reconstructAndVerifyRaw`。v0.2.3 不升级 checkpoint schema，改为：
+终态恢复缺口与 claim 完整性缺口一并收口：v0.2.3 将 writer 升为 schema v3，改为：
 
-1. schema v1/v2 继续按当前兼容路径读取；
+1. checkpoint schema 直接替换为 v3；reader 只接受 v3，v1/v2 一律
+   `InvalidDisklessDeliveryStore` 拒载，不迁移、不降级；
 2. restore 得到 terminal phase 时保留 session 长期状态投影，但不重构四类 raw token；
 3. terminal session 的四个 slot 在内存中保持不可认证，任何 capability 请求均拒绝；
 4. 非 terminal 且未过期 session 才执行确定性重构和 hash 验证。
+5. schema v3 的每个 slot 强制携带 claim MAC，缺失/非法/不匹配均 fail closed。
 
-若未来需要记录比 canonical phase 更细的终止原因，应另行升级 schema v3；v0.2.3
-不得复用已经占用的 schema v2。
+schema v3 只增加 claim 完整性字段，不新增 terminal reason；若未来需要记录比
+canonical phase 更细的终止原因，应再升级 schema，不得复用 v3。
 
 安装（install）session 使用 `boot_session.Store`，其 capability 是安全随机
 token（`generateCapability`），不是确定性派生的。install session 的 terminal
@@ -508,14 +611,34 @@ session 进入 `recovery_incomplete` 后：
 - 交付前（`issued=false`）、Range 传输中（`issued=true`，content 不完整）、
   完整交付后 restart；
 - master secret 变化 → `recovery_incomplete`；
-- hash 篡改、claim 篡改、session id 篡改 → fail closed；
+- 合法长度 token hash 内容不匹配 → 该 session `recovery_incomplete`；
+- claim 或 session id 单独篡改 → claim MAC 不匹配、fail closed；
+- hash/claim/JSON 长度或结构非法 → fail closed；
 - path/content/scope/node/replay 不匹配 → `ProofMismatch`；
 - terminal/cancel/expiry 后 restart → session 不恢复 capability；
 - 外部无效 token 洪泛不改变目标 session（`verify` 返回 `invalid`，不消耗
   session 状态）。
 
-其中合法长度 hash 的内容不匹配按 §6.2 进入该 session 的
-`recovery_incomplete`；导致 claim/JSON 不可解析或越界的篡改使 daemon 拒绝启动。
+checkpoint schema v3 为每个 slot 强制持久化 `claim_mac`：使用 diskless master secret 对
+session id、node、plan/rootfs digest、slot kind、scope、content digest、event
+sequence、token hash、issued 与 expiry 的长度前缀 canonical 编码做 HMAC-SHA256。
+恢复顺序先重构 token：合法长度 token hash 不匹配按 §6.2 进入该 session 的
+`recovery_incomplete`；token 可重构时再验证 claim MAC，任何 claim/session 字段
+变化均返回 `InvalidDisklessDeliveryStore`。v3 缺少 MAC、MAC 长度非法或 MAC
+不匹配均直接拒载；v1/v2 也直接拒载，不能通过修改 schema 或删除字段进入兼容
+路径。terminal
+session 不恢复 capability，也不依赖 claim 授权，仍按 §6.3 只保留长期状态投影。
+
+**实现状态（2026-07-31）**：已新增两条 §6.3 语义冻结负测
+（`src/state/diskless_delivery.zig`）：
+- terminal session 的 slot hash 内容被篡改（长度仍为 64）→ load 成功、投影
+  保留、四 scope verify 全部 `invalid_token`；
+- terminal session 的 slot hash 长度非法 → `InvalidDisklessDeliveryStore`、
+  daemon 拒启。
+- non-terminal session 的 scope claim 被改且 token hash 未变 → claim MAC 校验
+  失败、`InvalidDisklessDeliveryStore`、daemon 拒启。
+- schema v3 任一 slot 的 claim MAC 缺失 → `InvalidDisklessDeliveryStore`；v1/v2
+  checkpoint → 直接替换拒载，不执行迁移。
 
 ## 7. ISO import durable worker
 
@@ -550,7 +673,8 @@ HTTP validate/snapshot
 **关键变更**：
 
 - handler 不 `spawn` 后 `join`；持久化 queued operation 后立即返回；
-- 默认 CLI follow（`operation follow`），`--detach` 立即返回 operation id；
+- 默认 CLI follow（`operation follow`）；`--detach` 立即返回 operation id
+  （仅 initrd/rootfs build 提供，ISO import CLI 保持默认 follow，见 §7.6）；
 - CLI timeout 不取消 operation（operation 由 daemon 持有，与 CLI 进程解耦）；
 - daemon restart 将 queued/running 确定转为 `operation.interrupted`
   （`operations.Store.load` 已实现此逻辑：running → failed +
@@ -594,8 +718,29 @@ HTTP validate/snapshot
 
 - 同一时刻最多一个 ISO import operation（`iso_import_mutex` 语义保留，但从
   handler 级移到 worker 级）；
-- 同 idempotency key 的重复请求复用已有 operation（`beginRequest` 已实现）；
+- 同 idempotency key 的重复请求复用已有 operation（`beginQueuedRequest`
+  已实现）；
 - 不提供通用 cancel（`V02-D11`）。
+
+### 7.6 实现核对（v0.2.3 收口）
+
+- `IsoImportWorker`（`src/http/server.zig`）：队列容量 1，daemon 启动时 spawn、
+  停止时 join，替代 handler 级 `iso_import_mutex`（该全局互斥已删除）；
+- handler `importInstallSource` 改为 `beginQueuedRequest` → submit → 202；
+  submit 失败（队列已满）保持 409 `install_source.busy` 语义，并把刚创建的
+  queued operation 落为 `install_source.busy` 失败态（§8.3 映射 exit 3）；
+- `runIsoImportWorker`/`performIsoImport` 在 worker 线程内完成
+  `importMedia` → repository index blob → `publishInstallSource`；
+  发布失败调用 `cleanupPublishedOutputs`，importMedia 内部 defer 清理 staging；
+- staging 按 §7.4 命名 `work/iso-import-<operation_id>`
+  （`importMedia` 新增 `work_tag` 参数，由 worker 传入 operation id）；
+  启动时 `iso_import.cleanupOrphanStaging` 扫描 `work/` 删除 `iso-import-*`
+  孤儿目录（先收集名称再删除，避免迭代期间变更目录）；
+- restart→interrupted 由 `operations.load` 既有逻辑保证（queued/running →
+  failed + `operation.interrupted`），不自动重跑；
+- CLI 侧 `importInstallSource` 保持默认 follow 语义不变，轮询预算与 rootfs
+  build 对齐（4 小时）；未引入 `--detach`（不在 Batch 4 范围，避免改变
+  CLI 契约）。worker 队列容量/HTTP/CLI 契约均未改变。
 
 ## 8. CLI exit mapping
 
@@ -613,26 +758,29 @@ HTTP validate/snapshot
 
 ### 8.2 当前状态
 
-当前代码（`src/main.zig`）已使用 exit code 0/1/2/5/6：
+已实现（v0.2.3 收口）。当前代码（`src/main.zig`）已使用全部冻结 exit class
+0/1/2/3/4/5/6：
 
 | 现有 exit code | 使用场景 | 对应冻结类别 |
 |---:|---|---|
 | 0 | 命令成功 | ✅ 一致 |
-| 1 | `reportMutationFailure`、daemon 返回错误、JSON 解析失败 | ✅ 一致 |
+| 1 | daemon 返回未知业务错误、JSON 解析失败、本地数据/协议错误 | ✅ 一致 |
 | 2 | CLI 参数错误、`validLogicalId` 失败、无效 flag 值 | ✅ 一致 |
+| 3 | revision/idempotency 冲突（`catalog.revision_conflict`、`install_source.busy` 等，§8.3 表） | ✅ 已实现 |
+| 4 | readiness/前置条件（`profile.not_diskless`、`rootfs.digest_drift`、404 等，§8.3 表） | ✅ 已实现 |
 | 5 | `operation follow` 终态为 failed | ✅ 一致 |
 | 6 | daemon 不可达、operation follow 超时 | ✅ 一致 |
 
-**新增 exit code**：
-- **3**（revision/idempotency 冲突）：当前 `revisionConflict` 返回 HTTP 409，
-  CLI 映射为 exit code 1。v0.2.3 改为 exit code 3。
-- **4**（readiness/前置条件）：当前 `profile.not_diskless`、`rootfs.digest_drift`
-  等返回 HTTP 400/409，CLI 映射为 exit code 1。v0.2.3 改为 exit code 4。
+连接失败（`Mutation.reachable=false`）在 `reportMutationFailure` 中统一归为
+exit 6，不再落入默认 exit 1。`itemValuesHandler` 与 `reportMutationFailure`
+共用同一映射函数，避免同一 error.code 映射到不同 exit class。
 
 ### 8.3 API error.code → exit class 映射
 
-建立唯一映射函数 `mapErrorToExitCode(http_status, error_code) -> u8`（在
-`src/main.zig` 中实现，替代 `reportMutationFailure` 的硬编码 exit code 1）。
+已实现：唯一映射函数 `mapErrorToExitCode(http_status, error_code) -> u8`
+位于 `src/main.zig`（`reportMutationFailure` 旁），替代了硬编码 exit code 1；
+`src/http/client.zig` 的 `Mutation` 结构新增 `http_status`/`error_code` 字段，
+`managementMutation` 从统一错误信封提取稳定 `error.code` 并随响应返回。
 
 **HTTP status 映射**：
 
@@ -673,6 +821,11 @@ HTTP validate/snapshot
 
 handler 不得自行把同一 error.code 映射到不同 exit class。
 
+落地核对：`mapErrorToExitCode` 纯函数单测（`zig build test`）覆盖上表每个
+exit class 至少一个 case；连接失败 → 6 由 `reportMutationFailure` 的
+`reachable=false` 分支保证。exit 3/4 的端到端契约由 daemon 在线的
+`tests/http.sh` 体系覆盖（macOS 主机跳过，Linux 回归执行）。
+
 ### 8.4 复合错误处理
 
 clone + build 组合操作的 exit code：
@@ -712,7 +865,8 @@ JSON 错误 stdout 保持单一文档：
 ### Batch 1：Recovery
 
 - 冻结确定性重构语义（§6）；
-- 保持 checkpoint schema v2，terminal phase restore 时不重构 capability；
+- checkpoint schema 直接替换为 v3（reader 拒绝 v1/v2），terminal phase
+  restore 时不重构 capability；
 - 修订 `reconstructAndVerifyRaw` 注释（删除"capsule 交付前/中重启必须
   recovery_incomplete"的旧注释）；
 - 补四 scope restart 与篡改负测。
@@ -737,7 +891,7 @@ JSON 错误 stdout 保持单一文档：
   `ProfileBuildProjection` 增加 Profile revision 和 identity 字段）；
 - 所有 Profile mutation 接入 §5.4 统一 revision helper，并增加入口覆盖测试。
 
-### Batch 3：Create/clone
+### Batch 3：Create/clone（已实现）
 
 - `managementProfileCreate` 增加 identity 事务（`src/http/server.zig`）；
 - `managementProfileClone` 端点新增/扩展（`src/http/server.zig`）；
@@ -747,7 +901,12 @@ JSON 错误 stdout 保持单一文档：
 - clone provenance/patch/new keys；
 - build/detach 组合结果。
 
-### Batch 4：ISO worker
+落地核对：`--build`/`--detach` 与 property patch 已随 §5.2 完成；
+`profile clone --help` 展示全部 flags 与 `[KEY=VALUE...]`；`tests/cli.sh`
+覆盖 `--detach` 单独使用 exit 2、不可 patch 键 exit 2、集合键 exit 2；
+`revision_scan` 覆盖 clone+patch 原子性与非法 patch 回滚。
+
+### Batch 4：ISO worker（已实现）
 
 - 新增独立 `IsoImportWorker`（daemon 启动时 spawn、停止时 join）；
 - ISO import handler 改为 queued → 立即返回；
@@ -755,11 +914,15 @@ JSON 错误 stdout 保持单一文档：
 - staging orphan 清理（daemon 启动时扫描 `work/`）；
 - 对现有 rootfs/initrd worker 只做无行为变化回归，不重构其线程和队列模型。
 
-### Batch 5：CLI 与清理
+### Batch 5：CLI 与清理（已实现）
 
 - exit mapping 函数（`src/main.zig` `mapErrorToExitCode`）；
-- 替换所有 `setExitCode(ctx, 1)` 硬编码为映射函数调用；
-- exit code 3/4 契约测试；
+- mutation 失败路径的硬编码 exit 1 替换为映射函数调用
+  （`reportMutationFailure` 与 `itemValuesHandler`；本地数据/JSON 解析/协议
+  错误按 §8.1 保持 exit 1，不属于映射范围）；
+- exit code 3/4 契约测试：`mapErrorToExitCode` 纯函数单测下沉
+  `zig build test`（每个 exit class 至少一个 case），端到端由 daemon 在线
+  `tests/http.sh` 覆盖；
 - 删除旧同步 initrd handler（`src/main.zig` 中未绑定命令树的
   `initrdBuildHandler` 函数及其调用的 `initrd_build_executor.build`；
   `initrd_build_executor.buildFromInstaller` 仍被 daemon worker 使用，不删除）；
@@ -770,27 +933,59 @@ JSON 错误 stdout 保持单一文档：
 
 v0.2.3 只有同时满足以下条件才完成：
 
-- catalog schema 版本直接替换为 v5，旧 v4 catalog 不被加载（`UnsupportedSchemaVersion`）；
-- identity store 原子写、权限和 fail-closed 测试通过；
-- identity/catalog 两阶段发布的三处 crash recovery fixture 通过（§4.3）；
-- Profile 普通 rebuild 不改变 SSH fingerprint 或 input digest；
-- 所有公开 Profile mutation 成功恰好递增一次 Profile revision，失败/no-op 不递增；
-- clone 默认复用 identity，新 key clone 得到不同 fingerprint；
-- clone patch 与 provenance 原子，build 部分成功语义可诊断
-  （`profile_created`/`build_submitted` 字段正确）；
-- capability 四 scope 在 restart 后只恢复原 token（token 一致性测试通过）；
-- terminal canonical phase 在 restart 后保留且不恢复 capability（checkpoint v1/v2
-  兼容测试通过）；
-- secret/hash/claim 异常进入 `recovery_incomplete` 或 fail closed；
-- ISO/rootfs/initrd handler 不等待长任务，restart/partial/idempotency 确定；
-- exit code 0–6 契约测试通过（每个 exit class 至少一个 case）；
-- 旧同步 initrd 产品路径与死代码删除；
-- `node deploy <id>`（无第二参数）默认发送 `deploy=true`，显式 `false` 不受影响
+- ✅ catalog schema 版本直接替换为 v5，旧 v4 catalog 不被加载（`UnsupportedSchemaVersion`）；
+- ✅ identity store 原子写、权限和 fail-closed 测试通过；
+- ✅ identity/catalog 两阶段发布的三处 crash recovery fixture 通过（§4.3）；
+- ✅ Profile 普通 rebuild 不改变 SSH fingerprint 或 input digest；
+- ✅ 所有公开 Profile mutation 成功恰好递增一次 Profile revision，失败/no-op 不递增；
+- ✅ clone 默认复用 identity，新 key clone 得到不同 fingerprint；
+- ✅ clone patch 与 provenance 原子，build 部分成功语义可诊断
+  （`profile_created`/`build_submitted` 字段正确；patch 原子性与非法 patch
+  回滚由 `revision_scan` clone 用例覆盖，`profile_created`/`build_submitted`
+  由 `managementProfileClone` 复合响应实现，端到端由 daemon 在线
+  `tests/http.sh` 覆盖）；
+- ✅ capability 四 scope 在 restart 后只恢复原 token（token 一致性测试通过）；
+- ✅ terminal canonical phase 在 restart 后保留且不恢复 capability（checkpoint
+  v3 测试通过；v1/v2 直接替换拒载测试通过）；
+- ✅ secret/hash/claim 异常进入 `recovery_incomplete` 或 fail closed；
+- ✅ ISO/rootfs/initrd handler 不等待长任务，restart/partial/idempotency 确定
+  （ISO 已由 `IsoImportWorker` 后台化；restart→interrupted 由
+  `operations.load` 保证，idempotency 由 `beginQueuedRequest` 保证）；
+- ✅ exit code 0–6 契约测试通过（每个 exit class 至少一个 case，
+  `mapErrorToExitCode` 纯函数单测；端到端由 daemon 在线 `tests/http.sh` 覆盖）；
+- ✅ 旧同步 initrd 产品路径与死代码删除；
+- ✅ `node deploy <id>`（无第二参数）默认发送 `deploy=true`，显式 `false` 不受影响
   （契约测试通过）；
-- `node trace --session X --latest` 返回 exit code 2（契约测试通过）；
-- `V0_2_CLI.md` "唯一启用入口"不变量描述已更新；
-- `zig build test` 全量通过；
-- 当前 aarch64 VMware 完成 Rocky/Ubuntu diskless 定向回归；
+- ✅ `node trace --session X --latest` 返回 exit code 2（契约测试通过）；
+- ✅ `V0_2_CLI.md` "唯一启用入口"不变量描述已更新；
+- ✅ `zig build test` 全量通过（441/441，含 journal 删除失败传播、identity
+  copy/rollback 稳定性、checkpoint v3 MAC 必填、v1/v2 直接替换拒载、identity /
+  catalog revision overflow 以及 identity store 多记录持久化回归
+  用例：还原 `persistLocked` 悬垂切片缺陷时该用例失败、修复后通过）；
+- ✅ aarch64 VMware Rocky diskless 定向回归已通过（2026-07-31，r97n1 +
+  r97n0 生产 daemon，最终 v0.2.3 ReleaseSafe 四产物）：
+  - `profile create` 生成 identity → rootfs build 把 identity store 的
+    client/host keypair 烤入 squashfs（解包比对公钥一致）；
+  - PXE 启动后 session `f7718edd…` 到达 `diskless.running`，agent-consumed
+    已提交，config/rootfs/agent/event 四 capability 全部撤销；
+  - 从 r97n0 以 bootstrap key SSH 登录 `root@192.168.27.210` 成功，
+    `systemctl is-system-running` = running，根为 overlay，节点
+    `/root/.ssh/id_ed25519{,.pub}` 与 identity store 一致；
+  - 执行前提：用最终二进制**以新资产名**重建 initrd/bundle（旧同名 initrd
+    由旧 daemon 构建、携带旧 agent，`assets initrd build` 的
+    already_present 检查只比 name/source/kernel，不校验 overlay 内容）。
+- ✅ aarch64 VMware Ubuntu diskless 定向回归已通过（2026-07-31，同 Rocky
+  环境与最终二进制）：新名重建 `ubuntu-22.04.5-nodeforge-initrd-v023` +
+  v023 bundle + 新建 v0.2.3 ubuntu profile（casper/apt 路径，验证
+  `installIdentityKeys` 的 casper 分支——解包 squashfs 比对 client 公钥与
+  identity store 一致）；rootfs build 在 daemon 后台完成后，r97n1 重指与
+  PXE：session `66c6f11e…` 到达 `diskless.running`，agent-consumed 200，
+  四 capability 撤销；SSH 登录 `root@192.168.27.210` 成功，内核
+  `5.15.0-119-generic`，`systemctl is-system-running` = running，根为
+  overlay，节点 `/root/.ssh/id_ed25519{,.pub}` 与 identity store 一致。
+  legacy ubuntu profile 因空 `ssh_identity` 不能重建 rootfs
+  （`IdentityNotFound` fail closed，backlog §3.1 item 8 未实现、不在完成
+  闸内）——回归使用新建的 v0.2.3 profile 规避。
 - `V02-D01`—`V02-D14` 均不参与完成判定。
 
 完成后 v0.2 不再保留实现 backlog，v0.3 从 catalog v6 开始。
@@ -948,20 +1143,69 @@ optional。描述文字对用户有误导性。
 
 ### 12.6 实施归属
 
-本节全部变更归入 Batch 5（CLI 与清理），不独立成批：
+本节全部变更归入 Batch 5（CLI 与清理），不独立成批；已实现：
 
-- P0（deploy 默认 true）：handler + 声明 + 契约测试；
-- P2（unset 描述）：1 行 description；
-- P3（trace 冲突校验）：handler + description + 1 条契约测试。
+- ✅ P0（deploy 默认 true）：handler（`src/main.zig` `nodeDeployHandler` 缺省
+  true）+ flag 声明（`[true|false] (default: true)`）+ `tests/cli.sh` 契约测试；
+- ✅ P2（unset 描述）：1 行 description（`node unset`）；
+- ✅ P3（trace 冲突校验）：handler（`trace.conflicting_flags` exit 2）+
+  description + `tests/cli.sh` 契约测试。
 
 契约测试落点：需要 daemon 在线的端到端用例入 `tests/cli.sh`；纯 CLI 层
 校验（exit 2 路径）下沉为 `zig build test` 语义用例。
+
+实施核对：P0/P2/P3 均在 `tests/cli.sh` L521-540 有契约断言；`node deploy`
+帮助文本含 `(default: true)`；`--session`+`--latest` 冲突以 exit 2 拒绝。
 
 ### 12.7 完成标准补充
 
 在 §10 完成标准中追加：
 
-- `node deploy <id>`（无第二参数）默认发送 `deploy=true`，契约测试通过；
-- `node deploy <id> false` 显式 false 不受影响，契约测试通过；
-- `node trace --session X --latest` 返回 exit code 2，契约测试通过；
-- `V0_2_CLI.md` L517 不变量描述已更新；`docs/cli/REFERENCE.md` 已补缺省语义说明。
+- ✅ `node deploy <id>`（无第二参数）默认发送 `deploy=true`，契约测试通过；
+- ✅ `node deploy <id> false` 显式 false 不受影响，契约测试通过；
+- ✅ `node trace --session X --latest` 返回 exit code 2，契约测试通过；
+- ✅ `V0_2_CLI.md` L517 不变量描述已更新；`docs/cli/REFERENCE.md` 已补缺省
+  语义说明与 exit code 表。
+
+## 13. 实施状态附录（2026-07-31 同步）
+
+本表把"未提交代码修复实施方案"的批次项映射到文件/函数与状态，作为注释与
+设计文档一致性的单一事实源。Batch 1–5 全部落地；仅剩 §10 的 VMware 定向
+回归需要在真实 aarch64 VMware 环境执行。
+
+| 方案项 | 落点 | 状态 |
+|---|---|---|
+| A1 并发原语 | `src/state/identity_store.zig` `Store.mutex` + `lock` | 完成（HEAD 已含，本包复核） |
+| A2 迭代语法 + get 不变量文档 | 同文件 `get()` | 完成 |
+| A3 fillSlot 就地构造 / 持久化顺序 / 稳定 ref | 同文件 `fillSlot`/`create`/`createRevision` | 完成 |
+| A4 staging 迁出 /tmp + 无条件清理 + 泄漏修复 | `paths.identity_staging_dir` + `create`/`createRevision` | 完成 |
+| A5 atomicWriteSecret（创建即 0600） | 同文件 `atomicWriteSecret`（复用 `dhcp_store.syncParentDirectory`） | 完成 |
+| A6 load 事务性（staged 数组一次性提交） | 同文件 `load()` | 完成 |
+| A7 长度截断改显式报错 | 同文件 `fillSlot`（`error.KeyTooLarge`） | 完成 |
+| A8 私钥堆 buffer 清零 | 同文件 `zeroAndFree` | 完成 |
+| A9 强制语义分析 + 契约测试 | 同文件 `refAllDecls` + round-trip/复合键/损坏负测 | 完成 |
+| B1 putDiskless 合并语义 | `src/state/node_inventory.zig` `putDiskless` | 完成 |
+| B2 server 调用切换 + 注释 | `src/http/server.zig` `disklessFacts` | 完成 |
+| B3 postFacts 正规 JSON + sanitizeDmi | `src/initrd.zig` | 完成 |
+| B4 facts 三场景单测 | `node_inventory.zig` 测试区 | 完成 |
+| C catalog v4 拒载错误码 | `src/catalog/store.zig` `loadDirectory`（`UnsupportedSchemaVersion`）+ `src/nodeforged.zig` daemon 启动分支（指引 re-run setup） | 完成 |
+| D toProfile 补齐 | `src/catalog/dto.zig` `toProfile`（`kind`/`boot_bundle`/`bundle`/`diskless` + `revision`/`created_at`/`updated_at`/`provenance`/`ssh_identity` 与 `fromProfile` 对称） | 完成 |
+| E #15 语义冻结负测 | `src/state/diskless_delivery.zig` 两条 | 完成 |
+| #10 load 完整性校验 | `restoreRecord`（复合键去重、`revision>=1`、纯 Zig 指纹重算、`ssh-keygen -y` 配对） | 完成 |
+| #6 ProfileBuildProjection | `src/profile/diskless.zig` 两个构造点 | 完成 |
+| #9 mutateProfileMetadata | `src/config/profile_mutation.zig` + scalar/value/item/setKernelArgs | 完成（CLI 级扫描契约测试见 `src/config/revision_scan.zig`） |
+| #18 daemon 接线（load fail-closed + mkdir 0700 + RouteContext） | `src/app.zig` + `src/http/server.zig` `serve`/`RouteContext` | 完成（`recoverPendingTransactions` 属 #8） |
+| #8 两阶段 journal | `paths.identity_transactions_dir` + `src/state/identity_store.zig` `prepare`/`commit`/`rollback`/`recoverPendingTransactions` + `app.zig` 启动恢复（fail closed） | 完成（Batch 3 生产者接线：`create(…, &tx)` → catalog save → `commit`/`rollback`） |
+| #7 rootfs builder `installIdentityKeys` | `src/provision/rootfs_os_builder.zig` `buildOsLayer`/`buildDnf` 注入 `identities`+`profile`，按复合键从 store 读取写入 staging | 完成（未命中 `IdentityNotFound` fail closed，构建期不再 ssh-keygen） |
+| #23 §4.3 crash fixture | `src/state/identity_store.zig` 测试区：prepared/identity publish/catalog publish 三处崩溃恢复 fixture | 完成 |
+| Batch 3 create 接线 | `src/http/server.zig` `managementProfileCreate`（`create(…,&tx)` → `addInstallProfile` → `commit` → `applyCatalogFromDisk`，errdefer 幂等 rollback）+ `addInstallProfile` 增加 `ssh_identity` 参数 | 完成 |
+| Batch 3 clone 接线 | `managementProfileClone` + `cloneProfile` `ssh_identity_override`/property patch + `src/main.zig`/`src/http/client.zig` `--new-ssh-keys`/`--build`/`--detach` | 完成（见 §5.2） |
+| §3.3 `--new-ssh-keys` 轮换 | `profile_mutation.rotateSshIdentity` + `managementRootfsBuild` + `RootfsBuildRequest.new_ssh_keys` + CLI/客户端 | 完成 |
+| §5.4 CLI 级扫描契约测试 | `src/config/revision_scan.zig`（全部公开入口成功 +1 / 失败 +0，clone target=1 且 source 不变） | 完成 |
+| Batch 5 exit mapping | `src/main.zig` `mapErrorToExitCode`（§8.3 表：error.code 精确映射优先、HTTP status 回退）+ `reportMutationFailure`/`itemValuesHandler` 接入（连接失败→6）+ `Mutation.http_status/error_code`（`src/http/client.zig` `managementMutation` 从错误信封提取稳定 code） | 完成（纯函数单测覆盖 0–6 全 class；`formatErrorReason` 改为返回 reason+code 双切片，code 复制进 reason_buf NUL 分隔避免悬垂） |
+| Batch 5 死代码删除 | 删除 `src/main.zig` `initrdBuildHandler`（未绑定命令树）及 `src/provision/initrd_build_executor.zig` `build`（无引用包装）；`buildFromInstaller` 保留（daemon worker 在用） | 完成（`rg initrdBuildHandler` 无残留引用） |
+| Batch 4 ISO durable worker | `src/http/server.zig` `IsoImportWorker`（队列容量 1，spawn/join 接线）+ `importInstallSource` 改 `beginQueuedRequest`→submit→202 + `runIsoImportWorker`/`performIsoImport`；`iso_import_mutex` 全局删除；staging 按 operation id 命名 | 完成（409 `install_source.busy` 语义保留；失败路径 `cleanupPublishedOutputs` 不变；worker 队列单测下沉） |
+| §7.4 staging orphan 清理 | `src/catalog/iso_import.zig` `cleanupOrphanStaging`（启动扫描 `work/` 删除 `iso-import-*`）+ `importMedia` 新增 `work_tag` 参数 | 完成（serve() 启动、spawn worker 前调用） |
+| §8.2 退出码契约测试 | `mapErrorToExitCode` 单测（`zig build test`）+ 端到端 `tests/http.sh`（macOS 跳过） | 完成（434/434 全绿） |
+| §12 P0/P2/P3 契约测试 | `tests/cli.sh` L521-540（deploy 缺省 true、unset 描述、trace 冲突 exit 2） | 完成 |
+| §10 完成标准核对 | §10 清单逐项标注 ✅/⏳ | 完成（仅剩 VMware 定向回归 ⏳） |

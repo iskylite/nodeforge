@@ -570,8 +570,13 @@ provenance: {
 
 ### 7.6 SSH Identity 先行修复
 
-当前代码在每次 rootfs build staging 中重新运行 `ssh-keygen`，而 Profile 没有持久 SSH
-identity。这与设计中的 clone key 复用、`--new-ssh-keys` 和可复现 rootfs 冲突。
+> 状态（v0.2.3）：本节的先行修复已全部落地——daemon-owned identity store、create 固定
+> identity、clone 默认复用/`--new-ssh-keys` 轮换、rootfs build 只消费固定 identity
+> （构建期不再 `ssh-keygen`）、identity revision/fingerprint 进入 rootfs input digest、
+> API/CLI 不输出私钥。下文保留原问题陈述。
+
+v0.2.2 收口时，代码在每次 rootfs build staging 中重新运行 `ssh-keygen`，而 Profile 没有
+持久 SSH identity，与设计中的 clone key 复用、`--new-ssh-keys` 和可复现 rootfs 冲突。
 
 实现 clone 前必须：
 
@@ -588,6 +593,11 @@ identity。这与设计中的 clone key 复用、`--new-ssh-keys` 和可复现 r
 ### 7.7 `--build`
 
 `--build` 在 clone 成功后提交 target rootfs build。默认跟随，`--detach` 后台。
+
+> 状态（v0.2.3）：已实现——`managementProfileClone` 在 clone 发布后提交 build
+> operation；成功响应体含 operation id（客户端据此跟随/`--detach`），build 提交失败
+> 返回 `rootfs.build_submit_failed`（HTTP 503、exit 5），JSON 结果
+> `profile_created=true, build_submitted=false`。
 
 clone transaction 与实际长构建不做一个不可恢复的大事务，但响应必须分别报告：
 
@@ -982,30 +992,34 @@ exit/error mapping
 
 ### P0：修正关键数据与原子边界
 
-1. Profile provenance/revision/time。
-2. Profile SSH identity 持久化，移除 build-time 随机 identity。
-3. rootfs digest 纳入 identity revision/fingerprint。
-4. daemon 原子 `profile clone`。（基础 desired clone 已完成；identity/provenance 待补）
+1. Profile provenance/revision/time。（v0.2.3 已完成：`mutateProfileMetadata` + `revision_scan`）
+2. Profile SSH identity 持久化，移除 build-time 随机 identity。（v0.2.3 已完成：
+   daemon-owned identity store + `installIdentityKeys`，构建期不再 `ssh-keygen`）
+3. rootfs digest 纳入 identity revision/fingerprint。（v0.2.3 已完成：
+   `ProfileBuildProjection` 纳入 `ssh_identity` 引用与 fingerprint）
+4. daemon 原子 `profile clone`。（v0.2.3 已完成：clone property patch 与 provenance
+   同事务；identity/provenance 已补齐）
 5. daemon 原子、按 kind 分发的 `node retry`。（已完成）
 6. content asset daemon-owned publication。（已完成）
 
 ### P0：完成主流程
 
-1. `profile clone` CLI。（基础入口已完成）
-2. clone `--new-ssh-keys`。
-3. clone `--build [--detach]`。
+1. `profile clone` CLI。（v0.2.3 已完成：含 `[KEY=VALUE...]` properties 与
+   `--new-ssh-keys`/`--build`/`--detach` flags）
+2. clone `--new-ssh-keys`。（v0.2.3 已完成）
+3. clone `--build [--detach]`。（v0.2.3 已完成：build 提交失败复合错误信封，
+   成功响应体带 operation id 供跟随/detach）
 4. 抽取严格只读 boot projection/preview compiler。（已完成）
 5. `node boot preview` install/diskless。（已完成）
 6. 从普通 help/workflow 移除 boot-prepare。（已完成）
 
 ### P1：长任务与输出
 
-1. rootfs/initrd/ISO import 使用 durable operation。rootfs/initrd 已完成
-   queued/running/terminal worker、restart→interrupted 和原子发布；ISO 已有 durable
-   operation 记录，但 handler 仍同步 join，真后台执行列入发布后收口。
-2. 默认 follow、可选 detach。rootfs/initrd 已完成；ISO 随后台执行收口。
+1. rootfs/initrd/ISO import 使用 durable operation。（v0.2.3 已完成：ISO 由
+   `IsoImportWorker` 真后台执行，三类 worker 并行、restart→interrupted、原子发布）
+2. 默认 follow、可选 detach。（v0.2.3 已完成：ISO 随后台化收口）
 3. operation progress event。（`V02-D09`，未排期可观测性候选）
-4. 统一错误/exit mapping。
+4. 统一错误/exit mapping。（v0.2.3 已完成：exit 0–6 契约与 `mapErrorToExitCode` 纯函数）
 5. 共用 checks schema。（`V02-D10`，仅在后续 DTO 升级时重新评估）
 
 ### P1：CLI 与文档重基线
@@ -1013,7 +1027,7 @@ exit/error mapping
 1. 建立 `docs/cli/REFERENCE.md`。（已完成）
 2. 建立 primary workflow 和 troubleshooting。
 3. 给现有命令标记 visibility/stability。
-4. 更新全部设计分册和代码注释。
+4. 更新全部设计分册和代码注释。（v0.2.3 已按 §11 跨文档引用同步；后续版本继续）
 5. command tree/help 契约与文档一致性测试。（已完成当前公开主流程）
 
 ### P2：进一步体验优化

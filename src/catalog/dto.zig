@@ -274,6 +274,12 @@ fn toProfile(allocator: std.mem.Allocator, value: Profile, source: *const model.
             .hosts_content = value.system.hosts_content,
         },
         .software = value.software,
+        // v0.2.3: 解析方向补齐 kind/boot_bundle/bundle/diskless，与 fromProfile
+        // 对称；否则未来 import 接线会静默把 diskless Profile 降级为 install。
+        .kind = value.kind,
+        .boot_bundle = value.boot_bundle,
+        .bundle = value.bundle,
+        .diskless = value.diskless,
         .install = .{
             .storage = .{ .wipe = value.install.storage.wipe, .mode = value.install.storage.mode, .partition_table = value.install.storage.partition_table, .partitions = value.install.storage.partitions },
             .bootloader = .{ .install = value.install.bootloader.install },
@@ -285,6 +291,14 @@ fn toProfile(allocator: std.mem.Allocator, value: Profile, source: *const model.
             .proxy = value.install.proxy,
         },
         .kernel_args = try joinKernelArgs(allocator, value.kernel_args),
+        // v0.2.3: 与 fromProfile 对称补齐 revision/created_at/updated_at/
+        // provenance/ssh_identity；否则 import 会把审计与 identity 引用静默
+        // 重置为默认值（revision=1、created_at/updated_at=0）。
+        .revision = value.revision,
+        .created_at = value.created_at,
+        .updated_at = value.updated_at,
+        .provenance = value.provenance,
+        .ssh_identity = value.ssh_identity,
     };
 }
 

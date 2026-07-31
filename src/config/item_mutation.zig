@@ -8,6 +8,7 @@ const catalog_store = @import("../catalog/store.zig");
 const validate = @import("validate.zig");
 const install_compiler = @import("../profile/install.zig");
 const value_mutation = @import("value_mutation.zig");
+const profile_mutation = @import("profile_mutation.zig");
 
 /// 列表项操作类型。
 pub const Operation = enum {
@@ -93,6 +94,8 @@ pub fn profile(io: std.Io, allocator: std.mem.Allocator, config: *const model.Ap
     candidate.profiles = profiles;
     const projected = model.projectCatalog(config.*, &candidate);
     try validate.validate(&projected, &candidate);
+    // v0.2.3 §5.4: 所有 profile mutation 统一走 revision helper。
+    try profile_mutation.mutateProfileMetadata(profiles, identity, std.Io.Clock.real.now(io).toSeconds());
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
@@ -156,6 +159,8 @@ pub fn profileUserValues(io: std.Io, allocator: std.mem.Allocator, config: *cons
     candidate.profiles = profiles;
     const projected = model.projectCatalog(config.*, &candidate);
     try validate.validate(&projected, &candidate);
+    // v0.2.3 §5.4: 所有 profile mutation 统一走 revision helper。
+    try profile_mutation.mutateProfileMetadata(profiles, identity, std.Io.Clock.real.now(io).toSeconds());
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
@@ -241,6 +246,8 @@ pub fn replaceProfile(io: std.Io, allocator: std.mem.Allocator, config: *const m
     candidate.profiles = profiles;
     const projected = model.projectCatalog(config.*, &candidate);
     try validate.validate(&projected, &candidate);
+    // v0.2.3 §5.4: 所有 profile mutation 统一走 revision helper。
+    try profile_mutation.mutateProfileMetadata(profiles, identity, std.Io.Clock.real.now(io).toSeconds());
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 

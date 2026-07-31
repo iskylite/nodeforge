@@ -15,24 +15,6 @@
 const std = @import("std");
 const paths = @import("../paths.zig");
 
-/// 构建 nodeforge initramfs。
-///
-/// `kernel_release` 是内核 uname release（如 `5.14.0-611.5.1.el9_7.aarch64`），
-/// 从 install source 的 boot bundle 获取或由 CLI `--kver` 显式传入。
-/// `nodeforge_initrd_binary` 是 daemon install root 下的 `nodeforge-initrd` 二进制路径。
-/// `output_path` 是最终 initramfs 输出路径（受管 initrd_dir 下）。
-///
-/// 构建步骤全部使用外部命令（dracut/cpio/gzip），与 rootfs_os_builder 一致。
-pub fn build(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    kernel_release: []const u8,
-    nodeforge_initrd_binary: []const u8,
-    output_path: []const u8,
-) !void {
-    return buildInternal(io, allocator, kernel_release, nodeforge_initrd_binary, null, output_path);
-}
-
 /// 从 ISO/install source 的 installer initrd 派生。`base_initrd` 内容原样作为
 /// 第一个 initramfs member，NodeForge 文件仅作为第二个 gzip/newc member
 /// 追加；不解包重打 vendor member，避免丢失发行版 patch/ko/firmware。

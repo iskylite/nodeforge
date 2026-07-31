@@ -93,7 +93,9 @@ pub const Result = struct {
 /// 完整流程：
 /// 1. 校验 filename 安全性（无路径分隔符、无 `..`、无 null 字节）
 /// 2. 在受管 import_dir 内计算 ISO SHA-256（验证文件是普通非符号链接文件）
-/// 3. 创建随机 tag 的临时工作目录（mount point + staged repo）
+/// 3. 创建临时工作目录（mount point + staged repo）；`work_tag` 非空时目录
+///    命名为 `work/iso-import-<work_tag>`（v0.2.3 §7.4 由调用方传入 operation
+///    id，使 daemon 重启后的孤儿清理可按前缀识别），否则使用随机 tag
 /// 4. 只读 loop mount ISO（先尝试 iso9660，失败再尝试 udf）
 /// 5. 从媒体布局确定 family，并从元数据检测 distro/version/arch；未知产品标签可由请求覆盖
 /// 6. 将 mount 内容复制到 staged repo
@@ -112,7 +114,7 @@ pub const Result = struct {
 ///
 /// 调用方负责 catalog 发布和 Result 字符串释放。
 /// 临时工作目录在函数返回时通过 defer 清理（deleteTree）。
-pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, request: Request) !Result {
+pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const model.AppConfig, request: Request, work_tag: ?[]const u8) !Result {
     if (!safeFilename(request.filename)) return error.UnsafeImportFilename;
     if (!safeFilename(request.original_filename) or !std.mem.endsWith(u8, request.original_filename, ".iso")) return error.UnsafeImportFilename;
 
@@ -125,7 +127,8 @@ pub fn importMedia(io: std.Io, allocator: std.mem.Allocator, config: *const mode
 
     var random: [16]u8 = undefined;
     try io.randomSecure(&random);
-    const tag = std.fmt.bytesToHex(random, .lower);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    const tag = if (work_tag) |tag_value| tag_value else hex[0..];
     const work = try std.fmt.allocPrint(allocator, "{s}/iso-import-{s}", .{ paths.require().work_dir, tag[0..] });
     defer allocator.free(work);
     const mount_point = try std.fmt.allocPrint(allocator, "{s}/mnt", .{work});
@@ -415,6 +418,32 @@ fn removeCreatedOutputPaths(io: std.Io, allocator: std.mem.Allocator, iso: []con
 
 fn removeTreeBestEffort(io: std.Io, allocator: std.mem.Allocator, path: []const u8) void {
     std.Io.Dir.cwd().deleteTree(io, path) catch run(io, allocator, &.{ "rm", "-rf", "--", path }) catch {};
+}
+
+/// v0.2.3 §7.4：daemon 启动时清理 `work/iso-import-*` 孤儿 staging 目录。
+/// 正常路径的工作树由 `importMedia` 的 defer 清理（成功与失败都会删除）；
+/// 只有 daemon 崩溃会遗留目录。目录按 operation id 命名（§7.4），因此可以
+/// 按前缀安全识别并整树删除。先收集名称再删除，避免迭代期间变更目录。
+pub fn cleanupOrphanStaging(io: std.Io, allocator: std.mem.Allocator) void {
+    var dir = std.Io.Dir.cwd().openDir(io, paths.require().work_dir, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, "iso-import-")) continue;
+        const owned = allocator.dupe(u8, entry.name) catch continue;
+        names.append(allocator, owned) catch {
+            allocator.free(owned);
+            continue;
+        };
+    }
+    for (names.items) |name| {
+        observe_log.warn("iso import: removing orphan staging {s}", .{name});
+        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ paths.require().work_dir, name }) catch continue;
+        removeTreeBestEffort(io, allocator, path);
+        allocator.free(path);
+    }
 }
 
 /// 媒体布局描述。描述 installer kernel/initrd 在挂载的 ISO 中的相对路径，

@@ -1139,11 +1139,17 @@ build 输入参与 digest 计算时必须先进入带字段域分离的 canonica
 `--new-ssh-keys` 先生成并固定新 Profile client/host keys revision，再构建其新 input digest；
 readiness 只读、不暗中构建。`profile rootfs status <profile>` / `assets rootfs list|show` 查询（见 §4.1/§4.2）。
 
-> **实现现状**：rootfs builder 已实现 6 阶段固定流水线（`src/http/server.zig` `managementRootfsBuild`）：
+> **实现现状（v0.2.3 已更新）**：rootfs builder 已实现 6 阶段固定流水线（`src/http/server.zig`
+> `performRootfsBuild`）：
 > Stage 1 OS 层 → Stage 2 payload 物化 → Stage 3 rootfs-build 步骤 → Stage 4 target-system 骨架 →
-> Stage 5 SSH 信任基线（ed25519 client keypair + sshd host key + authorized_keys + sshd_config.d drop-in）→
-> Stage 6 mksquashfs 压缩（zstd）+ 流式 SHA-512 + 原子发布。`--new-ssh-keys` 的端到端流程尚在实现中；
-> 当前每次 rootfs build 均在 Stage 5 重新生成密钥。`/etc/ssh/ssh_known_hosts` 的自动生成为后续完善点。
+> Stage 5 SSH 信任基线 → Stage 6 mksquashfs 压缩（zstd）+ 流式 SHA-512 + 原子发布。v0.2.3 起 Stage 5 的
+> SSH 资产（client/host ed25519 keypair、`authorized_keys`、`ssh_known_hosts`、sshd_config.d drop-in）由
+> `rootfs_os_builder.installIdentityKeys` 从 identity store 按 `(ssh_identity.id, revision)` 复合键写入
+> staging（dnf 与 casper/apt 两分支一致），构建期不再调用 `ssh-keygen`，identity 缺失返回
+> `IdentityNotFound` fail closed；`ssh_known_hosts` 以 `localhost,127.0.0.1,*` 绑定共享 host public key。
+> `--new-ssh-keys` 端到端已接入 `managementRootfsBuild`（`createRevision` → `rotateSshIdentity` → `commit` →
+> `applyCatalogFromDisk`），失败边界区分 `identity.create_failed`/`catalog.publish_failed`/
+> `rootfs.build_submit_failed`（见 [`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §3.3）。
 > Stage 1 与 rootfs-build package action 使用本机受管 `file://` repository；安装计划和
 > AgentPlan 对目标系统继续发布受管 HTTP URL，两者不得混用。
 
@@ -1160,7 +1166,7 @@ readiness 只读、不暗中构建。`profile rootfs status <profile>` / `assets
 | hostname | 通用占位 | 写节点 hostname |
 | 网络 | 保留 DHCP bootstrap 能力和 NM/Netplan | 写目标静态/DHCP 持久配置 |
 | machine-id | 清理，不在共享 lower 留唯一身份 | 每次启动在 upper 生成 |
-| SSH key/authorized_keys | Profile create/clone preparation 自动生成并固定 client/host keys，合并所有 Profile 公钥并生成域内 ssh_known_hosts | 追加 key/删除可删除的继承 key；mandatory Profile client key 不可由标准 remove 删除；显式后处理仍可改最终文件 |
+| SSH key/authorized_keys | Profile create/clone 从 identity store 固定 client/host keys（`(ssh_identity.id, revision)` 复合键，v0.2.3 起不再构建期 ssh-keygen），lower 写 keypair/authorized_keys（mandatory client public key）与域内 ssh_known_hosts（localhost/127.0.0.1/*）；操作员 Profile 公钥由 node-apply 合并 | 追加 key/删除可删除的继承 key；mandatory Profile client key 不可由标准 remove 删除；显式后处理仍可改最终文件 |
 
 boot readiness 时把 Profile 的 target-system 与 rootfs manifest 对照：自定义 locale/timezone/keyboard、用户或包不存在、
 SSH enabled 但无 sshd、静态网络缺 renderer/tool 时拒绝启用 PXE，不等切根后失败。

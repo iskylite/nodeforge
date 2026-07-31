@@ -7,6 +7,7 @@ const std = @import("std");
 const model = @import("../model.zig");
 const catalog_store = @import("../catalog/store.zig");
 const validate = @import("validate.zig");
+const profile_mutation = @import("profile_mutation.zig");
 
 /// 单个标量 mutation。
 pub const Mutation = struct {
@@ -38,11 +39,15 @@ pub fn profileBatch(io: std.Io, allocator: std.mem.Allocator, config: *const mod
     candidate.profiles = profiles;
     const projected = model.projectCatalog(config.*, &candidate);
     try validate.validate(&projected, &candidate);
+    // v0.2.3 §5.4: 所有 profile mutation 统一走 revision helper。
+    try profile_mutation.mutateProfileMetadata(profiles, name, std.Io.Clock.real.now(io).toSeconds());
     try catalog_store.save(io, allocator, catalog_path, &candidate);
 }
 
 /// 将单个 key=value 应用到 profile 对象。不支持的关键字返回 `UnknownProperty`。
-fn applyProfile(catalog: *const model.Catalog, target: *model.ProfileConfig, key: []const u8, text: ?[]const u8) !void {
+/// v0.2.3 §5.2：`profile clone [KEY=VALUE...]` 在同一 catalog 事务中复用本函数
+/// 应用 property patch（由 `cloneProfile` 在写盘前调用）。
+pub fn applyProfile(catalog: *const model.Catalog, target: *model.ProfileConfig, key: []const u8, text: ?[]const u8) !void {
     if (eq(key, "diskless.failure.max_attempts")) {
         target.diskless.failure.max_attempts = try parseInt(u8, text);
         return;

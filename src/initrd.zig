@@ -715,7 +715,8 @@ fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, toke
 fn postFacts(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, memory_bytes: u64) !void {
     // 采集 DMI 硬件事实（与 kickstart %pre 的 nf_fact 等价）。纯 diskless 节点
     // 从未走过 install 路径，需要 initrd 自行上报 serial/uuid/vendor/model。
-    // sysfs 文件可能不存在（某些固件/容器无 DMI），读失败时该字段为空字符串。
+    // sysfs 文件可能不存在（某些固件/容器无 DMI），读失败或空值在序列化时
+    // 映射为 null（sanitizeDmi），server 端按可选字段处理。
     const serial = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_serial");
     defer if (serial) |s| allocator.free(s);
     const uuid = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_uuid");
@@ -724,16 +725,22 @@ fn postFacts(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: [
     defer if (vendor) |v| allocator.free(v);
     const model = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_name");
     defer if (model) |m| allocator.free(m);
-    const body = try std.fmt.allocPrint(allocator,
-        "{{\"memory_bytes\":{d},\"serial_number\":\"{s}\",\"product_uuid\":\"{s}\",\"vendor\":\"{s}\",\"model\":\"{s}\"}}\n",
-        .{
-            memory_bytes,
-            serial orelse "",
-            uuid orelse "",
-            vendor orelse "",
-            model orelse "",
-        },
-    );
+    const Payload = struct {
+        memory_bytes: u64,
+        serial_number: ?[]const u8 = null,
+        product_uuid: ?[]const u8 = null,
+        vendor: ?[]const u8 = null,
+        model: ?[]const u8 = null,
+    };
+    // 用正规 JSON 序列化而不是手工 `"{s}"` 内插：DMI 值含 `"`/`\`/控制字符时
+    // 手工拼接会产出非法 body，导致 daemon 400 并把连带的 memory_bytes 一起丢。
+    const body = try std.json.Stringify.valueAlloc(allocator, Payload{
+        .memory_bytes = memory_bytes,
+        .serial_number = sanitizeDmi(serial),
+        .product_uuid = sanitizeDmi(uuid),
+        .vendor = sanitizeDmi(vendor),
+        .model = sanitizeDmi(model),
+    }, .{});
     defer allocator.free(body);
     const facts_url = try http.Url.parse(url);
     const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
@@ -744,6 +751,24 @@ fn postFacts(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: [
         .{ .name = "Content-Type", .value = "application/json" },
     }, body);
     if (status < 200 or status >= 300) return error.FactsUploadRejected;
+}
+
+/// DMI 值进入 JSON body 前的卫生处理：截断到 255 字节并剔除 `< 0x20` 控制
+/// 字符；结果为空返回 null（server 端 `validateFacts` 对空串整包拒绝，宁可
+/// 丢该可选字段也不能损坏整包）。`"`/`\` 等 JSON 特殊字符由序列化器转义，
+/// 不在此处理。
+fn sanitizeDmi(value: ?[]u8) ?[]const u8 {
+    const raw = value orelse return null;
+    var write: usize = 0;
+    var read: usize = 0;
+    const cap = @min(raw.len, 255);
+    while (read < cap) : (read += 1) {
+        if (raw[read] < 0x20) continue;
+        raw[write] = raw[read];
+        write += 1;
+    }
+    if (write == 0) return null;
+    return raw[0..write];
 }
 
 /// 读取 sysfs 文件并 trim 空白。文件不存在或不可读时返回 null。
