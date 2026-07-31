@@ -808,7 +808,7 @@ v0.2.3 只有同时满足以下条件才完成：
 | [`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md) | deploy 示例保留显式 true 写法 |
 | [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) | "重建时换全部 SSH keys"标记为已实现 |
 | [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) | schema 版本引用更新 |
-| [`docs/cli/REFERENCE.md`](../cli/REFERENCE.md) | `profile clone` 新增 flags、exit code 表 |
+| [`docs/cli/REFERENCE.md`](../cli/REFERENCE.md) | `profile clone` 新增 flags、exit code 表；`node deploy` 缺省 true 语义说明 |
 | [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](CURRENT_CLI_OPTIMIZATION_PLAN.md) | P0/P1 完成状态更新 |
 | [`V0_3_DESIGN.md`](V0_3_DESIGN.md) | 前置条件从 v0.2.2 改为 v0.2.3 |
 
@@ -861,11 +861,14 @@ v0.2.3 只有同时满足以下条件才完成：
 |---|---|---|
 | `V0_2_CLI.md` | L517 | "唯一启用入口"改为"启用入口（缺省 true）" |
 | `V0_2_CLI.md` | L127 | 示例 `node deploy <id> false` 保持不变（显式 false 仍有效） |
-| `V0_2_CLI.md` | L131、L509、L577、L586、L597 | 示例可保留显式 `true` 写法（向后兼容），不强制改 |
+| `V0_2_CLI.md` | L131、L509、L510、L577、L586、L597 | 示例可保留显式 `true`/`false` 写法（向后兼容），不强制改 |
 | `V0_2_DISKLESS_WORKFLOW.md` | L253、L259、L345 | 同上，保留显式写法 |
 | `CURRENT_CLI_OPTIMIZATION_PLAN.md` | L674、L1039、L1051 | 同上 |
 | `README.md` | L308、L388、L410 | 同上 |
-| `V0_2_DESIGN.md` | L653、L1634 | 同上 |
+| `docs/cli/REFERENCE.md` | §Node 与生命周期 | 补一句“`node deploy <id>` 缺省等价于 `node deploy <id> true`” |
+
+注：`V0_2_DESIGN.md` 中的 `deploy=true` 引用（L653、L1634）属于属性值语义或
+`node set` 路径，不受本变更影响，无需同步。
 
 显式 `node deploy <id> true` 写法在所有文档中保留有效，不批量替换为缺省形式。
 只有不变量描述句（"唯一启用入口"）必须修正。
@@ -876,6 +879,9 @@ v0.2.3 只有同时满足以下条件才完成：
 - 负例：`node deploy r97n1 false` → daemon 收到 `deploy=false`（显式值不被
   `orelse` 吞掉）；
 - 非法值：`node deploy r97n1 yes` → exit code 2（现有校验保留）。
+
+测试落点：正例/负例需要 daemon 在线，入 `tests/cli.sh`；非法值 exit 2
+不依赖 daemon，下沉为 `zig build test` 语义用例。
 
 ### 12.3 P2：`node unset` 描述修正
 
@@ -908,16 +914,21 @@ optional。描述文字对用户有误导性。
    在 handler 开头、`requested_session` 校验之后添加：
 
    ```text
-   if (requested_session.len != 0 and ctx.flag("latest", bool))
-       return writeCommandError(ctx, "trace.conflicting_flags",
+   if (requested_session.len != 0 and ctx.flag("latest", bool)) {
+       try writeCommandError(ctx, "trace.conflicting_flags",
            "--session and --latest are mutually exclusive", 2);
+       return;
+   }
    ```
+
+   （与 handler 全库惯用的 `try writeCommandError(...); return;` 风格一致。）
 
 2. `--latest` 的 description 改为
    `"Select the latest retained session (default behavior; mutually exclusive with --session)"`。
 
-3. handler 中 `_ = ctx.flag("latest", bool)` 保留（仍不消费值，但上面新增的
-   冲突校验会读取它）。`--latest` 单独使用时行为不变（已经是缺省行为）。
+3. 删除 handler 中的 `_ = ctx.flag("latest", bool);` discard 行：冲突校验成为
+   该 flag 的唯一消费点，discard 行变为死代码（§10 完成标准含死代码删除）。
+   `--latest` 单独使用时行为不变（已经是缺省行为）。
 
 **不删除 `--latest` flag** 的理由：它作为显式 CLI 契约别名保留，允许脚本
 和自动化流程显式声明意图。删除会破坏现有脚本兼容性。
@@ -943,6 +954,9 @@ optional。描述文字对用户有误导性。
 - P2（unset 描述）：1 行 description；
 - P3（trace 冲突校验）：handler + description + 1 条契约测试。
 
+契约测试落点：需要 daemon 在线的端到端用例入 `tests/cli.sh`；纯 CLI 层
+校验（exit 2 路径）下沉为 `zig build test` 语义用例。
+
 ### 12.7 完成标准补充
 
 在 §10 完成标准中追加：
@@ -950,4 +964,4 @@ optional。描述文字对用户有误导性。
 - `node deploy <id>`（无第二参数）默认发送 `deploy=true`，契约测试通过；
 - `node deploy <id> false` 显式 false 不受影响，契约测试通过；
 - `node trace --session X --latest` 返回 exit code 2，契约测试通过；
-- `V0_2_CLI.md` L517 不变量描述已更新。
+- `V0_2_CLI.md` L517 不变量描述已更新；`docs/cli/REFERENCE.md` 已补缺省语义说明。
