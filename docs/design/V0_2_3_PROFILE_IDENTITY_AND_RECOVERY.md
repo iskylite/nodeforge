@@ -785,6 +785,10 @@ v0.2.3 只有同时满足以下条件才完成：
 - ISO/rootfs/initrd handler 不等待长任务，restart/partial/idempotency 确定；
 - exit code 0–6 契约测试通过（每个 exit class 至少一个 case）；
 - 旧同步 initrd 产品路径与死代码删除；
+- `node deploy <id>`（无第二参数）默认发送 `deploy=true`，显式 `false` 不受影响
+  （契约测试通过）；
+- `node trace --session X --latest` 返回 exit code 2（契约测试通过）；
+- `V0_2_CLI.md` "唯一启用入口"不变量描述已更新；
 - `zig build test` 全量通过；
 - 当前 aarch64 VMware 完成 Rocky/Ubuntu diskless 定向回归；
 - `V02-D01`—`V02-D14` 均不参与完成判定。
@@ -800,6 +804,8 @@ v0.2.3 只有同时满足以下条件才完成：
 | [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md) | v0.2.3 状态从"待实现"改为"已实现" |
 | [`V0_2_POST_RELEASE_BACKLOG.md`](V0_2_POST_RELEASE_BACKLOG.md) | §3 真实差异标记为已关闭 |
 | [`V0_2_DESIGN.md`](V0_2_DESIGN.md) | §4.4 SSH keys 描述更新为 identity store |
+| [`V0_2_CLI.md`](V0_2_CLI.md) | §8 L517 "唯一启用入口"不变量更新；deploy/readiness 示例保留显式 true |
+| [`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md) | deploy 示例保留显式 true 写法 |
 | [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) | "重建时换全部 SSH keys"标记为已实现 |
 | [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) | schema 版本引用更新 |
 | [`docs/cli/REFERENCE.md`](../cli/REFERENCE.md) | `profile clone` 新增 flags、exit code 表 |
@@ -807,3 +813,141 @@ v0.2.3 只有同时满足以下条件才完成：
 | [`V0_3_DESIGN.md`](V0_3_DESIGN.md) | 前置条件从 v0.2.2 改为 v0.2.3 |
 
 版本实施顺序固定为 v0.2.1 → v0.2.2 → v0.2.3 → v0.3 → v0.4 → v0.5。
+
+## 12. CLI 位置参数与默认值优化
+
+### 12.1 背景
+
+全 CLI 命令树扫描确认：`node deploy <node_id> <true|false>` 是唯一的布尔位置
+参数。其余所有布尔语义均通过 flag（`--force`、`--detach`、`--yes` 等）表达，
+默认值在 flag 声明层设定。zli 框架的 `PositionalArg` struct 只有
+`name/description/required/variadic` 四个字段，不支持 `default_value`——
+位置参数的默认值只能在 handler 层用 `ctx.getArg("name") orelse "default"` 实现。
+
+### 12.2 P0：`node deploy` 默认启用
+
+**现状**：`node deploy <node_id> <true|false>`，`enabled` 为 `required = true`
+位置参数。handler（`src/main.zig` L4807-L4811）手动校验 `"true"`/`"false"` 字符串。
+
+**变更**：
+
+1. `enabled` 位置参数改为 `required = false`（L377）；
+2. usage 从 `<node_id> <true|false>` 改为 `<node_id> [true|false]`（L375）；
+3. description 从 `"Deployment gate value: true or false"` 改为
+   `"Deployment gate value: true or false (default: true)"`（L377）；
+4. handler 改为 `const enabled = ctx.getArg("enabled") orelse "true"`（L4807）；
+5. `"true"`/`"false"` 校验逻辑保留不变（显式 `false` 仍正常工作）。
+
+**安全语义裁决**：
+
+`node deploy <id>` 缺省 `true` 意味着一条不完整命令直接打开部署闸门。这与
+项目一贯的"破坏性操作需显式声明"姿态（`--force` 默认 false、`--yes` 默认 false）
+存在张力。接受默认 `true` 的理由：
+
+- `deploy` 动词本身的语义就是"启用部署"，不是中性查询；
+- `node deploy` 底层是 `node set deploy=<v>` 的语法糖（handler 直接走
+  `scalarMutations` key=`deploy`），糖就该更甜；
+- 真正的安全闸是 boot readiness 强闸（`node readiness --stage boot`）而非
+  这个布尔值；deploy=false 只阻止新 PXE，不终止运行中的 session。
+
+此 trade-off 被显式 ack，不作为纯 UX 改动静默通过。
+
+**文档不变量同步**：
+
+`docs/design/V0_2_CLI.md` L517 明确写有 "`node deploy true` 是唯一启用入口"。
+变更后 `node deploy <id>`（无第二参数）成为第二个启用入口，以下文档必须同步：
+
+| 文档 | 位置 | 变更 |
+|---|---|---|
+| `V0_2_CLI.md` | L517 | "唯一启用入口"改为"启用入口（缺省 true）" |
+| `V0_2_CLI.md` | L127 | 示例 `node deploy <id> false` 保持不变（显式 false 仍有效） |
+| `V0_2_CLI.md` | L131、L509、L577、L586、L597 | 示例可保留显式 `true` 写法（向后兼容），不强制改 |
+| `V0_2_DISKLESS_WORKFLOW.md` | L253、L259、L345 | 同上，保留显式写法 |
+| `CURRENT_CLI_OPTIMIZATION_PLAN.md` | L674、L1039、L1051 | 同上 |
+| `README.md` | L308、L388、L410 | 同上 |
+| `V0_2_DESIGN.md` | L653、L1634 | 同上 |
+
+显式 `node deploy <id> true` 写法在所有文档中保留有效，不批量替换为缺省形式。
+只有不变量描述句（"唯一启用入口"）必须修正。
+
+**契约测试**：
+
+- 正例：`node deploy r97n1`（无第二参数）→ daemon 收到 `deploy=true`；
+- 负例：`node deploy r97n1 false` → daemon 收到 `deploy=false`（显式值不被
+  `orelse` 吞掉）；
+- 非法值：`node deploy r97n1 yes` → exit code 2（现有校验保留）。
+
+### 12.3 P2：`node unset` 描述修正
+
+**现状**：`keys` 位置参数 description 为 `"Optional property names to clear"`，
+`required = true, variadic = true`（L351）。
+
+**问题**："Optional" 指的是被清除的属性在 schema 中是 optional 的，不是参数本身
+optional。描述文字对用户有误导性。
+
+**变更**：description 改为 `"One or more optional property keys to clear"`。
+`required` 保持 `true`（`unset` 不带 key 语义上无意义）。仅修正描述歧义，
+不改变行为。
+
+### 12.4 P3：`node trace --latest` 与 `--session` 冲突处理
+
+**现状**：
+
+- `--latest` 是 `Bool, default false`（L403），description 为
+  `"Select the latest retained session (default when --session is omitted)"`；
+- handler（L5207）`_ = ctx.flag("latest", bool)` 完全丢弃 flag 值——
+  `--latest` 纯契约占位，无任何运行时效果；
+- `--session` 优先于 `--latest`：L5221 逻辑是 `if requested_session.len != 0`
+  则用 `--session`，否则回退到最新 session。同时给出 `--session X --latest`
+  时静默以 `--session` 为准，无任何校验或提示。
+
+**变更**：
+
+1. `--session` 和 `--latest` 同时给出时返回 exit code 2，error code
+   `trace.conflicting_flags`，message `"--session and --latest are mutually exclusive"`。
+   在 handler 开头、`requested_session` 校验之后添加：
+
+   ```text
+   if (requested_session.len != 0 and ctx.flag("latest", bool))
+       return writeCommandError(ctx, "trace.conflicting_flags",
+           "--session and --latest are mutually exclusive", 2);
+   ```
+
+2. `--latest` 的 description 改为
+   `"Select the latest retained session (default behavior; mutually exclusive with --session)"`。
+
+3. handler 中 `_ = ctx.flag("latest", bool)` 保留（仍不消费值，但上面新增的
+   冲突校验会读取它）。`--latest` 单独使用时行为不变（已经是缺省行为）。
+
+**不删除 `--latest` flag** 的理由：它作为显式 CLI 契约别名保留，允许脚本
+和自动化流程显式声明意图。删除会破坏现有脚本兼容性。
+
+### 12.5 不改动项
+
+以下经分析确认不需要改动：
+
+| 项 | 现状 | 裁决 |
+|---|---|---|
+| `--force`（7 处：node set/unset/deploy/retry、values、items） | flag, default false | 安全语义正确，破坏性操作需显式声明 |
+| `values replace-values` / `clear-values` 的 `values` | required = false | 已正确（replace 可只用 `--from-file`，clear 不需要值） |
+| `item set` 的 `fields` | required = false, variadic | 已正确（可只用 `--unset`） |
+| `profile clone --new-ssh-keys`/`--build`/`--detach` (v0.2.3) | flag, default false | 设计合理，见 §5.2 |
+| `setup --yes`/`--reconfigure`/`--reset-all` 等 | flag, default false | 安全语义正确 |
+| `--detach`（rootfs build、initrd build） | flag, default false | 默认 follow 符合交互习惯 |
+
+### 12.6 实施归属
+
+本节全部变更归入 Batch 5（CLI 与清理），不独立成批：
+
+- P0（deploy 默认 true）：handler + 声明 + 契约测试；
+- P2（unset 描述）：1 行 description；
+- P3（trace 冲突校验）：handler + description + 1 条契约测试。
+
+### 12.7 完成标准补充
+
+在 §10 完成标准中追加：
+
+- `node deploy <id>`（无第二参数）默认发送 `deploy=true`，契约测试通过；
+- `node deploy <id> false` 显式 false 不受影响，契约测试通过；
+- `node trace --session X --latest` 返回 exit code 2，契约测试通过；
+- `V0_2_CLI.md` L517 不变量描述已更新。
