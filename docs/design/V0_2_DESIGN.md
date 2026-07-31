@@ -540,7 +540,8 @@ v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不�
 | v0.2.0 | Rocky/RHEL diskless | M5 内存无盘启动 + M7 diskless 后处理；aarch64 QEMU/VMware 已验证 |
 | v0.2.1 | Ubuntu diskless | Ubuntu casper productization，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
 | v0.2.2 | 可运营性和当前环境矩阵 | 持久化兼容、durable builder、CLI 收敛、memory readiness、aarch64 VMware UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md)；本地不可验证项见 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) |
-| v0.3 | PXELINUX/BIOS install | M6 BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v6 + M7 `install-post`，见 `V0_3_DESIGN.md` |
+| v0.3 | install-post canonical 扩展与 adapter matrix | install-post 四类 canonical action、callback credential、发行版版本矩阵；保持 catalog schema v5，见 `V0_3_DESIGN.md` |
+| BIOS PXELINUX | 独立延后 | x86 BIOS PXELINUX install，不绑定产品版本号，最早在 v0.5 后实施，见 `BIOS_PXELINUX_DEFERRED.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 | v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
 
@@ -562,16 +563,17 @@ Diskless 不消费安装磁盘选择器，但必须复用同一个 Profile/Node 
 users/packages/network 默认值。凡是描述“最终运行系统”的 system/software/kernel/network override，diskless 与 install
 使用同一 effective 语义；只有 partition/bootloader/reinstall/completion 等依赖安装生命周期或持久磁盘的字段不适用。
 
-### M6：支持矩阵增强（BIOS/发行版 -> v0.3；多 NIC/容量 -> v0.4）
+### M6：支持矩阵增强（adapter matrix -> v0.3；多 NIC/容量 -> v0.4；BIOS -> 独立延后）
 
-- BIOS x86 PXELINUX。
 - Rocky/RHEL 系和 Ubuntu 后续 LTS 的显式 adapter capability matrix。
 - bootloader、发行版版本差异、错误分类和长期运行回归。
 - 最小功能并发、失败恢复验证（大规模容量压测延后 v0.4）。
+- BIOS x86 PXELINUX 独立延后，不绑定产品版本号，最早在 v0.5 后实施，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
 
-IPv6 是项目永久非目标，不进入 M6 或后续 schema。BIOS 与更多发行版版本彼此独立，不能捆绑实现。
+IPv6 是项目永久非目标，不进入 M6 或后续 schema。adapter matrix 与 BIOS 彼此独立，不能捆绑实现。
 
-M6 整体属 v0.3（BIOS PXELINUX、发行版版本矩阵、`firmware.mode` schema v6），不属 v0.2 diskless 主流程；
+M6 的 adapter matrix 部分属 v0.3（发行版版本矩阵、install-post canonical 扩展），不属 v0.2 diskless 主流程；
+BIOS PXELINUX 从 v0.3 剥离，独立延后。
 diskless 最小功能并发已在 M5（v0.2）验证。其中 PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网，
 以及大规模容量压测，在 VMware 难以有效验证且不属主流程，**延后到 v0.4**（需显式 consumer feature、schema 和验收）。
 
@@ -749,7 +751,7 @@ lineage，保证能回答“这个 Profile 基于哪个 OS 源、从哪个 Profi
 | 属性（v0.1 canonical） | diskless 适用性 | 说明 |
 |---|---|---|
 | Node `mac`/`arch`/`profile`/`pxe.ip_reservation`/`hostname`/`deploy` | 可用 | `deploy` 闸 diskless PXE；`pxe.ip_reservation` 为 DHCP 预留 |
-| Node `http_accel` | 可用（UEFI） | 仅 GRUB 取 kernel/initrd；BIOS not-applicable；不治理 initrd rootfs 下载（见 §5.1）|
+| Node `http_accel` | 可用（UEFI） | 仅 GRUB 取 kernel/initrd；BIOS not-applicable（见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）；不治理 initrd rootfs 下载（见 §5.1）|
 | Node `network.*` | 可用 | 目标系统网络，见下文网络标准 |
 | Node `storage.boot_disk`/`additional_disks` | 持久但不消费 | diskless effective 标记 not-applicable；保留以便日后绑 install Profile |
 | Node `overrides.software.*` | 全部可用（node-apply） | repositories/environment/groups/tasks/packages include/exclude 原样复用 v0.1 merge；解析为 pinned local repository/package closure 后重放，不改变公共 rootfs |
@@ -1202,15 +1204,12 @@ per-Node rootfs、variant、远程任务或真正 init 后的配置/artifact 下
 ### 5.1 M6
 
 BIOS 支持增加的是 Node confirmed firmware property和 bootloader adapter，不是 Profile 的物理磁盘 owner。
-M6 增加 Node direct `firmware.mode=uefi|bios`；schema v4 到 v5 的既有 Node migration 默认为 `uefi`，新认领 Node
-必须由管理员确认。DHCP observed firmware 只用于 mismatch/readiness 检查，不自动改写 desired property。该字段不能放入
-Profile 或 `overrides`。partition policy 仍使用 v0.1 的逻辑磁盘角色，由 effective compiler 结合 firmware 生成
-ESP/biosboot 要求。v0.1 保留的 `node.http_accel` 继续只适用于 UEFI GRUB；BIOS PXELINUX capability 必须报告
-`property.not_applicable`，不能接受后静默忽略，也不能为 BIOS 新增另一个同义传输开关。
+BIOS 相关的 `firmware.mode`、schema 变更、partition policy 和 `http_accel` 对 BIOS fail-closed 的完整设计
+见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。BIOS 不绑定产品版本号，最早在 v0.5 后实施。
 
 `http_accel` 治理的是 GRUB 在 PXE 阶段用 HTTP 取 kernel/initrd 的传输路径（install 与 diskless 共用，仅 UEFI）；它不
 治理 initrd 自身用 node-bound capability route 发起的 rootfs GET/HEAD/Range 下载--后者始终走受认证 HTTP 路由，与
-`http_accel` 开关无关，也不因 BIOS 而新增同义传输开关。
+`http_accel` 开关无关。
 
 ### 5.2 M7 phase 与八步执行契约
 
@@ -1263,7 +1262,7 @@ agent、属 install（v0.3）；`rootfs-build` 由服务端 rootfs builder 执�
 由 node-bound agent 在 diskless 真正 init 启动后顺序执行（一次性，无 `runtime` 周期、无远程控制）。此外，effective compiler
 生成的内部 `node-apply` 由同一 agent 的 pre-init 入口在真正 PID 1 前执行，它不是第四个用户可配置 phase。v0.2 的 agent **仅服务
 diskless**（diskless 无安装器，`node-apply`/`first-boot` 是其运行根执行路径）；rootfs-build 不需 agent（builder 本地受信），`install-post`
-随 v0.3（PXELINUX install）落地，install 侧 agent 延后到 v0.4（reconciliation 为永久非目标，见 §7）。本节 agent 设计
+随 v0.3 落地，install 侧 agent 延后到 v0.4（reconciliation 为永久非目标，见 §7）。本节 agent 设计
 以 diskless 后处理为唯一 v0.2 目标。
 
 **agent 身份与生命周期**。agent 无 enrollment：节点身份由 cmdline node/session、BootConfig 和 token claim
@@ -1361,10 +1360,9 @@ PropertySpec/CollectionSpec/ItemSpec 再给 handler；预留 enum/空 handler �
 `node boot preview`、`node diskless retry`、`node postprocess show`、
 `node trace`、`runtime dhcp-leases|tftp-sessions`、`events list|follow|types`、`nodeforge status`、`preflight diskless-builder`。
 
-**v0.3（PXELINUX/BIOS install）**：`node set firmware.mode=bios`（schema v6，仅 install）；
-既有 `install.post_install.bundle`/`install-post` 从 schema v4 的受限 managed-file
+**v0.3（install-post canonical 扩展）**：既有 `install.post_install.bundle`/`install-post` 从 schema v4 的受限 managed-file
 兼容形态扩展为四类 canonical action、generation callback 和完成闸；增加
-`node postprocess show --phase install-post --generation`。
+`node postprocess show --phase install-post --generation`。BIOS PXELINUX 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
 
 **v0.4（延后增强项）**：Node direct network topology ItemSpec、builder placement + 临时 PXE rootfs 构建 operation、
 大规模容量压测与 install 侧 agent generation 查询随其设计落地；
@@ -1374,8 +1372,8 @@ reconciliation/远程控制为永久非目标，无对应 CLI（见 §7）。v0.
 
 | 领域 | 当前结论 | 后续增量 |
 |---|---|---|
-| Profile/model | schema v4 `install|diskless`、boot bundle、三投影/两摘要已实现 | v0.3 才增加 firmware schema |
-| boot target | install/diskless UEFI GRUB 分支已接线 | BIOS/PXELINUX 属 v0.3 |
+| Profile/model | schema v4 `install|diskless`、boot bundle、三投影/两摘要已实现 | v0.3 不增加 firmware schema（BIOS 独立延后） |
+| boot target | install/diskless UEFI GRUB 分支已接线 | BIOS/PXELINUX 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md) |
 | HTTP delivery | BC v3/AP v1、rootfs/payload/agent/event/facts route 与四域 token 已实现 | v0.2.2 补 restart/abuse 矩阵 |
 | rootfs builder | Rocky dnf 路径已实现；持久 queued/running operation + 有界 worker，重启确定性 interrupted | Ubuntu casper 属 v0.2.1；initrd builder 异步化仍属 v0.2.2 |
 | initrd builder | vendor initrd 不变前缀 + NodeForge overlay、generic dracut fallback 已实现 | Ubuntu 需正式 CLI 产品链验收 |
@@ -1468,16 +1466,15 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
 
 ### 9.2 M6（v0.3）
 
-- schema v6 直接替换（不迁移），旧 v5 catalog 不被加载；活动 session 保护和 digest 预览通过。
-- `firmware.mode` claim/config、DHCP observed mismatch、readiness 和 digest 覆盖完整。
-- BIOS x86 PXELINUX DHCP/TFTP/config、kernel/initrd/cmdline、install generation gate 和 diskless 适用性通过 QEMU
-  smoke；`http_accel` 对 BIOS fail closed。
+- install-post 从既有受限形态扩展为四类 canonical action；旧 `repository`/`standard_packages` 退出。
+- install-post callback credential capsule 权限/泄漏检查、generation/plan 绑定、重放、过期、跨 Node 越权与 daemon restart-resume 负测通过。
 - 每个新增发行版版本逐项发布 adapter capability matrix，并通过 install answer、software index、默认值、
   unsupported/not-applicable 负向测试及至少一条可复现安装验证。
+- catalog schema 保持 v5（无 schema 变更）；BIOS PXELINUX 独立延后，不参与完成判定。
 
 ### 9.3 M7（rootfs-build/first-boot -> v0.2；install-post -> v0.3；install-agent -> v0.4；reconciliation 永久非目标）
 
-- schema v4 直接替换（不迁移），v3 managed-file bundle 按 v4 canonical tagged action/phase 定义；v0.3 schema v6
+- schema v4 直接替换（不迁移），v3 managed-file bundle 按 v4 canonical tagged action/phase 定义；v0.3 保持 schema v5
   仅增加 `install-post` 适用性，不另建 bundle owner；同一 Assets owner 扩展后的
   tagged ItemSpec 拒绝 action/phase 非法字段组合。
 - bundle CRUD、ordered item mutation、atomic file replacement、plan/apply/status、phase-specific retry、If-Match 和幂等键通过并发及
@@ -1557,7 +1554,7 @@ owner 或 v0.2 进入条件。
 
 **第二十二轮（跨版本契约复审）**：修正 digest 漂移分类，明确 identity/network/secret/overlay 只改变 desired plan、
 不分裂 rootfs cache；补通用 opaque operation show/wait、stdout/stderr 与 exit code 边界，删除 `preflight --scope` 双语法；
-修复 managed-file 字段矩阵与 BootConfig config digest 自引用、session supersede CAS。v0.3 将 BIOS 范围限定为 install，
+修复 managed-file 字段矩阵与 BootConfig config digest 自引用、session supersede CAS。v0.3 将 BIOS 独立延后，
 install-post 以 install generation 标识并只在 installer 内自动 retry。v0.4 网络改为 ItemSpec topology +
 BootConfig v4 bootstrap transport + AgentPlan v2 target topology，
 节点构建收敛为临时 PXE rootfs 构建 operation，install first-boot 补磁盘 handoff/journal，容量验收补 workload/SLO 证据。

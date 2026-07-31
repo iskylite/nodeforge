@@ -9,14 +9,17 @@ v0.4 在 v0.3 完成后启动，收纳 VMware 难以验证或非主流程的增�
 
 v0.4 必须基于 v0.2.2 operability 与 v0.3 完成：
 
-- v0.3 schema v6（`firmware.mode`）、BIOS PXELINUX、发行版版本矩阵与 `install-post` phase 已落地并通过验收。
-- v0.2/v0.3 diskless 与 install 主流程在 UEFI/BIOS 双模式下回归通过。
+- v0.3 install-post canonical 扩展、发行版版本矩阵与 callback credential 已落地并通过验收。
+- v0.2/v0.3 diskless 与 install 主流程在 UEFI 模式下回归通过。
 - 四个产品二进制（CLI `nodeforge` + `nodeforged`/`nodeforge-initrd`/`nodeforge-agent`
   三个运行角色）边界稳定。
 
+BIOS PXELINUX 不构成 v0.4 前置条件；它作为独立延后工作项管理，见
+[`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
+
 ## 2. 范围
 
-v0.4 的持久 shape 统一使用 catalog schema v7；v0.3 schema v6 到 v7 的迁移必须显式物化网络拓扑
+v0.4 的持久 shape 统一使用 catalog schema v6；v0.3 保持的 schema v5 到 v6 的迁移必须显式物化网络拓扑
 与 builder placement 默认值。不能在 v5 下静默增加多 NIC/VLAN/bonding 或 builder placement 字段。
 
 | 项 | v0.4 范围 | 说明 |
@@ -50,7 +53,7 @@ v0.4 **不**包含：可切换 rootfs 形态（-> v0.5）；NFS root/iPXE/IPv6�
   `{initrd:[...],agent:[...]}` 分域；任一缺失或冲突在 readiness 或 handoff 前以稳定 error code 拒绝，不静默降级。
 - PXE bootstrap、多 NIC、VLAN、bonding 不能由 initrd 或 agent 猜测或静默接受；未声明对应 consumer capability 时 readiness 失败。
 - VMware 难以有效验证的部分须在真机或更接近实机的环境验收，不混入主流程完成标准。
-- schema v7 使用四个 Node direct structured collection，均由 CollectionSpec/ItemSpec 驱动：
+- schema v6 使用四个 Node direct structured collection，均由 CollectionSpec/ItemSpec 驱动：
   `network.interfaces[]`（identity=`id`，含 `mac/mtu`）、`network.bonds[]`（identity=`id`，含
   `mode/members/mtu`）、`network.vlans[]`（identity=`id`，含 `parent_id/vlan_id/mtu`）和
   `network.routes[]`（identity=`id`，含 `destination/gateway/metric/interface_id`）。interface、bond、VLAN 都是
@@ -82,9 +85,9 @@ v0.4 **不**包含：可切换 rootfs 形态（-> v0.5）；NFS root/iPXE/IPv6�
   topology，不保留双 renderer。旧 active session 继续消费自己的 immutable BootConfig v3/AgentPlan v1 snapshot 到终态；
   新 v0.4 session 的 boot bundle/initrd 不支持 BootConfig v4，或 rootfs agent 不支持 AgentPlan v2 时 readiness 失败。
   v0.4 不改变 rootfs materialization 字段，仍固定 squashfs_overlay。
-- v6 → v7 采用直接替换（不迁移，见 v0.2.3 设计 §0）；旧 v6 catalog 不被
+- v5 → v6 采用直接替换（不迁移，见 v0.2.3 设计 §0）；旧 v5 catalog 不被
   加载，操作员需重新 `setup`。新 Profile 的 `network.interfaces` 和
-  `network.routes` 按 v7 schema 定义。active/recoverable BootConfig v3/v4 与
+  `network.routes` 按 v6 schema 定义。active/recoverable BootConfig v3/v4 与
   AgentPlan v1/v2 snapshot 均继续按创建时内容到终态。
 
 ## 5. 容量与压测
@@ -106,7 +109,7 @@ v0.4 **不**包含：可切换 rootfs 形态（-> v0.5）；NFS root/iPXE/IPv6�
 - builder 节点仍消费同一 pinned Profile build projection 与 `rootfs_input_digest`，不消费目标 Node override。
   成功产物必须上传并原子发布到服务端
   rootfs cache；v0.4 不允许“仅就地使用”，否则 delivery snapshot、Range 恢复和跨 Node cache 语义会分叉。
-- `builder.placement=server|node` 是 schema v7 的 Profile build policy，默认 `server`；Profile 只表达 placement
+- `builder.placement=server|node` 是 schema v6 的 Profile build policy，默认 `server`；Profile 只表达 placement
   策略，不持有物理 Node id。可作为 builder 的 Node 以 Node direct `builder.eligible=true` 显式加入本地 builder pool，
   且必须 `deploy=false`、无 active/recoverable session、capability 匹配。
 - CLI 创建的是有界 `rootfs-build` operation，并为 builder Node 原子 arm 一次性 builder delivery；它不远程重启、
@@ -151,7 +154,7 @@ v0.4 **不**包含：可切换 rootfs 形态（-> v0.5）；NFS root/iPXE/IPv6�
   执行模型：开机顺序执行、固定顺序（文件更新 -> package -> archive -> script）、一次性、确定性 + 幂等。
   diskless 仍在 first-boot 前执行 v0.2 的 Node `node-apply`；install Node effective override 已由安装器写入持久目标盘，
   因而 install first-boot 不重复执行 diskless node-apply。
-- install 仍只使用 `install.post_install.bundle` 及 v0.1 已有的 `overrides.install.post_install.bundle`；schema v7
+- install 仍只使用 `install.post_install.bundle` 及 v0.1 已有的 `overrides.install.post_install.bundle`；schema v6
   允许 effective bundle 同时含 `install-post` 与 `first-boot` item，不新增 `install.first_boot.bundle` 或第二个 owner。
   renderer 按 Profile + Node override 得到的 effective bundle，把 first-boot 固定 payload 写入目标磁盘。
 - **无 reconciliation**：agent 不检测 drift 后远程重跑收敛；drift 仅报告（v0.1 既有）不自动修复。
@@ -192,7 +195,7 @@ nodeforge node postprocess show <node> --phase first-boot [--generation <id>]
 ```
 
 - 多 NIC/VLAN/bonding、节点构建需配套显式 consumer feature：target topology 的 `multi-nic-v1`/`vlan-v1`/
-  `bonding-v1` 属 agent，PXE builder transport 的 `builder-node-v1` 属 initrd，并随 schema v7 扩展；未声明时
+  `bonding-v1` 属 agent，PXE builder transport 的 `builder-node-v1` 属 initrd，并随 schema v6 扩展；未声明时
   readiness 失败（`property.not_applicable` 或 `feature.missing`）。
   topology 为 Node direct structured collection，不经 `overrides`；mode 必须为 adapter 声明支持的值。
 - builder placement 由 Profile policy 决定，不使用一次性 `--on-node` 绕过 effective plan。当 placement=node 时
@@ -219,7 +222,7 @@ nodeforge node postprocess show <node> --phase first-boot [--generation <id>]
 
 - 多 NIC/VLAN/bonding 经显式 agent feature 与 schema 落地，readiness/handoff 前校验；agent pre-init 的 topology
   transaction 在真正 init 前完成，缺失/冲突 fail closed。
-- v6 → v7 直接替换（不迁移）；active/recoverable v2/v3
+- v5 → v6 直接替换（不迁移）；active/recoverable v2/v3
   snapshot 跨版本替换继续到终态。
 - DHCP/static bootstrap 都能创建唯一 BootSession；static 路径覆盖冒认、source-IP mismatch、duplicate IP、首次请求重传
   与并发 CAS，preview 不泄漏 token；authenticated route proof 失败时保留 bootstrap 网络。

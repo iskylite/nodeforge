@@ -311,8 +311,8 @@ manifest、event 或日志都不得包含 private key bytes。
   `MemAvailable` 执行硬闸；facts 上报失败只记录 warning，不能把成功 POST 误判为容量通过。
 - AgentPlan DTO `schema_version` v1（独立命名空间）；v0.4 target topology 升 v2，v0.5 保持 v2。
 - v0.2.3 Profile identity/provenance 使用 catalog schema v5；v0.3
-  `firmware.mode`/`install-post` schema v6；v0.4 schema v7；v0.5 rootfs 形态 schema v8，见
-  [`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
+保持 schema v5（install-post canonical 扩展）；BIOS PXELINUX 独立延后；v0.4 schema v6；v0.5 rootfs 形态 schema v7，见
+[`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
 - v0.2.2 不提供 `catalog migrate` CLI 命令；schema v4 是其唯一标准。后续版本
   （v0.2.3-v0.5）新增 schema 变更时采用**直接替换**：代码中的版本校验从旧版本
   改为新版本，旧 schema catalog 不被加载（`UnsupportedSchemaVersion`），操作员

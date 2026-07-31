@@ -156,7 +156,11 @@ Ubuntu 22.04.5 aarch64 VMware 冷启动回归。
   aarch64 VMware固定矩阵已完成；
 - **v0.2.3**：Profile稳定SSH identity/provenance、完整clone、capability restart
   语义、ISO后台operation和CLI exit mapping收口；
-- **v0.3+**：BIOS PXELINUX、多 NIC/topology、后续 rootfs 形态。
+- **v0.3**：install-post canonical 扩展、adapter capability matrix、callback credential；
+- **BIOS PXELINUX**：独立延后工作项，不绑定产品版本号，最早在 v0.5 后实施，见
+  [`BIOS_PXELINUX_DEFERRED.md`](docs/design/BIOS_PXELINUX_DEFERRED.md)；
+- **v0.4**：多 NIC/topology、容量、PXE builder、install first-boot；
+- **v0.5**：后续 rootfs 形态（`ram_rootfs`）。
 
 IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是项目永久非目标。
 

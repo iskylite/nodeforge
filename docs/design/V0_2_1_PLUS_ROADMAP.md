@@ -17,9 +17,10 @@
 | v0.2.1 | Ubuntu casper diskless 产品化 | 保持 catalog v4 / BC v3 / AP v1 | 已完成；fresh CLI 与 Rocky 9.7/10.2、Ubuntu aarch64 VMware 冷启动回归通过 |
 | v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 已完成并通过当前 aarch64 VMware 发布矩阵 |
 | v0.2.3 | Profile identity/provenance、recovery、ISO operation、exit mapping 收口 | catalog v5 / BC v3 / AP v1 | 已完成（含 aarch64 VMware 定向回归，2026-07-31） |
-| v0.3 | x86 BIOS/PXELINUX install + install-post canonical 扩展 | catalog v6；BC/AP 不因 BIOS 无盘升级 | 设计冻结，实现未开始 |
-| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v7 / BC v4 / AP v2 | 设计冻结，实现未开始 |
-| v0.5 | `ram_rootfs` materialization | catalog v8 / BC v5 / AP v2 | 设计冻结，实现未开始 |
+| v0.3 | install-post canonical 扩展、adapter matrix、callback credential | 保持 catalog v5 / BC v3 / AP v1 | 设计冻结，实现未开始 |
+| BIOS PXELINUX | x86 BIOS PXELINUX install | catalog v8（`firmware.mode`） | 独立延后，最早在 v0.5 后实施，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md) |
+| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v6 / BC v4 / AP v2 | 设计冻结，实现未开始 |
+| v0.5 | `ram_rootfs` materialization | catalog v7 / BC v5 / AP v2 | 设计冻结，实现未开始 |
 
 BC = BootConfig，AP = AgentPlan。catalog、节点 DTO、install callback、operation 和
 各 state file 是独立 schema namespace，绝不能因为版本号相同而共用升级判断。
@@ -56,31 +57,49 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
   归入当前环境不可验证清单，QEMU 只作可选补充证据。
 
 这一步把 v0.2 系列变成可长期维护的稳定底座。v0.3 不得绕过 v0.2.2，
-否则 BIOS 分支会建立在同步 builder、漂移 CLI 和不完整 restart 语义上。
+否则后续版本会建立在同步 builder、漂移 CLI 和不完整 restart 语义上。
 
-### Gate 3：v0.2.3 Profile identity 与恢复收口
+### Gate 3：v0.2.3 Profile identity 与恢复收口（已完成）
 
-状态：已完成（代码与单测全绿，aarch64 VMware 定向回归已通过，见 §10 完成标准）。
+状态：已完成（代码与单测全绿，aarch64 VMware 定向回归已通过，见 v0.2.3 完成标准）。
 
-在 catalog firmware shape 之前完成：
+在后续版本扩展 install-post 或 catalog shape 前完成：
 
-- catalog v5 Profile metadata与 daemon-owned SSH identity；
+- catalog v5 Profile metadata 与 daemon-owned SSH identity；
 - v4→v5 直接替换（不迁移）和旧 artifact 边界；
 - clone patch、`--new-ssh-keys`、`--build/--detach`；
-- capability确定性重构原token与安全负测；
-- ISO真后台operation；
+- capability 确定性重构原 token 与安全负测；
+- ISO 真后台 operation；
 - CLI exit mapping。
 
 非目标与完成闸见
 [`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)。
 
-### Gate 4：v0.3-v0.5 schema 演进
+### Gate 4：v0.3 install-post canonical 扩展与 adapter matrix
+
+状态：设计冻结，实现未开始。
+
+在 catalog topology 扩展之前完成：
+
+- install-post 四类 canonical action 扩展与旧 action 退出；
+- per-generation callback credential capsule；
+- install-post journal/status；
+- 显式 adapter capability matrix；
+- aarch64 UEFI install 回归。
+
+BIOS PXELINUX 不构成 v0.3 完成闸，已独立延后，见
+[`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
+非目标与完成闸见
+[`V0_3_DESIGN.md`](V0_3_DESIGN.md)。
+
+### Gate 5：v0.4-v0.5 schema 演进与 BIOS 延后项
 
 每版只引入自己需要的持久 shape：
 
-- v0.3 / catalog v6：Node `firmware.mode` 与 install-post canonical action/callback；
-- v0.4 / catalog v7：target topology、bootstrap transport、builder placement；
-- v0.5 / catalog v8：rootfs materialization mode。
+- v0.3 / 保持 catalog v5：install-post canonical 扩展、adapter capability matrix、callback credential；
+- BIOS PXELINUX / catalog v8：Node `firmware.mode`；最早在 v0.5 完成后实施，避免与 v0.4/v0.5 的 v6/v7 shape 复用版本号；
+- v0.4 / catalog v6：target topology、bootstrap transport、builder placement；
+- v0.5 / catalog v7：rootfs materialization mode。
 
 每次 schema 变更采用直接替换（见 v0.2.3 设计 §0）；旧版本 catalog
 不被加载，操作员需重新 `setup`。active immutable delivery snapshot
@@ -140,15 +159,17 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 ### v0.3
 
-- schema v5→v6 直接替换（不迁移）；
-- x86_64 BIOS install 完整闭环，diskless BIOS 明确拒绝；
-- install-post 从既有受限形态扩展为四 canonical action；
-- generation-bound callback credential、step journal 和完成闸；
-- UEFI install/diskless 与 v0.2.2 矩阵回归。
+- install-post 四类 canonical action、八步契约、credential/session 边界/finalizer、plan/status；
+- `standard_packages`/`repository` 已退出；
+- install-post callback credential capsule 权限/泄漏检查、generation/plan 绑定、重放、过期、跨 Node 越权与 daemon restart-resume 负测通过；
+- 显式 adapter capability matrix 覆盖目标 Rocky/RHEL 与 Ubuntu LTS；
+- aarch64 UEFI install 与 diskless 回归不退化；
+- catalog schema 保持 v5（无 schema 变更）；
+- BIOS PXELINUX 不参与完成判定（独立延后）。
 
 ### v0.4
 
-- topology v6→v7 直接替换（不迁移）；
+- 保持的 schema v5→v6 直接替换（不迁移）；
 - BC v4/AP v2 与旧 BC v3/AP v1 active snapshot 共存；
 - static/DHCP bootstrap、事务切网、容量 SLO；
 - PXE builder boot slot/upload claim/recovery；
@@ -156,10 +177,10 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 ### v0.5
 
-- catalog v8/BC v5；
+- catalog v7/BC v5；
 - `squashfs_overlay` 与 `ram_rootfs` 共用 artifact；
 - 双内存预算公式、metadata 保真和 `.part` 删除；
-- v7→v8 直接替换（不迁移）；
+- v6→v7 直接替换（不迁移）；
 - 不引入新的远程控制或 rootfs 传输变体。
 
 ## 5. 变更管理

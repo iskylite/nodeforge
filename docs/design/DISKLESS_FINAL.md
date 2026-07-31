@@ -58,7 +58,7 @@ squashfs_overlay = squashfs 只读 lower + tmpfs overlay upper
 
 NFS root 被 local-only 不变式（公网 mirror/metalink 必须移除）与“切根后独立运行”目标共同
 否决；rootfs 必须能下载到本地内存后离线切根。iPXE 引入额外引导栈与 BIOS/UEFI 兼容负担，
-v0.2 用 UEFI GRUB + 标准 PXE DHCP/TFTP 已足够；PXELINUX/BIOS 属 v0.3。
+v0.2 用 UEFI GRUB + 标准 PXE DHCP/TFTP 已足够；PXELINUX/BIOS 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
 
 ## 4. 共享 rootfs 构建模型
 

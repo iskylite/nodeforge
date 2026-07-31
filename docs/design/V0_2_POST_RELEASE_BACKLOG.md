@@ -50,7 +50,7 @@
 | `V02-D01` | x86_64 VMware UEFI E2E 与 Rocky/Ubuntu 矩阵 | `ENV-DEFERRED` | 不属于 v0.2.2/v0.2.3 完成闸；解除条件见 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) `ENV-X86-VMWARE` |
 | `V02-D02` | 每个候选重复跑 QEMU | `OPTIONAL-EVIDENCE` | VMware 已证明同一产品链时不要求；仅作诊断、故障注入或补充证据 |
 | `V02-D03` | Ubuntu 方案 B（rootfs 内 mkinitramfs） | `REJECTED-PATH` | 不是生产路径，不实施；实验记录仅供追溯，不进入路线图 |
-| `V02-D04` | BIOS/PXELINUX | `SCHEDULED` | 不属于 v0.2；进入 v0.3 |
+| `V02-D04` | BIOS/PXELINUX | `INDEPENDENT-DEFERRED` | 不绑定任何版本；独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md) |
 | `V02-D05` | 多 NIC/topology、大规模容量/SLO | `SCHEDULED` | 不属于 v0.2；进入 v0.4 |
 | `V02-D06` | `ram_rootfs` | `SCHEDULED` | 不属于 v0.2；进入 v0.5 |
 | `V02-D07` | Zig 0.16 显式 connect deadline | `UPSTREAM-BLOCKED` | 当前 runtime 会 panic，不能安全启用；上游解除后专项处理 |

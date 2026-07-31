@@ -36,5 +36,5 @@ QEMU（`V02-D02`）不属于必验环境。已有 QEMU 记录继续作为
 
 - NodeForge 继续支持并构建 x86_64 产物。
 - UEFI x86_64 路由、架构匹配和配置模型继续接受自动化回归。
-- BIOS/PXELINUX 仍属于 v0.3，不因本验证边界提前或取消。
+- BIOS/PXELINUX 作为 v0.5 后的独立延后工作项管理，不绑定产品版本号，不因本验证边界提前或取消；见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
 - 本文只调整验证义务，不调整 schema、DTO 或运行时能力范围。

@@ -23,8 +23,8 @@ v0.1 交付一个可独立使用的 IPv4 PXE 无人值守安装产品：
 - RHEL 软件环境/组/包和 Ubuntu task/metapackage/包的索引、查询与选择。
 - 未知 DHCP 客户端的持久化发现记录、查询和原子 Node 认领流程。
 
-v0.1 不包含 diskless rootfs 启动、BIOS PXELINUX 和高级 post-provision runner；这些属于
-`V0_2_DESIGN.md`。IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是永久非目标，模型、CLI、DHCP
+v0.1 不包含 diskless rootfs 启动、BIOS PXELINUX 和高级 post-provision runner；diskless 属于
+`V0_2_DESIGN.md`，BIOS PXELINUX 独立延后（见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）。IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是永久非目标，模型、CLI、DHCP
 和 adapter 不预留半实现字段。
 
 ## 2. 里程碑状态

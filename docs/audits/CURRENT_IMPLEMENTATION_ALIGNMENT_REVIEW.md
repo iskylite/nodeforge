@@ -48,7 +48,7 @@ x86_64 VMware 与重复 QEMU 不在当前完成闸，按
 | catalog schema | `Catalog.schema_version = 5`（v0.2.3 从 v4 直接替换升级，不迁移） |
 | Catalog 布局 | manifest layout schema v1 + catalog schema v5，8 类 entity 文件 |
 | 节点交付 DTO | BootConfig v3、AgentPlan v1（v0.2.3 不升级） |
-| install/diskless | UEFI install 与 UEFI diskless 共存；BIOS/PXELINUX 尚未实现（v0.3） |
+| install/diskless | UEFI install 与 UEFI diskless 共存；BIOS/PXELINUX 尚未实现（v0.5 后独立延后项） |
 
 “schema v3 已完成”只能描述 v0.1 历史里程碑，不能描述当前文件格式；“两个二进制”
 也不再是构建事实。catalog schema 变更一律直接替换（不迁移，见
@@ -255,9 +255,10 @@ v0.2.0 Rocky diskless 基线
   -> v0.2.1 Ubuntu casper productization（已完成）
   -> v0.2.2 operability + CLI convergence + fixed matrix（已完成）
   -> v0.2.3 Profile identity/recovery/ISO worker/exit mapping（已完成，当前基线）
-  -> v0.3 BIOS install + install-post canonical extension（设计冻结，实现未开始）
+  -> v0.3 install-post canonical extension + adapter matrix（设计冻结，实现未开始）
   -> v0.4 topology/capacity/PXE builder/install first-boot（设计冻结，实现未开始）
   -> v0.5 ram_rootfs materialization（设计冻结，实现未开始）
+  -> BIOS PXELINUX（独立延后；最早在 v0.5 后实施，catalog v8）
 ```
 
 详细依赖、schema/DTO 表和每版完成闸见

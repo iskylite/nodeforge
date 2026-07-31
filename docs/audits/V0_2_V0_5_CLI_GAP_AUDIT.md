@@ -5,6 +5,10 @@
 不一致和遗漏细节，并记录本轮修复的每一处变更。本文是审计证据，不定义产品行为；v0.2 总纲入口为
 `docs/design/V0_2_DESIGN.md`，CLI 细节由 `docs/design/V0_2_CLI.md` 负责。
 
+本文是历史快照；下文把 `firmware.mode`/BIOS 归入 v0.3 的条目仅作修复记录，不再定义当前范围。
+当前路线已将 BIOS PXELINUX 固定为 v0.5 后的独立延后项，以
+[`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准。
+
 ## 1. 审查范围
 
 | 文档 | 角色 | 行数 |

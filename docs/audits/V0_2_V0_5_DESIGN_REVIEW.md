@@ -1,6 +1,9 @@
 # NodeForge v0.2-v0.5 设计评审（基于 v0.1 M0-M4.13 实现）
 
 状态：2026-07-22 设计审计基线。本文回答“现有代码能复用什么、后续版本还缺什么、按什么顺序实现”。
+本文是历史快照；下文旧版 v0.3/BIOS 范围只用于追溯。当前路线已将 BIOS PXELINUX
+剥离为 v0.5 后的独立延后项，范围与 schema 编号以
+[`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准。
 权威行为以各版本总纲及其职责分册为准：v0.2 入口是 [`V0_2_DESIGN.md`](../design/V0_2_DESIGN.md)，
 diskless 架构细节由 [`DISKLESS_FINAL.md`](../design/DISKLESS_FINAL.md) 负责。
 当前实现状态与后续版本编号以

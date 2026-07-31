@@ -1,5 +1,11 @@
 # M5-M7 设计与实现对齐审计
 
+> 历史快照：本文记录 2026-07-22 的实现与设计状态，不定义当前版本范围。当前实现以
+> [`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md) 为准，
+> 当前路线与 schema 编号以
+> [`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准；其中 BIOS PXELINUX
+> 已从 v0.3 剥离并固定为 v0.5 后的独立延后项。下文旧版 v0.3/BIOS 表述仅作审计追溯。
+
 > M5-M7 归入 [`docs/design/V0_2_DESIGN.md`](../design/V0_2_DESIGN.md)，必须等待
 > [`docs/design/V0_1_DESIGN.md`](../design/V0_1_DESIGN.md) 的 schema v3 与全部进入条件验收完成。
 > 本文只记录当前代码证据和实现缺口；契约冲突时以版本设计为准，不能用历史

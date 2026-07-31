@@ -31,7 +31,7 @@ ISO import 后台 operation、CLI exit mapping。
 - 不新增迁移模块、不提供 `catalog migrate` 命令；
 - 不需要 migration journal、backup 目录或 downgrade blockers。
 
-后续版本（v0.3 catalog v6、v0.4 v7、v0.5 v8）同样遵循此原则。schema 版本号
+后续版本（v0.3 保持 catalog v5、v0.4 v6、v0.5 v7）同样遵循此原则。schema 版本号
 是代码级硬替换，不是数据级迁移。
 
 ## 1. 目标
@@ -50,7 +50,7 @@ v0.2.3 不实现：
 
 - `V02-D01`—`V02-D03`：x86_64 VMware E2E、强制 QEMU 矩阵、Ubuntu
   rootfs 内 mkinitramfs 方案 B；
-- `V02-D04`—`V02-D06`：BIOS/PXELINUX、多 NIC/topology/容量 SLO、`ram_rootfs`；
+- `V02-D04`—`V02-D06`：BIOS/PXELINUX（独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）、多 NIC/topology/容量 SLO、`ram_rootfs`；
 - `V02-D07`—`V02-D10`：Zig connect deadline、CommandSpec 自动生成、
   operation progress event、统一 `checks[]`；
 - `V02-D11`—`V02-D12`：operation cancel、Profile history / `--from-revision`；
@@ -988,7 +988,7 @@ v0.2.3 只有同时满足以下条件才完成：
   闸内）——回归使用新建的 v0.2.3 profile 规避。
 - `V02-D01`—`V02-D14` 均不参与完成判定。
 
-完成后 v0.2 不再保留实现 backlog，v0.3 从 catalog v6 开始。
+完成后 v0.2 不再保留实现 backlog，v0.3 保持 catalog v5（BIOS PXELINUX 独立延后）。
 
 ## 11. 跨文档引用
 
