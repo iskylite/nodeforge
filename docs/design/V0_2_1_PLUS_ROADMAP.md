@@ -1,7 +1,7 @@
 # NodeForge v0.2.1+ 实施路线图
 
 状态：现行跨版本路线图
-基线：产品 v0.2.2 / config+catalog schema v4 / BootConfig v3 / AgentPlan v1
+基线：产品 v0.2.3 / config schema v4 + catalog schema v5 / BootConfig v3 / AgentPlan v1
 更新日期：2026-07-30
 
 本文只定义版本依赖、实施顺序、schema/DTO 演进和完成闸。每个版本的领域细节仍由
@@ -16,7 +16,7 @@
 | v0.2.0 | Rocky/RHEL UEFI diskless + first-boot | catalog v4 / BC v3 / AP v1 | 已实现；安全审计通过（2026-07-29） |
 | v0.2.1 | Ubuntu casper diskless 产品化 | 保持 catalog v4 / BC v3 / AP v1 | 已完成；fresh CLI 与 Rocky 9.7/10.2、Ubuntu aarch64 VMware 冷启动回归通过 |
 | v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 已完成并通过当前 aarch64 VMware 发布矩阵 |
-| v0.2.3 | Profile identity/provenance、recovery、ISO operation、exit mapping 收口 | catalog v5 / BC v3 / AP v1 | 已实现（代码与单测全绿；仅剩 aarch64 VMware 定向回归） |
+| v0.2.3 | Profile identity/provenance、recovery、ISO operation、exit mapping 收口 | catalog v5 / BC v3 / AP v1 | 已完成（含 aarch64 VMware 定向回归，2026-07-31） |
 | v0.3 | x86 BIOS/PXELINUX install + install-post canonical 扩展 | catalog v6；BC/AP 不因 BIOS 无盘升级 | 设计冻结，实现未开始 |
 | v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v7 / BC v4 / AP v2 | 设计冻结，实现未开始 |
 | v0.5 | `ram_rootfs` materialization | catalog v8 / BC v5 / AP v2 | 设计冻结，实现未开始 |
@@ -60,7 +60,7 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 
 ### Gate 3：v0.2.3 Profile identity 与恢复收口
 
-状态：已实现（代码与单测全绿，见 §10 完成标准；仅剩 aarch64 VMware 定向回归）。
+状态：已完成（代码与单测全绿，aarch64 VMware 定向回归已通过，见 §10 完成标准）。
 
 在 catalog firmware shape 之前完成：
 
