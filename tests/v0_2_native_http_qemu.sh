@@ -86,7 +86,7 @@ h = hashlib.sha256()
 h.update(b"1")
 for e in entities:
     h.update(e["name"].encode() + e["sha256"].encode())
-manifest = {"layout_schema_version": 1, "catalog_schema_version": 4, "catalog_revision": 1,
+manifest = {"layout_schema_version": 1, "catalog_schema_version": 5, "catalog_revision": 1,
             "transaction_id": h.hexdigest(), "entities": entities}
 with open(f"{catalog_dir}/manifest.json", "w") as f:
     json.dump(manifest, f, indent=2)

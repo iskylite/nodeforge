@@ -92,8 +92,15 @@ pub const Store = struct {
         return true;
     }
 
-    /// 仅刷新内存事实并保留既有 DMI 字段。diskless initrd 不应因为只负责
-    /// `/proc/meminfo` 容量证明而清空先前安装环境上报的序列号/厂商信息。
+    /// 仅刷新内存事实并保留既有 DMI 字段。
+    ///
+    /// v0.2.3 前 diskless initrd 只上报 memory_bytes，daemon 的 `disklessFacts`
+    /// 端点调用本函数以保留先前安装环境上报的 serial/uuid/vendor/model。
+    /// v0.2.3 起 initrd 同时采集 DMI，`disklessFacts` 统一使用完整 `put`
+    /// 存储。旧版 initrd 二进制只发 `{"memory_bytes":N}` 时，`put` 以 null
+    /// DMI 覆盖已有记录——这在纯 diskless 节点上不会丢失信息（无先前 DMI），
+    /// 属可接受的升级窗口行为。本函数不再被 diskless 路径调用，仅作为
+    /// API-level 保留供未来按字段部分更新的场景使用。
     pub fn putMemory(self: *Store, node_id: []const u8, session_id: []const u8, generation: u64, session_created_at: i64, memory_bytes: u64, reported_at: i64) !bool {
         if (memory_bytes == 0) return error.InvalidFacts;
         lock(&self.mutex);

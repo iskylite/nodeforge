@@ -40,6 +40,9 @@ pub const BuildPlan = struct {
     commands: []const BuildCommand,
     package_manager: ?dto.FirstBootPackageManager,
     repository_urls: []const []const u8,
+    /// apt 专用：rootfs-build package 步骤是否保留 casper 自带源。
+    /// 来自 Profile install.apt.preserve_sources_list；dnf 恒为 false。
+    apt_preserve_sources_list: bool = false,
 
     pub fn deinit(self: BuildPlan, allocator: std.mem.Allocator) void {
         for (self.commands) |cmd| {
@@ -99,6 +102,7 @@ pub fn buildPlan(
     package_manager: ?dto.FirstBootPackageManager,
     repository_urls: []const []const u8,
     payload_paths: []const ?[]const u8,
+    apt_preserve_sources_list: bool,
 ) !BuildPlan {
     if (steps.len != payload_paths.len) return error.PayloadPathMismatch;
     // fail-closed 前置校验：每一步 phase 必须为 rootfs_build、action 必须属于允许集合。
@@ -150,6 +154,7 @@ pub fn buildPlan(
         .commands = try commands.toOwnedSlice(allocator),
         .package_manager = package_manager,
         .repository_urls = repository_urls,
+        .apt_preserve_sources_list = apt_preserve_sources_list,
     };
 }
 
@@ -168,7 +173,7 @@ pub fn execute(io: std.Io, allocator: std.mem.Allocator, staging: []const u8, pl
             },
             .namespaced_package => {
                 const package_manager = plan.package_manager orelse return error.UnsafeHostBuildCommand;
-                try namespaced_chroot_executor.execute(io, allocator, staging, package_manager, cmd.packages, plan.repository_urls, true, .chroot, cmd.timeout_s);
+                try namespaced_chroot_executor.execute(io, allocator, staging, package_manager, cmd.packages, plan.repository_urls, true, .chroot, cmd.timeout_s, plan.apt_preserve_sources_list);
             },
         }
     }
@@ -208,7 +213,7 @@ test "buildPlan orders steps managed_file -> package -> archive -> script and re
         .{ .name = "m", .phase = .rootfs_build, .action = .managed_file, .content = "hi\n", .destination = "/etc/motd" },
     };
     const payload_paths = [_]?[]const u8{ null, null, null, null };
-    const plan = try buildPlan(std.testing.allocator, &steps, .dnf, &.{"http://127.0.0.1/repo"}, &payload_paths);
+    const plan = try buildPlan(std.testing.allocator, &steps, .dnf, &.{"http://127.0.0.1/repo"}, &payload_paths, false);
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4), plan.commands.len);
     try std.testing.expectEqualStrings("/tmp/nodeforge-rootfs-build-0.sh", plan.commands[0].script_path);
@@ -225,7 +230,7 @@ test "buildPlan resolves content_asset to a staged payload path" {
         .{ .name = "arc", .phase = .rootfs_build, .action = .archive, .content_asset = "myarchive", .destination = "/opt/app" },
     };
     const payload_paths = [_]?[]const u8{"myarchive/1"};
-    const plan = try buildPlan(std.testing.allocator, &steps, null, &.{}, &payload_paths);
+    const plan = try buildPlan(std.testing.allocator, &steps, null, &.{}, &payload_paths, false);
     defer plan.deinit(std.testing.allocator);
     // 走 payload_path 分支：archive 用 cp/tar 引用已校验 payload，不内联字节。
     try std.testing.expect(std.mem.indexOf(u8, plan.commands[0].body, "/var/lib/nodeforge/payload/myarchive/1") != null);
@@ -237,25 +242,25 @@ test "buildPlan is fail-closed on wrong phase and disallowed action" {
         .{ .name = "x", .phase = .first_boot, .action = .managed_file, .content = "y", .destination = "/etc/motd" },
     };
     const paths = [_]?[]const u8{null};
-    try std.testing.expectError(error.PhaseNotRootfsBuild, buildPlan(std.testing.allocator, &wrong_phase, null, &.{}, &paths));
+    try std.testing.expectError(error.PhaseNotRootfsBuild, buildPlan(std.testing.allocator, &wrong_phase, null, &.{}, &paths, false));
 
     const bad_action = [_]model.ProvisionStep{
         .{ .name = "r", .phase = .rootfs_build, .action = .repository, .repository = "x" },
     };
-    try std.testing.expectError(error.ActionNotAllowedInRootfsBuild, buildPlan(std.testing.allocator, &bad_action, null, &.{}, &paths));
+    try std.testing.expectError(error.ActionNotAllowedInRootfsBuild, buildPlan(std.testing.allocator, &bad_action, null, &.{}, &paths, false));
 
     // payload_paths 长度不匹配也 fail-closed。
     const ok_steps = [_]model.ProvisionStep{
         .{ .name = "m", .phase = .rootfs_build, .action = .managed_file, .content = "y", .destination = "/etc/motd" },
     };
-    try std.testing.expectError(error.PayloadPathMismatch, buildPlan(std.testing.allocator, &ok_steps, null, &.{}, &.{}));
+    try std.testing.expectError(error.PayloadPathMismatch, buildPlan(std.testing.allocator, &ok_steps, null, &.{}, &.{}, false));
 }
 
 test "buildPlan package step carries packages for namespaced execution regardless of package manager" {
     const steps = [_]model.ProvisionStep{
         .{ .name = "p", .phase = .rootfs_build, .action = .package, .packages = &.{ "tmux", "vim" } },
     };
-    const plan = try buildPlan(std.testing.allocator, &steps, .dnf, &.{"http://10.0.2.2/repo"}, &.{null});
+    const plan = try buildPlan(std.testing.allocator, &steps, .dnf, &.{"http://10.0.2.2/repo"}, &.{null}, false);
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(.namespaced_package, plan.commands[0].isolation);
     try std.testing.expectEqualStrings("tmux", plan.commands[0].packages[0]);
@@ -266,17 +271,29 @@ test "apt rootfs-build package step compiles to namespaced_package isolation" {
     const steps = [_]model.ProvisionStep{
         .{ .name = "p", .phase = .rootfs_build, .action = .package, .packages = &.{"curl"} },
     };
-    const plan = try buildPlan(std.testing.allocator, &steps, .apt, &.{"file:///managed/apt"}, &.{null});
+    const plan = try buildPlan(std.testing.allocator, &steps, .apt, &.{"file:///managed/apt"}, &.{null}, false);
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(.namespaced_package, plan.commands[0].isolation);
     try std.testing.expectEqualStrings("curl", plan.commands[0].packages[0]);
+}
+
+test "buildPlan threads apt preserve_sources_list into the plan" {
+    const steps = [_]model.ProvisionStep{
+        .{ .name = "p", .phase = .rootfs_build, .action = .package, .packages = &.{"curl"} },
+    };
+    const preserved = try buildPlan(std.testing.allocator, &steps, .apt, &.{"file:///managed/apt"}, &.{null}, true);
+    defer preserved.deinit(std.testing.allocator);
+    try std.testing.expectEqual(true, preserved.apt_preserve_sources_list);
+    const replaced = try buildPlan(std.testing.allocator, &steps, .apt, &.{"file:///managed/apt"}, &.{null}, false);
+    defer replaced.deinit(std.testing.allocator);
+    try std.testing.expectEqual(false, replaced.apt_preserve_sources_list);
 }
 
 test "dnf rootfs-build package step also compiles to namespaced_package isolation" {
     const steps = [_]model.ProvisionStep{
         .{ .name = "p", .phase = .rootfs_build, .action = .package, .packages = &.{"jq"} },
     };
-    const plan = try buildPlan(std.testing.allocator, &steps, .dnf, &.{"file:///managed/dnf"}, &.{null});
+    const plan = try buildPlan(std.testing.allocator, &steps, .dnf, &.{"file:///managed/dnf"}, &.{null}, false);
     defer plan.deinit(std.testing.allocator);
     try std.testing.expectEqual(.namespaced_package, plan.commands[0].isolation);
 }

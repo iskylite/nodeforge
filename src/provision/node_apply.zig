@@ -58,9 +58,15 @@ fn renderManagedRepositories(w: *std.Io.Writer, allocator: std.mem.Allocator, tr
             try emitFile(w, "/etc/yum.repos.d/nodeforge.repo", content.written(), 0o644);
         },
         .apt => {
-            // casper layer 自带 ports.ubuntu.com/cdrom 源；diskless 运行根只能使用
-            // AgentPlan 固定的 NodeForge 受管仓库，不能在启动后重新暴露公网源。
-            try w.writeAll("rm -f /etc/apt/sources.list\nrm -rf /etc/apt/sources.list.d\nmkdir -p /etc/apt/sources.list.d\n");
+            // casper layer 自带 ports.ubuntu.com/cdrom 源。默认删除原有源，
+            // diskless 运行根只使用 AgentPlan 固定的 NodeForge 受管仓库，不能在
+            // 启动后重新暴露公网源；preserve_sources_list=true 时保留 casper
+            // 原有源，仅附加受管源（受管镜像缺少包时由操作员自行承担原始源
+            // 可达性/公网暴露）。
+            if (!transaction.preserve_sources_list) {
+                try w.writeAll("rm -f /etc/apt/sources.list\nrm -rf /etc/apt/sources.list.d\n");
+            }
+            try w.writeAll("mkdir -p /etc/apt/sources.list.d\n");
             var content: std.Io.Writer.Allocating = .init(allocator);
             defer content.deinit();
             for (transaction.repository_urls) |url|
@@ -633,6 +639,35 @@ test "apt runtime keeps only managed sources and masks installer-only services" 
     try std.testing.expect(std.mem.indexOf(u8, script, "rm -f /lib/systemd/system/getty@tty1.service") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "getty.target.wants/getty@tty1.service") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "getty.target.wants/serial-getty@ttyAMA0.service") != null);
+}
+
+test "apt runtime preserves existing sources when preserve_sources_list is enabled" {
+    const projection: dto.NodeApplyProjection = .{
+        .node_id = "n1",
+        .mac = "02:00:00:00:00:01",
+        .arch = .aarch64,
+        .hostname = null,
+        .network = .{},
+        .system = .{
+            .localization = .{},
+            .connectivity = .{},
+            .ssh = .{ .enabled = true, .password_authentication = true, .root_login = .yes },
+            .security = .{},
+            .users = &.{},
+        },
+        .software = .{},
+        .software_transaction = .{
+            .manager = .apt,
+            .repository_urls = &.{"http://192.0.2.1/ubuntu"},
+            .preserve_sources_list = true,
+        },
+    };
+    const script = try renderResolved(std.testing.allocator, projection, "enp2s0");
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "rm -f /etc/apt/sources.list") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "rm -rf /etc/apt/sources.list.d") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "mkdir -p /etc/apt/sources.list.d") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/apt/sources.list.d/nodeforge.list") != null);
 }
 
 test "encodeOctal round-trips arbitrary bytes through 3-digit octal" {

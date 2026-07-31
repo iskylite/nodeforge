@@ -123,7 +123,7 @@ pub fn validateConfigShape(config: *const model.AppConfig) ValidationError!void 
 /// 校验 catalog 的结构形状：schema 版本、名称唯一性、节点 ID/MAC 格式和资产路径安全。
 /// 不校验跨文件引用关系——那由 `validate` 统一执行。
 pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version != 4) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version != 5) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.DistroConfig, catalog.distros);
     try uniqueNamed(model.ProfileConfig, catalog.profiles);
     try uniqueNamed(model.ProvisioningBundle, catalog.provisioning_bundles);
@@ -300,7 +300,7 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
 /// 检查 distros/profiles/nodes/assets/repositories/install_sources/boot_bundles/provisioning_bundles
 /// 的名称唯一性、引用有效性和语义不变量。
 pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version != 4) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version != 5) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.RepositoryConfig, catalog.repositories);
     try uniqueNamed(model.AssetConfig, catalog.assets);
     try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
@@ -1030,9 +1030,9 @@ test "最小配置和空 catalog 有效" {
 }
 
 test "config and catalog pass validateModel" {
-    // 回归：apply 经 validateModel 校验候选，schema_version=4 不得被拒。
+    // 回归：apply 经 validateModel 校验候选，catalog schema_version=5 不得被拒。
     const config: model.AppConfig = .{ .schema_version = 4, .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
-    const cat: model.Catalog = .{ .schema_version = 4 };
+    const cat: model.Catalog = .{ .schema_version = 5 };
     try validateModel(&config, &cat);
 }
 

@@ -1,5 +1,5 @@
 //! catalog 实体的严格持久化 DTO（API/CLI 渲染用）。
-//! setup 始终生成 schema 4；不存在版本迁移。
+//! setup 始终生成 schema 5；不存在版本迁移。
 const std = @import("std");
 const model = @import("../model.zig");
 
@@ -47,12 +47,26 @@ const Install = struct {
 const Profile = struct {
     name: []const u8,
     install_source: []const u8,
+    kind: model.ProfileKind = .install,
+    boot_bundle: ?[]const u8 = null,
+    bundle: ?[]const u8 = null,
+    diskless: model.DisklessConfig = .{},
     system: System = .{},
     software: model.SoftwareSelection = .{},
     install: Install = .{},
     kernel_args: []const []const u8 = &.{},
+    /// v0.2.3: Profile 级单调递增 revision。
+    revision: u64 = 1,
+    /// v0.2.3: 创建时间（daemon UTC Unix seconds）。
+    created_at: i64 = 0,
+    /// v0.2.3: 最后更新时间。
+    updated_at: i64 = 0,
+    /// v0.2.3: 创建/克隆来源审计信息。
+    provenance: model.ProfileProvenance = .{},
+    /// v0.2.3: SSH identity 引用。
+    ssh_identity: model.ProfileSshIdentityRef = .{},
 };
-const AptOverride = struct { fallback: ?model.AptFallback = null };
+const AptOverride = struct { fallback: ?model.AptFallback = null, preserve_sources_list: ?bool = null };
 const CompletionOverride = struct { action: ?model.CompletionAction = null };
 const UpdatesOverride = struct { mode: ?model.UpdateMode = null };
 const ProxyOverride = struct { url: ?[]const u8 = null, no_proxy: model.StringSetDelta = .{} };
@@ -196,6 +210,10 @@ fn fromProfile(value: model.ProfileConfig, kernel_args: []const []const u8) Prof
     return .{
         .name = value.name,
         .install_source = value.install_source,
+        .kind = value.kind,
+        .boot_bundle = value.boot_bundle,
+        .bundle = value.bundle,
+        .diskless = value.diskless,
         .system = .{
             .localization = value.system.localization,
             .connectivity = .{ .time_sync = value.system.connectivity.time_sync, .ntp_servers = value.system.connectivity.ntp_servers },
@@ -217,6 +235,11 @@ fn fromProfile(value: model.ProfileConfig, kernel_args: []const []const u8) Prof
             .proxy = install.proxy,
         },
         .kernel_args = kernel_args,
+        .revision = value.revision,
+        .created_at = value.created_at,
+        .updated_at = value.updated_at,
+        .provenance = value.provenance,
+        .ssh_identity = value.ssh_identity,
     };
 }
 
@@ -298,7 +321,7 @@ fn fromNode(value: model.NodeConfig) Node {
             .install = .{
                 .storage = value.overrides.install.storage,
                 .bootloader = value.overrides.install.bootloader,
-                .apt = .{ .fallback = value.overrides.install.apt_fallback },
+                .apt = .{ .fallback = value.overrides.install.apt_fallback, .preserve_sources_list = value.overrides.install.apt_preserve_sources_list },
                 .completion = .{ .action = value.overrides.install.completion_action },
                 .updates = .{ .mode = value.overrides.install.updates_mode },
                 .proxy = .{ .url = value.overrides.install.proxy_url, .no_proxy = value.overrides.install.proxy_no_proxy },
@@ -329,6 +352,7 @@ fn toNode(value: Node) model.NodeConfig {
                 .storage = value.overrides.install.storage,
                 .bootloader = value.overrides.install.bootloader,
                 .apt_fallback = value.overrides.install.apt.fallback,
+                .apt_preserve_sources_list = value.overrides.install.apt.preserve_sources_list,
                 .completion_action = value.overrides.install.completion.action,
                 .updates_mode = value.overrides.install.updates.mode,
                 .proxy_url = value.overrides.install.proxy.url,

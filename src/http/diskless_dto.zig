@@ -107,6 +107,9 @@ pub const SoftwareTransaction = struct {
     remove: []const []const u8 = &.{},
     services_enable: []const []const u8 = &.{},
     services_disable: []const []const u8 = &.{},
+    /// apt 专用：保留 casper/installer 写入的原有源（NodeForge 受管源附加写入）。
+    /// dnf 无对应语义，恒为 false。
+    preserve_sources_list: bool = false,
 };
 
 /// AgentPlan 唯一的运行根配置 owner。字段是服务端已经合并完成的 effective

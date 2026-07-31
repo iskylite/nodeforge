@@ -60,6 +60,9 @@ pub const Decision = enum {
     path_not_allowed,
     content_mismatch,
     event_seq_mismatch,
+    /// v0.2.3: session 在 daemon restart 后无法安全重构同一 capability。
+    /// 该 session 的全部 scope 不可用，需新 boot session 重新走 bootstrap 认证。
+    recovery_incomplete,
 };
 
 /// 计算 raw token 的 HMAC-SHA256 十六进制摘要（服务端持久/内存只存此值）。

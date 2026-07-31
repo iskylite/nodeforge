@@ -321,7 +321,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
         if (link.id()) |id| log.info("RRQ {s} session={s}", .{ request.filename, id }) else log.warn("RRQ {s} session_link_state={s}", .{ request.filename, link.state().? });
     } else log.info("RRQ {s}", .{request.filename});
     const started = std.Io.Clock.awake.now(io);
-    emit(event_writer, io, allocator, &remote, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, linked_node_id, if (session_link) |*link| link else null);
+    emit(event_writer, io, allocator, &remote, request.filename, "tftp.rrq", "TFTP read requested", 0, 0, null, linked_node_id, if (session_link) |*link| link else null);
 
     const is_virtual_config = isVirtualGrubConfig(request.filename);
     const is_virtual_capsule = capsuleSessionFromPath(request.filename) != null;
@@ -333,7 +333,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
                 error.BootAccessDenied, error.BootTargetUnavailable, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected virtual config {s} from {f}: {t}", .{ request.filename, remote, err }),
                 else => observe_log.err("tftp: virtual config transfer failed for {s}: {t}", .{ request.filename, err }),
             }
-            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
+            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), tftpErrorReason(err), linked_node_id, if (session_link) |*link| link else null);
             if (initialErrorResponse(err)) |response| try sendEphemeralError(io, &remote, response.code, response.message);
             return;
         }
@@ -341,7 +341,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
         transferVirtualCapsule(io, &remote, request, config, sessions, capsules) catch |err| {
             runtime.tftp.finish(session, false);
             if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
-            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "credential capsule transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
+            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "credential capsule transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), tftpErrorReason(err), linked_node_id, if (session_link) |*link| link else null);
             if (initialErrorResponse(err)) |response| try sendEphemeralError(io, &remote, response.code, response.message);
             return;
         }
@@ -355,7 +355,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
                 error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected {s} from {f}: {t}", .{ request.filename, remote, err }),
                 else => observe_log.err("tftp: transfer failed for {s}: {t}", .{ request.filename, err }),
             }
-            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
+            emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "TFTP transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), tftpErrorReason(err), linked_node_id, if (session_link) |*link| link else null);
             if (initialErrorResponse(err)) |response| try sendEphemeralError(io, &remote, response.code, response.message);
             return;
         };
@@ -364,7 +364,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
     if (session_link) |*link| {
         if (link.id()) |boot_id| observe_log.info("tftp: transfer completed {s} ({d} bytes) session={s}", .{ request.filename, bytes_sent, boot_id }) else observe_log.info("tftp: transfer completed {s} ({d} bytes) session_link_state={s}", .{ request.filename, bytes_sent, link.state().? });
     } else observe_log.info("tftp: transfer completed {s} ({d} bytes)", .{ request.filename, bytes_sent });
-    emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), linked_node_id, if (session_link) |*link| link else null);
+    emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.complete", "TFTP transfer completed", bytes_sent, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), null, linked_node_id, if (session_link) |*link| link else null);
 }
 
 const InitialErrorResponse = struct { code: packet.ErrorCode, message: []const u8 };
@@ -1084,16 +1084,40 @@ fn sendError(socket: *std.Io.net.Socket, io: std.Io, remote: *const std.Io.net.I
     try socket.send(io, remote, try packet.encodeError(&buffer, code, message));
 }
 
+/// 将 TFTP 传输错误映射为结构化 reason 字符串，写入事件的 `error_reason` 字段。
+/// 使 `nodeforge node trace` 能直接显示具体失败原因（如 file_not_found、timeout），
+/// 而非笼统的 "TFTP transfer failed"。
+fn tftpErrorReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "file_not_found",
+        error.FileNotAllowed => "path_not_allowed",
+        error.Timeout => "timeout",
+        error.UnexpectedAck => "client_error",
+        error.UnsupportedMode => "unsupported_mode",
+        error.InvalidOption => "invalid_option",
+        error.BootAccessDenied => "access_denied",
+        error.BootTargetUnavailable => "target_unavailable",
+        error.DisklessSessionCapacity => "session_capacity",
+        error.StaleSource => "stale_source",
+        else => "io_error",
+    };
+}
+
 /// 追加 TFTP 审计事件并保留本次 RRQ 的关联结果。
 ///
 /// 关联结果在传输开始时确定，同一 RRQ 的 success/error 事件复用它；传输期间
 /// 不重新查询 Store，避免 session 过期或新 lease 把一条传输拆到不同 session。
-fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remote: *const std.Io.net.IpAddress, filename: []const u8, event_type: []const u8, message: []const u8, bytes_sent: u64, duration_us: i64, node_id: ?[]const u8, session_link: ?*const boot_session.Link) void {
+///
+/// `error_reason` 在失败事件中填入结构化原因（如 "file_not_found"、"timeout"），
+/// 成功事件传 null。该字段使 `nodeforge node trace` 能直接显示失败原因，
+/// 而不需要查 daemon 日志。字段数组容量 8（4 基础 + node_id + session +
+/// error_reason），实际使用 4-7 个。
+fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remote: *const std.Io.net.IpAddress, filename: []const u8, event_type: []const u8, message: []const u8, bytes_sent: u64, duration_us: i64, error_reason: ?[]const u8, node_id: ?[]const u8, session_link: ?*const boot_session.Link) void {
     const target = writer orelse return;
     var bytes_text: [20]u8 = undefined;
     var duration_text: [20]u8 = undefined;
     var client_ip: [64]u8 = undefined;
-    var fields: [7]events.Field = .{
+    var fields: [8]events.Field = .{
         .{ .key = "filename", .value = filename },
         .{ .key = "bytes_sent", .value = std.fmt.bufPrint(&bytes_text, "{d}", .{bytes_sent}) catch "0" },
         .{ .key = "client_ip", .value = std.fmt.bufPrint(&client_ip, "{f}", .{remote}) catch "unknown" },
@@ -1101,8 +1125,15 @@ fn emit(writer: ?*events.Writer, io: std.Io, allocator: std.mem.Allocator, remot
         .{ .key = "", .value = "" },
         .{ .key = "", .value = "" },
         .{ .key = "", .value = "" },
+        .{ .key = "", .value = "" },
     };
     var count: usize = 4;
+    // 失败事件的结构化原因：使 trace 输出能区分 file_not_found / timeout /
+    // client_error 等，而不需要交叉查 daemon 日志。
+    if (error_reason) |reason| {
+        fields[count] = .{ .key = "error_reason", .value = reason };
+        count += 1;
+    }
     if (node_id) |id| {
         fields[count] = .{ .key = "node_id", .value = id };
         count += 1;

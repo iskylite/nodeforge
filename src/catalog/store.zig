@@ -97,7 +97,7 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     var parsed_manifest = try std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{ .allocate = .alloc_always });
     defer parsed_manifest.deinit();
     const manifest = parsed_manifest.value;
-    if (manifest.layout_schema_version != layout_schema_version or manifest.catalog_schema_version != 4 or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != names.len)
+    if (manifest.layout_schema_version != layout_schema_version or manifest.catalog_schema_version != 5 or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != names.len)
         return error.InvalidCatalogManifest;
     var declared_tx: [64]u8 = undefined;
     try transactionId(manifest.catalog_revision, manifest.entities, &declared_tx);
@@ -392,20 +392,20 @@ test "v4 catalog round-trips diskless profile, boot bundle and rootfs_build step
     const steps = [_]model.ProvisionStep{.{ .name = "pkgs", .phase = .rootfs_build, .action = .@"package", .packages = &.{"vim"} }};
     const prov_bundles = [_]model.ProvisioningBundle{.{ .name = "pb", .steps = &steps }};
     const assets = [_]model.AssetConfig{.{ .name = "rk", .kind = .runtime_kernel, .path = "/rk" }};
-    const candidate: model.Catalog = .{ .schema_version = 4, .profiles = &profiles, .boot_bundles = &bundles, .provisioning_bundles = &prov_bundles, .assets = &assets };
+    const candidate: model.Catalog = .{ .schema_version = 5, .profiles = &profiles, .boot_bundles = &bundles, .provisioning_bundles = &prov_bundles, .assets = &assets };
     try save(std.testing.io, std.testing.allocator, root, &candidate);
     var loaded = try load(std.testing.io, std.testing.allocator, root);
     defer loaded.deinit();
-    try std.testing.expectEqual(@as(u32, 4), loaded.value.schema_version);
+    try std.testing.expectEqual(@as(u32, 5), loaded.value.schema_version);
     try std.testing.expectEqual(model.ProfileKind.diskless, loaded.value.profiles[0].kind);
     try std.testing.expectEqualStrings("bb", loaded.value.profiles[0].boot_bundle.?);
     try std.testing.expectEqual(model.ProvisionPhase.rootfs_build, loaded.value.provisioning_bundles[0].steps[0].phase);
     try std.testing.expectEqual(model.ProvisionAction.@"package", loaded.value.provisioning_bundles[0].steps[0].action);
     try std.testing.expectEqual(model.AssetKind.runtime_kernel, loaded.value.assets[0].kind);
-    // 幂等再次保存使 manifest 在 schema 4 下保持稳定（10 个实体）。
+    // 幂等再次保存使 manifest 在 schema 5 下保持稳定（10 个实体）。
     try save(std.testing.io, std.testing.allocator, root, &loaded.value);
     var reloaded = try load(std.testing.io, std.testing.allocator, root);
     defer reloaded.deinit();
-    try std.testing.expectEqual(@as(u32, 4), reloaded.value.schema_version);
+    try std.testing.expectEqual(@as(u32, 5), reloaded.value.schema_version);
     try std.testing.expectEqual(model.ProfileKind.diskless, reloaded.value.profiles[0].kind);
 }

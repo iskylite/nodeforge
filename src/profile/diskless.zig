@@ -56,6 +56,10 @@ pub const ProfileBuildProjection = struct {
     /// Ubuntu casper OS 层 layer 清单（base→top 有序）；非 Ubuntu install source
     /// 始终为空。同一 ISO 不同 layer 组合必须产生不同 `rootfs_input_digest`。
     casper_layers: []const model.CasperLayer = &.{},
+    /// Ubuntu apt 源保留策略（install.apt.preserve_sources_list 的 Profile 值）。
+    /// 影响 rootfs-build package 步骤是否删除 casper 自带源，必须进入
+    /// `rootfs_input_digest`，否则切换开关后可能复用旧缓存 rootfs。
+    apt_preserve_sources_list: bool = false,
 };
 
 /// 只在 kernel/rootfs 之前生效的内容。
@@ -79,6 +83,10 @@ pub const NodeApplyProjection = struct {
     system: model.TargetSystemConfig,
     software: model.SoftwareSelection,
     first_boot_bundle: ?[]const u8,
+    /// Ubuntu apt 源保留策略（Node override 优先，否则 Profile 值）。
+    /// 进入 `desired_plan_digest`；node-apply 运行时据此决定是否删除
+    /// casper 自带源。
+    apt_preserve_sources_list: bool = false,
     /// effective first-boot closure（含 asset path/digest/revision）的摘要。
     first_boot_digest: Digest = [_]u8{0} ** 64,
 };
@@ -168,6 +176,7 @@ pub fn compile(allocator: std.mem.Allocator, config: *const model.AppConfig, cat
         .rootfs_build_steps = rootfs_build_steps,
         .casper_layers = source.casper_layers,
         .first_boot_fixed_steps = first_boot_fixed_steps,
+        .apt_preserve_sources_list = profile.install.apt.preserve_sources_list,
     };
     const node_boot: NodeBootProjection = .{
         .kernel_args = inner.kernel_args,
@@ -187,6 +196,7 @@ pub fn compile(allocator: std.mem.Allocator, config: *const model.AppConfig, cat
         .system = inner.system,
         .software = inner.software,
         .first_boot_bundle = node_firstboot_bundle,
+        .apt_preserve_sources_list = node.overrides.install.apt_preserve_sources_list orelse profile.install.apt.preserve_sources_list,
         .first_boot_digest = first_boot_digest,
     };
 
@@ -242,6 +252,7 @@ pub fn rootfsInputDigest(allocator: std.mem.Allocator, config: *const model.AppC
         .rootfs_build_steps = rootfs_build_steps,
         .casper_layers = source.casper_layers,
         .first_boot_fixed_steps = first_boot_fixed_steps,
+        .apt_preserve_sources_list = profile.install.apt.preserve_sources_list,
     };
     return digestOf(allocator, profile_build);
 }
@@ -413,6 +424,23 @@ test "casper_layers content changes rootfs input digest" {
     const digest_b = try rootfsInputDigest(std.testing.allocator, &config, &catalog_b, &profile);
 
     try std.testing.expect(!std.mem.eql(u8, &digest_a, &digest_b));
+}
+
+test "apt_preserve_sources_list changes rootfs input digest" {
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .http_port = 18080 } };
+    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "ubuntu", .version = "22.04", .arch = .x86_64, .kernel_release = "5.15.0", .kernel = "k", .initrd = "i" };
+    const source: model.InstallSourceConfig = .{ .name = "s", .distro = "ubuntu", .version = "22.04", .arch = .x86_64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
+    const profile_off: model.ProfileConfig = .{ .name = "p", .install_source = "s", .kind = .diskless, .boot_bundle = "bb", .install = .{ .apt = .{ .preserve_sources_list = false } } };
+    const profile_on: model.ProfileConfig = .{ .name = "p", .install_source = "s", .kind = .diskless, .boot_bundle = "bb", .install = .{ .apt = .{ .preserve_sources_list = true } } };
+    const nodes = [_]model.NodeConfig{.{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .x86_64, .profile = "p" }};
+
+    const catalog_off: model.Catalog = .{ .profiles = &.{profile_off}, .nodes = &nodes, .install_sources = &.{source}, .boot_bundles = &.{bundle} };
+    const digest_off = try rootfsInputDigest(std.testing.allocator, &config, &catalog_off, &profile_off);
+
+    const catalog_on: model.Catalog = .{ .profiles = &.{profile_on}, .nodes = &nodes, .install_sources = &.{source}, .boot_bundles = &.{bundle} };
+    const digest_on = try rootfsInputDigest(std.testing.allocator, &config, &catalog_on, &profile_on);
+
+    try std.testing.expect(!std.mem.eql(u8, &digest_off, &digest_on));
 }
 
 test "rootfsBuildSteps returns pinned profile-fixed rootfs-build steps" {

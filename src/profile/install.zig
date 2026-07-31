@@ -46,6 +46,7 @@ pub fn effectiveInstall(node: *const model.NodeConfig, profile: *const model.Pro
     if (policy.storage.partitions) |value| install.storage.partitions = value;
     if (policy.bootloader.install) |value| install.bootloader.install = value;
     if (policy.apt_fallback) |value| install.apt.fallback = value;
+    if (policy.apt_preserve_sources_list) |value| install.apt.preserve_sources_list = value;
     if (policy.reinstall_policy) |value| install.reinstall_policy = value;
     if (policy.completion_action) |value| install.completion.action = value;
     if (policy.updates_mode) |value| install.updates.mode = value;

@@ -321,7 +321,10 @@ nodeforge profile set rocky-9 $'system.hosts_content=127.0.0.1 localhost\n192.16
 Install 与 diskless 默认继承 Install Source 导入的受管 Yum/APT 仓库。Rocky 安装后只保留
 `/etc/yum.repos.d/nodeforge.repo`；Ubuntu install 由 Subiquity 持久化 NodeForge APT
 primary，Ubuntu diskless 的 node-apply 则删除 casper 自带的公网/CD-ROM 源，只生成
-`/etc/apt/sources.list.d/nodeforge.list`。diskless 同时离线 mask 仅适用于安装介质的
+`/etc/apt/sources.list.d/nodeforge.list`。Ubuntu 可设置 profile 策略
+`install.apt.preserve_sources_list=true`（Node 级 `overrides.install.apt.preserve_sources_list`）
+保留安装器/ISO 写入的原有 APT 源，NodeForge 受管源改为附加写入，用于受管镜像缺少包、
+需要借助原始源补齐的场景；默认 `false` 保持只保留受管源的 local-only 契约。diskless 同时离线 mask 仅适用于安装介质的
 snapd、multipathd 和 casper-md5check 单元，防止 overlay 根上的重启循环和虚假 failed unit。
 node-apply 还会移除 casper 对 `getty@tty1` 的 vendor mask 和 Subiquity getty
 drop-in，恢复标准本地登录控制台；存在 ARM 串口设备时同时启用对应 serial getty。

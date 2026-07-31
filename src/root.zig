@@ -100,6 +100,8 @@ pub const artifact_layout = @import("provision/artifact_layout.zig");
 pub const state_rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
 /// v0.2 diskless delivery session + scoped token store（config/agent/event token）。
 pub const state_diskless_delivery = @import("state/diskless_delivery.zig");
+/// v0.2.3 SSH identity store：Profile SSH 密钥对独立持久化。
+pub const state_identity_store = @import("state/identity_store.zig");
 pub const operations = @import("state/operations.zig");
 pub const config_runtime = @import("state/config_runtime.zig");
 pub const model_runtime = @import("state/model_runtime.zig");
@@ -214,6 +216,7 @@ test {
     _ = provision_rootfs_build;
     _ = state_rootfs_artifact_store;
     _ = state_diskless_delivery;
+    _ = state_identity_store;
     _ = node_inventory;
     _ = operations;
     _ = config_runtime;

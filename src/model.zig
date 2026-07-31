@@ -54,9 +54,9 @@ pub const AppConfig = struct {
 /// 该文件只由 `nodeforged` 通过 catalog store 原子事务写入，CLI 不直接编辑。
 /// 磁盘布局为 manifest + 8 个 entity 文件，内存模型由本结构体表达。
 pub const Catalog = struct {
-    /// 内存 catalog schema 版本。永久默认 4（最新）；setup 始终生成 v4，不存在版本迁移。
+    /// 内存 catalog schema 版本。永久默认 5（最新）；setup 始终生成 v5，不存在版本迁移。
     /// 磁盘布局另由 manifest schema 约束。
-    schema_version: u32 = 4,
+    schema_version: u32 = 5,
     /// manifest 的单调 catalog revision；每次原子事务提交递增。legacy 单文件输入为 0。
     revision: u64 = 0,
     /// ISO 导入后自动形成的发行版能力索引。非操作员手动创建的策略对象。
@@ -333,6 +333,49 @@ pub const BootKind = enum {
 /// 设计文档使用的 `ProfileKind` 即代码 [`BootKind`]。
 pub const ProfileKind = BootKind;
 
+/// v0.2.3: Profile 创建/克隆来源审计信息。
+pub const ProfileProvenance = struct {
+    /// 创建来源：直接创建或克隆。
+    origin: ProfileProvenanceOrigin = .create,
+    /// 创建/克隆时的 install source 名称。
+    install_source_name: []const u8 = "",
+    /// 创建/克隆时的 catalog revision 快照。
+    install_source_revision: u64 = 0,
+    /// origin=clone 时非 null，记录 source Profile 信息。
+    cloned_from: ?ClonedFrom = null,
+};
+
+/// v0.2.3: Profile 创建来源枚举。
+pub const ProfileProvenanceOrigin = enum {
+    create,
+    clone,
+};
+
+/// v0.2.3: 克隆来源记录。
+pub const ClonedFrom = struct {
+    /// source Profile 名称。
+    profile_name: []const u8,
+    /// source Profile 的 revision 快照。
+    profile_revision: u64 = 0,
+    /// 克隆时的 catalog revision。
+    catalog_revision: u64 = 0,
+    /// 克隆时间（daemon UTC Unix seconds）。
+    cloned_at: i64 = 0,
+};
+
+/// v0.2.3: Profile 绑定的 SSH identity 引用。private key 不进入 catalog，
+/// 只保存 reference/revision/fingerprint。
+pub const ProfileSshIdentityRef = struct {
+    /// 32 字符小写十六进制，与 identity store 主键一致。
+    id: []const u8 = "",
+    /// identity revision，--new-ssh-keys 递增。
+    revision: u64 = 1,
+    /// SHA-256 base64 指纹（SSH 标准指纹格式）。
+    client_public_fingerprint: []const u8 = "",
+    /// SHA-256 base64 指纹。
+    host_public_fingerprint: []const u8 = "",
+};
+
 /// 基础源及额外标准包使用的包管理器。由 [`packageManagerForFamily`] 从 family 派生。
 pub const PackageManager = enum { dnf, apt };
 
@@ -607,8 +650,19 @@ pub const ProfileConfig = struct {
     /// 引用的 install source 资源名称。平台能力（distro/version/arch）由此派生。
     /// install 与 diskless Profile 都从 InstallSource 创建/派生，共用同一 source。
     install_source: []const u8,
-    /// Profile 部署类型（schema v4 tagged kind）。v3 迁移后 install Profile 为 `.install`。
+    /// Profile 部署类型（schema v4+ tagged kind）。v3 迁移后 install Profile 为 `.install`。
     kind: ProfileKind = .install,
+    /// v0.2.3: Profile 级单调递增 revision，初始值 1。每次 Profile mutation 成功后递增 1。
+    /// 不等于 catalog revision；不因无关 catalog mutation 改变。
+    revision: u64 = 1,
+    /// v0.2.3: Profile 首次创建的 daemon UTC Unix seconds，创建后不可变。
+    created_at: i64 = 0,
+    /// v0.2.3: 最近一次 mutation 的 daemon UTC Unix seconds。
+    updated_at: i64 = 0,
+    /// v0.2.3: Profile 创建/克隆来源审计信息。
+    provenance: ProfileProvenance = .{},
+    /// v0.2.3: Profile 绑定的 SSH identity 引用（指向 identity store）。
+    ssh_identity: ProfileSshIdentityRef = .{},
     /// diskless Profile 引用的 boot bundle 名称；仅 `kind == .diskless` 时必填。
     /// install Profile 忽略此字段。
     boot_bundle: ?[]const u8 = null,
@@ -925,6 +979,8 @@ pub const InstallOverrideConfig = struct {
     bootloader: BootloaderOverride = .{},
     /// Ubuntu APT fallback 策略 override。
     apt_fallback: ?AptFallback = null,
+    /// Ubuntu APT 源保留策略 override（null 继承 Profile）。
+    apt_preserve_sources_list: ?bool = null,
     /// 重装策略 override。
     reinstall_policy: ?ReinstallPolicy = null,
     /// 安装完成动作 override（reboot/poweroff/halt）。
@@ -1152,6 +1208,12 @@ pub const AptFallback = enum {
 pub const AptInstallConfig = struct {
     /// APT mirror 不可用时的 fallback 策略。
     fallback: AptFallback = .@"offline-install",
+    /// 是否保留安装器/ISO 写入的原有 APT 源，而不是删除后只保留 NodeForge
+    /// 受管源。默认 false：autoinstall late-command、diskless node-apply 和
+    /// rootfs-build package 步骤都会删除原有源，只生成 nodeforge.list
+    /// （local-only 受管源契约）。设为 true 时保留原有源，NodeForge 受管源
+    /// 作为附加源写入——受管镜像缺少包、需要借助原始源补齐时使用。
+    preserve_sources_list: bool = false,
 };
 
 /// 磁盘存储布局配置（effective plan 编译结果）。

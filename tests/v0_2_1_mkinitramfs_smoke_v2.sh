@@ -267,7 +267,7 @@ for name in names:
     ents.append({"name":name,"file":f"{name}.json","sha256":hashlib.sha256(data).hexdigest()})
 h=hashlib.sha256(); h.update(b"1")
 for e in ents: h.update(e["name"].encode()+e["sha256"].encode())
-man={"layout_schema_version":1,"catalog_schema_version":4,"catalog_revision":1,
+man={"layout_schema_version":1,"catalog_schema_version":5,"catalog_revision":1,
      "transaction_id":h.hexdigest(),"entities":ents}
 with open(f"{dst}/manifest.json","w") as f: json.dump(man,f,indent=2)
 print(f"catalog injected; assets={len(assets)} bundles={len(bundles)} nodes={len(nodes)} profiles={len(profs)}")

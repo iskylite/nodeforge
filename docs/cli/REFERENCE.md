@@ -63,6 +63,7 @@ node claim
 `node readiness` 用于 diskless build/boot readiness；install Profile 使用
 `node boot preview` 检查下一次启动选择。`node retry` 由服务端单事务完成
 install rearm 或 diskless failure/quarantine 恢复。
+`node deploy <id>` 缺省等价于 `node deploy <id> true`；显式 `false` 关闭部署闸门。
 
 `node show` 已包含 Stored、Overrides、Effective 与 Runtime，不另设
 `node effective`。有副作用的 boot prepare transition 不属于普通公开工作流。

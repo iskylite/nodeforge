@@ -200,9 +200,11 @@ credential。`/var/lib/nodeforge/boot.json` 只保存 plan/config digest 与非 
 `event:append` token 单独保存于 `/var/lib/nodeforge/credentials/event.token`，mode 0400，不能进入 boot.json、
 日志或进程 argv。initrd 在 `switch_root` 前清零 config/rootfs-artifact token；agent 在预取并校验全部输入后、修改
 目标系统前清零 agent token，first-boot 结束后清零 event token。
-BootConfig DTO 自身 `schema_version` v3（与 catalog schema v4 分属不同命名空间）；
-v3 增加 `facts_url`，initrd 以 event/telemetry capability 上报 `MemTotal`，
+BootConfig DTO 自身 `schema_version` v3（与 catalog schema v5 分属不同命名空间）；
+v3 增加 `facts_url`，initrd 以 event/telemetry capability 上报 `MemTotal` + DMI 硬件事实
+（`product_serial`/`product_uuid`/`sys_vendor`/`product_name`），
 使用 `kind` 判别字段（与 `ProfileKind` 一致），废弃 legacy `mode="diskless"`。
+v0.2.3 起 facts 上报从仅 memory_bytes 扩展为完整 Facts，使纯 diskless 节点也有 SN/UUID 等信息。
 
 `required_features` 按 consumer 分成 `initrd`/`agent` 两个排序去重集合。initrd 至少需要
 `node-identity-handoff-v1`/`agent-plan-handoff-v1`；Node first-boot override 非空时 agent 另需
@@ -225,7 +227,7 @@ JSON 计算 SHA-256。未知顶层字段默认拒绝，只有 `extensions` 容�
 | `overlay` | v0.2 固定 `tmpfs_percent`、`minimum_free_bytes`；不存在 mode 字段 |
 | `bootstrap_network` | 仅启动 NIC MAC、PXE 地址/lease 与 server endpoint；目标 renderer/topology 在 AgentPlan |
 | `agent_plan` | URL、digest、size、expiry 与 feature 摘要；完整内容由 agent 切根后按 `agent:read` 获取，不由 initrd 解析 |
-| `facts_url` | 固定到本 node 的 facts POST；只接受本 session event/telemetry capability，memory 上报不推进 lifecycle event_seq |
+| `facts_url` | 固定到本 node 的 facts POST；只接受本 session event/telemetry capability；上报 memory_bytes + DMI（serial/uuid/vendor/model），不推进 lifecycle event_seq |
 | `required_features` | `{initrd:[...],agent:[...]}`；分别是 initrd manifest 与 rootfs agent manifest features 的子集 |
 | `artifacts` / `events` | rootfs/AgentPlan/event URL 与 credential slot 引用；raw config/rootfs/agent/event token 只在 credential capsule/0400 文件，不进入 DTO；URL host 必须是配置的 `server_ip` 字面地址 |
 

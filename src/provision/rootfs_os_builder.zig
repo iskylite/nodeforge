@@ -146,7 +146,7 @@ fn buildDnf(
     // 与旧实现的区别是该 host-context 被限制在独立 mount/PID namespace 中，并
     // 显式为 staging bind-mount /dev、/proc、/sys。OS 层完成后的 package 步骤
     // 才统一进入 chroot。
-    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &baseline, repository_urls, true, .installroot, 0) catch |err| {
+    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &baseline, repository_urls, true, .installroot, 0, false) catch |err| {
         std.log.scoped(.rootfs_build).err("os-layer dnf namespaced install failed: {t}", .{err});
         return error.OsLayerBuildFailed;
     };

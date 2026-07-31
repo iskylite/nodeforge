@@ -28,8 +28,9 @@ const dto = @import("../http/diskless_dto.zig");
 ///   仅 dnf 支持；apt 恒为 `.chroot`（没有等价 host-context 安装模式）。
 pub const Target = enum { chroot, installroot };
 
-/// 在 chroot 内以真根路径执行的 package 安装步骤脚本体（dnf/apt 均先禁用全部
-/// 既有源，只启用调用方传入的 nodeforged 受管 `file://` 源）。
+/// 在 chroot 内以真根路径执行的 package 安装步骤脚本体（默认 dnf/apt 均先禁用
+/// 全部既有源，只启用调用方传入的 nodeforged 受管 `file://` 源；
+/// `preserve_sources_list=true` 时 apt 保留既有源，仅附加受管源）。
 pub fn renderPackageStep(
     w: *std.Io.Writer,
     package_manager: dto.FirstBootPackageManager,
@@ -38,6 +39,7 @@ pub fn renderPackageStep(
     nogpgcheck: bool,
     target: Target,
     staging: []const u8,
+    preserve_sources_list: bool,
 ) !void {
     if (packages.len == 0) return error.NoPackages;
     if (repository_urls.len == 0) return error.NoManagedRepository;
@@ -61,9 +63,14 @@ pub fn renderPackageStep(
         .apt => {
             // apt/dpkg 没有等价 host-context 安装模式，恒须 chroot；不支持 installroot。
             if (target == .installroot) return error.AptInstallrootUnsupported;
-            // 先禁用全部既有源（含 casper 层自带的 cdrom:/公网条目），只留受管源。
-            try w.writeAll("(test -f /etc/apt/sources.list && mv /etc/apt/sources.list /etc/apt/sources.list.disabled; true)");
-            try w.writeAll(" && rm -rf /etc/apt/sources.list.d && mkdir -p /etc/apt/sources.list.d");
+            // 默认先禁用全部既有源（含 casper 层自带的 cdrom:/公网条目），只留
+            // 受管源；preserve_sources_list=true 时保留原有源，仅附加受管源。
+            if (!preserve_sources_list) {
+                try w.writeAll("(test -f /etc/apt/sources.list && mv /etc/apt/sources.list /etc/apt/sources.list.disabled; true)");
+                try w.writeAll(" && rm -rf /etc/apt/sources.list.d && mkdir -p /etc/apt/sources.list.d");
+            } else {
+                try w.writeAll("mkdir -p /etc/apt/sources.list.d");
+            }
             try w.writeAll(" && : > /etc/apt/sources.list.d/nodeforge.list");
             for (repository_urls) |url| {
                 try w.writeAll(" && printf 'deb [trusted=yes] %s ./\\n' ");
@@ -118,6 +125,7 @@ pub fn execute(
     nogpgcheck: bool,
     target: Target,
     timeout_s: u32,
+    preserve_sources_list: bool,
 ) !void {
     // OS 层 bootstrap 没有 ProvisionStep 可携带 timeout，使用显式构建默认值；
     // 普通 package step 必须尊重模型中的 timeout_s，任何外部包管理器都不能
@@ -126,7 +134,7 @@ pub fn execute(
     if (effective_timeout > 86400) return error.InvalidStepTimeout;
     var step_body: std.Io.Writer.Allocating = .init(allocator);
     defer step_body.deinit();
-    try renderPackageStep(&step_body.writer, package_manager, packages, repository_urls, nogpgcheck, target, staging);
+    try renderPackageStep(&step_body.writer, package_manager, packages, repository_urls, nogpgcheck, target, staging, preserve_sources_list);
 
     const step_script_rel = "/tmp/nodeforge-namespaced-step.sh";
     const step_script_full = try std.fmt.allocPrint(allocator, "{s}{s}", .{ staging, step_script_rel });
@@ -214,7 +222,7 @@ fn writeQuoted(w: *std.Io.Writer, s: []const u8) !void {
 test "renderPackageStep dnf disables host repos and installs from managed source only" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try renderPackageStep(&out.writer, .dnf, &.{"jq"}, &.{"file:///managed/dnf"}, true, .chroot, "/staging");
+    try renderPackageStep(&out.writer, .dnf, &.{"jq"}, &.{"file:///managed/dnf"}, true, .chroot, "/staging", false);
     const body = out.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "--disablerepo='*'") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "--repofrompath=nodeforge-0,'file:///managed/dnf'") != null);
@@ -225,7 +233,7 @@ test "renderPackageStep dnf disables host repos and installs from managed source
 test "renderPackageStep dnf installroot target injects --installroot for bootstrap OS layer" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try renderPackageStep(&out.writer, .dnf, &.{"bash"}, &.{"file:///managed/dnf"}, true, .installroot, "/staging");
+    try renderPackageStep(&out.writer, .dnf, &.{"bash"}, &.{"file:///managed/dnf"}, true, .installroot, "/staging", false);
     const body = out.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "--installroot=/staging") != null);
 }
@@ -233,7 +241,7 @@ test "renderPackageStep dnf installroot target injects --installroot for bootstr
 test "renderPackageStep apt disables all existing sources before installing" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try renderPackageStep(&out.writer, .apt, &.{"curl"}, &.{"file:///managed/apt"}, true, .chroot, "/staging");
+    try renderPackageStep(&out.writer, .apt, &.{"curl"}, &.{"file:///managed/apt"}, true, .chroot, "/staging", false);
     const body = out.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "sources.list.disabled") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "rm -rf /etc/apt/sources.list.d") != null);
@@ -246,15 +254,27 @@ test "renderPackageStep apt rejects installroot target (no host-context mode exi
     defer out.deinit();
     try std.testing.expectError(
         error.AptInstallrootUnsupported,
-        renderPackageStep(&out.writer, .apt, &.{"curl"}, &.{"file:///managed/apt"}, true, .installroot, "/staging"),
+        renderPackageStep(&out.writer, .apt, &.{"curl"}, &.{"file:///managed/apt"}, true, .installroot, "/staging", false),
     );
 }
 
 test "renderPackageStep fails closed with no packages or no repository" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try std.testing.expectError(error.NoPackages, renderPackageStep(&out.writer, .dnf, &.{}, &.{"file:///x"}, true, .chroot, "/staging"));
-    try std.testing.expectError(error.NoManagedRepository, renderPackageStep(&out.writer, .dnf, &.{"jq"}, &.{}, true, .chroot, "/staging"));
+    try std.testing.expectError(error.NoPackages, renderPackageStep(&out.writer, .dnf, &.{}, &.{"file:///x"}, true, .chroot, "/staging", false));
+    try std.testing.expectError(error.NoManagedRepository, renderPackageStep(&out.writer, .dnf, &.{"jq"}, &.{}, true, .chroot, "/staging", false));
+}
+
+test "renderPackageStep apt preserves existing sources when preserve_sources_list is set" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try renderPackageStep(&out.writer, .apt, &.{"curl"}, &.{"file:///managed/apt"}, true, .chroot, "/staging", true);
+    const body = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "sources.list.disabled") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "rm -rf /etc/apt/sources.list.d") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "mkdir -p /etc/apt/sources.list.d") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "nodeforge.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "apt-get -y install 'curl'") != null);
 }
 
 test "renderWrapperScript wraps chroot execution in an isolated namespace with policy-rc.d guard" {

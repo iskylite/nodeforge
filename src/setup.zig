@@ -116,8 +116,9 @@ pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     const config = if (imported_config) |candidate| candidate.* else generatedConfig(p, network);
     // 空 distro 索引是正常的首次安装状态；首个通过媒体布局校验的 ISO
     // 会与 install source 一起原子创建对应 family/version/arch 能力记录。
-    // schema 永久为 v4；diskless profile 的 tagged union kind 需要 v4。
-    const catalog: model.Catalog = .{ .schema_version = 4 };
+    // schema 永久为 v5（catalog）；diskless profile 的 tagged union kind 需要 v4+。
+    // v0.2.3: catalog schema 从 v4 升级为 v5（Profile identity/provenance）。
+    const catalog: model.Catalog = .{ .schema_version = 5 };
     try validate.validate(&config, &catalog);
     try installBundle(io, allocator, p);
     try config_store.save(io, allocator, p.config_path, &config);

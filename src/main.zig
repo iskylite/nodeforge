@@ -348,7 +348,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .help = "Unset optional Node direct or overrides.* scalar keys. Clearing an override restores Profile inheritance.",
     }, nodeUnsetHandler);
     try node_unset.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
-    try node_unset.addPositionalArg(.{ .name = "keys", .description = "Optional property names to clear", .required = true, .variadic = true });
+    try node_unset.addPositionalArg(.{ .name = "keys", .description = "One or more optional property keys to clear", .required = true, .variadic = true });
     try addConfigPathFlag(node_unset);
     try addOutputFlag(node_unset);
     try addDebugFlag(node_unset);
@@ -372,9 +372,9 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(node_retry);
     try addOutputFlag(node_retry);
     try addDebugFlag(node_retry);
-    const node_deploy = try zli.Command.init(init_options, .{ .name = "deploy", .description = "Enable or disable the node deployment gate", .usage = "nodeforge node deploy <node_id> <true|false> [options]" }, nodeDeployHandler);
+    const node_deploy = try zli.Command.init(init_options, .{ .name = "deploy", .description = "Enable or disable the node deployment gate", .usage = "nodeforge node deploy <node_id> [true|false] [options]" }, nodeDeployHandler);
     try node_deploy.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
-    try node_deploy.addPositionalArg(.{ .name = "enabled", .description = "Deployment gate value: true or false", .required = true });
+    try node_deploy.addPositionalArg(.{ .name = "enabled", .description = "Deployment gate value: true or false (default: true)", .required = false });
     try node_deploy.addFlag(.{ .name = "force", .description = "Terminate active sessions (install/diskless) on the target node before mutation", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(node_deploy);
     try addOutputFlag(node_deploy);
@@ -400,7 +400,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try node_trace.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
     try node_trace.addFlags(&.{
         .{ .name = "session", .description = "Exact 32-character boot session identifier", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "latest", .description = "Select the latest retained session (default when --session is omitted)", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "latest", .description = "Select the latest retained session (default behavior; mutually exclusive with --session)", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.require().events_path } },
     });
     try addOutputFlag(node_trace);
@@ -3914,6 +3914,7 @@ fn profileShowHandler(ctx: zli.CommandContext) !void {
         .{ .key = "system.security.selinux", .value = result.effective_system.security.selinux, .section = "effective", .json_path = "effective_system.security.selinux" },
         .{ .key = "system.security.apparmor", .value = result.effective_system.security.apparmor, .section = "effective", .json_path = "effective_system.security.apparmor" },
         .{ .key = "install.apt.fallback", .value = @tagName(install.apt.fallback), .section = "effective", .json_path = "install.apt.fallback" },
+        .{ .key = "install.apt.preserve_sources_list", .value = if (install.apt.preserve_sources_list) "true" else "false", .section = "effective", .json_path = "install.apt.preserve_sources_list" },
         .{ .key = "install.completion.action", .value = @tagName(install.completion.action), .section = "effective", .json_path = "install.completion.action" },
         .{ .key = "install.updates.mode", .value = @tagName(install.updates.mode), .section = "effective", .json_path = "install.updates.mode" },
         .{ .key = "install.proxy.url", .value = install.proxy.url orelse "<unset>", .section = "effective", .json_path = "install.proxy.url" },
@@ -4796,19 +4797,35 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
 }
 
+/// `node deploy` 的 enabled 位置参数：缺省时默认 "true"（deploy 动词语义），
+/// 非法字面量返回 null 由调用方报 exit code 2。显式 "true"/"false" 必须原样透传。
+fn resolveDeployEnabled(raw: ?[]const u8) ?[]const u8 {
+    const value = raw orelse return "true";
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "false")) return value;
+    return null;
+}
+
+test "node deploy enabled defaults to true and passes explicit values through" {
+    try std.testing.expectEqualStrings("true", resolveDeployEnabled(null).?);
+    try std.testing.expectEqualStrings("true", resolveDeployEnabled("true").?);
+    try std.testing.expectEqualStrings("false", resolveDeployEnabled("false").?);
+    try std.testing.expect(resolveDeployEnabled("yes") == null);
+    try std.testing.expect(resolveDeployEnabled("TRUE") == null);
+    try std.testing.expect(resolveDeployEnabled("") == null);
+}
+
 fn nodeDeployHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
+    const node_id = ctx.getArg("node_id") orelse return;
+    const enabled = resolveDeployEnabled(ctx.getArg("enabled")) orelse {
+        try writeCommandError(ctx, "deploy.invalid_value", "deploy value must be true or false", 2);
+        return;
+    };
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
     };
     defer config.deinit();
-    const node_id = ctx.getArg("node_id") orelse return;
-    const enabled = ctx.getArg("enabled") orelse return;
-    if (!std.mem.eql(u8, enabled, "true") and !std.mem.eql(u8, enabled, "false")) {
-        try writeCommandError(ctx, "deploy.invalid_value", "deploy value must be true or false", 2);
-        return;
-    }
     var reason: [256]u8 = undefined;
     const result = nodeforge.management_client.scalarMutations(ctx.io, config.value.server.http_port, "node", node_id, &.{.{ .key = "deploy", .value = enabled }}, ctx.flag("force", bool), &reason);
     if (!result.healthy) return reportMutationFailure(ctx, result, "deploy update failed");
@@ -5204,9 +5221,12 @@ fn traceHandler(ctx: zli.CommandContext) !void {
     const node_id = ctx.getArg("node_id") orelse return;
     const requested_session = ctx.flag("session", []const u8);
     const events_path = ctx.flag("events-path", []const u8);
-    _ = ctx.flag("latest", bool);
     if (requested_session.len != 0 and !nodeforge.events.validCorrelationId(requested_session)) {
         try writeCommandError(ctx, "trace.invalid_session", "--session must be 32 lowercase hexadecimal characters", 2);
+        return;
+    }
+    if (requested_session.len != 0 and ctx.flag("latest", bool)) {
+        try writeCommandError(ctx, "trace.conflicting_flags", "--session and --latest are mutually exclusive", 2);
         return;
     }
 

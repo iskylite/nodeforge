@@ -648,9 +648,12 @@ apt-get -y -o Dir::Etc::sourcelist=/tmp/nodeforge.sources.list \
 Ubuntu 22.04.5 live-server ISO 包含 `jammy` suite（不含 `jammy-updates`/`jammy-security`），
 使用受管源时 `linux-image-generic` 的版本会被固定在 ISO 发布时的版本，不会漂移。
 
-切根前的 node-apply 还必须把运行根收敛为同一模型：删除 casper layer 自带的
-`sources.list`/`sources.list.d`，只生成 NodeForge 受管源；并在 `/etc/systemd/system`
-离线 mask `snapd.*`、`multipathd.*` 与 `casper-md5check.service`。这些单元面向 live
+切根前的 node-apply 还必须把运行根收敛为同一模型：默认删除 casper layer 自带的
+`sources.list`/`sources.list.d`，只生成 NodeForge 受管源；profile 开启
+`install.apt.preserve_sources_list=true` 时保留原有源，NodeForge 受管源作为附加源
+写入（受管镜像缺少包、需要借助原始源补齐时使用；操作员自行承担公网/介质源可达性）。
+node-apply 同时在 `/etc/systemd/system` 离线 mask `snapd.*`、`multipathd.*` 与
+`casper-md5check.service`。这些单元面向 live
 安装介质或持久块设备，在 overlay diskless 根上分别会形成 restart loop、无设备失败，
 或因不存在 `/cdrom` 产生虚假 failed unit，不属于 v0.2.1 的运行时能力。
 casper 还会把 `getty@tty1.service` vendor-mask 到 `/dev/null`，并用 drop-in

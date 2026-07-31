@@ -132,6 +132,15 @@ fn moveMount(comptime source: [:0]const u8, comptime target: [:0]const u8) !void
 
 fn enterRoot(comptime root: [:0]const u8) !void {
     if (builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
+    // 将新根 mount tree 递归设为 PRIVATE，切断与 initramfs root 的 MS_SHARED
+    // 传播关系。chroot 不创建新 mount namespace，只是换根目录；若不设 PRIVATE，
+    // systemd 接管后在 per-service 私有 namespace 中创建的 credential tmpfs
+    // （如 /run/credentials/systemd-journald.service）会通过 SHARED 传播链路
+    // 回泄到主 namespace，导致 df 能看到本应隔离的挂载。与 dracut switch_root
+    // 前的 `mount --make-rprivate /sysroot` 等价。best-effort：已经是 PRIVATE
+    // 时返回 EINVAL，忽略即可。
+    const prop_rc = std.os.linux.mount(root.ptr, root.ptr, null, std.os.linux.MS.PRIVATE | std.os.linux.MS.REC, 0);
+    _ = std.os.linux.errno(prop_rc);
     if (std.os.linux.errno(std.os.linux.chroot(root.ptr)) != .SUCCESS) return error.ChrootFailed;
     if (std.os.linux.errno(std.os.linux.chdir("/")) != .SUCCESS) return error.ChdirFailed;
 }
@@ -267,9 +276,9 @@ fn run(init: std.process.Init) !void {
         "[nodeforge-initrd] stage={s}: MemTotal={d} MemAvailable={d} rootfs_compressed={d} rootfs_uncompressed={?d} payload={d} tmpfs_percent={d} minimum_free={d} safety_margin={d}\n",
         .{ current_stage, memory_bytes, available_budget, bc.rootfs_size, bc.rootfs_uncompressed_size, bc.node_payload_size, bc.tmpfs_percent, bc.minimum_free_bytes, bc.safety_margin_bytes },
     );
-    current_stage = "facts.upload_memory";
-    postMemoryFacts(io, allocator, bc.facts_url, event_token, session, memory_bytes) catch |err|
-        log("[nodeforge-initrd] WARNING: authenticated memory facts upload failed: {t}\n", .{err});
+    current_stage = "facts.upload";
+    postFacts(io, allocator, bc.facts_url, event_token, session, memory_bytes) catch |err|
+        log("[nodeforge-initrd] WARNING: authenticated facts upload failed: {t}\n", .{err});
     current_stage = "memory.capacity_gate";
     const scaled_upper = std.math.mul(u64, available_budget, bc.tmpfs_percent) catch return error.MemoryBudgetOverflow;
     const upper_limit = if (bc.rootfs_uncompressed_size) |uncompressed_size|
@@ -703,8 +712,28 @@ fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, toke
 
 /// event capability 同时是本 session 的 telemetry 写凭据；facts 写入不消耗或
 /// 推进 lifecycle event_seq。失败不削弱当前启动的本地 MemAvailable 硬闸。
-fn postMemoryFacts(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, memory_bytes: u64) !void {
-    const body = try std.fmt.allocPrint(allocator, "{{\"memory_bytes\":{d}}}\n", .{memory_bytes});
+fn postFacts(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, memory_bytes: u64) !void {
+    // 采集 DMI 硬件事实（与 kickstart %pre 的 nf_fact 等价）。纯 diskless 节点
+    // 从未走过 install 路径，需要 initrd 自行上报 serial/uuid/vendor/model。
+    // sysfs 文件可能不存在（某些固件/容器无 DMI），读失败时该字段为空字符串。
+    const serial = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_serial");
+    defer if (serial) |s| allocator.free(s);
+    const uuid = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_uuid");
+    defer if (uuid) |u| allocator.free(u);
+    const vendor = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/sys_vendor");
+    defer if (vendor) |v| allocator.free(v);
+    const model = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_name");
+    defer if (model) |m| allocator.free(m);
+    const body = try std.fmt.allocPrint(allocator,
+        "{{\"memory_bytes\":{d},\"serial_number\":\"{s}\",\"product_uuid\":\"{s}\",\"vendor\":\"{s}\",\"model\":\"{s}\"}}\n",
+        .{
+            memory_bytes,
+            serial orelse "",
+            uuid orelse "",
+            vendor orelse "",
+            model orelse "",
+        },
+    );
     defer allocator.free(body);
     const facts_url = try http.Url.parse(url);
     const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
@@ -715,6 +744,22 @@ fn postMemoryFacts(io: std.Io, allocator: std.mem.Allocator, url: []const u8, to
         .{ .name = "Content-Type", .value = "application/json" },
     }, body);
     if (status < 200 or status >= 300) return error.FactsUploadRejected;
+}
+
+/// 读取 sysfs 文件并 trim 空白。文件不存在或不可读时返回 null。
+fn readSysfsTrimmed(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256)) catch return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+    const result = allocator.dupe(u8, trimmed) catch {
+        allocator.free(raw);
+        return null;
+    };
+    allocator.free(raw);
+    return result;
 }
 
 /// 用内建 SHA-512 流式校验下载产物，不依赖最小 initramfs 未必携带的

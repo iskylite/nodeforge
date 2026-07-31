@@ -514,7 +514,7 @@ nodeforge node deploy <node> false
 readiness 检查 rootfs ready、deep validation、delivery manifest、feature/kernel/modules、AgentPlan renderer、
 MAC/IP、quarantine 和 session gate。
 
-`node deploy true` 是唯一启用入口；`node deploy false` 立即阻止新 PXE，但不终止正在下载/运行的 session。
+`node deploy` 是启用入口：`node deploy <id>` 缺省等价于 `node deploy <id> true`；`node deploy false` 立即阻止新 PXE，但不终止正在下载/运行的 session。
 `node boot preview` 严格只读地展示启动选择；真实 boot-prepare 是 daemon 内部
 transition（签发 config token + agent plan），真实 per-session capsule
 在 PXE 请求时随 BootSession/delivery snapshot 原子生成。

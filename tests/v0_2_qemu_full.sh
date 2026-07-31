@@ -136,7 +136,7 @@ for name in names:
     entities.append({"name": name, "file": f"{name}.json", "sha256": hashlib.sha256(data).hexdigest()})
 h = hashlib.sha256(); h.update(b"1")
 for e in entities: h.update(e["name"].encode() + e["sha256"].encode())
-manifest = {"layout_schema_version": 1, "catalog_schema_version": 4, "catalog_revision": 1,
+manifest = {"layout_schema_version": 1, "catalog_schema_version": 5, "catalog_revision": 1,
             "transaction_id": h.hexdigest(), "entities": entities}
 with open(f"{dst}/manifest.json", "w") as f: json.dump(manifest, f, indent=2)
 print(f"install-source fixture prepared; assets={len(assets)} repos={len(repos)}")

@@ -33,7 +33,7 @@ test -x "$install/bin/nodeforge-initrd"
 test -x "$install/bin/nodeforge-agent"
 test "$(jq -r .schema_version "$install/config/config.json")" = 4
 test "$(jq -r .layout_schema_version "$install/catalog/manifest.json")" = 1
-test "$(jq -r .catalog_schema_version "$install/catalog/manifest.json")" = 4
+test "$(jq -r .catalog_schema_version "$install/catalog/manifest.json")" = 5
 test "$(mode "$install/config/config.json")" = 600
 test "$(mode "$install/catalog/manifest.json")" = 600
 test "$(mode "$install/config")" = 700

@@ -1561,9 +1561,14 @@ fn normalizeFacts(facts: *node_inventory.Facts) void {
     };
 }
 
-/// Diskless initrd 使用 event capability 上报同一组硬件事实。event token 是四域
+/// Diskless initrd 使用 event capability 上报硬件事实。event token 是四域
 /// credential 中唯一的 telemetry 写域；facts 不推进 event_seq，因此 lifecycle
 /// CAS 与 inventory 幂等摘要保持独立。
+///
+/// v0.2.3 起 initrd 同时上报 memory_bytes + DMI 字段（serial/uuid/vendor/
+/// model），daemon 用完整 `put` 存储而非 `putMemory`，使纯 diskless 节点
+/// 也有 SN/UUID 等硬件信息。memory_bytes 是必需字段（内存闸依据），DMI
+/// 字段可选（某些固件/容器无 DMI 时为空）。
 fn disklessFacts(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const token = parseBearer(request.getHeader("authorization")) orelse
         return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"event token is required\"}}\n", meta);
@@ -1581,11 +1586,25 @@ fn disklessFacts(request: zap.Request, context: *const RouteContext, node_id: []
         return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"facts body too large\"}}\n", meta);
     const body = request.body orelse
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"missing facts body\"}}\n", meta);
-    const MemoryFacts = struct { memory_bytes: u64 };
-    const parsed = std.json.parseFromSlice(MemoryFacts, context.allocator, body, .{ .allocate = .alloc_always }) catch
+    const FactsPayload = struct { memory_bytes: ?u64 = null, serial_number: ?[]const u8 = null, product_uuid: ?[]const u8 = null, vendor: ?[]const u8 = null, model: ?[]const u8 = null };
+    const parsed = std.json.parseFromSlice(FactsPayload, context.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"invalid facts body\"}}\n", meta);
     defer parsed.deinit();
-    _ = context.inventories.putMemory(node_id, session_id, 0, session.armed_at, parsed.value.memory_bytes, unixNow()) catch |err| switch (err) {
+    // memory_bytes 是 diskless 启动的必需字段（内存闸依据），DMI 字段可选
+    // （某些固件/容器无 DMI）。initrd 从 /sys/class/dmi/id/ 读取并和 memory_bytes
+    // 一起上报，daemon 用完整 put 存储而非 putMemory，使纯 diskless 节点也
+    // 有 SN/UUID/vendor/model。
+    if (parsed.value.memory_bytes == null or parsed.value.memory_bytes.? == 0)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"memory_bytes is required for diskless facts\"}}\n", meta);
+    var facts: node_inventory.Facts = .{
+        .memory_bytes = parsed.value.memory_bytes,
+        .serial_number = parsed.value.serial_number,
+        .product_uuid = parsed.value.product_uuid,
+        .vendor = parsed.value.vendor,
+        .model = parsed.value.model,
+    };
+    normalizeFacts(&facts);
+    _ = context.inventories.put(node_id, session_id, 0, session.armed_at, facts, unixNow()) catch |err| switch (err) {
         error.StaleSource => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"inventory.stale_source\",\"message\":\"facts came from a stale session\"}}\n", meta),
         else => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"inventory.invalid\",\"message\":\"facts rejected\"}}\n", meta),
     };
@@ -3533,7 +3552,7 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
     //    managed_file/archive/script 仍
     //    chroot 执行（写绝对路径到 staging lower）。两者都不接触公网。
     std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 3/6 - executing rootfs-build steps ({d} step(s))", .{ name, build_steps.len });
-    const plan = try rootfs_build_executor.buildPlan(context.allocator, build_steps, dto_manager, repo_closure.repository_urls, payload_paths);
+    const plan = try rootfs_build_executor.buildPlan(context.allocator, build_steps, dto_manager, repo_closure.repository_urls, payload_paths, profile.install.apt.preserve_sources_list);
     defer plan.deinit(context.allocator);
     rootfs_build_executor.execute(context.io, context.allocator, staging, plan) catch |err| {
         std.log.scoped(.rootfs_build).err("rootfs build [{s}]: stage 3 FAILED - rootfs-build steps ({t})", .{ name, err });
@@ -4308,6 +4327,7 @@ fn managementRootfsStatus(request: zap.Request, context: *RouteContext, name: []
 fn disklessCredentialError(decision: diskless_credential.Decision) []const u8 {
     return switch (decision) {
         .expired => "{\"ok\":false,\"error\":{\"code\":\"diskless.token_expired\",\"message\":\"capability token has expired\"}}\n",
+        .recovery_incomplete => "{\"ok\":false,\"error\":{\"code\":\"capability.recovery_incomplete\",\"message\":\"session capability cannot be reconstructed after daemon restart\"}}\n",
         else => "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n",
     };
 }
@@ -5207,6 +5227,7 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
                 .repository_urls = repository_urls.items,
                 .install = node.overrides.software.packages_include.add,
                 .remove = packages_remove.items,
+                .preserve_sources_list = plan.node_apply.apt_preserve_sources_list,
             },
         },
         .first_boot_bundle = effectiveFirstBootBundle(&plan),
@@ -5800,7 +5821,10 @@ fn writeTargetSystem(writer: *std.Io.Writer, system: model.TargetSystemConfig) !
     }
     try writer.writeAll("],\"packages\":");
     try std.json.Stringify.value(system.packages, .{}, writer);
-    try writer.writeByte('}');
+    try writer.print(",\"import_host_hosts\":{s},\"hosts_content\":{f}}}", .{
+        if (system.import_host_hosts) "true" else "false",
+        std.json.fmt(system.hosts_content, .{}),
+    });
 }
 
 test "management effective system exposes canonical password policy values" {

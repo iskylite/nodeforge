@@ -49,7 +49,7 @@ transaction_id=$(printf "1%s" "$tx_input" | sha256sum | cut -d ' ' -f 1)
 cat > "$catalog_dir/manifest.json" <<EOF
 {
   "layout_schema_version": 1,
-  "catalog_schema_version": 4,
+  "catalog_schema_version": 5,
   "catalog_revision": 1,
   "transaction_id": "$transaction_id",
   "entities": $entities_json
@@ -288,9 +288,9 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-"$cli" --version | grep -Eq '^nodeforge 0\.2\.2 \(commit [0-9a-f]{12}|unknown'
+"$cli" --version | grep -Eq '^nodeforge 0\.2\.3 \(commit [0-9a-f]{12}|unknown'
 "$cli" -v | grep -Fq 'built '
-"$daemon" --version | grep -Eq '^nodeforged 0\.2\.2 \(commit [0-9a-f]{12}|unknown'
+"$daemon" --version | grep -Eq '^nodeforged 0\.2\.3 \(commit [0-9a-f]{12}|unknown'
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then
@@ -516,6 +516,29 @@ grep -Fq '"kind":"daemon_restart_gap"' "$tmp/trace-session-json"
 grep -Fq 'daemon_restart_gap' "$tmp/trace-session-human"
 "$cli" node trace node-02 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-capacity-json"
 grep -Fq '"kind":"capacity_exhausted"' "$tmp/trace-capacity-json"
+
+# §12.4 --session 与 --latest 互斥，同时给出是 usage error。
+if "$cli" node trace node-01 --session "$session_id" --latest --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-conflicting-flags" 2>&1; then
+    echo "conflicting --session/--latest unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+grep -Fq '"code":"trace.conflicting_flags"' "$tmp/trace-conflicting-flags"
+
+# §12.2 node deploy 的 enabled 位置参数可缺省（默认 true）；非法字面量在
+# 读取 config/daemon 之前就以 exit 2 拒绝。
+"$cli" node deploy --help >"$tmp/node-deploy-help"
+grep -Fq '[true|false]' "$tmp/node-deploy-help"
+grep -Fq '(default: true)' "$tmp/node-deploy-help"
+if "$cli" node deploy node-01 yes -o json >"$tmp/node-deploy-invalid" 2>&1; then
+    echo "invalid deploy value unexpectedly succeeded" >&2
+    exit 1
+else
+    test "$?" -eq 2
+fi
+grep -Fq '"code":"deploy.invalid_value"' "$tmp/node-deploy-invalid"
+
 if "$cli" events list --session invalid --events-path "$events_dir/events.jsonl" >"$tmp/events-invalid-session" 2>&1; then
     echo "invalid session filter unexpectedly succeeded" >&2
     exit 1

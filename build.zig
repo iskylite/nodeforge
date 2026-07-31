@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// NodeForge 产品版本的唯一构建事实源。发布新版本时同步更新 build.zig.zon。
-const nodeforge_version = "0.2.2";
+const nodeforge_version = "0.2.3";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

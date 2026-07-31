@@ -210,12 +210,14 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     // in the target even when mirror-selection points at NodeForge. Persist the
     // imported repository explicitly from the ISO's signed Release metadata so
     // the installed system has the same local-only repository contract as the
-    // effective plan and the diskless node-apply path.
+    // effective plan and the diskless node-apply path. When
+    // install.apt.preserve_sources_list is enabled, the installer/ISO-written
+    // sources are kept and the managed repository is added alongside.
     if (apt_primary_url) |url| {
         const apt_source = try std.fmt.allocPrint(
             allocator,
-            "set -eu; d=''; for x in /cdrom/dists/*; do test -f \"$x/Release\" && d=\"$x\" && break; done; test -n \"$d\"; suite=$(basename \"$d\"); components=$(awk '/^Components:/ {{ $1=\"\"; sub(/^ /,\"\"); print; exit }}' \"$d/Release\"); test -n \"$components\"; mkdir -p /target/etc/apt/sources.list.d; rm -f /target/etc/apt/sources.list /target/etc/apt/sources.list.d/*.list /target/etc/apt/sources.list.d/*.sources; printf 'deb [trusted=yes] {s} %s %s\\n' \"$suite\" \"$components\" > /target/etc/apt/sources.list.d/nodeforge.list; chmod 0644 /target/etc/apt/sources.list.d/nodeforge.list",
-            .{url},
+            "set -eu; d=''; for x in /cdrom/dists/*; do test -f \"$x/Release\" && d=\"$x\" && break; done; test -n \"$d\"; suite=$(basename \"$d\"); components=$(awk '/^Components:/ {{ $1=\"\"; sub(/^ /,\"\"); print; exit }}' \"$d/Release\"); test -n \"$components\"; mkdir -p /target/etc/apt/sources.list.d; {s}printf 'deb [trusted=yes] {s} %s %s\\n' \"$suite\" \"$components\" > /target/etc/apt/sources.list.d/nodeforge.list; chmod 0644 /target/etc/apt/sources.list.d/nodeforge.list",
+            .{ if (install.apt.preserve_sources_list) "" else "rm -f /target/etc/apt/sources.list /target/etc/apt/sources.list.d/*.list /target/etc/apt/sources.list.d/*.sources; ", url },
         );
         defer allocator.free(apt_source);
         try w.writeAll("    - ");
@@ -652,6 +654,10 @@ test "autoinstall has NoCloud header and late event hook" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/apt/sources.list.d/nodeforge.list") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "deb [trusted=yes] http://repo %s %s") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/cdrom/dists/*") != null);
+    // 默认（preserve_sources_list=false）：late-command 删除安装器/ISO 写入的
+    // 原有源，只保留 NodeForge 受管源。
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "rm -f /target/etc/apt/sources.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/apt/sources.list.d/*.sources") != null);
     // disable_suites 不在 Subiquity autoinstall schema 中，不能出现在输出里
     try std.testing.expect(std.mem.indexOf(u8, bytes, "disable_suites") == null);
     // 隔离网段防超时配置
@@ -685,6 +691,18 @@ test "apt fallback is rendered from the install profile" {
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "fallback: abort") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "fallback: offline-install") == null);
+}
+
+test "preserve_sources_list keeps the original target sources in the late command" {
+    const node: model.NodeConfig = .{ .id = "node-preserve", .mac = "00:11:22:33:44:cc", .arch = .aarch64, .profile = "ubuntu" };
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{ .apt = .{ .preserve_sources_list = true } }, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    defer std.testing.allocator.free(bytes);
+    // preserve=true：late-command 不再删除原有源，只附加 NodeForge 受管源。
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "rm -f /target/etc/apt/sources.list") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/apt/sources.list.d/*.list") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/apt/sources.list.d/*.sources") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/apt/sources.list.d/nodeforge.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "deb [trusted=yes] http://repo %s %s") != null);
 }
 
 test "M4.1 autoinstall renders target defaults and static network" {
