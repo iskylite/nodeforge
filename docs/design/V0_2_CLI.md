@@ -196,8 +196,8 @@ RHEL comps 选择区分 environment、group 与 package。未设置
 
 ```text
 nodeforge assets managed-file import <asset> --from-file <path> [--media-type <type>]
-nodeforge assets archive build <output.tar> --install-script <path> \
-  [--base-dir <dir>] [--files-from <list>] [paths...]
+nodeforge assets archive build <output> --install-script <path> \
+  [--compression none|gzip|xz] [--base-dir <dir>] [--files-from <list>] [paths...]
 nodeforge assets archive import <asset> --from-file <path> [--media-type <type>]
 nodeforge assets script import <asset> --from-file <path> [--media-type <type>]
 
@@ -226,7 +226,7 @@ asset import flag 约束：
 | 命令 | 必填 flag | 可选 flag | 说明 |
 |---|---|---|---|
 | `managed-file import` | `<asset>`、`--from-file` | `--media-type` | 只导入不可变文件内容；不保存 destination/mode/owner/group |
-| `archive build` | `<output.tar>`、`--install-script`、至少一个 payload 路径 | `--base-dir`、`--files-from` | 用 GNU tar 构建 PAX archive；安装脚本固定映射为顶层 `.nf.install.sh` |
+| `archive build` | `<output>`、`--install-script`、至少一个 payload 路径 | `--compression none\|gzip\|xz`、`--base-dir`、`--files-from` | 构建 PAX archive；默认未压缩 tar，安装脚本固定映射为顶层 `.nf.install.sh` |
 | `archive import` | `<asset>`、`--from-file` | `--media-type` | 导入 tar 归档；destination 由 archive action 规则在执行期决定 |
 | `script import` | `<asset>`、`--from-file` | `--media-type` | 导入受审计脚本；interpreter 在 item add 时指定 |
 
@@ -253,6 +253,9 @@ per-action 必填字段矩阵（`item add` 拒绝不适用的字段）：
   symlink、mode、数字 uid/gid、mtime、ACL、xattr，并避免读取更新源 atime。解压端显式
   请求恢复 owner/mode/ACL/xattr。ctime 由内核维护且新 inode 必然改变，解压后 atime
   也没有可靠的跨系统 tar 恢复语义，二者不在“前后一致”的承诺内。
+  `--compression` 默认 `none`，后缀必须严格匹配 `.tar`、`.tar.gz`/`.tgz` 或
+  `.tar.xz`/`.txz`。rootfs 基线包含 `tar`、`gzip`、`xz`，执行端对三种格式始终使用
+  同一条 `tar -xf`，不按后缀分叉。
   first-boot 与 install postprocess 一样可修改用户、SSH、hosts 和系统文件，但不得读取/复制
   `/run/nodeforge/credentials`、修改只读 lower 或篡改 session handoff。script 只能来自已导入 asset，
   不能接收 argv 内联脚本。

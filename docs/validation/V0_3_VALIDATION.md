@@ -197,5 +197,12 @@ nodeforge assets archive build <output.tar> --install-script <path> \
 | parent path | PASS | `../escape` 在调用 tar 前拒绝 |
 | ctime 语义 | PASS | JSON 明确 `ctime_preserved=false`，文档明确不可还原 |
 
+随后扩展 `--compression none|gzip|xz` 并在同一 r97n0 环境增量验证：三种产物分别被
+`file` 识别为 POSIX tar、gzip 和 XZ；同一条
+`tar --same-owner --same-permissions --acls --xattrs -xf` 均成功解压，隐藏入口、硬链接
+inode 和 symlink target 保持一致。`--compression gzip` 搭配 `.tar` 后缀被 CLI 拒绝。
+Rocky rootfs bootstrap 已显式加入 `gzip`、`xz`；Ubuntu casper rootfs 发布前显式验证
+`tar`、`gzip`、`xz` 可执行文件存在。
+
 `zig build test` 用时约 61 秒并通过。此增量验证证明标准构建命令及共享 archive
 解压元数据选项符合设计；它不替代上文已经执行的五项 VMware 系统矩阵。

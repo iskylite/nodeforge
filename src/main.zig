@@ -589,14 +589,15 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const archive_build = try zli.Command.init(init_options, .{
         .name = "build",
         .description = "Build a canonical metadata-preserving archive",
-        .usage = "nodeforge assets archive build <output.tar> --install-script <path> [--base-dir <dir>] [--files-from <list>] [paths...]",
-        .help = "Requires GNU tar. Payload paths must be relative to --base-dir. The install script is stored as the reserved top-level .nf.install.sh entry.",
+        .usage = "nodeforge assets archive build <output> --install-script <path> [--compression none|gzip|xz] [--base-dir <dir>] [--files-from <list>] [paths...]",
+        .help = "Requires GNU tar and, when selected, gzip or xz. Payload paths must be relative to --base-dir. The install script is stored as the reserved top-level .nf.install.sh entry.",
     }, archiveBuildHandler);
-    try archive_build.addPositionalArg(.{ .name = "archive", .description = "Output .tar path", .required = true });
+    try archive_build.addPositionalArg(.{ .name = "archive", .description = "Output .tar, .tar.gz/.tgz, or .tar.xz/.txz path", .required = true });
     try archive_build.addPositionalArg(.{ .name = "paths", .description = "Payload paths relative to --base-dir", .required = false, .variadic = true });
     try archive_build.addFlag(.{ .name = "install-script", .description = "Installer script stored as .nf.install.sh", .type = .String, .default_value = .{ .String = "" } });
     try archive_build.addFlag(.{ .name = "base-dir", .description = "Base directory for payload paths", .type = .String, .default_value = .{ .String = "." } });
     try archive_build.addFlag(.{ .name = "files-from", .description = "Text file containing one payload path per line", .type = .String, .default_value = .{ .String = "" } });
+    try archive_build.addFlag(.{ .name = "compression", .description = "Output compression: none, gzip, or xz", .type = .String, .default_value = .{ .String = "none" } });
     try addOutputFlag(archive_build);
     try addDebugFlag(archive_build);
     const archive_import = try zli.Command.init(init_options, .{ .name = "import", .description = "Atomically import an archive revision" }, archiveImportHandler);
@@ -2765,10 +2766,12 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
     const install_script = ctx.flag("install-script", []const u8);
     const base_dir = ctx.flag("base-dir", []const u8);
     const files_from = ctx.flag("files-from", []const u8);
+    const compression_name = ctx.flag("compression", []const u8);
+    const compression = parseArchiveCompression(compression_name) orelse return itemUsageError(ctx, "archive build --compression must be none, gzip, or xz");
     if (output_path.len == 0 or install_script.len == 0 or base_dir.len == 0)
-        return itemUsageError(ctx, "archive build requires <output.tar>, --install-script, and a non-empty --base-dir");
-    if (!std.mem.endsWith(u8, output_path, ".tar"))
-        return itemUsageError(ctx, "archive build output must use the .tar suffix");
+        return itemUsageError(ctx, "archive build requires <output>, --install-script, and a non-empty --base-dir");
+    if (!compression.validOutputSuffix(output_path))
+        return itemUsageError(ctx, "archive output suffix does not match --compression (.tar, .tar.gz/.tgz, or .tar.xz/.txz)");
     if (std.Io.Dir.cwd().statFile(ctx.io, output_path, .{ .follow_symlinks = false })) |_| {
         return itemUsageError(ctx, "archive build refuses to overwrite an existing output");
     } else |err| if (err != error.FileNotFound) return itemUsageError(ctx, "archive build output cannot be inspected");
@@ -2839,10 +2842,45 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
     const script_name = std.fs.path.basename(install_script);
     try runArchiveBuildTar(ctx, &.{ "tar", "--format=pax", "--acls", "--xattrs", "--numeric-owner", "--atime-preserve=system", "--transform=s|.*|.nf.install.sh|", "-rf", temp_archive, script_name }, .{ .path = script_dir });
     validateArchiveForImport(ctx, temp_archive) catch return itemUsageError(ctx, "archive build produced an invalid final archive");
-    try std.Io.Dir.rename(std.Io.Dir.cwd(), temp_archive, std.Io.Dir.cwd(), output_path, ctx.io);
+    const publish_source = switch (compression) {
+        .none => temp_archive,
+        .gzip => blk: {
+            try runArchiveCompressor(ctx, &.{ "gzip", "-n", "--", temp_archive });
+            break :blk try std.fmt.allocPrint(ctx.allocator, "{s}.gz", .{temp_archive});
+        },
+        .xz => blk: {
+            try runArchiveCompressor(ctx, &.{ "xz", "--check=crc64", "--", temp_archive });
+            break :blk try std.fmt.allocPrint(ctx.allocator, "{s}.xz", .{temp_archive});
+        },
+    };
+    defer if (compression != .none) ctx.allocator.free(publish_source);
+    defer if (compression != .none) std.Io.Dir.cwd().deleteFile(ctx.io, publish_source) catch {};
+    validateArchiveForImport(ctx, publish_source) catch return itemUsageError(ctx, "archive build produced an unreadable compressed archive");
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), publish_source, std.Io.Dir.cwd(), output_path, ctx.io);
 
     const human = try std.fmt.allocPrint(ctx.allocator, "built canonical archive {s} ({d} payload paths; entrypoint .nf.install.sh)", .{ output_path, path_count });
-    try renderCommandResult(ctx, human, .{ .archive = output_path, .entrypoint = ".nf.install.sh", .payload_paths = path_count, .format = "pax", .ctime_preserved = false });
+    try renderCommandResult(ctx, human, .{ .archive = output_path, .entrypoint = ".nf.install.sh", .payload_paths = path_count, .format = "pax", .compression = compression_name, .ctime_preserved = false });
+}
+
+const ArchiveCompression = enum {
+    none,
+    gzip,
+    xz,
+
+    fn validOutputSuffix(self: ArchiveCompression, path: []const u8) bool {
+        return switch (self) {
+            .none => std.mem.endsWith(u8, path, ".tar"),
+            .gzip => std.mem.endsWith(u8, path, ".tar.gz") or std.mem.endsWith(u8, path, ".tgz"),
+            .xz => std.mem.endsWith(u8, path, ".tar.xz") or std.mem.endsWith(u8, path, ".txz"),
+        };
+    }
+};
+
+fn parseArchiveCompression(value: []const u8) ?ArchiveCompression {
+    if (std.mem.eql(u8, value, "none")) return .none;
+    if (std.mem.eql(u8, value, "gzip")) return .gzip;
+    if (std.mem.eql(u8, value, "xz")) return .xz;
+    return null;
 }
 
 fn validArchiveBuildPath(path: []const u8) bool {
@@ -2862,6 +2900,18 @@ fn runArchiveBuildTar(ctx: zli.CommandContext, argv: []const []const u8, cwd: st
     }
     if (ctx.flag("debug", bool) and result.stderr.len != 0) try errorWriter(ctx).print("debug: archive build: {s}\n", .{result.stderr});
     return itemUsageError(ctx, "GNU tar failed while building the archive");
+}
+
+fn runArchiveCompressor(ctx: zli.CommandContext, argv: []const []const u8) !void {
+    const result = std.process.run(ctx.allocator, ctx.io, .{ .argv = argv, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(256 * 1024) }) catch return itemUsageError(ctx, "selected archive compressor could not be executed");
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    if (ctx.flag("debug", bool) and result.stderr.len != 0) try errorWriter(ctx).print("debug: archive compressor: {s}\n", .{result.stderr});
+    return itemUsageError(ctx, "selected archive compressor failed");
 }
 
 fn archiveHasReservedInstallEntry(ctx: zli.CommandContext, source: []const u8) !bool {
@@ -5951,6 +6001,19 @@ test "archive build accepts only safe relative payload paths" {
     try std.testing.expect(!validArchiveBuildPath("safe/../../escape"));
     try std.testing.expect(!validArchiveBuildPath("bad\npath"));
     try std.testing.expect(!validArchiveBuildPath(""));
+}
+
+test "archive compression requires an explicit matching suffix" {
+    try std.testing.expect(parseArchiveCompression("none").? == .none);
+    try std.testing.expect(parseArchiveCompression("gzip").? == .gzip);
+    try std.testing.expect(parseArchiveCompression("xz").? == .xz);
+    try std.testing.expect(parseArchiveCompression("bzip2") == null);
+    try std.testing.expect(ArchiveCompression.none.validOutputSuffix("bundle.tar"));
+    try std.testing.expect(!ArchiveCompression.none.validOutputSuffix("bundle.tar.gz"));
+    try std.testing.expect(ArchiveCompression.gzip.validOutputSuffix("bundle.tar.gz"));
+    try std.testing.expect(ArchiveCompression.gzip.validOutputSuffix("bundle.tgz"));
+    try std.testing.expect(ArchiveCompression.xz.validOutputSuffix("bundle.tar.xz"));
+    try std.testing.expect(ArchiveCompression.xz.validOutputSuffix("bundle.txz"));
 }
 
 /// 输出稳定的 CLI 名称与项目版本。

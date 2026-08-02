@@ -17,6 +17,24 @@ const dto = @import("../http/diskless_dto.zig");
 const namespaced_chroot_executor = @import("namespaced_chroot_executor.zig");
 const identity_store = @import("../state/identity_store.zig");
 
+/// archive action 的压缩能力属于 rootfs 基线，而不是某个 bundle 的可选软件。
+/// GNU tar 自动识别 gzip/xz，但仍需要对应外部解压程序。
+const dnf_baseline_packages = [_][]const u8{
+    "bash",      "coreutils",    "tar",        "gzip",    "xz",             "dnf",
+    "systemd",   "shadow-utils", "util-linux", "iproute", "NetworkManager", "openssh-server",
+    "procps-ng",
+};
+
+const casper_required_files = [_][]const u8{
+    "sbin/init",
+    "usr/lib/systemd/systemd",
+    "usr/bin/apt",
+    "usr/sbin/sshd",
+    "usr/bin/tar",
+    "usr/bin/gzip",
+    "usr/bin/xz",
+};
+
 /// 在 staging 目录内用发行版原生工具构建 OS 层。`repository_urls` 为
 /// nodeforged 本机受管源的 `file://` URL。构建发生在 management handler 内，
 /// 禁止回连同一 HTTP listener；目标系统获得的仓库仍由 AgentPlan/安装计划绑定
@@ -27,7 +45,7 @@ const identity_store = @import("../state/identity_store.zig");
 /// 路径，与 `casper_layers` 一一对应、base→top 有序）只在 `package_manager ==
 /// .apt` 时有意义；dnf 分支忽略。
 ///
-/// v1：安装最小可 chroot 基线（bash/coreutils/tar + 包管理器），足以叠加
+/// v1：安装最小可 chroot 基线（bash/coreutils/tar/gzip/xz + 包管理器），足以叠加
 /// rootfs-build phase 的 managed_file/archive/script/package 步骤；Profile
 /// software/system 全量烤入留作后续保真项（见 `docs/validation`）。
 pub fn buildOsLayer(
@@ -103,12 +121,9 @@ fn buildCasperOverlay(
         std.Io.Dir.cwd().deleteTree(io, layer_dir) catch {};
     }
 
-    for ([_][]const u8{
-        "sbin/init",
-        "usr/lib/systemd/systemd",
-        "usr/bin/apt",
-        "usr/sbin/sshd",
-    }) |rel| {
+    // archive action 统一使用 `tar -xf` 自动识别压缩格式；casper 输入必须
+    // 明确提供 tar/gzip/xz，不能依赖“Ubuntu 通常会带”的隐式假设。
+    for (casper_required_files) |rel| {
         const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging, rel });
         defer allocator.free(abs);
         if (!fileExists(io, abs)) {
@@ -139,24 +154,13 @@ fn buildDnf(
     try std.Io.Dir.cwd().createDirPath(io, staging);
     // 可启动且可由 nodeforge-agent 收敛的基线。不能只满足 chroot：node-apply
     // 固定使用 usermod/systemctl，切根后的系统还需要 init、网络与 SSH 服务。
-    const baseline = [_][]const u8{
-        "bash",
-        "coreutils",
-        "tar",
-        "dnf",
-        "systemd",
-        "shadow-utils",
-        "util-linux",
-        "iproute",
-        "NetworkManager",
-        "openssh-server",
-        "procps-ng",
-    };
+    // GNU tar 对 gzip/xz 的自动识别仍会调用对应外部程序。把两者固化为
+    // rootfs 基线，保证 rootfs-build 与 first-boot 都能执行受支持 archive。
     // 空 staging 尚无 dnf/rpm，bootstrap 必须由 host dnf + --installroot 完成；
     // 与旧实现的区别是该 host-context 被限制在独立 mount/PID namespace 中，并
     // 显式为 staging bind-mount /dev、/proc、/sys。OS 层完成后的 package 步骤
     // 才统一进入 chroot。
-    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &baseline, repository_urls, true, .installroot, 0, false) catch |err| {
+    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &dnf_baseline_packages, repository_urls, true, .installroot, 0, false) catch |err| {
         std.log.scoped(.rootfs_build).err("os-layer dnf namespaced install failed: {t}", .{err});
         return error.OsLayerBuildFailed;
     };
@@ -304,4 +308,16 @@ fn runChecked(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8
 fn majorVersion(version: []const u8) []const u8 {
     const dot = std.mem.indexOfScalar(u8, version, '.') orelse return version;
     return version[0..dot];
+}
+
+test "rootfs baseline guarantees gzip and xz archive extraction tools" {
+    inline for (.{ "tar", "gzip", "xz" }) |required| {
+        var found = false;
+        for (dnf_baseline_packages) |package| found = found or std.mem.eql(u8, package, required);
+        try std.testing.expect(found);
+        const executable = "usr/bin/" ++ required;
+        found = false;
+        for (casper_required_files) |path| found = found or std.mem.eql(u8, path, executable);
+        try std.testing.expect(found);
+    }
 }

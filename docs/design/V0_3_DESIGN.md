@@ -458,8 +458,8 @@ archive 只允许引用已发布的受管 Asset；表中同时明确禁止的 in
 公开 CLI 提供唯一标准构建入口：
 
 ```text
-nodeforge assets archive build <output.tar> --install-script <path> \
-  [--base-dir <dir>] [--files-from <list>] [paths...]
+nodeforge assets archive build <output> --install-script <path> \
+  [--compression none|gzip|xz] [--base-dir <dir>] [--files-from <list>] [paths...]
 ```
 
 - `<paths...>` 与 `--files-from` 可同时使用；list 是 UTF-8 文本，一行一个相对
@@ -467,7 +467,10 @@ nodeforge assets archive build <output.tar> --install-script <path> \
 - 拒绝绝对路径、任意 `..` component、NUL/换行路径和已存在的输出文件。
 - 用户安装脚本必须是普通文件。CLI 在追加时将它映射为精确顶层
   `.nf.install.sh`；payload 已含该保留条目时失败，绝不覆盖或猜测用户意图。
-- 构建依赖 GNU tar，输出为未压缩 PAX `.tar`。全部 payload 在同一次创建调用中
+- 构建依赖 GNU tar，默认输出未压缩 PAX `.tar`；`--compression gzip|xz` 分别生成
+  `.tar.gz`/`.tgz` 或 `.tar.xz`/`.txz`，参数和后缀不匹配即拒绝。实现必须先创建、
+  追加并校验完整的临时 tar，最后才执行一次压缩，不能向压缩流追加入口。
+  全部 payload 在同一次创建调用中
   读取，GNU tar 因而能够保留软链接目标及跨显式输入项的硬链接关系；追加入口不会
   改写 payload。
 - 归档记录 mode、数字 uid/gid、mtime、ACL 和 xattr；读取使用
@@ -477,6 +480,10 @@ nodeforge assets archive build <output.tar> --install-script <path> \
   不能设置；解压创建新 inode 后不可能与源 ctime 相等。atime 是否能在解压后恢复也
   受 tar、文件系统 mount option 和后续读取影响，不作为跨系统保证。实现只能保证
   打包过程不扰动源 atime，不能宣称解压后 ctime/atime 完全一致。
+- rootfs 的 Rocky bootstrap 必须显式安装 `tar`、`gzip`、`xz`；Ubuntu casper overlay
+  必须在发布前验证 `/usr/bin/tar`、`/usr/bin/gzip`、`/usr/bin/xz` 全部存在，否则
+  rootfs build fail closed。三个 phase 统一使用 `tar -xf` 自动识别，不按压缩格式
+  复制 Mode A/B runner。
 
 install-post 上下文中：
 

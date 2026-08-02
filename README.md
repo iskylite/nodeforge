@@ -669,12 +669,28 @@ nodeforge assets archive build ./vendor-agent.tar \
   --files-from ./packaging/files.list \
   usr/share/vendor-agent/README
 
+# 可选 gzip/xz；省略 --compression 时仍生成未压缩 .tar。
+nodeforge assets archive build ./vendor-agent.tar.gz \
+  --compression gzip \
+  --install-script ./packaging/install.sh \
+  --base-dir ./payload \
+  --files-from ./packaging/files.list
+
+nodeforge assets archive build ./vendor-agent.tar.xz \
+  --compression xz \
+  --install-script ./packaging/install.sh \
+  --base-dir ./payload \
+  --files-from ./packaging/files.list
+
 nodeforge assets archive import vendor-agent \
   --from-file ./vendor-agent.tar --media-type application/x-tar
 ```
 
-`archive build` 需要 GNU tar，输出固定为未压缩 PAX `.tar`，并把用户提供的安装脚本
-映射为归档顶层 `.nf.install.sh`。payload 自带该保留顶层条目时拒绝构建；绝对路径、
+`archive build` 需要 GNU tar，默认输出未压缩 PAX `.tar`；可显式选择
+`--compression gzip|xz`，对应 `.tar.gz`/`.tgz` 或 `.tar.xz`/`.txz`。构建先完成并校验
+完整 tar，再执行最终压缩；运行端仍统一以 `tar -xf` 自动识别。rootfs 基线明确包含
+`tar`、`gzip` 和 `xz`。命令把用户提供的安装脚本映射为归档顶层
+`.nf.install.sh`。payload 自带该保留顶层条目时拒绝构建；绝对路径、
 含 `..` 的路径和换行路径同样拒绝。所有 payload 在一次 tar 调用中读取，保留软链接
 目标和跨输入项硬链接关系，并记录数字 uid/gid、mode、mtime、ACL 与 xattr；打包使用
 `--atime-preserve=system`，不应因读取而更新源文件 atime。解压显式恢复 owner、mode、

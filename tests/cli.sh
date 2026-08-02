@@ -114,6 +114,8 @@ grep -q -- "--log-level" "$tmp/setup-help"
 grep -Fq -- '--install-script' "$tmp/archive-build-help"
 grep -Fq -- '--files-from' "$tmp/archive-build-help"
 grep -Fq -- '--base-dir' "$tmp/archive-build-help"
+grep -Fq -- '--compression' "$tmp/archive-build-help"
+grep -Fq -- 'none, gzip, or xz' "$tmp/archive-build-help"
 grep -Fq -- '.nf.install.sh' "$tmp/archive-build-help"
 
 # GNU tar 环境验证 canonical archive 的入口映射、软/硬链接、权限、mtime，
@@ -137,7 +139,7 @@ if tar --version 2>/dev/null | grep -Fq 'GNU tar'; then
     "$cli" assets archive build "$archive_out" \
         --install-script "$tmp/user-install.sh" --base-dir "$archive_src" \
         --files-from "$tmp/archive-files" etc/nodeforge/symlink -o json >"$tmp/archive-build.json"
-    jq -e '.ok and .result.entrypoint == ".nf.install.sh" and .result.payload_paths == 3 and (.result.ctime_preserved | not)' "$tmp/archive-build.json" >/dev/null
+    jq -e '.ok and .result.entrypoint == ".nf.install.sh" and .result.payload_paths == 3 and .result.compression == "none" and (.result.ctime_preserved | not)' "$tmp/archive-build.json" >/dev/null
     test "$(tar -tf "$archive_out" | grep -cx '\.nf\.install\.sh')" -eq 1
     tar --same-owner --same-permissions --acls --xattrs -xf "$archive_out" -C "$archive_extract"
     test "$(stat -c %i "$archive_extract/etc/nodeforge/original")" = "$(stat -c %i "$archive_extract/etc/nodeforge/hardlink")"
@@ -145,6 +147,28 @@ if tar --version 2>/dev/null | grep -Fq 'GNU tar'; then
     test "$(stat -c %a "$archive_extract/etc/nodeforge/original")" = 640
     test "$(stat -c %Y "$archive_extract/etc/nodeforge/original")" = "$before_mtime"
     test "$(stat -c %X "$archive_src/etc/nodeforge/original")" = "$before_atime"
+
+    # gzip/xz 只改变最终传输编码；tar -tf/-xf 自动识别，内部 PAX payload、
+    # hidden entrypoint 与链接语义保持一致。
+    for compression in gzip xz; do
+        case "$compression" in
+            gzip) compressed="$tmp/canonical.tar.gz" ;;
+            xz) compressed="$tmp/canonical.tar.xz" ;;
+        esac
+        "$cli" assets archive build "$compressed" --compression "$compression" \
+            --install-script "$tmp/user-install.sh" --base-dir "$archive_src" etc/nodeforge >/dev/null
+        tar -tf "$compressed" | grep -Fxq '.nf.install.sh'
+        mkdir "$tmp/extract-$compression"
+        tar --same-owner --same-permissions --acls --xattrs -xf "$compressed" -C "$tmp/extract-$compression"
+        test "$(readlink "$tmp/extract-$compression/etc/nodeforge/symlink")" = original
+    done
+    if "$cli" assets archive build "$tmp/mismatch.tar" --compression gzip \
+        --install-script "$tmp/user-install.sh" --base-dir "$archive_src" etc/nodeforge >"$tmp/archive-mismatch" 2>&1; then
+        echo "archive compression/suffix mismatch unexpectedly succeeded" >&2
+        exit 1
+    else
+        test "$?" -eq 2
+    fi
 fi
 "$cli" profile create --help >"$tmp/profile-create-help"
 grep -Fq 'Create an install or diskless profile from an imported install source' "$tmp/profile-create-help"
