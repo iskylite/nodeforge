@@ -216,6 +216,15 @@ test ! -s "$tmp/node-show-bad-section.out"
 grep -Fq 'unknown key' "$tmp/node-show-bad-section.err"
 "$cli" node list --columns id,mac,profile,deploy --no-header >"$tmp/node-list"
 grep -Eq '^contract-node[[:space:]]+02:00:00:00:00:42[[:space:]]+contract-profile[[:space:]]+no[[:space:]]*$' "$tmp/node-list"
+"$cli" node list >"$tmp/node-list-default"
+if grep -Eq '(^|[[:space:]])(ARMED|INSTALL|FINISHED)([[:space:]]|$)' "$tmp/node-list-default"; then
+    echo 'node list default output unexpectedly contains lifecycle timestamps' >&2
+    exit 1
+fi
+"$cli" node list -l >"$tmp/node-list-long"
+grep -Eq '(^|[[:space:]])ARMED([[:space:]]|$)' "$tmp/node-list-long"
+grep -Eq '(^|[[:space:]])INSTALL([[:space:]]|$)' "$tmp/node-list-long"
+grep -Eq '(^|[[:space:]])FINISHED([[:space:]]|$)' "$tmp/node-list-long"
 "$cli" node list -o jsonl >"$tmp/node-list-jsonl"
 jq -e '.ok and .result.id == "contract-node" and .result.profile == "contract-profile" and (.result.deploy | not)' "$tmp/node-list-jsonl" >/dev/null
 "$cli" profile item add contract-profile system.users name=ops sudo=true >"$tmp/user-add"

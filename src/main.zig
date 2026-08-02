@@ -311,6 +311,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     }, showCurrentHelp);
 
     const node_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List registered nodes" }, nodeListHandler);
+    try node_list.addFlag(.{ .name = "long", .shortcut = "l", .description = "Show the full table, including armed/install/finished timestamps", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(node_list);
     try addOutputFlag(node_list);
     try addDebugFlag(node_list);
@@ -3728,6 +3729,7 @@ const NodeListPage = struct { ok: bool, result: struct { view_revision: NodeList
 fn nodeListHandler(ctx: zli.CommandContext) !void {
     const output = outputFromContext(ctx) orelse return;
     const machine_output = output.mode != .human;
+    const show_timestamps = ctx.flag("long", bool) or output.columns.len != 0;
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
         setExitCode(ctx, 1);
         return;
@@ -3793,14 +3795,16 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
             return;
         };
     }
-    const cells = try a.alloc([11][]const u8, items.items.len);
-    const rows = try a.alloc(nodeforge.cli_table.Row, items.items.len);
+    const full_cells = try a.alloc([11][]const u8, items.items.len);
+    const full_rows = try a.alloc(nodeforge.cli_table.Row, items.items.len);
+    const compact_cells = try a.alloc([8][]const u8, items.items.len);
+    const compact_rows = try a.alloc(nodeforge.cli_table.Row, items.items.len);
     const jsonl = try a.alloc([]const u8, items.items.len);
     for (items.items, 0..) |item, index| {
         var armed_buf: [20]u8 = undefined;
         var install_buf: [20]u8 = undefined;
         var finished_buf: [20]u8 = undefined;
-        cells[index] = .{
+        full_cells[index] = .{
             item.id,
             item.mac,
             item.pxe.ip_reservation orelse "-",
@@ -3813,13 +3817,29 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
             try a.dupe(u8, views.formatTimestamp(&finished_buf, item.finished_at orelse 0)),
             item.serial_number orelse "-",
         };
-        rows[index] = .{ .cells = &cells[index] };
+        full_rows[index] = .{ .cells = &full_cells[index] };
+        compact_cells[index] = .{
+            full_cells[index][0],
+            full_cells[index][1],
+            full_cells[index][2],
+            full_cells[index][3],
+            full_cells[index][4],
+            full_cells[index][5],
+            full_cells[index][6],
+            full_cells[index][10],
+        };
+        compact_rows[index] = .{ .cells = &compact_cells[index] };
         jsonl[index] = try std.json.Stringify.valueAlloc(a, .{ .ok = true, .result = item }, .{});
     }
     const Result = struct { view_revision: NodeListViewRevision, items: []const NodeListItem, next_cursor: ?[]const u8 = null };
     const json = try std.json.Stringify.valueAlloc(a, .{ .ok = true, .result = Result{ .view_revision = view_revision.?, .items = items.items } }, .{});
-    const columns = [_]nodeforge.cli_table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "armed_at", .title = "ARMED" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
-    try renderOutputDocument(ctx, .{ .human = .{ .table = .{ .columns = &columns, .rows = rows, .empty_message = "No nodes registered." } }, .json = json, .jsonl = jsonl });
+    const full_columns = [_]nodeforge.cli_table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "armed_at", .title = "ARMED" }, .{ .key = "install_at", .title = "INSTALL" }, .{ .key = "finished_at", .title = "FINISHED" }, .{ .key = "sn", .title = "SN" } };
+    const compact_columns = [_]nodeforge.cli_table.Column{ .{ .key = "id", .title = "ID" }, .{ .key = "mac", .title = "MAC" }, .{ .key = "ip", .title = "IP" }, .{ .key = "profile", .title = "PROFILE" }, .{ .key = "deploy", .title = "DEPLOY" }, .{ .key = "intent", .title = "INSTALL_INTENT" }, .{ .key = "status", .title = "STATUS" }, .{ .key = "sn", .title = "SN" } };
+    const human: nodeforge.cli_document.Human = if (show_timestamps)
+        .{ .table = .{ .columns = &full_columns, .rows = full_rows, .empty_message = "No nodes registered." } }
+    else
+        .{ .table = .{ .columns = &compact_columns, .rows = compact_rows, .empty_message = "No nodes registered." } };
+    try renderOutputDocument(ctx, .{ .human = human, .json = json, .jsonl = jsonl });
     if (truncated) try errorWriter(ctx).writeAll("note: node list truncated at 256 rows; use the management API with limit/cursor for the full list\n");
 }
 

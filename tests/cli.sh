@@ -215,6 +215,9 @@ grep -Fq '1..32' "$tmp/node-set-help-full"
 grep -Fq 'overrides.* scalar keys' "$tmp/node-unset-help"
 "$cli" node retry --help >"$tmp/node-retry-help"
 grep -Fq 'Supersede a stuck active install or diskless session' "$tmp/node-retry-help"
+"$cli" node list --help >"$tmp/node-list-help"
+grep -Fq -- '--long' "$tmp/node-list-help"
+grep -Fq -- '-l' "$tmp/node-list-help"
 "$cli" node render --help >"$tmp/node-render-help"
 if grep -Eq '^   .*--output' "$tmp/node-render-help"; then
     echo "node render emits an answer artifact and must not expose a view-format flag" >&2
@@ -391,9 +394,9 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-"$cli" --version | grep -Eq '^nodeforge 0\.3\.0 \(commit [0-9a-f]{12}|unknown'
+"$cli" --version | grep -Eq '^nodeforge 0\.3\.1 \(commit [0-9a-f]{12}|unknown'
 "$cli" -v | grep -Fq 'built '
-"$daemon" --version | grep -Eq '^nodeforged 0\.3\.0 \(commit [0-9a-f]{12}|unknown'
+"$daemon" --version | grep -Eq '^nodeforged 0\.3\.1 \(commit [0-9a-f]{12}|unknown'
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then
