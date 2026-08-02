@@ -686,9 +686,20 @@ nodeforge assets archive import vendor-agent \
   --from-file ./vendor-agent.tar --media-type application/x-tar
 ```
 
+`--install-script` 不是必填项。省略时构建 Mode B 数据归档，普通 `install.sh` 只作为
+数据文件解压，不会执行：
+
+```bash
+nodeforge assets archive build ./static-files.tar \
+  --base-dir ./payload \
+  etc usr
+```
+
 `archive build` 需要 GNU tar，默认输出未压缩 PAX `.tar`；可显式选择
 `--compression gzip|xz`，对应 `.tar.gz`/`.tgz` 或 `.tar.xz`/`.txz`。构建先完成并校验
-完整 tar，再执行最终压缩；运行端仍统一以 `tar -xf` 自动识别。rootfs 基线明确包含
+完整 tar，再执行最终压缩；运行端仍统一以 `tar -xf` 自动识别。仅当指定
+`--install-script` 时才生成 Mode A 的 `.nf.install.sh`；缺省为无入口的 Mode B。
+rootfs 基线明确包含
 `tar`、`gzip` 和 `xz`。命令把用户提供的安装脚本映射为归档顶层
 `.nf.install.sh`。payload 自带该保留顶层条目时拒绝构建；绝对路径、
 含 `..` 的路径和换行路径同样拒绝。所有 payload 在一次 tar 调用中读取，保留软链接

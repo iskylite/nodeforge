@@ -178,7 +178,7 @@ fresh 流程独立验证。
 新增公开命令：
 
 ```text
-nodeforge assets archive build <output.tar> --install-script <path> \
+nodeforge assets archive build <output.tar> [--install-script <path>] \
   [--base-dir <dir>] [--files-from <list>] [paths...]
 ```
 
@@ -196,6 +196,7 @@ nodeforge assets archive build <output.tar> --install-script <path> \
 | 保留入口冲突 | PASS | payload 含顶层 `.nf.install.sh` 时拒绝 |
 | parent path | PASS | `../escape` 在调用 tar 前拒绝 |
 | ctime 语义 | PASS | JSON 明确 `ctime_preserved=false`，文档明确不可还原 |
+| 无安装脚本 Mode B | PASS | `mode=B`、`entrypoint=null`，普通 `install.sh` 仅作为数据条目 |
 
 随后扩展 `--compression none|gzip|xz` 并在同一 r97n0 环境增量验证：三种产物分别被
 `file` 识别为 POSIX tar、gzip 和 XZ；同一条

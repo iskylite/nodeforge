@@ -589,12 +589,12 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     const archive_build = try zli.Command.init(init_options, .{
         .name = "build",
         .description = "Build a canonical metadata-preserving archive",
-        .usage = "nodeforge assets archive build <output> --install-script <path> [--compression none|gzip|xz] [--base-dir <dir>] [--files-from <list>] [paths...]",
-        .help = "Requires GNU tar and, when selected, gzip or xz. Payload paths must be relative to --base-dir. The install script is stored as the reserved top-level .nf.install.sh entry.",
+        .usage = "nodeforge assets archive build <output> [--install-script <path>] [--compression none|gzip|xz] [--base-dir <dir>] [--files-from <list>] [paths...]",
+        .help = "Requires GNU tar and, when selected, gzip or xz. Without --install-script it builds a data-only Mode B archive; when provided, the script is stored as the reserved top-level .nf.install.sh Mode A entry.",
     }, archiveBuildHandler);
     try archive_build.addPositionalArg(.{ .name = "archive", .description = "Output .tar, .tar.gz/.tgz, or .tar.xz/.txz path", .required = true });
     try archive_build.addPositionalArg(.{ .name = "paths", .description = "Payload paths relative to --base-dir", .required = false, .variadic = true });
-    try archive_build.addFlag(.{ .name = "install-script", .description = "Installer script stored as .nf.install.sh", .type = .String, .default_value = .{ .String = "" } });
+    try archive_build.addFlag(.{ .name = "install-script", .description = "Optional Mode A installer stored as .nf.install.sh", .type = .String, .default_value = .{ .String = "" } });
     try archive_build.addFlag(.{ .name = "base-dir", .description = "Base directory for payload paths", .type = .String, .default_value = .{ .String = "." } });
     try archive_build.addFlag(.{ .name = "files-from", .description = "Text file containing one payload path per line", .type = .String, .default_value = .{ .String = "" } });
     try archive_build.addFlag(.{ .name = "compression", .description = "Output compression: none, gzip, or xz", .type = .String, .default_value = .{ .String = "none" } });
@@ -2768,8 +2768,8 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
     const files_from = ctx.flag("files-from", []const u8);
     const compression_name = ctx.flag("compression", []const u8);
     const compression = parseArchiveCompression(compression_name) orelse return itemUsageError(ctx, "archive build --compression must be none, gzip, or xz");
-    if (output_path.len == 0 or install_script.len == 0 or base_dir.len == 0)
-        return itemUsageError(ctx, "archive build requires <output>, --install-script, and a non-empty --base-dir");
+    if (output_path.len == 0 or base_dir.len == 0)
+        return itemUsageError(ctx, "archive build requires <output> and a non-empty --base-dir");
     if (!compression.validOutputSuffix(output_path))
         return itemUsageError(ctx, "archive output suffix does not match --compression (.tar, .tar.gz/.tgz, or .tar.xz/.txz)");
     if (std.Io.Dir.cwd().statFile(ctx.io, output_path, .{ .follow_symlinks = false })) |_| {
@@ -2778,8 +2778,10 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
 
     const base_stat = std.Io.Dir.cwd().statFile(ctx.io, base_dir, .{ .follow_symlinks = true }) catch return itemUsageError(ctx, "archive build --base-dir is unreadable");
     if (base_stat.kind != .directory) return itemUsageError(ctx, "archive build --base-dir must be a directory");
-    const script_stat = std.Io.Dir.cwd().statFile(ctx.io, install_script, .{ .follow_symlinks = false }) catch return itemUsageError(ctx, "archive build install script is unreadable");
-    if (script_stat.kind != .file) return itemUsageError(ctx, "archive build install script must be a regular file, not a symlink");
+    if (install_script.len != 0) {
+        const script_stat = std.Io.Dir.cwd().statFile(ctx.io, install_script, .{ .follow_symlinks = false }) catch return itemUsageError(ctx, "archive build install script is unreadable");
+        if (script_stat.kind != .file) return itemUsageError(ctx, "archive build install script must be a regular file, not a symlink");
+    }
 
     var list: std.Io.Writer.Allocating = .init(ctx.allocator);
     defer list.deinit();
@@ -2838,9 +2840,11 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
     if (try archiveHasReservedInstallEntry(ctx, temp_archive))
         return itemUsageError(ctx, "archive payload already contains the reserved top-level .nf.install.sh entry");
 
-    const script_dir = std.fs.path.dirname(install_script) orelse ".";
-    const script_name = std.fs.path.basename(install_script);
-    try runArchiveBuildTar(ctx, &.{ "tar", "--format=pax", "--acls", "--xattrs", "--numeric-owner", "--atime-preserve=system", "--transform=s|.*|.nf.install.sh|", "-rf", temp_archive, script_name }, .{ .path = script_dir });
+    if (install_script.len != 0) {
+        const script_dir = std.fs.path.dirname(install_script) orelse ".";
+        const script_name = std.fs.path.basename(install_script);
+        try runArchiveBuildTar(ctx, &.{ "tar", "--format=pax", "--acls", "--xattrs", "--numeric-owner", "--atime-preserve=system", "--transform=s|.*|.nf.install.sh|", "-rf", temp_archive, script_name }, .{ .path = script_dir });
+    }
     validateArchiveForImport(ctx, temp_archive) catch return itemUsageError(ctx, "archive build produced an invalid final archive");
     const publish_source = switch (compression) {
         .none => temp_archive,
@@ -2858,8 +2862,10 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
     validateArchiveForImport(ctx, publish_source) catch return itemUsageError(ctx, "archive build produced an unreadable compressed archive");
     try std.Io.Dir.rename(std.Io.Dir.cwd(), publish_source, std.Io.Dir.cwd(), output_path, ctx.io);
 
-    const human = try std.fmt.allocPrint(ctx.allocator, "built canonical archive {s} ({d} payload paths; entrypoint .nf.install.sh)", .{ output_path, path_count });
-    try renderCommandResult(ctx, human, .{ .archive = output_path, .entrypoint = ".nf.install.sh", .payload_paths = path_count, .format = "pax", .compression = compression_name, .ctime_preserved = false });
+    const mode: []const u8 = if (install_script.len == 0) "B" else "A";
+    const entrypoint: ?[]const u8 = if (install_script.len == 0) null else ".nf.install.sh";
+    const human = try std.fmt.allocPrint(ctx.allocator, "built canonical archive {s} ({d} payload paths; Mode {s})", .{ output_path, path_count, mode });
+    try renderCommandResult(ctx, human, .{ .archive = output_path, .mode = mode, .entrypoint = entrypoint, .payload_paths = path_count, .format = "pax", .compression = compression_name, .ctime_preserved = false });
 }
 
 const ArchiveCompression = enum {

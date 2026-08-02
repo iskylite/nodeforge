@@ -88,8 +88,9 @@ remote_cli "assets archive build $work/arc-mode-a.tar --install-script $work/arc
 # archive Mode B: ordinary top-level install.sh must remain data and not execute
 remote_sh "mkdir -p $work/arc-b/etc/issue.d && \
     printf 'NODEFORGE_INSTALLPOST_ARCHIVE_B\n' > $work/arc-b/etc/issue.d/nodeforge-arc-b.issue && \
-    printf '#!/bin/sh\nprintf '\''NODEFORGE_ORDINARY_INSTALL_SH_EXECUTED\\n'\'' > /etc/issue.d/nodeforge-ordinary-install-sh.issue\n' > $work/arc-b/install.sh && \
-    tar -C $work/arc-b -cf $work/arc-mode-b.tar ."
+    printf '#!/bin/sh\nprintf '\''NODEFORGE_ORDINARY_INSTALL_SH_EXECUTED\\n'\'' > /etc/issue.d/nodeforge-ordinary-install-sh.issue\n' > $work/arc-b/install.sh"
+# No --install-script: public builder must create Mode B and keep install.sh as data.
+remote_cli "assets archive build $work/arc-mode-b.tar --base-dir $work/arc-b ." >/dev/null
 
 # script asset: creates a marker file
 remote_sh "printf '#!/bin/sh\nmkdir -p /etc/issue.d\nprintf '\''NODEFORGE_INSTALLPOST_SCRIPT\\n'\'' > /etc/issue.d/nodeforge-script.issue\n' > $work/setup.sh"

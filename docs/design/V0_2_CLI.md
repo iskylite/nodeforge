@@ -196,7 +196,7 @@ RHEL comps 选择区分 environment、group 与 package。未设置
 
 ```text
 nodeforge assets managed-file import <asset> --from-file <path> [--media-type <type>]
-nodeforge assets archive build <output> --install-script <path> \
+nodeforge assets archive build <output> [--install-script <path>] \
   [--compression none|gzip|xz] [--base-dir <dir>] [--files-from <list>] [paths...]
 nodeforge assets archive import <asset> --from-file <path> [--media-type <type>]
 nodeforge assets script import <asset> --from-file <path> [--media-type <type>]
@@ -226,7 +226,7 @@ asset import flag 约束：
 | 命令 | 必填 flag | 可选 flag | 说明 |
 |---|---|---|---|
 | `managed-file import` | `<asset>`、`--from-file` | `--media-type` | 只导入不可变文件内容；不保存 destination/mode/owner/group |
-| `archive build` | `<output>`、`--install-script`、至少一个 payload 路径 | `--compression none\|gzip\|xz`、`--base-dir`、`--files-from` | 构建 PAX archive；默认未压缩 tar，安装脚本固定映射为顶层 `.nf.install.sh` |
+| `archive build` | `<output>`、至少一个 payload 路径 | `--install-script`、`--compression none\|gzip\|xz`、`--base-dir`、`--files-from` | 构建 PAX archive；省略安装脚本为 Mode B，提供时固定映射为 Mode A 顶层 `.nf.install.sh` |
 | `archive import` | `<asset>`、`--from-file` | `--media-type` | 导入 tar 归档；destination 由 archive action 规则在执行期决定 |
 | `script import` | `<asset>`、`--from-file` | `--media-type` | 导入受审计脚本；interpreter 在 item add 时指定 |
 

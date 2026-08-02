@@ -458,15 +458,16 @@ archive 只允许引用已发布的受管 Asset；表中同时明确禁止的 in
 公开 CLI 提供唯一标准构建入口：
 
 ```text
-nodeforge assets archive build <output> --install-script <path> \
+nodeforge assets archive build <output> [--install-script <path>] \
   [--compression none|gzip|xz] [--base-dir <dir>] [--files-from <list>] [paths...]
 ```
 
 - `<paths...>` 与 `--files-from` 可同时使用；list 是 UTF-8 文本，一行一个相对
   `--base-dir` 的路径，空行忽略；至少需要一个 payload 路径。
 - 拒绝绝对路径、任意 `..` component、NUL/换行路径和已存在的输出文件。
-- 用户安装脚本必须是普通文件。CLI 在追加时将它映射为精确顶层
-  `.nf.install.sh`；payload 已含该保留条目时失败，绝不覆盖或猜测用户意图。
+- `--install-script` 可选。省略时生成没有保留入口的 Mode B 数据归档；提供时脚本
+  必须是普通文件，CLI 将它映射为精确顶层 `.nf.install.sh` 并生成 Mode A。两种模式
+  都拒绝 payload 自带该保留条目，绝不覆盖、自动执行普通 `install.sh` 或猜测用户意图。
 - 构建依赖 GNU tar，默认输出未压缩 PAX `.tar`；`--compression gzip|xz` 分别生成
   `.tar.gz`/`.tgz` 或 `.tar.xz`/`.txz`，参数和后缀不匹配即拒绝。实现必须先创建、
   追加并校验完整的临时 tar，最后才执行一次压缩，不能向压缩流追加入口。

@@ -116,6 +116,7 @@ grep -Fq -- '--files-from' "$tmp/archive-build-help"
 grep -Fq -- '--base-dir' "$tmp/archive-build-help"
 grep -Fq -- '--compression' "$tmp/archive-build-help"
 grep -Fq -- 'none, gzip, or xz' "$tmp/archive-build-help"
+grep -Fq -- 'data-only Mode B' "$tmp/archive-build-help"
 grep -Fq -- '.nf.install.sh' "$tmp/archive-build-help"
 
 # GNU tar 环境验证 canonical archive 的入口映射、软/硬链接、权限、mtime，
@@ -139,7 +140,7 @@ if tar --version 2>/dev/null | grep -Fq 'GNU tar'; then
     "$cli" assets archive build "$archive_out" \
         --install-script "$tmp/user-install.sh" --base-dir "$archive_src" \
         --files-from "$tmp/archive-files" etc/nodeforge/symlink -o json >"$tmp/archive-build.json"
-    jq -e '.ok and .result.entrypoint == ".nf.install.sh" and .result.payload_paths == 3 and .result.compression == "none" and (.result.ctime_preserved | not)' "$tmp/archive-build.json" >/dev/null
+    jq -e '.ok and .result.mode == "A" and .result.entrypoint == ".nf.install.sh" and .result.payload_paths == 3 and .result.compression == "none" and (.result.ctime_preserved | not)' "$tmp/archive-build.json" >/dev/null
     test "$(tar -tf "$archive_out" | grep -cx '\.nf\.install\.sh')" -eq 1
     tar --same-owner --same-permissions --acls --xattrs -xf "$archive_out" -C "$archive_extract"
     test "$(stat -c %i "$archive_extract/etc/nodeforge/original")" = "$(stat -c %i "$archive_extract/etc/nodeforge/hardlink")"
@@ -147,6 +148,18 @@ if tar --version 2>/dev/null | grep -Fq 'GNU tar'; then
     test "$(stat -c %a "$archive_extract/etc/nodeforge/original")" = 640
     test "$(stat -c %Y "$archive_extract/etc/nodeforge/original")" = "$before_mtime"
     test "$(stat -c %X "$archive_src/etc/nodeforge/original")" = "$before_atime"
+
+    # --install-script 不是必填项。缺省时生成 Mode B，普通 install.sh 只是
+    # payload 数据，且归档中不得出现保留隐藏入口。
+    printf '#!/bin/sh\nexit 99\n' >"$archive_src/install.sh"
+    "$cli" assets archive build "$tmp/data-only.tar" --base-dir "$archive_src" \
+        install.sh etc/nodeforge -o json >"$tmp/archive-mode-b.json"
+    jq -e '.ok and .result.mode == "B" and .result.entrypoint == null' "$tmp/archive-mode-b.json" >/dev/null
+    tar -tf "$tmp/data-only.tar" | grep -Fxq 'install.sh'
+    if tar -tf "$tmp/data-only.tar" | grep -Fxq '.nf.install.sh'; then
+        echo "Mode B archive unexpectedly contains reserved installer" >&2
+        exit 1
+    fi
 
     # gzip/xz 只改变最终传输编码；tar -tf/-xf 自动识别，内部 PAX payload、
     # hidden entrypoint 与链接语义保持一致。
