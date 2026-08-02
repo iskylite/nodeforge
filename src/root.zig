@@ -121,6 +121,8 @@ pub const dhcp_store = @import("state/dhcp_store.zig");
 /// 节点状态持久化存储：磁盘上的节点状态和终态记录。
 pub const status_store = @import("state/status_store.zig");
 pub const deployment_control = @import("state/deployment_control.zig");
+/// v0.3 install-post journal：步骤执行状态、attempt 计数和 run 状态机。
+pub const install_post_journal = @import("state/install_post_journal.zig");
 /// M4.9b：仅包含节点实际引用事实的完整 SHA-256 部署计划摘要。
 pub const plan_digest = @import("state/plan_digest.zig");
 pub const repository_index_blob = @import("state/repository_index_blob.zig");
@@ -164,9 +166,9 @@ pub const adapter_capabilities = @import("profile/capabilities.zig");
 pub const admin_key = @import("server/admin_key.zig");
 pub const kickstart = @import("profile/adapter/kickstart.zig");
 pub const ubuntu_autoinstall = @import("profile/adapter/ubuntu.zig");
-/// 当前 schema v4 的受限 install-post 渲染器：只执行既有
-/// repository/standard_packages/managed_file 兼容动作；v0.3 规划的四类
-/// canonical action、generation callback 和完成闸尚未由此模块实现。
+/// v0.3 install-post canonical 渲染器：四类 canonical action（managed_file/
+/// package/archive/script）固定执行顺序，archive 运行时模式 A/B 判定。
+/// 旧 repository/standard_packages action 已退出，不兼容。
 pub const provision_runner = @import("provision/runner.zig");
 pub const provision_first_boot = @import("provision/first_boot.zig");
 /// 错误渲染器：将 Zig error set 映射为人类可读的审计消息。
@@ -232,6 +234,7 @@ test {
     _ = dhcp_store;
     _ = status_store;
     _ = deployment_control;
+    _ = install_post_journal;
     _ = plan_digest;
     _ = repository_index_blob;
     _ = profile_diskless;

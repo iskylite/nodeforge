@@ -69,6 +69,7 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try w.writeAll(if (system.ssh.password_authentication) "true" else "false");
     try w.writeAll("\n  packages:\n");
     if (system.ssh.enabled) try w.writeAll("    - 'openssh-server'\n");
+    if (bundleHasInstallPostArchive(bundle)) try w.writeAll("    - 'tar'\n");
     for (software.tasks) |task| {
         try w.writeAll("    - ");
         const task_name = try std.fmt.allocPrint(allocator, "{s}^", .{task});
@@ -310,7 +311,11 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
         try w.writeByte('\n');
     }
     if (bundle) |value| {
-        const script = try runner.renderInstallPost(allocator, value, .apt);
+        const script = try runner.renderInstallPostInstrumented(allocator, value, .apt, .{
+            .event_url = event_url,
+            .token = token,
+            .boot_session_id = session,
+        });
         defer allocator.free(script);
         var command: std.Io.Writer.Allocating = .init(allocator);
         defer command.deinit();
@@ -342,6 +347,12 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try w.writeByte('\n');
     try w.writeAll("package_update: false\npackage_upgrade: false\n");
     return out.toOwnedSlice();
+}
+
+fn bundleHasInstallPostArchive(bundle: ?*const model.ProvisioningBundle) bool {
+    const value = bundle orelse return false;
+    for (value.steps) |step| if (step.phase == .install_post and step.action == .archive) return true;
+    return false;
 }
 
 /// 渲染绑定到 `boot_disk` 的受约束 direct 布局，或显式 curtin action graph。
@@ -782,13 +793,13 @@ test "M4.6 autoinstall persists literal kernel args in GRUB drop-in" {
 test "late command keeps managed files single-line and fail-fast" {
     const node: model.NodeConfig = .{ .id = "node-03", .mac = "00:11:22:33:44:77", .arch = .aarch64, .profile = "ubuntu" };
     const bundle: model.ProvisioningBundle = .{ .name = "base", .steps = &.{
-        .{ .name = "packages", .action = .standard_packages, .packages = &.{"curl"} },
+        .{ .name = "packages", .action = .package, .packages = &.{"curl"} },
         .{ .name = "hosts", .action = .managed_file, .destination = "/etc/hosts.d/nodeforge", .content = "127.0.0.1 localhost\n" },
     } };
     const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", &bundle, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "NODEFORGE_EOF") == null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, " && install -d") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "install -d") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "printf") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "%b") != null);
 }

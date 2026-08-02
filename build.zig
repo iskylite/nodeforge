@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// NodeForge 产品版本的唯一构建事实源。发布新版本时同步更新 build.zig.zon。
-const nodeforge_version = "0.2.3";
+const nodeforge_version = "0.3.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -149,6 +149,13 @@ pub fn build(b: *std.Build) void {
     setup_tests.addArtifactArg(daemon);
     setup_tests.step.dependOn(&http_tests.step);
     test_step.dependOn(&setup_tests.step);
+
+    // 目标环境发布闸默认不挂到本地 test：它会实际修改配置的 r97n1 虚拟机，
+    // 并依赖可访问的 r97n0 管理节点，因此必须由操作员显式触发。
+    const v03_install_post_e2e = b.addSystemCommand(&.{"bash"});
+    v03_install_post_e2e.addFileArg(b.path("tests/v0_3_install_post_e2e.sh"));
+    const v03_install_post_e2e_step = b.step("test-v0.3-install-post-e2e", "Run the real PXE install-post v0.3 gate");
+    v03_install_post_e2e_step.dependOn(&v03_install_post_e2e.step);
 }
 
 fn commandOutput(b: *std.Build, argv: []const []const u8) ?[]const u8 {

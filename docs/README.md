@@ -25,7 +25,8 @@
   版本完成闸的目标环境验证，包含 x86_64 VMware；QEMU 只作可选补充证据。
 - [v0.2 发布后收口清单](design/V0_2_POST_RELEASE_BACKLOG.md)：区分真实实现差异、
   已完成项和明确暂不做项；第 2 节稳定 ID 是非阻断范围的唯一权威索引。
-- [v0.3 设计：install-post canonical 扩展与 adapter matrix](design/V0_3_DESIGN.md)：install-post 四类 canonical action、callback credential、发行版版本矩阵；保持 catalog schema v5。
+- [v0.3 设计：install-post canonical 扩展](design/V0_3_DESIGN.md)：install-post 四类 canonical action、callback generation 绑定与 journal/finalizer；保持 catalog schema v5。
+- [v0.3 验证记录](validation/V0_3_VALIDATION.md)：fresh 双机部署、Compute Use VMware 五项矩阵、generation 3 install-post、重启恢复与负路径证据，最终结论 PASS。
 - [BIOS PXELINUX 延后设计](design/BIOS_PXELINUX_DEFERRED.md)：x86 BIOS PXELINUX install 独立设计，不绑定产品版本号，最早在 v0.5 后实施。
 - [v0.4 设计：延后增强项](design/V0_4_DESIGN.md)：多 NIC/VLAN/bonding、容量压测、临时 PXE rootfs 构建节点与 install 侧 first-boot agent（无 reconciliation）。
 - [v0.5 设计：可切换 rootfs 形态](design/V0_5_DESIGN.md)：`ram_rootfs` 全内存模式与 `diskless.overlay.mode` 字段。

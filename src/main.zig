@@ -441,9 +441,10 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addDebugFlag(node_session_cancel);
     try node_session.addCommands(&.{ node_session_list, node_session_show, node_session_cancel });
     const node_postprocess = try zli.Command.init(init_options, .{ .name = "postprocess", .description = "Inspect post-deployment execution state" }, showCurrentHelp);
-    const node_postprocess_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show first-boot postprocess state for a node" }, nodePostprocessShowHandler);
+    const node_postprocess_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show postprocess state for a node" }, nodePostprocessShowHandler);
     try node_postprocess_show.addPositionalArg(.{ .name = "node_id", .description = "Registered node identifier", .required = true });
-    try node_postprocess_show.addFlag(.{ .name = "phase", .description = "Postprocess phase; v0.2.2 supports first-boot", .type = .String, .default_value = .{ .String = "first-boot" } });
+    try node_postprocess_show.addFlag(.{ .name = "phase", .description = "Postprocess phase: first-boot or install-post", .type = .String, .default_value = .{ .String = "first-boot" } });
+    try node_postprocess_show.addFlag(.{ .name = "generation", .description = "Install generation (install-post only)", .type = .Int, .default_value = .{ .Int = 0 } });
     try addConfigPathFlag(node_postprocess_show);
     try addOutputFlag(node_postprocess_show);
     try addDebugFlag(node_postprocess_show);
@@ -2767,6 +2768,10 @@ fn contentAssetImportHandler(ctx: zli.CommandContext, kind: nodeforge.model.Asse
     defer input.close(ctx.io);
     const stat = input.stat(ctx.io) catch return itemUsageError(ctx, "managed-file source cannot be inspected");
     if (stat.kind != .file or stat.size > max_size) return itemUsageError(ctx, "content asset source is not a regular file or exceeds its size limit");
+    if (kind == .archive) validateArchiveForImport(ctx, source) catch {
+        try writeCommandError(ctx, "archive.invalid", "archive must be a readable tar without absolute paths or '..' path components", 2);
+        return;
+    };
     const directory: []const u8 = switch (kind) {
         .managed_file => "managed-files",
         .archive => "archives",
@@ -2794,6 +2799,28 @@ fn contentAssetImportHandler(ctx: zli.CommandContext, kind: nodeforge.model.Asse
     published = true;
     const human = try std.fmt.allocPrint(ctx.allocator, "imported {s} revision {d} ({d} bytes)", .{ name, revision, stat.size });
     try renderCommandResult(ctx, human, .{ .name = name, .revision = revision, .size = stat.size, .media_type = media_type });
+}
+
+fn validateArchiveForImport(ctx: zli.CommandContext, source: []const u8) !void {
+    const result = try std.process.run(ctx.allocator, ctx.io, .{
+        .argv = &.{ "tar", "-tf", source },
+        .stdout_limit = .limited(16 * 1024 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    });
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.InvalidArchive,
+        else => return error.InvalidArchive,
+    }
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |raw_entry| {
+        const entry = std.mem.trim(u8, raw_entry, "\r");
+        if (entry.len == 0) continue;
+        if (entry[0] == '/') return error.InvalidArchivePath;
+        var components = std.mem.splitScalar(u8, entry, '/');
+        while (components.next()) |component| if (std.mem.eql(u8, component, "..")) return error.InvalidArchivePath;
+    }
 }
 
 fn managedFileRemoveHandler(ctx: zli.CommandContext) !void {
@@ -4302,8 +4329,9 @@ fn profilePropertyError(ctx: zli.CommandContext, err: anyerror) void {
 const ResolvedPreviewBundle = struct {
     value: model.ProvisioningBundle,
     urls: []const []u8,
+    url_count: usize = 0,
     fn deinit(self: *ResolvedPreviewBundle, allocator: std.mem.Allocator) void {
-        for (self.urls) |url| allocator.free(url);
+        for (self.urls[0..self.url_count]) |url| allocator.free(url);
         allocator.free(self.urls);
         allocator.free(self.value.steps);
     }
@@ -4323,18 +4351,30 @@ fn resolvePreviewBundle(allocator: std.mem.Allocator, catalog: *const model.Cata
     var initialized: usize = 0;
     errdefer for (urls[0..initialized]) |url| allocator.free(url);
     for (bundle.steps, 0..) |step, index| {
+        // v0.3: 接受四类 canonical action。package 不引用 asset，直接传递。
+        if (step.action == .package) {
+            if (step.packages.len == 0) return error.InvalidProvisioningStep;
+            steps[index] = step;
+            continue;
+        }
         const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
         const asset = nodeforge.catalog.findAsset(catalog, asset_name) orelse return error.MissingAsset;
-        if (asset.kind != .managed_file or asset.sha256 == null) return error.InvalidProvisioningStep;
-        urls[index] = try std.fmt.allocPrint(allocator, "http://{s}:{d}/artifacts/managed-files/{s}/{d}", .{ server_ip, port, asset.name, asset.revision });
-        initialized += 1;
+        if (asset.sha256 == null) return error.InvalidProvisioningStep;
+        const url_path: []const u8 = switch (asset.kind) {
+            .managed_file => "managed-files",
+            .archive => "archives",
+            .script => "scripts",
+            else => return error.InvalidProvisioningStep,
+        };
+        urls[initialized] = try std.fmt.allocPrint(allocator, "http://{s}:{d}/artifacts/{s}/{s}/{d}", .{ server_ip, port, url_path, asset.name, asset.revision });
         steps[index] = step;
-        steps[index].content_url = urls[index];
+        steps[index].content_url = urls[initialized];
         steps[index].content_sha256 = asset.sha256;
+        initialized += 1;
     }
     var value = bundle.*;
     value.steps = steps;
-    return .{ .value = value, .urls = urls };
+    return .{ .value = value, .urls = urls, .url_count = initialized };
 }
 
 fn installRenderHandler(ctx: zli.CommandContext) !void {
@@ -4565,8 +4605,15 @@ fn disklessSessionListHandler(ctx: zli.CommandContext) !void {
 fn nodePostprocessShowHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     const node_id = ctx.getArg("node_id") orelse return;
-    if (!std.mem.eql(u8, ctx.flag("phase", []const u8), "first-boot")) {
-        try writeCommandError(ctx, "postprocess.invalid_phase", "v0.2.2 supports only --phase first-boot", 2);
+    const phase = ctx.flag("phase", []const u8);
+
+    if (std.mem.eql(u8, phase, "install-post")) {
+        try nodePostprocessShowInstallPost(ctx, node_id);
+        return;
+    }
+
+    if (!std.mem.eql(u8, phase, "first-boot")) {
+        try writeCommandError(ctx, "postprocess.invalid_phase", "supported phases: first-boot, install-post", 2);
         return;
     }
     var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
@@ -4598,6 +4645,54 @@ fn nodePostprocessShowHandler(ctx: zli.CommandContext) !void {
     const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = true, .result = .{ .node_id = node_id, .phase = "first-boot", .state = state, .session_id = item.session_id, .lifecycle_phase = item.phase } }, .{});
     const human = try std.fmt.allocPrint(ctx.allocator, "Postprocess {s}\nphase: first-boot\nstate: {s}\nsession: {s}\nlifecycle: {s}", .{ node_id, state, item.session_id, item.phase });
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = json });
+}
+
+/// v0.3: 查询 install-post journal 状态（通过管理 API GET /install-post-journal）。
+fn nodePostprocessShowInstallPost(ctx: zli.CommandContext, node_id: []const u8) !void {
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const generation_value = ctx.flag("generation", i64);
+    if (generation_value < 0) return writeCommandError(ctx, "postprocess.invalid_generation", "generation must be positive", 2);
+    const generation: ?u64 = if (generation_value == 0) null else @intCast(generation_value);
+    const body = nodeforge.management_client.installPostJournalJson(ctx.io, config.value.server.http_port, node_id, generation, response) catch null orelse {
+        try writeCommandError(ctx, "postprocess.unavailable", "cannot read install-post journal state", 1);
+        return;
+    };
+    const Run = struct { step_id: []const u8 = "", status: []const u8 = "", attempts: u8 = 0, updated_at: i64 = 0 };
+    const Envelope = struct { ok: bool, result: struct { node_id: []const u8 = "", run: ?struct {
+        install_generation: u64 = 0,
+        status: []const u8 = "",
+        bundle_revision: u64 = 0,
+        created_at: i64 = 0,
+        updated_at: i64 = 0,
+        steps: []const Run = &.{},
+        failure_reason: ?[]const u8 = null,
+    } = null } };
+    const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try writeCommandError(ctx, "postprocess.invalid_response", "daemon returned malformed install-post journal", 1);
+        return;
+    };
+    defer parsed.deinit();
+    const journal_run = parsed.value.result.run orelse {
+        const empty_json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = true, .result = .{ .node_id = node_id, .phase = "install-post", .run = @as(?u8, null) } }, .{});
+        try renderOutputDocument(ctx, .{ .human = .{ .text = "No install-post history." }, .json = empty_json });
+        return;
+    };
+    const json_out = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .ok = true, .result = .{ .node_id = node_id, .phase = "install-post", .state = journal_run.status, .install_generation = journal_run.install_generation, .steps = journal_run.steps, .failure_reason = journal_run.failure_reason } }, .{});
+    var human: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer human.deinit();
+    try human.writer.print("Postprocess {s}\nphase: install-post\nstate: {s}\ngeneration: {d}", .{ node_id, journal_run.status, journal_run.install_generation });
+    if (journal_run.failure_reason) |reason| try human.writer.print("\nfailure: {s}", .{reason});
+    if (journal_run.steps.len > 0) {
+        try human.writer.writeAll("\nsteps:");
+        for (journal_run.steps) |step| try human.writer.print("\n  {s}: {s} (attempts={d})", .{ step.step_id, step.status, step.attempts });
+    }
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human.written() }, .json = json_out });
 }
 
 fn disklessSessionShowHandler(ctx: zli.CommandContext) !void {

@@ -561,7 +561,7 @@ nodeforge node retry <node> [--force]
 
 ## 12. v0.3+ 命令隔离
 
-- v0.3 才提供 `install-post` canonical 扩展和 adapter capability matrix（BIOS PXELINUX 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）。
+- v0.3 才提供 `install-post` canonical 扩展（BIOS PXELINUX 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）。
 - v0.4 才提供多 NIC/VLAN/bonding、临时 PXE rootfs 构建节点和 install first-boot agent。
 - v0.5 才提供 `diskless.overlay.mode=ram_rootfs`。
 

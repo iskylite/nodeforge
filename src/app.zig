@@ -37,6 +37,7 @@ const operations = @import("state/operations.zig");
 const rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
 const diskless_delivery = @import("state/diskless_delivery.zig");
 const identity_store = @import("state/identity_store.zig");
+const install_post_journal = @import("state/install_post_journal.zig");
 const model_transaction = @import("state/model_transaction.zig");
 const capacity = @import("state/capacity.zig");
 
@@ -164,6 +165,20 @@ pub fn run(
         observe_log.warn("identity-store: recovered {d} pending transaction(s) at startup", .{recovered_journals});
     if (identities.count != 0)
         observe_log.info("identity-store: loaded {d} identity revision(s)", .{identities.count});
+    // v0.3 install-post journal：既有 BootSession credential 会持久化并在 daemon 重启
+    // 后恢复，因此重启本身不等于 run 不可恢复；只有无法匹配持久事实时才进入恢复失败。
+    const install_post_journal_store = try allocator.create(install_post_journal.Store);
+    defer allocator.destroy(install_post_journal_store);
+    install_post_journal_store.* = .{};
+    defer install_post_journal_store.deinit(allocator);
+    install_post_journal.load(io, allocator, paths.require().install_post_journal_path, install_post_journal_store) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            // journal 损坏必须阻止启动，禁止当成空状态 fallback 后误放行 completed。
+            observe_log.err("install-post-journal: refusing startup with invalid state: {t}", .{err});
+            return err;
+        },
+    };
     const model_revision = try deployment_control.revisionForModel(allocator, config, catalog);
     const config_revision = model_revision.config;
     var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);
@@ -181,6 +196,20 @@ pub fn run(
             return err;
         },
     };
+    const recovered_install_completions = install_post_journal.recoverCommitting(
+        io,
+        allocator,
+        paths.require().install_post_journal_path,
+        install_post_journal_store,
+        paths.require().deployment_control_path,
+        deployments,
+        current_time,
+    ) catch |err| {
+        observe_log.err("install-post-journal: completion recovery failed: {t}", .{err});
+        return err;
+    };
+    if (recovered_install_completions != 0)
+        observe_log.warn("install-post-journal: recovered {d} completion transaction(s)", .{recovered_install_completions});
     // M4.9：必须先加载 deployment-control，再恢复 capability。两个 checkpoint
     // 分别原子写但不构成跨文件事务，因此恢复破坏性安装 session 前必须验证它
     // 仍对应当时固定的 generation/revision，不能把旧 token 接到新 generation。
@@ -290,6 +319,7 @@ pub fn run(
         &rootfs_artifacts,
         &diskless_store,
         identities,
+        install_post_journal_store,
         config_revision,
         bootstrap_key,
         additional_keys,

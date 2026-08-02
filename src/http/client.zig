@@ -214,6 +214,16 @@ pub fn nodesJson(io: std.Io, port: u16, node_id: ?[]const u8, output: []u8) !?[]
     return managementJson(io, port, path, output);
 }
 
+/// v0.3: 获取节点最近一次 install-post journal 状态。
+pub fn installPostJournalJson(io: std.Io, port: u16, node_id: []const u8, generation: ?u64, output: []u8) !?[]const u8 {
+    var path_buffer: [320]u8 = undefined;
+    const path = if (generation) |value|
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/nodes/{s}/install-post-journal?generation={d}", .{ node_id, value }) catch return error.InvalidNodeId
+    else
+        std.fmt.bufPrint(&path_buffer, "/api/v1/management/nodes/{s}/install-post-journal", .{node_id}) catch return error.InvalidNodeId;
+    return managementJson(io, port, path, output);
+}
+
 pub fn profilesJson(io: std.Io, port: u16, name: ?[]const u8, output: []u8) !?[]const u8 {
     var path_buffer: [256]u8 = undefined;
     const path = if (name) |id| std.fmt.bufPrint(&path_buffer, "/api/v1/management/profiles/{s}", .{id}) catch return error.InvalidProfileName else "/api/v1/management/profiles";

@@ -208,7 +208,7 @@ test "buildPlan orders steps managed_file -> package -> archive -> script and re
     // 故意乱序输入；输出必须按固定顺序排列。
     const steps = [_]model.ProvisionStep{
         .{ .name = "s", .phase = .rootfs_build, .action = .script, .content = "echo hi\n" },
-        .{ .name = "a", .phase = .rootfs_build, .action = .archive, .content = "x", .destination = "/opt/app" },
+        .{ .name = "a", .phase = .rootfs_build, .action = .archive, .content = "x" },
         .{ .name = "p", .phase = .rootfs_build, .action = .package, .packages = &.{"jq"} },
         .{ .name = "m", .phase = .rootfs_build, .action = .managed_file, .content = "hi\n", .destination = "/etc/motd" },
     };
@@ -221,13 +221,15 @@ test "buildPlan orders steps managed_file -> package -> archive -> script and re
     try std.testing.expect(std.mem.indexOf(u8, plan.commands[0].body, "/etc/motd") != null);
     try std.testing.expectEqual(.namespaced_package, plan.commands[1].isolation);
     try std.testing.expectEqualStrings("jq", plan.commands[1].packages[0]);
-    try std.testing.expect(std.mem.indexOf(u8, plan.commands[2].body, "/opt/app") != null);
+    // v0.3: archive 使用模式 A/B 判定，目标根固定为 /。
+    try std.testing.expect(std.mem.indexOf(u8, plan.commands[2].body, "tar -tf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.commands[2].body, "install.sh") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.commands[3].body, "sh /tmp/.nodeforge-script") != null);
 }
 
 test "buildPlan resolves content_asset to a staged payload path" {
     const steps = [_]model.ProvisionStep{
-        .{ .name = "arc", .phase = .rootfs_build, .action = .archive, .content_asset = "myarchive", .destination = "/opt/app" },
+        .{ .name = "arc", .phase = .rootfs_build, .action = .archive, .content_asset = "myarchive" },
     };
     const payload_paths = [_]?[]const u8{"myarchive/1"};
     const plan = try buildPlan(std.testing.allocator, &steps, null, &.{}, &payload_paths, false);

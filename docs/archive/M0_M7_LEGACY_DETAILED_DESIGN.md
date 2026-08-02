@@ -3797,7 +3797,7 @@ overlay/tmpfs、rootfs 下载校验、switch_root 和每实例 SSH host key。ho
 
 共享字段由 `profile/system.zig` 归一化一次，再分别生成 install plan 和 diskless plan。adapter、answer route、
 boot resolver 和 initrd 均不得自行补默认值。任何共享字段变更都必须同时更新 M4.1 adapter fixture、M5
-rootfs/BootConfig/overlay fixture、M6 capability matrix 和 M7 protected-domain/finalizer 回归。
+rootfs/BootConfig/overlay fixture 和 M7 protected-domain/finalizer 回归。
 
 #### 9.10.11 一次性安装意图、retry 与重复 PXE
 

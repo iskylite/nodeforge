@@ -73,12 +73,12 @@ initrd producer；`AssetKind.rootfs/nodeforge_initrd` 与 `BootBundleConfig` 没
 | 版本 | schema | 必须交付 | 不得偷跑 |
 |---|---:|---|---|
 | v0.2 | 4 | UEFI diskless、builder、initrd、diskless agent、rootfs-build/node-apply/first-boot、恢复/失败闭环 | BIOS、多 NIC、rootfs mode |
-| v0.3 | 5 | BIOS PXELINUX install、`firmware.mode`、install-post、明确 distro capability matrix | install agent、多 NIC |
+| v0.3 | 5 | BIOS PXELINUX install、`firmware.mode`、install-post | install agent、多 NIC |
 | v0.4 | 6 | ItemSpec 网络 topology、BootConfig v4 + AgentPlan v2、量化容量目标、临时 PXE rootfs 构建节点、install first-boot generation | 可切 rootfs 形态 |
 | v0.5 | 7 | `squashfs_overlay|ram_rootfs`、BootConfig v5、共享 artifact 与双模式内存预算 | NFS/iPXE/persistent overlay |
 
 v0.3 的 BIOS 与发行版扩展应拆成两个可独立验收的 feature slice；共同点只有版本发布，不应让新增发行版阻塞
-PXELINUX，也不应让 BIOS 绕过 adapter matrix。v0.4 的网络拓扑、容量、临时 PXE rootfs 构建节点和 install agent 是四个风险域，
+PXELINUX。v0.4 的网络拓扑、容量、临时 PXE rootfs 构建节点和 install agent 是四个风险域，
 schema 可同版但实现/验收必须独立。v0.5 只改变 rootfs materializer；BootConfig 必须显式升版承载 mode，auth、状态机与
 agent 不分叉。
 

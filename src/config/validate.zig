@@ -486,27 +486,25 @@ fn validateProvisioningBundles(catalog: *const model.Catalog) ValidationError!vo
         for (bundle.steps, 0..) |step, index| {
             switch (step.phase) {
                 .install_post => {
-                    // install_post 仅 managed_file，不含 repository/packages/content（v3+v4 一致）。
-                    if (step.action != .managed_file or step.repository != null or step.packages.len != 0 or step.content != null) return error.InvalidProvisioningStep;
-                    try validateManagedFileStep(catalog, &step);
+                    // v0.3: install-post 接受四类 canonical action（managed_file/
+                    // archive/script/package），旧 repository/standard_packages
+                    // 直接拒绝，不迁移、不兼容。
+                    switch (step.action) {
+                        .managed_file => try validateManagedFileStep(catalog, &step),
+                        .archive => try validateArchiveStep(catalog, &step),
+                        .script => try validateScriptStep(catalog, &step),
+                        .package => {
+                            if (step.packages.len == 0) return error.InvalidProvisioningStep;
+                        },
+                        .repository, .standard_packages => return error.InvalidProvisioningStep,
+                    }
                 },
                 .rootfs_build, .first_boot => {
                     // v0.2 build/first-boot 阶段：允许 managed_file/archive/script/package。
                     switch (step.action) {
                         .managed_file => try validateManagedFileStep(catalog, &step),
-                        .archive => {
-                            const destination = step.destination orelse return error.InvalidProvisioningStep;
-                            if (!std.mem.startsWith(u8, destination, "/") or std.mem.indexOf(u8, destination, "..") != null or step.mode > 0o777) return error.InvalidProvisioningStep;
-                            if (!validIdentifier(step.owner) or !validIdentifier(step.group)) return error.InvalidProvisioningStep;
-                            const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
-                            const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
-                            if (asset.kind != .archive) return error.AssetKindMismatch;
-                        },
-                        .script => {
-                            const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
-                            const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
-                            if (asset.kind != .script) return error.AssetKindMismatch;
-                        },
+                        .archive => try validateArchiveStep(catalog, &step),
+                        .script => try validateScriptStep(catalog, &step),
                         .package => {
                             if (step.packages.len == 0 and step.repository == null) return error.InvalidProvisioningStep;
                         },
@@ -527,6 +525,28 @@ fn validateManagedFileStep(catalog: *const model.Catalog, step: *const model.Pro
     const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
     const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
     if (asset.kind != .managed_file) return error.AssetKindMismatch;
+}
+
+/// archive 步骤共享校验（v0.3 §4.6.6）：
+/// - content_asset 必须指向 catalog 中 kind=archive 的资产
+/// - 禁止 inline content（archive 必须先导入为受管 Asset）
+/// - 禁止 destination（目标根由执行上下文决定，不由字段指定）
+fn validateArchiveStep(catalog: *const model.Catalog, step: *const model.ProvisionStep) ValidationError!void {
+    if (step.destination != null) return error.InvalidProvisioningStep;
+    if (step.content != null) return error.InvalidProvisioningStep;
+    const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
+    const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
+    if (asset.kind != .archive) return error.AssetKindMismatch;
+}
+
+/// script 步骤共享校验（v0.3）：
+/// - content_asset 必须指向 catalog 中 kind=script 的资产
+/// - 禁止 inline content（script 必须先导入为受管 Asset）
+fn validateScriptStep(catalog: *const model.Catalog, step: *const model.ProvisionStep) ValidationError!void {
+    if (step.content != null) return error.InvalidProvisioningStep;
+    const asset_name = step.content_asset orelse return error.InvalidProvisioningStep;
+    const asset = lookup.findAsset(catalog, asset_name) orelse return error.InvalidProvisioningStep;
+    if (asset.kind != .script) return error.AssetKindMismatch;
 }
 fn validateRepositories(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     for (catalog.repositories) |repository| {
@@ -684,7 +704,8 @@ fn validateInstallConfig(config: *const model.AppConfig, system: model.TargetSys
             if (std.mem.eql(u8, bundle.name, name)) found = true;
         }
         if (!found) return error.MissingProvisioningBundle;
-        for (config.provisioning_bundles) |bundle| if (std.mem.eql(u8, bundle.name, name)) for (bundle.steps) |step| if (step.action == .standard_packages) for (step.packages) |package| for (system.packages) |requested| if (std.mem.eql(u8, package, requested)) return error.InstallPackageUnavailable;
+        // v0.3: 旧 standard_packages action 已在 validateProvisioningBundles 中拒绝，
+        // 此处不再检查包冲突（旧逻辑已为死代码）。
     }
 }
 
@@ -1102,6 +1123,37 @@ test "install profile derives its platform from source" {
             .{ .name = "rocky-initrd", .kind = .installer_initrd, .path = "install/rocky/initrd.img", .distro = "rocky", .version = "9.7", .arch = .aarch64 },
         },
         .install_sources = &.{.{ .name = "rocky-source", .distro = "rocky", .version = "9.7", .arch = .aarch64, .source_asset = "rocky-iso", .installer_kernel = "rocky-kernel", .installer_initrd = "rocky-initrd" }},
+    };
+    try validate(&config, &catalog);
+}
+
+test "x86_64 install sources are validated by configured adapter support without a static tuple allowlist" {
+    const config: model.AppConfig = .{
+        .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" },
+        .http = test_http,
+        .tftp = test_tftp,
+        .distros = &.{.{
+            .name = "rocky",
+            .family = .rhel,
+            .versions = &.{.{ .version = "9.7", .archs = &.{.x86_64}, .install_adapter = .kickstart, .package_manager = .dnf }},
+        }},
+        .profiles = &.{.{ .name = "rocky-x86", .install_source = "rocky-x86-source" }},
+    };
+    const catalog: model.Catalog = .{
+        .assets = &.{
+            .{ .name = "rocky-x86-iso", .kind = .iso, .path = "iso/rocky-x86.iso", .distro = "rocky", .version = "9.7", .arch = .x86_64 },
+            .{ .name = "rocky-x86-kernel", .kind = .kernel, .path = "install/rocky-x86/vmlinuz", .distro = "rocky", .version = "9.7", .arch = .x86_64 },
+            .{ .name = "rocky-x86-initrd", .kind = .installer_initrd, .path = "install/rocky-x86/initrd.img", .distro = "rocky", .version = "9.7", .arch = .x86_64 },
+        },
+        .install_sources = &.{.{
+            .name = "rocky-x86-source",
+            .distro = "rocky",
+            .version = "9.7",
+            .arch = .x86_64,
+            .source_asset = "rocky-x86-iso",
+            .installer_kernel = "rocky-x86-kernel",
+            .installer_initrd = "rocky-x86-initrd",
+        }},
     };
     try validate(&config, &catalog);
 }

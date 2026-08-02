@@ -1,6 +1,6 @@
-# NodeForge v0.3 设计：install-post canonical 扩展与 adapter capability matrix
+# NodeForge v0.3 设计：install-post canonical 扩展
 
-状态：设计冻结，实现未开始。本文定义 v0.3 范围，与
+状态：已实现，并于 2026-08-02 完成 fresh 双机发布闸。本文定义 v0.3 范围，与
 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §2 版本表一致。
 v0.3 在 v0.2.3 完成（[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §10
 完成标准）后启动。跨版本顺序见
@@ -11,24 +11,83 @@ v0.3 在 v0.2.3 完成（[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROF
 BIOS x86 PXELINUX 已从本版本剥离，独立设计见
 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
 
+## 发布结论
+
+**结论：v0.3 install-post canonical 能力在当前 aarch64 双机环境中 PASS，可以按本文
+边界发布。**
+
+该结论由三类证据共同支撑：Zig/CLI/HTTP/setup 自动化；Rocky 9.7 install-post
+generation 3 真实 PXE E2E；Rocky 9.7、Rocky 10.2、Ubuntu 的两项 install 与三项
+diskless VMware 矩阵。完整命令、摘要、journal 和 Compute Use 操作边界见
+[`../validation/V0_3_VALIDATION.md`](../validation/V0_3_VALIDATION.md)。
+
+发布结论只覆盖本文范围，不代表 BIOS PXELINUX、多 NIC/VLAN/bonding、规模容量或其他
+未执行平台已经验证。旧 `repository`/`standard_packages` 被拒绝是预期产品结论，
+不是待补兼容项。
+
+## 前置裁决：冲突、实施前提与明确禁止
+
+本节优先级高于本文其他章节以及历史审计中与其冲突的表述。
+
+### 冲突裁决
+
+1. **不迁移旧语义**：v0.3 只按最新 canonical 设计实施，不兼容 v0.2.x
+   install-post 的 `repository`/`standard_packages` action，不提供读取兼容、自动转换、
+   手工迁移工具或双写期。测试 catalog/bundle 按 v0.3 设计重新创建。
+2. **schema 版本只表达持久化 shape**：install-post action 仍使用 catalog v5 已有的
+   `ProvisionAction` shape，因此 catalog schema 保持 v5。同一 schema 号不承诺不同
+   NodeForge 产品版本之间继续接受已经退出的旧语义。
+3. **callback 复用现有启动凭据**：install-post 不新建 per-generation raw token、
+   credential capsule 或 claim 协议。安装器复用当前 BootSession callback credential；
+   服务端在 `installer.started` 后把该 session 固定到当前 install generation。认证归
+   BootSession，journal/status/completion 归 install generation，两者不得混为一个状态主键。
+4. **archive 先检查、后解压**：运行期先以 `tar -tf` 读取顶层条目，判定是否存在
+   `install.sh`/`./install.sh`，再选择执行或直接解压。不得为了判定模式先解压 archive。
+5. **统一术语**：`managed_file -> package -> archive -> script` 称为“四类 action
+   固定顺序”；“八步执行契约”只指 pin/validate、materialize、四类 action、finalizer、
+   publish 的执行生命周期，不再把 CRUD/plan/apply/status 称为另一套八步。
+
+### 实施前提
+
+- 使用受信管理域内由操作员导入的本地 Asset；v0.3 不把 archive/callback 设计成面向
+  多租户或不可信公网的通用上传、任务执行平台。
+- BootSession callback credential 已能完成现有 installer 事件认证，并能在 daemon
+  restart 后按现有规则继续验证；若现有 session 无法恢复，本次安装确定失败并由新
+  generation 重装，不为 v0.3 另建 token 恢复协议。
+- `installer.started` 是 session 固定到 armed install generation 的唯一时点；固定后
+  Node、generation、plan digest 不得改绑。
+- archive Asset 在导入时完成 tar 可读性、绝对路径和 `..` 路径组件检查并固定 SHA-256；
+  runner 只执行已发布且 digest 匹配的 Asset。
+
+### 明确禁止
+
+- 禁止 legacy action 的兼容读取、隐式转换、运行时 fallback 或迁移命令。
+- 禁止新增 generation credential capsule、一次性 claim endpoint、raw token 注入
+  installer initrd、capsule delivery started/completed 状态和对应 recovery 分支。
+- 禁止仅凭请求 body 中的 `node_id`/`generation` 推进状态；必须由已认证 BootSession
+  和服务端固定关联得到 Node/generation。
+- 禁止用 BootSession id 作为 install-post journal 主键，或把 install generation
+  状态回写成 diskless BootSession journal。
+- 禁止 archive 为判断 `install.sh` 而预解压，禁止子目录 `install.sh` 自动执行，
+  禁止为 archive 恢复 `destination` 字段。
+
 ## 0. 设计动机与代码基线
 
-v0.2.3 完成后，install-post phase 在代码中只支持三种受限动作
+v0.2.3 完成时，install-post phase 在代码中只支持三种受限动作
 （`repository`、`standard_packages`、`managed_file`），而 rootfs-build/first-boot
 已经使用四类 canonical action（`managed_file`/`archive`/`script`/`package`）。
 install-post 的能力缺口是当前最大的实现差异：
 
-| 维度 | rootfs-build / first-boot（v0.2 已实现） | install-post（当前代码） |
+| 维度 | rootfs-build / first-boot（v0.2 已实现） | install-post（v0.3 前基线） |
 |---|---|---|
 | 支持动作 | `managed_file`/`archive`/`script`/`package` | `repository`/`standard_packages`/`managed_file` |
 | 执行契约 | 八步固定顺序 + 隔离执行 | 声明顺序，无隔离 |
-| callback credential | per-session scoped token | 简单 bearer token，无 generation 绑定 |
+| callback credential | per-session scoped token | 复用 BootSession bearer token，尚未固定到 install generation |
 | journal/status | `(boot_session_id, step_id)` journal | 无结构化 journal |
 | 错误恢复 | retryable step 自动重试 + failure budget | 无自动重试 |
 
 v0.3 关闭这组差异：把 install-post 从受限形态升级为完整 canonical phase，
-与 rootfs-build/first-boot 统一执行模型，并补齐 callback credential 和
-adapter capability matrix。
+与 rootfs-build/first-boot 统一执行模型，并补齐 callback generation 绑定。
 
 **不引入 catalog schema 变更**：`firmware.mode` 随 BIOS 一起延后
 （见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）；
@@ -53,15 +112,14 @@ v0.3 必须基于 v0.2.1/v0.2.2/v0.2.3 完成：
 
 ## 2. 范围
 
-v0.3 聚焦 **install-post canonical 扩展与发行版版本矩阵**：
+v0.3 聚焦 **install-post canonical 扩展**：
 
 | 项 | v0.3 范围 | 说明 |
 |---|---|---|
 | install-post 四类 canonical action | 是 | 扩展 `renderInstallPost` 接受 `managed_file`/`archive`/`script`/`package` |
-| 旧受限 action 退出 | 是 | `repository`/`standard_packages` 按迁移表退出，不新增同义 action |
-| install-post callback credential | 是 | per-generation credential capsule，hash-only 恢复 |
-| install-post journal/status | 是 | `(node_id, install_generation, bundle_revision, plan_digest, step_id)` 标识 |
-| 发行版版本矩阵 | 是 | Rocky/RHEL 系与 Ubuntu LTS 的显式 adapter capability matrix |
+| 旧受限 action 退出 | 是 | `repository`/`standard_packages` 直接退出，不迁移、不兼容、不新增同义 action |
+| install-post callback credential | 是 | 复用 BootSession credential，固定到 install generation；不新增 token/capsule |
+| install-post journal/status | 是 | `(node_id, install_generation, bundle_revision, plan_digest, step_id, attempt)` 标识 |
 | 错误分类与长期运行回归 | 是 | bootloader/版本差异/错误分类 |
 
 v0.3 **不**包含：BIOS PXELINUX（独立延后，见
@@ -116,24 +174,36 @@ v0.3 将 install-post 扩展为与 rootfs-build/first-boot 一致的完整 canon
 | `script` | 安装目标根 `/` | 受管脚本 asset，在安装目标根执行 |
 | `package` | 安装目标根 `/` | 只引用 pinned effective software/capability，经本地 repository 解析校验、幂等 |
 
-**八步执行契约**（固定顺序，与 rootfs-build/first-boot 一致）：
+**四类 action 固定执行顺序**（与 rootfs-build/first-boot 一致）：
 
 ```text
 文件更新(managed_file) -> package -> archive -> script
 ```
 
+**八步执行生命周期**（跳过无对应 action 的步骤，但不得重排）：
+
+1. pin 并校验 target root、effective、bundle revision、plan digest 与凭据/session 边界；
+2. 物化并校验已发布的本地 repository 和输入 Asset；
+3. 原子执行 `managed_file`；
+4. 执行 `package`；
+5. 校验并执行 `archive`；
+6. 按 bundle 声明顺序执行 `script`；
+7. 运行 TargetSystem finalizer；
+8. 原子发布 journal/status/audit，并在全部成功后推进 `install.completed`。
+
 action 可修改安装目标根的 users/SSH/hosts/系统文件；credential/session 越权在
 plan/validate 阶段拒绝，不能用 `--force` 绕过；finalizer 末尾重新断言 effective
 顺序与离线策略。
 
-**旧 action 退出**：
+**旧 action 直接退出**：
 
-| 旧 action | 替代 | 迁移边界 |
+| 旧 action | 最新设计中的表达 | v0.3 行为 |
 |---|---|---|
-| `repository` | `package` action 引用 pinned effective repository | 旧 bundle 中的 `repository` step 在 v0.3 validator 报错 `install_post.legacy_action_deprecated` |
-| `standard_packages` | `package` action 引用 pinned effective software | 同上 |
+| `repository` | `package` action 引用 pinned effective repository | parser/validator 拒绝 `provision.action_unsupported` |
+| `standard_packages` | `package` action 引用 pinned effective software | parser/validator 拒绝 `provision.action_unsupported` |
 
-不新增同义 action。迁移是操作员手动修改 bundle 定义，不提供自动迁移脚本。
+不新增同义 action，不兼容读取，不提供迁移脚本或迁移提示；v0.3 bundle 按最新设计
+重新创建。
 
 **Profile 引用**：`install.post_install.bundle`（与 diskless 的
 `diskless.provision.bundle` 对应，已在 `src/model.zig` `PostInstallConfig` 中存在）。
@@ -146,39 +216,102 @@ plan/validate 阶段拒绝，不能用 `--force` 绕过；finalizer 末尾重新
 - v0.3 不提供远程 step retry；重新执行必须由新的 install generation 完整重装，
   不能在已安装目标上远程补跑。
 - install-post journal/status 以 `(node_id, install_generation, bundle_revision,
-  plan_digest, step_id)` 标识，不能复用 diskless `boot_session_id` 假装安装器执行
+  plan_digest, step_id, attempt)` 标识，不能复用 diskless `boot_session_id` 假装安装器执行
   属于 BootSession。
 
-### 4.4 install-post callback credential
+#### 4.3.1 InstallPostRun 状态机
 
-install renderer 复用该 generation 的 append-only callback credential 上报
-step/finalizer 状态。
+每个 `(node_id, install_generation)` 只能有一个 `InstallPostRun`，创建后固定
+`bundle_revision` 和 `plan_digest`：
+
+```text
+pending
+  └─ installer.started + session/generation/plan 固定成功 → running
+       ├─ 任一步重试耗尽或 finalizer 失败              → failed
+       ├─ session 不可恢复/超时                          → recovery_incomplete
+       └─ 全部 step succeeded + finalizer succeeded      → completed
+```
+
+`completed|failed|recovery_incomplete` 为终态，不允许倒退或相互转换。重新安装必须创建新
+install generation 和新的 `InstallPostRun`；禁止复用旧 run、清空失败记录后续跑或远程
+补跑。`pending` 尚未收到经过认证的 `installer.started` 时不得创建 step journal。
+
+#### 4.3.2 step/attempt 状态
+
+每个 canonical step 的状态为：
+
+```text
+pending → running → succeeded
+                 └→ failed_retryable → running（attempt + 1）
+                 └→ failed_terminal
+```
+
+- 非 retryable step 只允许 `attempt=1`；失败直接 `failed_terminal`。
+- retryable step 从 `attempt=1` 开始，只能递增 1，不接受跳号；最大次数来自固定 plan。
+- 同一 attempt 的完全相同事件幂等成功；重复 `started`/`succeeded` 不重复写审计副作用。
+- 已 `succeeded` 的 step 不得回到 running/failed；较旧 attempt 不推进状态。
+- 当前 step 未成功前，不接受固定 action 顺序中的后续 step；同一 action 内按 bundle
+  声明顺序执行，不允许并发或越序。
+- 任一步进入 `failed_terminal` 后，run 原子进入 `failed`，后续 step/finalizer 事件不推进。
+
+#### 4.3.3 finalizer 与完成原子性
+
+finalizer 是 run 级步骤，不使用普通 bundle `step_id`，固定标识为 `@finalizer`。只有
+全部 canonical step succeeded 后才能开始。服务端处理 finalizer success 时，必须在同一
+持久化事务/CAS 中完成：
+
+1. 验证 run 仍为 `running` 且 generation/plan 未变化；
+2. 写入 finalizer succeeded journal；
+3. 把 `InstallPostRun` 置为 `completed`；
+4. 把 install generation 置为 `install.completed`；
+5. 在同一完成记录中保存生成 audit/event 所需的稳定事实。
+
+不得出现 run completed 但 generation 未完成，或 generation completed 但 finalizer journal
+未持久化的可观察状态。事务提交前 daemon 崩溃视为未提交，重复 callback 按同一幂等键
+安全重放；提交后重复 callback 返回当前 completed 结果。外部 Event 在提交后由完成记录
+幂等派生，不参与状态原子性，也不能反向推进 generation。
+
+#### 4.3.4 callback 状态推进结果
+
+callback 使用统一结果，不让 adapter 根据 HTTP 文本猜测：
+
+| 场景 | HTTP | reason | 是否推进 |
+|---|---:|---|---|
+| 首次合法事件 | 200 | `postprocess.event_applied` | 是 |
+| 完全相同的重复事件 | 200 | `postprocess.event_duplicate` | 否，幂等成功 |
+| attempt 小于当前值 | 200 | `postprocess.event_stale` | 否 |
+| attempt 跳号/step 越序/状态倒退 | 409 | `postprocess.transition_invalid` | 否 |
+| generation/plan 不匹配 | 409 | `postprocess.run_mismatch` | 否 |
+| run 已终态且事件不等同于已提交事实 | 409 | `postprocess.run_terminal` | 否 |
+| credential 无效或 session 未固定 | 401/403 | `postprocess.unauthorized` | 否 |
+| 持久化失败 | 503 | `postprocess.persist_failed` | 否，installer 可重试同一事件 |
+
+认证失败不得创建、修改或消耗任何 run/step attempt；错误响应不得回显 bearer token。
+
+### 4.4 install-post callback credential 与 generation 绑定
+
+install renderer 复用本次 PXE BootSession 已有的 callback credential 上报
+step/finalizer 状态；v0.3 不签发第二种 raw token。
 
 **当前状态**：`src/profile/adapter/kickstart.zig` 和 `ubuntu.zig` 的 `%post`/`late-commands`
-中直接嵌入 bearer token + session id 的 `curl` 命令。token 与 BootSession 绑定，
-不与 install generation 绑定。
+中直接嵌入 bearer token + session id 的 `curl` 命令。token 已与 BootSession 绑定，
+缺口只是服务端尚未把经过认证的 session 固定关联到 install generation journal。
 
 **v0.3 变更**：
 
-- raw token 在 generation 创建时生成，通过随 installer initrd 加载的
-  per-generation credential capsule 交付到
-  `/run/nodeforge/credentials/install-callback.token`（0400）。
-- token 不进入 kernel cmdline、catalog、公开渲染模板或日志；服务端只保存不可逆 hash。
-- credential 绑定 `node_id/install_generation/plan_digest/audience/method/path/expiry`，
-  并按单调 `event_seq` 去重。
-- 它不能读取 catalog、触发 retry 或升级为 management credential。
-- generation 终态/超时后立即撤销。
-- daemon restart 后用持久 hash 继续验证，不能为同一 generation 静默生成第二个
-  并行有效 token。
-- `node_id + install_generation` 只是关联键，不能单独作为认证证明。
+1. `installer.started` 使用现有 BootSession credential 认证；服务端校验 session 的
+   Node、mode 和当前 armed generation 后，原子固定
+   `(boot_session_id, node_id, install_generation, plan_digest)`。
+2. 后续 callback 继续使用同一 credential。服务端从固定关联取得 Node/generation，
+   不信任请求 body 自报的身份字段。
+3. journal 以 `(node_id, install_generation, plan_digest, step_id, attempt)` 幂等；
+   完全相同的重复事件返回成功，旧 attempt 或会令成功状态倒退的事件不推进状态。
+4. credential 仅允许 installer event/postprocess callback，不能读取 catalog、触发远程
+   retry 或升级为 management credential；generation 终态或 session 超时后失效。
+5. daemon restart 复用现有 BootSession credential 恢复规则。现有 session 无法恢复时，
+   当前 generation 确定失败，下一次安装创建新 generation；不增加 capsule 特殊恢复。
 
-**capsule 恢复边界**：
-
-raw capsule token 只驻内存：restart-resume 只保证 installer 已完整取得 token 后的
-callback 阶段。capsule 尚未开始或传输中重启且 installer 未取得完整 token 时，本
-generation attempt 标 `generation.recovery_incomplete`，不得由 hash 重建 token；
-下一次安装启动创建新 generation。持久化 capsule delivery started/completed 只用于
-审计和错误分类。
+请求中的 `node_id + install_generation` 只可用于一致性核对，不能单独作为认证证明。
 
 ### 4.5 执行上下文差异
 
@@ -195,7 +328,7 @@ install-post 由安装器在安装期执行，**无 agent**：
 - 复用 v0.1 已有最小 install-post provision bundle（managed-file asset 驱动），
   **不改变其 Assets owner**。
 - v0.3 将既有 phase 扩展为完整四类 action；旧 `repository`/`standard_packages`
-  按迁移表退出。
+  直接退出，不迁移、不兼容。
 
 ### 4.6 archive action 详细设计
 
@@ -207,23 +340,27 @@ script 总是跑脚本、package 总是装包。但 archive 需要在运行时**
 决定是"直接解压"还是"解压后执行脚本"**。
 
 这个判定规则已在 v0.2 设计中冻结（[`V0_2_DESIGN.md`](V0_2_DESIGN.md) §5.4），
-rootfs-build 和 first-boot 已按此规则实现。v0.3 的 install-post 必须遵循完全相同的
-规则，不能为 install-post 新建第二套判定逻辑。
+但 rootfs-build 和 first-boot 当前只实现模式 B。v0.3 必须补齐共享判定逻辑，不能为
+install-post 新建第二套规则。
 
 #### 4.6.2 判定规则
 
-archive action 读取 tar 归档后，按以下规则判定执行模式：
+archive action 先用 `tar -tf` 读取条目列表，不解压；规范化可选的单个 `./` 前缀后，
+按以下规则判定执行模式：
 
 ```text
 读取 tar 顶层条目列表
-├── 顶层存在 ./install.sh  →  模式 A：解压到临时目录 + 执行 ./install.sh
+├── 顶层存在 install.sh 或 ./install.sh  →  模式 A：解压到临时目录 + 执行 sh ./install.sh
 └── 顶层不存在 ./install.sh  →  模式 B：直接解压到目标根 /
 ```
+
+`app/install.sh`、`scripts/install.sh` 等子目录脚本不触发模式 A；不得通过路径规范化把
+含 `..` 的条目提升为顶层 `install.sh`。
 
 **模式 A：解压 + 执行（`./install.sh` 存在）**
 
 1. 把 tar 解压到一个临时目录（如 `/tmp/.nodeforge-archive-<step_id>`）；
-2. 以该临时目录为工作目录执行 `./install.sh`；
+2. 以该临时目录为工作目录执行 `sh ./install.sh`，不依赖 executable bit；
 3. `install.sh` 退出码 0 视为成功，非 0 视为失败；
 4. 执行完成后删除临时目录。
 
@@ -272,7 +409,7 @@ install-post 由安装器执行（Kickstart `%post` / Autoinstall `late-commands
 TMPDIR=$(mktemp -d /tmp/.nodeforge-arc-XXXXXX)
 tar -xf <archive_source> -C "$TMPDIR"
 # 执行 install.sh
-( cd "$TMPDIR" && ./install.sh )
+( cd "$TMPDIR" && sh ./install.sh )
 RC=$?
 # 清理
 rm -rf "$TMPDIR"
@@ -285,52 +422,55 @@ exit $RC
 tar -xf <archive_source> -C /
 ```
 
-由于 shell 渲染期（`renderInstallPost`）无法读取 tar 内容，判定必须在运行时
-（安装器执行 `%post` 时）完成。因此实际渲染的是一段**运行时自判定脚本**：
+由于 shell 渲染期（`renderInstallPost`）无法读取 tar 内容，判定必须在安装器执行
+`%post` 时完成。实际脚本必须先列表判定，再执行对应模式：
 
 ```bash
-TMPDIR=$(mktemp -d /tmp/.nodeforge-arc-XXXXXX)
-tar -xf <archive_source> -C "$TMPDIR"
-if [ -f "$TMPDIR/install.sh" ]; then
-  ( cd "$TMPDIR" && ./install.sh )
-  RC=$?
+ARCHIVE=<archive_source>
+ENTRIES=$(tar -tf "$ARCHIVE") || exit 1
+if printf '%s\n' "$ENTRIES" | sed 's#^\./##' | grep -Fxq 'install.sh'; then
+  TMPDIR=$(mktemp -d /tmp/.nodeforge-arc-XXXXXX) || exit 1
+  trap 'rm -rf "$TMPDIR"' EXIT
+  tar -xf "$ARCHIVE" -C "$TMPDIR" || exit 1
+  ( cd "$TMPDIR" && sh ./install.sh )
 else
-  # 没有 install.sh，把内容移到目标根
-  tar -cf - -C "$TMPDIR" . | tar -xf - -C /
-  RC=$?
+  tar -xf "$ARCHIVE" -C /
 fi
-rm -rf "$TMPDIR"
-exit $RC
 ```
+
+实现可以不用 `sed|grep`，但必须保持相同语义：只去掉一个可选的 `./` 前缀、只接受
+精确顶层 `install.sh`，并且判定前不解压。模式 B 直接解压原 archive，禁止先解压后
+使用 `tar | tar` 二次搬运。
 
 #### 4.6.5 archive 来源
 
-archive 内容有两个来源，与 `managed_file` 一致：
+archive 只允许引用已发布的受管 Asset；表中同时明确禁止的 inline 形态：
 
 | 来源 | 字段 | 说明 |
 |---|---|---|
-| catalog asset | `content_asset` + `content_url` + `content_sha256` | 从 HTTP 下载已校验 tar 归档 |
-| inline content | `content` | 步骤内联 tar 字节，编码为 `printf %b` 八进制转义 |
+| catalog asset | `archive_asset`（plan 物化 `content_url` + `content_sha256`） | 从 HTTP 下载已校验 tar 归档 |
+| inline content | 不适用 | archive 必须先导入为受管 Asset，不在 bundle 内嵌 tar 字节 |
 
 install-post 上下文中：
 
 - **catalog asset 方式**：渲染为 `curl -fsS --output <tmpfile> <url> && sha256sum -c -`
   下载校验后再判定解压。与现有 `managed_file` 的 asset download 路径一致。
-- **inline content 方式**：渲染为 `printf '%b' '<bytes>' > <tmpfile>` 后再判定解压。
-  与现有 `managed_file` 的 inline content 路径一致。
+- **inline content**：禁止；避免把二进制 tar 编入安装模板，所有 archive 统一走
+  `archive_asset`。
 
 rootfs-build/first-boot 还支持第三种来源 `payload_path`（agent pre-init 已下载校验
 的本地路径），但 install-post **不使用 payload_path**——install-post 由安装器执行，
 没有 agent pre-init 阶段预下载 payload。asset 下载在安装器 `%post` 运行时通过 HTTP
 完成。
 
-#### 4.6.6 安全约束（build/运行期通用，继承 v0.2 §5.4）
+#### 4.6.6 受信 Asset 约束（build/运行期通用，继承 v0.2 §5.4）
 
-- archive 顶层仅允许单一 `./install.sh` 特例；不允许多个脚本、子目录中的脚本或
-  其他可执行文件自动执行。
-- tar 条目拒绝绝对路径（如 `/etc/passwd`）、`..` 路径组件、device 文件、FIFO 和
-  越界 symlink（指向目标根之外的路径）。
-- `install.sh` 以 `sh` 执行，退出码 0 且幂等；禁止隐式下载未声明内容。
+- archive 是受信管理域内由操作员导入的受管 Asset，不按不可信多租户上传物处理。
+- Asset import 必须验证 tar 可读取，拒绝绝对路径和 `..` 路径组件，并保存 SHA-256；
+  runner 下载后必须核对同一 digest。
+- archive 顶层只识别精确 `install.sh`/`./install.sh`；子目录脚本和其他可执行文件不
+  自动执行。
+- `install.sh` 以 `sh` 执行，退出码 0 且由操作者保证幂等；禁止隐式下载未声明内容。
 - manifest 只声明 SHA-256（由 asset 提供），不设 `script|extract` 策略、`target_root`、
   `install --root` 参数或 `NODEFORGE_TARGET_ROOT` 环境变量。
 - archive 没有 `destination` 字段——目标根由执行上下文决定（install-post 为安装
@@ -347,63 +487,20 @@ rootfs-build/first-boot 还支持第三种来源 `payload_path`（agent pre-init
 | 模式 A（`./install.sh` 存在） | 解压到临时目录 + 执行 | 同左 | 同左 |
 | 模式 B（`./install.sh` 不存在） | 解压到目标根 `/` | 解压到 staging `/` | 解压到 overlay upper `/` |
 | 来源：catalog asset | `curl + sha256sum -c` | payload_path（已物化） | payload_path（pre-init 已下载） |
-| 来源：inline content | `printf %b` | `printf %b` | `printf %b` |
+| 来源：inline content | 禁止 | 禁止 | 禁止 |
 | 来源：payload_path | **不适用**（无 agent pre-init） | chroot 内 payload 路径 | `/var/lib/nodeforge/payload/` |
 | `destination` 字段 | 禁止 | 禁止 | 禁止 |
-| 安全约束 | §4.6.6 | 同左 | 同左 |
+| 受信 Asset 约束 | §4.6.6 | 同左 | 同左 |
 
 v0.3 实施时需要：
 
 1. 在 `renderInstallPost` 中新增 `.archive` 分支，渲染运行时自判定脚本；
 2. 在 `first_boot.zig` 的 `renderStep` `.archive` 分支中补齐模式 A 逻辑；
 3. rootfs-build 复用 `first_boot.renderStep`，自动获得模式 A；
-4. 三个 phase 的安全约束统一由 validator 在 plan/validate 阶段强制。
+4. 三个 phase 共用“digest 校验 -> `tar -tf` 判定 -> 模式 A/B”逻辑；Asset import
+   统一完成 tar 可读性和基本路径检查。
 
-## 5. 发行版版本矩阵
-
-### 5.1 当前实现状态
-
-`src/profile/capabilities.zig` 已有一个静态 adapter capability registry，
-按 domain 列出 Kickstart/Autoinstall 的 `native`/`translated`/`not_applicable`/
-`unsupported` 状态。`src/catalog/software_index.zig` 索引
-`environment`/`group`/`task`/`metapackage`/`package` 五种 software kind。
-
-但缺少**显式的 `(distro, version, arch)` capability matrix**——即声明每个
-发行版版本支持哪些 storage mode、software kind、bootloader 与 firmware。
-
-### 5.2 目标模型
-
-- Rocky/RHEL 系与 Ubuntu 后续 LTS 的显式 adapter capability matrix：声明每个
-  `(distro, version, arch)` 支持的 storage mode、software kind
-  （environment/group/task/metapackage/package）、bootloader 与 firmware。
-- bootloader、发行版版本差异、错误分类与长期运行回归。
-- 对当前 adapter 不适用的 kind 返回 `software.kind_not_applicable` 并列出
-  `supported_kinds`，不能返回易误判的空列表。
-- adapter 不能在配置路径不存在或不适用时猜测，也不能实现运行时 fallback。
-
-### 5.3 capability matrix 结构
-
-```text
-AdapterCapabilityMatrix = struct {
-    entries: []const AdapterCapabilityEntry,
-}
-
-AdapterCapabilityEntry = struct {
-    distro: []const u8,          // "rocky", "ubuntu", "rhel", ...
-    version: []const u8,         // "9.7", "22.04", ...
-    arch: Arch,                  // x86_64, aarch64
-    adapter: InstallAdapter,     // kickstart, autoinstall
-    storage_modes: []const StorageMode,     // 支持的存储拓扑
-    software_kinds: []const SoftwareKind,   // 支持的 software kind
-    bootloader: []const BootloaderSupport,  // 支持的 bootloader
-    firmware: []const FirmwareMode,         // 支持的固件模式（当前仅 uefi）
-}
-```
-
-当前 `firmware` 只含 `uefi`；`bios` 在 BIOS PXELINUX 独立工作项落地后补充
-（见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）。
-
-## 6. CLI（v0.3）
+## 5. CLI（v0.3）
 
 > 完整 CLI 约定见 [`V0_2_CLI.md`](V0_2_CLI.md) §0；本节给 v0.3 新增。
 
@@ -416,29 +513,27 @@ nodeforge assets provision-bundle item add <bundle> steps \
   id=<id> phase=install-post action=package packages=tmux,nmap \
   idempotency_key=pkgs timeout_s=600 retryable=true
 nodeforge assets provision-bundle item add <bundle> steps \
-  id=<id> phase=install-post action=archive content_asset=<app-archive> destination=/opt/app
+  id=<id> phase=install-post action=archive archive_asset=<app-archive> \
+  idempotency_key=app-archive timeout_s=120 retryable=false
 nodeforge assets provision-bundle item add <bundle> steps \
-  id=<id> phase=install-post action=script content_asset=<setup-script> timeout_s=120
+  id=<id> phase=install-post action=script script_asset=<setup-script> interpreter=sh \
+  idempotency_key=setup timeout_s=120 retryable=false
 nodeforge node postprocess show <node> --phase install-post [--generation <id>]
-nodeforge assets adapter-matrix list
-nodeforge assets adapter-matrix show <distro> <version> <arch>
 ```
 
 - `profile set ... install.post_install.bundle` 与 provision-bundle owner 沿用 v0.2
-  现有入口；v0.3 新增的是 canonical action 接受范围、generation status/callback 和
-  adapter matrix 命令。
+  现有入口；v0.3 新增的是 canonical action 接受范围和 generation status/callback。
 - `postprocess` 统一命名（同 v0.2）：install 侧的 install-post phase 也用
   `node postprocess show` 查询，不用 `postinstall`，避免与 diskless 命名分叉。
   省略 `--generation` 时查询最近一个 install generation；无历史时返回空结果 exit 0。
   `--session` 只适用于 diskless first-boot，不能和 `--generation` 混用。
-- `adapter-matrix` 是只读查询命令，列出/显示显式 capability matrix。
 - `install-post` phase token 在 schema v4/parser 中已经存在，且兼容 runner 支持
-  `repository`、`standard-packages` 与 `managed-file` 子集；v0.3 才接受
-  `archive`/`script`/`package` 等 canonical 新形态，同时给旧形态明确迁移与拒绝边界。
+  `repository`、`standard-packages` 与 `managed-file` 子集；v0.3 只接受四类 canonical
+  action，旧形态直接拒绝且不提供迁移/兼容路径。
 - v0.3 不提供多 NIC/VLAN/bonding、容量压测、install 侧 agent 的 CLI
   （属 v0.4/永久非目标）。
 
-## 7. 明确非目标（v0.3 增量）
+## 6. 明确非目标（v0.3 增量）
 
 - BIOS/PXELINUX -> 独立延后文档
   [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)，不绑定产品版本号，最早在 v0.5 后实施。
@@ -450,7 +545,7 @@ nodeforge assets adapter-matrix show <distro> <version> <arch>
 - IPv6、by-id/serial/WWN -> 永久非目标（继承 v0.1）。
 - v0.3 不提供 v0.4/v0.5 命令的 help/handler；预留 enum 不算实现。
 
-## 8. 实施批次
+## 7. 实施批次
 
 ### Batch 1：install-post runner 扩展
 
@@ -458,71 +553,58 @@ nodeforge assets adapter-matrix show <distro> <version> <arch>
 `src/config/validate.zig`、相关测试。
 
 - 扩展 `renderInstallPost` 接受 `archive`/`script`/`package` 三类 canonical action；
-- 八步执行契约排序（文件更新 -> package -> archive -> script）；
+- 八步执行生命周期与四类 action 固定顺序；
 - `package` action 只引用 pinned effective software/capability，经本地 repository
   解析校验、幂等；
 - `archive` 规则与 v0.2 §5.4 一致：运行时自判定 `./install.sh` 存在则解压到临时
   目录执行（模式 A），否则直接解压到目标根（模式 B），详见 §4.6；
 - **补齐** `first_boot.zig` `renderStep` `.archive` 分支的模式 A 逻辑，使
   rootfs-build/first-boot 与 install-post 行为一致；
-- 旧 `repository`/`standard_packages` 在 validator 报错
-  `install_post.legacy_action_deprecated`；
+- 旧 `repository`/`standard_packages` 在 parser/validator 报错
+  `provision.action_unsupported`，不提供迁移分支；
 - aarch64 UEFI install 回归不退化。
 
-### Batch 2：install-post callback credential
+### Batch 2：install-post callback 与 journal
 
 **涉及文件**：`src/profile/adapter/kickstart.zig`、`src/profile/adapter/ubuntu.zig`、
-`src/state/`（新增 generation credential 模块）、`src/http/server.zig`。
+`src/state/`（新增 install-post journal）、`src/http/server.zig`、`src/main.zig`。
 
-- per-generation credential capsule（0400，`/run/nodeforge/credentials/install-callback.token`）；
-- hash-only 恢复边界；
-- `node_id/install_generation/plan_digest/audience/method/path/expiry` 绑定；
-- 单调 `event_seq` 去重；
-- generation 终态/超时撤销；
-- daemon restart hash 验证恢复；
-- capsule 交付前/中 `recovery_incomplete` 负测。
-
-### Batch 3：install-post journal/status
-
-**涉及文件**：`src/state/`（新增 install-post journal 模块）、`src/http/server.zig`、
-`src/main.zig`。
-
-- `(node_id, install_generation, bundle_revision, plan_digest, step_id)` 标识；
+- 复用现有 BootSession callback credential，不新增 token/capsule/claim endpoint；
+- `installer.started` 原子固定 session 到 Node/generation/plan；
+- `(node_id, install_generation, bundle_revision, plan_digest, step_id, attempt)` 标识；
+- 实现 `pending -> running -> committing -> completed` 成功状态机、
+  `failed|recovery_incomplete` 失败分支和 step attempt 状态机；
+- 相同事件幂等，attempt 跳号、step 越序、旧 attempt、成功状态倒退和 terminal
+  generation 后事件按 §4.3.4 返回稳定结果；
 - step/finalizer 状态上报与持久化；
+- finalizer 成功先持久化 `committing` WAL，再提交 deployment generation，最后发布
+  journal completed；daemon 启动时按同一顺序恢复中断事务；
 - `node postprocess show --phase install-post [--generation <id>]` 查询；
 - 同次安装自动 step retry；耗尽后阻止 `install.completed`；
-- 不存在远程 step retry。
+- 不存在远程 step retry；daemon restart 只复用现有 session 恢复能力。
 
-### Batch 4：adapter capability matrix
-
-**涉及文件**：`src/profile/capabilities.zig`、`src/profile/adapter/`、`src/catalog/`、
-`src/main.zig`。
-
-- 显式 `(distro, version, arch)` capability matrix；
-- `software.kind_not_applicable` + `supported_kinds` 返回；
-- `assets adapter-matrix list/show` CLI；
-- adapter 不猜测、不运行时 fallback。
-
-### Batch 5：CLI + 文档 + 全量回归
+### Batch 3：CLI + 文档 + 全量回归
 
 - 文档：更新路线图状态、当前实现审计、CLI reference、`V0_2_CLI.md`、本设计实现状态；
 - schema fixture、state/DTO fixture；
 - aarch64 UEFI install/diskless 全量回归。
 
-## 9. 完成标准
+## 8. 完成标准
 
 - install-post phase 在同一 Assets owner 上实现四类 action、八步契约、
   credential/session 边界/finalizer、plan/status、同次安装自动 step retry；
   耗尽后阻止 `install.completed`，且不存在远程 step retry。
-  `standard_packages`/`repository` 已退出（validator 拒绝 + 迁移提示）。
-- install-post callback credential 的 capsule 权限/泄漏检查、generation/plan 绑定、
-  重放、过期、跨 Node 越权与 daemon restart-resume 负向测试通过；测试必须区分
-  capsule 交付前/中 `recovery_incomplete` 与 token 已交付后的 hash 验证恢复；
-  未经认证的 node/generation 事件不能推进 deployment。
-- 显式 adapter capability matrix 覆盖目标 Rocky/RHEL 与 Ubuntu LTS；不适用 kind
-  返回 `software.kind_not_applicable` + `supported_kinds`。
+  `standard_packages`/`repository` 已退出（parser/validator 直接拒绝，无迁移提示）。
+- install-post callback 复用 BootSession credential；session/generation/plan 固定、重复
+  callback 幂等、attempt 跳号、step 越序、旧 attempt、状态倒退、跨 Node、错误 plan、
+  终态后 callback、finalizer 原子提交失败注入与 daemon restart 负向测试通过；未经认证
+  或仅自报 node/generation 的事件不能推进 deployment。
 - `node list`/`node status` 对 install 与 diskless 统一投影，
   installer 进度仅在 `node_status` 保留。
 - aarch64 UEFI install 与 diskless 回归不退化。
 - catalog schema 保持 v5（无 schema 变更）。
 - 本审计与版本设计、配套文档同步更新；预留 enum/空 handler 不算实现证据。
+
+以上完成标准已由 2026-08-02 fresh 验证全部满足，最终判定为 **PASS**。后续修改若触及
+callback 认证、generation 绑定、runner 顺序、archive 校验、WAL 恢复或既有 diskless
+路径，必须重新执行 `zig build test` 和真实 `test-v0.3-install-post-e2e` 发布闸。

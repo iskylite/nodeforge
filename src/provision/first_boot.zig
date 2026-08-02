@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const dto = @import("../http/diskless_dto.zig");
+const runner = @import("runner.zig");
 
 const log_path = "/var/lib/nodeforge/firstboot.log";
 const journal_path = "/var/lib/nodeforge/firstboot-journal.json";
@@ -272,29 +273,28 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
             }
         },
         .archive => {
-            const dest = step.destination orelse "/";
-            try safeDest(dest);
+            // v0.3：archive 使用运行时模式 A/B 判定（tar -tf 检测 ./install.sh）。
+            // 模式 A：解压到临时目录 + 执行 sh ./install.sh；
+            // 模式 B：直接解压到目标根（first-boot 为 overlay upper /）。
+            // archive 没有 destination 字段——目标根由执行上下文决定。
+            // 三个 phase（install-post/rootfs-build/first-boot）共用 runner.renderArchiveModeDetection。
+            const dest = "/";
             if (step.payload_path) |relative| {
-                try w.writeAll("mkdir -p ");
-                try writeQuoted(w, dest);
-                try w.writeAll(" && tar -xf ");
-                try writePayloadPath(w, relative);
-                try w.writeAll(" -C ");
+                // payload_path：agent pre-init 已下载校验的本地路径。
+                // 渲染 payload 路径后直接进入模式 A/B 判定。
+                var buf: [256]u8 = undefined;
+                const quoted = try writePayloadPathBuf(&buf, relative);
+                try runner.renderArchiveModeDetection(w, quoted, dest);
             } else {
+                // inline content：写入临时文件后进入模式 A/B 判定。
                 try w.writeAll("printf '%b' '");
                 try writeBytes(w, step.content orelse "");
-                try w.writeAll("' > /tmp/.nodeforge-arc && mkdir -p ");
-                try writeQuoted(w, dest);
-                try w.writeAll(" && tar -xf /tmp/.nodeforge-arc -C ");
+                try w.writeAll("' > /tmp/.nodeforge-arc && ");
+                try runner.renderArchiveModeDetection(w, "/tmp/.nodeforge-arc", dest);
+                // 清理临时文件。模式 A/B 判定成功后才删除；
+                // 失败时退出码正确传播（&& 链）。
+                try w.writeAll(" && rm -f /tmp/.nodeforge-arc");
             }
-            try writeQuoted(w, dest);
-            // BUG 修复：原代码使用 ` ; rm -f /tmp/.nodeforge-arc`，分号使 rm 无条件执行
-            // 且其退出码（0）成为整条命令的最终退出码，掩盖了 tar 解压失败。
-            // 改为 `&& rm` 确保仅解压成功后才删除临时文件；解压失败时退出码正确传播，
-            // runShTimeout 才能检测到 SubprocessFailed 并计入 failures。
-            // 临时文件在失败时不会被清理，但 first-boot 在 tmpfs upper 中运行，
-            // 重启后自动清空，不存在持久泄漏风险。
-            if (step.payload_path == null) try w.writeAll(" && rm -f /tmp/.nodeforge-arc");
         },
         .script => {
             if (step.payload_path) |relative| {
@@ -321,6 +321,22 @@ fn writePayloadPath(w: *std.Io.Writer, relative: []const u8) !void {
     try w.writeAll("'/var/lib/nodeforge/payload/");
     for (relative) |c| if (c == '\'') try w.writeAll("'\\''") else try w.writeByte(c);
     try w.writeByte('\'');
+}
+
+/// 与 writePayloadPath 相同的验证逻辑，但写入 buffer 并返回切片。
+/// 用于需要将引号包裹的 payload 路径作为 shell 表达式传递给
+/// runner.renderArchiveModeDetection 的场景。
+fn writePayloadPathBuf(buf: []u8, relative: []const u8) ![]const u8 {
+    if (relative.len == 0 or relative[0] == '/' or std.mem.indexOfScalar(u8, relative, '%') != null)
+        return error.InvalidPayloadPath;
+    var parts = std.mem.splitScalar(u8, relative, '/');
+    while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, ".."))
+        return error.InvalidPayloadPath;
+    var writer = std.Io.Writer.fixed(buf);
+    try writer.writeAll("'/var/lib/nodeforge/payload/");
+    for (relative) |c| if (c == '\'') try writer.writeAll("'\\''") else try writer.writeByte(c);
+    try writer.writeByte('\'');
+    return writer.buffered();
 }
 
 fn safeDest(dest: []const u8) !void {
@@ -401,8 +417,18 @@ test "renderStep package confines apt to nodeforged sources" {
 test "renderStep archive and script render extraction/execution" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try renderStep(&out.writer, .{ .id = "a", .action = .archive, .content = "x", .destination = "/opt/app" }, null, &.{}, false, null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tar -xf /tmp/.nodeforge-arc -C '/opt/app'") != null);
+    // v0.3: archive 使用模式 A/B 判定，不再直接 tar -xf 到 destination。
+    // archive 没有 destination 字段，目标根固定为 /。
+    try renderStep(&out.writer, .{ .id = "a", .action = .archive, .content = "x" }, null, &.{}, false, null);
+    // 验证写入临时文件
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "> /tmp/.nodeforge-arc") != null);
+    // 验证模式 A/B 判定脚本
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tar -tf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "grep -Fxq 'install.sh'") != null);
+    // 验证模式 B 直接解压到 /（不再有 destination）
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tar -xf /tmp/.nodeforge-arc -C '/'") != null);
+    // 验证清理
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "rm -f /tmp/.nodeforge-arc") != null);
     out.deinit();
     out = .init(std.testing.allocator);
     try renderStep(&out.writer, .{ .id = "s", .action = .script, .content = "echo hi\n" }, null, &.{}, false, null);

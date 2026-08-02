@@ -351,17 +351,18 @@ manifest、event 或日志都不得包含 private key bytes。
 canonical `Phase` 枚举覆盖两条流：`install-post`（v0.3）/`rootfs-build`（v0.2）/`first-boot`（v0.2），
 **无 `runtime` phase**。八步顺序固定，任一步失败不得发布 succeeded：
 
-1. bundle CRUD / ordered item mutation。
-2. `plan` 预览（无副作用，安装包/改文件/脚本）。
-3. `apply` 需目标 revision。
-4. item schema 校验（tagged action 字段，parser 拒绝不适用字段）。
-5. atomic file replacement / archive 解压规则（[`V0_2_DESIGN.md`](V0_2_DESIGN.md) §5.4）。
-6. 执行（按 phase 执行者：rootfs-build=builder，first-boot=agent，install-post=installer）。
-7. `status` / `retry`（retry 只重跑明确 retryable 失败 step）。
-8. 事件 `provision.step.started/succeeded/warned/failed` + 幂等键 + 日志脱敏。
+1. pin 并校验 target root、effective、bundle revision、plan digest 与凭据/session 边界。
+2. 物化并校验已发布的本地 repository 和输入 Asset。
+3. 原子执行 `managed_file`。
+4. 执行 `package`。
+5. 校验并执行 `archive`。
+6. 按 bundle 声明顺序执行 `script`。
+7. 运行 TargetSystem finalizer。
+8. 原子发布 journal/status/audit；全部成功后才发布 succeeded。
 
 固定执行顺序：文件更新 -> package -> archive -> script。`repository`/`standard_packages` 旧 action
-按迁移表退出，不新增同义 action。
+直接退出，不兼容、不迁移、不新增同义 action。CRUD、`plan`、`apply`、`status`、`retry` 和事件是
+围绕执行生命周期的接口，不构成第二套“八步”。
 
 ## 9. node list 统一状态 schema（草案）
 

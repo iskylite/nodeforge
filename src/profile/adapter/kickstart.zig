@@ -144,6 +144,7 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     if (software.environment) |environment| try w.print("@^{s}\n", .{environment}) else try w.writeAll("@^minimal-environment\n");
     for (software.groups) |group| try w.print("@{s}\n", .{group});
     if (system.ssh.enabled) try w.writeAll("openssh-server\n");
+    if (bundleHasInstallPostArchive(bundle)) try w.writeAll("tar\n");
     for (software.packages.include) |package| try w.print("{s}\n", .{package});
     for (software.packages.exclude) |package| try w.print("-{s}\n", .{package});
     try w.writeAll("%end\n%post --erroronfail\n");
@@ -190,13 +191,23 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     }
     try renderHostsPost(w, system);
     if (bundle) |value| {
-        const script = try runner.renderInstallPost(allocator, value, .dnf);
+        const script = try runner.renderInstallPostInstrumented(allocator, value, .dnf, .{
+            .event_url = event_url,
+            .token = token,
+            .boot_session_id = session,
+        });
         defer allocator.free(script);
         try w.writeAll(script);
     }
     try w.print("curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"completed\"}}' {s} || true\n%end\n%onerror\nERRLOG=$(ls /tmp/anaconda-tb-*/anaconda-tb 2>/dev/null | head -1)\nSUMMARY=\"anaconda error\"\nif [ -n \"$ERRLOG\" ]; then\n  SUMMARY=\"anaconda error: $(head -c 1800 \"$ERRLOG\" 2>/dev/null | tr '\\n' ' ')\"\nfi\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' --data-urlencode 'v=1' --data-urlencode 'boot_session_id={s}' --data-urlencode 'reason=install.anaconda_error' --data-urlencode \"summary=$SUMMARY\" {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"failed\"}}' {s} || true\n%end\n", .{ token, session, session, event_url, token, session, session, event_url, token, session, session, log_url, token, session, session, event_url });
     try w.print("{s}\n", .{@tagName(install.completion.action)});
     return out.toOwnedSlice();
+}
+
+fn bundleHasInstallPostArchive(bundle: ?*const model.ProvisioningBundle) bool {
+    const value = bundle orelse return false;
+    for (value.steps) |step| if (step.phase == .install_post and step.action == .archive) return true;
+    return false;
 }
 
 fn renderHostsPost(w: *std.Io.Writer, system: model.TargetSystemConfig) !void {
@@ -473,4 +484,3 @@ test "M4.1 kickstart static target network uses Anaconda netmask syntax" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "timesource --ntp-server=ntp.nodeforge.local") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "server ntp.nodeforge.local iburst") != null);
 }
-

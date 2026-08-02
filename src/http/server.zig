@@ -51,6 +51,7 @@ const diskless_delivery = @import("../state/diskless_delivery.zig");
 const diskless_credential = @import("../state/diskless_credential.zig");
 const diskless_lifecycle = @import("../state/diskless_session.zig");
 const dhcp_store = @import("../state/dhcp_store.zig");
+const install_post_journal = @import("../state/install_post_journal.zig");
 const diskless = @import("../profile/diskless.zig");
 const diskless_dto = @import("diskless_dto.zig");
 const rootfs_build_executor = @import("../provision/rootfs_build_executor.zig");
@@ -229,6 +230,8 @@ const RouteContext = struct {
     rootfs_artifacts: *rootfs_artifact_store.Store,
     diskless_store: *diskless_delivery.Store,
     identities: *identity_store.Store,
+    /// v0.3: install-post journal store。记录 install-post 步骤执行状态。
+    install_post_journal: *install_post_journal.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     /// M4.2 F5：来自配置和状态目录的额外 SSH 公钥。
@@ -311,6 +314,7 @@ pub fn serve(
     rootfs_artifacts: *rootfs_artifact_store.Store,
     diskless_store: *diskless_delivery.Store,
     identities: *identity_store.Store,
+    install_post_journal_store: *install_post_journal.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     additional_keys: []const []const u8,
@@ -354,6 +358,7 @@ pub fn serve(
         .rootfs_artifacts = rootfs_artifacts,
         .diskless_store = diskless_store,
         .identities = identities,
+        .install_post_journal = install_post_journal_store,
         .config_revision = config_revision,
         .bootstrap_key = bootstrap_key,
         .additional_keys = additional_keys,
@@ -480,6 +485,8 @@ fn route(request: zap.Request) !void {
         // ── 静态制品路由 ──────────────────────────────────────
         if (assetRoute(path, "/artifacts/images/")) |name| return imageAsset(request, context, name, meta);
         if (managedFileRoute(path)) |managed| return managedFileAsset(request, context, managed.name, managed.revision, meta);
+        if (revisionedAssetRoute(path, "/artifacts/archives/")) |rev| return revisionedAsset(request, context, rev.name, rev.revision, .archive, meta);
+        if (revisionedAssetRoute(path, "/artifacts/scripts/")) |rev| return revisionedAsset(request, context, rev.name, rev.revision, .script, meta);
         if (artifactRepoRoute(path)) |repo| return repositoryAsset(request, context, repo.name, repo.tail, meta);
         if (artifactBootRoute(path)) |relative| return bootFile(request, context, relative, meta);
     }
@@ -534,6 +541,7 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/capabilities")) |name| return managementCapabilities(request, context, .profile, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/properties")) |name| return managementScalarMutation(request, context, .profile, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (installGenerationsPath(path)) |node_id| return installGenerations(request, context, node_id, meta);
+    if (std.mem.eql(u8, method, "GET")) if (installPostJournalPath(path)) |node_id| return managementInstallPostJournal(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/boot-prepare")) |node_id| return managementBootPrepare(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/readiness")) |node_id| return managementNodeReadiness(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/boot-preview")) |node_id| return managementNodeBootPreview(request, context, node_id, meta);
@@ -799,6 +807,28 @@ test "managed-file artifact path requires canonical name and positive revision" 
 fn managedFileAsset(request: zap.Request, context: *const RouteContext, name: []const u8, revision: u64, meta: RequestMeta) !void {
     const asset = lookup.findAsset(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
     if (asset.kind != .managed_file or asset.revision != revision or asset.sha256 == null) return notFound(request, meta);
+    return staticFile(request, context, paths.require().assets_dir, asset.path, asset.sha256, meta);
+}
+
+/// v0.3: `/artifacts/archives/{name}/{revision}` 和 `/artifacts/scripts/{name}/{revision}`
+/// 路由解析。与 managedFileRoute 结构相同，但用于 archive 和 script 资产。
+const RevisionedAssetRoute = struct { name: []const u8, revision: u64 };
+fn revisionedAssetRoute(path: []const u8, prefix: []const u8) ?RevisionedAssetRoute {
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const name = rest[0..slash];
+    if (!@import("../config/validate.zig").validLogicalId(name)) return null;
+    const revision = std.fmt.parseInt(u64, rest[slash + 1 ..], 10) catch return null;
+    if (revision == 0) return null;
+    return .{ .name = name, .revision = revision };
+}
+
+/// v0.3: 提供 archive/script 资产的 HTTP 下载。与 managedFileAsset 逻辑相同，
+/// 但校验 asset.kind 与传入的 expected_kind 匹配。
+fn revisionedAsset(request: zap.Request, context: *const RouteContext, name: []const u8, revision: u64, expected_kind: model.AssetKind, meta: RequestMeta) !void {
+    const asset = lookup.findAsset(context.catalog_snapshot.value(), name) orelse return notFound(request, meta);
+    if (asset.kind != expected_kind or asset.revision != revision or asset.sha256 == null) return notFound(request, meta);
     return staticFile(request, context, paths.require().assets_dir, asset.path, asset.sha256, meta);
 }
 
@@ -1399,12 +1429,37 @@ fn buildInstallPlan(context: *const RouteContext, node_id: []const u8, profile_n
         const source_bundle = found orelse return error.MissingProvisioningBundle;
         const steps = try plan_allocator.alloc(model.ProvisionStep, source_bundle.steps.len);
         for (source_bundle.steps, 0..) |step, index| {
-            if (step.action != .managed_file) return error.InvalidProvisioningStep;
-            const asset = lookup.findAsset(catalog_snapshot.value(), step.content_asset orelse return error.InvalidProvisioningStep) orelse return error.MissingAsset;
-            if (asset.kind != .managed_file or asset.sha256 == null) return error.InvalidProvisioningStep;
-            steps[index] = step;
-            steps[index].content_url = try std.fmt.allocPrint(plan_allocator, "http://{s}:{d}/artifacts/managed-files/{s}/{d}", .{ context.config.server.server_ip, context.config.server.http_port, asset.name, asset.revision });
-            steps[index].content_sha256 = asset.sha256;
+            // v0.3: install-post 接受四类 canonical action（managed_file/archive/
+            // script/package），旧 repository/standard_packages 直接拒绝。
+            switch (step.action) {
+                .managed_file => {
+                    const asset = lookup.findAsset(catalog_snapshot.value(), step.content_asset orelse return error.InvalidProvisioningStep) orelse return error.MissingAsset;
+                    if (asset.kind != .managed_file or asset.sha256 == null) return error.InvalidProvisioningStep;
+                    steps[index] = step;
+                    steps[index].content_url = try std.fmt.allocPrint(plan_allocator, "http://{s}:{d}/artifacts/managed-files/{s}/{d}", .{ context.config.server.server_ip, context.config.server.http_port, asset.name, asset.revision });
+                    steps[index].content_sha256 = asset.sha256;
+                },
+                .archive => {
+                    const asset = lookup.findAsset(catalog_snapshot.value(), step.content_asset orelse return error.InvalidProvisioningStep) orelse return error.MissingAsset;
+                    if (asset.kind != .archive or asset.sha256 == null) return error.InvalidProvisioningStep;
+                    steps[index] = step;
+                    steps[index].content_url = try std.fmt.allocPrint(plan_allocator, "http://{s}:{d}/artifacts/archives/{s}/{d}", .{ context.config.server.server_ip, context.config.server.http_port, asset.name, asset.revision });
+                    steps[index].content_sha256 = asset.sha256;
+                },
+                .script => {
+                    const asset = lookup.findAsset(catalog_snapshot.value(), step.content_asset orelse return error.InvalidProvisioningStep) orelse return error.MissingAsset;
+                    if (asset.kind != .script or asset.sha256 == null) return error.InvalidProvisioningStep;
+                    steps[index] = step;
+                    steps[index].content_url = try std.fmt.allocPrint(plan_allocator, "http://{s}:{d}/artifacts/scripts/{s}/{d}", .{ context.config.server.server_ip, context.config.server.http_port, asset.name, asset.revision });
+                    steps[index].content_sha256 = asset.sha256;
+                },
+                .package => {
+                    // package action 不引用 asset，直接传递。
+                    if (step.packages.len == 0) return error.InvalidProvisioningStep;
+                    steps[index] = step;
+                },
+                .repository, .standard_packages => return error.InvalidProvisioningStep,
+            }
         }
         bundles[0] = source_bundle;
         bundles[0].steps = steps;
@@ -1515,6 +1570,13 @@ fn findProvisioningBundle(config: *const model.AppConfig, name: []const u8) ?*co
     return null;
 }
 
+fn installPostBundleForNode(config: *const model.Catalog, node_id: []const u8) ?*const model.ProvisioningBundle {
+    const node = lookup.findNode(config, node_id) orelse return null;
+    const profile = lookup.findProfile(config, node.profile orelse return null) orelse return null;
+    if (profile.kind != .install) return null;
+    return findProvisioningBundleIn(config.provisioning_bundles, profile.install.post_install.bundle orelse return null);
+}
+
 fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticate(context.sessions, node_id, meta.client_ip, request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.proof != .capability) return nodeAuthError(request, error.MissingProof, meta);
@@ -1522,6 +1584,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
     var event = parseNodeEvent(request, context.allocator) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_event\",\"message\":\"invalid node event\"}}\n", meta);
     defer event.params.deinit();
     @import("contracts.zig").validateNodeEvent(event.value) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_event\",\"message\":\"invalid node event\"}}\n", meta);
+    if (!validInstallPostEventShape(event.value)) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"node.invalid_event\",\"message\":\"invalid install-post event fields\"}}\n", meta);
     if (!std.mem.eql(u8, event.value.boot_session_id, checked.session.boot_session_id[0..])) return nodeAuthError(request, error.ProofMismatch, meta);
     const mapped = mapStage(checked.session.mode, event.value.stage) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.stage_invalid\",\"message\":\"stage not allowed for profile mode\"}}\n", meta);
     const terminal = std.mem.eql(u8, event.value.stage, "completed") or std.mem.eql(u8, event.value.stage, "failed");
@@ -1535,6 +1598,16 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist install generation\"}}\n", meta);
         };
     }
+    // install-post 是 generation completion gate：只要配置了 bundle，installer 的
+    // 粗粒度 `completed` 就不能单独关闭部署；必须先持久接受带认证 finalizer callback。
+    if (checked.session.mode == .install and std.mem.eql(u8, event.value.stage, "completed")) {
+        if (installPostBundleForNode(context.catalog_snapshot.value(), node_id) != null) {
+            const run = context.install_post_journal.view(node_id, checked.session.deployment_generation) orelse
+                return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_incomplete\",\"message\":\"install-post finalizer has not completed\"}}\n", meta);
+            if (run.status != .completed)
+                return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_incomplete\",\"message\":\"install-post finalizer has not completed\"}}\n", meta);
+        }
+    }
     if (checked.session.mode == .install and terminal) {
         const terminal_result = context.deployments.markTerminalAt(node_id, std.mem.eql(u8, event.value.stage, "completed"), unixNow());
         deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch |err| {
@@ -1542,6 +1615,92 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
             observe_log.err("deployment-control applied revision save failed: {t}", .{err});
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
         };
+    }
+    // v0.3: install-post journal 状态机。
+    // - installer `started` → 创建 pending run（复用已有 generation/plan）。
+    // - installer `post` → 转为 running。
+    // - installer `completed` → 转为 completed。
+    // - installer `failed` → 转为 failed + 记录 failure reason。
+    if (checked.session.mode == .install) {
+        const gen = checked.session.deployment_generation;
+        if (std.mem.eql(u8, event.value.stage, "started") and gen != 0) {
+            const bundle_revision = if (installPostBundleForNode(context.catalog_snapshot.value(), node_id)) |bundle| bundle.revision else 0;
+            const digest = if (deployment_control.digestSet(checked.session.model_plan_digest)) checked.session.model_plan_digest[0..] else "";
+            _ = context.install_post_journal.findOrCreate(context.allocator, node_id, gen, bundle_revision, digest, checked.session.boot_session_id[0..], unixNow()) catch
+                return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_binding_mismatch\",\"message\":\"install-post generation is already bound to different immutable facts\"}}\n", meta);
+            install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch |err|
+                observe_log.err("install-post journal save failed: {t}", .{err});
+        } else if (std.mem.eql(u8, event.value.stage, "post") or std.mem.eql(u8, event.value.stage, "post_step_started") or std.mem.eql(u8, event.value.stage, "post_finalizer_started")) {
+            if (gen != 0) {
+                _ = context.install_post_journal.transition(node_id, gen, .running, unixNow());
+                if (std.mem.eql(u8, event.value.stage, "post_step_started")) {
+                    const bundle = installPostBundleForNode(context.catalog_snapshot.value(), node_id) orelse
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_plan_mismatch\",\"message\":\"install-post bundle is not available\"}}\n", meta);
+                    const run = context.install_post_journal.view(node_id, gen) orelse
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_run_missing\",\"message\":\"install-post run is not bound\"}}\n", meta);
+                    if (!installPostStepIsCurrent(bundle, run, event.value.step_id.?))
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_step_out_of_order\",\"message\":\"install-post step is not the current planned step\"}}\n", meta);
+                } else if (std.mem.eql(u8, event.value.stage, "post_finalizer_started")) {
+                    const bundle = installPostBundleForNode(context.catalog_snapshot.value(), node_id) orelse
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_plan_mismatch\",\"message\":\"install-post bundle is not available\"}}\n", meta);
+                    const run = context.install_post_journal.view(node_id, gen) orelse
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_run_missing\",\"message\":\"install-post run is not bound\"}}\n", meta);
+                    if (!allInstallPostStepsSucceeded(bundle, run))
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_finalizer_early\",\"message\":\"install-post steps have not all succeeded\"}}\n", meta);
+                }
+                if (!std.mem.eql(u8, event.value.stage, "post"))
+                    _ = context.install_post_journal.recordStepAttempt(context.allocator, node_id, gen, event.value.step_id orelse "", event.value.attempt orelse 0, .running, unixNow()) catch
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_event_rejected\",\"message\":\"invalid install-post step transition\"}}\n", meta);
+            }
+        } else if (std.mem.eql(u8, event.value.stage, "post_step_succeeded")) {
+            if (gen != 0) _ = context.install_post_journal.recordStepAttempt(context.allocator, node_id, gen, event.value.step_id orelse "", event.value.attempt orelse 0, .succeeded, unixNow()) catch
+                return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_event_rejected\",\"message\":\"invalid install-post step transition\"}}\n", meta);
+        } else if (std.mem.eql(u8, event.value.stage, "post_step_failed_retryable")) {
+            if (gen != 0) _ = context.install_post_journal.recordStepAttempt(context.allocator, node_id, gen, event.value.step_id orelse "", event.value.attempt orelse 0, .failed_retryable, unixNow()) catch
+                return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_event_rejected\",\"message\":\"invalid install-post step transition\"}}\n", meta);
+        } else if (std.mem.eql(u8, event.value.stage, "post_step_failed_terminal") or std.mem.eql(u8, event.value.stage, "post_finalizer_failed")) {
+            if (gen != 0) {
+                if (event.value.step_id) |step_id| _ = context.install_post_journal.recordStepAttempt(context.allocator, node_id, gen, step_id, event.value.attempt orelse 0, .failed_terminal, unixNow()) catch {};
+                _ = context.install_post_journal.transition(node_id, gen, .failed, unixNow());
+                install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch |err|
+                    observe_log.err("install-post journal save failed: {t}", .{err});
+            }
+        } else if (std.mem.eql(u8, event.value.stage, "post_finalizer_succeeded")) {
+            if (gen != 0) {
+                _ = context.install_post_journal.recordStepAttempt(context.allocator, node_id, gen, "@finalizer", event.value.attempt orelse 0, .succeeded, unixNow()) catch
+                    return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_event_rejected\",\"message\":\"invalid install-post finalizer transition\"}}\n", meta);
+                if (!context.install_post_journal.transition(node_id, gen, .committing, unixNow()))
+                    return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_event_rejected\",\"message\":\"install-post run cannot enter completion transaction\"}}\n", meta);
+                install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch
+                    return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_persist_failed\",\"message\":\"cannot prepare install-post completion\"}}\n", meta);
+                const terminal_result = context.deployments.markTerminalAt(node_id, true, unixNow()) orelse
+                    return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_generation_mismatch\",\"message\":\"install generation cannot be completed\"}}\n", meta);
+                if (terminal_result.generation != gen) {
+                    context.deployments.rollbackTerminal(node_id, terminal_result);
+                    return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_generation_mismatch\",\"message\":\"install generation does not match finalizer run\"}}\n", meta);
+                }
+                deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch {
+                    context.deployments.rollbackTerminal(node_id, terminal_result);
+                    return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_persist_failed\",\"message\":\"cannot commit install generation\"}}\n", meta);
+                };
+                if (!context.install_post_journal.transition(node_id, gen, .completed, unixNow()))
+                    return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_commit_failed\",\"message\":\"cannot publish completed install-post run\"}}\n", meta);
+                install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch {
+                    _ = context.install_post_journal.rollbackCompletion(node_id, gen, unixNow());
+                    return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_persist_failed\",\"message\":\"install completion requires recovery\"}}\n", meta);
+                };
+            }
+        } else if (std.mem.eql(u8, event.value.stage, "failed")) {
+            if (gen != 0) {
+                _ = context.install_post_journal.transition(node_id, gen, .failed, unixNow());
+                if (event.value.reason) |reason| context.install_post_journal.setFailureReason(context.allocator, node_id, gen, reason);
+                install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch |err|
+                    observe_log.err("install-post journal save failed: {t}", .{err});
+            }
+        }
+        if (std.mem.startsWith(u8, event.value.stage, "post_step_") or std.mem.startsWith(u8, event.value.stage, "post_finalizer_") or std.mem.eql(u8, event.value.stage, "post"))
+            install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch
+                return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_persist_failed\",\"message\":\"cannot persist install-post journal\"}}\n", meta);
     }
     context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, mapped.phase, event.value.reason, unixNow(), !terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
@@ -1567,6 +1726,44 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
         context.sessions.advanceDelivery(checked.session.boot_session_id[0..], phase, boot_session.monotonicNow(), unixNow());
     }
     return json(request, .ok, "{\"ok\":true}\n", meta);
+}
+
+fn validInstallPostEventShape(event: @import("contracts.zig").NodeEvent) bool {
+    const post_callback = std.mem.startsWith(u8, event.stage, "post_step_") or std.mem.startsWith(u8, event.stage, "post_finalizer_");
+    if (!post_callback) return event.step_id == null and event.attempt == null;
+    const step_id = event.step_id orelse return false;
+    _ = event.attempt orelse return false;
+    if (std.mem.startsWith(u8, event.stage, "post_finalizer_")) return std.mem.eql(u8, step_id, "@finalizer");
+    return !std.mem.eql(u8, step_id, "@finalizer");
+}
+
+fn installPostStepId(step: model.ProvisionStep) []const u8 {
+    return if (step.idempotency_key.len != 0) step.idempotency_key else step.name;
+}
+
+fn journalStep(run: install_post_journal.Run, step_id: []const u8) ?install_post_journal.StepEntry {
+    for (run.steps) |step| if (std.mem.eql(u8, step.step_id, step_id)) return step;
+    return null;
+}
+
+fn installPostStepIsCurrent(bundle: *const model.ProvisioningBundle, run: install_post_journal.Run, requested: []const u8) bool {
+    const order = [_]model.ProvisionAction{ .managed_file, .package, .archive, .script };
+    for (order) |action| for (bundle.steps) |step| {
+        if (step.phase != .install_post or step.action != action) continue;
+        const id = installPostStepId(step);
+        const existing = journalStep(run, id);
+        if (existing == null or existing.?.status != .succeeded) return std.mem.eql(u8, id, requested);
+    };
+    return false;
+}
+
+fn allInstallPostStepsSucceeded(bundle: *const model.ProvisioningBundle, run: install_post_journal.Run) bool {
+    for (bundle.steps) |step| {
+        if (step.phase != .install_post) continue;
+        const existing = journalStep(run, installPostStepId(step)) orelse return false;
+        if (existing.status != .succeeded) return false;
+    }
+    return true;
 }
 
 fn nodeLog(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
@@ -1839,7 +2036,7 @@ fn parseNodeEvent(request: zap.Request, allocator: std.mem.Allocator) !ParsedNod
     try request.parseBody();
     var params = try request.parametersToOwnedList(allocator);
     errdefer params.deinit();
-    if (params.items.len < 3 or params.items.len > 5) return error.InvalidNodeEvent;
+    if (params.items.len < 3 or params.items.len > 7) return error.InvalidNodeEvent;
     // `reason` 和 `message` 是可选字段。从 contract 默认值开始，
     // 而非在检查有效客户端负载中的重复键时检查未初始化的 optional。
     var result: @import("contracts.zig").NodeEvent = .{ .v = 0, .boot_session_id = "", .stage = "" };
@@ -1865,6 +2062,12 @@ fn parseNodeEvent(request: zap.Request, allocator: std.mem.Allocator) !ParsedNod
         } else if (std.mem.eql(u8, param.key, "message")) {
             if (result.message != null) return error.InvalidNodeEvent;
             result.message = stringParam(param.value) orelse return error.InvalidNodeEvent;
+        } else if (std.mem.eql(u8, param.key, "step_id")) {
+            if (result.step_id != null) return error.InvalidNodeEvent;
+            result.step_id = stringParam(param.value) orelse return error.InvalidNodeEvent;
+        } else if (std.mem.eql(u8, param.key, "attempt")) {
+            if (result.attempt != null or param.value == null or param.value.? != .Int) return error.InvalidNodeEvent;
+            result.attempt = std.math.cast(u8, param.value.?.Int) orelse return error.InvalidNodeEvent;
         } else return error.InvalidNodeEvent;
     }
     if (!seen_v or !seen_session or !seen_stage) return error.InvalidNodeEvent;
@@ -1912,7 +2115,7 @@ const StageMapping = struct { event_type: []const u8, phase: node_status.Phase }
 fn mapStage(mode: model.BootKind, stage: []const u8) ?StageMapping {
     if (mode == .install) {
         const values = [_]struct { []const u8, []const u8, node_status.Phase }{
-            .{ "installer_started", "install.installer_started", .installer_started }, .{ "config_fetched", "install.config_fetched", .install_config_fetched }, .{ "started", "install.started", .install_started }, .{ "partitioning", "install.partitioning", .install_partitioning }, .{ "packages", "install.packages", .install_packages }, .{ "bootloader", "install.bootloader", .install_bootloader }, .{ "post", "install.post", .install_post }, .{ "rebooting", "install.rebooting", .install_rebooting }, .{ "completed", "install.completed", .completed }, .{ "failed", "install.failed", .failed },
+            .{ "installer_started", "install.installer_started", .installer_started }, .{ "config_fetched", "install.config_fetched", .install_config_fetched }, .{ "started", "install.started", .install_started }, .{ "partitioning", "install.partitioning", .install_partitioning }, .{ "packages", "install.packages", .install_packages }, .{ "bootloader", "install.bootloader", .install_bootloader }, .{ "post", "install.post", .install_post }, .{ "post_step_started", "install.post_step_started", .install_post }, .{ "post_step_succeeded", "install.post_step_succeeded", .install_post }, .{ "post_step_failed_retryable", "install.post_step_failed_retryable", .install_post }, .{ "post_step_failed_terminal", "install.post_step_failed_terminal", .install_post }, .{ "post_finalizer_started", "install.post_finalizer_started", .install_post }, .{ "post_finalizer_succeeded", "install.post_finalizer_succeeded", .install_post }, .{ "post_finalizer_failed", "install.post_finalizer_failed", .install_post }, .{ "rebooting", "install.rebooting", .install_rebooting }, .{ "completed", "install.completed", .completed }, .{ "failed", "install.failed", .failed },
         };
         for (values) |value| if (std.mem.eql(u8, stage, value[0])) return .{ .event_type = value[1], .phase = value[2] };
     }
@@ -2758,6 +2961,42 @@ fn installGenerationsPath(path: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
     const node_id = path[prefix.len .. path.len - suffix.len];
     return if (auth.nodeIdSafe(node_id)) node_id else null;
+}
+
+/// v0.3: 匹配 `GET /api/v1/management/nodes/:id/install-post-journal`。
+fn installPostJournalPath(path: []const u8) ?[]const u8 {
+    const prefix = "/api/v1/management/nodes/";
+    const suffix = "/install-post-journal";
+    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+    const node_id = path[prefix.len .. path.len - suffix.len];
+    return if (auth.nodeIdSafe(node_id)) node_id else null;
+}
+
+/// v0.3: 返回节点最近一次 install-post run 的 journal 状态。
+fn managementInstallPostJournal(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const selected = if (request.getParamSlice("generation")) |raw| blk: {
+        const generation = std.fmt.parseInt(u64, raw, 10) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"postprocess.invalid_generation\",\"message\":\"generation must be a positive integer\"}}\n", meta);
+        if (generation == 0) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"postprocess.invalid_generation\",\"message\":\"generation must be a positive integer\"}}\n", meta);
+        break :blk context.install_post_journal.view(node_id, generation);
+    } else context.install_post_journal.latestView(node_id);
+    const run = selected orelse {
+        var body: [80]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&body, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"run\":null}}}}\n", .{std.json.fmt(node_id, .{})});
+        return json(request, .ok, msg, meta);
+    };
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"run\":{{\"install_generation\":{d},\"status\":{f},\"bundle_revision\":{d},\"created_at\":{d},\"updated_at\":{d},\"steps\":[", .{ std.json.fmt(node_id, .{}), run.install_generation, std.json.fmt(@tagName(run.status), .{}), run.bundle_revision, run.created_at, run.updated_at });
+    for (run.steps, 0..) |step, i| {
+        if (i > 0) try output.writer.writeByte(',');
+        try output.writer.print("{{\"step_id\":{f},\"status\":{f},\"attempts\":{d},\"updated_at\":{d}}}", .{ std.json.fmt(step.step_id, .{}), std.json.fmt(@tagName(step.status), .{}), step.attempts, step.updated_at });
+    }
+    try output.writer.writeAll("]}");
+    if (run.failure_reason) |reason| {
+        try output.writer.print(",\"failure_reason\":{f}", .{std.json.fmt(reason, .{})});
+    }
+    try output.writer.writeAll("}}\n");
+    return json(request, .ok, output.written(), meta);
 }
 
 fn claimPath(path: []const u8) ?[]const u8 {
@@ -5145,6 +5384,8 @@ fn managementNodeReadiness(request: zap.Request, context: *RouteContext, node_id
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     if (parsed.value.stage == .build) {
+        _ = lookup.findInstallSource(catalog, profile.install_source) orelse
+            return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.source_missing\",\"message\":\"install source not found\"}}\n", meta);
         try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"stage\":\"build\",\"ready\":true,\"rootfs_input_digest\":{f},\"desired_plan_digest\":{f},\"issues\":[],\"warnings\":[]}}}}\n", .{
             std.json.fmt(node_id, .{}), std.json.fmt(rootfs_digest, .{}), std.json.fmt(desired_digest, .{}),
         });

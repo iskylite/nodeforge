@@ -156,7 +156,7 @@ Ubuntu 22.04.5 aarch64 VMware 冷启动回归。
   aarch64 VMware固定矩阵已完成；
 - **v0.2.3**：Profile稳定SSH identity/provenance、完整clone、capability restart
   语义、ISO后台operation和CLI exit mapping收口；
-- **v0.3**：install-post canonical 扩展、adapter capability matrix、callback credential；
+- **v0.3**：install-post canonical 扩展与 callback generation 绑定；
 - **BIOS PXELINUX**：独立延后工作项，不绑定产品版本号，最早在 v0.5 后实施，见
   [`BIOS_PXELINUX_DEFERRED.md`](docs/design/BIOS_PXELINUX_DEFERRED.md)；
 - **v0.4**：多 NIC/topology、容量、PXE builder、install first-boot；
@@ -416,6 +416,279 @@ nodeforge events list --node node-01 --limit 50
 nodeforge node show node-01
 nodeforge node deploy node-01 false
 ```
+
+### v0.3 双机实机验收流程
+
+下面是 2026-08-02 在 `r97n0`（Rocky 9.8 aarch64 管理节点）和 VMware Fusion
+中的 `r97n1`（UEFI aarch64 计算节点）完成的 fresh 验收流程。示例地址和接口属于
+该验证环境，其他站点必须先替换；完整结果与 journal 证据见
+[`docs/validation/V0_3_VALIDATION.md`](docs/validation/V0_3_VALIDATION.md)。
+
+> **破坏性操作**：清场会停止 NodeForge 并删除 `/opt/nodeforge` 中的配置、Catalog、
+> ISO 副本、rootfs、状态和日志。执行前必须再次确认 `hostname`、安装根和 unit 路径；
+> 原始 ISO 应保存在安装根之外。不要用宽泛路径或未解析变量替换下列精确目标。
+
+#### 1. 确认目标并清理旧环境
+
+```bash
+ssh root@r97n0 '
+  hostname
+  uname -m
+  systemctl show nodeforged -p FragmentPath -p ActiveState -p SubState
+  systemctl cat nodeforged --no-pager
+  pgrep -a -x nodeforged || true
+  ss -lntup | grep -E ":(67|69|18080)([[:space:]]|$)" || true
+'
+
+ssh root@r97n0 '
+  set -euo pipefail
+  test "$(hostname)" = r97n0
+  systemctl stop nodeforged.service 2>/dev/null || true
+  systemctl disable nodeforged.service 2>/dev/null || true
+  rm -f /etc/systemd/system/nodeforged.service /etc/profile.d/nodeforge.sh
+  rm -rf --one-file-system /opt/nodeforge
+  systemctl daemon-reload
+  test ! -e /opt/nodeforge
+  systemctl is-active sshd
+  systemctl is-active NetworkManager
+'
+```
+
+#### 2. 交叉编译、核验和部署四个程序
+
+```bash
+zig version
+git rev-parse --short=12 HEAD
+zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe
+
+for program in nodeforge nodeforged nodeforge-initrd nodeforge-agent; do
+  test -x "zig-out/bin/$program"
+  file "zig-out/bin/$program"
+  shasum -a 256 "zig-out/bin/$program"
+done
+
+ssh root@r97n0 'rm -rf /tmp/nodeforge-v03-bundle && mkdir -p /tmp/nodeforge-v03-bundle'
+scp zig-out/bin/{nodeforge,nodeforged,nodeforge-initrd,nodeforge-agent} \
+  root@r97n0:/tmp/nodeforge-v03-bundle/
+ssh root@r97n0 '/tmp/nodeforge-v03-bundle/nodeforge --version'
+```
+
+`nodeforge-initrd` 是 initramfs 的 PID 1，不能把直接执行
+`nodeforge-initrd --version` 当作普通版本检查；这样会进入实际 bootstrap 流程。
+它与 `nodeforge-agent` 应通过同一构建命令、ELF 架构、摘要、initrd/rootfs 注入结果和
+实际 diskless 启动共同核验。
+
+再次执行第 1 步的精确清场后，仅用发布目录中的 `setup` 初始化：
+
+```bash
+ssh root@r97n0 '
+  set -euo pipefail
+  cd /tmp/nodeforge-v03-bundle
+  ./nodeforge setup --install-root /opt/nodeforge --non-interactive --yes \
+    --bind-interface enp26s0 --server-ip 192.168.27.128 \
+    --subnet 192.168.27.0/24 \
+    --pool-start 192.168.27.220 --pool-end 192.168.27.240
+  ./nodeforge setup --install-root /opt/nodeforge --generate-systemd --install \
+    --non-interactive --yes
+  systemctl start nodeforged
+  /opt/nodeforge/bin/nodeforge status --output json
+  /opt/nodeforge/bin/nodeforge config validate --output json
+  /opt/nodeforge/bin/nodeforge catalog validate --output json
+'
+```
+
+DHCP 池必须避开管理节点、网关和 `r97n1` 的 reservation；本次环境使用
+`.220-.240`，`r97n1` 使用 `.210`。
+
+#### 3. 仅通过 CLI 导入介质并构建三套 diskless Profile
+
+```bash
+ssh root@r97n0 '
+  set -euo pipefail
+  nodeforge assets import /root/Rocky-9.7-aarch64-minimal.iso
+  nodeforge assets import /root/Rocky-10.2-aarch64-dvd1.iso
+  nodeforge assets import /root/ubuntu-22.04.5-live-server-arm64.iso
+  nodeforge assets install-source list --output json
+  for source in \
+    rocky-9.7-aarch64-minimal \
+    rocky-10.2-aarch64-dvd1 \
+    ubuntu-22.04.5-live-server-arm64; do
+    nodeforge assets install-source show "$source" --output json
+  done
+  nodeforge catalog validate --output json
+'
+```
+
+导入结果必须分别识别为 `rocky/9.7/aarch64`、`rocky/10.2/aarch64` 和
+`ubuntu/22.04.5/aarch64`，并检查 installer kernel/initrd、Minimal、
+BaseOS/AppStream、APT repository 和 casper layers。随后构建 initrd 和 boot bundle：
+
+```bash
+ssh root@r97n0 '
+  set -euo pipefail
+  nodeforge assets initrd build rocky-9.7-nodeforge-initrd \
+    --from-install-source rocky-9.7-aarch64-minimal \
+    --kernel-release 5.14.0-611.5.1.el9_7.aarch64
+  nodeforge assets initrd build rocky-10.2-nodeforge-initrd \
+    --from-install-source rocky-10.2-aarch64-dvd1 \
+    --kernel-release 6.12.0-211.16.1.el10_2.0.1.aarch64
+  nodeforge assets initrd build ubuntu-22.04.5-nodeforge-initrd \
+    --from-install-source ubuntu-22.04.5-live-server-arm64 \
+    --kernel-release 5.15.0-119-generic
+
+  nodeforge assets boot-bundle create rocky-9.7-aarch64-minimal \
+    --kernel rocky-9.7-aarch64-minimal-kernel \
+    --initrd rocky-9.7-nodeforge-initrd \
+    --distro rocky --version 9.7 --arch aarch64 \
+    --kernel-release 5.14.0-611.5.1.el9_7.aarch64
+  nodeforge profile create rocky-9.7-aarch64-minimal --kind diskless
+
+  nodeforge assets boot-bundle create rocky-10.2-aarch64-dvd1 \
+    --kernel rocky-10.2-aarch64-dvd1-kernel \
+    --initrd rocky-10.2-nodeforge-initrd \
+    --distro rocky --version 10.2 --arch aarch64 \
+    --kernel-release 6.12.0-211.16.1.el10_2.0.1.aarch64
+  nodeforge profile create rocky-10.2-aarch64-dvd1 --kind diskless
+
+  nodeforge assets boot-bundle create ubuntu-22.04.5-live-server-arm64 \
+    --kernel ubuntu-22.04.5-live-server-arm64-kernel \
+    --initrd ubuntu-22.04.5-nodeforge-initrd \
+    --distro ubuntu --version 22.04.5 --arch aarch64 \
+    --kernel-release 5.15.0-119-generic
+  nodeforge profile create ubuntu-22.04.5-live-server-arm64 --kind diskless
+'
+```
+
+对每个 `*-diskless` Profile 先读取不可变 input digest，再提交构建：
+
+```bash
+profile=rocky-9.7-aarch64-minimal-diskless
+plan=$(ssh root@r97n0 "nodeforge profile rootfs plan $profile --output json")
+digest=$(printf '%s' "$plan" | jq -r .result.rootfs_input_digest)
+ssh root@r97n0 \
+  "nodeforge profile rootfs build $profile --if-input-digest $digest --output json"
+ssh root@r97n0 "nodeforge profile rootfs status $profile --output json"
+```
+
+Rocky 10.2 和 Ubuntu Profile 使用相同步骤。三个 `rootfs status` 都必须为
+`state=ready`，且 `rootfs_input_digest`、kernel release、SHA-512、压缩/展开大小和
+文件路径完整。
+
+#### 4. 从管理节点 hosts 登记 r97n1
+
+```bash
+ssh root@r97n0 '
+  set -euo pipefail
+  node_ip=$(getent hosts r97n1 | awk "NR==1 { print \$1 }")
+  test -n "$node_ip"
+  nodeforge node add r97n1 \
+    mac=00:50:56:2A:23:DB arch=aarch64 \
+    profile=rocky-10.2-aarch64-dvd1-diskless \
+    pxe.ip_reservation="$node_ip" deploy=false
+  nodeforge node show r97n1 --output json
+  nodeforge node software show r97n1 --output json
+  nodeforge node readiness r97n1 --stage boot --output json
+  nodeforge node boot preview r97n1 --output json
+'
+```
+
+不要从工作站 DNS、旧 deployment 或手写常量推断节点 IP。`node show` 中还应确认
+MAC、aarch64、受管 repo、`system.import_host_hosts=true`、SSH policy、存储和
+deploy gate。第一次 diskless 启动后，从 r97n0 使用服务端 bootstrap key 验证：
+
+```bash
+ssh root@r97n0 \
+  'ssh -o BatchMode=yes -o StrictHostKeyChecking=no root@192.168.27.210 \
+   "cat /etc/os-release; uname -r; findmnt -n -o FSTYPE /; \
+    grep -E \"r97n0|r97n1\" /etc/hosts; systemctl --failed"'
+```
+
+#### 5. Compute Use 驱动 VMware，CLI 驱动部署矩阵
+
+VMware Fusion 中只执行虚拟机电源和界面操作：通过 Computer Use 选择 `r97n1`，
+从每次最新的 accessibility state 定位 `Start Up` 或 `Shut Down` 按钮，点击后重新
+读取界面状态确认结果。不要复用旧 element index，也不要在 VMware UI 中修改
+NodeForge 业务配置。Profile、deploy、retry 和 readiness 始终通过 CLI：
+
+```bash
+# install：必须显式 rearm generation
+nodeforge node set r97n1 \
+  profile=rocky-9.7-aarch64-minimal-install \
+  storage.boot_disk=/dev/nvme0n1 --force
+nodeforge node retry r97n1 --force
+nodeforge node boot preview r97n1 --output json
+
+# diskless：绑定 ready profile 并打开 deploy gate
+nodeforge node set r97n1 \
+  profile=rocky-10.2-aarch64-dvd1-diskless --force
+nodeforge node readiness r97n1 --stage boot --output json
+nodeforge node deploy r97n1 true
+nodeforge node boot preview r97n1 --output json
+```
+
+按以下顺序冷启动，每项完成后从 r97n0 SSH 验证 `/etc/os-release`、`uname -r`、
+`/etc/hosts`、Yum/APT repo、SSH 和 failed units；diskless 还必须确认 `/` 为
+`overlay`：
+
+1. `rocky-9.7-aarch64-minimal-install`
+2. `ubuntu-22.04.5-live-server-arm64-install`
+3. `rocky-9.7-aarch64-minimal-diskless`
+4. `rocky-10.2-aarch64-dvd1-diskless`
+5. `ubuntu-22.04.5-live-server-arm64-diskless`
+
+Install PASS 条件包括 `terminal_generation == successful_generation ==
+current_generation`、requested/applied/desired plan digest 一致且
+`drift_state=clean`。Diskless PASS 条件包括 readiness 无 issue、实际发行版和 kernel
+匹配、overlay 根、仅保留 NodeForge 受管 repo，并能使用 bootstrap key SSH 登录。
+
+#### 6. install-post canonical 与自动化收口
+
+仓库脚本会创建全新 bundle，导入 managed file、archive 和 script 制品，加入
+`managed_file → package → archive → script` actions，绑定 Rocky 9.7 install
+Profile，执行真实 PXE 安装并核验目标内容：
+
+```bash
+bash tests/v0_3_install_post_e2e.sh
+# 等价的显式 build step：
+zig build test-v0.3-install-post-e2e
+```
+
+验收 journal：
+
+```bash
+ssh root@r97n0 \
+  'nodeforge node postprocess show r97n1 --phase install-post --output json'
+ssh root@r97n0 \
+  'nodeforge node show r97n1 --output json | jq .result.deployment'
+ssh root@r97n0 \
+  'nodeforge events list --node r97n1 --limit 100 --output json'
+```
+
+所有 action 和 `@finalizer` 必须按固定顺序 `attempts=1`、`succeeded`；在此之前
+`install.completed` 必须被 completion gate 拒绝。完成后 generation 必须
+terminal/successful 一致且 drift clean。另需通过 CLI 导入恶意 tar，确认不可读、
+绝对路径和 `..` 路径均返回 `archive.invalid`；向新 bundle 添加 `repository` 或
+`standard_packages` 必须返回 `InvalidStepAction`，不能存在兼容或 fallback。
+
+最后执行完整自动化并验证 daemon 重启恢复：
+
+```bash
+zig build test
+ssh root@r97n0 '
+  systemctl restart nodeforged
+  # systemd active 不等于管理面已经 ready；轮询到完整健康后再判定。
+  for attempt in $(seq 1 30); do
+    nodeforge status --output json | jq -e ".ok and .result.ok" && break
+    sleep 1
+  done
+  nodeforge node postprocess show r97n1 --phase install-post --output json
+'
+```
+
+`zig build test` 覆盖 callback 认证和 generation 绑定、attempt 跳号、顺序、early
+finalizer、completion gate、archive fail-closed、旧 action 拒绝和 interrupted
+`committing` WAL 恢复；真实重启后 completed journal 也必须保持可读。任何必要检查
+缺失或失败，整轮结论都必须是 FAIL。
 
 ### 日志
 

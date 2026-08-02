@@ -1,8 +1,8 @@
 # NodeForge v0.2.1+ 实施路线图
 
 状态：现行跨版本路线图
-基线：产品 v0.2.3 / config schema v4 + catalog schema v5 / BootConfig v3 / AgentPlan v1
-更新日期：2026-07-30
+基线：产品 v0.3.0 / config schema v4 + catalog schema v5 / BootConfig v3 / AgentPlan v1
+更新日期：2026-08-01
 
 本文只定义版本依赖、实施顺序、schema/DTO 演进和完成闸。每个版本的领域细节仍由
 对应设计文档负责；当前实现状态以
@@ -17,7 +17,7 @@
 | v0.2.1 | Ubuntu casper diskless 产品化 | 保持 catalog v4 / BC v3 / AP v1 | 已完成；fresh CLI 与 Rocky 9.7/10.2、Ubuntu aarch64 VMware 冷启动回归通过 |
 | v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 已完成并通过当前 aarch64 VMware 发布矩阵 |
 | v0.2.3 | Profile identity/provenance、recovery、ISO operation、exit mapping 收口 | catalog v5 / BC v3 / AP v1 | 已完成（含 aarch64 VMware 定向回归，2026-07-31） |
-| v0.3 | install-post canonical 扩展、adapter matrix、callback credential | 保持 catalog v5 / BC v3 / AP v1 | 设计冻结，实现未开始 |
+| v0.3 | install-post canonical 扩展、callback generation 绑定与 journal | 保持 catalog v5 / BC v3 / AP v1 | 已完成；aarch64 UEFI install-post 与 diskless 发布回归通过（2026-08-01） |
 | BIOS PXELINUX | x86 BIOS PXELINUX install | catalog v8（`firmware.mode`） | 独立延后，最早在 v0.5 后实施，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md) |
 | v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v6 / BC v4 / AP v2 | 设计冻结，实现未开始 |
 | v0.5 | `ram_rootfs` materialization | catalog v7 / BC v5 / AP v2 | 设计冻结，实现未开始 |
@@ -75,16 +75,15 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 非目标与完成闸见
 [`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)。
 
-### Gate 4：v0.3 install-post canonical 扩展与 adapter matrix
+### Gate 4：v0.3 install-post canonical 扩展
 
-状态：设计冻结，实现未开始。
+状态：已完成（代码、状态机/恢复测试、aarch64 UEFI install-post 与 diskless 实机闸均通过）。
 
 在 catalog topology 扩展之前完成：
 
 - install-post 四类 canonical action 扩展与旧 action 退出；
-- per-generation callback credential capsule；
+- 复用 BootSession callback credential，并在 `installer.started` 后固定到 install generation；
 - install-post journal/status；
-- 显式 adapter capability matrix；
 - aarch64 UEFI install 回归。
 
 BIOS PXELINUX 不构成 v0.3 完成闸，已独立延后，见
@@ -96,7 +95,7 @@ BIOS PXELINUX 不构成 v0.3 完成闸，已独立延后，见
 
 每版只引入自己需要的持久 shape：
 
-- v0.3 / 保持 catalog v5：install-post canonical 扩展、adapter capability matrix、callback credential；
+- v0.3 / 保持 catalog v5：install-post canonical 扩展、callback generation 绑定与 journal；
 - BIOS PXELINUX / catalog v8：Node `firmware.mode`；最早在 v0.5 完成后实施，避免与 v0.4/v0.5 的 v6/v7 shape 复用版本号；
 - v0.4 / catalog v6：target topology、bootstrap transport、builder placement；
 - v0.5 / catalog v7：rootfs materialization mode。
@@ -161,8 +160,7 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
 - install-post 四类 canonical action、八步契约、credential/session 边界/finalizer、plan/status；
 - `standard_packages`/`repository` 已退出；
-- install-post callback credential capsule 权限/泄漏检查、generation/plan 绑定、重放、过期、跨 Node 越权与 daemon restart-resume 负测通过；
-- 显式 adapter capability matrix 覆盖目标 Rocky/RHEL 与 Ubuntu LTS；
+- install-post callback 复用 BootSession credential；session/generation/plan 固定、重复事件幂等、旧 attempt、错误 plan、跨 Node、终态后事件与 daemon restart 负测通过；
 - aarch64 UEFI install 与 diskless 回归不退化；
 - catalog schema 保持 v5（无 schema 变更）；
 - BIOS PXELINUX 不参与完成判定（独立延后）。

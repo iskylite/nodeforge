@@ -9,7 +9,7 @@ v0.4 在 v0.3 完成后启动，收纳 VMware 难以验证或非主流程的增�
 
 v0.4 必须基于 v0.2.2 operability 与 v0.3 完成：
 
-- v0.3 install-post canonical 扩展、发行版版本矩阵与 callback credential 已落地并通过验收。
+- v0.3 install-post canonical 扩展与 callback generation 绑定已落地并通过验收。
 - v0.2/v0.3 diskless 与 install 主流程在 UEFI 模式下回归通过。
 - 四个产品二进制（CLI `nodeforge` + `nodeforged`/`nodeforge-initrd`/`nodeforge-agent`
   三个运行角色）边界稳定。

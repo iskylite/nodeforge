@@ -46,7 +46,7 @@ token 是固定 session 的传输/事件鉴权，不是 enrollment，不得与�
 | 里程碑 | 当前实际存在 | 关键缺失 | 当前结论 |
 |---|---|---|---|
 | M5 | `AssetKind.nodeforge_initrd/rootfs`、基础 `BootBundleConfig` tuple、diskless phase/event 枚举；通用 asset import 可接受预留 kind | schema v4 tagged Profile、DisklessEffectivePlan、共享 rootfs builder、`nodeforge-initrd` dracut 引导程序、最小 typed BootConfig + typed AgentPlan、node-bound Range route、完整状态机/status/retry、QEMU smoke | 只有无 consumer 的数据预留；M5 未开始实现 |
-| M6 | DHCP arch 识别、UEFI x86_64/aarch64 GRUB 路径和基础 fixture | schema v5 confirmed `firmware.mode`、BIOS PXELINUX、后续发行版 capability matrix、生产容量/恢复/长期运行验收 | UEFI 基础不等于 M6；M6 未实现 |
+| M6 | DHCP arch 识别、UEFI x86_64/aarch64 GRUB 路径和基础 fixture | schema v5 confirmed `firmware.mode`、BIOS PXELINUX、生产容量/恢复/长期运行验收 | UEFI 基础不等于 M6；M6 未实现 |
 | M7 | `provision/runner.zig` 的 M4 `install_post` repository/`standard_packages`/managed-file runner | schema v4 tagged action/`rootfs-build|first-boot`，schema v5 扩 `install-post` 适用性；Assets item CRUD、archive/script、credential/session/lower 边界/finalizer、`first-boot` 确定性执行器、phase-specific retry | M4 runner 与目标 owner 冲突；M7 未开始实现 |
 
 ## 当前代码事实

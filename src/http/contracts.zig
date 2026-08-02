@@ -54,6 +54,8 @@ pub const NodeEvent = struct {
     stage: []const u8,
     reason: ?[]const u8 = null,
     message: ?[]const u8 = null,
+    step_id: ?[]const u8 = null,
+    attempt: ?u8 = null,
 };
 
 pub const LogSummary = struct {
@@ -68,6 +70,8 @@ pub fn validateNodeEvent(value: NodeEvent) !void {
     if (!safeToken(value.stage, 64)) return error.InvalidNodeEvent;
     if (value.reason) |reason| if (!safeToken(reason, max_reason_bytes)) return error.InvalidNodeEvent;
     if (value.message) |message| if (!safeSingleLine(message, max_message_bytes)) return error.InvalidNodeEvent;
+    if (value.step_id) |step_id| if (!std.mem.eql(u8, step_id, "@finalizer") and !safeToken(step_id, 128)) return error.InvalidNodeEvent;
+    if (value.attempt) |attempt| if (attempt == 0) return error.InvalidNodeEvent;
 }
 
 pub fn validateLogSummary(value: LogSummary) !void {

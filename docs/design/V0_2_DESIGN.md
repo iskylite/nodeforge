@@ -540,7 +540,7 @@ v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不�
 | v0.2.0 | Rocky/RHEL diskless | M5 内存无盘启动 + M7 diskless 后处理；aarch64 QEMU/VMware 已验证 |
 | v0.2.1 | Ubuntu diskless | Ubuntu casper productization，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
 | v0.2.2 | 可运营性和当前环境矩阵 | 持久化兼容、durable builder、CLI 收敛、memory readiness、aarch64 VMware UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md)；本地不可验证项见 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) |
-| v0.3 | install-post canonical 扩展与 adapter matrix | install-post 四类 canonical action、callback credential、发行版版本矩阵；保持 catalog schema v5，见 `V0_3_DESIGN.md` |
+| v0.3 | install-post canonical 扩展 | install-post 四类 canonical action、callback generation 绑定与 journal；保持 catalog schema v5，见 `V0_3_DESIGN.md` |
 | BIOS PXELINUX | 独立延后 | x86 BIOS PXELINUX install，不绑定产品版本号，最早在 v0.5 后实施，见 `BIOS_PXELINUX_DEFERRED.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 | v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
@@ -563,16 +563,14 @@ Diskless 不消费安装磁盘选择器，但必须复用同一个 Profile/Node 
 users/packages/network 默认值。凡是描述“最终运行系统”的 system/software/kernel/network override，diskless 与 install
 使用同一 effective 语义；只有 partition/bootloader/reinstall/completion 等依赖安装生命周期或持久磁盘的字段不适用。
 
-### M6：支持矩阵增强（adapter matrix -> v0.3；多 NIC/容量 -> v0.4；BIOS -> 独立延后）
+### M6：多 NIC/容量与 BIOS 延后项
 
-- Rocky/RHEL 系和 Ubuntu 后续 LTS 的显式 adapter capability matrix。
 - bootloader、发行版版本差异、错误分类和长期运行回归。
 - 最小功能并发、失败恢复验证（大规模容量压测延后 v0.4）。
 - BIOS x86 PXELINUX 独立延后，不绑定产品版本号，最早在 v0.5 后实施，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
 
-IPv6 是项目永久非目标，不进入 M6 或后续 schema。adapter matrix 与 BIOS 彼此独立，不能捆绑实现。
+IPv6 是项目永久非目标，不进入 M6 或后续 schema。
 
-M6 的 adapter matrix 部分属 v0.3（发行版版本矩阵、install-post canonical 扩展），不属 v0.2 diskless 主流程；
 BIOS PXELINUX 从 v0.3 剥离，独立延后。
 diskless 最小功能并发已在 M5（v0.2）验证。其中 PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网，
 以及大规模容量压测，在 VMware 难以有效验证且不属主流程，**延后到 v0.4**（需显式 consumer feature、schema 和验收）。
@@ -1467,9 +1465,7 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
 ### 9.2 M6（v0.3）
 
 - install-post 从既有受限形态扩展为四类 canonical action；旧 `repository`/`standard_packages` 退出。
-- install-post callback credential capsule 权限/泄漏检查、generation/plan 绑定、重放、过期、跨 Node 越权与 daemon restart-resume 负测通过。
-- 每个新增发行版版本逐项发布 adapter capability matrix，并通过 install answer、software index、默认值、
-  unsupported/not-applicable 负向测试及至少一条可复现安装验证。
+- install-post callback 复用 BootSession credential；session/generation/plan 固定、重复事件幂等、旧 attempt、错误 plan、跨 Node、终态后事件与 daemon restart 负测通过。
 - catalog schema 保持 v5（无 schema 变更）；BIOS PXELINUX 独立延后，不参与完成判定。
 
 ### 9.3 M7（rootfs-build/first-boot -> v0.2；install-post -> v0.3；install-agent -> v0.4；reconciliation 永久非目标）
@@ -1562,11 +1558,11 @@ v0.5 固定复用同一 squashfs 传输制品，BootConfig 升 v5，mode 只改�
 
 **第二十三轮（实现契约与认证复审）**：恢复 v0.1 冻结的 Assets import owner/参数顺序与 provision-bundle `steps`
 collection；Profile boot effective 只输出可证明 requirements，resolved projection 归 Node，`postprocess show` 改为
-active-first。v0.3 补 generation-bound callback credential。v0.4 topology 增 `routes` 并冻结无损迁移，全部新 delivery
+active-first。v0.3 把现有 BootSession callback credential 固定到 install generation。v0.4 topology 增 `routes` 并冻结无损迁移，全部新 delivery
 统一使用 BootConfig v4 + AgentPlan v2；临时构建节点补 BuilderBootAttempt、boot-slot 互斥、scoped upload claim 和 digest 边界，install
 first-boot 补一次性 bootstrap token 交换。v0.5 冻结 ram_rootfs 双预算公式、feature 适用性与 unsquashfs metadata 保真。
 
-**第二十四轮（可执行性复核）**：v0.3 明确 install callback raw token 通过 per-generation credential capsule 以 0400
+**第二十四轮（历史可执行性复核，已由 v0.3 §0.1 裁决取代）**：曾规划 install callback raw token 通过 per-generation credential capsule 以 0400
 文件交付，服务端只持 hash 且 restart 后不产生并行有效 token。v0.4 要求 effective compiler 在选择物理 builder Node
 前唯一导出 capability class/ABI 并固定 input digest。v0.5 将内存校验改为规范化 available budget：运行态限制展开根，
 峰值同时计入 compressed/uncompressed 副本，避免对 initrd `MemAvailable` 重复扣 kernel/initrd，并冻结 checked

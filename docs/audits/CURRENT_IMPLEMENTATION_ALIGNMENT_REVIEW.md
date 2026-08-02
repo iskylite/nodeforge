@@ -255,7 +255,7 @@ v0.2.0 Rocky diskless 基线
   -> v0.2.1 Ubuntu casper productization（已完成）
   -> v0.2.2 operability + CLI convergence + fixed matrix（已完成）
   -> v0.2.3 Profile identity/recovery/ISO worker/exit mapping（已完成，当前基线）
-  -> v0.3 install-post canonical extension + adapter matrix（设计冻结，实现未开始）
+  -> v0.3 install-post canonical extension（当时设计冻结、实现未开始）
   -> v0.4 topology/capacity/PXE builder/install first-boot（设计冻结，实现未开始）
   -> v0.5 ram_rootfs materialization（设计冻结，实现未开始）
   -> BIOS PXELINUX（独立延后；最早在 v0.5 后实施，catalog v8）

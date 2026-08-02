@@ -105,6 +105,9 @@ pub const Paths = struct {
     /// v0.2.3: SSH identity store 文件路径（`<root>/state/identities.json`）。
     /// 存储 Profile SSH 密钥对，private key 不进入 catalog。
     identity_store_path: []const u8,
+    /// v0.3: install-post journal 文件路径（`<root>/state/install-post-journal.json`）。
+    /// 记录 install-post 步骤执行状态、attempt 计数和 run 状态机。
+    install_post_journal_path: []const u8,
     /// v0.2.3: SSH identity 密钥生成/校验暂存目录（`<root>/state/identity-staging`，
     /// 0700）。私钥只在暂存目录中出现，绝不进入 `/tmp` 或工作目录。
     identity_staging_dir: []const u8,
@@ -310,6 +313,7 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .diskless_delivery_path = try join(allocator, root, "state/diskless-delivery.json"),
         .diskless_secret_path = try join(allocator, root, "state/diskless-secret"),
         .identity_store_path = try join(allocator, root, "state/identities.json"),
+        .install_post_journal_path = try join(allocator, root, "state/install-post-journal.json"),
         .identity_staging_dir = try join(allocator, root, "state/identity-staging"),
         .identity_transactions_dir = try join(allocator, root, "state/identity-transactions"),
         .model_transactions_dir = try join(allocator, root, "state/model-transactions"),
