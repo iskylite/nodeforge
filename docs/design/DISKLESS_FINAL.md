@@ -5,8 +5,7 @@ squashfs overlay、共享 rootfs、BootConfig 以及启动、恢复和安全时�
 [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md)，程序边界见
 [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md)，CLI 见
 [`V0_2_CLI.md`](V0_2_CLI.md)，从零构建/启动操作闭环见
-[`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md)。v0.5 的可切换 rootfs 形态见
-[`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
+[`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md)。
 
 本文不维护完整 CLI 语法、代码模块任务或操作教程；其中的命令和模块名只用于解释架构。
 
@@ -20,8 +19,8 @@ diskless 主流程完备可用，不追求 VMware 无法验证或非主流程的
 明确排除（详见 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §7）：
 
 - NFS root（任何形态）、iPXE 菜单/脚本。
-- 可切换 rootfs 形态（`ram_rootfs` 全内存、`diskless.overlay.mode` 字段）→ v0.5。
-- 多 NIC/VLAN/bonding、PXE 阶段纯静态、下载后切换地址/子网 → v0.4。
+- 多 NIC/VLAN/bonding、下载后切换目标地址/子网 → v0.4；PXE 继续使用 DHCPv4，稳定地址由
+  `pxe.ip_reservation` 提供，不新增绕过 DHCP 的静态启动链。
 - 临时 PXE rootfs 构建节点 → v0.4。
 - 持久化 overlay、跨重启 rootfs partial → 永久非目标，具体语义见下文。
 - reconciliation/远程控制、可续期 enrollment credential → 永久非目标；per-boot 短时 capability token 保留。
@@ -41,8 +40,7 @@ squashfs_overlay = squashfs 只读 lower + tmpfs overlay upper
 
 选择理由：
 
-1. 内存占用低于全内存 `ram_rootfs`（只读层是压缩 squashfs，不必把整个 rootfs 解压进
-   内存），VMware 与实机均可验证。
+1. 只读层保持压缩 squashfs，不必把整个 rootfs 解压进内存，内存占用可控，VMware 与实机均可验证。
 2. 共享 lower + per-Node 差异落 upper 的模型天然契合 AgentPlan “动态参数不烤入 lower”
    的不变式（见 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §4.3）。
 3. 读写覆盖语义成熟（overlayfs），无需自研联合挂载。
@@ -52,13 +50,12 @@ squashfs_overlay = squashfs 只读 lower + tmpfs overlay upper
 | 方案 | 内存占用 | 共享性 | 复杂度 | v0.2 结论 |
 |---|---|---|---|---|
 | **squashfs + overlay tmpfs**（本文） | 中（压缩 lower + 写时 upper） | lower 跨 Node 共享 | 低，overlayfs 原生 | **采纳** |
-| `ram_rootfs` 全内存 rootfs | 高（整 rootfs 解压进内存，需预算校验） | 不可共享 lower | 中 | v0.5 单独项 |
 | NFS root | 低（rootfs 留服务端） | 服务端单点、依赖网络常驻 | 低但违背离线/local-only | 排除 |
 | iPXE 菜单/脚本引导 | 不提供 rootfs 形态 | — | 引入第二引导栈 | 排除 |
 
 NFS root 被 local-only 不变式（公网 mirror/metalink 必须移除）与“切根后独立运行”目标共同
-否决；rootfs 必须能下载到本地内存后离线切根。iPXE 引入额外引导栈与 BIOS/UEFI 兼容负担，
-v0.2 用 UEFI GRUB + 标准 PXE DHCP/TFTP 已足够；PXELINUX/BIOS 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
+否决；rootfs 必须能下载到本地内存后离线切根。iPXE 引入额外引导栈与 firmware 兼容负担，
+v0.2 用 UEFI GRUB + 标准 PXE DHCP/TFTP 已足够。
 
 ## 4. 共享 rootfs 构建模型
 
@@ -155,9 +152,10 @@ initramfs、装载内核模块）须 bind-mount `/dev`/`/proc`/`/sys` 并使用�
 ## 5. BootConfig 与启动时序
 
 BootConfig 是给 initrd 的 **per-boot、per-Node 最小 DTO**，由服务端按 session 的 immutable
-DisklessEffectivePlan snapshot 在 boot 时生成，initrd 经 node-bound capability 拉取。它只携带
-rootfs/overlay/bootstrap network、AgentPlan URL/digest/size/expiry、consumer feature 摘要和 session capability，不携带
-users/SSH/hosts/software 等完整 Node 配置。
+DisklessEffectivePlan snapshot 在 boot 时生成，initrd 经 node-bound capability 拉取。当前 v3 只携带
+rootfs/overlay、AgentPlan locator、event/facts URL、expiry 和必要的 session identity，不携带
+users/SSH/hosts/software 等完整 Node 配置。PXE lease/MAC/prefix/gateway 来自 GRUB cmdline 与 BootSession，
+不在 BootConfig v3 内重复编码；consumer feature 由 boot bundle manifest/readiness 校验，不是 v3 字段。
 
 AgentPlan 是给最终 rootfs agent 的 **唯一执行配置**。服务端按同一 snapshot 把 Profile + Node effective 结果编译为
 唯一 `node_apply_projection`，包含 hostname、网络、machine-id、password hash、users、authorized_keys add/remove、
@@ -451,7 +449,7 @@ v0.1 删除 `system.connectivity.mode`（曾取值 `local-only`），因 `local-
 
 ## 8. 验收不变式
 
-- v0.2 不存在 NFS root、iPXE、`diskless.overlay.mode` 字段、`ram_rootfs` 路径或其 help/enum。
+- v0.2 不存在 NFS root、iPXE 或可切换 rootfs mode 字段及其 help/enum。
 - 同一 Profile revision 解析出唯一 `rootfs_input_digest`；适用的 Node override 不改 rootfs，只改
   `desired_plan_digest`；完整差量经 typed AgentPlan 交给 agent pre-init 写 overlay upper，Node first-boot override payload
   经 agent pre-init 预取校验后由 first-boot 从 `/run` 执行。

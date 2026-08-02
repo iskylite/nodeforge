@@ -573,9 +573,8 @@ nodeforge node retry <node> [--force]
 
 ## 12. v0.3+ 命令隔离
 
-- v0.3 才提供 `install-post` canonical 扩展（BIOS PXELINUX 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）。
-- v0.4 才提供多 NIC/VLAN/bonding、临时 PXE rootfs 构建节点和 install first-boot agent。
-- v0.5 才提供 `diskless.overlay.mode=ram_rootfs`。
+- v0.3 才提供 `install-post` canonical 扩展。
+- v0.4 才提供多 NIC/VLAN/bonding、临时 PXE rootfs 构建节点、install first-boot agent 和 SN+IP draft Node discovery。
 
 这些字段/enum/handler 不得出现在 v0.2 help 或 parser 中；reconciliation、远程命令、NFS root、iPXE、IPv6
 永久没有对应 CLI。

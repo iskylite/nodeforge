@@ -905,7 +905,6 @@ exit/error mapping
 | `design/DISKLESS_FINAL.md` | boot-prepare 标记内部 transition；Preview 不生成 authority |
 | `design/V0_3_DESIGN.md` | 标记已提前完成与仍缺能力，不再仅按版本隔离 CLI |
 | `design/V0_4_DESIGN.md` | 保持新增能力映射到当前分层 CLI |
-| `design/V0_5_DESIGN.md` | boot preview 展示 overlay mode，但不改变 rootfs cache owner |
 | `audits/V0_2_V0_5_CLI_GAP_AUDIT.md` | 标记为历史审计；记录被本方案取代的 `--wait`/通用 CAS 决策 |
 | `docs/cli/REFERENCE.md` | 从实际 command tree 建立当前正式接口 |
 | `docs/cli/WORKFLOWS.md` | 只使用 primary 命令描述正常流程 |

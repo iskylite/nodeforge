@@ -74,18 +74,22 @@ NodeForge/
 详细设计、审计和验证记录位于 [`docs/`](docs/)，入口见 [文档导航](docs/README.md)：
 
 - [当前实现对齐审查](docs/audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)：基于
-  `e1af4e0` 的代码、测试、持久化和文档差距清单。
-- [v0.2 设计总纲](docs/design/V0_2_DESIGN.md)：Rocky/RHEL diskless 主流程。
+  当前 v0.3.1 基线的代码、测试、持久化和文档差距清单。
+- [v0.2 冻结设计总纲](docs/design/V0_2_DESIGN.md)：已落地的 Rocky/RHEL diskless 主流程。
 - [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu
-  casper 方案；运行时与 smoke 已验证，生产 rootfs builder 尚待实现。
+  casper 方案与正式 rootfs builder 已落地并完成验证。
 - [v0.2.2 可运营性设计](docs/design/V0_2_2_OPERABILITY.md)：持久化兼容、
   durable builder operation、CLI 收敛和当前环境验证矩阵。
 - [当前环境不可验证项](docs/design/LOCAL_VALIDATION_DEFERRED.md)：集中记录
   x86_64 VMware 等当前无法执行的目标环境验证；QEMU 只作可选补充。
 - [v0.2 暂不做与发布后收口索引](docs/design/V0_2_POST_RELEASE_BACKLOG.md)：用稳定
   `V02-Dxx` 标识区分环境延后、拒绝路径、后续版本和永久非目标，避免被再次误报为残留。
-- [v0.2.1+ 路线图](docs/design/V0_2_1_PLUS_ROADMAP.md)：v0.2.1-v0.5 的依赖、
+- [v0.2.1+ 路线图](docs/design/V0_2_1_PLUS_ROADMAP.md)：v0.2.1-v0.4 的依赖、
   schema/DTO 演进与完成闸。
+- [v0.3 冻结设计与验证](docs/design/V0_3_DESIGN.md)：install-post canonical 扩展已落地并通过发布闸。
+- [v0.4 统一设计](docs/design/V0_4_DESIGN.md)：当前待实施的 topology、容量、PXE builder、install first-boot 与 SN discovery 契约。
+- [独立保留设计索引](docs/design/DEFERRED_DESIGN_INDEX.md)：统一登记不属于已排期版本的设计，不预占版本/schema/DTO。
+- [`ram_rootfs` 保留设计](docs/design/RAM_ROOTFS_DEFERRED.md)：未排期且不占用产品版本号，未来从当时基线重新分配 schema/DTO。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
 - [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录（含 [Phase 8 QEMU 全量验证](docs/validation/V0_2_PHASE8_VALIDATION.md)）。
 
@@ -139,7 +143,7 @@ IPv4 PXE 无人值守安装产品已完成；所有权模型、typed property re
 | M4.12 | 存储 override | 已由 canonical Node/Profile 所有权模型取代旧 fallback |
 | M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 已完成 |
 
-### v0.2.2（当前版本）
+### v0.3.1（当前版本）
 
 v0.2.0 已落地 schema v4、diskless Profile、rootfs 制品登记、BootConfig v3 /
 AgentPlan v1、四域 capability、严格 HEAD + Range 下载、tmpfs overlay、node-apply、
@@ -150,17 +154,19 @@ apt rootfs-build 隔离执行、原生 HTTP 诊断、制品路径规范、casper
 标准 getty 恢复。已在 r97n0 fresh CLI 环境中完成 Rocky 9.7、Rocky 10.2 与
 Ubuntu 22.04.5 aarch64 VMware 冷启动回归。
 
+v0.2.2/v0.2.3 已完成可运营性、Profile identity/provenance、capability restart、ISO 后台 operation 与 CLI
+exit mapping 收口；v0.3 已完成 install-post 四类 canonical action、callback generation 绑定和 journal/finalizer，
+并通过 fresh 双机发布闸。v0.3 及更早设计均按已落地冻结基线管理。
+
 后续按以下边界推进：
 
-- **v0.2.2**：持久化升级兼容、durable builder operation、CLI 收敛与当前可用
-  aarch64 VMware固定矩阵已完成；
-- **v0.2.3**：Profile稳定SSH identity/provenance、完整clone、capability restart
-  语义、ISO后台operation和CLI exit mapping收口；
-- **v0.3**：install-post canonical 扩展与 callback generation 绑定；
-- **BIOS PXELINUX**：独立延后工作项，不绑定产品版本号，最早在 v0.5 后实施，见
+- **v0.4**：AppConfig v5/catalog v6 fresh replacement、多 NIC/topology、强制容量闸、PXE builder、
+  install first-boot 与 SN+IP draft Node discovery；
+- **BIOS PXELINUX**：独立保留工作项，不绑定产品/schema 版本号，也不进入 v0.4，见
   [`BIOS_PXELINUX_DEFERRED.md`](docs/design/BIOS_PXELINUX_DEFERRED.md)；
-- **v0.4**：多 NIC/topology、容量、PXE builder、install first-boot；
-- **v0.5**：后续 rootfs 形态（`ram_rootfs`）。
+- **DHCP-less static PXE**：独立保留设计，不进入 v0.4，见
+  [`STATIC_PXE_BOOTSTRAP_DEFERRED.md`](docs/design/STATIC_PXE_BOOTSTRAP_DEFERRED.md)；
+- **`ram_rootfs`**：独立保留设计，不绑定后续版本号，未来重新立项。
 
 IPv6 和 by-id/serial/WWN 等稳定磁盘选择器是项目永久非目标。
 

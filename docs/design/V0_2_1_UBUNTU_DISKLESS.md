@@ -36,7 +36,6 @@
 | **v0.2.1** | **Ubuntu diskless（casper squashfs 叠加方案 + 跨发行版宿主支持）** | **已完成；fresh CLI 与三发行版 aarch64 VMware 冷启动回归通过** |
 | v0.2.2 | 持久化兼容、durable operation、CLI 收口与固定验证矩阵 | [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md) |
 | v0.3 | install-post canonical 扩展 | 设计阶段 |
-| BIOS PXELINUX | 独立延后 | [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md) |
 
 v0.2.1 是 v0.2 的**增量补充**，不修改 v0.2 的 schema、catalog、BootSession 或 rootfs overlay 架构。
 它只新增 Ubuntu 作为 diskless 目标发行版的能力，并使该能力在 Rocky/RHEL 宿主机上可用。

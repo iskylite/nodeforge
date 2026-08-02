@@ -5,9 +5,11 @@
 不一致和遗漏细节，并记录本轮修复的每一处变更。本文是审计证据，不定义产品行为；v0.2 总纲入口为
 `docs/design/V0_2_DESIGN.md`，CLI 细节由 `docs/design/V0_2_CLI.md` 负责。
 
-本文是历史快照；下文把 `firmware.mode`/BIOS 归入 v0.3 的条目仅作修复记录，不再定义当前范围。
-当前路线已将 BIOS PXELINUX 固定为 v0.5 后的独立延后项，以
-[`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准。
+本文是历史快照；下文的 `firmware.mode`/BIOS、v0.4 static bootstrap、BootConfig v4、跨版本
+active session 和 DTO 迁移条目仅作当时的审计记录，不再定义当前范围或协议。当前 v0.4 行为以
+[`V0_4_DESIGN.md`](../design/V0_4_DESIGN.md) 为准，版本号和顺序以
+[`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准。标题和下文的“v0.5”是已撤销的历史标签；
+当前对应内容只作为 [`ram_rootfs` 独立保留设计](../design/RAM_ROOTFS_DEFERRED.md)，不代表后续产品版本。
 
 ## 1. 审查范围
 
@@ -20,8 +22,8 @@
 | `V0_2_PROGRAM_DESIGN.md` | 三程序边界 | 209 |
 | `DISKLESS_FINAL.md` | diskless 收敛基线 | 395 |
 | `V0_3_DESIGN.md` | BIOS PXELINUX install | 167 |
-| `V0_4_DESIGN.md` | 延后增强项 | 240 |
-| `V0_5_DESIGN.md` | 可切换 rootfs 形态 | 175 |
+| `V0_4_DESIGN.md` | 历史版延后增强项（本审计快照） | 240（审计时） |
+| `RAM_ROOTFS_DEFERRED.md` | 可切换 rootfs 形态；本审计当时称 v0.5 | 主题化保留稿 |
 | `V0_2_V0_5_DESIGN_REVIEW.md` | 已有设计评审 | 106 |
 
 对照代码：`src/main.zig`（CLI 入口）、`src/model.zig`（`BootKind`/`AssetKind`/`ProvisionAction`/
@@ -239,8 +241,8 @@ flag 专项盘点后的保留/收敛决定：
 | `V0_2_DESIGN.md` | §5.5 补命令；§7 将 remove 限定为 v0.2 非目标；§9.3 拆 phase-specific retry；补 SSH/profile password/Node override 不变式与设计轨迹 |
 | `V0_2_DISKLESS_WORKFLOW.md` | preflight、asset import、`steps` ItemSpec 命令统一；补 Profile baseline、Node node-apply 与 SSH 域语义 |
 | `V0_3_DESIGN.md` | §7 `postinstall` -> `postprocess`；补 FIRMWARE 列/BIOS readiness/install-post 字段矩阵与 generation-bound callback credential |
-| `V0_4_DESIGN.md` | 补可承载 L3 的四 collection topology、static bootstrap session、事务网络切换、BootConfig v4 + AgentPlan v2、PXE builder 恢复和 install token exchange |
-| `V0_5_DESIGN.md` | 固定共享 squashfs artifact、BootConfig v5、digest/cache/双公式内存预算、临时制品删除、旧 v4 session 与 downgrade 边界 |
+| `V0_4_DESIGN.md` | 历史版曾规划可承载 L3 的四 collection topology、static bootstrap session、事务网络切换、BootConfig v4 + AgentPlan v2、PXE builder 恢复和 install token exchange；当前行为以统一 v0.4 设计为准 |
+| `RAM_ROOTFS_DEFERRED.md` | 历史审计曾固定的共享 squashfs artifact、digest/cache/双公式内存预算与临时制品删除；当前 DTO/schema 编号不再预占 |
 
 ## 5. 未修复的已知实现差距（设计已覆盖，代码待实现）
 
@@ -283,12 +285,14 @@ flag 专项盘点后的保留/收敛决定：
    per-action 字段矩阵。
 4. **输出可读性**：为 `preflight`/`boot preview`/`node status`/`runtime`/`status --component`/
    `rootfs plan` 补 human/JSON 输出格式。
-5. **版本边界可验证**：v0.3 install generation、v0.4 BootConfig v4/PXE builder、v0.5 BootConfig v5/cache 语义闭环。
+5. **版本边界可验证**：本审计快照记录的 v0.3 install generation、历史 v0.4 BootConfig v4/PXE builder 草案，以及
+   当时标为 v0.5 的 BootConfig/cache 草案；该标签和编号均已撤销，当前版本边界以各权威设计文档为准。
 6. **保留演进空间**：remove 只作为 v0.2 非目标；未来必须经 tombstone/retention 设计。
 7. **认证与构建边界闭环**：install callback、first-boot bootstrap 和 PXE builder 都使用有界、hash-only、不可升级的
    一次性能力；物理 builder identity 不污染共享 rootfs cache key。
-8. **跨版本 DTO 可迁移**：v0.4 全量使用 BootConfig v4 承载 bootstrap transport、AgentPlan v2 承载四 collection target topology；v0.5 再以 BootConfig v5 承载 materialization，
-   active session 始终消费创建时 immutable snapshot。
+8. **跨版本 DTO 可追溯**：本审计快照曾记录 v0.4 使用 BootConfig v4 承载 bootstrap transport、AgentPlan v2 承载四
+   collection target topology；当前 v0.4 统一设计改为保持 BootConfig v3、仅升级 AgentPlan v2。后续 materialization
+   只在不编号的 `ram_rootfs` 保留稿讨论，重新立项时才分配 DTO；active session 策略也以当时已实现基线重新裁决。
 9. **恢复边界可证明**：XID alias、bounded replay、hash-only capsule 中断和鉴权失败归责均有确定状态/错误语义，
    外部探测不能推进或隔离受害 session。
 10. **迁移不丢语义**：每版区分 finalize 前 journal rollback 与 finalize 后可表示 downgrade；不可表示状态结构化拒绝，

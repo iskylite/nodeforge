@@ -1,8 +1,8 @@
 # NodeForge v0.2.1+ 实施路线图
 
 状态：现行跨版本路线图
-基线：产品 v0.3.0 / config schema v4 + catalog schema v5 / BootConfig v3 / AgentPlan v1
-更新日期：2026-08-01
+基线：产品 v0.3.1 / config schema v4 + catalog schema v5 / BootConfig v3 / AgentPlan v1
+更新日期：2026-08-02
 
 本文只定义版本依赖、实施顺序、schema/DTO 演进和完成闸。每个版本的领域细节仍由
 对应设计文档负责；当前实现状态以
@@ -18,9 +18,7 @@
 | v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 已完成并通过当前 aarch64 VMware 发布矩阵 |
 | v0.2.3 | Profile identity/provenance、recovery、ISO operation、exit mapping 收口 | catalog v5 / BC v3 / AP v1 | 已完成（含 aarch64 VMware 定向回归，2026-07-31） |
 | v0.3 | install-post canonical 扩展、callback generation 绑定与 journal | 保持 catalog v5 / BC v3 / AP v1 | 已完成；aarch64 UEFI install-post 与 diskless 发布回归通过（2026-08-01） |
-| BIOS PXELINUX | x86 BIOS PXELINUX install | catalog v8（`firmware.mode`） | 独立延后，最早在 v0.5 后实施，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md) |
-| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot | catalog v6 / BC v4 / AP v2 | 设计冻结，实现未开始 |
-| v0.5 | `ram_rootfs` materialization | catalog v7 / BC v5 / AP v2 | 设计冻结，实现未开始 |
+| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot、SN+IP draft Node discovery | AppConfig v5 / catalog v6 / BC v3 / AP v2 / BuilderPlan v1 / InstallFirstBootPlan v1 / NodeDiscoveryState v1 | 设计冻结，实现未开始 |
 
 BC = BootConfig，AP = AgentPlan。catalog、节点 DTO、install callback、operation 和
 各 state file 是独立 schema namespace，绝不能因为版本号相同而共用升级判断。
@@ -86,23 +84,18 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 - install-post journal/status；
 - aarch64 UEFI install 回归。
 
-BIOS PXELINUX 不构成 v0.3 完成闸，已独立延后，见
-[`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
 非目标与完成闸见
 [`V0_3_DESIGN.md`](V0_3_DESIGN.md)。
 
-### Gate 5：v0.4-v0.5 schema 演进与 BIOS 延后项
+### Gate 5：v0.4 schema 直接替换
 
 每版只引入自己需要的持久 shape：
 
 - v0.3 / 保持 catalog v5：install-post canonical 扩展、callback generation 绑定与 journal；
-- BIOS PXELINUX / catalog v8：Node `firmware.mode`；最早在 v0.5 完成后实施，避免与 v0.4/v0.5 的 v6/v7 shape 复用版本号；
-- v0.4 / catalog v6：target topology、bootstrap transport、builder placement；
-- v0.5 / catalog v7：rootfs materialization mode。
+- v0.4 / AppConfig v5 + catalog v6：强制容量上限、target topology、builder placement/capability、Node hardware serial binding；BootConfig 保持 v3，AgentPlan 升 v2；
 
-每次 schema 变更采用直接替换（见 v0.2.3 设计 §0）；旧版本 catalog
-不被加载，操作员需重新 `setup`。active immutable delivery snapshot
-不重编译。
+v0.4 边界采用直接替换（见 v0.2.3 设计 §0）：旧 config/catalog/state/session/artifact
+不被加载、转换或延续，操作员必须 fresh `setup` 并重建输入与制品。
 
 ## 3. 跨版本不变式
 
@@ -163,23 +156,16 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 - install-post callback 复用 BootSession credential；session/generation/plan 固定、重复事件幂等、旧 attempt、错误 plan、跨 Node、终态后事件与 daemon restart 负测通过；
 - aarch64 UEFI install 与 diskless 回归不退化；
 - catalog schema 保持 v5（无 schema 变更）；
-- BIOS PXELINUX 不参与完成判定（独立延后）。
 
 ### v0.4
 
-- 保持的 schema v5→v6 直接替换（不迁移）；
-- BC v4/AP v2 与旧 BC v3/AP v1 active snapshot 共存；
-- static/DHCP bootstrap、事务切网、容量 SLO；
+- AppConfig v5/catalog v6 直接替换；旧 config/catalog/state/session/artifact 全部拒载，不迁移、不共存；
+- BootConfig 保持 v3；全部 fresh v0.4 diskless delivery 只使用 AgentPlan v2；
+- UEFI GRUB + DHCPv4 bootstrap 保持现状，支持动态 lease 或 `pxe.ip_reservation`，不新增 no-DHCP static PXE；
+- target topology 与 PXE transport 分离，diskless 事务切网、回滚和 adopt 闭环，容量 SLO；
 - PXE builder boot slot/upload claim/recovery；
-- install first-boot 一次性交换与磁盘 journal。
-
-### v0.5
-
-- catalog v7/BC v5；
-- `squashfs_overlay` 与 `ram_rootfs` 共用 artifact；
-- 双内存预算公式、metadata 保真和 `.part` 删除；
-- v6→v7 直接替换（不迁移）；
-- 不引入新的远程控制或 rootfs 传输变体。
+- install first-boot 一次性交换与磁盘 journal；
+- SN+IP draft Node + per-Node 短时 discovery + 现有 initrd discovery mode 上报 SN + MAC/arch 原子回填；匹配后仍不自动部署。
 
 ## 5. 变更管理
 

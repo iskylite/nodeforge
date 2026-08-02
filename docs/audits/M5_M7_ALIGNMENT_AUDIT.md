@@ -4,7 +4,10 @@
 > [`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md) 为准，
 > 当前路线与 schema 编号以
 > [`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准；其中 BIOS PXELINUX
-> 已从 v0.3 剥离并固定为 v0.5 后的独立延后项。下文旧版 v0.3/BIOS 表述仅作审计追溯。
+> 已从 v0.3 剥离为不绑定版本号的独立延后项。下文旧版 v0.3/BIOS 及“纯静态 PXE 延后 v0.4”
+> 表述仅作审计追溯；当前 v0.4 不新增 no-DHCP static PXE，以
+> [`V0_4_DESIGN.md`](../design/V0_4_DESIGN.md) 为准；独立保留项以
+> [`DEFERRED_DESIGN_INDEX.md`](../design/DEFERRED_DESIGN_INDEX.md) 为准。
 
 > M5-M7 归入 [`docs/design/V0_2_DESIGN.md`](../design/V0_2_DESIGN.md)，必须等待
 > [`docs/design/V0_1_DESIGN.md`](../design/V0_1_DESIGN.md) 的 schema v3 与全部进入条件验收完成。
@@ -16,9 +19,10 @@
 Node direct storage、Profile policy/Node override、effective compiler 和 schema v3 已进入代码。v0.1 是否完成仍由
 `docs/design/V0_1_DESIGN.md` 的自动化、迁移和双发行版验收决定；本审计不替它提前宣告完成。
 
-设计收敛状态：v0.2 已收敛、v0.3 冻结、v0.4-v0.5 仍为设计草案，配套文档包括（[`DISKLESS_FINAL.md`](../design/DISKLESS_FINAL.md)、
+设计收敛状态是本审计当时的历史结论；当前 v0.3 及以前已冻结、v0.4 为唯一待实施版本，旧“v0.5”标签已撤销并改为
+主题化 `ram_rootfs` 保留设计。配套文档包括（[`DISKLESS_FINAL.md`](../design/DISKLESS_FINAL.md)、
 [`V0_2_PROGRAM_DESIGN.md`](../design/V0_2_PROGRAM_DESIGN.md)、[`V0_2_IMPL_DETAILS.md`](../design/V0_2_IMPL_DETAILS.md)、
-[`V0_2_CLI.md`](../design/V0_2_CLI.md)、[`V0_5_DESIGN.md`](../design/V0_5_DESIGN.md)、
+[`V0_2_CLI.md`](../design/V0_2_CLI.md)、[`RAM_ROOTFS_DEFERRED.md`](../design/RAM_ROOTFS_DEFERRED.md)、
 [`DISKLESS_OSS_COMPARISON.md`](../design/DISKLESS_OSS_COMPARISON.md)）。本轮收敛的硬性结论：
 reconciliation/远程控制与可续期 enrollment credential 均升级为**永久非目标**；per-boot 短时 capability token 保留；
 收敛为每个 diskless Profile 单一共享 rootfs；canonical phase = `install-post|rootfs-build|first-boot`，**无 `runtime` phase**。

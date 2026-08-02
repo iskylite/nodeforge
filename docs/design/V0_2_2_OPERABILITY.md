@@ -19,7 +19,7 @@ v0.2.2 不增加新的部署形态。它把 v0.2.0/v0.2.1 已有能力收敛为�
 | matrix | 当前可用 VMware 环境中的 distro/lifecycle/fault 固定发布矩阵 |
 | capacity | v0.2 规模内的有界并发与资源预算；大规模生产压测仍属 v0.4 |
 
-不包含 BIOS/PXELINUX（独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）、多 NIC/topology（v0.4）、ram_rootfs（v0.5）。
+不包含多 NIC/topology（v0.4）。
 
 ## 2. 持久化兼容
 

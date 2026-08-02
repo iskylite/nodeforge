@@ -1,13 +1,14 @@
-# NodeForge BIOS PXELINUX 设计（独立延后文档）
+# NodeForge BIOS PXELINUX 保留设计
 
-状态：设计冻结，实现未排期。不绑定产品版本号；最早在 v0.5 完成后实施。  
-前置条件：获得可重复使用的 x86_64 BIOS 物理机或 VMware x86_64 guest 验证环境。  
+状态：独立保留设计，实现未排期。不绑定产品版本号或既定 schema 号。
+前置条件：获得可重复使用的 x86_64 BIOS 物理机或 VMware x86_64 guest 验证环境。
 关联文档：[`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) `ENV-X86-VMWARE`。
+统一索引：[`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md)。
 
 本文从 v0.3 设计中剥离，收录所有 BIOS x86 PXELINUX install 相关的设计决策。
 BIOS 不再绑定 v0.3 或任何产品版本号；只有在其验证环境约束（`ENV-X86-VMWARE`）
-解除且 v0.5 完成后，才作为独立工作项进入实施计划。在此之前，v0.2/v0.3/v0.4/v0.5
-的版本设计、完成闸和路线图均不包含 BIOS。
+解除并重新完成 schema/CLI/验收评审后，才作为独立工作项进入实施计划。在此之前，当前产品版本设计、完成闸和
+实施顺序均不包含 BIOS。
 
 ## 1. 为什么独立
 
@@ -16,9 +17,8 @@ BIOS PXELINUX 是 x86_64 专属功能，当前实验室环境为 Apple Silicon +
 "版本已完成代码但无法完成验证"的矛盾状态。因此：
 
 - BIOS 从版本路线图中剥离，不再阻塞任何版本的完成；
-- BIOS 相关的 schema 变更（`firmware.mode`、catalog schema v8）一并延后；
-- 实施顺序固定在 v0.5（catalog v7）之后，避免独立工作项插入 v0.4/v0.5 前造成
-  两种不同 catalog shape 复用 v6 或 v7；
+- BIOS 相关的 schema 变更（`firmware.mode`）一并延后，具体 catalog 版本在未来实施时分配；
+- 不插入 v0.4 schema 演进，不复用 catalog v6；未来以当时产品基线直接替换到新的唯一 schema；
 - BIOS 的设计决策保留在此文档中，供环境就绪后直接参考。
 
 ## 2. 范围
@@ -37,7 +37,7 @@ BIOS **不**包含：多 NIC/VLAN/bonding（v0.4 范围）、reconciliation/远�
 ## 3. firmware.mode
 
 - 新增 Node direct `firmware.mode=uefi|bios`；**不**放入 Profile 或 `overrides`。
-- catalog schema 从 v7 直接替换为 v8（不迁移，见 v0.2.3 设计 §0）；旧 catalog 不被加载，
+- catalog schema 从未来实施时的产品基线直接替换到新分配版本（不迁移，见 v0.2.3 设计 §0）；旧 catalog 不被加载，
   操作员需重新 `setup`，新认领 Node 必须由管理员确认 desired `firmware.mode`。
 - DHCP observed firmware 只用于 mismatch/readiness 检查，不自动改写 desired property。
 - partition policy 仍用 v0.1 逻辑磁盘角色，由 effective compiler 结合 firmware 生成

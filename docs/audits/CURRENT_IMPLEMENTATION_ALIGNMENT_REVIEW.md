@@ -1,8 +1,8 @@
 # NodeForge 当前实现与设计对齐审查
 
 状态：当前实现事实审计
-审查基线：`97c6a10`（2026-07-31）
-产品版本：`0.2.3`
+审查基线：`a29ca69`（2026-08-02）
+产品版本：`0.3.1`
 配置 schema：v4（config.json，`AppConfig.schema_version`）
 Catalog schema：v5（`Catalog.schema_version`，v0.2.3 从 v4 直接替换升级）
 
@@ -20,6 +20,7 @@ Catalog schema：v5（`Catalog.schema_version`，v0.2.3 从 v4 直接替换升�
 - delivery/deployment/session/inventory/operation 持久化；
 - identity store、Profile metadata/provenance、clone、capability restart 语义；
 - ISO import durable worker、CLI exit mapping 与死代码清理；
+- v0.3 install-post canonical runner、generation-bound callback、journal/finalizer 与 v0.3.1 CLI；
 - 当前 CLI command tree、shell contract tests、HTTP tests 和实机/QEMU 记录；
 - `docs/design/`、`docs/audits/`、`docs/validation/` 与 README 导航。
 
@@ -27,7 +28,7 @@ Catalog schema：v5（`Catalog.schema_version`，v0.2.3 从 v4 直接替换升�
 
 ```text
 zig build test --summary all
-结果：441/441 tests passed
+结果：460/460 tests passed
 ```
 
 环境型 QEMU/VMware 脚本未在本轮重复执行；aarch64 VMware Rocky/Ubuntu diskless
@@ -42,13 +43,13 @@ x86_64 VMware 与重复 QEMU 不在当前完成闸，按
 
 | 维度 | 当前代码事实 |
 |---|---|
-| 产品版本 | `build.zig` 唯一值 `0.2.3`（`build.zig.zon` 同步） |
+| 产品版本 | `build.zig` 当前值 `0.3.1`；v0.3.1 增加 long node listing，不改变 config/catalog/DTO schema |
 | 程序 | `nodeforge`、`nodeforged`、`nodeforge-initrd`、`nodeforge-agent` 四个产物 |
 | config schema | `AppConfig.schema_version = 4`（v0.2.3 不变） |
 | catalog schema | `Catalog.schema_version = 5`（v0.2.3 从 v4 直接替换升级，不迁移） |
 | Catalog 布局 | manifest layout schema v1 + catalog schema v5，8 类 entity 文件 |
-| 节点交付 DTO | BootConfig v3、AgentPlan v1（v0.2.3 不升级） |
-| install/diskless | UEFI install 与 UEFI diskless 共存；BIOS/PXELINUX 尚未实现（v0.5 后独立延后项） |
+| 节点交付 DTO | BootConfig v3、AgentPlan v1（v0.3.1 不升级） |
+| install/diskless | UEFI install 与 UEFI diskless 共存 |
 
 “schema v3 已完成”只能描述 v0.1 历史里程碑，不能描述当前文件格式；“两个二进制”
 也不再是构建事实。catalog schema 变更一律直接替换（不迁移，见
@@ -145,7 +146,15 @@ v0.2.3 是 v0.2 系列最后一个收口版本，不增加部署形态。已落�
   `initrd_build_executor.build`（`buildFromInstaller` 保留，daemon worker 在用）；
 - aarch64 VMware Rocky/Ubuntu diskless 定向回归均已通过（2026-07-31）。
 
-### 2.6 当前 CLI 与目标 CLI 的边界
+### 2.6 v0.3/v0.3.1（已完成）
+
+v0.3 已把 install-post 扩展到 `managed_file|package|archive|script` 四类 canonical action，复用现有
+BootSession callback credential并在 `installer.started` 后固定 install generation；install-post journal、step attempt、
+finalizer WAL/恢复与 `node postprocess show --phase install-post --generation` 已落地。fresh 双机 install/diskless 发布闸
+通过，证据见 [`V0_3_VALIDATION.md`](../validation/V0_3_VALIDATION.md)。v0.3.1 只补 long node listing；AppConfig v4、
+catalog v5、BootConfig v3、AgentPlan v1 保持不变。v0.3 及更早版本设计按已落地冻结基线管理。
+
+### 2.7 当前 CLI 与目标 CLI 的边界
 
 v0.2.2/v0.2.3 已把 [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../design/CURRENT_CLI_OPTIMIZATION_PLAN.md)
 中的主要 proposed 项落地为现行接口：
@@ -228,23 +237,23 @@ initrd 都使用 session capability 上报，旧 generation/session 不可覆盖
 - **legacy profile identity 初始化**（[`V0_2_POST_RELEASE_BACKLOG.md`](../design/V0_2_POST_RELEASE_BACKLOG.md)
   §3.1 item 8）：旧 Profile（空 `ssh_identity`）首次使用时尚未实现确定性、可审计的
   identity 初始化；实测影响为 legacy profile 无法重建 rootfs（`IdentityNotFound`
-  fail closed）。回归以新建 v0.2.3 profile 规避。该项不阻塞 v0.2.3 完成，建议作为
-  v0.3 启动前的补丁或纳入 v0.3 Batch 1。
+  fail closed）。回归以新建 v0.2.3 profile 规避。该项不反向打开已经完成的 v0.2.3/v0.3 设计；
+  v0.4 通过 fresh replacement 和重新创建 Profile 消除旧 Profile 输入，不增加 legacy 初始化兼容路径。
 
 ## 5. 文档对齐结论
 
 | 文档 | 当前状态 |
 |---|---|
-| `README.md` | 已更新至四产物、schema v4/v5、v0.2.3 规划与 diskless 流程 |
-| `docs/README.md` | 已含当前审计、v0.2.1+ roadmap、v0.2.2/v0.2.3 入口 |
+| `README.md` | 已更新至四产物、schema v4/v5、当前 v0.3.1、v0.4 规划与 diskless 流程 |
+| `docs/README.md` | 已含当前审计、v0.2.1+ roadmap、v0.3 冻结基线、v0.4 与独立保留设计入口 |
 | `V0_2_DESIGN.md` | diskless 版本边界、跨域不变式、实现状态表 |
 | `V0_2_1_UBUNTU_DISKLESS.md` | casper layer productization，已完成 |
 | `V0_2_2_OPERABILITY.md` | 持久化兼容、异步 builder、CLI 收敛、矩阵，已完成 |
 | `V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md` | identity/recovery/ISO worker/exit mapping，已完成 |
-| `V0_2_1_PLUS_ROADMAP.md` | v0.2.0–v0.2.3 已完成；v0.3–v0.5 设计冻结、实现未开始 |
-| `V0_3_DESIGN.md` | BIOS PXELINUX install + install-post canonical 扩展，设计冻结 |
+| `V0_2_1_PLUS_ROADMAP.md` | v0.2.0–v0.2.3 已完成；v0.3 已完成；v0.4 设计冻结、实现未开始 |
+| `V0_3_DESIGN.md` | install-post canonical 扩展，已完成 |
 | `V0_4_DESIGN.md` | 多 NIC/topology/容量/PXE builder/install first-boot，设计冻结 |
-| `V0_5_DESIGN.md` | `ram_rootfs` materialization，设计冻结 |
+| `DEFERRED_DESIGN_INDEX.md` | static PXE、BIOS/PXELINUX、`ram_rootfs` 均为不编号、未排期的独立保留设计，不进入 v0.4 |
 
 历史审计中的“v0.2 尚未实现项”保留用于追溯，不再作为当前实现清单。
 
@@ -254,14 +263,12 @@ initrd 都使用 session capability 上报，旧 generation/session 不可覆盖
 v0.2.0 Rocky diskless 基线
   -> v0.2.1 Ubuntu casper productization（已完成）
   -> v0.2.2 operability + CLI convergence + fixed matrix（已完成）
-  -> v0.2.3 Profile identity/recovery/ISO worker/exit mapping（已完成，当前基线）
-  -> v0.3 install-post canonical extension（当时设计冻结、实现未开始）
+  -> v0.2.3 Profile identity/recovery/ISO worker/exit mapping（已完成）
+  -> v0.3/v0.3.1 install-post canonical extension + CLI（已完成，当前基线）
   -> v0.4 topology/capacity/PXE builder/install first-boot（设计冻结，实现未开始）
-  -> v0.5 ram_rootfs materialization（设计冻结，实现未开始）
-  -> BIOS PXELINUX（独立延后；最早在 v0.5 后实施，catalog v8）
 ```
 
 详细依赖、schema/DTO 表和每版完成闸见
 [`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md)。
-后续版本实施顺序固定为 v0.2.3 → v0.3 → v0.4 → v0.5；
+后续实施从已完成的 v0.3.1 基线进入 v0.4；
 reconciliation/远程控制为永久非目标。

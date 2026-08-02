@@ -8,9 +8,6 @@ v0.3 在 v0.2.3 完成（[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROF
 [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md)，共用 CLI 契约见 [`V0_2_CLI.md`](V0_2_CLI.md) §0，
 程序边界见 [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md) §7。
 
-BIOS x86 PXELINUX 已从本版本剥离，独立设计见
-[`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
-
 ## 发布结论
 
 **结论：v0.3 install-post canonical 能力在当前 aarch64 双机环境中 PASS，可以按本文
@@ -21,7 +18,7 @@ generation 3 真实 PXE E2E；Rocky 9.7、Rocky 10.2、Ubuntu 的两项 install 
 diskless VMware 矩阵。完整命令、摘要、journal 和 Compute Use 操作边界见
 [`../validation/V0_3_VALIDATION.md`](../validation/V0_3_VALIDATION.md)。
 
-发布结论只覆盖本文范围，不代表 BIOS PXELINUX、多 NIC/VLAN/bonding、规模容量或其他
+发布结论只覆盖本文范围，不代表多 NIC/VLAN/bonding、规模容量或其他
 未执行平台已经验证。旧 `repository`/`standard_packages` 被拒绝是预期产品结论，
 不是待补兼容项。
 
@@ -91,9 +88,7 @@ install-post 的能力缺口是当前最大的实现差异：
 v0.3 关闭这组差异：把 install-post 从受限形态升级为完整 canonical phase，
 与 rootfs-build/first-boot 统一执行模型，并补齐 callback generation 绑定。
 
-**不引入 catalog schema 变更**：`firmware.mode` 随 BIOS 一起延后
-（见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）；
-install-post 的四类 action 在 `ProvisionAction` enum 中已存在
+**不引入 catalog schema 变更**：install-post 的四类 action 在 `ProvisionAction` enum 中已存在
 （`src/model.zig`），只是 runner/validator 尚未接受。
 因此 v0.3 **保持 catalog schema v5**，BootConfig v3 和 AgentPlan v1 不变。
 
@@ -124,8 +119,7 @@ v0.3 聚焦 **install-post canonical 扩展**：
 | install-post journal/status | 是 | `(node_id, install_generation, bundle_revision, plan_digest, step_id, attempt)` 标识 |
 | 错误分类与长期运行回归 | 是 | bootloader/版本差异/错误分类 |
 
-v0.3 **不**包含：BIOS PXELINUX（独立延后，见
-[`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）；多 NIC/VLAN/bonding、
+v0.3 **不**包含：多 NIC/VLAN/bonding、
 大规模容量压测（-> v0.4）；install 侧 first-boot agent（-> v0.4）；
 reconciliation/远程控制（永久非目标）。
 
@@ -585,15 +579,13 @@ nodeforge node postprocess show <node> --phase install-post [--generation <id>]
 
 ## 6. 明确非目标（v0.3 增量）
 
-- BIOS/PXELINUX -> 独立延后文档
-  [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)，不绑定产品版本号，最早在 v0.5 后实施。
 - 多 NIC/VLAN/bonding、PXE 阶段纯静态、下载后切换地址/子网 -> v0.4
   （需显式 initrd/agent consumer feature、schema 和验收）。
 - 大规模容量压测 -> v0.4。
 - install 侧 first-boot agent -> v0.4（确定性，无 reconciliation）。
 - reconciliation/远程控制 -> 永久非目标（全版本）。
 - IPv6、by-id/serial/WWN -> 永久非目标（继承 v0.1）。
-- v0.3 不提供 v0.4/v0.5 命令的 help/handler；预留 enum 不算实现。
+- v0.3 不提供 v0.4 命令的 help/handler；预留 enum 不算实现。
 
 ## 7. 实施批次
 

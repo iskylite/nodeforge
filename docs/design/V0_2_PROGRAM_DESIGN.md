@@ -225,13 +225,10 @@ nodeforged 生成 BootConfig（per immutable DisklessEffectivePlan snapshot）
 install Profile 的 BootSession 在 `boot_config_fetched` 完成交付后终止，无 nodeforge-agent
 （install 侧 agent 延后 v0.4，且同样无 reconciliation）。nodeforge-agent 在 v0.2 仅 diskless 有。
 
-## 7. v0.3/v0.4/v0.5 的程序边界
+## 7. v0.3/v0.4 的程序边界
 
 - v0.3（install-post canonical 扩展）：增加 `install-post` phase 四类 canonical action，由安装器（Kickstart `%post`/
-Autoinstall `late-commands`）执行，无 nodeforge-agent；保持 catalog schema v5。BIOS PXELINUX 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
-- v0.4（延后增强项）：install 侧 first-boot agent（install generation + 磁盘 journal，一次性）；临时 PXE rootfs 构建节点
-  operation 驱动节点构建 rootfs（不远程重启、不向运行中 agent 下发任务）；多 NIC/VLAN/bonding 令 BootConfig
-  DTO 升 v3；以及容量压测。reconciliation/通用远程控制仍为永久非目标。
-- v0.5：可切换 rootfs 形态（`ram_rootfs`、`diskless.overlay.mode` 字段）；BootConfig DTO 升 v4，显式携带
-  mode/uncompressed size 并要求 `ram-rootfs-v1`，其余 credential/agent 边界不变，见
-  [`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
+Autoinstall `late-commands`）执行，无 nodeforge-agent；保持 catalog schema v5。
+- v0.4（统一增强项）：install 侧 first-boot agent（install generation + 磁盘 journal，一次性）；临时 PXE rootfs 构建节点
+  operation 驱动节点构建 rootfs（不远程重启、不向运行中 agent 下发任务）；多 NIC/VLAN/bonding 令 AgentPlan
+  升 v2、BootConfig 保持 v3；增加强制容量闸与 SN+IP draft Node discovery。reconciliation/通用远程控制仍为永久非目标。

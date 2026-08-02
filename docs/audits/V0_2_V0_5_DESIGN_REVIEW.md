@@ -1,9 +1,12 @@
 # NodeForge v0.2-v0.5 设计评审（基于 v0.1 M0-M4.13 实现）
 
 状态：2026-07-22 设计审计基线。本文回答“现有代码能复用什么、后续版本还缺什么、按什么顺序实现”。
-本文是历史快照；下文旧版 v0.3/BIOS 范围只用于追溯。当前路线已将 BIOS PXELINUX
-剥离为 v0.5 后的独立延后项，范围与 schema 编号以
+本文是历史快照；下文旧版 v0.3/BIOS 以及 v0.4 static bootstrap、BootConfig v4、跨版本
+active session 和 DTO 迁移结论只用于追溯，不再定义当前行为。v0.4 以
+[`V0_4_DESIGN.md`](../design/V0_4_DESIGN.md) 为准，版本号和顺序以
 [`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准。
+标题和下文“v0.5”是本审计当时使用、现已撤销的版本标签；对应设计只以
+[`RAM_ROOTFS_DEFERRED.md`](../design/RAM_ROOTFS_DEFERRED.md) 作为未排期主题保留稿，不代表 v0.4 后必然发布 v0.5。
 权威行为以各版本总纲及其职责分册为准：v0.2 入口是 [`V0_2_DESIGN.md`](../design/V0_2_DESIGN.md)，
 diskless 架构细节由 [`DISKLESS_FINAL.md`](../design/DISKLESS_FINAL.md) 负责。
 当前实现状态与后续版本编号以
@@ -75,12 +78,12 @@ initrd producer；`AssetKind.rootfs/nodeforge_initrd` 与 `BootBundleConfig` 没
 | v0.2 | 4 | UEFI diskless、builder、initrd、diskless agent、rootfs-build/node-apply/first-boot、恢复/失败闭环 | BIOS、多 NIC、rootfs mode |
 | v0.3 | 5 | BIOS PXELINUX install、`firmware.mode`、install-post | install agent、多 NIC |
 | v0.4 | 6 | ItemSpec 网络 topology、BootConfig v4 + AgentPlan v2、量化容量目标、临时 PXE rootfs 构建节点、install first-boot generation | 可切 rootfs 形态 |
-| v0.5 | 7 | `squashfs_overlay|ram_rootfs`、BootConfig v5、共享 artifact 与双模式内存预算 | NFS/iPXE/persistent overlay |
+| v0.5（历史标签，已撤销） | 7（历史草案） | `ram_rootfs` 考量已移至不编号保留稿；不再预占 BootConfig/schema | NFS/iPXE/persistent overlay |
 
 v0.3 的 BIOS 与发行版扩展应拆成两个可独立验收的 feature slice；共同点只有版本发布，不应让新增发行版阻塞
 PXELINUX。v0.4 的网络拓扑、容量、临时 PXE rootfs 构建节点和 install agent 是四个风险域，
-schema 可同版但实现/验收必须独立。v0.5 只改变 rootfs materializer；BootConfig 必须显式升版承载 mode，auth、状态机与
-agent 不分叉。
+schema 可同版但实现/验收必须独立。历史“v0.5”结论仅表示 `ram_rootfs` 只改变 rootfs materializer；若未来重新立项，
+是否升级 BootConfig 及具体编号必须从当时基线重新裁决，auth、状态机与 agent 不得无故分叉。
 
 ## 4. v0.2 推荐实施顺序
 

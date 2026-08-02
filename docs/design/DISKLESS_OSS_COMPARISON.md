@@ -50,7 +50,7 @@ NodeForge v0.2 的 diskless 必须满足以下硬约束（均来自 [`V0_2_DESIG
 
 - **机制**：iPXE 作为网络引导固件，执行脚本拉取 kernel/initrd 或 chainload。
 - **优点**：脚本化引导流程灵活，支持 HTTP/NFS/iSCSI 多源。
-- **否决理由**：引入第二引导栈（iPXE），增加 BIOS/UEFI 兼容与维护负担；v0.2 用 GRUB + 标准 PXELINUX
+- **否决理由**：引入第二引导栈（iPXE），增加 firmware 兼容与维护负担；v0.2 用 UEFI GRUB
   DHCP/TFTP 已足够；iPXE 菜单/脚本属永久非目标（[`V0_2_DESIGN.md`](V0_2_DESIGN.md) §7）。
 - **结论**：排除。
 
@@ -62,8 +62,6 @@ NodeForge v0.2 的 diskless 必须满足以下硬约束（均来自 [`V0_2_DESIG
 - **子方案对比**：
   - **squashfs + overlay tmpfs**：lower 为压缩 squashfs（loop 只读），upper 为 tmpfs。内存占用中、
     lower 跨 Node 共享、overlayfs 原生。**NodeForge v0.2 采纳**。
-  - **ram_rootfs（全内存）**：整 rootfs 解压进内存。内存占用高、需预算校验、不可共享 lower。**v0.5 单独项**
-    （[`V0_5_DESIGN.md`](V0_5_DESIGN.md)）。
 - **结论**：squashfs_overlay 为 v0.2 唯一形态。
 
 ### 3.5 容器/镜像 stateless（CoreOS ignition）
@@ -86,15 +84,15 @@ builder 消费与 Profile 查询相同的 environment/group/task/package selecti
 
 ## 4. 约束匹配矩阵
 
-| 约束 | NFS root | iSCSI/AoE | iPXE | squashfs_overlay(本文) | ram_rootfs(v0.5) |
-|---|---|---|---|---|---|
-| local-only 离线切根 | ✗ | ✗ | 部分 | ✓ | ✓ |
-| IPv4 单进程协议栈 | ✓ | ✗(额外栈) | ✗(第二引导栈) | ✓ | ✓ |
-| per-Node 差异落 overlay | N/A | 需额外设计 | 脚本 | ✓ | ✓ |
-| 共享 rootfs lower | ✓(NFS 单份) | 部分 | 取决 | ✓ | ✗(各节点解压) |
-| VMware 可验证 | ✓ | 难 | 难 | ✓ | ✓(需大内存) |
-| 内存占用 | 极低 | 低 | 低 | 中 | 高 |
-| 持久化 overlay 需求 | N/A | 需 | N/A | 不提供(非目标) | 不提供(非目标) |
+| 约束 | NFS root | iSCSI/AoE | iPXE | squashfs_overlay(本文) |
+|---|---|---|---|---|
+| local-only 离线切根 | ✗ | ✗ | 部分 | ✓ |
+| IPv4 单进程协议栈 | ✓ | ✗(额外栈) | ✗(第二引导栈) | ✓ |
+| per-Node 差异落 overlay | N/A | 需额外设计 | 脚本 | ✓ |
+| 共享 rootfs lower | ✓(NFS 单份) | 部分 | 取决 | ✓ |
+| VMware 可验证 | ✓ | 难 | 难 | ✓ |
+| 内存占用 | 极低 | 低 | 低 | 中 |
+| 持久化 overlay 需求 | N/A | 需 | N/A | 不提供(非目标) |
 
 ## 5. 选型结论
 
@@ -105,9 +103,7 @@ v0.2 固定 **squashfs_overlay + 标准 dracut initrd + HTTP 下载 + BootConfig
 3. per-Node 差异经 BootConfig（per-boot、per-Node 短时 DTO）落 overlay upper，rootfs lower 按 effective
    digest 跨 Node 共享。
 4. 借鉴 CoreOS ignition “配置 boot 时注入”理念，但用通用发行版 rootfs + NodeForge BootConfig 实现。
-5. 内存占用适中、VMware 可验证；`ram_rootfs` 全内存模式作为 v0.5 可选项
-   （[`V0_5_DESIGN.md`](V0_5_DESIGN.md)），与 squashfs_overlay 共享 BootConfig/initrd/agent/协议栈，仅
-   rootfs 物化不同。
+5. 内存占用适中、VMware 可验证。
 
 ## 6. 对 NodeForge 设计的影响
 
@@ -115,4 +111,3 @@ v0.2 固定 **squashfs_overlay + 标准 dracut initrd + HTTP 下载 + BootConfig
 - **复用** `nodeforged` 内置 DHCP/TFTP/HTTP；rootfs 路由为 node-bound GET/HEAD/Range。
 - **构建** OS 层用发行版原生工具（lorax/debootstrap），rootfs-build phase 在其上追加业务内容。
 - **initrd** 用 dracut 注入 `nodeforge-initrd` 引导程序（[`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md)）。
-- **形态切换** 延后 v0.5（`diskless.overlay.mode`），v0.2 不提供 mode 字段（单值无选择意义）。

@@ -541,9 +541,7 @@ v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不�
 | v0.2.1 | Ubuntu diskless | Ubuntu casper productization，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
 | v0.2.2 | 可运营性和当前环境矩阵 | 持久化兼容、durable builder、CLI 收敛、memory readiness、aarch64 VMware UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md)；本地不可验证项见 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) |
 | v0.3 | install-post canonical 扩展 | install-post 四类 canonical action、callback generation 绑定与 journal；保持 catalog schema v5，见 `V0_3_DESIGN.md` |
-| BIOS PXELINUX | 独立延后 | x86 BIOS PXELINUX install，不绑定产品版本号，最早在 v0.5 后实施，见 `BIOS_PXELINUX_DEFERRED.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、临时 PXE rootfs 构建节点；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
-| v0.5 | rootfs 形态 | 可切换 rootfs 形态（`ram_rootfs` 全内存模式、`diskless.overlay.mode` 字段），见 `V0_5_DESIGN.md` |
 
 下文 M5-M7 仍按里程碑组织，每节标注其目标版本；未标 v0.2 的内容不计入 v0.2 完成。
 
@@ -554,7 +552,7 @@ v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不�
   boot readiness/DeliveryManifest 阶段与 kernel modules ABI 联合校验。
 - node-bound、capability-authenticated rootfs HTTP GET/HEAD/Range。
 - 小 initrd 联网、配置获取、digest 校验、下载恢复、overlay 和 switch_root。
-- v0.2 固定 `squashfs_overlay`（squashfs lower + tmpfs overlay upper）为唯一 rootfs 形态；可切换 rootfs 形态（`ram_rootfs` 等）作为 v0.5 单独项，不在 v0.2。
+- v0.2 固定 `squashfs_overlay`（squashfs lower + tmpfs overlay upper）为唯一 rootfs 形态。
 - `local-only` rootfs/initrd 离线策略、目标静态地址与 MAC reservation 一致性和 BootConfig secret 边界。
 - diskless readiness、status、failure quarantine、retry 和事件闭环。
 - target-system、software 和 kernel arguments 直接复用 v0.1 effective compiler。
@@ -563,17 +561,16 @@ Diskless 不消费安装磁盘选择器，但必须复用同一个 Profile/Node 
 users/packages/network 默认值。凡是描述“最终运行系统”的 system/software/kernel/network override，diskless 与 install
 使用同一 effective 语义；只有 partition/bootloader/reinstall/completion 等依赖安装生命周期或持久磁盘的字段不适用。
 
-### M6：多 NIC/容量与 BIOS 延后项
+### M6：多 NIC 与容量
 
 - bootloader、发行版版本差异、错误分类和长期运行回归。
 - 最小功能并发、失败恢复验证（大规模容量压测延后 v0.4）。
-- BIOS x86 PXELINUX 独立延后，不绑定产品版本号，最早在 v0.5 后实施，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
 
 IPv6 是项目永久非目标，不进入 M6 或后续 schema。
 
-BIOS PXELINUX 从 v0.3 剥离，独立延后。
-diskless 最小功能并发已在 M5（v0.2）验证。其中 PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网，
-以及大规模容量压测，在 VMware 难以有效验证且不属主流程，**延后到 v0.4**（需显式 consumer feature、schema 和验收）。
+diskless 最小功能并发已在 M5（v0.2）验证。其中多 NIC、VLAN、bonding、下载后切换目标地址/子网和大规模容量压测
+延后到 v0.4（需显式 consumer feature、schema 和验收）。v0.4 PXE bootstrap 仍使用 DHCPv4；稳定地址由
+`pxe.ip_reservation` 提供，不新增绕过 DHCP 的 firmware static PXE。
 
 ### M7：补充包和后处理增强（rootfs-build/first-boot -> v0.2；install-post -> v0.3；install-agent -> v0.4；reconciliation 永久非目标）
 
@@ -585,7 +582,7 @@ diskless 最小功能并发已在 M5（v0.2）验证。其中 PXE 阶段纯静�
 M7 扩展 v0.1 已有的最小 install-post provision bundle，不改变其 Assets owner。它复用 v0.1 软件
 capability/selection，不再引入 `standard_packages` 作为第四个包配置事实源。 v0.2 实现 `rootfs-build`（build 期，
 服务端 builder）与 `first-boot`（diskless 切根后 agent 开机顺序执行一次性后处理）phase；`install-post` 随 v0.3
-（PXELINUX install）落地，install 侧 agent 延后 v0.4（reconciliation 为永久非目标，见 §7）。
+落地，install 侧 agent 延后 v0.4（reconciliation 为永久非目标，见 §7）。
 
 ## 3. 从 v0.1 继承的强制契约
 
@@ -651,16 +648,16 @@ Profile 在 v4 映射到 `ProfileKind.install`；install/diskless Profile 都必
 另引用与该 source 一致的完整 boot bundle（source + kernel + nodeforge-initrd，明确不含 rootfs）。build readiness
 通过后才允许构建派生 rootfs，boot readiness 通过后才允许
 `deploy=true`。
-v4-v7 复用 v0.1 已落地的 schema-v3 发布事务机制：plan/digest、journal、apply/rollback 与 daemon 启动崩溃恢复沿用
+v4-v6 复用 v0.1 已落地的 schema-v3 发布事务机制：plan/digest、journal、apply/rollback 与 daemon 启动崩溃恢复沿用
 同一套 `.schema-v3` 风格事务目录与活动 session snapshot，不为每个版本另起迁移原语。`catalog/dto.zig`（原 `schema_v3_dto.zig`）
 现拒绝 `schema_version != 4`，后续各版本新增对应 parser 校验分支并把 config 与 catalog 的 `schema_version` 同步提升；
 旧 parser 不得接受半成品 nullable v0.2 shape。v0.2 不提供迁移 CLI 命令，schema v4 是唯一标准。
 
 catalog schema 变更采用直接替换（不迁移），见 v0.2.3 设计 §0。旧版本 catalog 不被加载
 （`UnsupportedSchemaVersion`），操作员需重新 `setup`。不实现 migration journal、
-rollback 或 downgrade preflight。active/recoverable session 始终消费创建时 immutable
-snapshot，不随 catalog schema 替换重编译。统一细节见
-[`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) §5，v0.3-v0.5 均复用该契约。
+rollback 或 downgrade preflight。同一 deployment 内的 session 始终消费创建时 immutable snapshot；但 v0.4
+采用更严格的 fresh replacement，旧 deployment 的 catalog/state/session/artifact 全部拒载，不存在跨版本 session 延续。
+统一细节见 [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) §5 和 [`V0_4_DESIGN.md`](V0_4_DESIGN.md) §2。
 
 ### 3.1 schema v3 到 v4 的唯一转换
 
@@ -749,7 +746,7 @@ lineage，保证能回答“这个 Profile 基于哪个 OS 源、从哪个 Profi
 | 属性（v0.1 canonical） | diskless 适用性 | 说明 |
 |---|---|---|
 | Node `mac`/`arch`/`profile`/`pxe.ip_reservation`/`hostname`/`deploy` | 可用 | `deploy` 闸 diskless PXE；`pxe.ip_reservation` 为 DHCP 预留 |
-| Node `http_accel` | 可用（UEFI） | 仅 GRUB 取 kernel/initrd；BIOS not-applicable（见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)）；不治理 initrd rootfs 下载（见 §5.1）|
+| Node `http_accel` | 可用（UEFI） | 仅 GRUB 取 kernel/initrd；不治理 initrd rootfs 下载（见 §5.1）|
 | Node `network.*` | 可用 | 目标系统网络，见下文网络标准 |
 | Node `storage.boot_disk`/`additional_disks` | 持久但不消费 | diskless effective 标记 not-applicable；保留以便日后绑 install Profile |
 | Node `overrides.software.*` | 全部可用（node-apply） | repositories/environment/groups/tasks/packages include/exclude 原样复用 v0.1 merge；解析为 pinned local repository/package closure 后重放，不改变公共 rootfs |
@@ -820,7 +817,8 @@ sshd（SSH enabled 时）及其必需依赖；若 effective delta 会移除 prot
 renderer capability 必须在 effective/readiness 阶段共同校验。initrd 下载期间不切换地址，也不写 renderer 配置；
 `switch_root` 后由 agent pre-init 在最终 rootfs 写入持久网络配置，再由 NetworkManager/Netplan 接管同一地址；不一致必须在切根前的
 server/initrd 检点或真正 init 前的 agent 检点以稳定 reason 失败，不能回退到未声明
-DHCP 目标配置。PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网不属于 M5，亦不在 M6 范围，延后到 v0.4。
+DHCP 目标配置。多 NIC、VLAN、bonding 和下载后切换目标地址/子网不属于 M5，亦不在 M6 范围，延后到 v0.4；
+绕过 DHCP 的 firmware static PXE 不随之进入 v0.4。
 renderer 由 adapter capability 选择：RHEL 系写 NetworkManager connection、Ubuntu 写 Netplan，均以
 `match.macaddress`/`connection.mac-address` 绑定 `node.mac` 对应的启动 NIC；`network.mode=dhcp` 时目标系统在
 `switch_root` 后对同一 NIC 重新 DHCP（沿用该 MAC 的 `pxe.ip_reservation`），不写静态配置；`network.mode=static` 时
@@ -1201,10 +1199,6 @@ per-Node rootfs、variant、远程任务或真正 init 后的配置/artifact 下
 
 ### 5.1 M6
 
-BIOS 支持增加的是 Node confirmed firmware property和 bootloader adapter，不是 Profile 的物理磁盘 owner。
-BIOS 相关的 `firmware.mode`、schema 变更、partition policy 和 `http_accel` 对 BIOS fail-closed 的完整设计
-见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。BIOS 不绑定产品版本号，最早在 v0.5 后实施。
-
 `http_accel` 治理的是 GRUB 在 PXE 阶段用 HTTP 取 kernel/initrd 的传输路径（install 与 diskless 共用，仅 UEFI）；它不
 治理 initrd 自身用 node-bound capability route 发起的 rootfs GET/HEAD/Range 下载--后者始终走受认证 HTTP 路由，与
 `http_accel` 开关无关。
@@ -1366,7 +1360,7 @@ PropertySpec/CollectionSpec/ItemSpec 再给 handler；预留 enum/空 handler �
 
 **v0.3（install-post canonical 扩展）**：既有 `install.post_install.bundle`/`install-post` 从 schema v4 的受限 managed-file
 兼容形态扩展为四类 canonical action、generation callback 和完成闸；增加
-`node postprocess show --phase install-post --generation`。BIOS PXELINUX 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md)。
+`node postprocess show --phase install-post --generation`。
 
 **v0.4（延后增强项）**：Node direct network topology ItemSpec、builder placement + 临时 PXE rootfs 构建 operation、
 大规模容量压测与 install 侧 agent generation 查询随其设计落地；
@@ -1376,8 +1370,8 @@ reconciliation/远程控制为永久非目标，无对应 CLI（见 §7）。v0.
 
 | 领域 | 当前结论 | 后续增量 |
 |---|---|---|
-| Profile/model | schema v4 `install|diskless`、boot bundle、三投影/两摘要已实现 | v0.3 不增加 firmware schema（BIOS 独立延后） |
-| boot target | install/diskless UEFI GRUB 分支已接线 | BIOS/PXELINUX 独立延后，见 [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md) |
+| Profile/model | schema v4 `install|diskless`、boot bundle、三投影/两摘要已实现 | v0.3 不增加 firmware schema |
+| boot target | install/diskless UEFI GRUB 分支已接线 | 保持 UEFI GRUB 唯一路径 |
 | HTTP delivery | BC v3/AP v1、rootfs/payload/agent/event/facts route 与四域 token 已实现 | v0.2.2 补 restart/abuse 矩阵 |
 | rootfs builder | Rocky dnf 路径已实现；持久 queued/running operation + 有界 worker，重启确定性 interrupted | Ubuntu casper 属 v0.2.1；initrd builder 异步化仍属 v0.2.2 |
 | initrd builder | vendor initrd 不变前缀 + NodeForge overlay、generic dracut fallback 已实现 | Ubuntu 需正式 CLI 产品链验收 |
@@ -1397,12 +1391,10 @@ reconciliation/远程控制为永久非目标，无对应 CLI（见 §7）。v0.
 - v0.2 不提供持久化 overlay 或跨重启 rootfs partial：无盘 upper/work 重启即丢；`rootfs.part`
   仅在同一 BootSession/initrd 运行内 Range 续传。Profile SSH client/host keys 属于共享 rootfs 基线，不依赖持久
   overlay。完整语义见 `DISKLESS_FINAL.md` §4。
-- v0.2 不支持 PXE 阶段纯静态、多 NIC、VLAN、bonding 或下载后切换地址/子网；该项延后到 v0.4，需显式 capability 扩展，
-  不得由 initrd 猜测或静默接受。
+- v0.2 不支持多 NIC、VLAN、bonding 或下载后切换目标地址/子网；这些能力延后到 v0.4，需显式 capability 扩展，
+  不得由 initrd 猜测或静默接受。no-DHCP firmware static PXE 不在 v0.4，稳定 PXE 地址仍由 DHCP reservation 提供。
 - 在线/远程 mirror rootfs 模式或可切换的 `local-only` 开关；v0.1 删除 `connectivity.mode` 正因 `local-only` 是唯一行为，M5
   rootfs/initrd 恒 `local-only`，不存在 online 变体，也不新增 `local-only` PropertySpec。
-- 可切换的 rootfs 形态（`ram_rootfs` 等全内存模式、`diskless.overlay.mode` 字段）作为 v0.5 单独项；v0.2 固定 `squashfs_overlay`，
-  不提供 mode 字段（同上单值无选择意义逻辑）。
 - NFS root（任何形态）、iPXE 菜单/脚本；临时 PXE rootfs 构建节点延后 v0.4。
 - enrollment 机制（可续期的运行期节点认证 secret）全版本不引入；boot/first-boot 仍使用与 session 或 generation
   绑定、短时、最小权限且服务端只存 hash 的 capability token，不能升级为 management credential。
@@ -1464,15 +1456,14 @@ install 侧 agent 属 v0.4（reconciliation/远程控制为永久非目标，见
   uncompressed size + 完整 upper limit + safety margin；readiness
   用 inventory 减 kernel/initrd，initrd 直接使用 `MemAvailable`，不得重复扣 kernel/initrd。无 inventory 时 readiness 明示
   unknown/checked required minimum，并由 initrd 实测硬闸。若 rootfs uncompressed size 本身未知，则只告警并跳过
-  容量硬闸，不得把 compressed size 当作替代值。可切换 rootfs 形态
-  （`ram_rootfs` 等）属 v0.5，不纳入 v0.2 验收。
+  容量硬闸，不得把 compressed size 当作替代值。
 - install Profile 的既有 PXE、全部 v0.1 storage/software/override 和 schema v3 migration 回归不退化。
 
 ### 9.2 M6（v0.3）
 
 - install-post 从既有受限形态扩展为四类 canonical action；旧 `repository`/`standard_packages` 退出。
 - install-post callback 复用 BootSession credential；session/generation/plan 固定、重复事件幂等、旧 attempt、错误 plan、跨 Node、终态后事件与 daemon restart 负测通过。
-- catalog schema 保持 v5（无 schema 变更）；BIOS PXELINUX 独立延后，不参与完成判定。
+- catalog schema 保持 v5（无 schema 变更）。
 
 ### 9.3 M7（rootfs-build/first-boot -> v0.2；install-post -> v0.3；install-agent -> v0.4；reconciliation 永久非目标）
 
@@ -1556,34 +1547,30 @@ owner 或 v0.2 进入条件。
 
 **第二十二轮（跨版本契约复审）**：修正 digest 漂移分类，明确 identity/network/secret/overlay 只改变 desired plan、
 不分裂 rootfs cache；补通用 opaque operation show/wait、stdout/stderr 与 exit code 边界，删除 `preflight --scope` 双语法；
-修复 managed-file 字段矩阵与 BootConfig config digest 自引用、session supersede CAS。v0.3 将 BIOS 独立延后，
+修复 managed-file 字段矩阵与 BootConfig config digest 自引用、session supersede CAS。v0.3 的
 install-post 以 install generation 标识并只在 installer 内自动 retry。v0.4 网络改为 ItemSpec topology +
-BootConfig v4 bootstrap transport + AgentPlan v2 target topology，
+AgentPlan v2 target topology/bootstrap lease snapshot，BootConfig 保持 v3，
 节点构建收敛为临时 PXE rootfs 构建 operation，install first-boot 补磁盘 handoff/journal，容量验收补 workload/SLO 证据。
-v0.5 固定复用同一 squashfs 传输制品，BootConfig 升 v5，mode 只改变 desired/delivery digest、不改变 rootfs input digest。
 
 **第二十三轮（实现契约与认证复审）**：恢复 v0.1 冻结的 Assets import owner/参数顺序与 provision-bundle `steps`
 collection；Profile boot effective 只输出可证明 requirements，resolved projection 归 Node，`postprocess show` 改为
-active-first。v0.3 把现有 BootSession callback credential 固定到 install generation。v0.4 topology 增 `routes` 并冻结无损迁移，全部新 delivery
-统一使用 BootConfig v4 + AgentPlan v2；临时构建节点补 BuilderBootAttempt、boot-slot 互斥、scoped upload claim 和 digest 边界，install
-first-boot 补一次性 bootstrap token 交换。v0.5 冻结 ram_rootfs 双预算公式、feature 适用性与 unsquashfs metadata 保真。
+active-first。v0.3 把现有 BootSession callback credential 固定到 install generation。v0.4 topology 增 `routes` 并采用直接替换，全部 fresh delivery
+统一使用 BootConfig v3 + AgentPlan v2；临时构建节点补 BuilderBootAttempt、boot-slot 互斥、scoped upload claim 和 digest 边界，install
+first-boot 补一次性 bootstrap token 交换。
 
 **第二十四轮（历史可执行性复核，已由 v0.3 §0.1 裁决取代）**：曾规划 install callback raw token 通过 per-generation credential capsule 以 0400
 文件交付，服务端只持 hash 且 restart 后不产生并行有效 token。v0.4 要求 effective compiler 在选择物理 builder Node
-前唯一导出 capability class/ABI 并固定 input digest。v0.5 将内存校验改为规范化 available budget：运行态限制展开根，
-峰值同时计入 compressed/uncompressed 副本，避免对 initrd `MemAvailable` 重复扣 kernel/initrd，并冻结 checked
-`required_min_memory_bytes` 公式。
+前唯一导出 capability class/ABI 并固定 input digest。
 
 **第二十五轮（协议恢复与迁移复核）**：DHCP 新 XID 改为 correlation-window transaction alias，不再自动误杀同次 PXE；
 BootConfig token 改为 single-purpose bounded replay，以 `diskless.initrd_started` config digest 确认；冻结 hash-only raw
 token 在 capsule 交付前/中的 restart 恢复边界和鉴权错误归责。catalog schema 变更统一采用直接替换
-（不迁移，见 v0.2.3 设计 §0）；v0.2 squashfs 内存预算与 v0.5 共用 available-budget 口径。
+（不迁移，见 v0.2.3 设计 §0）。
 
-**第二十六轮（v0.2-v0.5 再复审）**：修正 workflow 遗留的旧 asset/item CLI；diskless Node software override
+**第二十六轮（diskless 契约再复审）**：修正 workflow 遗留的旧 asset/item CLI；diskless Node software override
 保留与 install 相同的 effective merge，切根后由 agent `node-apply` 重放，不进入公共 rootfs；diskless Profile password hash 改为按
 credential revision 固定，避免 per-session salt 破坏可复现 rootfs；mandatory Profile client key 与 effective-hosts
-known_hosts 重算保证标准路径的域内互信。统一 rootfs cache key、BootConfig 挂载/投影顺序和 agent session/token 身份；
-v0.5 mode 固定为 Profile-only，schema v8 下两种取值均显式表达。
+known_hosts 重算保证标准路径的域内互信。统一 rootfs cache key、BootConfig 挂载/投影顺序和 agent session/token 身份。
 
 **第二十七轮（initrd / Node override 边界复审）**：删除 initrd 内静态配置 projector 的设计残留。nodeforged 只编译
 immutable `node_apply_projection`；initrd 只 transport/verify/mount/handoff，并以 rootfs 内

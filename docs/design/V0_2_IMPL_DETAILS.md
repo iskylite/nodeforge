@@ -309,19 +309,18 @@ manifest、event 或日志都不得包含 private key bytes。
   `facts_url`，由 initrd 上报 `MemTotal`）。facts 不是启动进度确认：服务端持久化
   inventory 供后续 readiness 预检，当前启动仍必须以本机 `/proc/meminfo` 的
   `MemAvailable` 执行硬闸；facts 上报失败只记录 warning，不能把成功 POST 误判为容量通过。
-- AgentPlan DTO `schema_version` v1（独立命名空间）；v0.4 target topology 升 v2，v0.5 保持 v2。
+- AgentPlan DTO `schema_version` v1（独立命名空间）；v0.4 target topology 升 v2。
 - v0.2.3 Profile identity/provenance 使用 catalog schema v5；v0.3
-保持 schema v5（install-post canonical 扩展）；BIOS PXELINUX 独立延后；v0.4 schema v6；v0.5 rootfs 形态 schema v7，见
-[`V0_5_DESIGN.md`](V0_5_DESIGN.md)。
-- v0.2.2 不提供 `catalog migrate` CLI 命令；schema v4 是其唯一标准。后续版本
-  （v0.2.3-v0.5）新增 schema 变更时采用**直接替换**：代码中的版本校验从旧版本
+保持 schema v5（install-post canonical 扩展）；v0.4 schema v6。
+- v0.2.2 不提供 `catalog migrate` CLI 命令；schema v4 是其唯一标准。后续已进入当前路线的版本
+  新增 schema 变更时采用**直接替换**：代码中的版本校验从旧版本
   改为新版本，旧 schema catalog 不被加载（`UnsupportedSchemaVersion`），操作员
   需重新 `setup`。不实现迁移、rollback、downgrade 检查或 migration journal。
-- active/recoverable session、install generation 和 builder attempt 始终消费创建时 immutable delivery snapshot；catalog
-  schema 替换不重编译、不改写或撤销这些 snapshot。旧 rootfs artifact 按 digest
-  自然不会命中新 schema 的 build。
+- 同一 deployment 内的 active/recoverable session、install generation 和 builder attempt 始终消费创建时 immutable
+  delivery snapshot，不因同版本 catalog mutation 重编译。v0.4 的版本替换更严格：旧 deployment 的
+  catalog/state/session/artifact 全部拒载，不延续旧 active snapshot；旧 rootfs artifact 也不重新登记。
 - 各版本 schema 替换验收必须覆盖：新版本 catalog 正常加载、旧版本 catalog
-  被拒绝、活动 snapshot 跨版本替换继续完成。旧 initrd 未声明 feature 时仅阻止新 readiness/delivery，不静默忽略，也不杀死旧 active snapshot。
+  被拒绝；v0.4 还必须覆盖旧 state/session/artifact 全部拒载与 fresh rebuild。
 
 ## 6. event 脱敏
 

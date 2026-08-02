@@ -105,6 +105,17 @@ events
 runtime
 ```
 
+`setup` 的 reset/purge 边界：
+
+| 入口 | 保留/删除语义 |
+|---|---|
+| `--reset-state --yes` | 备份并清空 runtime state；保留 config、catalog、assets、work、logs、backups |
+| `--reset-all --yes` | 另重新生成 config；默认仍保留 catalog/assets，不等于 fresh replacement |
+| `--reset-all --purge-data --yes` | 再删除 catalog/assets；保留 work/logs/backups |
+| `--reset-all --purge-all --reconfigure --yes` | 不可恢复地删除 catalog/assets/work/logs/backups/migration history，生成空部署并重新发布 unit |
+
+所有 reset/purge 要求 daemon 已停止；`--reconfigure` 不调用 `systemctl start/restart`。
+
 推荐主流程：
 
 ```text
