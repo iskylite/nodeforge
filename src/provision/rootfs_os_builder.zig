@@ -17,22 +17,21 @@ const dto = @import("../http/diskless_dto.zig");
 const namespaced_chroot_executor = @import("namespaced_chroot_executor.zig");
 const identity_store = @import("../state/identity_store.zig");
 
-/// archive action 的压缩能力属于 rootfs 基线，而不是某个 bundle 的可选软件。
-/// GNU tar 自动识别 gzip/xz，但仍需要对应外部解压程序。
-const dnf_baseline_packages = [_][]const u8{
-    "bash",      "coreutils",    "tar",        "gzip",    "xz",             "dnf",
-    "systemd",   "shadow-utils", "util-linux", "iproute", "NetworkManager", "openssh-server",
-    "procps-ng",
+const dnf_core_packages = [_][]const u8{
+    "bash",    "coreutils",      "dnf",            "systemd",   "shadow-utils", "util-linux",
+    "iproute", "NetworkManager", "openssh-server", "procps-ng",
 };
+
+/// archive 并非每个 Profile 都会使用。builder 默认尝试提供这些工具，但缺失只
+/// 降低可选 action 能力，不得阻断普通 rootfs。
+const archive_tool_packages = [_][]const u8{ "tar", "gzip", "xz" };
+const archive_tool_files = [_][]const u8{ "usr/bin/tar", "usr/bin/gzip", "usr/bin/xz" };
 
 const casper_required_files = [_][]const u8{
     "sbin/init",
     "usr/lib/systemd/systemd",
     "usr/bin/apt",
     "usr/sbin/sshd",
-    "usr/bin/tar",
-    "usr/bin/gzip",
-    "usr/bin/xz",
 };
 
 /// 在 staging 目录内用发行版原生工具构建 OS 层。`repository_urls` 为
@@ -45,7 +44,8 @@ const casper_required_files = [_][]const u8{
 /// 路径，与 `casper_layers` 一一对应、base→top 有序）只在 `package_manager ==
 /// .apt` 时有意义；dnf 分支忽略。
 ///
-/// v1：安装最小可 chroot 基线（bash/coreutils/tar/gzip/xz + 包管理器），足以叠加
+/// v1：安装最小可 chroot 基线，并尽力补充 tar/gzip/xz archive 工具；后者缺失
+/// 只产生 warning，只有实际引用相应 archive 的 action 才会失败。
 /// rootfs-build phase 的 managed_file/archive/script/package 步骤；Profile
 /// software/system 全量烤入留作后续保真项（见 `docs/validation`）。
 pub fn buildOsLayer(
@@ -121,8 +121,6 @@ fn buildCasperOverlay(
         std.Io.Dir.cwd().deleteTree(io, layer_dir) catch {};
     }
 
-    // archive action 统一使用 `tar -xf` 自动识别压缩格式；casper 输入必须
-    // 明确提供 tar/gzip/xz，不能依赖“Ubuntu 通常会带”的隐式假设。
     for (casper_required_files) |rel| {
         const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging, rel });
         defer allocator.free(abs);
@@ -130,6 +128,14 @@ fn buildCasperOverlay(
             std.log.scoped(.rootfs_build).err("casper overlay missing expected baseline file: {s}", .{abs});
             return error.CasperOverlayIncomplete;
         }
+    }
+    // casper layer 通常包含这些工具，但 archive 是可选能力。缺失时保留一个
+    // 可定位 warning；不能因为当前 Profile 根本没有 archive action 而拒绝 rootfs。
+    for (archive_tool_files) |rel| {
+        const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ staging, rel });
+        defer allocator.free(abs);
+        if (!fileExists(io, abs))
+            std.log.scoped(.rootfs_build).warn("casper overlay lacks optional archive tool: {s}; compressed archive actions may fail", .{abs});
     }
 
     // casper 安装器层的默认 target 可能指向安装器专用逻辑；覆盖为
@@ -154,15 +160,18 @@ fn buildDnf(
     try std.Io.Dir.cwd().createDirPath(io, staging);
     // 可启动且可由 nodeforge-agent 收敛的基线。不能只满足 chroot：node-apply
     // 固定使用 usermod/systemctl，切根后的系统还需要 init、网络与 SSH 服务。
-    // GNU tar 对 gzip/xz 的自动识别仍会调用对应外部程序。把两者固化为
-    // rootfs 基线，保证 rootfs-build 与 first-boot 都能执行受支持 archive。
     // 空 staging 尚无 dnf/rpm，bootstrap 必须由 host dnf + --installroot 完成；
     // 与旧实现的区别是该 host-context 被限制在独立 mount/PID namespace 中，并
     // 显式为 staging bind-mount /dev、/proc、/sys。OS 层完成后的 package 步骤
     // 才统一进入 chroot。
-    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &dnf_baseline_packages, repository_urls, true, .installroot, 0, false) catch |err| {
+    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &dnf_core_packages, repository_urls, true, .installroot, 0, false) catch |err| {
         std.log.scoped(.rootfs_build).err("os-layer dnf namespaced install failed: {t}", .{err});
         return error.OsLayerBuildFailed;
+    };
+    // 默认尽力补齐 tar/gzip/xz。仓库裁剪或定制发行版缺少它们时只告警；普通
+    // rootfs 仍可发布，真正使用 archive 时由统一 `tar -xf` action/journal 报错。
+    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &archive_tool_packages, repository_urls, true, .installroot, 0, false) catch |err| {
+        std.log.scoped(.rootfs_build).warn("optional archive tools were not fully installed: {t}; archive actions may fail", .{err});
     };
 
     // 构建期与运行期都只使用 nodeforged 发布的 HTTP repository。这里清除
@@ -310,14 +319,15 @@ fn majorVersion(version: []const u8) []const u8 {
     return version[0..dot];
 }
 
-test "rootfs baseline guarantees gzip and xz archive extraction tools" {
+test "rootfs builder treats gzip and xz as optional archive capabilities" {
     inline for (.{ "tar", "gzip", "xz" }) |required| {
         var found = false;
-        for (dnf_baseline_packages) |package| found = found or std.mem.eql(u8, package, required);
+        for (archive_tool_packages) |package| found = found or std.mem.eql(u8, package, required);
         try std.testing.expect(found);
         const executable = "usr/bin/" ++ required;
         found = false;
-        for (casper_required_files) |path| found = found or std.mem.eql(u8, path, executable);
+        for (archive_tool_files) |path| found = found or std.mem.eql(u8, path, executable);
         try std.testing.expect(found);
+        for (casper_required_files) |path| try std.testing.expect(!std.mem.eql(u8, path, executable));
     }
 }

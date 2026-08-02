@@ -254,8 +254,9 @@ per-action 必填字段矩阵（`item add` 拒绝不适用的字段）：
   请求恢复 owner/mode/ACL/xattr。ctime 由内核维护且新 inode 必然改变，解压后 atime
   也没有可靠的跨系统 tar 恢复语义，二者不在“前后一致”的承诺内。
   `--compression` 默认 `none`，后缀必须严格匹配 `.tar`、`.tar.gz`/`.tgz` 或
-  `.tar.xz`/`.txz`。rootfs 基线包含 `tar`、`gzip`、`xz`，执行端对三种格式始终使用
-  同一条 `tar -xf`，不按后缀分叉。
+  `.tar.xz`/`.txz`。rootfs builder 默认尝试安装/发现 `tar`、`gzip`、`xz`，缺失只
+  warning，不阻断未使用 archive 的普通 rootfs；实际 action 缺工具时按步骤失败。
+  执行端对三种格式始终使用同一条 `tar -xf`，不按后缀分叉。
   first-boot 与 install postprocess 一样可修改用户、SSH、hosts 和系统文件，但不得读取/复制
   `/run/nodeforge/credentials`、修改只读 lower 或篡改 session handoff。script 只能来自已导入 asset，
   不能接收 argv 内联脚本。

@@ -202,8 +202,9 @@ nodeforge assets archive build <output.tar> [--install-script <path>] \
 `file` 识别为 POSIX tar、gzip 和 XZ；同一条
 `tar --same-owner --same-permissions --acls --xattrs -xf` 均成功解压，隐藏入口、硬链接
 inode 和 symlink target 保持一致。`--compression gzip` 搭配 `.tar` 后缀被 CLI 拒绝。
-Rocky rootfs bootstrap 已显式加入 `gzip`、`xz`；Ubuntu casper rootfs 发布前显式验证
-`tar`、`gzip`、`xz` 可执行文件存在。
+Rocky rootfs builder 默认尽力安装 `tar`、`gzip`、`xz`；Ubuntu casper rootfs 检查
+对应可执行文件。缺失属于可选 archive capability warning，不阻断未引用 archive 的
+普通 rootfs；实际 archive action 缺工具时才失败并进入 journal。
 
 `zig build test` 用时约 61 秒并通过。此增量验证证明标准构建命令及共享 archive
 解压元数据选项符合设计；它不替代上文已经执行的五项 VMware 系统矩阵。

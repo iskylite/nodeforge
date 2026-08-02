@@ -699,8 +699,9 @@ nodeforge assets archive build ./static-files.tar \
 `--compression gzip|xz`，对应 `.tar.gz`/`.tgz` 或 `.tar.xz`/`.txz`。构建先完成并校验
 完整 tar，再执行最终压缩；运行端仍统一以 `tar -xf` 自动识别。仅当指定
 `--install-script` 时才生成 Mode A 的 `.nf.install.sh`；缺省为无入口的 Mode B。
-rootfs 基线明确包含
-`tar`、`gzip` 和 `xz`。命令把用户提供的安装脚本映射为归档顶层
+rootfs builder 默认尝试提供 `tar`、`gzip` 和 `xz`；缺失时记录 warning，但不阻断
+没有 archive action 的普通 rootfs。真正执行 archive 时若工具仍缺失，由该 action
+失败并写入 journal。命令把用户提供的安装脚本映射为归档顶层
 `.nf.install.sh`。payload 自带该保留顶层条目时拒绝构建；绝对路径、
 含 `..` 的路径和换行路径同样拒绝。所有 payload 在一次 tar 调用中读取，保留软链接
 目标和跨输入项硬链接关系，并记录数字 uid/gid、mode、mtime、ACL 与 xattr；打包使用

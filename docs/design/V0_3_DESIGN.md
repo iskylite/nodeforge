@@ -481,10 +481,11 @@ nodeforge assets archive build <output> [--install-script <path>] \
   不能设置；解压创建新 inode 后不可能与源 ctime 相等。atime 是否能在解压后恢复也
   受 tar、文件系统 mount option 和后续读取影响，不作为跨系统保证。实现只能保证
   打包过程不扰动源 atime，不能宣称解压后 ctime/atime 完全一致。
-- rootfs 的 Rocky bootstrap 必须显式安装 `tar`、`gzip`、`xz`；Ubuntu casper overlay
-  必须在发布前验证 `/usr/bin/tar`、`/usr/bin/gzip`、`/usr/bin/xz` 全部存在，否则
-  rootfs build fail closed。三个 phase 统一使用 `tar -xf` 自动识别，不按压缩格式
-  复制 Mode A/B runner。
+- rootfs 的 Rocky builder 在核心 OS 成功后尽力安装 `tar`、`gzip`、`xz`；Ubuntu
+  casper overlay 检查 `/usr/bin/tar`、`/usr/bin/gzip`、`/usr/bin/xz`。这些是可选
+  archive capability：缺失只记录 warning，不得阻断没有 archive action 的普通
+  rootfs。真正执行相关 archive 时若工具缺失，由该 action/journal 报错。三个 phase
+  统一使用 `tar -xf` 自动识别，不按压缩格式复制 Mode A/B runner。
 
 install-post 上下文中：
 
