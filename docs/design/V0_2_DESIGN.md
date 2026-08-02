@@ -1311,15 +1311,15 @@ ItemSpec 字段与 §5.2 八步执行契约，差异只在执行者、目标上�
 四类 action 均声明 `phase`、`idempotency_key`、`timeout_s`、`retryable` 与影响域；`item add/set` 用 `FIELD=VALUE` 精确字段，
 parser 拒绝该 action 不适用的字段。`repository`/`standard_packages` 旧 action 按 §5.2 迁移表退出，不新增同义 action。
 
-**archive 规则**（build/运行期通用）：读取 tar，若顶层存在 `./install.sh` 则解压到临时目录并以该目录为工作目录执行
-`./install.sh`（退出码 0 且幂等，禁止隐式下载未声明内容）；否则直接把 payload 解压到 `/`。步骤作者始终以 `/` 为目标，
+**archive 规则**（build/运行期通用）：读取 tar，若顶层存在 `./.nf.install.sh` 则解压到临时目录并以该目录为工作目录执行
+`./.nf.install.sh`（退出码 0 且幂等，禁止隐式下载未声明内容）；否则直接把 payload 解压到 `/`。普通 `install.sh` 始终是数据文件，步骤作者始终以 `/` 为目标，
 builder/agent 提供挂载或 chroot 上下文把写入落到对应 lower 或 overlay upper；manifest 只声明 SHA256（由 asset 提供），
 不设 `script|extract` 策略、`target_root`、`install --root` 参数或 `NODEFORGE_TARGET_ROOT` 环境变量。
 
 **provision-bundle item 编写**（复用 v0.1 §7.1 structured collection `item add/set/move`、`replace-items`、`--before/--after`、
 `--unset`，canonical collection key 为 `steps`）。字段示例见 `V0_2_CLI.md` §3。`managed-file` asset 只保存不可变内容；
 `destination/mode/owner/group` 属于引用 asset 的 step，不得复制到 asset metadata。`destination` 为 `/` 下绝对路径（rootfs-build 落 lower、first-boot
-落 overlay upper）；`archive` 无 `destination`，按 archive 规则解压到 `/` 或在临时目录执行 `install.sh`；`script` 由
+落 overlay upper）；`archive` 无 `destination`，按 archive 规则解压到 `/` 或在临时目录执行 `.nf.install.sh`；`script` 由
 `script_asset` 提供受审计可执行内容；`package` 的 `packages`/`group`/`environment`/`selection` 至少一项，均经本地
 repository 解析校验、幂等。
 

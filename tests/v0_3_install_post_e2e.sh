@@ -77,16 +77,18 @@ remote_sh "rm -rf $work && mkdir -p $work"
 # managed_file asset: a simple MOTD file
 remote_sh "printf 'NODEFORGE_INSTALLPOST_MOTD\n' > $work/motd"
 
-# archive Mode A: tar with install.sh at top level
+# archive Mode A: use the public canonical builder. The user's installer keeps
+# its ordinary name on disk; CLI maps it to the reserved .nf.install.sh entry.
 remote_sh "mkdir -p $work/arc-a/etc/issue.d && \
     printf 'NODEFORGE_INSTALLPOST_ARCHIVE_A\n' > $work/arc-a/etc/issue.d/nodeforge-arc-a.issue && \
-    printf '#!/bin/sh\nmkdir -p /etc/issue.d\nprintf '\''NODEFORGE_INSTALLPOST_ARCHIVE_A_INSTALLED\\n'\'' > /etc/issue.d/nodeforge-arc-a-installed.issue\n' > $work/arc-a/install.sh && \
-    chmod +x $work/arc-a/install.sh && \
-    tar -C $work/arc-a -cf $work/arc-mode-a.tar ."
+    printf '#!/bin/sh\nmkdir -p /etc/issue.d\nprintf '\''NODEFORGE_INSTALLPOST_ARCHIVE_A_INSTALLED\\n'\'' > /etc/issue.d/nodeforge-arc-a-installed.issue\n' > $work/arc-a-install.sh && \
+    printf 'etc/issue.d/nodeforge-arc-a.issue\n' > $work/arc-a-files.list"
+remote_cli "assets archive build $work/arc-mode-a.tar --install-script $work/arc-a-install.sh --base-dir $work/arc-a --files-from $work/arc-a-files.list" >/dev/null
 
-# archive Mode B: tar with just files (no install.sh)
+# archive Mode B: ordinary top-level install.sh must remain data and not execute
 remote_sh "mkdir -p $work/arc-b/etc/issue.d && \
     printf 'NODEFORGE_INSTALLPOST_ARCHIVE_B\n' > $work/arc-b/etc/issue.d/nodeforge-arc-b.issue && \
+    printf '#!/bin/sh\nprintf '\''NODEFORGE_ORDINARY_INSTALL_SH_EXECUTED\\n'\'' > /etc/issue.d/nodeforge-ordinary-install-sh.issue\n' > $work/arc-b/install.sh && \
     tar -C $work/arc-b -cf $work/arc-mode-b.tar ."
 
 # script asset: creates a marker file
@@ -132,14 +134,14 @@ remote_cli "assets provision-bundle item add $bundle steps \
     packages=tree" >/dev/null
 echo "  step: package -> tree"
 
-# archive Mode A (tar with install.sh -> extract to tmpdir + execute)
+# archive Mode A (tar with .nf.install.sh -> extract to tmpdir + execute)
 remote_cli "assets provision-bundle item add $bundle steps \
     name=e2e-arc-a action=archive phase=install-post \
     idempotency_key=e2e-arc-a-v1 timeout_s=60 retryable=false \
     content_asset=$arc_a_asset" >/dev/null
-echo "  step: archive Mode A -> install.sh execution"
+echo "  step: archive Mode A -> .nf.install.sh execution"
 
-# archive Mode B (tar without install.sh -> direct extract to /)
+# archive Mode B (ordinary install.sh only -> direct extract to /, no execution)
 remote_cli "assets provision-bundle item add $bundle steps \
     name=e2e-arc-b action=archive phase=install-post \
     idempotency_key=e2e-arc-b-v1 timeout_s=60 retryable=false \
@@ -312,12 +314,12 @@ if target_sh "true" 2>/dev/null; then
         exit 1
     fi
 
-    # archive Mode A: install.sh should have run and created the installed marker
+    # archive Mode A: .nf.install.sh should have run and created the installed marker
     arc_a_installed=$(target_sh "cat /etc/issue.d/nodeforge-arc-a-installed.issue 2>/dev/null || true")
     if echo "$arc_a_installed" | grep -q 'NODEFORGE_INSTALLPOST_ARCHIVE_A_INSTALLED'; then
-        echo "  PASS: archive Mode A -> install.sh executed, marker file created"
+        echo "  PASS: archive Mode A -> .nf.install.sh executed, marker file created"
     else
-        echo "FAIL: archive Mode A install.sh marker not found" >&2
+        echo "FAIL: archive Mode A .nf.install.sh marker not found" >&2
         echo "      got: $arc_a_installed" >&2
         exit 1
     fi
@@ -328,6 +330,14 @@ if target_sh "true" 2>/dev/null; then
         echo "  PASS: archive Mode B -> tar content extracted to /"
     else
         echo "FAIL: archive Mode B content not found" >&2
+        exit 1
+    fi
+
+    # Ordinary install.sh is not the reserved Mode A entrypoint.
+    if target_sh "test ! -e /etc/issue.d/nodeforge-ordinary-install-sh.issue"; then
+        echo "  PASS: ordinary top-level install.sh was extracted but not executed"
+    else
+        echo "FAIL: ordinary top-level install.sh was executed" >&2
         exit 1
     fi
 
@@ -366,8 +376,8 @@ echo ""
 echo "Verified canonical actions:"
 echo "  1. managed_file: /etc/motd written via curl+sha256sum+chmod"
 echo "  2. package: tree installed via dnf -y install"
-echo "  3. archive Mode A: tar with install.sh -> extract to tmpdir + execute"
-echo "  4. archive Mode B: tar without install.sh -> direct extract to /"
+echo "  3. archive Mode A: tar with .nf.install.sh -> extract to tmpdir + execute"
+echo "  4. archive Mode B: ordinary install.sh remains data and archive extracts directly"
 echo "  5. script: downloaded via curl+sha256sum, executed via sh"
 echo ""
 echo "Journal: all steps succeeded, run status: completed"

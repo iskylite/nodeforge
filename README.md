@@ -647,6 +647,41 @@ current_generation`、requested/applied/desired plan digest 一致且
 `managed_file → package → archive → script` actions，绑定 Rocky 9.7 install
 Profile，执行真实 PXE 安装并核验目标内容：
 
+Archive 的模式入口是顶层保留隐藏文件 `.nf.install.sh`：只有 tar 中精确的
+`.nf.install.sh` 或 `./.nf.install.sh` 才触发“解压到临时目录后执行”的模式 A；普通
+顶层 `install.sh`、子目录脚本和其他可执行文件都按数据处理并走直接解压的模式 B。
+入口由 `sh ./.nf.install.sh` 执行，不依赖 executable bit，但必须幂等且不得隐式下载
+未声明内容。
+
+推荐用公开 CLI 构建标准 Mode A archive，而不是手工重命名安装脚本：
+
+```bash
+# 多个路径直接作为位置参数；路径均相对于 --base-dir。
+nodeforge assets archive build ./vendor-agent.tar \
+  --install-script ./packaging/install.sh \
+  --base-dir ./payload \
+  etc/vendor-agent usr/lib/vendor-agent
+
+# 或从文本文件读取（一行一个相对路径），并可与位置参数合并。
+nodeforge assets archive build ./vendor-agent.tar \
+  --install-script ./packaging/install.sh \
+  --base-dir ./payload \
+  --files-from ./packaging/files.list \
+  usr/share/vendor-agent/README
+
+nodeforge assets archive import vendor-agent \
+  --from-file ./vendor-agent.tar --media-type application/x-tar
+```
+
+`archive build` 需要 GNU tar，输出固定为未压缩 PAX `.tar`，并把用户提供的安装脚本
+映射为归档顶层 `.nf.install.sh`。payload 自带该保留顶层条目时拒绝构建；绝对路径、
+含 `..` 的路径和换行路径同样拒绝。所有 payload 在一次 tar 调用中读取，保留软链接
+目标和跨输入项硬链接关系，并记录数字 uid/gid、mode、mtime、ACL 与 xattr；打包使用
+`--atime-preserve=system`，不应因读取而更新源文件 atime。解压显式恢复 owner、mode、
+ACL 与 xattr。ctime 是内核维护的 inode 变更时间，新建解压文件必然获得新 ctime，任何
+工具都不能合法还原；解压后的 atime 也不属于 tar 的可靠跨系统还原契约。CLI 因而
+明确报告 `ctime_preserved=false`，不得把“归档记录过某个时间”误解为“解压后完全一致”。
+
 ```bash
 bash tests/v0_3_install_post_e2e.sh
 # 等价的显式 build step：

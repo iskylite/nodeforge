@@ -196,6 +196,8 @@ RHEL comps 选择区分 environment、group 与 package。未设置
 
 ```text
 nodeforge assets managed-file import <asset> --from-file <path> [--media-type <type>]
+nodeforge assets archive build <output.tar> --install-script <path> \
+  [--base-dir <dir>] [--files-from <list>] [paths...]
 nodeforge assets archive import <asset> --from-file <path> [--media-type <type>]
 nodeforge assets script import <asset> --from-file <path> [--media-type <type>]
 
@@ -224,6 +226,7 @@ asset import flag 约束：
 | 命令 | 必填 flag | 可选 flag | 说明 |
 |---|---|---|---|
 | `managed-file import` | `<asset>`、`--from-file` | `--media-type` | 只导入不可变文件内容；不保存 destination/mode/owner/group |
+| `archive build` | `<output.tar>`、`--install-script`、至少一个 payload 路径 | `--base-dir`、`--files-from` | 用 GNU tar 构建 PAX archive；安装脚本固定映射为顶层 `.nf.install.sh` |
 | `archive import` | `<asset>`、`--from-file` | `--media-type` | 导入 tar 归档；destination 由 archive action 规则在执行期决定 |
 | `script import` | `<asset>`、`--from-file` | `--media-type` | 导入受审计脚本；interpreter 在 item add 时指定 |
 
@@ -244,7 +247,12 @@ per-action 必填字段矩阵（`item add` 拒绝不适用的字段）：
 - v0.2 parser 只接受 `rootfs-build|first-boot`；`install-post` 到 v0.3 才可用，不应提前出现在 v0.2 help。
 - action 固定 `managed-file|package|archive|script`。每项必须有稳定 `id` 与 `idempotency_key`。
 - plan 必须显示执行顺序、输入 digest、目标路径、package resolution 和执行环境，无副作用。
-- archive 顶层仅允许单一 `install.sh` 特例；拒绝绝对路径、`..`、device、FIFO 和越界 symlink。
+- archive 顶层仅把保留入口 `.nf.install.sh` 视为模式 A；普通 `install.sh` 始终是数据文件。拒绝绝对路径、`..`、device、FIFO 和越界 symlink。
+  标准构建命令接受相对 `--base-dir` 的多个位置参数和/或“一行一个路径”的
+  `--files-from`。一次 GNU tar 调用处理全部 payload，避免拆包破坏硬链接关系；保存
+  symlink、mode、数字 uid/gid、mtime、ACL、xattr，并避免读取更新源 atime。解压端显式
+  请求恢复 owner/mode/ACL/xattr。ctime 由内核维护且新 inode 必然改变，解压后 atime
+  也没有可靠的跨系统 tar 恢复语义，二者不在“前后一致”的承诺内。
   first-boot 与 install postprocess 一样可修改用户、SSH、hosts 和系统文件，但不得读取/复制
   `/run/nodeforge/credentials`、修改只读 lower 或篡改 session handoff。script 只能来自已导入 asset，
   不能接收 argv 内联脚本。

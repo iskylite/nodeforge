@@ -223,7 +223,7 @@ test "buildPlan orders steps managed_file -> package -> archive -> script and re
     try std.testing.expectEqualStrings("jq", plan.commands[1].packages[0]);
     // v0.3: archive 使用模式 A/B 判定，目标根固定为 /。
     try std.testing.expect(std.mem.indexOf(u8, plan.commands[2].body, "tar -tf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plan.commands[2].body, "install.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.commands[2].body, ".nf.install.sh") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.commands[3].body, "sh /tmp/.nodeforge-script") != null);
 }
 

@@ -273,8 +273,8 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
             }
         },
         .archive => {
-            // v0.3：archive 使用运行时模式 A/B 判定（tar -tf 检测 ./install.sh）。
-            // 模式 A：解压到临时目录 + 执行 sh ./install.sh；
+            // v0.3：archive 使用运行时模式 A/B 判定（tar -tf 检测 ./.nf.install.sh）。
+            // 模式 A：解压到临时目录 + 执行 sh ./.nf.install.sh；
             // 模式 B：直接解压到目标根（first-boot 为 overlay upper /）。
             // archive 没有 destination 字段——目标根由执行上下文决定。
             // 三个 phase（install-post/rootfs-build/first-boot）共用 runner.renderArchiveModeDetection。
@@ -424,9 +424,10 @@ test "renderStep archive and script render extraction/execution" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "> /tmp/.nodeforge-arc") != null);
     // 验证模式 A/B 判定脚本
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "tar -tf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "grep -Fxq 'install.sh'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "grep -Fxq '.nf.install.sh'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "grep -Fxq 'install.sh'") == null);
     // 验证模式 B 直接解压到 /（不再有 destination）
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tar -xf /tmp/.nodeforge-arc -C '/'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tar --same-owner --same-permissions --acls --xattrs -xf /tmp/.nodeforge-arc -C '/'") != null);
     // 验证清理
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "rm -f /tmp/.nodeforge-arc") != null);
     out.deinit();

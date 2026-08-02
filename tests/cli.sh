@@ -110,6 +110,42 @@ fi
 grep -q -- "--import-config" "$tmp/setup-help"
 grep -q -- "--purge-all" "$tmp/setup-help"
 grep -q -- "--log-level" "$tmp/setup-help"
+"$cli" assets archive build --help >"$tmp/archive-build-help"
+grep -Fq -- '--install-script' "$tmp/archive-build-help"
+grep -Fq -- '--files-from' "$tmp/archive-build-help"
+grep -Fq -- '--base-dir' "$tmp/archive-build-help"
+grep -Fq -- '.nf.install.sh' "$tmp/archive-build-help"
+
+# GNU tar 环境验证 canonical archive 的入口映射、软/硬链接、权限、mtime，
+# 以及打包读取不会更新源文件 atime。Darwin 默认 BSD tar，按公开契约应拒绝，
+# 因此这里只在 GNU tar 主机执行内容级测试。
+if tar --version 2>/dev/null | grep -Fq 'GNU tar'; then
+    archive_src="$tmp/archive-src"
+    archive_out="$tmp/canonical.tar"
+    archive_extract="$tmp/archive-extract"
+    mkdir -p "$archive_src/etc/nodeforge" "$archive_extract"
+    printf 'canonical archive payload\n' >"$archive_src/etc/nodeforge/original"
+    chmod 0640 "$archive_src/etc/nodeforge/original"
+    ln "$archive_src/etc/nodeforge/original" "$archive_src/etc/nodeforge/hardlink"
+    ln -s original "$archive_src/etc/nodeforge/symlink"
+    touch -a -d '2020-01-02 03:04:05 UTC' "$archive_src/etc/nodeforge/original"
+    touch -m -d '2021-02-03 04:05:06 UTC' "$archive_src/etc/nodeforge/original"
+    before_atime=$(stat -c %X "$archive_src/etc/nodeforge/original")
+    before_mtime=$(stat -c %Y "$archive_src/etc/nodeforge/original")
+    printf '#!/bin/sh\nexit 0\n' >"$tmp/user-install.sh"
+    printf 'etc/nodeforge/original\netc/nodeforge/hardlink\n' >"$tmp/archive-files"
+    "$cli" assets archive build "$archive_out" \
+        --install-script "$tmp/user-install.sh" --base-dir "$archive_src" \
+        --files-from "$tmp/archive-files" etc/nodeforge/symlink -o json >"$tmp/archive-build.json"
+    jq -e '.ok and .result.entrypoint == ".nf.install.sh" and .result.payload_paths == 3 and (.result.ctime_preserved | not)' "$tmp/archive-build.json" >/dev/null
+    test "$(tar -tf "$archive_out" | grep -cx '\.nf\.install\.sh')" -eq 1
+    tar --same-owner --same-permissions --acls --xattrs -xf "$archive_out" -C "$archive_extract"
+    test "$(stat -c %i "$archive_extract/etc/nodeforge/original")" = "$(stat -c %i "$archive_extract/etc/nodeforge/hardlink")"
+    test "$(readlink "$archive_extract/etc/nodeforge/symlink")" = original
+    test "$(stat -c %a "$archive_extract/etc/nodeforge/original")" = 640
+    test "$(stat -c %Y "$archive_extract/etc/nodeforge/original")" = "$before_mtime"
+    test "$(stat -c %X "$archive_src/etc/nodeforge/original")" = "$before_atime"
+fi
 "$cli" profile create --help >"$tmp/profile-create-help"
 grep -Fq 'Create an install or diskless profile from an imported install source' "$tmp/profile-create-help"
 grep -Fq '<install-source>[-<qualifier>]-<install|diskless>' "$tmp/profile-create-help"

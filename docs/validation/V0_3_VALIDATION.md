@@ -42,8 +42,8 @@ zig build -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe
 
 - Zig：`0.16.0`
 - NodeForge：`0.3.0`
-- commit：`a39b20b407ec`
-- build time：`2026-08-02T03:47:22Z`
+- archive 隐藏入口复测 commit：`36005a3e2136`（工作树包含本次入口名调整）
+- archive 隐藏入口复测 build time：`2026-08-02T08:57:10Z`
 - 目标：Linux aarch64 GNU、ReleaseSafe
 
 四个产物均为 Linux aarch64 ELF：
@@ -104,16 +104,16 @@ Computer Use 执行，每次操作后重新读取 accessibility state 确认界�
 bash tests/v0_3_install_post_e2e.sh
 ```
 
-结果：PASS。fresh bundle 为 `v03-installpost-20260802122050`，Rocky 9.7 install
-generation 3 从 PXE 到 `install.completed` 用时 286 秒。
+结果：PASS。隐藏入口调整后的 fresh bundle 为 `v03-installpost-20260802165745`，
+Rocky 9.7 install generation 4 从 PXE 到 `install.completed` 用时 287 秒。
 
 最终 deployment：
 
-- `current_generation=3`
-- `terminal_generation=3`
-- `successful_generation=3`
+- `current_generation=4`
+- `terminal_generation=4`
+- `successful_generation=4`
 - requested/applied/desired plan digest：
-  `1152d789c46eaae85b65c07470431f1ebf4ae707eef419af460a52034b0e9968`
+  `4e1ecad1da83cba135c710721c8c783d1b9f782902a128adbb827ae93469f835`
 - `drift_state=clean`
 
 Journal：
@@ -131,7 +131,7 @@ Journal：
 
 - `/etc/motd` 含 `NODEFORGE_INSTALLPOST_MOTD`；
 - `tree` 包已安装；
-- archive Mode A 的 `install.sh` 已执行；
+- archive Mode A 的 `.nf.install.sh` 已执行，普通顶层 `install.sh` 仅解压且未执行；
 - archive Mode B 已直接展开到 `/`；
 - script marker 已生成；
 - 四个 immutable artifact URL 都返回 HTTP 200；
@@ -162,8 +162,8 @@ CLI 实测：
 - 旧 action 无兼容、迁移或 fallback。
 
 真实执行 `systemctl restart nodeforged` 后，需等待 daemon 完成 preflight，而不能只凭
-systemd active 判定 ready。管理面恢复健康后，generation 3 completed journal 完整保留，
-deployment 仍为 terminal=successful=3、digest 一致、drift clean。
+systemd active 判定 ready。管理面恢复健康后，generation 4 completed journal 完整保留，
+deployment 仍为 terminal=successful=4、digest 一致、drift clean。
 
 ## 发布判定
 
@@ -172,3 +172,30 @@ deployment 仍为 terminal=successful=3、digest 一致、drift clean。
 
 该结论不外推到未执行的硬件、架构或网络拓扑；未来若新增平台矩阵，仍须按 README 的
 fresh 流程独立验证。
+
+## 2026-08-02 canonical archive build 增量验证
+
+新增公开命令：
+
+```text
+nodeforge assets archive build <output.tar> --install-script <path> \
+  [--base-dir <dir>] [--files-from <list>] [paths...]
+```
+
+在 r97n0（aarch64、GNU tar 1.34）交叉构建产物上执行真实打包和解压，结果：
+
+| 检查项 | 结果 | 证据 |
+|---|---|---|
+| 隐藏入口映射 | PASS | tar 顶层仅一个 `.nf.install.sh` |
+| 多位置参数 + files list | PASS | JSON `payload_paths=3` |
+| hardlink | PASS | 解压后 original/hardlink inode 同为 `167953805` |
+| symlink | PASS | target 仍为 `original` |
+| mode/mtime | PASS | mode `0640`；mtime `1612325106` 不变 |
+| 源 atime 不扰动 | PASS | 打包前后均为 `1577934245` |
+| xattr | PASS | `user.nodeforge=canonical` 解压后存在 |
+| 保留入口冲突 | PASS | payload 含顶层 `.nf.install.sh` 时拒绝 |
+| parent path | PASS | `../escape` 在调用 tar 前拒绝 |
+| ctime 语义 | PASS | JSON 明确 `ctime_preserved=false`，文档明确不可还原 |
+
+`zig build test` 用时约 61 秒并通过。此增量验证证明标准构建命令及共享 archive
+解压元数据选项符合设计；它不替代上文已经执行的五项 VMware 系统矩阵。

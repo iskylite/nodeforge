@@ -586,9 +586,22 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addDebugFlag(managed_file_remove);
     try managed_file.addCommands(&.{ managed_file_list, managed_file_show, managed_file_import, managed_file_remove });
     const archive = try zli.Command.init(init_options, .{ .name = "archive", .description = "Manage immutable archive assets" }, showCurrentHelp);
+    const archive_build = try zli.Command.init(init_options, .{
+        .name = "build",
+        .description = "Build a canonical metadata-preserving archive",
+        .usage = "nodeforge assets archive build <output.tar> --install-script <path> [--base-dir <dir>] [--files-from <list>] [paths...]",
+        .help = "Requires GNU tar. Payload paths must be relative to --base-dir. The install script is stored as the reserved top-level .nf.install.sh entry.",
+    }, archiveBuildHandler);
+    try archive_build.addPositionalArg(.{ .name = "archive", .description = "Output .tar path", .required = true });
+    try archive_build.addPositionalArg(.{ .name = "paths", .description = "Payload paths relative to --base-dir", .required = false, .variadic = true });
+    try archive_build.addFlag(.{ .name = "install-script", .description = "Installer script stored as .nf.install.sh", .type = .String, .default_value = .{ .String = "" } });
+    try archive_build.addFlag(.{ .name = "base-dir", .description = "Base directory for payload paths", .type = .String, .default_value = .{ .String = "." } });
+    try archive_build.addFlag(.{ .name = "files-from", .description = "Text file containing one payload path per line", .type = .String, .default_value = .{ .String = "" } });
+    try addOutputFlag(archive_build);
+    try addDebugFlag(archive_build);
     const archive_import = try zli.Command.init(init_options, .{ .name = "import", .description = "Atomically import an archive revision" }, archiveImportHandler);
     try addContentAssetImportArgs(archive_import, "Archive");
-    try archive.addCommands(&.{archive_import});
+    try archive.addCommands(&.{ archive_build, archive_import });
     const script = try zli.Command.init(init_options, .{ .name = "script", .description = "Manage immutable script assets" }, showCurrentHelp);
     const script_import = try zli.Command.init(init_options, .{ .name = "import", .description = "Atomically import a script revision" }, scriptImportHandler);
     try addContentAssetImportArgs(script_import, "Script");
@@ -2737,6 +2750,135 @@ fn managedFileImportHandler(ctx: zli.CommandContext) !void {
 
 fn archiveImportHandler(ctx: zli.CommandContext) !void {
     return contentAssetImportHandler(ctx, .archive, 256 * 1024 * 1024);
+}
+
+/// 构建 NodeForge canonical archive。
+///
+/// payload 始终由一次 GNU tar 调用从同一个基准目录读取，因此符号链接不会被
+/// 解引用，跨输入项的硬链接关系也不会因逐文件打包而丢失。GNU tar 的
+/// `--atime-preserve=system` 使读取操作不更新源文件 atime；PAX、ACL 与 xattr
+/// 选项保存权限、数字 uid/gid、mtime、ACL 和扩展属性。ctime 是内核维护的 inode
+/// 变更时间，任何新建解压文件都会获得新的 ctime，CLI 不伪造也不承诺保持它。
+fn archiveBuildHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const output_path = ctx.getArg("archive") orelse return;
+    const install_script = ctx.flag("install-script", []const u8);
+    const base_dir = ctx.flag("base-dir", []const u8);
+    const files_from = ctx.flag("files-from", []const u8);
+    if (output_path.len == 0 or install_script.len == 0 or base_dir.len == 0)
+        return itemUsageError(ctx, "archive build requires <output.tar>, --install-script, and a non-empty --base-dir");
+    if (!std.mem.endsWith(u8, output_path, ".tar"))
+        return itemUsageError(ctx, "archive build output must use the .tar suffix");
+    if (std.Io.Dir.cwd().statFile(ctx.io, output_path, .{ .follow_symlinks = false })) |_| {
+        return itemUsageError(ctx, "archive build refuses to overwrite an existing output");
+    } else |err| if (err != error.FileNotFound) return itemUsageError(ctx, "archive build output cannot be inspected");
+
+    const base_stat = std.Io.Dir.cwd().statFile(ctx.io, base_dir, .{ .follow_symlinks = true }) catch return itemUsageError(ctx, "archive build --base-dir is unreadable");
+    if (base_stat.kind != .directory) return itemUsageError(ctx, "archive build --base-dir must be a directory");
+    const script_stat = std.Io.Dir.cwd().statFile(ctx.io, install_script, .{ .follow_symlinks = false }) catch return itemUsageError(ctx, "archive build install script is unreadable");
+    if (script_stat.kind != .file) return itemUsageError(ctx, "archive build install script must be a regular file, not a symlink");
+
+    var list: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer list.deinit();
+    var path_count: usize = 0;
+    for (ctx.positional_args[1..]) |path| {
+        if (!validArchiveBuildPath(path)) return itemUsageError(ctx, "archive payload paths must be non-empty relative paths without '..' or newlines");
+        try list.writer.writeAll(path);
+        try list.writer.writeByte(0);
+        path_count += 1;
+    }
+    if (files_from.len != 0) {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(ctx.io, files_from, ctx.allocator, .limited(4 * 1024 * 1024)) catch return itemUsageError(ctx, "archive build --files-from is unreadable or too large");
+        defer ctx.allocator.free(bytes);
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |raw| {
+            const path = std.mem.trim(u8, raw, " \t\r");
+            if (path.len == 0) continue;
+            if (!validArchiveBuildPath(path)) return itemUsageError(ctx, "archive --files-from contains an absolute, parent, or malformed path");
+            try list.writer.writeAll(path);
+            try list.writer.writeByte(0);
+            path_count += 1;
+        }
+    }
+    if (path_count == 0) return itemUsageError(ctx, "archive build requires at least one payload path or --files-from entry");
+
+    const version = std.process.run(ctx.allocator, ctx.io, .{ .argv = &.{ "tar", "--version" }, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(64 * 1024) }) catch return itemUsageError(ctx, "archive build requires GNU tar");
+    defer ctx.allocator.free(version.stdout);
+    defer ctx.allocator.free(version.stderr);
+    const gnu_tar_ok = switch (version.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!gnu_tar_ok or std.mem.indexOf(u8, version.stdout, "GNU tar") == null)
+        return itemUsageError(ctx, "archive build requires GNU tar; BSD tar is not supported");
+
+    var random: [12]u8 = undefined;
+    try ctx.io.randomSecure(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    const output_dir = std.fs.path.dirname(output_path) orelse ".";
+    try std.Io.Dir.cwd().createDirPath(ctx.io, output_dir);
+    var output_dir_handle = try std.Io.Dir.cwd().openDir(ctx.io, output_dir, .{});
+    defer output_dir_handle.close(ctx.io);
+    var real_output_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_output_dir_len = try output_dir_handle.realPath(ctx.io, &real_output_dir_buf);
+    const real_output_dir = real_output_dir_buf[0..real_output_dir_len];
+    const temp_archive = try std.fmt.allocPrint(ctx.allocator, "{s}/.nodeforge-archive-{s}.tar", .{ real_output_dir, hex[0..] });
+    defer ctx.allocator.free(temp_archive);
+    const temp_list = try std.fmt.allocPrint(ctx.allocator, "{s}/.nodeforge-archive-{s}.list", .{ real_output_dir, hex[0..] });
+    defer ctx.allocator.free(temp_list);
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, temp_archive) catch {};
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, temp_list) catch {};
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = temp_list, .data = list.written() });
+
+    try runArchiveBuildTar(ctx, &.{ "tar", "--format=pax", "--acls", "--xattrs", "--numeric-owner", "--atime-preserve=system", "--null", "--files-from", temp_list, "-cf", temp_archive }, .{ .path = base_dir });
+    validateArchiveForImport(ctx, temp_archive) catch return itemUsageError(ctx, "archive build produced an invalid payload archive");
+    if (try archiveHasReservedInstallEntry(ctx, temp_archive))
+        return itemUsageError(ctx, "archive payload already contains the reserved top-level .nf.install.sh entry");
+
+    const script_dir = std.fs.path.dirname(install_script) orelse ".";
+    const script_name = std.fs.path.basename(install_script);
+    try runArchiveBuildTar(ctx, &.{ "tar", "--format=pax", "--acls", "--xattrs", "--numeric-owner", "--atime-preserve=system", "--transform=s|.*|.nf.install.sh|", "-rf", temp_archive, script_name }, .{ .path = script_dir });
+    validateArchiveForImport(ctx, temp_archive) catch return itemUsageError(ctx, "archive build produced an invalid final archive");
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), temp_archive, std.Io.Dir.cwd(), output_path, ctx.io);
+
+    const human = try std.fmt.allocPrint(ctx.allocator, "built canonical archive {s} ({d} payload paths; entrypoint .nf.install.sh)", .{ output_path, path_count });
+    try renderCommandResult(ctx, human, .{ .archive = output_path, .entrypoint = ".nf.install.sh", .payload_paths = path_count, .format = "pax", .ctime_preserved = false });
+}
+
+fn validArchiveBuildPath(path: []const u8) bool {
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null or std.mem.indexOfScalar(u8, path, '\n') != null or std.mem.indexOfScalar(u8, path, '\r') != null) return false;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| if (std.mem.eql(u8, component, "..")) return false;
+    return true;
+}
+
+fn runArchiveBuildTar(ctx: zli.CommandContext, argv: []const []const u8, cwd: std.process.Child.Cwd) !void {
+    const result = std.process.run(ctx.allocator, ctx.io, .{ .argv = argv, .cwd = cwd, .stdout_limit = .limited(64 * 1024), .stderr_limit = .limited(256 * 1024) }) catch return itemUsageError(ctx, "GNU tar could not be executed");
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    if (ctx.flag("debug", bool) and result.stderr.len != 0) try errorWriter(ctx).print("debug: archive build: {s}\n", .{result.stderr});
+    return itemUsageError(ctx, "GNU tar failed while building the archive");
+}
+
+fn archiveHasReservedInstallEntry(ctx: zli.CommandContext, source: []const u8) !bool {
+    const result = try std.process.run(ctx.allocator, ctx.io, .{ .argv = &.{ "tar", "-tf", source }, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(64 * 1024) });
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.InvalidArchive,
+        else => return error.InvalidArchive,
+    }
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |raw| {
+        var entry = std.mem.trim(u8, raw, "\r");
+        while (std.mem.startsWith(u8, entry, "./")) entry = entry[2..];
+        if (std.mem.eql(u8, entry, ".nf.install.sh")) return true;
+    }
+    return false;
 }
 
 fn scriptImportHandler(ctx: zli.CommandContext) !void {
@@ -5798,6 +5940,17 @@ fn isUsageError(err: anyerror) bool {
 /// 返回可直接嵌入 JSON 的布尔字面量。
 fn jsonBool(value: bool) []const u8 {
     return if (value) "true" else "false";
+}
+
+test "archive build accepts only safe relative payload paths" {
+    try std.testing.expect(validArchiveBuildPath("etc/nodeforge/config.yaml"));
+    try std.testing.expect(validArchiveBuildPath("./usr/local/bin/tool"));
+    try std.testing.expect(validArchiveBuildPath("directory with spaces/file"));
+    try std.testing.expect(!validArchiveBuildPath("/etc/passwd"));
+    try std.testing.expect(!validArchiveBuildPath("../escape"));
+    try std.testing.expect(!validArchiveBuildPath("safe/../../escape"));
+    try std.testing.expect(!validArchiveBuildPath("bad\npath"));
+    try std.testing.expect(!validArchiveBuildPath(""));
 }
 
 /// 输出稳定的 CLI 名称与项目版本。

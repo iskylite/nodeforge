@@ -42,7 +42,8 @@ diskless VMware 矩阵。完整命令、摘要、journal 和 Compute Use 操作�
    服务端在 `installer.started` 后把该 session 固定到当前 install generation。认证归
    BootSession，journal/status/completion 归 install generation，两者不得混为一个状态主键。
 4. **archive 先检查、后解压**：运行期先以 `tar -tf` 读取顶层条目，判定是否存在
-   `install.sh`/`./install.sh`，再选择执行或直接解压。不得为了判定模式先解压 archive。
+   保留入口 `.nf.install.sh`/`./.nf.install.sh`，再选择执行或直接解压。普通
+   `install.sh` 始终是数据文件；不得为了判定模式先解压 archive。
 5. **统一术语**：`managed_file -> package -> archive -> script` 称为“四类 action
    固定顺序”；“八步执行契约”只指 pin/validate、materialize、四类 action、finalizer、
    publish 的执行生命周期，不再把 CRUD/plan/apply/status 称为另一套八步。
@@ -68,7 +69,8 @@ diskless VMware 矩阵。完整命令、摘要、journal 和 Compute Use 操作�
   和服务端固定关联得到 Node/generation。
 - 禁止用 BootSession id 作为 install-post journal 主键，或把 install generation
   状态回写成 diskless BootSession journal。
-- 禁止 archive 为判断 `install.sh` 而预解压，禁止子目录 `install.sh` 自动执行，
+- 禁止 archive 为判断 `.nf.install.sh` 而预解压，禁止普通或子目录 `install.sh`
+  自动执行，
   禁止为 archive 恢复 `destination` 字段。
 
 ## 0. 设计动机与代码基线
@@ -350,24 +352,24 @@ archive action 先用 `tar -tf` 读取条目列表，不解压；规范化可选
 
 ```text
 读取 tar 顶层条目列表
-├── 顶层存在 install.sh 或 ./install.sh  →  模式 A：解压到临时目录 + 执行 sh ./install.sh
-└── 顶层不存在 ./install.sh  →  模式 B：直接解压到目标根 /
+├── 顶层存在 .nf.install.sh 或 ./.nf.install.sh  →  模式 A：解压到临时目录 + 执行 sh ./.nf.install.sh
+└── 顶层不存在 ./.nf.install.sh  →  模式 B：直接解压到目标根 /
 ```
 
-`app/install.sh`、`scripts/install.sh` 等子目录脚本不触发模式 A；不得通过路径规范化把
-含 `..` 的条目提升为顶层 `install.sh`。
+普通顶层 `install.sh`、`app/.nf.install.sh` 等非保留入口不触发模式 A；不得通过
+路径规范化把含 `..` 的条目提升为顶层 `.nf.install.sh`。
 
-**模式 A：解压 + 执行（`./install.sh` 存在）**
+**模式 A：解压 + 执行（`./.nf.install.sh` 存在）**
 
 1. 把 tar 解压到一个临时目录（如 `/tmp/.nodeforge-archive-<step_id>`）；
-2. 以该临时目录为工作目录执行 `sh ./install.sh`，不依赖 executable bit；
-3. `install.sh` 退出码 0 视为成功，非 0 视为失败；
+2. 以该临时目录为工作目录执行 `sh ./.nf.install.sh`，不依赖 executable bit；
+3. `.nf.install.sh` 退出码 0 视为成功，非 0 视为失败；
 4. 执行完成后删除临时目录。
 
 适用场景：应用安装包，归档内自带安装脚本（如解压后需要跑 `configure`、
 `systemctl enable`、`useradd` 等操作）。
 
-**模式 B：直接解压（`./install.sh` 不存在）**
+**模式 B：直接解压（`./.nf.install.sh` 不存在）**
 
 1. 把 tar 直接解压到目标根 `/`（install-post 上下文中是安装目标磁盘根）；
 2. tar 退出码 0 视为成功，非 0 视为失败。
@@ -385,11 +387,11 @@ archive action 先用 `tar -tf` 读取条目列表，不解压；规范化可选
     const dest = step.destination orelse "/";
     // ... 渲染为：
     // tar -xf <archive> -C <dest>
-    // 没有 install.sh 检测逻辑
+    // 没有 .nf.install.sh 检测逻辑
 },
 ```
 
-- `dest` 默认为 `/`，不检测 `./install.sh`，总是直接解压到 `dest`；
+- `dest` 默认为 `/`，不检测 `./.nf.install.sh`，总是直接解压到 `dest`；
 - 没有"解压到临时目录 + 执行"的分支。
 
 这意味着 v0.2 的 rootfs-build/first-boot **尚未实现模式 A**。v0.3 在为 install-post
@@ -402,24 +404,24 @@ install-post 由安装器执行（Kickstart `%post` / Autoinstall `late-commands
 `renderInstallPost` 需要渲染出一段 shell 命令，这段命令在安装目标根执行时完成
 上述判定和执行：
 
-**模式 A 渲染**（`./install.sh` 存在）：
+**模式 A 渲染**（`./.nf.install.sh` 存在）：
 
 ```bash
 # 解压到临时目录
 TMPDIR=$(mktemp -d /tmp/.nodeforge-arc-XXXXXX)
-tar -xf <archive_source> -C "$TMPDIR"
-# 执行 install.sh
-( cd "$TMPDIR" && sh ./install.sh )
+tar --same-owner --same-permissions --acls --xattrs -xf <archive_source> -C "$TMPDIR"
+# 执行保留隐藏入口
+( cd "$TMPDIR" && sh ./.nf.install.sh )
 RC=$?
 # 清理
 rm -rf "$TMPDIR"
 exit $RC
 ```
 
-**模式 B 渲染**（`./install.sh` 不存在）：
+**模式 B 渲染**（`./.nf.install.sh` 不存在）：
 
 ```bash
-tar -xf <archive_source> -C /
+tar --same-owner --same-permissions --acls --xattrs -xf <archive_source> -C /
 ```
 
 由于 shell 渲染期（`renderInstallPost`）无法读取 tar 内容，判定必须在安装器执行
@@ -428,18 +430,18 @@ tar -xf <archive_source> -C /
 ```bash
 ARCHIVE=<archive_source>
 ENTRIES=$(tar -tf "$ARCHIVE") || exit 1
-if printf '%s\n' "$ENTRIES" | sed 's#^\./##' | grep -Fxq 'install.sh'; then
+if printf '%s\n' "$ENTRIES" | sed 's#^\./##' | grep -Fxq '.nf.install.sh'; then
   TMPDIR=$(mktemp -d /tmp/.nodeforge-arc-XXXXXX) || exit 1
   trap 'rm -rf "$TMPDIR"' EXIT
-  tar -xf "$ARCHIVE" -C "$TMPDIR" || exit 1
-  ( cd "$TMPDIR" && sh ./install.sh )
+  tar --same-owner --same-permissions --acls --xattrs -xf "$ARCHIVE" -C "$TMPDIR" || exit 1
+  ( cd "$TMPDIR" && sh ./.nf.install.sh )
 else
-  tar -xf "$ARCHIVE" -C /
+  tar --same-owner --same-permissions --acls --xattrs -xf "$ARCHIVE" -C /
 fi
 ```
 
 实现可以不用 `sed|grep`，但必须保持相同语义：只去掉一个可选的 `./` 前缀、只接受
-精确顶层 `install.sh`，并且判定前不解压。模式 B 直接解压原 archive，禁止先解压后
+精确顶层 `.nf.install.sh`，并且判定前不解压。模式 B 直接解压原 archive，禁止先解压后
 使用 `tar | tar` 二次搬运。
 
 #### 4.6.5 archive 来源
@@ -450,6 +452,31 @@ archive 只允许引用已发布的受管 Asset；表中同时明确禁止的 in
 |---|---|---|
 | catalog asset | `archive_asset`（plan 物化 `content_url` + `content_sha256`） | 从 HTTP 下载已校验 tar 归档 |
 | inline content | 不适用 | archive 必须先导入为受管 Asset，不在 bundle 内嵌 tar 字节 |
+
+#### 4.6.6 标准 archive 构建命令与元数据边界
+
+公开 CLI 提供唯一标准构建入口：
+
+```text
+nodeforge assets archive build <output.tar> --install-script <path> \
+  [--base-dir <dir>] [--files-from <list>] [paths...]
+```
+
+- `<paths...>` 与 `--files-from` 可同时使用；list 是 UTF-8 文本，一行一个相对
+  `--base-dir` 的路径，空行忽略；至少需要一个 payload 路径。
+- 拒绝绝对路径、任意 `..` component、NUL/换行路径和已存在的输出文件。
+- 用户安装脚本必须是普通文件。CLI 在追加时将它映射为精确顶层
+  `.nf.install.sh`；payload 已含该保留条目时失败，绝不覆盖或猜测用户意图。
+- 构建依赖 GNU tar，输出为未压缩 PAX `.tar`。全部 payload 在同一次创建调用中
+  读取，GNU tar 因而能够保留软链接目标及跨显式输入项的硬链接关系；追加入口不会
+  改写 payload。
+- 归档记录 mode、数字 uid/gid、mtime、ACL 和 xattr；读取使用
+  `--atime-preserve=system`，不更新源 atime。运行端以
+  `--same-owner --same-permissions --acls --xattrs` 解压，保证 root 上下文按归档恢复。
+- **明确不可实现项**：ctime 是 inode 元数据发生变化时由内核设置的时间，用户态
+  不能设置；解压创建新 inode 后不可能与源 ctime 相等。atime 是否能在解压后恢复也
+  受 tar、文件系统 mount option 和后续读取影响，不作为跨系统保证。实现只能保证
+  打包过程不扰动源 atime，不能宣称解压后 ctime/atime 完全一致。
 
 install-post 上下文中：
 
@@ -468,9 +495,9 @@ rootfs-build/first-boot 还支持第三种来源 `payload_path`（agent pre-init
 - archive 是受信管理域内由操作员导入的受管 Asset，不按不可信多租户上传物处理。
 - Asset import 必须验证 tar 可读取，拒绝绝对路径和 `..` 路径组件，并保存 SHA-256；
   runner 下载后必须核对同一 digest。
-- archive 顶层只识别精确 `install.sh`/`./install.sh`；子目录脚本和其他可执行文件不
-  自动执行。
-- `install.sh` 以 `sh` 执行，退出码 0 且由操作者保证幂等；禁止隐式下载未声明内容。
+- archive 顶层只识别精确 `.nf.install.sh`/`./.nf.install.sh`；普通 `install.sh`、
+  子目录脚本和其他可执行文件不自动执行。
+- `.nf.install.sh` 以 `sh` 执行，退出码 0 且由操作者保证幂等；禁止隐式下载未声明内容。
 - manifest 只声明 SHA-256（由 asset 提供），不设 `script|extract` 策略、`target_root`、
   `install --root` 参数或 `NODEFORGE_TARGET_ROOT` 环境变量。
 - archive 没有 `destination` 字段——目标根由执行上下文决定（install-post 为安装
@@ -484,8 +511,8 @@ rootfs-build/first-boot 还支持第三种来源 `payload_path`（agent pre-init
 
 | 维度 | install-post（v0.3 新增） | rootfs-build（v0.2 已有模式 B，需补模式 A） | first-boot（v0.2 已有模式 B，需补模式 A） |
 |---|---|---|---|
-| 模式 A（`./install.sh` 存在） | 解压到临时目录 + 执行 | 同左 | 同左 |
-| 模式 B（`./install.sh` 不存在） | 解压到目标根 `/` | 解压到 staging `/` | 解压到 overlay upper `/` |
+| 模式 A（`./.nf.install.sh` 存在） | 解压到临时目录 + 执行 | 同左 | 同左 |
+| 模式 B（`./.nf.install.sh` 不存在） | 解压到目标根 `/` | 解压到 staging `/` | 解压到 overlay upper `/` |
 | 来源：catalog asset | `curl + sha256sum -c` | payload_path（已物化） | payload_path（pre-init 已下载） |
 | 来源：inline content | 禁止 | 禁止 | 禁止 |
 | 来源：payload_path | **不适用**（无 agent pre-init） | chroot 内 payload 路径 | `/var/lib/nodeforge/payload/` |
@@ -556,7 +583,7 @@ nodeforge node postprocess show <node> --phase install-post [--generation <id>]
 - 八步执行生命周期与四类 action 固定顺序；
 - `package` action 只引用 pinned effective software/capability，经本地 repository
   解析校验、幂等；
-- `archive` 规则与 v0.2 §5.4 一致：运行时自判定 `./install.sh` 存在则解压到临时
+- `archive` 规则与 v0.2 §5.4 一致：运行时自判定 `./.nf.install.sh` 存在则解压到临时
   目录执行（模式 A），否则直接解压到目标根（模式 B），详见 §4.6；
 - **补齐** `first_boot.zig` `renderStep` `.archive` 分支的模式 A 逻辑，使
   rootfs-build/first-boot 与 install-post 行为一致；

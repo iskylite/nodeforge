@@ -57,12 +57,12 @@ fn writePrintfBytes(writer: *std.Io.Writer, content: []const u8) !void {
 /// 执行逻辑。判定规则（v0.2 设计 §5.4 冻结）：
 ///
 /// 1. 用 `tar -tf` 读取条目列表（不解压）；
-/// 2. 规范化可选的 `./` 前缀后，检查顶层是否存在精确 `install.sh`；
-/// 3. 存在则模式 A：解压到临时目录 + 执行 `sh ./install.sh`；
+/// 2. 规范化可选的 `./` 前缀后，检查顶层是否存在精确 `.nf.install.sh`；
+/// 3. 存在则模式 A：解压到临时目录 + 执行 `sh ./.nf.install.sh`；
 /// 4. 不存在则模式 B：直接解压到目标根。
 ///
-/// 子目录 `install.sh`（如 `app/install.sh`）不触发模式 A；不得通过路径规范化
-/// 把含 `..` 的条目提升为顶层 `install.sh`。
+/// 普通 `install.sh` 以及子目录入口（如 `app/.nf.install.sh`）不触发模式 A；不得
+/// 通过路径规范化把含 `..` 的条目提升为顶层 `.nf.install.sh`。
 ///
 /// 脚本以单行 `{ if ! ENTRIES=$(tar -tf ...); then exit 1; fi; if ...; then ...; else ...; fi; }` 渲染。
 /// 这在 Kickstart `%post`（多行）和 Ubuntu `late-commands`（换行转 `&&`）中
@@ -78,9 +78,9 @@ fn writePrintfBytes(writer: *std.Io.Writer, content: []const u8) !void {
 pub fn renderArchiveModeDetection(w: *std.Io.Writer, archive_expr: []const u8, target_root: []const u8) !void {
     try w.writeAll("{ if ! ENTRIES=$(timeout 10 tar -tf ");
     try w.writeAll(archive_expr);
-    try w.writeAll("); then exit 1; fi; if printf '%s\\n' \"$ENTRIES\" | sed 's#^\\./##' | grep -Fxq 'install.sh'; then TMPDIR=$(mktemp -d /tmp/.nodeforge-arc-XXXXXX) && timeout 30 tar -xf ");
+    try w.writeAll("); then exit 1; fi; if printf '%s\\n' \"$ENTRIES\" | sed 's#^\\./##' | grep -Fxq '.nf.install.sh'; then TMPDIR=$(mktemp -d /tmp/.nodeforge-arc-XXXXXX) && timeout 30 tar --same-owner --same-permissions --acls --xattrs -xf ");
     try w.writeAll(archive_expr);
-    try w.writeAll(" -C \"$TMPDIR\" && ( cd \"$TMPDIR\" && timeout 30 sh ./install.sh ) && rm -rf \"$TMPDIR\"; else timeout 30 tar -xf ");
+    try w.writeAll(" -C \"$TMPDIR\" && ( cd \"$TMPDIR\" && timeout 30 sh ./.nf.install.sh ) && rm -rf \"$TMPDIR\"; else timeout 30 tar --same-owner --same-permissions --acls --xattrs -xf ");
     try w.writeAll(archive_expr);
     try w.writeAll(" -C ");
     try writeShellQuoted(w, target_root);
@@ -181,7 +181,7 @@ pub fn renderInstallPost(allocator: std.mem.Allocator, bundle: *const model.Prov
                 },
 
                 // archive action：下载 catalog asset 到临时文件，校验 digest，
-                // 然后运行时自判定模式 A（./install.sh 存在 -> 解压到临时目录 +
+                // 然后运行时自判定模式 A（./.nf.install.sh 存在 -> 解压到临时目录 +
                 // 执行）或模式 B（直接解压到目标根 /）。
                 // archive 只允许引用 catalog asset（content_asset + content_url +
                 // content_sha256），禁止 inline content；没有 destination 字段，
@@ -343,10 +343,11 @@ test "renderInstallPost archive renders mode A/B detection" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "sha256sum -c -") != null);
     // 验证模式 A/B 判定
     try std.testing.expect(std.mem.indexOf(u8, bytes, "tar -tf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "grep -Fxq 'install.sh'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "grep -Fxq '.nf.install.sh'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "grep -Fxq 'install.sh'") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "mktemp -d") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "sh ./install.sh") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "tar -xf \"$ARCFILE\" -C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "sh ./.nf.install.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "tar --same-owner --same-permissions --acls --xattrs -xf \"$ARCFILE\" -C") != null);
     // 验证清理
     try std.testing.expect(std.mem.indexOf(u8, bytes, "rm -f \"$ARCFILE\"") != null);
 }
@@ -411,12 +412,12 @@ test "renderArchiveModeDetection produces valid single-line if/then/else/fi" {
     try std.testing.expect(std.mem.indexOf(u8, s, "then") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "else") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "fi; }") != null);
-    // 验证模式 A：解压到临时目录 + 执行 install.sh
+    // 验证模式 A：解压到临时目录 + 执行隐藏入口 .nf.install.sh
     try std.testing.expect(std.mem.indexOf(u8, s, "mktemp -d") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "sh ./install.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "sh ./.nf.install.sh") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "rm -rf \"$TMPDIR\"") != null);
     // 验证模式 B：直接解压到目标根
-    try std.testing.expect(std.mem.indexOf(u8, s, "tar -xf \"$ARCFILE\" -C '/'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "tar --same-owner --same-permissions --acls --xattrs -xf \"$ARCFILE\" -C '/'") != null);
 }
 
 test "instrumented install-post emits ordered attempts and finalizer callbacks" {
