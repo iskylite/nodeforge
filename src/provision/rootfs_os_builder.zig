@@ -17,6 +17,7 @@ const dto = @import("../http/diskless_dto.zig");
 const namespaced_chroot_executor = @import("namespaced_chroot_executor.zig");
 const identity_store = @import("../state/identity_store.zig");
 
+/// 缺失会导致普通 rootfs 无法启动或无法由 Agent 收敛的核心包；该集合严格失败。
 const dnf_core_packages = [_][]const u8{
     "bash",    "coreutils",      "dnf",            "systemd",   "shadow-utils", "util-linux",
     "iproute", "NetworkManager", "openssh-server", "procps-ng",
@@ -27,6 +28,8 @@ const dnf_core_packages = [_][]const u8{
 const archive_tool_packages = [_][]const u8{ "tar", "gzip", "xz" };
 const archive_tool_files = [_][]const u8{ "usr/bin/tar", "usr/bin/gzip", "usr/bin/xz" };
 
+/// Ubuntu casper OS 层的真正发布闸，只包含普通 rootfs 自身必需的文件。
+/// archive 工具不得放入本集合，否则未使用 archive 的 Profile 也会被错误阻断。
 const casper_required_files = [_][]const u8{
     "sbin/init",
     "usr/lib/systemd/systemd",

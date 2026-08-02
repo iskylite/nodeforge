@@ -87,7 +87,7 @@ diskless ready；它只建立可重复构建的本地输入。
 
 ```text
 nodeforge assets managed-file import motd-v1 --from-file ./motd
-nodeforge assets archive import vendor-agent-v1 --from-file ./vendor-agent.tar.bz2
+nodeforge assets archive import vendor-agent-v1 --from-file ./vendor-agent.tar.xz
 nodeforge assets script import register-service-v1 --from-file ./register-local-service.sh
 nodeforge assets provision-bundle create compute-diskless-v1
 

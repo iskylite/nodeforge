@@ -2778,6 +2778,8 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
 
     const base_stat = std.Io.Dir.cwd().statFile(ctx.io, base_dir, .{ .follow_symlinks = true }) catch return itemUsageError(ctx, "archive build --base-dir is unreadable");
     if (base_stat.kind != .directory) return itemUsageError(ctx, "archive build --base-dir must be a directory");
+    // `.nf.install.sh` 是显式 opt-in 的 Mode A 入口，不是 archive 的必备组成。
+    // 未提供脚本时不得生成占位入口，否则纯数据包会被 runner 错判并执行。
     if (install_script.len != 0) {
         const script_stat = std.Io.Dir.cwd().statFile(ctx.io, install_script, .{ .follow_symlinks = false }) catch return itemUsageError(ctx, "archive build install script is unreadable");
         if (script_stat.kind != .file) return itemUsageError(ctx, "archive build install script must be a regular file, not a symlink");
@@ -2846,6 +2848,9 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
         try runArchiveBuildTar(ctx, &.{ "tar", "--format=pax", "--acls", "--xattrs", "--numeric-owner", "--atime-preserve=system", "--transform=s|.*|.nf.install.sh|", "-rf", temp_archive, script_name }, .{ .path = script_dir });
     }
     validateArchiveForImport(ctx, temp_archive) catch return itemUsageError(ctx, "archive build produced an invalid final archive");
+    // GNU tar 不能向已经压缩的流安全追加条目。必须先完成 payload、可选入口和
+    // 路径校验，再把最终临时 tar 压缩一次；三种输出因此共享完全相同的内部 PAX
+    // 布局、hardlink/symlink 与元数据语义。
     const publish_source = switch (compression) {
         .none => temp_archive,
         .gzip => blk: {
@@ -2868,6 +2873,9 @@ fn archiveBuildHandler(ctx: zli.CommandContext) !void {
     try renderCommandResult(ctx, human, .{ .archive = output_path, .mode = mode, .entrypoint = entrypoint, .payload_paths = path_count, .format = "pax", .compression = compression_name, .ctime_preserved = false });
 }
 
+/// canonical archive 的传输压缩层。`none` 是默认值；compression 只改变外层编码，
+/// 不改变 Mode A/B 判定和归档内 PAX 数据模型。后缀必须与显式选择一致，避免调用方
+/// 仅凭文件名产生错误的 media type 或缓存策略。
 const ArchiveCompression = enum {
     none,
     gzip,

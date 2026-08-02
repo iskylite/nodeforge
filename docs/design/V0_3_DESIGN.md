@@ -487,6 +487,20 @@ nodeforge assets archive build <output> [--install-script <path>] \
   rootfs。真正执行相关 archive 时若工具缺失，由该 action/journal 报错。三个 phase
   统一使用 `tar -xf` 自动识别，不按压缩格式复制 Mode A/B runner。
 
+能力检查必须区分“系统必需”和“步骤按需”，不得扩大失败域：
+
+| 时点 | 检查对象 | 缺失处理 |
+|---|---|---|
+| Rocky 核心 OS bootstrap | init、systemd、包管理器、网络、SSH 等 | rootfs build 失败 |
+| Rocky archive 工具补齐 | `tar`、`gzip`、`xz` | warning，继续发布普通 rootfs |
+| Ubuntu casper 核心校验 | init、systemd、apt、sshd | rootfs build 失败 |
+| Ubuntu casper archive 能力探测 | `tar`、`gzip`、`xz` | warning，继续发布普通 rootfs |
+| archive action 执行 | 当前归档真实需要的工具 | 当前 action 失败并写 journal |
+
+warning 不能提前把 deployment 标为失败，也不能被伪装成“已支持”；它只表示该
+rootfs 的可选 archive capability 不完整。若 bundle 没有 archive action，最终状态不受
+影响；若有，则由 action 的实际执行结果决定。
+
 install-post 上下文中：
 
 - **catalog asset 方式**：渲染为 `curl -fsS --output <tmpfile> <url> && sha256sum -c -`

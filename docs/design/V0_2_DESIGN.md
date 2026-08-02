@@ -1304,7 +1304,7 @@ ItemSpec 字段与 §5.2 八步执行契约，差异只在执行者、目标上�
 | action | 用途 | 输入 asset | 关键 ItemSpec 字段 |
 |---|---|---|---|
 | `managed-file` | 导入单个文件（如 `/etc/hosts.d/nodeforge`、motd） | `managed_file` | `destination`、`content_asset`、`mode`、`owner`、`group` |
-| `archive` | 导入目录树或自定义软件包（`tar.bz2`） | `archive` | `archive_asset` |
+| `archive` | 导入目录树或自定义软件包（`.tar`/`.tar.gz`/`.tar.xz`） | `archive` | `archive_asset` |
 | `script` | 执行受审计自定义脚本 | `script` | `script_asset`、`interpreter`、`timeout_s` |
 | `package` | 安装补充标准包/组/环境（RPM/DEB） | 引用 selection 或本地 repo | `selection`、`packages`、`group`、`environment`（至少一项，经本地 repo 解析校验） |
 
@@ -1315,6 +1315,12 @@ parser 拒绝该 action 不适用的字段。`repository`/`standard_packages` �
 `./.nf.install.sh`（退出码 0 且幂等，禁止隐式下载未声明内容）；否则直接把 payload 解压到 `/`。普通 `install.sh` 始终是数据文件，步骤作者始终以 `/` 为目标，
 builder/agent 提供挂载或 chroot 上下文把写入落到对应 lower 或 overlay upper；manifest 只声明 SHA256（由 asset 提供），
 不设 `script|extract` 策略、`target_root`、`install --root` 参数或 `NODEFORGE_TARGET_ROOT` 环境变量。
+
+标准 builder 默认生成未压缩 PAX `.tar`，可显式生成 gzip/xz 外层；`.nf.install.sh`
+可选，只有传入 `--install-script` 才创建 Mode A，否则为纯数据 Mode B。rootfs builder
+尽力补齐 `tar`/`gzip`/`xz`，缺失仅 warning，因为普通 rootfs 不一定声明 archive；
+只有实际 archive action 缺少所需工具时，该步骤才失败。该边界禁止把可选 action
+能力升级为整个 rootfs 的无条件发布闸。
 
 **provision-bundle item 编写**（复用 v0.1 §7.1 structured collection `item add/set/move`、`replace-items`、`--before/--after`、
 `--unset`，canonical collection key 为 `steps`）。字段示例见 `V0_2_CLI.md` §3。`managed-file` asset 只保存不可变内容；

@@ -710,6 +710,18 @@ ACL 与 xattr。ctime 是内核维护的 inode 变更时间，新建解压文件
 工具都不能合法还原；解压后的 atime 也不属于 tar 的可靠跨系统还原契约。CLI 因而
 明确报告 `ctime_preserved=false`，不得把“归档记录过某个时间”误解为“解压后完全一致”。
 
+rootfs 中的能力边界如下：
+
+| 检查 | 缺失时行为 | 原因 |
+|---|---|---|
+| init/systemd/包管理器/SSH 等核心基线 | rootfs build 失败 | 普通系统本身不可用 |
+| `tar`/`gzip`/`xz` 可选 archive 工具 | 记录 warning，继续构建 | Profile 可能没有 archive action |
+| action 实际解压 archive | action 失败并写 journal | 此时工具成为该步骤的真实依赖 |
+
+因此不要把 rootfs 日志中的 `optional archive tools ... may fail` warning 当成普通
+rootfs 发布失败；只有该 Profile 确实声明了相关 archive action 时才需要补齐工具或
+调整归档格式。
+
 ```bash
 bash tests/v0_3_install_post_e2e.sh
 # 等价的显式 build step：
