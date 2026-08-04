@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# v0.2.1 mkinitramfs approach smoke test v2.
+# Historical v0.2.1 hand-assembled rootfs fixture; not a current product test.
+# v0.2.1 casper initrd + ISO kernel QEMU smoke test.
 #
-# v2 fix: After mkinitramfs, strip /lib/modules and /boot from rootfs
-# to avoid InsufficientMemory (rootfs was 1.3G vs 948M for casper approach).
+# Verifies the CORRECT Ubuntu diskless approach:
+#   - kernel: Ubuntu /casper/vmlinuz (5.15.0-119-generic, from ISO)
+#   - initrd: Ubuntu /casper/initrd (extract → inject nodeforge-initrd → replace /init → repack)
+#   - rootfs: Ubuntu casper squashfs 3-layer overlay
 #
-# Tests building initrd from rootfs via chroot mkinitramfs (NOT casper initrd reuse).
-#   - kernel: from rootfs /boot/vmlinuz-<KREL> (installed via apt install linux-image-generic)
-#   - initrd: chroot rootfs mkinitramfs -o initrd.img <KREL>
-#   - rootfs: Ubuntu casper squashfs 3-layer overlay (same as casper approach)
-#   - POST-INITRD: strip /lib/modules and /boot from rootfs before mksquashfs
+# All three components are from the same Ubuntu ISO → vermagic matches.
 set -euo pipefail
 
 repo=${NODEFORGE_REPO:-/root/NodeForge}
 iso=${NODEFORGE_UBUNTU_ISO:-/root/ubuntu-22.04.5-live-server-arm64.iso}
 install_root=${NODEFORGE_UB_INSTALL_ROOT:-/tmp/nf-ub2}
-work=/tmp/nodeforge-v021-mkinit2
-port=18095
-node=ub-mkinit2-node
-profile=ub-mkinit2
+work=/tmp/nodeforge-v021-casper
+port=18093
+node=ub-casper-node
+profile=ub-casper
+KREL="5.15.0-119-generic"
 
 cleanup() {
     if [[ -n "${qemu_pid:-}" ]]; then kill "$qemu_pid" 2>/dev/null || true; wait "$qemu_pid" 2>/dev/null || true; fi
@@ -66,137 +66,60 @@ mkdir -p "$work/rootfs/etc/systemd/system/nodeforge-firstboot.service.d"
 printf '%s\n' \
     '[Service]' \
     'ExecStartPost=/usr/sbin/nodeforge-agent' \
-    "ExecStartPost=/bin/sh -c 'cat /var/lib/nodeforge/firstboot-journal.json /var/lib/nodeforge/firstboot.log > /dev/console; echo NODEFORGE_UBUNTU_MKINIT2_VALIDATION_DONE > /dev/console'" \
+    "ExecStartPost=/bin/sh -c 'cat /var/lib/nodeforge/firstboot-journal.json /var/lib/nodeforge/firstboot.log > /dev/console; echo NODEFORGE_UBUNTU_CASPER_VALIDATION_DONE > /dev/console'" \
     >"$work/rootfs/etc/systemd/system/nodeforge-firstboot.service.d/validation.conf"
-echo "rootfs built (before mksquashfs)"
-
-# ============================================================
-# 2. Install linux-image-generic in chroot (populate /lib/modules)
-# ============================================================
-echo "=== 2. Install linux-image-generic in chroot ==="
-mount -t proc none "$work/rootfs/proc" 2>/dev/null || true
-mount -t sysfs none "$work/rootfs/sys" 2>/dev/null || true
-mount --bind /dev "$work/rootfs/dev" 2>/dev/null || true
-mount --bind /dev/pts "$work/rootfs/dev/pts" 2>/dev/null || true
-cp /etc/resolv.conf "$work/rootfs/etc/resolv.conf"
-
-chroot "$work/rootfs" /bin/bash -c "
-    apt-get update 2>&1 | tail -3
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends linux-image-generic 2>&1 | tail -10
-"
-
-KREL=$(ls "$work/rootfs/lib/modules/")
-echo "=== Installed kernel release: $KREL ==="
-echo "vmlinuz: $(ls "$work/rootfs/boot/vmlinuz-"*)"
-echo "module count: $(find "$work/rootfs/lib/modules/$KREL" -name '*.ko' | wc -l)"
-
-# Extract vmlinuz BEFORE cleanup
-cp "$work/rootfs/boot/vmlinuz-$KREL" "$work/vmlinuz-$KREL"
-echo "kernel extracted: vmlinuz-$KREL"
-
-# ============================================================
-# 3. Build initrd via chroot mkinitramfs
-# ============================================================
-echo "=== 3. Build initrd via mkinitramfs ==="
-chroot "$work/rootfs" /usr/sbin/mkinitramfs -o /tmp/mkinitrd-output.img "$KREL" 2>&1 | tail -20
-cp "$work/rootfs/tmp/mkinitrd-output.img" "$work/mkinitrd-output.img"
-rm -f "$work/rootfs/tmp/mkinitrd-output.img"
-echo "mkinitramfs output: $(du -h "$work/mkinitrd-output.img" | cut -f1)"
-file "$work/mkinitrd-output.img"
-
-# Unmount chroot mounts
-umount "$work/rootfs/dev/pts" 2>/dev/null || true
-umount "$work/rootfs/dev" 2>/dev/null || true
-umount "$work/rootfs/sys" 2>/dev/null || true
-umount "$work/rootfs/proc" 2>/dev/null || true
-
-# ============================================================
-# 3.5 CRITICAL: Strip /lib/modules and /boot from rootfs
-# ============================================================
-echo "=== 3.5 Strip /lib/modules and /boot from rootfs ==="
-echo "Before strip:"
-du -sh "$work/rootfs/lib/modules/" "$work/rootfs/boot/"
-rm -rf "$work/rootfs/lib/modules/"*
-rm -f "$work/rootfs/boot/vmlinuz-"*
-rm -f "$work/rootfs/boot/initrd-"*
-rm -f "$work/rootfs/boot/config-"*
-rm -f "$work/rootfs/boot/System.map-"*
-echo "After strip:"
-ls "$work/rootfs/lib/modules/" 2>/dev/null | wc -l
-ls "$work/rootfs/boot/" 2>/dev/null
-
-# Now mksquashfs the rootfs (WITHOUT kernel modules)
 mksquashfs "$work/rootfs" "$work/rootfs.squashfs" -noappend -comp zstd >/dev/null
 echo "rootfs.squashfs: $(du -h "$work/rootfs.squashfs" | cut -f1)"
 
 # ============================================================
-# 4. Extract mkinitramfs output and inject nodeforge-initrd
+# 2. Extract vmlinuz from ISO and rename to actual kernel version
 # ============================================================
-echo "=== 4. Extract and inject nodeforge-initrd ==="
+echo "=== 2. Extract vmlinuz and rename ==="
+cp "$m/casper/vmlinuz" "$work/vmlinuz-${KREL}"
+file "$work/vmlinuz-${KREL}"
+echo "vmlinuz renamed to: vmlinuz-${KREL}"
+
+# ============================================================
+# 3. Build initrd from casper initrd
+#    zstd -d → cpio extract → inject nodeforge-initrd → replace /init → repack
+# ============================================================
+echo "=== 3. Build initrd from casper initrd ==="
+zstd -d "$m/casper/initrd" -o "$work/casper-initrd.cpio" 2>/dev/null
+echo "casper initrd decompressed: $(du -h "$work/casper-initrd.cpio" | cut -f1)"
+
 mkdir -p "$work/initrd-root"
 cd "$work/initrd-root"
+cat "$work/casper-initrd.cpio" | cpio -idmv 2>&1 | tail -3
+echo "casper initrd extracted"
 
-# Try zstd first, then gzip
-if zstd -d "$work/mkinitrd-output.img" -o /tmp/mkinitrd.cpio 2>/dev/null; then
-    echo "format: zstd"
-    cat /tmp/mkinitrd.cpio | cpio -idmv 2>&1 | tail -5
-    rm -f /tmp/mkinitrd.cpio
-elif gzip -dc "$work/mkinitrd-output.img" | cpio -idmv 2>&1 | tail -5; then
-    echo "format: gzip"
-else
-    cat "$work/mkinitrd-output.img" | cpio -idmv 2>&1 | tail -5
-    echo "format: plain cpio"
+# Check /sbin structure
+echo "=== /sbin structure ==="
+ls -la ./sbin 2>/dev/null || echo "/sbin not found, creating..."
+if [[ ! -e ./sbin ]]; then
+    mkdir -p ./sbin
+fi
+if [[ -d ./sbin && ! -L ./sbin ]]; then
+    echo "/sbin is a directory (not symlink)"
 fi
 
-echo "=== mkinitramfs initrd contents ==="
-echo "init: $(ls -la ./init 2>/dev/null || echo 'not found')"
-echo "total .ko: $(find . -name '*.ko*' 2>/dev/null | wc -l)"
-echo "overlay.ko: $(find . -name 'overlay.ko*' 2>/dev/null | head -1)"
-
-echo "=== Critical tools check ==="
-for tool in ip dhclient modprobe switch_root mount busybox wget; do
-    found=$(find . -name "$tool" -type f 2>/dev/null | head -1)
-    if [[ -z "$found" ]]; then
-        echo "MISSING: $tool"
-    else
-        echo "OK: $tool -> $found"
-    fi
-done
-
-# 直接安装为 /init；nodeforge-initrd 使用原生 HTTP，不注入 curl/libc。
+# nodeforge-initrd 本身直接作为 PID 1。它内置 HTTP 客户端并自行设置 PATH，
+# 因此验证产物不得再注入 curl、目标 rootfs libc 或 shell wrapper。
 install -m 0755 "$repo/zig-out/bin/nodeforge-initrd" ./init
 mkdir -p ./usr/sbin
 install -m 0755 "$repo/zig-out/bin/nodeforge-initrd" ./usr/sbin/nodeforge-initrd
 
-# Inject modprobe from rootfs if missing
-if [[ ! -f ./sbin/modprobe && ! -L ./sbin/modprobe ]]; then
-    echo "=== Injecting modprobe from rootfs ==="
-    if [[ -f "$work/rootfs/sbin/modprobe" ]]; then
-        install -m 0755 "$work/rootfs/sbin/modprobe" ./sbin/modprobe
-        echo "  copied modprobe"
-    elif [[ -L "$work/rootfs/sbin/modprobe" ]]; then
-        # modprobe is a symlink, find the real binary
-        real_modprobe=$(readlink -f "$work/rootfs/sbin/modprobe")
-        if [[ -f "$real_modprobe" ]]; then
-            install -m 0755 "$real_modprobe" ./sbin/modprobe
-            echo "  copied modprobe (from symlink target)"
-        fi
-    fi
-    # Also copy kmod if modprobe is part of kmod
-    if [[ -f "$work/rootfs/bin/kmod" ]]; then
-        install -m 0755 "$work/rootfs/bin/kmod" ./bin/kmod 2>/dev/null || true
-    fi
-fi
-
 # Create capsule directory
 mkdir -p ./capsule; rm -f ./capsule/*
 
-# Verify
+# Verify key files exist
 echo "=== verification ==="
 echo "init: $(file ./init)"
 echo "nodeforge-initrd: $(ls -la ./usr/sbin/nodeforge-initrd | awk '{print $1, $5}')"
 echo "modules: $(find ./usr/lib/modules -name '*.ko*' 2>/dev/null | wc -l)"
+echo "overlay.ko: $(find ./usr/lib/modules -name 'overlay.ko*' 2>/dev/null | head -1)"
 echo "modprobe: $(ls ./sbin/modprobe 2>/dev/null || echo 'not found')"
+echo "switch_root: $(find . -name 'switch_root' 2>/dev/null | head -1)"
+echo "busybox: $(ls ./usr/bin/busybox 2>/dev/null || echo 'not found')"
 
 # Repack as cpio + gzip
 cd "$work/initrd-root"
@@ -207,22 +130,28 @@ umount "$m"; rmdir "$m"
 cd "$repo"
 
 # ============================================================
-# 5. Set up catalog
+# 4. Set up catalog with Ubuntu kernel + casper initrd + rootfs
 # ============================================================
-echo "=== 5. Set up catalog ==="
+echo "=== 4. Set up catalog ==="
 config="$install_root/config/config.json"
 
+# Kill any existing test daemon
 pkill -f "nodeforged --install-root $install_root" 2>/dev/null || true
 for _ in {1..50}; do ! pgrep -f "nodeforged --install-root $install_root" >/dev/null && break; sleep 0.1; done
 
+# Place kernel in the install root assets
 mkdir -p "$install_root/assets/boot"
-cp "$work/vmlinuz-$KREL" "$install_root/assets/boot/vmlinuz-$KREL"
-mkdir -p "$install_root/assets/boot/diskless/ubuntu"
-cp "$work/initramfs.img" "$install_root/assets/boot/diskless/ubuntu/ub-mkinit2-initrd"
-mkdir -p "$install_root/assets/rootfs-ubuntu"
-cp "$work/rootfs.squashfs" "$install_root/assets/rootfs-ubuntu/ub-mkinit2-rootfs"
+cp "$work/vmlinuz-${KREL}" "$install_root/assets/boot/vmlinuz-${KREL}"
 
-P="ub-mkinit2"
+# Place initrd
+mkdir -p "$install_root/assets/boot/diskless/ubuntu"
+cp "$work/initramfs.img" "$install_root/assets/boot/diskless/ubuntu/ub-casper-initrd"
+
+# Place rootfs
+mkdir -p "$install_root/assets/rootfs-ubuntu"
+cp "$work/rootfs.squashfs" "$install_root/assets/rootfs-ubuntu/ub-casper-rootfs"
+
+P="ub-casper"
 python3 - "$install_root/catalog" "$KREL" "$P" <<'PYINJ'
 import json, hashlib, sys, os
 dst, krel, P = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -249,15 +178,15 @@ b = {"name": f"{P}-bundle", "distro": "ubuntu", "version": "22.04", "arch": "aar
 if not any(x["name"] == b["name"] for x in bundles): bundles.append(b)
 dump("boot_bundles", bundles)
 nodes = load("nodes")
-if not any(x["id"] == "ub-mkinit2-node" for x in nodes):
-    nodes.append({"id":"ub-mkinit2-node","mac":"52:54:00:12:34:93","arch":"aarch64","profile":"ub-mkinit2"})
+if not any(x["id"] == "ub-casper-node" for x in nodes):
+    nodes.append({"id":"ub-casper-node","mac":"52:54:00:12:34:91","arch":"aarch64","profile":"ub-casper"})
 dump("nodes", nodes)
 profs = load("profiles")
-p = next((x for x in profs if x["name"]=="ub-mkinit2"), None)
+p = next((x for x in profs if x["name"]=="ub-casper"), None)
 if p is None:
     base = next((x for x in profs if x["name"]=="ubuntu-22.04-aarch64-iso"), profs[0])
-    p = json.loads(json.dumps(base)); p["name"]="ub-mkinit2"; profs.append(p)
-p["install_source"]="ubuntu-22.04-aarch64-iso"; p["kind"]="diskless"; p["boot_bundle"]="ub-mkinit2-bundle"
+    p = json.loads(json.dumps(base)); p["name"]="ub-casper"; profs.append(p)
+p["install_source"]="ubuntu-22.04-aarch64-iso"; p["kind"]="diskless"; p["boot_bundle"]="ub-casper-bundle"
 dump("profiles", profs)
 names = ["distros","profiles","nodes","provisioning_bundles","repositories","assets",
          "install_sources","boot_bundles","discovery_policy","unknown_client_observations"]
@@ -273,6 +202,7 @@ with open(f"{dst}/manifest.json","w") as f: json.dump(man,f,indent=2)
 print(f"catalog injected; assets={len(assets)} bundles={len(bundles)} nodes={len(nodes)} profiles={len(profs)}")
 PYINJ
 
+# Clear stale rootfs artifacts
 rm -f "$install_root/state/rootfs-artifacts.json" "$install_root/assets/rootfs/"*.squashfs 2>/dev/null || true
 
 # Start daemon
@@ -284,7 +214,7 @@ echo "daemon started"
 
 # Create profile + register rootfs
 zig-out/bin/nodeforge --install-root "$install_root" profile create "$profile" ubuntu-22.04-aarch64-iso \
-    --kind diskless --boot-bundle ub-mkinit2-bundle --config "$config" --output json >/dev/null 2>&1 || true
+    --kind diskless --boot-bundle ub-casper-bundle --config "$config" --output json >/dev/null 2>&1 || true
 zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" diskless.failure.max_attempts=3 --config "$config" --output json >/dev/null
 zig-out/bin/nodeforge --install-root "$install_root" profile set "$profile" diskless.failure.backoff_seconds=1 --config "$config" --output json >/dev/null
 zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" \
@@ -311,23 +241,22 @@ cd "$repo"
 echo "final initramfs: $(du -h "$work/initramfs-final.img" | cut -f1)"
 
 # ============================================================
-# 6. QEMU boot
+# 5. QEMU boot: Ubuntu kernel + casper initrd + Ubuntu rootfs
 # ============================================================
-echo "=== 6. QEMU boot ==="
-echo "kernel: $work/vmlinuz-$KREL"
+echo "=== 5. QEMU boot ==="
+echo "kernel: $work/vmlinuz-${KREL}"
 echo "initrd: $work/initramfs-final.img"
-echo "kernel vermagic: $KREL"
-echo "rootfs.squashfs: $(du -h "$work/rootfs.squashfs" | cut -f1)"
+echo "kernel vermagic: ${KREL}"
 
 /usr/libexec/qemu-kvm -cpu max -M virt -m 3072 \
-    -kernel "$work/vmlinuz-$KREL" -initrd "$work/initramfs-final.img" \
+    -kernel "$work/vmlinuz-${KREL}" -initrd "$work/initramfs-final.img" \
     -append "nodeforge.config_url=$config_url nodeforge.session=$session nodeforge.node=$node console=ttyAMA0" \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
     -nographic -no-reboot >"$work/console.log" 2>&1 &
 qemu_pid=$!
 deadline=$((SECONDS + 600))
 while (( SECONDS < deadline )); do
-    if grep -q 'NODEFORGE_UBUNTU_MKINIT2_VALIDATION_DONE' "$work/console.log" 2>/dev/null &&
+    if grep -q 'NODEFORGE_UBUNTU_CASPER_VALIDATION_DONE' "$work/console.log" 2>/dev/null &&
        grep -q '"type":"diskless.running"' "$install_root/logs/events.jsonl" 2>/dev/null; then break; fi
     kill -0 "$qemu_pid" 2>/dev/null || break
     sleep 1
@@ -338,7 +267,7 @@ echo "=== console tail (last 40 lines) ==="
 tail -40 "$work/console.log"
 echo ""
 echo "=== assertions ==="
-grep -q 'NODEFORGE_UBUNTU_MKINIT2_VALIDATION_DONE' "$work/console.log" && echo "PASS: validation done" || echo "FAIL: validation done"
+grep -q 'NODEFORGE_UBUNTU_CASPER_VALIDATION_DONE' "$work/console.log" && echo "PASS: validation done" || echo "FAIL: validation done"
 grep -q '"type":"diskless.running"' "$install_root/logs/events.jsonl" && echo "PASS: diskless.running" || echo "FAIL: diskless.running"
 grep -qiE 'Ubuntu|switch_root|Reached target' "$work/console.log" && echo "PASS: ubuntu boot evidence" || echo "FAIL: ubuntu boot evidence"
-echo "MKINIT2_SMOKE_DONE console=$work/console.log events=$install_root/logs/events.jsonl"
+echo "CASPER_SMOKE_DONE console=$work/console.log events=$install_root/logs/events.jsonl"

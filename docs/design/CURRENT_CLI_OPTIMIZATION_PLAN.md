@@ -145,7 +145,7 @@ profile add-values|remove-values|replace-values|clear-values
 profile item ...
 profile software ...
 profile capabilities show
-profile rootfs plan|register
+profile rootfs plan|build
 
 node unset
 node add-values|remove-values|replace-values|clear-values
@@ -772,7 +772,7 @@ assets archive import
 assets script import
 assets initrd build
 assets boot-bundle create
-profile rootfs build|register
+profile rootfs build
 ```
 
 逐步淘汰与类型化入口重复的通用 `assets register --type ...`，避免一个资源有两套身份和
@@ -783,7 +783,7 @@ profile rootfs build|register
 rootfs 的产品 owner 是 Profile：
 
 ```text
-profile rootfs plan|build|register|status
+profile rootfs plan|build|status
 ```
 
 物理内容寻址视图如需要，可在 assets 下只读查询，但不能引入第二套 mutation owner。

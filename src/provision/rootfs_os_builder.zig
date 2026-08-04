@@ -17,13 +17,20 @@ const dto = @import("../http/diskless_dto.zig");
 const namespaced_chroot_executor = @import("namespaced_chroot_executor.zig");
 const identity_store = @import("../state/identity_store.zig");
 
+pub const IdentityMaterial = struct {
+    client_private_key: []const u8,
+    client_public_key: []const u8,
+    host_private_key: []const u8,
+    host_public_key: []const u8,
+};
+
 /// 缺失会导致普通 rootfs 无法启动或无法由 Agent 收敛的核心包；该集合严格失败。
 const dnf_core_packages = [_][]const u8{
     "bash",    "coreutils",      "dnf",            "systemd",   "shadow-utils", "util-linux",
     "iproute", "NetworkManager", "openssh-server", "procps-ng",
 };
 
-/// archive 并非每个 Profile 都会使用。builder 默认尝试提供这些工具，但缺失只
+/// archive 并非每个 Profile 都会使用。服务端 rootfs 构建默认尝试提供这些工具，但缺失只
 /// 降低可选 action 能力，不得阻断普通 rootfs。
 const archive_tool_packages = [_][]const u8{ "tar", "gzip", "xz" };
 const archive_tool_files = [_][]const u8{ "usr/bin/tar", "usr/bin/gzip", "usr/bin/xz" };
@@ -62,14 +69,36 @@ pub fn buildOsLayer(
     identities: *identity_store.Store,
     profile: *const model.ProfileConfig,
 ) !void {
+    var identity: identity_store.IdentityRecord = undefined;
+    if (!identities.copy(profile.ssh_identity.id, profile.ssh_identity.revision, &identity)) return error.IdentityNotFound;
+    defer @memset(std.mem.asBytes(&identity), 0);
+    return buildOsLayerWithIdentity(io, allocator, staging, package_manager, version, repository_urls, casper_layer_paths, .{
+        .client_private_key = identity.clientPrivateKey(),
+        .client_public_key = identity.clientPublicKey(),
+        .host_private_key = identity.hostPrivateKey(),
+        .host_public_key = identity.hostPublicKey(),
+    });
+}
+
+/// 使用已解析的身份材料构建服务端 rootfs OS layer。
+pub fn buildOsLayerWithIdentity(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    staging: []const u8,
+    package_manager: model.PackageManager,
+    version: []const u8,
+    repository_urls: []const []const u8,
+    casper_layer_paths: []const []const u8,
+    identity: IdentityMaterial,
+) !void {
     switch (package_manager) {
         // dnf 从零 bootstrap 必须有受管仓库；casper OS 层直接来自已导入的
         // squashfs，即使定制 ISO 没有完整 APT metadata 也应允许构建。
         .dnf => {
             if (repository_urls.len == 0) return error.NoManagedRepository;
-            try buildDnf(io, allocator, staging, version, repository_urls, identities, profile);
+            try buildDnf(io, allocator, staging, version, repository_urls, identity);
         },
-        .apt => try buildCasperOverlay(io, allocator, staging, casper_layer_paths, identities, profile),
+        .apt => try buildCasperOverlay(io, allocator, staging, casper_layer_paths, identity),
     }
 }
 
@@ -87,8 +116,24 @@ fn buildCasperOverlay(
     allocator: std.mem.Allocator,
     staging: []const u8,
     casper_layer_paths: []const []const u8,
-    identities: *identity_store.Store,
-    profile: *const model.ProfileConfig,
+    identity: IdentityMaterial,
+) !void {
+    try materializeCasperOverlay(io, allocator, staging, casper_layer_paths);
+
+    // casper 安装器层的默认 target 可能指向安装器专用逻辑；覆盖为
+    // multi-user.target，与 dnf OS 层一致。sshd 配置同样是纯 staging 文件
+    // 操作，不依赖 apt。v0.2.3 起 SSH 资产与 dnf 分支一致从 identity store
+    // 安装（installIdentityKeys，构建期不再 ssh-keygen）。
+    try writeDefaultSshdConfig(io, allocator, staging);
+    try installIdentityKeys(io, allocator, staging, identity);
+    try ensureDefaultTarget(io, allocator, staging);
+}
+
+fn materializeCasperOverlay(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    staging: []const u8,
+    casper_layer_paths: []const []const u8,
 ) !void {
     if (casper_layer_paths.len == 0) return error.MissingCasperLayers;
     try std.Io.Dir.cwd().createDirPath(io, staging);
@@ -140,14 +185,6 @@ fn buildCasperOverlay(
         if (!fileExists(io, abs))
             std.log.scoped(.rootfs_build).warn("casper overlay lacks optional archive tool: {s}; compressed archive actions may fail", .{abs});
     }
-
-    // casper 安装器层的默认 target 可能指向安装器专用逻辑；覆盖为
-    // multi-user.target，与 dnf OS 层一致。sshd 配置同样是纯 staging 文件
-    // 操作，不依赖 apt。v0.2.3 起 SSH 资产与 dnf 分支一致从 identity store
-    // 安装（installIdentityKeys，构建期不再 ssh-keygen）。
-    try writeDefaultSshdConfig(io, allocator, staging);
-    try installIdentityKeys(io, allocator, staging, identities, profile);
-    try ensureDefaultTarget(io, allocator, staging);
 }
 
 fn buildDnf(
@@ -156,10 +193,8 @@ fn buildDnf(
     staging: []const u8,
     version: []const u8,
     repository_urls: []const []const u8,
-    identities: *identity_store.Store,
-    profile: *const model.ProfileConfig,
+    identity: IdentityMaterial,
 ) !void {
-    _ = version;
     try std.Io.Dir.cwd().createDirPath(io, staging);
     // 可启动且可由 nodeforge-agent 收敛的基线。不能只满足 chroot：node-apply
     // 固定使用 usermod/systemctl，切根后的系统还需要 init、网络与 SSH 服务。
@@ -167,13 +202,13 @@ fn buildDnf(
     // 与旧实现的区别是该 host-context 被限制在独立 mount/PID namespace 中，并
     // 显式为 staging bind-mount /dev、/proc、/sys。OS 层完成后的 package 步骤
     // 才统一进入 chroot。
-    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &dnf_core_packages, repository_urls, true, .installroot, 0, false) catch |err| {
+    namespaced_chroot_executor.executeWithReleasever(io, allocator, staging, .dnf, &dnf_core_packages, repository_urls, true, .installroot, 0, false, majorVersion(version)) catch |err| {
         std.log.scoped(.rootfs_build).err("os-layer dnf namespaced install failed: {t}", .{err});
         return error.OsLayerBuildFailed;
     };
     // 默认尽力补齐 tar/gzip/xz。仓库裁剪或定制发行版缺少它们时只告警；普通
     // rootfs 仍可发布，真正使用 archive 时由统一 `tar -xf` action/journal 报错。
-    namespaced_chroot_executor.execute(io, allocator, staging, .dnf, &archive_tool_packages, repository_urls, true, .installroot, 0, false) catch |err| {
+    namespaced_chroot_executor.executeWithReleasever(io, allocator, staging, .dnf, &archive_tool_packages, repository_urls, true, .installroot, 0, false, majorVersion(version)) catch |err| {
         std.log.scoped(.rootfs_build).warn("optional archive tools were not fully installed: {t}; archive actions may fail", .{err});
     };
 
@@ -186,7 +221,7 @@ fn buildDnf(
     // v0.2.3 §3.3: 从 identity store 按 (ssh_identity.id, revision) 复合键读取
     // Profile 级共享 SSH keys 并写入 staging（不再在构建期 ssh-keygen）。
     // 同 Profile 节点共享这些 keys，因而可相互免密且 host fingerprint 一致。
-    try installIdentityKeys(io, allocator, staging, identities, profile);
+    try installIdentityKeys(io, allocator, staging, identity);
     // 确保 systemd 默认启动目标为 multi-user.target。
     try ensureDefaultTarget(io, allocator, staging);
 }
@@ -236,9 +271,7 @@ fn writeDefaultSshdConfig(io: std.Io, allocator: std.mem.Allocator, staging: []c
 ///
 /// 未命中（identity 缺失或引用为空）→ `IdentityNotFound` fail closed：绝不在
 /// build 期静默生成与 catalog 引用不一致的替代密钥。
-fn installIdentityKeys(io: std.Io, allocator: std.mem.Allocator, staging: []const u8, identities: *identity_store.Store, profile: *const model.ProfileConfig) !void {
-    var identity: identity_store.IdentityRecord = undefined;
-    if (!identities.copy(profile.ssh_identity.id, profile.ssh_identity.revision, &identity)) return error.IdentityNotFound;
+fn installIdentityKeys(io: std.Io, allocator: std.mem.Allocator, staging: []const u8, identity: IdentityMaterial) !void {
 
     // ── 1. host keys：写入 sshd host keypair ───────────────────────────
     const ssh_dir = try std.fmt.allocPrint(allocator, "{s}/etc/ssh", .{staging});
@@ -248,8 +281,8 @@ fn installIdentityKeys(io: std.Io, allocator: std.mem.Allocator, staging: []cons
     defer allocator.free(host_key);
     const host_pub_path = try std.fmt.allocPrint(allocator, "{s}.pub", .{host_key});
     defer allocator.free(host_pub_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = host_key, .data = identity.hostPrivateKey() });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = host_pub_path, .data = identity.hostPublicKey() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = host_key, .data = identity.host_private_key });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = host_pub_path, .data = identity.host_public_key });
 
     // ── 2. root client keypair ─────────────────────────────────────────
     const root_ssh = try std.fmt.allocPrint(allocator, "{s}/root/.ssh", .{staging});
@@ -259,15 +292,15 @@ fn installIdentityKeys(io: std.Io, allocator: std.mem.Allocator, staging: []cons
     defer allocator.free(client_key);
     const client_pub_path = try std.fmt.allocPrint(allocator, "{s}.pub", .{client_key});
     defer allocator.free(client_pub_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = client_key, .data = identity.clientPrivateKey() });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = client_pub_path, .data = identity.clientPublicKey() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = client_key, .data = identity.client_private_key });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = client_pub_path, .data = identity.client_public_key });
 
     // ── 3. authorized_keys 包含自身的 client public key ───────────────
     // 使 root 可免密 SSH 到自身和同 Profile 的其他节点（共享同一 rootfs 与
     // client keypair）。
     const authorized_keys_path = try std.fmt.allocPrint(allocator, "{s}/authorized_keys", .{root_ssh});
     defer allocator.free(authorized_keys_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = authorized_keys_path, .data = identity.clientPublicKey() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = authorized_keys_path, .data = identity.client_public_key });
     // 权限：私钥 0600，公钥/authorized_keys 0644，.ssh 目录 0700。
     try runChecked(io, allocator, &.{ "chmod", "0600", client_key });
     try runChecked(io, allocator, &.{ "chmod", "0644", client_pub_path });
@@ -281,7 +314,7 @@ fn installIdentityKeys(io: std.Io, allocator: std.mem.Allocator, staging: []cons
     defer allocator.free(known_hosts_path);
     var kh: std.Io.Writer.Allocating = .init(allocator);
     defer kh.deinit();
-    try kh.writer.print("localhost,127.0.0.1,* {s}", .{identity.hostPublicKey()});
+    try kh.writer.print("localhost,127.0.0.1,* {s}", .{identity.host_public_key});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = known_hosts_path, .data = kh.written() });
     try runChecked(io, allocator, &.{ "chmod", "0644", known_hosts_path });
 }
@@ -322,7 +355,7 @@ fn majorVersion(version: []const u8) []const u8 {
     return version[0..dot];
 }
 
-test "rootfs builder treats gzip and xz as optional archive capabilities" {
+test "server rootfs build treats gzip and xz as optional archive capabilities" {
     inline for (.{ "tar", "gzip", "xz" }) |required| {
         var found = false;
         for (archive_tool_packages) |package| found = found or std.mem.eql(u8, package, required);
@@ -333,4 +366,9 @@ test "rootfs builder treats gzip and xz as optional archive capabilities" {
         try std.testing.expect(found);
         for (casper_required_files) |path| try std.testing.expect(!std.mem.eql(u8, path, executable));
     }
+}
+
+test "dnf release version uses the target major version" {
+    try std.testing.expectEqualStrings("9", majorVersion("9.7"));
+    try std.testing.expectEqualStrings("9", majorVersion("9"));
 }

@@ -33,28 +33,33 @@
 //!
 //! - YAML 字符串使用单引号包裹并转义内部单引号，防止注入
 //! - `late-commands` 中的脚本换行符转为 `&&`，保持单行并在任一步失败时停止
-//! - 事件上报 curl 携带 capability token 和 session id
+//! - user-data 不内联 capability；early-command 从 boot-config bootstrap 到
+//!   0400 `/run` 文件，回调运行时读取并在终态后清理
 
 const std = @import("std");
 const model = @import("../../model.zig");
 const render = @import("../render.zig");
 const runner = @import("../../provision/runner.zig");
 const password_hash = @import("../password_hash.zig");
+const first_boot_handoff = @import("../../provision/install_first_boot_handoff.zig");
+const installer_auth = @import("installer_auth.zig");
 
 /// 测试夹具将共享 system 字段投影为 canonical software 输入；所有断言最终
 /// 覆盖唯一的 `renderEffective`，不会重新引入简化版 Autoinstall 路径。
-fn renderTestFixture(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
+fn renderTestFixture(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, boot_config_url: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     const network = node.network;
     const software: model.SoftwareSelection = .{ .packages = .{ .include = system.packages } };
-    return renderEffective(allocator, node, install, system, network, software, bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session, token, password_scope, kernel_args);
+    return renderEffective(allocator, node, install, system, network, software, bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session, boot_config_url, password_scope, kernel_args, null);
 }
 
 /// 从已编译的唯一 effective plan 渲染 Ubuntu Autoinstall。Profile、Node
 /// override、软件选择和目标网络必须在进入 adapter 前完成合并与校验。
-pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, network: model.TargetNetworkConfig, software: model.SoftwareSelection, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
+pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, network: model.TargetNetworkConfig, software: model.SoftwareSelection, bootstrap_key: []const u8, bundle: ?*const model.ProvisioningBundle, apt_primary_url: ?[]const u8, facts_url: []const u8, event_url: []const u8, log_url: []const u8, report_url: []const u8, session: []const u8, boot_config_url: []const u8, password_scope: []const u8, kernel_args: ?[]const u8, install_first_boot: ?first_boot_handoff.Config) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    const auth_bootstrap = try installer_auth.bootstrapCommand(allocator, boot_config_url, session, installer_auth.token_path);
+    defer allocator.free(auth_bootstrap);
     try w.writeAll("#cloud-config\nautoinstall:\n  version: 1\n  interactive-sections: []\n  shutdown: ");
     try w.writeAll(if (install.completion.action == .reboot) "reboot" else "poweroff");
     try w.writeAll("\n  refresh-installer:\n    update: false\n  locale: ");
@@ -70,6 +75,7 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try w.writeAll("\n  packages:\n");
     if (system.ssh.enabled) try w.writeAll("    - 'openssh-server'\n");
     if (bundleHasInstallPostArchive(bundle)) try w.writeAll("    - 'tar'\n");
+    if (install_first_boot != null) try w.writeAll("    - 'python3'\n");
     for (software.tasks) |task| {
         try w.writeAll("    - ");
         const task_name = try std.fmt.allocPrint(allocator, "{s}^", .{task});
@@ -199,14 +205,36 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try renderCloudUser(w, allocator, "root", system.ssh.root_password, false, &.{}, bootstrap_key, system.ssh.root_authorized_keys, password_scope);
     for (system.users) |user| try renderCloudUser(w, allocator, user.name, user.password, user.sudo, user.groups, bootstrap_key, user.ssh_authorized_keys, password_scope);
     try w.writeAll("  early-commands:\n");
-    const facts_command = try std.fmt.allocPrint(allocator, "nf_fact() {{ test -r /sys/class/dmi/id/$1 && head -c 256 /sys/class/dmi/id/$1 | tr -d '\\r\\n' | sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g'; }}; s=$(nf_fact product_serial); u=$(nf_fact product_uuid); v=$(nf_fact sys_vendor); m=$(nf_fact product_name); k=$(awk '$1 == \"MemTotal:\" {{ print $2; exit }}' /proc/meminfo); case \"$k\" in ''|*[!0-9]*) k=0;; esac; b=$((k * 1024)); d=$(printf '{{\"serial_number\":\"%s\",\"product_uuid\":\"%s\",\"vendor\":\"%s\",\"model\":\"%s\",\"memory_bytes\":%s}}' \"$s\" \"$u\" \"$v\" \"$m\" \"$b\"); curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d \"$d\" {s} || true", .{ token, session, facts_url });
+    try w.writeAll("    - ");
+    try render.yamlQuote(w, auth_bootstrap);
+    try w.writeByte('\n');
+    const facts_command = try std.fmt.allocPrint(allocator, "NF_TOKEN=$(cat {s}); nf_fact() {{ test -r /sys/class/dmi/id/$1 && head -c 256 /sys/class/dmi/id/$1 | tr -d '\\r\\n' | sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g'; }}; s=$(nf_fact product_serial); u=$(nf_fact product_uuid); v=$(nf_fact sys_vendor); m=$(nf_fact product_name); k=$(awk '$1 == \"MemTotal:\" {{ print $2; exit }}' /proc/meminfo); case \"$k\" in ''|*[!0-9]*) k=0;; esac; b=$((k * 1024)); d=$(printf '{{\"serial_number\":\"%s\",\"product_uuid\":\"%s\",\"vendor\":\"%s\",\"model\":\"%s\",\"memory_bytes\":%s}}' \"$s\" \"$u\" \"$v\" \"$m\" \"$b\"); curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d \"$d\" {s} || true; unset NF_TOKEN", .{ installer_auth.token_path, session, facts_url });
     defer allocator.free(facts_command);
     try w.writeAll("    - ");
     try render.yamlQuote(w, facts_command);
     try w.writeByte('\n');
-    try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"installer_started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
-    try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"started\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
+    try w.print("    - 'NF_TOKEN=$(cat {s}); curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"installer_started\\\"}}\" {s} || true; unset NF_TOKEN'\n", .{ installer_auth.token_path, session, session, event_url });
+    try w.print("    - 'NF_TOKEN=$(cat {s}); curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"started\\\"}}\" {s} || true; unset NF_TOKEN'\n", .{ installer_auth.token_path, session, session, event_url });
     try w.writeAll("  late-commands:\n");
+    // Never copy bearer bytes into the target filesystem. If Subiquity already
+    // exposes the live installer's /run inside the target, the same inode is
+    // immediately usable. Otherwise bind-mount the live tmpfs file over an
+    // empty 0400 placeholder; an abrupt power loss can therefore leave at
+    // most an empty inode on disk, never the capability.
+    try w.print("    - 'install -d -m 0755 /target/run; if [ \"$(stat -c %d:%i /run)\" != \"$(stat -c %d:%i /target/run)\" ]; then rm -f /target{s}; install -m 0400 /dev/null /target{s}; mount --bind {s} /target{s}; fi'\n", .{ installer_auth.token_path, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path });
+    if (install_first_boot) |handoff_config| {
+        const script = try first_boot_handoff.render(allocator, handoff_config);
+        defer allocator.free(script);
+        const encoded_len = std.base64.standard.Encoder.calcSize(script.len);
+        const encoded = try allocator.alloc(u8, encoded_len);
+        defer allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, script);
+        const command = try std.fmt.allocPrint(allocator, "printf '%s' '{s}' | base64 -d > /tmp/nodeforge-firstboot-handoff.sh && chmod 0700 /tmp/nodeforge-firstboot-handoff.sh && /bin/sh /tmp/nodeforge-firstboot-handoff.sh", .{encoded});
+        defer allocator.free(command);
+        try w.writeAll("    - ");
+        try render.yamlQuote(w, command);
+        try w.writeByte('\n');
+    }
     // Subiquity's offline-install fallback may restore Ubuntu's public mirrors
     // in the target even when mirror-selection points at NodeForge. Persist the
     // imported repository explicitly from the ISO's signed Release metadata so
@@ -313,7 +341,7 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     if (bundle) |value| {
         const script = try runner.renderInstallPostInstrumented(allocator, value, .apt, .{
             .event_url = event_url,
-            .token = token,
+            .token_file = installer_auth.token_path,
             .boot_session_id = session,
         });
         defer allocator.free(script);
@@ -326,13 +354,14 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
         try render.yamlQuote(w, command.written());
         try w.writeByte('\n');
     }
-    try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"post\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
+    try w.print("    - 'NF_TOKEN=$(cat {s}); curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"post\\\"}}\" {s} || true; unset NF_TOKEN'\n", .{ installer_auth.token_path, session, session, event_url });
     // 这是刻意安排的最后一个安装器侧成功操作。它在 Subiquity 执行
     // 配置的重启之前关闭持久化 generation 并记录已应用的修订版本。
-    try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"completed\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
+    try w.print("    - 'NF_TOKEN=$(cat {s}); curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"completed\\\"}}\" {s} || true; unset NF_TOKEN'\n", .{ installer_auth.token_path, session, session, event_url });
+    try w.print("    - 'umount /target{s} 2>/dev/null || true; rm -f {s} /target{s}; grep -RIl \"Authorization: Bearer \" /target/var/log/installer /target/var/lib/cloud 2>/dev/null | xargs -r rm -f'\n", .{ installer_auth.token_path, installer_auth.token_path, installer_auth.token_path });
     try w.writeAll("  error-commands:\n");
-    try w.print("    - 'ERR_CMD=${{ERROR_CMD}} ERR_STATUS=${{ERROR_STATUS}} ERR_TB=${{ERROR_TRACEBACK}} && SUMMARY=$(printf \"subiquity error: %s %s %s\" \"$ERR_CMD\" \"$ERR_STATUS\" \"$ERR_TB\" | head -c 1800) && curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" --data-urlencode \"v=1\" --data-urlencode \"boot_session_id={s}\" --data-urlencode \"reason=install.subiquity_error\" --data-urlencode \"summary=$SUMMARY\" {s} || true'\n", .{ token, session, session, log_url });
-    try w.print("    - 'curl -fsS -H \"Authorization: Bearer {s}\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"failed\\\"}}\" {s} || true'\n", .{ token, session, session, event_url });
+    try w.print("    - 'NF_TOKEN=$(cat {s} 2>/dev/null || true); ERR_CMD=${{ERROR_CMD}} ERR_STATUS=${{ERROR_STATUS}} ERR_TB=${{ERROR_TRACEBACK}} && SUMMARY=$(printf \"subiquity error: %s %s %s\" \"$ERR_CMD\" \"$ERR_STATUS\" \"$ERR_TB\" | head -c 1800) && test -z \"$NF_TOKEN\" || curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H \"X-NodeForge-Session: {s}\" --data-urlencode \"v=1\" --data-urlencode \"boot_session_id={s}\" --data-urlencode \"reason=install.subiquity_error\" --data-urlencode \"summary=$SUMMARY\" {s} || true; unset NF_TOKEN'\n", .{ installer_auth.token_path, session, session, log_url });
+    try w.print("    - 'NF_TOKEN=$(cat {s} 2>/dev/null || true); test -z \"$NF_TOKEN\" || curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H \"X-NodeForge-Session: {s}\" -H \"Content-Type: application/json\" -d \"{{\\\"v\\\":1,\\\"boot_session_id\\\":\\\"{s}\\\",\\\"stage\\\":\\\"failed\\\"}}\" {s} || true; unset NF_TOKEN; umount /target{s} 2>/dev/null || true; rm -f {s} /target{s}'\n", .{ installer_auth.token_path, session, session, event_url, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path });
     if (system.connectivity.time_sync) {
         try w.writeAll("ntp:\n  enabled: true\n  servers:\n");
         for (system.connectivity.ntp_servers) |server| {
@@ -651,7 +680,7 @@ pub fn renderMetaData(allocator: std.mem.Allocator, node: *const model.NodeConfi
 // - cloud-config 顶层 ntp/package_update/package_upgrade 禁用网络操作
 test "autoinstall has NoCloud header and late event hook" {
     const node: model.NodeConfig = .{ .id = "node-01", .mac = "00:11:22:33:44:55", .arch = .aarch64, .profile = "ubuntu" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "#cloud-config") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "autoinstall:") != null);
@@ -680,6 +709,15 @@ test "autoinstall has NoCloud header and late event hook" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\nntp:\n  enabled: false") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\npackage_update: false") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\npackage_upgrade: false") != null);
+    const raw_capability = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "http://srv/api/v1/nodes/n1/boot-config") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, installer_auth.token_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Authorization: Bearer $NF_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, raw_capability) == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "mount --bind /run/nodeforge-installer.token /target/run/nodeforge-installer.token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "install -D -m 0400 /run/nodeforge-installer.token /target/run/nodeforge-installer.token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "umount /target/run/nodeforge-installer.token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "rm -f /run/nodeforge-installer.token /target/run/nodeforge-installer.token") != null);
 }
 
 // 测试：apt 段在 apt_primary_url 为 null 时仍然渲染（空 uri）。
@@ -687,7 +725,7 @@ test "autoinstall has NoCloud header and late event hook" {
 // 即使 URI 为空，默认 fallback: offline-install 仍能保证安装继续。
 test "apt section is always rendered even when apt_primary_url is null" {
     const node: model.NodeConfig = .{ .id = "node-02", .mac = "00:11:22:33:44:66", .arch = .x86_64, .profile = "ubuntu" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, null, "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, null, "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     // 即使 apt_primary_url 为 null，apt 段也必须存在
     try std.testing.expect(std.mem.indexOf(u8, bytes, "apt:") != null);
@@ -698,7 +736,7 @@ test "apt section is always rendered even when apt_primary_url is null" {
 
 test "apt fallback is rendered from the install profile" {
     const node: model.NodeConfig = .{ .id = "node-strict", .mac = "00:11:22:33:44:88", .arch = .aarch64, .profile = "ubuntu" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{ .apt = .{ .fallback = .abort } }, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{ .apt = .{ .fallback = .abort } }, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "fallback: abort") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "fallback: offline-install") == null);
@@ -706,7 +744,7 @@ test "apt fallback is rendered from the install profile" {
 
 test "preserve_sources_list keeps the original target sources in the late command" {
     const node: model.NodeConfig = .{ .id = "node-preserve", .mac = "00:11:22:33:44:cc", .arch = .aarch64, .profile = "ubuntu" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{ .apt = .{ .preserve_sources_list = true } }, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{ .apt = .{ .preserve_sources_list = true } }, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     // preserve=true：late-command 不再删除原有源，只附加 NodeForge 受管源。
     try std.testing.expect(std.mem.indexOf(u8, bytes, "rm -f /target/etc/apt/sources.list") == null);
@@ -719,7 +757,7 @@ test "preserve_sources_list keeps the original target sources in the late comman
 test "M4.1 autoinstall renders target defaults and static network" {
     const node: model.NodeConfig = .{ .id = "node-04", .mac = "00:11:22:33:44:99", .arch = .aarch64, .profile = "ubuntu", .pxe = .{ .ip_reservation = "192.168.50.27" }, .network = .{ .mode = .static, .interface = "ens160", .address = "192.168.50.27", .prefix_len = 24, .gateway = "192.168.50.1", .dns = &.{"192.168.50.1"}, .search_domains = &.{"nodeforge.local"} } };
     const system: model.TargetSystemConfig = .{ .localization = .{ .locale = "zh_CN.UTF-8", .timezone = "Asia/Shanghai", .keyboard = "us" }, .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} }, .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }} };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/artifacts/repositories/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, system, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", null, "http://192.168.50.1/artifacts/repositories/ubuntu", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "daemon:session:1", null);
     // report_url="" 表示未配置 installer-hooks/subiquity 端点（不渲染 reporting 块）
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "locale: 'zh_CN.UTF-8'") != null);
@@ -739,8 +777,10 @@ test "M4.1 autoinstall renders target defaults and static network" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--data-urlencode \"summary=$SUMMARY\"") != null);
     // reporting 块不渲染（report_url 为空时跳过）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "reporting:") == null);
-    // curl 回调中仍含 Authorization: Bearer header（降级路径）
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "Authorization: Bearer token") != null);
+    // Answer 只包含 bootstrap endpoint/path；bearer 在运行时从 0400 文件读取。
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Authorization: Bearer $NF_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, installer_auth.token_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "http://srv/api/v1/nodes/n1/boot-config") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "archive.ubuntu.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "99-nodeforge.cfg") == null);
 }
@@ -748,7 +788,7 @@ test "M4.1 autoinstall renders target defaults and static network" {
 test "M4.2 webhook reporting rendered when report_url is non-empty" {
     // 非空 report_url 渲染 reporting 块（webhook reporter 在 22.04 和 24.04 均可用）
     const node: model.NodeConfig = .{ .id = "node-rpt", .mac = "00:11:22:33:44:aa", .arch = .aarch64, .profile = "ubuntu", .hostname = "noderpt" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "http://192.168.50.1:18080/report", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "http://192.168.50.1:18080/report", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     // reporting 块应渲染，type 必须是 webhook（不是 http）
     try std.testing.expect(std.mem.indexOf(u8, bytes, "reporting:") != null);
@@ -764,7 +804,7 @@ test "M4.2 webhook reporting rendered when report_url is non-empty" {
 test "M4.2 hostname always rendered even without users" {
     // 显式空 users 保留 root-only；目标 hostname 必须位于 autoinstall.user-data。
     const node: model.NodeConfig = .{ .id = "node-nh", .mac = "00:11:22:33:44:bb", .arch = .aarch64, .profile = "ubuntu", .hostname = "myhost" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{ .users = &.{} }, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{ .users = &.{} }, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "  user-data:\n    hostname: 'myhost'\n    preserve_hostname: false\n    disable_root: false") != null);
     // identity 不应出现（无 users）
@@ -773,7 +813,7 @@ test "M4.2 hostname always rendered even without users" {
 
 test "M4.2 autoinstall renders default nodeforge identity" {
     const node: model.NodeConfig = .{ .id = "node-default", .mac = "00:11:22:33:44:bc", .arch = .aarch64, .profile = "ubuntu", .hostname = "ubuntu-default" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "identity:\n    hostname: 'ubuntu-default'\n    username: 'nodeforge'") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "name: 'nodeforge'") != null);
@@ -782,7 +822,7 @@ test "M4.2 autoinstall renders default nodeforge identity" {
 
 test "M4.6 autoinstall persists literal kernel args in GRUB drop-in" {
     const node: model.NodeConfig = .{ .id = "node-kargs", .mac = "00:11:22:33:44:bd", .arch = .aarch64, .profile = "ubuntu" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", "iommu=pt hugepages=4");
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", "iommu=pt hugepages=4");
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/default/grub.d/99-nodeforge.cfg") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "GRUB_CMDLINE_LINUX=\"${GRUB_CMDLINE_LINUX} iommu=pt hugepages=4\"") != null);
@@ -796,7 +836,7 @@ test "late command keeps managed files single-line and fail-fast" {
         .{ .name = "packages", .action = .package, .packages = &.{"curl"} },
         .{ .name = "hosts", .action = .managed_file, .destination = "/etc/hosts.d/nodeforge", .content = "127.0.0.1 localhost\n" },
     } };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", &bundle, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", &bundle, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "NODEFORGE_EOF") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "install -d") != null);

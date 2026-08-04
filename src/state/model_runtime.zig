@@ -44,9 +44,13 @@ pub const ModelRuntime = struct {
     }
     /// 获取 mutation_gate。变更操作（catalog mutation、ISO 导入等）必须
     /// 在持有此锁期间完成 config/catalog 的 prepare 和 publish。
-    pub fn lock(self: *ModelRuntime) void { while (!self.mutation_gate.tryLock()) std.Thread.yield() catch {}; }
+    pub fn lock(self: *ModelRuntime) void {
+        while (!self.mutation_gate.tryLock()) std.Thread.yield() catch {};
+    }
     /// 释放 mutation_gate。
-    pub fn unlock(self: *ModelRuntime) void { self.mutation_gate.unlock(); }
+    pub fn unlock(self: *ModelRuntime) void {
+        self.mutation_gate.unlock();
+    }
     /// Pin 当前 config/catalog 世代对。返回的 `Pair` 持有两个引用计数 +1
     /// 的快照，调用方负责 `release()`。加锁顺序固定：
     /// model gate -> ConfigRuntime reader -> CatalogRuntime reader。

@@ -74,11 +74,60 @@ pub fn resolve(
     http_port: u16,
     cmdline_buf: []u8,
 ) ?BootTarget {
+    if (identity.discovery) return resolveDiscovery(identity, config, catalog, server_ip, http_port, cmdline_buf);
     const profile = lookup.findProfile(catalog, identity.profileName()) orelse lookup.findProfile(config, identity.profileName()) orelse return null;
     return switch (profile.kind) {
         .install => resolveInstall(identity, config, catalog, server_ip, http_port, cmdline_buf),
         .diskless => resolveDiskless(identity, config, catalog, server_ip, http_port, cmdline_buf),
     };
+}
+
+/// Resolve the one-shot v0.4 discovery target. It deliberately selects only
+/// generic, daemon-owned kernel/initrd assets and never produces a node
+/// BootConfig, AgentPlan, rootfs URL, or credential capsule.
+fn resolveDiscovery(
+    identity: TftpBootIdentity,
+    config: *const model.AppConfig,
+    catalog: *const model.Catalog,
+    server_ip: []const u8,
+    http_port: u16,
+    cmdline_buf: []u8,
+) ?BootTarget {
+    var kernel: ?model.AssetConfig = null;
+    var initrd: ?model.AssetConfig = null;
+    const requested_arch: model.Arch = identity.discovery_arch orelse .x86_64;
+    // Discovery sessions do not yet know the firmware architecture at the
+    // catalog layer. Prefer an explicitly matching asset, then fall back to
+    // the newest untyped asset so the PXE architecture still controls GRUB.
+    for (catalog.assets) |asset| {
+        if (asset.kind == .kernel or asset.kind == .runtime_kernel) {
+            const matches = if (asset.arch) |arch| arch == requested_arch else kernel == null;
+            if (matches and (kernel == null or asset.revision > kernel.?.revision)) kernel = asset;
+        }
+        if (asset.kind == .nodeforge_initrd) {
+            const matches = if (asset.arch) |arch| arch == requested_arch else initrd == null;
+            if (matches and (initrd == null or asset.revision > initrd.?.revision)) initrd = asset;
+        }
+    }
+    const kernel_asset = kernel orelse return null;
+    const initrd_asset = initrd orelse return null;
+    const kernel_path = toGrubPath(kernel_asset.path) orelse return null;
+    const initrd_path = toGrubPath(initrd_asset.path) orelse return null;
+    const slash = std.mem.lastIndexOfScalar(u8, config.dhcp.subnet, '/') orelse return null;
+    const prefix = config.dhcp.subnet[slash + 1 ..];
+    const base = if (config.dhcp.router) |router|
+        std.fmt.bufPrint(
+            cmdline_buf,
+            "ip=dhcp nodeforge.discovery=1 nodeforge.discovery_session={s} nodeforge.discovery_url=http://{s}:{d}/api/v1/discovery/probes/{s}/facts nodeforge.mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} nodeforge.ip={d}.{d}.{d}.{d} nodeforge.prefix={s} nodeforge.gateway={s} console=ttyAMA0 console=tty0",
+            .{ identity.boot_session_id[0..], server_ip, http_port, identity.boot_session_id[0..], identity.mac[0], identity.mac[1], identity.mac[2], identity.mac[3], identity.mac[4], identity.mac[5], (identity.lease_ip >> 24) & 0xff, (identity.lease_ip >> 16) & 0xff, (identity.lease_ip >> 8) & 0xff, identity.lease_ip & 0xff, prefix, router },
+        ) catch return null
+    else
+        std.fmt.bufPrint(
+            cmdline_buf,
+            "ip=dhcp nodeforge.discovery=1 nodeforge.discovery_session={s} nodeforge.discovery_url=http://{s}:{d}/api/v1/discovery/probes/{s}/facts nodeforge.mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} nodeforge.ip={d}.{d}.{d}.{d} nodeforge.prefix={s} console=ttyAMA0 console=tty0",
+            .{ identity.boot_session_id[0..], server_ip, http_port, identity.boot_session_id[0..], identity.mac[0], identity.mac[1], identity.mac[2], identity.mac[3], identity.mac[4], identity.mac[5], (identity.lease_ip >> 24) & 0xff, (identity.lease_ip >> 16) & 0xff, (identity.lease_ip >> 8) & 0xff, identity.lease_ip & 0xff, prefix },
+        ) catch return null;
+    return .{ .kernel_path = kernel_path, .initrd_path = initrd_path, .cmdline = base, .arch = kernel_asset.arch orelse requested_arch };
 }
 
 /// 解析 install 模式的 boot target。

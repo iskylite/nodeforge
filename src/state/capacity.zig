@@ -12,6 +12,64 @@ const std = @import("std");
 /// `effective` 是允许的已用条目数，而不是数组前缀长度。
 pub const store_ceiling: usize = 2048;
 
+pub const Resource = enum { http_connection, boot_session, rootfs_download };
+
+pub const Admission = struct {
+    http_connections: usize = 0,
+    boot_sessions: usize = 0,
+    rootfs_downloads: usize = 0,
+
+    pub fn tryAcquire(self: *Admission, resource: Resource, limit: usize) !void {
+        if (limit == 0) return error.CapacityLimitInvalid;
+        const value = self.count(resource);
+        if (value >= limit) return error.CapacityExhausted;
+        self.setCount(resource, value + 1);
+    }
+
+    pub fn release(self: *Admission, resource: Resource) void {
+        const value = self.count(resource);
+        if (value != 0) self.setCount(resource, value - 1);
+    }
+
+    pub fn count(self: *const Admission, resource: Resource) usize {
+        return switch (resource) {
+            .http_connection => self.http_connections,
+            .boot_session => self.boot_sessions,
+            .rootfs_download => self.rootfs_downloads,
+        };
+    }
+
+    fn setCount(self: *Admission, resource: Resource, value: usize) void {
+        switch (resource) {
+            .http_connection => self.http_connections = value,
+            .boot_session => self.boot_sessions = value,
+            .rootfs_download => self.rootfs_downloads = value,
+        }
+    }
+};
+
+pub const TokenBucket = struct {
+    tokens: u64,
+    last_second: i64,
+    refill_per_second: u64,
+    burst: u64,
+
+    pub fn init(refill_per_second: u32, burst: u32, now: i64) !TokenBucket {
+        if (refill_per_second == 0 or burst == 0 or now <= 0) return error.InvalidTokenBucket;
+        return .{ .tokens = burst, .last_second = now, .refill_per_second = refill_per_second, .burst = burst };
+    }
+
+    pub fn take(self: *TokenBucket, count: u32, now: i64) !void {
+        if (count == 0 or now <= 0 or now < self.last_second) return error.InvalidTokenBucket;
+        const elapsed = @as(u64, @intCast(now - self.last_second));
+        const refill = elapsed *| self.refill_per_second;
+        self.tokens = @min(self.burst, self.tokens +| refill);
+        self.last_second = now;
+        if (self.tokens < count) return error.RateLimited;
+        self.tokens -= count;
+    }
+};
+
 /// 解析点分十进制 IPv4 为 u32；非法返回 null。
 fn parseIpv4U32(s: []const u8) ?u32 {
     var parts: [4]u32 = .{ 0, 0, 0, 0 };
@@ -105,4 +163,12 @@ test "tftpConcurrency auto-derives max(128, 2x cores) when no override" {
     // 覆盖优先
     try std.testing.expectEqual(@as(u16, 4), tftpConcurrency(96, 4));
     try std.testing.expectEqual(@as(u16, 255), tftpConcurrency(8, 255));
+}
+
+test "v0.4 token buckets enforce refill and burst" {
+    var bucket = try TokenBucket.init(2, 2, 1);
+    try bucket.take(2, 1);
+    try std.testing.expectError(error.RateLimited, bucket.take(1, 1));
+    try bucket.take(1, 2);
+    try std.testing.expectError(error.InvalidTokenBucket, bucket.take(1, 1));
 }

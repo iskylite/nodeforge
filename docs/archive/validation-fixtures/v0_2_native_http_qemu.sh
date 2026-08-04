@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# v0.2 native HTTP client QEMU validation
+# Archived v0.2 native HTTP client QEMU validation (not a current test).
+# It preserves the historical three-token capsule and is not a v0.4 gate.
 # Tests: nodeforge-initrd with built-in HTTP client (no curl dependency)
 set -euo pipefail
 
@@ -27,6 +28,10 @@ cd "$repo"
 for b in nodeforge nodeforged nodeforge-agent nodeforge-initrd; do
     [[ -x "zig-out/bin/$b" ]] || { echo "missing prebuilt $b" >&2; exit 1; }
 done
+if [[ "$(zig-out/bin/nodeforge --version | awk 'NR == 1 { print $2 }')" != "0.2.0" ]]; then
+    echo "archived v0.2 fixture: current binaries are not v0.2; use docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md" >&2
+    exit 2
+fi
 
 # 1. Set up test daemon with server_ip=10.0.2.2 (QEMU user-net host)
 zig-out/bin/nodeforge setup --install-root "$install_root" --non-interactive --yes \

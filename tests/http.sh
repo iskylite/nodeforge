@@ -31,8 +31,8 @@ cp "$daemon" "$tmp/bundle/nodeforged"
 cli=$install/bin/nodeforge
 daemon=$install/bin/nodeforged
 
-test "$(jq -r .schema_version "$install/config/config.json")" = 4
-test "$(jq -r .catalog_schema_version "$install/catalog/manifest.json")" = 5
+test "$(jq -r .schema_version "$install/config/config.json")" = 5
+test "$(jq -r .catalog_schema_version "$install/catalog/manifest.json")" = 6
 test "$(jq -r .unknown_action "$install/catalog/discovery_policy.json")" = record
 
 publish_entity() {

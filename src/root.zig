@@ -63,15 +63,22 @@ pub const preflight = @import("preflight.zig");
 pub const runtime_state = @import("state/runtime.zig");
 /// M4.8 启动时容量与并发派生：按网段/CPU/节点数动态计算上限，config 可覆盖。
 pub const capacity = @import("state/capacity.zig");
+pub const install_first_boot_state = @import("state/install_first_boot.zig");
+pub const install_first_boot_store = @import("state/install_first_boot_store.zig");
+/// v0.4 target-network topology schema and structural/deployable validator.
+pub const topology = @import("network/topology.zig");
+pub const deployment_manifest = @import("state/deployment_manifest.zig");
 /// PXE boot session 注册表：关联 DHCP→TFTP→HTTP 启动链路的进程内状态。
 pub const boot_session = @import("state/boot_session.zig");
 pub const boot_session_store = @import("state/boot_session_store.zig");
 /// v0.2 canonical diskless BootSession 状态机 reducer。
 pub const diskless_session = @import("state/diskless_session.zig");
-/// v0.2 diskless 分域 scoped capability token（hash-only、有界、一次性）。
+/// v0.4 diskless lifecycle event capability（读取使用 boot-session token）。
 pub const diskless_credential = @import("state/diskless_credential.zig");
-/// v0.2 diskless delivery DTOs：BootConfig v3 与 AgentPlan v1。
+/// v0.2 diskless delivery DTOs：BootConfig v3 与 AgentPlan v2。
 pub const http_diskless_dto = @import("http/diskless_dto.zig");
+/// v0.4 install-generation first-boot handoff plan DTO.
+pub const http_first_boot_dto = @import("http/first_boot_dto.zig");
 /// v0.2 rootfs builder core：制品记录、构建状态机、DeliveryManifest、local-only 检查。
 pub const provision_rootfs_build = @import("provision/rootfs_build.zig");
 /// v0.2 agent pre-init typed TargetSystem finalizer。
@@ -97,6 +104,8 @@ test {
     _ = initrd_download;
 }
 pub const node_inventory = @import("state/node_inventory.zig");
+/// v0.4 per-node SN discovery lifecycle state.
+pub const node_discovery = @import("state/node_discovery.zig");
 pub const artifact_layout = @import("provision/artifact_layout.zig");
 /// v0.2 rootfs artifact store：已构建 rootfs 制品按 rootfs_input_digest 内容寻址登记。
 pub const state_rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
@@ -171,6 +180,8 @@ pub const ubuntu_autoinstall = @import("profile/adapter/ubuntu.zig");
 /// 旧 repository/standard_packages action 已退出，不兼容。
 pub const provision_runner = @import("provision/runner.zig");
 pub const provision_first_boot = @import("provision/first_boot.zig");
+pub const provision_install_first_boot = @import("provision/install_first_boot.zig");
+pub const provision_install_first_boot_handoff = @import("provision/install_first_boot_handoff.zig");
 /// 错误渲染器：将 Zig error set 映射为人类可读的审计消息。
 pub const observe_error = @import("observe/error.zig");
 /// 日志前端：结构化日志的公共 API。
@@ -213,16 +224,19 @@ test {
     _ = preflight;
     _ = runtime_state;
     _ = capacity;
+    _ = install_first_boot_state;
     _ = boot_session;
     _ = boot_session_store;
     _ = diskless_session;
     _ = diskless_credential;
     _ = http_diskless_dto;
+    _ = http_first_boot_dto;
     _ = provision_rootfs_build;
     _ = state_rootfs_artifact_store;
     _ = state_diskless_delivery;
     _ = state_identity_store;
     _ = node_inventory;
+    _ = node_discovery;
     _ = operations;
     _ = config_runtime;
     _ = model_runtime;
@@ -261,6 +275,8 @@ test {
     _ = ubuntu_autoinstall;
     _ = provision_runner;
     _ = provision_first_boot;
+    _ = provision_install_first_boot;
+    _ = provision_install_first_boot_handoff;
     _ = observe_error;
     _ = observe_log;
     _ = log_backend;

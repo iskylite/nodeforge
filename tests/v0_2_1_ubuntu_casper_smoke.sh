@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v0.2.1 Ubuntu diskless production CLI path smoke test.
 #
-# Unlike tests/v0_2_1_casper_initrd_smoke.sh (manual scripted artifact assembly,
+# Unlike docs/archive/validation-fixtures/v0_2_1_casper_initrd_smoke.sh (manual scripted artifact assembly,
 # used to validate technical feasibility before the production builder existed),
 # this script drives ONLY the real product CLI surface end to end:
 #

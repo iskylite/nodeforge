@@ -44,6 +44,7 @@ const status_store = @import("../state/status_store.zig");
 const boot_session_store = @import("../state/boot_session_store.zig");
 const deployment_control = @import("../state/deployment_control.zig");
 const node_inventory = @import("../state/node_inventory.zig");
+const node_discovery = @import("../state/node_discovery.zig");
 const operations = @import("../state/operations.zig");
 const rootfs_artifact_store = @import("../state/rootfs_artifact_store.zig");
 const repository_index_blob = @import("../state/repository_index_blob.zig");
@@ -52,8 +53,10 @@ const diskless_credential = @import("../state/diskless_credential.zig");
 const diskless_lifecycle = @import("../state/diskless_session.zig");
 const dhcp_store = @import("../state/dhcp_store.zig");
 const install_post_journal = @import("../state/install_post_journal.zig");
+const install_first_boot_store = @import("../state/install_first_boot_store.zig");
 const diskless = @import("../profile/diskless.zig");
 const diskless_dto = @import("diskless_dto.zig");
+const first_boot_dto = @import("first_boot_dto.zig");
 const rootfs_build_executor = @import("../provision/rootfs_build_executor.zig");
 const rootfs_os_builder = @import("../provision/rootfs_os_builder.zig");
 const initrd_memory = @import("../initrd/memory.zig");
@@ -223,6 +226,7 @@ const RouteContext = struct {
     statuses: *node_status.Store,
     deployments: *deployment_control.Store,
     inventories: *node_inventory.Store,
+    discoveries: *node_discovery.Store,
     operations: *operations.Store,
     rootfs_worker: *RootfsBuildWorker,
     initrd_worker: *InitrdBuildWorker,
@@ -232,6 +236,7 @@ const RouteContext = struct {
     identities: *identity_store.Store,
     /// v0.3: install-post journal store。记录 install-post 步骤执行状态。
     install_post_journal: *install_post_journal.Store,
+    install_first_boot: *install_first_boot_store.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     /// M4.2 F5：来自配置和状态目录的额外 SSH 公钥。
@@ -241,6 +246,7 @@ const RouteContext = struct {
     /// worker 的 lease 文件锁竞争。
     status_io_mutex: *std.atomic.Mutex,
     node_status_path: []const u8,
+    node_discovery_path: []const u8,
     /// config.json 路径，供 config+catalog 联合迁移事务定位事实源。
     config_path: []const u8,
 };
@@ -310,17 +316,20 @@ pub fn serve(
     statuses: *node_status.Store,
     deployments: *deployment_control.Store,
     inventories: *node_inventory.Store,
+    discoveries: *node_discovery.Store,
     operation_store: *operations.Store,
     rootfs_artifacts: *rootfs_artifact_store.Store,
     diskless_store: *diskless_delivery.Store,
     identities: *identity_store.Store,
     install_post_journal_store: *install_post_journal.Store,
+    install_first_boot_store_value: *install_first_boot_store.Store,
     config_revision: u64,
     bootstrap_key: []const u8,
     additional_keys: []const []const u8,
     daemon_instance_id: *const [boot_session.id_len]u8,
     status_io_mutex: *std.atomic.Mutex,
     node_status_path: []const u8,
+    node_discovery_path: []const u8,
     config_path: []const u8,
 ) !void {
     try routes.validate();
@@ -351,6 +360,7 @@ pub fn serve(
         .statuses = statuses,
         .deployments = deployments,
         .inventories = inventories,
+        .discoveries = discoveries,
         .operations = operation_store,
         .rootfs_worker = &rootfs_worker,
         .initrd_worker = &initrd_worker,
@@ -359,12 +369,14 @@ pub fn serve(
         .diskless_store = diskless_store,
         .identities = identities,
         .install_post_journal = install_post_journal_store,
+        .install_first_boot = install_first_boot_store_value,
         .config_revision = config_revision,
         .bootstrap_key = bootstrap_key,
         .additional_keys = additional_keys,
         .daemon_instance_id = daemon_instance_id,
         .status_io_mutex = status_io_mutex,
         .node_status_path = node_status_path,
+        .node_discovery_path = node_discovery_path,
         .config_path = config_path,
     };
     var rootfs_thread = try std.Thread.spawn(.{}, runRootfsBuildWorker, .{ &context, &rootfs_worker });
@@ -386,10 +398,6 @@ pub fn serve(
         .interface = "0.0.0.0",
         .port = port,
         .on_request = route,
-        // 安装器 stage2 镜像通常超过 1 GiB。Zap listener 默认超时（5 秒）
-        // 在中等速率链路上会在 Anaconda 完成传输前中断正常的 PXE HTTP 传输。
-        // 保持传输窗口有界但足够长以适应低带宽实验和生产网络；
-        // 请求体限制仍按路由独立执行。
         .timeout = 120,
         .log = false,
     });
@@ -468,6 +476,8 @@ fn route(request: zap.Request) !void {
         return json(request, .ok, "{\"ok\":true,\"service\":\"nodeforge\"}\n", meta);
 
     // ── 节点交付 API ──────────────────────────────────────────
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/discovery/probes/", "/facts")) |session_id|
+        return discoveryProbeFacts(request, context, session_id, meta);
     if (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD")) {
         if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/boot-config")) return bootConfig(request, context, node_route.node_id, meta);
@@ -477,6 +487,12 @@ fn route(request: zap.Request) !void {
             if (std.mem.eql(u8, node_route.suffix, "/install-config/nocloud/meta-data")) return installConfig(request, context, node_route.node_id, .meta_data, meta);
             if (std.mem.eql(u8, node_route.suffix, "/install-config/nocloud/vendor-data")) return installConfig(request, context, node_route.node_id, .vendor_data, meta);
         };
+        if (firstBootRoute(path)) |first_boot_route| {
+            if (first_boot_route.kind == .plan and std.mem.eql(u8, method, "GET")) return firstBootPlan(request, context, first_boot_route.node_id, first_boot_route.generation, meta);
+            if (first_boot_route.kind == .agent and std.mem.eql(u8, method, "GET")) return firstBootAgent(request, context, first_boot_route.node_id, first_boot_route.generation, meta);
+            if (first_boot_route.kind == .payload and std.mem.eql(u8, method, "GET")) return firstBootPayload(request, context, first_boot_route.node_id, first_boot_route.generation, first_boot_route.tail, meta);
+            if (first_boot_route.kind == .capsule and std.mem.eql(u8, method, "GET")) return firstBootCapsule(request, context, first_boot_route.node_id, first_boot_route.generation, meta);
+        }
         // v0.2: diskless boot-session 交付路由（agent-plan / payload）。
         if (std.mem.startsWith(u8, path, "/api/v1/boot-sessions/")) if (splitBootSessionRoute(path["/api/v1/boot-sessions/".len..])) |bs| {
             if (bs.kind == .agent_plan) return disklessAgentPlan(request, context, bs.session, bs.digest, meta);
@@ -491,7 +507,10 @@ fn route(request: zap.Request) !void {
         if (artifactBootRoute(path)) |relative| return bootFile(request, context, relative, meta);
     }
     if (std.mem.eql(u8, method, "POST")) {
-        if (agentConsumedSession(path)) |session_id| return disklessAgentConsumed(request, context, session_id, meta);
+        if (firstBootRoute(path)) |first_boot_route| {
+            if (first_boot_route.kind == .handoff) return firstBootHandoff(request, context, first_boot_route.node_id, first_boot_route.generation, meta);
+            if (first_boot_route.kind == .events) return firstBootEvent(request, context, first_boot_route.node_id, first_boot_route.generation, meta);
+        }
         if (std.mem.startsWith(u8, path, "/api/v1/nodes/")) if (splitNodeRoute(path["/api/v1/nodes/".len..])) |node_route| {
             if (std.mem.eql(u8, node_route.suffix, "/events")) {
                 if (request.getHeader("x-nodeforge-session")) |session_id|
@@ -534,6 +553,8 @@ fn route(request: zap.Request) !void {
     if (nodePath(path, "/api/v1/management/nodes/")) |node_id| {
         if (std.mem.eql(u8, method, "DELETE")) return managementNodeRemove(request, context, node_id, meta);
     }
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/discovery")) |node_id| return managementNodeDiscovery(request, context, node_id, meta);
+    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/nodes/", "/discovery")) |node_id| return managementNodeDiscovery(request, context, node_id, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/values")) |name| return managementValuesMutation(request, context, .profile, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/values")) |name| return managementValuesGet(request, context, .profile, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/items")) |name| return managementItemMutation(request, context, .profile, name, meta);
@@ -560,7 +581,6 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfiles(request, context, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/software/available")) |name| return managementProfileSoftware(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/plan")) |name| return managementRootfsPlan(request, context, name, meta);
-    if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/register")) |name| return managementRootfsRegister(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/build")) |name| return managementRootfsBuild(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs")) |name| return managementRootfsStatus(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfileCreate(request, context, meta);
@@ -700,16 +720,6 @@ fn splitBootSessionRoute(tail: []const u8) ?BootSessionRoute {
     return null;
 }
 
-fn agentConsumedSession(path: []const u8) ?[]const u8 {
-    const prefix = "/api/v1/boot-sessions/";
-    const suffix = "/agent-consumed";
-    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
-    const session = path[prefix.len .. path.len - suffix.len];
-    if (session.len != diskless_delivery.id_len) return null;
-    for (session) |byte| if (!std.ascii.isHex(byte)) return null;
-    return session;
-}
-
 /// v0.2: 从 `Authorization: Bearer <token>` 提取 raw token。
 fn parseBearer(header: ?[]const u8) ?[]const u8 {
     const value = header orelse return null;
@@ -717,6 +727,574 @@ fn parseBearer(header: ?[]const u8) ?[]const u8 {
     const token = value["Bearer ".len..];
     if (token.len == 0) return null;
     return token;
+}
+
+const FirstBootRouteKind = enum { plan, agent, payload, capsule, handoff, exchange, events };
+const FirstBootRoute = struct { node_id: []const u8, generation: u64, kind: FirstBootRouteKind, tail: []const u8 = "" };
+
+fn firstBootRoute(path: []const u8) ?FirstBootRoute {
+    const prefix = "/api/v1/nodes/";
+    const marker = "/install-generations/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    const marker_index = std.mem.indexOf(u8, rest, marker) orelse return null;
+    const node_id = rest[0..marker_index];
+    if (!auth.nodeIdSafe(node_id)) return null;
+    const generation_start = marker_index + marker.len;
+    const slash = std.mem.indexOfScalarPos(u8, rest, generation_start, '/') orelse return null;
+    const generation = std.fmt.parseInt(u64, rest[generation_start..slash], 10) catch return null;
+    if (generation == 0) return null;
+    const suffix = rest[slash..];
+    const first_boot = "/first-boot/";
+    if (!std.mem.startsWith(u8, suffix, first_boot)) return null;
+    const value = suffix[first_boot.len..];
+    if (std.mem.eql(u8, value, "plan")) return .{ .node_id = node_id, .generation = generation, .kind = .plan };
+    if (std.mem.eql(u8, value, "agent")) return .{ .node_id = node_id, .generation = generation, .kind = .agent };
+    if (std.mem.eql(u8, value, "capsule")) return .{ .node_id = node_id, .generation = generation, .kind = .capsule };
+    if (std.mem.startsWith(u8, value, "payloads/")) return .{ .node_id = node_id, .generation = generation, .kind = .payload, .tail = value["payloads/".len..] };
+    if (std.mem.eql(u8, value, "handoff")) return .{ .node_id = node_id, .generation = generation, .kind = .handoff };
+    if (std.mem.eql(u8, value, "exchange")) return .{ .node_id = node_id, .generation = generation, .kind = .exchange };
+    if (std.mem.eql(u8, value, "events")) return .{ .node_id = node_id, .generation = generation, .kind = .events };
+    return null;
+}
+
+test "first-boot route exposes generation-bound immutable agent" {
+    const parsed_route = firstBootRoute("/api/v1/nodes/node-01/install-generations/7/first-boot/agent").?;
+    try std.testing.expectEqualStrings("node-01", parsed_route.node_id);
+    try std.testing.expectEqual(@as(u64, 7), parsed_route.generation);
+    try std.testing.expectEqual(FirstBootRouteKind.agent, parsed_route.kind);
+}
+
+/// v0.4 first-boot 跨重启确定性凭证推导。
+///
+/// F1 修复（v0.4 token 简化）：主密钥从 `bootstrap_key`（SSH 公钥，**公开**）
+/// 改为 `daemon_secret`（32 字节随机密钥，持久化于 `state/diskless-secret`，
+/// 0600 权限）。SSH 公钥是公开信息，用作 HMAC 主密钥意味着任何能读取该公钥
+/// 的人都能推导出 first-boot 事件令牌——这是 v0.4 token 体系中唯一真正
+/// 关键的安全缺陷。`daemon_secret` 是真正的对称密钥，仅 daemon 进程可读，
+/// 跨重启持久化，确保已签发令牌在 daemon 重启后仍可确定性重建。
+fn v04Token(context: *const RouteContext, audience: []const u8, resource: []const u8, generation: u64, counter: u64) [diskless_credential.token_len]u8 {
+    var token: [diskless_credential.token_len]u8 = undefined;
+    // 使用 daemon_secret 作为 HMAC 主密钥，而非公开的 SSH 公钥。
+    // diskless_store.secret 指向 app.zig 中持久化的 [32]u8 随机密钥。
+    diskless_credential.deriveToken(&token, context.diskless_store.secret, context.config.deployment_id orelse "", audience, resource, generation, counter);
+    return token;
+}
+
+fn tokenMatches(request: zap.Request, token: []const u8) bool {
+    const supplied = parseBearer(request.getHeader("authorization")) orelse return false;
+    if (supplied.len != diskless_credential.token_len or token.len != diskless_credential.token_len) return false;
+    const actual: [diskless_credential.token_len]u8 = supplied[0..diskless_credential.token_len].*;
+    const expected: [diskless_credential.token_len]u8 = token[0..diskless_credential.token_len].*;
+    return std.crypto.timing_safe.eql([diskless_credential.token_len]u8, actual, expected);
+}
+
+fn saveFirstBoot(context: *const RouteContext) !void {
+    try context.install_first_boot.save(context.io, context.allocator, paths.require().install_first_boot_path);
+}
+
+fn firstBootResource(buffer: []u8, node_id: []const u8, generation: u64, plan_digest: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}/{d}/{s}", .{ node_id, generation, plan_digest });
+}
+
+fn deepValidateRootfsArtifact(context: *const RouteContext, validation_id: []const u8, part: []const u8, expected_agent_sha256: []const u8) !void {
+    const verification_root = try std.fmt.allocPrint(context.allocator, "{s}/rootfs-validation-{s}", .{ paths.require().work_dir, validation_id });
+    defer context.allocator.free(verification_root);
+    std.Io.Dir.cwd().deleteTree(context.io, verification_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(context.io, verification_root) catch {};
+    const extraction = try std.process.run(context.allocator, context.io, .{ .argv = &.{ "unsquashfs", "-no-progress", "-d", verification_root, part }, .stdout_limit = .limited(4 * 1024 * 1024), .stderr_limit = .limited(4 * 1024 * 1024) });
+    defer context.allocator.free(extraction.stdout);
+    defer context.allocator.free(extraction.stderr);
+    switch (extraction.term) {
+        .exited => |code| if (code != 0) return error.RootfsSquashfsInvalid,
+        else => return error.RootfsSquashfsInvalid,
+    }
+    const required_files = [_][]const u8{ "usr/sbin/nodeforge-agent", "etc/systemd/system/nodeforge-firstboot.service" };
+    for (required_files) |required| {
+        const path = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ verification_root, required });
+        defer context.allocator.free(path);
+        const stat = std.Io.Dir.cwd().statFile(context.io, path, .{ .follow_symlinks = false }) catch return error.RootfsArtifactClosureIncomplete;
+        if (stat.kind != .file) return error.RootfsArtifactClosureIncomplete;
+    }
+    const os_release = try std.fmt.allocPrint(context.allocator, "{s}/etc/os-release", .{verification_root});
+    defer context.allocator.free(os_release);
+    const os_release_stat = std.Io.Dir.cwd().statFile(context.io, os_release, .{ .follow_symlinks = false }) catch return error.RootfsArtifactClosureIncomplete;
+    if (os_release_stat.kind == .sym_link) {
+        const canonical_os_release = try std.fmt.allocPrint(context.allocator, "{s}/usr/lib/os-release", .{verification_root});
+        defer context.allocator.free(canonical_os_release);
+        const canonical_stat = std.Io.Dir.cwd().statFile(context.io, canonical_os_release, .{ .follow_symlinks = false }) catch return error.RootfsArtifactClosureIncomplete;
+        if (canonical_stat.kind != .file) return error.RootfsArtifactClosureIncomplete;
+    } else if (os_release_stat.kind != .file) return error.RootfsArtifactClosureIncomplete;
+    var embedded_agent_sha256: [64]u8 = undefined;
+    asset_validate.sha256File(context.io, verification_root, "usr/sbin/nodeforge-agent", &embedded_agent_sha256) catch return error.RootfsArtifactClosureIncomplete;
+    if (!std.mem.eql(u8, &embedded_agent_sha256, expected_agent_sha256)) return error.RootfsArtifactAgentDigestMismatch;
+}
+
+fn requestWithNoContent(request: zap.Request, meta: RequestMeta) !void {
+    request.setStatus(.no_content);
+    _ = meta;
+    return request.sendBody("");
+}
+
+fn authenticateFirstBootInstaller(request: zap.Request, context: *const RouteContext, node_id: []const u8, generation: u64) !boot_session.Authenticated {
+    const checked = try auth.authenticate(context.sessions, node_id, getClientIp(request), request.getHeader("authorization"), request.getHeader("x-nodeforge-session"), boot_session.monotonicNow());
+    if (checked.session.mode != .install or checked.session.deployment_generation != generation) return error.FirstBootBindingMismatch;
+    return checked.session;
+}
+
+fn currentFirstBootGeneration(context: *const RouteContext, node_id: []const u8, generation: u64) bool {
+    const view = context.deployments.view(node_id) orelse return false;
+    return view.currentGeneration() == generation;
+}
+
+fn firstBootBundle(context: *const RouteContext, node_id: []const u8) ?*const model.ProvisioningBundle {
+    const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return null;
+    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return null) orelse return null;
+    const name = node.overrides.install.post_install_bundle orelse profile.install.post_install.bundle orelse return null;
+    return findProvisioningBundleIn(context.catalog_snapshot.value().provisioning_bundles, name);
+}
+
+fn bundleHasFirstBoot(bundle: *const model.ProvisioningBundle) bool {
+    for (bundle.steps) |step| if (step.phase == .first_boot) return true;
+    return false;
+}
+
+fn bundleHasInstallPost(bundle: *const model.ProvisioningBundle) bool {
+    for (bundle.steps) |step| if (step.phase == .install_post) return true;
+    return false;
+}
+
+fn installCompletionNeedsFirstBoot(context: *const RouteContext, node_id: []const u8) bool {
+    const bundle = firstBootBundle(context, node_id) orelse return false;
+    return bundleHasFirstBoot(bundle);
+}
+
+fn projectFirstBootTerminal(context: *const RouteContext, node_id: []const u8, generation: u64, success: bool) !void {
+    const status = context.statuses.get(node_id) orelse return error.FirstBootStatusMissing;
+    if (status.deployment_generation != generation) return error.FirstBootBindingMismatch;
+
+    // The installer completion is deliberately projected as install_rebooting
+    // while first-boot is pending. Reuse its immutable provenance when the
+    // generation-bound terminal event finally opens (or closes) readiness.
+    try context.statuses.updateForDeployment(
+        node_id,
+        status.boot_session_id[0..],
+        context.daemon_instance_id,
+        status.model_revision,
+        status.model_plan_digest,
+        generation,
+        if (success) .completed else .failed,
+        if (success) null else "install first-boot failed",
+        unixNow(),
+        false,
+    );
+    if (!persistStatus(context)) return error.FirstBootStatusPersistFailed;
+
+    const terminal_result = context.deployments.markTerminalAt(node_id, success, unixNow()) orelse return error.FirstBootBindingMismatch;
+    if (terminal_result.generation != generation) {
+        context.deployments.rollbackTerminal(node_id, terminal_result);
+        return error.FirstBootBindingMismatch;
+    }
+    deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch |err| {
+        context.deployments.rollbackTerminal(node_id, terminal_result);
+        return err;
+    };
+}
+
+fn firstBootAction(action: model.ProvisionAction) ?diskless_dto.FirstBootAction {
+    return switch (action) {
+        .managed_file => .managed_file,
+        .package => .package,
+        .archive => .archive,
+        .script => .script,
+        .repository, .standard_packages => null,
+    };
+}
+
+fn renderInstallFirstBootPlan(context: *const RouteContext, node_id: []const u8, generation: u64) ![]u8 {
+    const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return error.FirstBootBindingMismatch;
+    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return error.FirstBootBindingMismatch) orelse return error.FirstBootBindingMismatch;
+    const source = lookup.findInstallSource(context.catalog_snapshot.value(), profile.install_source) orelse return error.FirstBootBindingMismatch;
+    const distro = lookup.findDistro(context.catalog_snapshot.value(), source.distro) orelse return error.FirstBootBindingMismatch;
+    var effective = effective_compiler.compileInputs(context.allocator, node, profile, source) catch return error.FirstBootBindingMismatch;
+    defer effective.deinit();
+    const deployment = context.deployments.view(node_id) orelse return error.FirstBootBindingMismatch;
+    const desired_digest = deployment.requested_plan_digest[0..];
+    var steps: std.ArrayList(first_boot_dto.Step) = .empty;
+    defer steps.deinit(context.allocator);
+    var payloads: std.ArrayList(first_boot_dto.Payload) = .empty;
+    defer payloads.deinit(context.allocator);
+    var owned_paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned_paths.items) |path| context.allocator.free(path);
+        owned_paths.deinit(context.allocator);
+    }
+    var repository_urls: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (repository_urls.items) |url| context.allocator.free(url);
+        repository_urls.deinit(context.allocator);
+    }
+    var repository_names: std.ArrayList([]const u8) = .empty;
+    defer repository_names.deinit(context.allocator);
+    for (source.repositories) |name| try repository_names.append(context.allocator, name);
+    for (effective.software.repositories) |name| {
+        var duplicate = false;
+        for (repository_names.items) |existing| if (std.mem.eql(u8, existing, name)) {
+            duplicate = true;
+            break;
+        };
+        if (!duplicate) try repository_names.append(context.allocator, name);
+    }
+    for (repository_names.items) |name| {
+        const repository = lookup.findRepository(context.catalog_snapshot.value(), name) orelse return error.InvalidInstallFirstBootPlan;
+        const marker = "/artifacts/repositories/";
+        const marker_index = std.mem.indexOf(u8, repository.base_url, marker) orelse return error.InvalidInstallFirstBootPlan;
+        try repository_urls.append(context.allocator, try std.fmt.allocPrint(context.allocator, "http://{s}:{d}{s}", .{ context.config.server.server_ip, context.config.server.http_port, repository.base_url[marker_index..] }));
+    }
+    var bundle_revision: u64 = 0;
+    if (firstBootBundle(context, node_id)) |bundle| {
+        bundle_revision = bundle.revision;
+        for (bundle.steps) |step| {
+            if (step.phase != .first_boot) continue;
+            const action = firstBootAction(step.action) orelse return error.InvalidInstallFirstBootPlan;
+            var payload_path: ?[]const u8 = null;
+            if (step.content_asset) |asset_name| {
+                const asset = lookup.findAsset(context.catalog_snapshot.value(), asset_name) orelse return error.InvalidInstallFirstBootPlan;
+                const sha = asset.sha256 orelse return error.InvalidInstallFirstBootPlan;
+                const size = asset.size orelse return error.InvalidInstallFirstBootPlan;
+                const path = try std.fmt.allocPrint(context.allocator, "{s}/{d}", .{ asset.name, asset.revision });
+                try owned_paths.append(context.allocator, path);
+                payload_path = path;
+                try payloads.append(context.allocator, .{ .path = path, .size = size, .sha256 = sha, .mode = step.mode });
+            }
+            try steps.append(context.allocator, .{
+                .id = step.name,
+                .idempotency_key = if (step.idempotency_key.len == 0) step.name else step.idempotency_key,
+                .timeout_s = step.timeout_s,
+                .retryable = step.retryable,
+                .action = action,
+                .content = step.content,
+                .payload_path = payload_path,
+                .destination = step.destination,
+                .mode = step.mode,
+                .owner = step.owner,
+                .group = step.group,
+                .packages = step.packages,
+            });
+        }
+    }
+    var base: [128]u8 = undefined;
+    const base_url = try std.fmt.bufPrint(&base, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
+    var event_url: [320]u8 = undefined;
+    var exchange_url: [320]u8 = undefined;
+    var agent_url: [320]u8 = undefined;
+    const event = try std.fmt.bufPrint(&event_url, "{s}/api/v1/nodes/{s}/install-generations/{d}/first-boot/events", .{ base_url, node_id, generation });
+    const exchange = try std.fmt.bufPrint(&exchange_url, "{s}/api/v1/nodes/{s}/install-generations/{d}/first-boot/exchange", .{ base_url, node_id, generation });
+    const agent = try std.fmt.bufPrint(&agent_url, "{s}/api/v1/nodes/{s}/install-generations/{d}/first-boot/agent", .{ base_url, node_id, generation });
+    var agent_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const agent_path = try std.fmt.bufPrint(&agent_path_buffer, "{s}/nodeforge-agent", .{paths.require().bin_dir});
+    const agent_stat = try std.Io.Dir.cwd().statFile(context.io, agent_path, .{ .follow_symlinks = false });
+    if (agent_stat.kind != .file or agent_stat.size == 0) return error.InvalidInstallFirstBootPlan;
+    var agent_digest: [64]u8 = undefined;
+    try asset_validate.sha256File(context.io, paths.require().bin_dir, "nodeforge-agent", &agent_digest);
+    const expires_at = if (deployment.armed_at > 0) deployment.armed_at + 24 * 60 * 60 else return error.FirstBootBindingMismatch;
+    const digest_placeholder = "0000000000000000000000000000000000000000000000000000000000000000";
+    const plan_without_digest: first_boot_dto.InstallFirstBootPlan = .{
+        .deployment_id = context.config.deployment_id orelse return error.FirstBootBindingMismatch,
+        .node_id = node_id,
+        .install_generation = generation,
+        .desired_plan_digest = desired_digest,
+        .delivery_digest = digest_placeholder,
+        .bundle_revision = bundle_revision,
+        .first_boot_plan_digest = digest_placeholder,
+        .steps = steps.items,
+        .payloads = payloads.items,
+        .package_manager = switch (model.packageManagerForFamily(distro.family)) {
+            .dnf => .dnf,
+            .apt => .apt,
+        },
+        .repository_urls = repository_urls.items,
+        .agent_url = agent,
+        .agent_size = agent_stat.size,
+        .agent_sha256 = agent_digest[0..],
+        .event_url = event,
+        .exchange_url = exchange,
+        .expires_at = expires_at,
+    };
+    const plan_digest = try first_boot_dto.digest(context.allocator, plan_without_digest);
+    const plan: first_boot_dto.InstallFirstBootPlan = .{
+        .deployment_id = plan_without_digest.deployment_id,
+        .node_id = plan_without_digest.node_id,
+        .install_generation = plan_without_digest.install_generation,
+        .desired_plan_digest = plan_without_digest.desired_plan_digest,
+        .delivery_digest = plan_digest[0..],
+        .bundle_revision = plan_without_digest.bundle_revision,
+        .first_boot_plan_digest = plan_digest[0..],
+        .steps = plan_without_digest.steps,
+        .payloads = plan_without_digest.payloads,
+        .package_manager = plan_without_digest.package_manager,
+        .repository_urls = plan_without_digest.repository_urls,
+        .agent_url = plan_without_digest.agent_url,
+        .agent_size = plan_without_digest.agent_size,
+        .agent_sha256 = plan_without_digest.agent_sha256,
+        .event_url = plan_without_digest.event_url,
+        .exchange_url = plan_without_digest.exchange_url,
+        .expires_at = plan_without_digest.expires_at,
+    };
+    return first_boot_dto.render(context.allocator, plan);
+}
+
+fn ensureFirstBootJournal(context: *const RouteContext, node_id: []const u8, generation: u64) !*install_first_boot_store.Entry {
+    const existing = context.install_first_boot.find(node_id, generation);
+    const plan_bytes = try immutableFirstBootPlan(context, node_id, generation, existing == null);
+    defer context.allocator.free(plan_bytes);
+    var raw: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(plan_bytes, &raw, .{});
+    var plan_digest: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&plan_digest, "{x}", .{raw}) catch unreachable;
+    if (existing) |entry| {
+        if (!std.crypto.timing_safe.eql([64]u8, entry.plan()[0..64].*, plan_digest)) return error.FirstBootPlanDrift;
+        return entry;
+    }
+    const bundle_revision: u64 = if (firstBootBundle(context, node_id)) |bundle| bundle.revision else 0;
+    // F4：创建 entry 时记录当前 daemon_secret 指纹，用于 daemon 重启后校验。
+    const entry = try context.install_first_boot.create(node_id, generation, bundle_revision, plan_digest[0..], context.diskless_store.secret);
+    try saveFirstBoot(context);
+    return entry;
+}
+
+fn firstBootPlanSnapshotPath(allocator: std.mem.Allocator, node_id: []const u8, generation: u64) ![]u8 {
+    const state_dir = std.fs.path.dirname(paths.require().install_first_boot_path) orelse return error.InvalidFirstBootPlanPath;
+    return std.fmt.allocPrint(allocator, "{s}/install-first-boot-plans/{s}/{d}.json", .{ state_dir, node_id, generation });
+}
+
+fn firstBootAgentSnapshotPath(allocator: std.mem.Allocator, node_id: []const u8, generation: u64) ![]u8 {
+    const state_dir = std.fs.path.dirname(paths.require().install_first_boot_path) orelse return error.InvalidFirstBootPlanPath;
+    return std.fmt.allocPrint(allocator, "{s}/install-first-boot-plans/{s}/{d}.agent", .{ state_dir, node_id, generation });
+}
+
+fn immutableFirstBootPlan(context: *const RouteContext, node_id: []const u8, generation: u64, allow_create: bool) ![]u8 {
+    const path = try firstBootPlanSnapshotPath(context.allocator, node_id, generation);
+    defer context.allocator.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(context.io, path, context.allocator, .limited(first_boot_dto.max_plan_bytes)) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (!allow_create) return error.FirstBootPlanMissing;
+            const bytes = try renderInstallFirstBootPlan(context, node_id, generation);
+            errdefer context.allocator.free(bytes);
+            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(context.io, parent);
+            const agent_path = try firstBootAgentSnapshotPath(context.allocator, node_id, generation);
+            defer context.allocator.free(agent_path);
+            const source_path = try std.fmt.allocPrint(context.allocator, "{s}/nodeforge-agent", .{paths.require().bin_dir});
+            defer context.allocator.free(source_path);
+            const agent_bytes = try std.Io.Dir.cwd().readFileAlloc(context.io, source_path, context.allocator, .limited(64 * 1024 * 1024));
+            defer context.allocator.free(agent_bytes);
+            try dhcp_store.atomicWrite(context.io, agent_path, agent_bytes);
+            try dhcp_store.atomicWrite(context.io, path, bytes);
+            return bytes;
+        },
+        else => return err,
+    };
+}
+
+fn firstBootInstallerError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
+    return switch (err) {
+        error.FirstBootBindingMismatch => json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.binding_mismatch\",\"message\":\"boot session does not match install generation\"}}\n", meta),
+        else => nodeAuthError(request, err, meta),
+    };
+}
+
+fn firstBootPlan(request: zap.Request, context: *const RouteContext, node_id: []const u8, generation: u64, meta: RequestMeta) !void {
+    _ = authenticateFirstBootInstaller(request, context, node_id, generation) catch |err| return firstBootInstallerError(request, err, meta);
+    if (!currentFirstBootGeneration(context, node_id, generation)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.binding_mismatch\",\"message\":\"install generation is not current\"}}\n", meta);
+    _ = ensureFirstBootJournal(context, node_id, generation) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot persist first-boot journal\"}}\n", meta);
+    const bytes = immutableFirstBootPlan(context, node_id, generation, false) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot read immutable first-boot plan\"}}\n", meta);
+    defer context.allocator.free(bytes);
+    var raw: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &raw, .{});
+    var etag: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&etag, "{x}", .{raw}) catch unreachable;
+    try request.setHeader("etag", etag[0..]);
+    return json(request, .ok, bytes, meta);
+}
+
+fn firstBootPayload(request: zap.Request, context: *const RouteContext, node_id: []const u8, generation: u64, digest: []const u8, meta: RequestMeta) !void {
+    _ = authenticateFirstBootInstaller(request, context, node_id, generation) catch |err| return firstBootInstallerError(request, err, meta);
+    if (!currentFirstBootGeneration(context, node_id, generation) or digest.len != 64) return notFound(request, meta);
+    const bundle = firstBootBundle(context, node_id) orelse return notFound(request, meta);
+    for (bundle.steps) |step| {
+        if (step.phase != .first_boot) continue;
+        const asset_name = step.content_asset orelse continue;
+        const asset = lookup.findAsset(context.catalog_snapshot.value(), asset_name) orelse continue;
+        if (asset.sha256) |sha| if (std.mem.eql(u8, sha, digest)) return staticFile(request, context, paths.require().assets_dir, asset.path, sha, meta);
+    }
+    return notFound(request, meta);
+}
+
+fn firstBootAgent(request: zap.Request, context: *const RouteContext, node_id: []const u8, generation: u64, meta: RequestMeta) !void {
+    _ = authenticateFirstBootInstaller(request, context, node_id, generation) catch |err| return firstBootInstallerError(request, err, meta);
+    if (!currentFirstBootGeneration(context, node_id, generation)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.binding_mismatch\",\"message\":\"install generation is not current\"}}\n", meta);
+    _ = ensureFirstBootJournal(context, node_id, generation) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot recover immutable first-boot agent\"}}\n", meta);
+    const snapshot = try firstBootAgentSnapshotPath(context.allocator, node_id, generation);
+    defer context.allocator.free(snapshot);
+    const plan_bytes = immutableFirstBootPlan(context, node_id, generation, false) catch return notFound(request, meta);
+    defer context.allocator.free(plan_bytes);
+    const plan = std.json.parseFromSlice(first_boot_dto.InstallFirstBootPlan, context.allocator, plan_bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return notFound(request, meta);
+    defer plan.deinit();
+    return staticFile(request, context, std.fs.path.dirname(snapshot) orelse return notFound(request, meta), std.fs.path.basename(snapshot), plan.value.agent_sha256, meta);
+}
+
+fn firstBootCapsule(request: zap.Request, context: *const RouteContext, node_id: []const u8, generation: u64, meta: RequestMeta) !void {
+    _ = authenticateFirstBootInstaller(request, context, node_id, generation) catch |err| return firstBootInstallerError(request, err, meta);
+    if (!currentFirstBootGeneration(context, node_id, generation)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.binding_mismatch\",\"message\":\"install generation is not current\"}}\n", meta);
+    const entry = ensureFirstBootJournal(context, node_id, generation) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot persist first-boot journal\"}}\n", meta);
+    if (entry.journal.server != .pending_handoff) return json(request, .gone, "{\"ok\":false,\"error\":{\"code\":\"first_boot.replay\",\"message\":\"first-boot capsule is no longer available (bootstrap token spent or terminal generation replay)\"}}\n", meta);
+    var resource: [256]u8 = undefined;
+    const resource_id = try firstBootResource(&resource, node_id, generation, entry.plan());
+    const token = v04Token(context, "first-boot:exchange", resource_id, generation, 0);
+    var base: [128]u8 = undefined;
+    const base_url = try std.fmt.bufPrint(&base, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
+    var exchange: [320]u8 = undefined;
+    const exchange_url = try std.fmt.bufPrint(&exchange, "{s}/api/v1/nodes/{s}/install-generations/{d}/first-boot/exchange", .{ base_url, node_id, generation });
+    var body: [640]u8 = undefined;
+    return json(request, .ok, try std.fmt.bufPrint(&body, "{{\"schema_version\":1,\"node_id\":{f},\"install_generation\":{d},\"bootstrap_token\":{f},\"exchange_url\":{f}}}\n", .{ std.json.fmt(node_id, .{}), generation, std.json.fmt(token[0..], .{}), std.json.fmt(exchange_url, .{}) }), meta);
+}
+
+fn firstBootHandoff(request: zap.Request, context: *const RouteContext, node_id: []const u8, generation: u64, meta: RequestMeta) !void {
+    _ = authenticateFirstBootInstaller(request, context, node_id, generation) catch |err| return firstBootInstallerError(request, err, meta);
+    if (!currentFirstBootGeneration(context, node_id, generation)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.binding_mismatch\",\"message\":\"install generation is not current\"}}\n", meta);
+    _ = ensureFirstBootJournal(context, node_id, generation) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot persist first-boot journal\"}}\n", meta);
+    context.install_first_boot.handoff(node_id, generation) catch |err| switch (err) {
+        error.FirstBootStateConflict => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.replay\",\"message\":\"first-boot handoff was already completed (terminal generation replay)\"}}\n", meta),
+        else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot update first-boot handoff\"}}\n", meta),
+    };
+    try saveFirstBoot(context);
+    return requestWithNoContent(request, meta);
+}
+
+const FirstBootEventRequest = struct { schema_version: u32, event_seq: u64, expected_state: []const u8, event: []const u8, event_id: []const u8, step_index: ?usize = null };
+
+fn expectedFirstBootEventId(buffer: *[64]u8, plan_digest: []const u8, kind: []const u8, index: ?usize) []const u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("nodeforge-install-firstboot-event-v1\x00");
+    hasher.update(plan_digest);
+    hasher.update("\x00");
+    hasher.update(kind);
+    if (index) |value| {
+        var number: [24]u8 = undefined;
+        hasher.update(std.fmt.bufPrint(&number, ":{d}", .{value}) catch unreachable);
+    }
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    buffer.* = std.fmt.bytesToHex(raw, .lower);
+    return buffer[0..];
+}
+
+test "install first-boot event ids bind kind and canonical step" {
+    var first: [64]u8 = undefined;
+    var second: [64]u8 = undefined;
+    const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    _ = expectedFirstBootEventId(&first, digest, "step-started", 0);
+    _ = expectedFirstBootEventId(&second, digest, "step-started", 1);
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    var replay: [64]u8 = undefined;
+    _ = expectedFirstBootEventId(&replay, digest, "step-started", 0);
+    try std.testing.expectEqualSlices(u8, &first, &replay);
+}
+
+fn firstBootEvent(request: zap.Request, context: *const RouteContext, node_id: []const u8, generation: u64, meta: RequestMeta) !void {
+    if (!bodyWithin(request, 16 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_invalid\",\"message\":\"first-boot event body exceeds 16 KiB\"}}\n", meta);
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_invalid\",\"message\":\"first-boot event body is required\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(FirstBootEventRequest, context.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_invalid\",\"message\":\"invalid first-boot event envelope\"}}\n", meta);
+    defer parsed.deinit();
+    const entry = context.install_first_boot.find(node_id, generation) orelse return notFound(request, meta);
+    // F4：secret 轮换后，旧 entry 的确定性令牌无法重建，拒绝事件。
+    if (entry.journal.server == .recovery_incomplete) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.recovery_incomplete\",\"message\":\"first-boot journal cannot be recovered after daemon secret rotation; re-initiate first-boot\"}}\n", meta);
+    var resource: [256]u8 = undefined;
+    const resource_id = try firstBootResource(&resource, node_id, generation, entry.plan());
+    // 一个 generation 只有一枚 first-boot event capability，不再依赖交换计数。
+    const event_token = v04Token(context, "first-boot:event", resource_id, generation, 0);
+    if (!tokenMatches(request, &event_token)) return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_invalid\",\"message\":\"first-boot event token is invalid\"}}\n", meta);
+    const canonical_plan_bytes = immutableFirstBootPlan(context, node_id, generation, false) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot recover first-boot plan identity\"}}\n", meta);
+    defer context.allocator.free(canonical_plan_bytes);
+    const canonical_plan = std.json.parseFromSlice(first_boot_dto.InstallFirstBootPlan, context.allocator, canonical_plan_bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot recover first-boot plan identity\"}}\n", meta);
+    defer canonical_plan.deinit();
+    const event_plan_digest = canonical_plan.value.first_boot_plan_digest;
+    const event_kind_known = std.mem.eql(u8, parsed.value.event, "first_boot.started") or
+        std.mem.eql(u8, parsed.value.event, "first_boot.step_started") or
+        std.mem.eql(u8, parsed.value.event, "first_boot.step_succeeded") or
+        std.mem.eql(u8, parsed.value.event, "first_boot.succeeded") or
+        std.mem.eql(u8, parsed.value.event, "first_boot.failed");
+    if (parsed.value.schema_version != 1 or !event_kind_known)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_invalid\",\"message\":\"unknown or invalid first-boot event schema\"}}\n", meta);
+    const event_shape_valid = blk: {
+        var expected_id_buffer: [64]u8 = undefined;
+        var expected_id: []const u8 = "";
+        if (std.mem.eql(u8, parsed.value.event, "first_boot.started")) {
+            expected_id = expectedFirstBootEventId(&expected_id_buffer, event_plan_digest, "started", null);
+            break :blk parsed.value.event_seq == 0 and std.mem.eql(u8, parsed.value.expected_state, "exchanging") and parsed.value.step_index == null and std.mem.eql(u8, parsed.value.event_id, expected_id);
+        }
+        if (std.mem.eql(u8, parsed.value.event, "first_boot.step_started")) {
+            const index = parsed.value.step_index orelse break :blk false;
+            expected_id = expectedFirstBootEventId(&expected_id_buffer, event_plan_digest, "step-started", index);
+            break :blk parsed.value.event_seq == 1 and std.mem.eql(u8, parsed.value.expected_state, if (index == 0) "started" else "running") and std.mem.eql(u8, parsed.value.event_id, expected_id);
+        }
+        if (std.mem.eql(u8, parsed.value.event, "first_boot.step_succeeded")) {
+            const index = parsed.value.step_index orelse break :blk false;
+            expected_id = expectedFirstBootEventId(&expected_id_buffer, event_plan_digest, "step-succeeded", index);
+            break :blk parsed.value.event_seq == 1 and std.mem.eql(u8, parsed.value.expected_state, "running") and std.mem.eql(u8, parsed.value.event_id, expected_id);
+        }
+        if (std.mem.eql(u8, parsed.value.event, "first_boot.succeeded") or std.mem.eql(u8, parsed.value.event, "first_boot.failed")) {
+            expected_id = expectedFirstBootEventId(&expected_id_buffer, event_plan_digest, if (std.mem.eql(u8, parsed.value.event, "first_boot.succeeded")) "succeeded" else "failed", null);
+            break :blk parsed.value.event_seq == 1 and std.mem.eql(u8, parsed.value.expected_state, "running") and parsed.value.step_index == null and std.mem.eql(u8, parsed.value.event_id, expected_id);
+        }
+        break :blk false;
+    };
+    if (!event_shape_valid) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_body_drift\",\"message\":\"first-boot event identity or body drifted from canonical expectation\"}}\n", meta);
+    // A committed transition whose response was lost must accept the exact
+    // generation/event replay.  This check intentionally precedes expected
+    // state/sequence CAS because those values describe the original request.
+    if (std.mem.eql(u8, parsed.value.event, "first_boot.started") and
+        (entry.journal.server == .started or entry.journal.server == .running) and
+        std.mem.eql(u8, entry.startedEvent(), parsed.value.event_id))
+        return requestWithNoContent(request, meta);
+    if (std.mem.eql(u8, parsed.value.event, "first_boot.step_started") and
+        entry.journal.local == .step_running and
+        parsed.value.step_index != null and parsed.value.step_index.? == entry.journal.completed_step_count)
+        return requestWithNoContent(request, meta);
+    if (std.mem.eql(u8, parsed.value.event, "first_boot.step_succeeded") and
+        entry.journal.local == .started and
+        parsed.value.step_index != null and parsed.value.step_index.? + 1 == entry.journal.completed_step_count)
+        return requestWithNoContent(request, meta);
+    if ((std.mem.eql(u8, parsed.value.event, "first_boot.succeeded") or std.mem.eql(u8, parsed.value.event, "first_boot.failed")) and
+        (entry.journal.server == .succeeded or entry.journal.server == .failed) and
+        std.mem.eql(u8, entry.terminalEvent(), parsed.value.event_id))
+    {
+        const success = entry.journal.server == .succeeded;
+        projectFirstBootTerminal(context, node_id, generation, success) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot publish first-boot terminal state\"}}\n", meta);
+        if (entry.journal.local == .completed_pending_ack or entry.journal.local == .failed_pending_ack) {
+            try context.install_first_boot.acknowledge(node_id, generation, success);
+            try saveFirstBoot(context);
+        }
+        return requestWithNoContent(request, meta);
+    }
+    if (parsed.value.schema_version != 1 or parsed.value.event_id.len == 0 or !std.mem.eql(u8, parsed.value.expected_state, @tagName(entry.journal.server)) or parsed.value.event_seq != entry.journal.event_seq)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_conflict\",\"message\":\"first-boot event CAS failed (event_seq or expected_state mismatch)\"}}\n", meta);
+    if (std.mem.eql(u8, parsed.value.event, "first_boot.started")) {
+        context.install_first_boot.started(node_id, generation, parsed.value.event_id) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_conflict\",\"message\":\"first-boot start transition was rejected (state already advanced)\"}}\n", meta);
+    } else if (std.mem.eql(u8, parsed.value.event, "first_boot.step_started")) {
+        context.install_first_boot.beginStep(node_id, generation, parsed.value.step_index orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_invalid\",\"message\":\"step index is required for step_started event\"}}\n", meta)) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_conflict\",\"message\":\"first-boot step order was rejected (out-of-sequence step index)\"}}\n", meta);
+    } else if (std.mem.eql(u8, parsed.value.event, "first_boot.step_succeeded")) {
+        if (parsed.value.step_index == null or parsed.value.step_index.? != entry.journal.completed_step_count) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_conflict\",\"message\":\"first-boot step completion index was rejected (expected current step)\"}}\n", meta);
+        context.install_first_boot.stepSucceeded(node_id, generation) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_conflict\",\"message\":\"first-boot step completion was rejected (step not running)\"}}\n", meta);
+    } else if (std.mem.eql(u8, parsed.value.event, "first_boot.succeeded") or std.mem.eql(u8, parsed.value.event, "first_boot.failed")) {
+        const success = std.mem.eql(u8, parsed.value.event, "first_boot.succeeded");
+        context.install_first_boot.terminal(node_id, generation, success, parsed.value.event_id) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_conflict\",\"message\":\"first-boot terminal event was rejected (already terminal)\"}}\n", meta);
+        try saveFirstBoot(context);
+        projectFirstBootTerminal(context, node_id, generation, success) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot publish first-boot terminal state\"}}\n", meta);
+        try context.install_first_boot.acknowledge(node_id, generation, success);
+    } else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_invalid\",\"message\":\"unknown first-boot event kind\"}}\n", meta);
+    try saveFirstBoot(context);
+    return requestWithNoContent(request, meta);
 }
 
 fn passwordSalt(plan_digest: []const u8, account: []const u8) [16]u8 {
@@ -1090,8 +1668,8 @@ fn parseSingleRange(value: []const u8, size: u64) !ByteRange {
 /// 签发 M3 BootConfig v1 文档。密钥只出现在此认证响应中，永远不会出现在
 /// 事件、错误信封、URL 或日志中。
 fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
-    // v0.2: diskless 节点走独立的 BootConfig v3 交付路径（capsule config-token 认证），
-    // 不经过 DHCP-coupled boot_session 认证。
+    // Diskless 使用自己的 BootConfig v3 shape，但与 install 共用 DHCP-coupled
+    // boot-session 认证；这里只负责分派到 diskless renderer/authority join。
     {
         const catalog = context.catalog_snapshot.value();
         if (lookup.findNode(catalog, node_id)) |node| if (node.profile) |profile_name|
@@ -1194,7 +1772,7 @@ fn bootConfig(request: zap.Request, context: *const RouteContext, node_id: []con
         // `bootConfig()` 入口已在上方把 diskless session 分派给
         // `disklessBootConfig()`。保留本分支作为防御性不变量：旧 install
         // BootSession 处理器绝不能意外签发 diskless capability。
-        .diskless => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.not_implemented\",\"message\":\"diskless boot-config delivery is not yet available\"}}\n", meta),
+        .diskless => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.invalid_dispatch\",\"message\":\"diskless boot-config must use its bound delivery handler\"}}\n", meta),
     }
     try output.writer.print(",\"access\":{{\"session_header\":\"X-NodeForge-Session\",\"session_id\":{f},\"authorization_header\":\"Authorization\",\"bearer_token\":{f}}}}}\n", .{
         std.json.fmt(session.boot_session_id[0..], .{}), std.json.fmt(session.capability[0..], .{}),
@@ -1267,6 +1845,8 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     defer context.allocator.free(log_url);
     const facts_url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/facts", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
     defer context.allocator.free(facts_url);
+    const boot_config_url = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}/api/v1/nodes/{s}/boot-config", .{ context.config.server.server_ip, context.config.server.http_port, node_id });
+    defer context.allocator.free(boot_config_url);
     const node = &plan.node;
     const profile = &plan.profile;
     // M4.2: Subiquity webhook reporting 在 22.04 和 24.04 均可用（curtin handler 相同）。
@@ -1291,6 +1871,12 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     defer if (context.additional_keys.len > 0) context.allocator.free(merged_keys);
     system.ssh.root_authorized_keys = merged_keys;
     const bundle = if (install.post_install.bundle) |name| findProvisioningBundleIn(plan.provisioning_bundles, name) else null;
+    const has_install_first_boot = if (bundle) |value| bundleHasFirstBoot(value) else false;
+    const first_boot_base = if (has_install_first_boot)
+        try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port })
+    else
+        null;
+    defer if (first_boot_base) |value| context.allocator.free(value);
     var password_scope_buffer: [96]u8 = undefined;
     // salt scope 必须能经受 daemon 重启。session id 是随机的，且
     // 捕获的模型 revision 对本次投递不可变；daemon 实例
@@ -1312,7 +1898,7 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
     } else null;
     const body = switch (format) {
         .meta_data => try @import("../profile/adapter/ubuntu.zig").renderMetaData(context.allocator, node),
-        .user_data => try @import("../profile/adapter/ubuntu.zig").renderEffective(context.allocator, node, install, system, effective_plan.network, effective_plan.software, context.bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session.boot_session_id[0..], session.capability[0..], password_scope, effective_plan.kernel_args),
+        .user_data => try @import("../profile/adapter/ubuntu.zig").renderEffective(context.allocator, node, install, system, effective_plan.network, effective_plan.software, context.bootstrap_key, bundle, apt_primary_url, facts_url, event_url, log_url, report_url, session.boot_session_id[0..], boot_config_url, password_scope, effective_plan.kernel_args, if (first_boot_base) |base_url| .{ .node_id = node_id, .generation = session.deployment_generation, .base_url = base_url, .boot_session_id = session.boot_session_id[0..], .capability_file = "/run/nodeforge-installer.token", .target_root = "/target", .enable_command = "curtin in-target --target=/target -- systemctl enable nodeforge-install-firstboot.service" } else null),
         .vendor_data => try context.allocator.dupe(u8, ""),
         .kickstart => blk: {
             const source = &plan.install_source;
@@ -1323,7 +1909,7 @@ fn installConfig(request: zap.Request, context: *const RouteContext, node_id: []
                 for (repository_urls) |url| context.allocator.free(url);
                 context.allocator.free(repository_urls);
             }
-            break :blk try @import("../profile/adapter/kickstart.zig").renderEffective(context.allocator, node, install, system, effective_plan.network, effective_plan.software, context.bootstrap_key, install_root, repository_urls, bundle, facts_url, event_url, log_url, session.boot_session_id[0..], session.capability[0..], password_scope, effective_plan.kernel_args);
+            break :blk try @import("../profile/adapter/kickstart.zig").renderEffective(context.allocator, node, install, system, effective_plan.network, effective_plan.software, context.bootstrap_key, install_root, repository_urls, bundle, facts_url, event_url, log_url, session.boot_session_id[0..], boot_config_url, password_scope, effective_plan.kernel_args, if (first_boot_base) |base_url| .{ .node_id = node_id, .generation = session.deployment_generation, .base_url = base_url, .boot_session_id = session.boot_session_id[0..], .capability_file = "/run/nodeforge-installer.token" } else null);
         },
     };
     defer context.allocator.free(body);
@@ -1588,6 +2174,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
     if (!std.mem.eql(u8, event.value.boot_session_id, checked.session.boot_session_id[0..])) return nodeAuthError(request, error.ProofMismatch, meta);
     const mapped = mapStage(checked.session.mode, event.value.stage) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.stage_invalid\",\"message\":\"stage not allowed for profile mode\"}}\n", meta);
     const terminal = std.mem.eql(u8, event.value.stage, "completed") or std.mem.eql(u8, event.value.stage, "failed");
+    const first_boot_pending = checked.session.mode == .install and std.mem.eql(u8, event.value.stage, "completed") and installCompletionNeedsFirstBoot(context, node_id);
     // generation 仅在安装器自身报告已启动时被消费，
     // 而非 DHCP、TFTP 或 answer 下发成功时消费。
     if (checked.session.mode == .install and std.mem.eql(u8, event.value.stage, "started")) {
@@ -1601,14 +2188,14 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
     // install-post 是 generation completion gate：只要配置了 bundle，installer 的
     // 粗粒度 `completed` 就不能单独关闭部署；必须先持久接受带认证 finalizer callback。
     if (checked.session.mode == .install and std.mem.eql(u8, event.value.stage, "completed")) {
-        if (installPostBundleForNode(context.catalog_snapshot.value(), node_id) != null) {
+        if (installPostBundleForNode(context.catalog_snapshot.value(), node_id)) |bundle| if (bundleHasInstallPost(bundle)) {
             const run = context.install_post_journal.view(node_id, checked.session.deployment_generation) orelse
                 return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_incomplete\",\"message\":\"install-post finalizer has not completed\"}}\n", meta);
             if (run.status != .completed)
                 return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_incomplete\",\"message\":\"install-post finalizer has not completed\"}}\n", meta);
-        }
+        };
     }
-    if (checked.session.mode == .install and terminal) {
+    if (checked.session.mode == .install and terminal and !first_boot_pending) {
         const terminal_result = context.deployments.markTerminalAt(node_id, std.mem.eql(u8, event.value.stage, "completed"), unixNow());
         deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch |err| {
             if (terminal_result) |result| context.deployments.rollbackTerminal(node_id, result);
@@ -1673,16 +2260,18 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
                     return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_event_rejected\",\"message\":\"install-post run cannot enter completion transaction\"}}\n", meta);
                 install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch
                     return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_persist_failed\",\"message\":\"cannot prepare install-post completion\"}}\n", meta);
-                const terminal_result = context.deployments.markTerminalAt(node_id, true, unixNow()) orelse
-                    return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_generation_mismatch\",\"message\":\"install generation cannot be completed\"}}\n", meta);
-                if (terminal_result.generation != gen) {
-                    context.deployments.rollbackTerminal(node_id, terminal_result);
-                    return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_generation_mismatch\",\"message\":\"install generation does not match finalizer run\"}}\n", meta);
+                if (!installCompletionNeedsFirstBoot(context, node_id)) {
+                    const terminal_result = context.deployments.markTerminalAt(node_id, true, unixNow()) orelse
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_generation_mismatch\",\"message\":\"install generation cannot be completed\"}}\n", meta);
+                    if (terminal_result.generation != gen) {
+                        context.deployments.rollbackTerminal(node_id, terminal_result);
+                        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_generation_mismatch\",\"message\":\"install generation does not match finalizer run\"}}\n", meta);
+                    }
+                    deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch {
+                        context.deployments.rollbackTerminal(node_id, terminal_result);
+                        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_persist_failed\",\"message\":\"cannot commit install generation\"}}\n", meta);
+                    };
                 }
-                deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch {
-                    context.deployments.rollbackTerminal(node_id, terminal_result);
-                    return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_persist_failed\",\"message\":\"cannot commit install generation\"}}\n", meta);
-                };
                 if (!context.install_post_journal.transition(node_id, gen, .completed, unixNow()))
                     return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_commit_failed\",\"message\":\"cannot publish completed install-post run\"}}\n", meta);
                 install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch {
@@ -1702,7 +2291,7 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
             install_post_journal.save(context.io, context.allocator, paths.require().install_post_journal_path, context.install_post_journal) catch
                 return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"install.postprocess_persist_failed\",\"message\":\"cannot persist install-post journal\"}}\n", meta);
     }
-    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, mapped.phase, event.value.reason, unixNow(), !terminal) catch |err|
+    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, if (first_boot_pending) .install_rebooting else mapped.phase, event.value.reason, unixNow(), !terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [4]events.Field = .{
@@ -1718,8 +2307,8 @@ fn nodeEvent(request: zap.Request, context: *const RouteContext, node_id: []cons
     };
     if (terminal) {
         context.sessions.finishDelivery(checked.session.boot_session_id[0..], if (std.mem.eql(u8, event.value.stage, "completed")) .completed else .failed, boot_session.monotonicNow(), unixNow());
-        // M4.9：同步持久化 capability 删除；否则响应后崩溃会在重启时复活
-        // 上一个 active checkpoint。
+        // 同步移除 durable authority；schema v5 从不保存 raw capability，但若
+        // 旧 active authority 留在 checkpoint，restart 后仍会允许 peer-IP 重新签发。
         if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist terminal delivery session\"}}\n", meta);
     } else {
         const phase: boot_session.Phase = if (std.mem.eql(u8, event.value.stage, "installer_started")) .installer_started else .installing;
@@ -1827,8 +2416,8 @@ fn normalizeFacts(facts: *node_inventory.Facts) void {
     };
 }
 
-/// Diskless initrd 使用 event capability 上报硬件事实。event token 是四域
-/// credential 中唯一的 telemetry 写域；facts 不推进 event_seq，因此 lifecycle
+/// Diskless initrd 使用唯一 durable event capability 上报硬件事实；读取链由
+/// 随机 boot-session capability 认证。facts 不推进 event_seq，因此 lifecycle
 /// CAS 与 inventory 幂等摘要保持独立。
 ///
 /// v0.2.3 起 initrd 同时上报 memory_bytes + DMI 字段（serial/uuid/vendor/
@@ -1954,6 +2543,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
         return json(request, .ok, "{\"ok\":true}\n", meta);
     };
     const deployment_terminal = std.mem.eql(u8, stage, "completed") or std.mem.eql(u8, stage, "failed");
+    const first_boot_pending = std.mem.eql(u8, stage, "completed") and installCompletionNeedsFirstBoot(context, node_id);
     // curtin 的 FAIL webhook 通常先于 error-commands。失败时先更新 deployment
     // 和状态，但保留 capability，让随后携带 traceback 的 /logs 仍可认证；
     // 成功没有后续失败摘要，可以立即关闭 delivery。
@@ -1967,7 +2557,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist install generation\"}}\n", meta);
         };
     }
-    if (deployment_terminal) {
+    if (deployment_terminal and !first_boot_pending) {
         const terminal_result = context.deployments.markTerminalAt(node_id, std.mem.eql(u8, stage, "completed"), unixNow());
         deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch |err| {
             if (terminal_result) |result| context.deployments.rollbackTerminal(node_id, result);
@@ -1975,7 +2565,7 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"cannot persist applied install revision\"}}\n", meta);
         };
     }
-    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, mapped.phase, null, unixNow(), !delivery_terminal) catch |err|
+    context.statuses.updateForDeployment(node_id, checked.session.boot_session_id[0..], context.daemon_instance_id, checked.session.model_revision, checked.session.model_plan_digest, checked.session.deployment_generation, if (first_boot_pending) .install_rebooting else mapped.phase, null, unixNow(), !delivery_terminal) catch |err|
         observe_log.err("node status update failed: {t}", .{err});
     if (!persistStatus(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"status.persist_failed\",\"message\":\"node status persistence failed\"}}\n", meta);
     var fields: [3]events.Field = .{
@@ -2199,7 +2789,7 @@ fn parseForceFlag(request: zap.Request) bool {
 /// 2. **diskless 模式**：节点正在 diskless 启动过程中（尚未到达终态），
 ///    操作员需要修改属性。`supersedeNode` 终止 `boot_session.Store` 中的
 ///    DHCP session；同时 `diskless_store.cancel` 终止 `diskless_delivery.Store`
-///    中的交付 session（撤销全部 capability 并从 checkpoint 中移除）。
+///    中的交付 session（撤销 event capability 并从 checkpoint 中移除）。
 ///
 /// **安全保证**：
 /// - install plan 在 PXE bootstrap 时已固定为不可变快照，终止 session 不会
@@ -2224,8 +2814,8 @@ fn forceTerminateNodeSessions(context: *RouteContext, node_id: []const u8) bool 
     if (!checkpointSessions(context)) return false;
 
     // 2. 终止 diskless_delivery.Store 中该节点的活动交付 session。
-    //    `cancel` 会撤销全部 capability（config/rootfs/agent/event token），
-    //    并从持久化 checkpoint 中移除该 session。如果节点没有 diskless
+    //    `cancel` 会撤销唯一 durable event capability，并从持久化 checkpoint
+    //    中移除该 session。如果节点没有 diskless
     //    session（例如 install 模式节点），此步骤为 no-op。
     if (context.diskless_store.findByNode(node_id)) |session| {
         context.diskless_store.cancel(context.io, session.session_id[0..]) catch return false;
@@ -3682,7 +4272,7 @@ fn managementProfileClone(request: zap.Request, context: *RouteContext, source: 
     const catalog = context.catalog_snapshot.value();
     const profile = lookup.findProfile(catalog, parsed.value.target) orelse
         return cloneBuildSubmitFailed(request, meta, "clone committed but target profile is missing");
-    const digest = diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile) catch
+    const digest = resolvedRootfsInputDigest(context, catalog, profile) catch
         return cloneBuildSubmitFailed(request, meta, "cannot compute rootfs input digest after clone");
     const digest_hex: []const u8 = digest[0..];
     // 缓存命中：内容寻址制品已 ready，build 视为已提交（幂等，不建 operation）。
@@ -3816,7 +4406,7 @@ fn managementInitrdBuild(request: zap.Request, context: *RouteContext, meta: Req
 /// `profile rootfs build`：从 Profile build projection 构建内容寻址 rootfs 制品。
 /// daemon 用发行版原生 install-root 工具从 install source 受管 repository 构建
 /// OS 层 lower，叠加 rootfs-build phase 步骤（managed_file/archive/script/package），
-/// 再 mksquashfs 压缩，按 `rootfs_input_digest` 内容寻址登记。fail-closed：OS 层、
+/// 再 mksquashfs 压缩，按 `rootfs_input_digest` 内容寻址发布。fail-closed：OS 层、
 /// 任一 rootfs-build 步骤或 squashfs 压缩失败即放弃整次构建，不发布半成品。
 ///
 /// rootfs 按 `rootfs_input_digest` 缓存：若该 digest 已有 ready 制品则直接命中
@@ -3896,7 +4486,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     if (if_input_digest) |expected| if (!std.mem.eql(u8, expected, digest_hex))
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.digest_drift\",\"message\":\"current rootfs input digest does not match if_input_digest\"}}\n", meta);
 
-    // 缓存命中：该 digest 已有 ready 制品，幂等返回，不重构建。
+    // rootfs 只由 nodeforged 服务端构建；物理 Node 不参与构建或发布。
     if (context.rootfs_artifacts.find(digest_hex)) |existing| {
         var output: std.Io.Writer.Allocating = .init(context.allocator);
         defer output.deinit();
@@ -3947,7 +4537,7 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
     const catalog = context.catalog_snapshot.value();
     const profile = lookup.findProfile(catalog, name) orelse return error.MissingProfile;
     if (profile.kind != .diskless) return error.ProfileNotDiskless;
-    const digest = try diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile);
+    const digest = try resolvedRootfsInputDigest(context, catalog, profile);
     const digest_hex: []const u8 = &digest;
     if (!std.mem.eql(u8, expected_digest, digest_hex)) return error.RootfsDigestDrift;
     if (context.rootfs_artifacts.find(digest_hex) != null) return;
@@ -4174,6 +4764,9 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
     sha.final(&sha512_raw);
     var content_sha512: [128]u8 = undefined;
     _ = std.fmt.bufPrint(&content_sha512, "{x}", .{sha512_raw}) catch unreachable;
+    var expected_agent_sha256: [64]u8 = undefined;
+    try asset_validate.sha256File(context.io, paths.require().bin_dir, "nodeforge-agent", &expected_agent_sha256);
+    try deepValidateRootfsArtifact(context, operation_id, part, &expected_agent_sha256);
     // 6. 在同一发布临界区内校验已有记录、原子替换文件并持久化登记。
     // 临时文件包含请求标识；相同摘要的并发构建不会共享或删除彼此的临时文件。
     const artifact: rootfs_artifact_store.Artifact = .{
@@ -4185,6 +4778,8 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
         .kernel_release = boot_bundle.kernel_release,
         .file = file_name,
         .created_at = unixNow(),
+        .deep_validated = true,
+        .deep_validation_version = rootfs_artifact_store.current_deep_validation_version,
     };
     const result = try publishRootfsArtifact(context, part, dest, artifact);
     const state_str: []const u8 = @tagName(result);
@@ -4657,24 +5252,29 @@ fn publishRootfsArtifact(
     temporary_path: []const u8,
     destination_path: []const u8,
     artifact: rootfs_artifact_store.Artifact,
-) !rootfs_artifact_store.RegisterResult {
+) !rootfs_artifact_store.PublishResult {
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
 
     if (context.rootfs_artifacts.find(artifact.rootfs_input_digest) != null) {
-        const result = try context.rootfs_artifacts.register(context.io, artifact);
+        const result = try context.rootfs_artifacts.publish(context.io, artifact);
         std.Io.Dir.cwd().deleteFile(context.io, temporary_path) catch {};
+        dhcp_store.syncParentDirectory(context.io, temporary_path) catch {};
         return result;
     }
 
     try std.Io.Dir.rename(std.Io.Dir.cwd(), temporary_path, std.Io.Dir.cwd(), destination_path, context.io);
-    _ = context.rootfs_artifacts.register(context.io, artifact) catch |err| {
+    // The file data is synced by the uploader before this point. Persist the
+    // destination directory entry before making it reachable from the index.
+    try dhcp_store.syncParentDirectory(context.io, destination_path);
+    _ = context.rootfs_artifacts.publish(context.io, artifact) catch |err| {
         // 当前锁内已证明该输入摘要尚无记录，因此目标路径不可能属于另一个
         // 已发布制品；持久化失败时删除它，避免留下无记录的半发布文件。
         std.Io.Dir.cwd().deleteFile(context.io, destination_path) catch {};
+        dhcp_store.syncParentDirectory(context.io, destination_path) catch {};
         return err;
     };
-    return .registered;
+    return .published;
 }
 
 /// 运行构建期 OS 命令，退出码非 0 返回 BuildStepFailed。
@@ -4718,13 +5318,6 @@ fn measureTreeApparentSize(io: std.Io, allocator: std.mem.Allocator, path: []con
     return size;
 }
 
-const RootfsRegisterRequest = struct {
-    path: []const u8,
-    /// 外部 squashfs 无法从压缩文件大小可靠推导逻辑展开大小。0/缺失表示未知；
-    /// 登记仍然成功，但 readiness/initrd 不得据此执行内存容量硬校验。
-    uncompressed_size: u64 = 0,
-};
-
 /// `profile rootfs plan`：编译 diskless Profile 的 `rootfs_input_digest`（Node-independent）
 /// 并报告该 digest 是否已有 ready 制品（cache_state）。不要求存在 Node 或 deploy=true。
 fn managementRootfsPlan(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
@@ -4737,7 +5330,7 @@ fn managementRootfsPlan(request: zap.Request, context: *RouteContext, name: []co
     const cache_state: []const u8 = if (artifact != null) "ready" else "miss";
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"cache_state\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(cache_state, .{}) });
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"build_location\":\"nodeforged\",\"rootfs_input_digest\":{f},\"cache_state\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(cache_state, .{}) });
     if (artifact) |a| {
         try output.writer.print(",\"content_sha512\":{f},\"compressed_bytes\":{d},\"uncompressed_bytes\":", .{ std.json.fmt(a.content_sha512, .{}), a.compressed_size });
         if (a.uncompressed_size == 0) try output.writer.writeAll("null") else try output.writer.print("{d}", .{a.uncompressed_size});
@@ -4747,99 +5340,12 @@ fn managementRootfsPlan(request: zap.Request, context: *RouteContext, name: []co
     return json(request, .ok, output.written(), meta);
 }
 
-/// `profile rootfs register`：登记一个已构建 rootfs 制品（测试/导入用）。daemon 从
-/// Profile 编译 `rootfs_input_digest`，校验文件 sha512+size，内容寻址拷贝到 rootfs_dir，
-/// 再经 rootfs_artifact_store 幂等登记（同 digest sha512 一致则静默成功，漂移则拒绝）。
-fn managementRootfsRegister(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
-    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"missing request body\"}}\n", meta);
-    const parsed = std.json.parseFromSlice(RootfsRegisterRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
-        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"path is required\"}}\n", meta);
-    defer parsed.deinit();
-    if (parsed.value.path.len == 0) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"path is required\"}}\n", meta);
-    if (parsed.value.uncompressed_size == 0)
-        std.log.scoped(.rootfs).warn("registering external rootfs for profile {s} without uncompressed_size; hard memory-capacity checks will be skipped", .{name});
-    const catalog = context.catalog_snapshot.value();
-    const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
-    if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs register is only available for diskless profiles\"}}\n", meta);
-    const digest = diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile) catch |err| return validationError(request, err, meta);
-    const digest_hex: []const u8 = digest[0..];
-    const bundle_name = profile.boot_bundle orelse return validationError(request, error.MissingBootBundle, meta);
-    const boot_bundle = lookup.findBootBundle(catalog, bundle_name) orelse return validationError(request, error.MissingBootBundle, meta);
-    const cwd = std.Io.Dir.cwd();
-    // 流式导入：rootfs 可能数 GB，不能整块读入内存。边读边算 SHA-512、边写
-    // 内容寻址目标文件（先写 .part 再原子 rename），仅持有固定缓冲。
-    const rootfs_dir = paths.require().rootfs_dir;
-    cwd.createDirPath(context.io, rootfs_dir) catch {};
-    const file_name = try @import("../provision/artifact_layout.zig").rootfsRelative(context.allocator, profile.name, digest_hex);
-    defer context.allocator.free(file_name);
-    const dest = try std.fmt.allocPrint(context.allocator, "{s}/{s}", .{ rootfs_dir, file_name });
-    defer context.allocator.free(dest);
-    if (std.fs.path.dirname(dest)) |parent| try cwd.createDirPath(context.io, parent);
-    const tmp = try std.fmt.allocPrint(context.allocator, "{s}.part-{s}", .{ dest, &meta.request_id });
-    defer context.allocator.free(tmp);
-    errdefer cwd.deleteFile(context.io, tmp) catch {};
-
-    var src_file = cwd.openFile(context.io, parsed.value.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"rootfs.file_not_found\",\"message\":\"rootfs file does not exist\"}}\n", meta),
-        else => return validationError(request, err, meta),
-    };
-    defer src_file.close(context.io);
-    const src_stat = src_file.stat(context.io) catch |err| return validationError(request, err, meta);
-    if (src_stat.kind != .file) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"rootfs path is not a regular file\"}}\n", meta);
-    const total_size: u64 = src_stat.size;
-
-    var sha = std.crypto.hash.sha2.Sha512.init(.{});
-    {
-        var out_file = cwd.createFile(context.io, tmp, .{ .truncate = true }) catch |err| return validationError(request, err, meta);
-        defer out_file.close(context.io);
-        var buf: [256 * 1024]u8 = undefined;
-        var offset: u64 = 0;
-        while (true) {
-            const n = src_file.readPositionalAll(context.io, &buf, offset) catch |err| return validationError(request, err, meta);
-            if (n == 0) break;
-            sha.update(buf[0..n]);
-            out_file.writeStreamingAll(context.io, buf[0..n]) catch |err| return validationError(request, err, meta);
-            offset += n;
-        }
-        out_file.sync(context.io) catch |err| return validationError(request, err, meta);
-    }
-    var sha512_raw: [64]u8 = undefined;
-    sha.final(&sha512_raw);
-    var content_sha512: [128]u8 = undefined;
-    _ = std.fmt.bufPrint(&content_sha512, "{x}", .{sha512_raw}) catch unreachable;
-    const artifact: rootfs_artifact_store.Artifact = .{
-        .rootfs_input_digest = digest_hex,
-        .profile = profile.name,
-        .content_sha512 = content_sha512[0..],
-        .compressed_size = total_size,
-        .uncompressed_size = parsed.value.uncompressed_size,
-        .kernel_release = boot_bundle.kernel_release,
-        .file = file_name,
-        .created_at = unixNow(),
-    };
-    const result = publishRootfsArtifact(context, tmp, dest, artifact) catch |err| switch (err) {
-        error.RootfsDigestDrift, error.RootfsMetadataDrift => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.digest_drift\",\"message\":\"a different rootfs is already registered for this profile build\"}}\n", meta),
-        else => return validationError(request, err, meta),
-    };
-    const state_str: []const u8 = @tagName(result);
-    const effective_uncompressed_size = context.rootfs_artifacts.find(digest_hex).?.uncompressed_size;
-    var output: std.Io.Writer.Allocating = .init(context.allocator);
-    defer output.deinit();
-    try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":{f},\"content_sha512\":{f},\"compressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(state_str, .{}), std.json.fmt(content_sha512[0..], .{}), total_size, std.json.fmt(boot_bundle.kernel_release, .{}), std.json.fmt(file_name, .{}) });
-    if (effective_uncompressed_size != 0)
-        try output.writer.print(",\"uncompressed_bytes\":{d},\"warnings\":[]", .{effective_uncompressed_size})
-    else
-        try output.writer.writeAll(",\"uncompressed_bytes\":null,\"warnings\":[{\"code\":\"rootfs.uncompressed_size_unknown\",\"message\":\"uncompressed rootfs size is unknown; hard memory-capacity checks will be skipped\"}]");
-    try output.writer.writeAll("}}\n");
-    return json(request, .created, output.written(), meta);
-}
-
 /// `profile rootfs status`：报告 Profile 当前 rootfs_input_digest 对应的 ready 制品。
 fn managementRootfsStatus(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
     const catalog = context.catalog_snapshot.value();
     const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
     if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs status is only available for diskless profiles\"}}\n", meta);
-    const digest = diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile) catch |err| return validationError(request, err, meta);
+    const digest = resolvedRootfsInputDigest(context, catalog, profile) catch |err| return validationError(request, err, meta);
     const digest_hex: []const u8 = digest[0..];
     const artifact = context.rootfs_artifacts.find(digest_hex);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
@@ -4855,51 +5361,68 @@ fn managementRootfsStatus(request: zap.Request, context: *RouteContext, name: []
     return json(request, .ok, output.written(), meta);
 }
 
-/// 将 credential `Decision` 映射为对外的稳定错误信封 JSON。
-///
-/// 安全策略（§10 分域能力令牌）：
-/// - `expired` 单独返回 `diskless.token_expired`，允许 initrd/agent 据此区分
-///   "token 过期需重新 boot-prepare"与"token 被篡改/越权"，实现精准重试；
-/// - 其余 decision（`invalid_token`/`scope_mismatch`/`node_mismatch`/
-///   `path_not_allowed`/`content_mismatch`/`event_seq_mismatch`）仍归为笼统的
-///   `diskless.unauthorized`，避免向客户端泄露具体失败原因（防探测攻击）。
-///
-/// 返回的 JSON 字面量是编译期常量，不涉及分配；调用方直接传给 `json()`
-/// 即可，`appendRequestId` 会自动补充 `request_id` 字段。
-/// 具体的 decision 值由调用方在 `observe_log.warn` 中记录，不进入 HTTP 响应。
+fn resolvedRootfsInputDigest(
+    context: *RouteContext,
+    catalog: *const model.Catalog,
+    profile: *const model.ProfileConfig,
+) !diskless.Digest {
+    return diskless.rootfsInputDigest(context.allocator, context.config, catalog, profile);
+}
+
+fn compileResolvedDisklessPlan(
+    context: *RouteContext,
+    catalog: *const model.Catalog,
+    node: *const model.NodeConfig,
+    profile: *const model.ProfileConfig,
+) !diskless.DisklessPlan {
+    _ = profile;
+    return diskless.compile(context.allocator, context.config, catalog, node);
+}
+
 fn disklessCredentialError(decision: diskless_credential.Decision) []const u8 {
     return switch (decision) {
         .expired => "{\"ok\":false,\"error\":{\"code\":\"diskless.token_expired\",\"message\":\"capability token has expired\"}}\n",
-        .recovery_incomplete => "{\"ok\":false,\"error\":{\"code\":\"capability.recovery_incomplete\",\"message\":\"session capability cannot be reconstructed after daemon restart\"}}\n",
+        .recovery_incomplete => "{\"ok\":false,\"error\":{\"code\":\"capability.recovery_incomplete\",\"message\":\"durable event credential cannot be reconstructed after daemon restart\"}}\n",
         else => "{\"ok\":false,\"error\":{\"code\":\"diskless.unauthorized\",\"message\":\"diskless credential verification failed\"}}\n",
     };
 }
 
-/// v0.2 diskless BootConfig v3 交付。initrd 用 capsule 交付的 config-token +
-/// X-NodeForge-Session 认证后返回 immutable rootfs + AgentPlan 定位器。四类
-/// capability 已由 boot-prepare 签发并通过 capsule 分离交付，BootConfig 不含 token。
+/// PR3-1（token 简化）：diskless BootConfig v3 交付。initrd 通过 peer-IP 引导
+/// 认证（boot_session.Store，与 install 路径一致）获取 BootConfig。不再使用
+/// capsule config-token —— config/rootfs/agent 三个读取作用域 token 已删除，
+/// 因为它们全部打包在同一 capsule 中交给同一 initrd 进程，作用域分离无效。
+///
+/// 引导认证通过后签发随机能力 token（boot_session capability），仅用于后续
+/// AgentPlan 等小型敏感控制面读取。rootfs/payload 大对象仍由 direct peer、活动
+/// session 与 immutable digest 共同约束，不携带 capability header。
+/// event:append token 仍由 capsule 单独交付（切网后 lease-IP 身份可能变化）。
 fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
-    const config_token = parseBearer(request.getHeader("authorization")) orelse
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <config-token> is required\"}}\n", meta);
-    const session_hdr = request.getHeader("x-nodeforge-session") orelse
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_required\",\"message\":\"X-NodeForge-Session header is required\"}}\n", meta);
-    const session = context.diskless_store.find(session_hdr) orelse
-        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
-    if (!std.mem.eql(u8, session.nodeId(), node_id))
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.node_mismatch\",\"message\":\"session does not belong to this node\"}}\n", meta);
-    const decision = context.diskless_store.verify(session_hdr, config_token, .config, node_id, "", session.rootfsSha512(), 0, boot_session.monotonicNow());
-    // 凭证校验失败：日志记录具体 decision（如 invalid_token/expired/scope_mismatch），
-    // 供运维定位；HTTP 响应只对外暴露笼统的 unauthorized 或 token_expired（见
-    // disklessCredentialError），不泄露具体原因以防探测。此前此路径缺失日志，
-    // 导致 5 种不同安全语义的失败在日志中无法区分。
-    if (decision != .ok) {
-        observe_log.warn(
-            "diskless config credential rejected: node={s} session={s} decision={s}",
-            .{ node_id, session_hdr, @tagName(decision) },
-        );
-        return json(request, .unauthorized, disklessCredentialError(decision), meta);
-    }
-    context.diskless_store.markBootConfigFetched(context.io, session_hdr) catch
+    // 引导认证：peer-IP 匹配 DHCP lease-IP。无 token，无 session header。
+    const checked = auth.authenticate(
+        context.sessions,
+        node_id,
+        meta.client_ip,
+        request.getHeader("authorization"),
+        request.getHeader("x-nodeforge-session"),
+        boot_session.monotonicNow(),
+    ) catch |err| return nodeAuthError(request, err, meta);
+    // 通过 node_id 反查 diskless_delivery session（boot_session 与 delivery 是两个
+    // 独立 store，session id 不同，但都绑定同一 node_id）。
+    const session = context.diskless_store.findByNode(node_id) orelse
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless delivery session prepared for this node\"}}\n", meta);
+    if (session.recovery_incomplete)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.recovery_incomplete\",\"message\":\"diskless session cannot be recovered after daemon secret rotation\"}}\n", meta);
+    // 签发随机、仅驻内存的控制面能力 token。后续 AgentPlan 请求使用 Bearer +
+    // session header；rootfs/payload 大对象请求不传播该 token。
+    const bs_session = if (checked.proof == .bootstrap)
+        context.sessions.issueCapability(context.io, checked.session.boot_session_id[0..], boot_session.monotonicNow(), unixNow()) catch |err| return nodeAuthError(request, err, meta)
+    else blk: {
+        context.sessions.touchDelivery(checked.session.boot_session_id[0..], boot_session.monotonicNow(), unixNow());
+        break :blk checked.session;
+    };
+    if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist delivery session\"}}\n", meta);
+    const delivery_session_id: []const u8 = session.session_id[0..];
+    context.diskless_store.markBootConfigFetched(context.io, delivery_session_id) catch
         return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_persist_failed\",\"message\":\"cannot persist boot-config lifecycle\"}}\n", meta);
     const base = try std.fmt.allocPrint(context.allocator, "http://{s}:{d}", .{ context.config.server.server_ip, context.config.server.http_port });
     defer context.allocator.free(base);
@@ -4907,8 +5430,7 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
     defer context.allocator.free(config_url);
     const rootfs_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/rootfs", .{ base, node_id });
     defer context.allocator.free(rootfs_url);
-    const session_id_slice: []const u8 = session.session_id[0..];
-    const agent_plan_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/boot-sessions/{s}/agent-plan/{s}", .{ base, session_id_slice, session.agentPlanDigest() });
+    const agent_plan_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/boot-sessions/{s}/agent-plan/{s}", .{ base, delivery_session_id, session.agentPlanDigest() });
     defer context.allocator.free(agent_plan_url);
     const event_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/events", .{ base, node_id });
     defer context.allocator.free(event_url);
@@ -4924,7 +5446,8 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
             return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.payload_size_overflow\",\"message\":\"payload closure size overflow\"}}\n", meta);
     const bc: diskless_dto.BootConfig = .{
         .node_id = node_id,
-        .session_id = session_id_slice,
+        // 使用 boot_session id（能力认证用），不是 delivery session id。
+        .session_id = bs_session.boot_session_id[0..],
         .profile = session.profileName(),
         .kernel_release = session.kernelRelease(),
         .config_url = config_url,
@@ -4939,6 +5462,12 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
         .event_url = event_url,
         .facts_url = facts_url,
         .expires_at = session.expires_at,
+        // v0.4 token 简化：引导认证签发的随机能力 token 直接随 BootConfig 下发，
+        // 仅用于 AgentPlan 等小型敏感控制面读取；固定大对象不使用它。
+        .access = .{
+            .session_id = bs_session.boot_session_id[0..],
+            .bearer_token = bs_session.capability[0..],
+        },
     };
     const body = try diskless_dto.renderBootConfig(context.allocator, bc);
     defer context.allocator.free(body);
@@ -4947,95 +5476,47 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
     return json(request, .ok, body, meta);
 }
 
-/// v0.2 diskless rootfs 下载。initrd 用独立 rootfs:read token 认证，
-/// 通过 rootfs_artifact_store 定位已注册的 squashfs 制品并经 staticFile 交付。
+/// diskless rootfs 是固定 SHA-512 数据面。direct peer-IP、活动 diskless session、TTL
+/// 与当前 artifact binding 已足够鉴别，不让 initrd 为大对象下载携带 capability。
 fn disklessRootfs(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
-    const rootfs_token = parseBearer(request.getHeader("authorization")) orelse
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <rootfs-token> is required\"}}\n", meta);
-    const session_hdr = request.getHeader("x-nodeforge-session") orelse
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_required\",\"message\":\"X-NodeForge-Session header is required\"}}\n", meta);
-    const session = context.diskless_store.find(session_hdr) orelse
+    _ = auth.authenticateWebhook(context.sessions, node_id, getClientIp(request), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
+    const session = context.diskless_store.findByNode(node_id) orelse
         return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
-    if (!std.mem.eql(u8, session.nodeId(), node_id))
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.node_mismatch\",\"message\":\"session does not belong to this node\"}}\n", meta);
-    const decision = context.diskless_store.verify(session_hdr, rootfs_token, .rootfs, node_id, "", session.rootfsSha512(), 0, boot_session.monotonicNow());
-    // 凭证校验失败：日志记录具体 decision（如 invalid_token/expired/scope_mismatch），
-    // 供运维定位；HTTP 响应只对外暴露笼统的 unauthorized 或 token_expired。
-    // 此前此路径缺失日志，导致 token 过期与 token 篡改在日志中无法区分。
-    if (decision != .ok) {
-        observe_log.warn(
-            "diskless rootfs credential rejected: node={s} session={s} decision={s}",
-            .{ node_id, session_hdr, @tagName(decision) },
-        );
-        return json(request, .unauthorized, disklessCredentialError(decision), meta);
-    }
+    if (session.recovery_incomplete)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.recovery_incomplete\",\"message\":\"diskless session cannot be recovered\"}}\n", meta);
     const artifact = context.rootfs_artifacts.find(session.rootfsInputDigest()) orelse
-        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.rootfs_not_found\",\"message\":\"no rootfs artifact registered for this profile build\"}}\n", meta);
+        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.rootfs_not_found\",\"message\":\"no ready rootfs artifact exists for this profile build\"}}\n", meta);
     return staticFile(request, context, paths.require().rootfs_dir, artifact.file, artifact.content_sha512, meta);
 }
 
-/// v0.2 diskless AgentPlan v1 交付。agent pre-init 用 agent:read token 认证后，
-/// 获取 pinned immutable AgentPlan JSON（digest 必须与 URL 中的 digest 一致）。
+/// PR3-1（token 简化）：diskless AgentPlan v2 交付。使用 boot_session 能力 token
+/// 认证（与 install 路径一致），不再使用独立的 agent:read token。通过 delivery
+/// session id 反查 node_id 后执行能力认证，获取 pinned immutable AgentPlan JSON
+/// （digest 必须与 URL 中的 digest 一致）。
 fn disklessAgentPlan(request: zap.Request, context: *const RouteContext, session_id: []const u8, digest: []const u8, meta: RequestMeta) !void {
-    const agent_token = parseBearer(request.getHeader("authorization")) orelse
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <agent-token> is required\"}}\n", meta);
     const session = context.diskless_store.find(session_id) orelse
         return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
     if (!std.mem.eql(u8, digest, session.agentPlanDigest()))
         return notFound(request, meta);
-    const decision = context.diskless_store.verify(session_id, agent_token, .agent, session.nodeId(), "", session.agentPlanDigest(), 0, boot_session.monotonicNow());
-    // 凭证校验失败：日志记录具体 decision（如 invalid_token/expired/node_mismatch），
-    // 供运维定位；HTTP 响应只对外暴露笼统的 unauthorized 或 token_expired。
-    // 此前此路径缺失日志，agent pre-init 拉取 AgentPlan 失败时无法区分原因。
-    if (decision != .ok) {
-        observe_log.warn(
-            "diskless agent-plan credential rejected: session={s} decision={s}",
-            .{ session_id, @tagName(decision) },
-        );
-        return json(request, .unauthorized, disklessCredentialError(decision), meta);
-    }
+    // 通过 delivery session 反查 node_id，再用 boot_session 能力 token 认证。
+    const node_id = session.nodeId();
+    _ = auth.authenticate(
+        context.sessions,
+        node_id,
+        meta.client_ip,
+        request.getHeader("authorization"),
+        request.getHeader("x-nodeforge-session"),
+        boot_session.monotonicNow(),
+    ) catch |err| return nodeAuthError(request, err, meta);
     return json(request, .ok, session.agentPlanJson(), meta);
 }
 
-/// agent 已把 AgentPlan 与完整 payload closure 校验到本地后主动撤销读能力。
-fn disklessAgentConsumed(request: zap.Request, context: *const RouteContext, session_id: []const u8, meta: RequestMeta) !void {
-    const token = parseBearer(request.getHeader("authorization")) orelse
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"agent token is required\"}}\n", meta);
-    const session = context.diskless_store.find(session_id) orelse return notFound(request, meta);
-    const decision = context.diskless_store.verify(session_id, token, .agent, session.nodeId(), "", session.agentPlanDigest(), 0, boot_session.monotonicNow());
-    // 凭证校验失败：日志记录具体 decision（如 invalid_token/expired/node_mismatch），
-    // 供运维定位；HTTP 响应只对外暴露笼统的 unauthorized 或 token_expired。
-    // 此前此路径缺失日志，agent 撤销 token 失败时无法区分原因。
-    if (decision != .ok) {
-        observe_log.warn(
-            "diskless agent-consumed credential rejected: session={s} decision={s}",
-            .{ session_id, @tagName(decision) },
-        );
-        return json(request, .unauthorized, disklessCredentialError(decision), meta);
-    }
-    context.diskless_store.revoke(context.io, session_id, .agent) catch
-        return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_revoke_failed\",\"message\":\"cannot persist agent token revocation\"}}\n", meta);
-    return json(request, .ok, "{\"ok\":true}\n", meta);
-}
-
-/// v0.2 diskless payload 交付。agent 用 agent:read token 认证后下载 content-addressed
-/// payload。v0.2 smoke test 的 AgentPlan payload 为空，此路由 fail-closed（404）。
+/// diskless payload 是 AgentPlan 固定的 content-addressed 数据面。只接受 DHCP direct
+/// peer 与活动 session；path/digest/size 仍必须属于 immutable plan allowlist。
 fn disklessPayload(request: zap.Request, context: *const RouteContext, session_id: []const u8, file_path: []const u8, meta: RequestMeta) !void {
-    const agent_token = parseBearer(request.getHeader("authorization")) orelse
-        return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"diskless.token_required\",\"message\":\"Authorization: Bearer <agent-token> is required\"}}\n", meta);
     const session = context.diskless_store.find(session_id) orelse
         return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_not_found\",\"message\":\"no diskless session found\"}}\n", meta);
-    const decision = context.diskless_store.verify(session_id, agent_token, .agent, session.nodeId(), file_path, session.agentPlanDigest(), 0, boot_session.monotonicNow());
-    // 凭证校验失败：日志记录具体 decision（含请求路径，便于定位越权访问），
-    // 供运维定位；HTTP 响应只对外暴露笼统的 unauthorized 或 token_expired。
-    // 此前此路径缺失日志，payload 下载失败时无法区分 path_not_allowed 与 token 错误。
-    if (decision != .ok) {
-        observe_log.warn(
-            "diskless payload credential rejected: session={s} path={s} decision={s}",
-            .{ session_id, file_path, @tagName(decision) },
-        );
-        return json(request, .unauthorized, disklessCredentialError(decision), meta);
-    }
+    _ = auth.authenticateWebhook(context.sessions, session.nodeId(), getClientIp(request), boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     const P = struct { payload: []const diskless_dto.PayloadEntry = &.{} };
     const parsed = std.json.parseFromSlice(P, context.allocator, session.agentPlanJson(), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
         return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"diskless.plan_invalid\",\"message\":\"pinned AgentPlan is invalid\"}}\n", meta);
@@ -5135,11 +5616,12 @@ fn disklessEvent(request: zap.Request, context: *const RouteContext, node_id: []
         else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"diskless.session_persist_failed\",\"message\":\"cannot persist diskless lifecycle\"}}\n", meta),
     };
     if (result == .applied) {
+        // PR3-1（token 简化）：config/rootfs/agent 读取作用域 token 已删除，
+        // 读取访问由 boot_session 能力 token 控制（终态时由 finishNodeDelivery 终止）。
+        // 只有 event:append token 需要在此显式撤销（终态时不再接受事件）。
         const revoke_kinds: []const diskless_delivery.Store.SlotKind = switch (target) {
-            .diskless_initrd_started => &.{.config},
-            .diskless_rootfs_verified => &.{.rootfs},
-            .diskless_running => &.{ .agent, .event },
-            .failed => &.{ .config, .rootfs, .agent, .event },
+            .diskless_running => &.{.event},
+            .failed => &.{.event},
             else => &.{},
         };
         for (revoke_kinds) |kind| context.diskless_store.revoke(context.io, session_id, kind) catch
@@ -5194,10 +5676,8 @@ fn disklessEvent(request: zap.Request, context: *const RouteContext, node_id: []
         if (target == .diskless_running or target == .failed) {
             const terminal_reason: boot_session.TerminalReason = if (target == .diskless_running) .completed else .failed;
             _ = context.sessions.finishNodeDelivery(node_id, terminal_reason, boot_session.monotonicNow(), unixNow());
-            // 同步持久化 capability 删除，避免 daemon 重启后从 checkpoint 复活。
-            // 注意：`boot_session_store.load()` 只恢复 install 模式 session
-            // （`if (record.mode != .install) continue`），diskless session 不会
-            // 被恢复，但保持 checkpoint 一致性仍是必要的。
+            // 同步移除 schema v5 authority，避免 daemon 重启后与 durable
+            // diskless delivery 重新 join 并允许 peer-IP 再签发 capability。
             if (!checkpointSessions(context)) return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"session.persist_failed\",\"message\":\"cannot persist terminal delivery session\"}}\n", meta);
         }
     }
@@ -5222,7 +5702,7 @@ fn managementNodeBootPreview(request: zap.Request, context: *RouteContext, node_
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     if (profile.kind == .diskless) {
-        var plan = diskless.compile(context.allocator, context.config, catalog, node) catch |err| return validationError(request, err, meta);
+        var plan = compileResolvedDisklessPlan(context, catalog, node, profile) catch |err| return validationError(request, err, meta);
         defer plan.deinit();
         const rootfs_digest: []const u8 = &plan.rootfs_input_digest;
         const desired_digest: []const u8 = &plan.desired_plan_digest;
@@ -5319,12 +5799,9 @@ fn writeDisklessSession(writer: *std.Io.Writer, session: *const diskless_deliver
         session.rootfs_size,
     });
     if (session.rootfs_uncompressed_size == 0) try writer.writeAll("null") else try writer.print("{d}", .{session.rootfs_uncompressed_size});
-    try writer.print(",\"armed_at\":{d},\"expires_at\":{d},\"capabilities\":{{\"config\":{s},\"rootfs\":{s},\"agent\":{s},\"event\":{s}}}}}", .{
+    try writer.print(",\"armed_at\":{d},\"expires_at\":{d},\"capabilities\":{{\"event\":{s}}}}}", .{
         session.armed_at,
         session.expires_at,
-        if (session.config_token.issued) "true" else "false",
-        if (session.rootfs_token.issued) "true" else "false",
-        if (session.agent_token.issued) "true" else "false",
         if (session.event_token.issued) "true" else "false",
     });
 }
@@ -5376,7 +5853,7 @@ fn managementNodeReadiness(request: zap.Request, context: *RouteContext, node_id
     const profile = lookup.findProfile(catalog, profile_name) orelse return notFound(request, meta);
     if (profile.kind != .diskless)
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"readiness is only available for diskless profiles\"}}\n", meta);
-    var plan = diskless.compile(context.allocator, context.config, catalog, node) catch |err| return validationError(request, err, meta);
+    var plan = compileResolvedDisklessPlan(context, catalog, node, profile) catch |err| return validationError(request, err, meta);
     defer plan.deinit();
     const rootfs_digest: []const u8 = plan.rootfs_input_digest[0..];
     const desired_digest: []const u8 = plan.desired_plan_digest[0..];
@@ -5411,7 +5888,7 @@ fn managementNodeReadiness(request: zap.Request, context: *RouteContext, node_id
     const initrd_stat = std.Io.Dir.cwd().statFile(context.io, initrd_path, .{ .follow_symlinks = false }) catch
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.initrd_missing\",\"message\":\"registered initrd file is missing\"}}\n", meta);
     const rootfs_stat = std.Io.Dir.cwd().statFile(context.io, rootfs_path, .{ .follow_symlinks = false }) catch
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_file_missing\",\"message\":\"registered rootfs file is missing\"}}\n", meta);
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_file_missing\",\"message\":\"ready rootfs file is missing\"}}\n", meta);
     if (kernel_stat.kind != .file or initrd_stat.kind != .file or rootfs_stat.kind != .file or rootfs_stat.size != artifact.compressed_size)
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.artifact_drift\",\"message\":\"registered artifact metadata does not match managed files\"}}\n", meta);
     var kernel_sha256: [64]u8 = undefined;
@@ -5423,9 +5900,9 @@ fn managementNodeReadiness(request: zap.Request, context: *RouteContext, node_id
     if (!std.mem.eql(u8, &kernel_sha256, kernel.sha256.?) or !std.mem.eql(u8, &initrd_sha256, initrd_asset.sha256.?))
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.boot_asset_digest_mismatch\",\"message\":\"kernel or initrd content digest does not match catalog identity\"}}\n", meta);
     const rootfs_sha512 = sha512File(context.io, rootfs_path) catch
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_digest_unavailable\",\"message\":\"cannot validate registered rootfs digest\"}}\n", meta);
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_digest_unavailable\",\"message\":\"cannot validate ready rootfs digest\"}}\n", meta);
     if (!std.mem.eql(u8, &rootfs_sha512, artifact.content_sha512))
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_digest_mismatch\",\"message\":\"rootfs content digest does not match registered identity\"}}\n", meta);
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"readiness.rootfs_digest_mismatch\",\"message\":\"rootfs content digest does not match published identity\"}}\n", meta);
     try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"stage\":\"boot\",\"ready\":true,\"rootfs_input_digest\":{f},\"desired_plan_digest\":{f},\"kernel_path\":{f},\"initrd_path\":{f},\"rootfs_file\":{f},\"compressed_bytes\":{d},\"uncompressed_bytes\":", .{
         std.json.fmt(node_id, .{}), std.json.fmt(rootfs_digest, .{}), std.json.fmt(desired_digest, .{}), std.json.fmt(kernel.path, .{}), std.json.fmt(initrd_asset.path, .{}), std.json.fmt(artifact.file, .{}), artifact.compressed_size,
     });
@@ -5534,8 +6011,11 @@ fn effectiveFirstBootBundle(plan: *const diskless.DisklessPlan) ?[]const u8 {
 }
 
 /// `node boot-prepare`：为 diskless 节点创建交付 session。编译 diskless plan 得到
-/// rootfs_input_digest + desired_plan_digest，定位已注册 rootfs 制品，创建 session，
-/// 渲染并 pin immutable AgentPlan，签发 config-token。返回 capsule 交付所需的全部门票。
+/// rootfs_input_digest + desired_plan_digest，定位已深验发布的 ready rootfs，创建 session，
+/// 渲染并 pin immutable AgentPlan，签发 event-token。返回 capsule 交付所需的凭证。
+/// PR3-1（token 简化）：不再签发 config/rootfs/agent token —— initrd 通过 peer-IP
+/// 引导认证获取 BootConfig/rootfs/payload；BootConfig 另签发仅供 AgentPlan 的
+/// 短时 capability。仅 event:append token 保留（切网后 lease-IP 身份可能变化）。
 fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const catalog = context.catalog_snapshot.value();
     const node = lookup.findNode(catalog, node_id) orelse return notFound(request, meta);
@@ -5544,12 +6024,12 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
     const profile = lookup.findProfile(catalog, profile_name) orelse return notFound(request, meta);
     if (profile.kind != .diskless)
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"boot-prepare is only available for diskless profiles\"}}\n", meta);
-    var plan = diskless.compile(context.allocator, context.config, catalog, node) catch |err| return validationError(request, err, meta);
+    var plan = compileResolvedDisklessPlan(context, catalog, node, profile) catch |err| return validationError(request, err, meta);
     defer plan.deinit();
     const rootfs_input_digest: []const u8 = plan.rootfs_input_digest[0..];
     const desired_plan_digest: []const u8 = plan.desired_plan_digest[0..];
     const artifact = context.rootfs_artifacts.find(rootfs_input_digest) orelse
-        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.rootfs_not_registered\",\"message\":\"no rootfs artifact registered for this profile build; run 'profile rootfs register' first\"}}\n", meta);
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"diskless.rootfs_not_ready\",\"message\":\"no ready rootfs artifact exists for this profile build; run 'profile rootfs build' first\"}}\n", meta);
     const bundle_name = profile.boot_bundle orelse return validationError(request, error.MissingBootBundle, meta);
     const boot_bundle = lookup.findBootBundle(catalog, bundle_name) orelse return validationError(request, error.MissingBootBundle, meta);
     const session = context.diskless_store.begin(
@@ -5740,10 +6220,13 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
         if (!duplicate) try packages_remove.append(context.allocator, package);
     }
     const ap: diskless_dto.AgentPlan = .{
+        .deployment_id = context.config.deployment_id orelse "",
         .node_id = node_id,
         .session_id = session_id_slice,
         .plan_digest = desired_plan_digest,
         .rootfs_input_digest = rootfs_input_digest,
+        .desired_plan_digest = desired_plan_digest,
+        .target_network = plan.node_apply.network,
         .node_apply_projection = .{
             .node_id = plan.node_apply.node_id,
             .mac = plan.node_apply.mac,
@@ -5788,13 +6271,14 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
     const plan_json = try diskless_dto.renderAgentPlan(context.allocator, ap);
     defer context.allocator.free(plan_json);
     context.diskless_store.pinAgentPlan(context.io, session_id_slice, plan_json) catch |err| return validationError(request, err, meta);
-    context.diskless_store.issue(context.io, session_id_slice, .config) catch |err| return validationError(request, err, meta);
-    context.diskless_store.issue(context.io, session_id_slice, .rootfs) catch |err| return validationError(request, err, meta);
-    context.diskless_store.issue(context.io, session_id_slice, .agent) catch |err| return validationError(request, err, meta);
+    // PR3-1（token 简化）：diskless 不再签发 config/rootfs/agent 三个读取作用域
+    // token。这些 token 全部打包在同一个 capsule 中交给同一 initrd 进程，作用域
+    // 分离无效（相同 capsule、相同进程、相同 lease-IP 身份）。initrd 现在通过
+    // peer-IP 引导认证（boot_session.Store）获取 BootConfig/rootfs/payload；
+    // BootConfig 另签发随机 boot-session capability，仅用于 AgentPlan 控制面读取。
+    // 仅保留 event:append token —— 它在 diskless 有界切网后仍需推进生命周期 CAS，
+    // 此时 lease-IP 身份可能已变，无法用 peer-IP 引导认证。
     context.diskless_store.issue(context.io, session_id_slice, .event) catch |err| return validationError(request, err, meta);
-    const config_token = context.diskless_store.rawToken(session, .config);
-    const rootfs_token = context.diskless_store.rawToken(session, .rootfs);
-    const agent_token = context.diskless_store.rawToken(session, .agent);
     const event_token = context.diskless_store.rawToken(session, .event);
     const config_url = try std.fmt.allocPrint(context.allocator, "{s}/api/v1/nodes/{s}/boot-config", .{ base, node_id });
     defer context.allocator.free(config_url);
@@ -5802,8 +6286,8 @@ fn managementBootPrepare(request: zap.Request, context: *RouteContext, node_id: 
     defer output.deinit();
     const internal_capsule = if (request.getHeader("x-nodeforge-internal-capsule")) |value| std.mem.eql(u8, value, "1") else false;
     if (internal_capsule)
-        try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"config_token\":{f},\"rootfs_token\":{f},\"agent_token\":{f},\"event_token\":{f},\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
-            std.json.fmt(node_id, .{}), std.json.fmt(session_id_slice, .{}), std.json.fmt(config_token, .{}), std.json.fmt(rootfs_token, .{}), std.json.fmt(agent_token, .{}), std.json.fmt(event_token, .{}), std.json.fmt(config_url, .{}), std.json.fmt(session.agentPlanDigest(), .{}), std.json.fmt(rootfs_input_digest, .{}),
+        try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"event_token\":{f},\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
+            std.json.fmt(node_id, .{}), std.json.fmt(session_id_slice, .{}), std.json.fmt(event_token, .{}), std.json.fmt(config_url, .{}), std.json.fmt(session.agentPlanDigest(), .{}), std.json.fmt(rootfs_input_digest, .{}),
         })
     else
         try output.writer.print("{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"state\":\"prepared\",\"config_url\":{f},\"agent_plan_digest\":{f},\"rootfs_input_digest\":{f}}}}}\n", .{
@@ -5867,7 +6351,18 @@ fn managementDiscoveryObservations(request: zap.Request, context: *const RouteCo
     }
     try output.writer.writeByte(']');
     try writeNextCursor(&output.writer, "discovery-observations", context.catalog_snapshot.revision, end, observations.len);
-    try output.writer.print(",\"view_revision\":{d}}}}}\n", .{context.catalog_snapshot.revision});
+    try output.writer.writeAll(",\"node_states\":[");
+    var state_index: usize = 0;
+    for (context.catalog_snapshot.value().nodes) |node| {
+        const state = context.discoveries.find(node.id, unixNow()) orelse continue;
+        if (state_index != 0) try output.writer.writeByte(',');
+        state_index += 1;
+        try output.writer.writeAll("{\"node_id\":");
+        try output.writer.print("{f},\"discovery\":", .{std.json.fmt(node.id, .{})});
+        try writeNodeDiscovery(&output.writer, state);
+        try output.writer.writeByte('}');
+    }
+    try output.writer.print("],\"view_revision\":{d}}}}}\n", .{context.catalog_snapshot.revision});
     try setRevisionEtag(request, context.catalog_snapshot.revision);
     return json(request, .ok, output.written(), meta);
 }
@@ -5891,6 +6386,70 @@ const NodeClaimRequest = struct {
     arch: model.Arch,
     observation_revision: u64,
 };
+
+const DiscoveryFactsRequest = struct {
+    schema_version: u32 = 1,
+    mac: ?[]const u8 = null,
+    arch: []const u8,
+    serial_number: ?[]const u8 = null,
+    product_uuid: ?[]const u8 = null,
+    vendor: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+};
+
+fn discoveryProbeFacts(request: zap.Request, context: *RouteContext, session_id: []const u8, meta: RequestMeta) !void {
+    const header = request.getHeader("x-nodeforge-discovery-session") orelse return json(request, .unauthorized, "{\"ok\":false,\"error\":{\"code\":\"discovery.session_required\",\"message\":\"discovery session header is required\"}}\n", meta);
+    if (!std.mem.eql(u8, header, session_id)) return json(request, .forbidden, "{\"ok\":false,\"error\":{\"code\":\"discovery.session_mismatch\",\"message\":\"discovery session does not match path\"}}\n", meta);
+    const peer_ip = auth.parsePeerIpv4(meta.client_ip) catch return json(request, .forbidden, "{\"ok\":false,\"error\":{\"code\":\"discovery.peer_invalid\",\"message\":\"discovery peer must be IPv4\"}}\n", meta);
+    const authenticated = context.sessions.authenticateDiscovery(session_id, peer_ip, boot_session.monotonicNow()) catch |err| switch (err) {
+        error.ProofMismatch => return json(request, .forbidden, "{\"ok\":false,\"error\":{\"code\":\"discovery.proof_mismatch\",\"message\":\"probe session is not bound to this lease\"}}\n", meta),
+        else => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.session_inactive\",\"message\":\"probe session is inactive\"}}\n", meta),
+    };
+    const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.facts_invalid\",\"message\":\"facts body is required\"}}\n", meta);
+    const parsed = std.json.parseFromSlice(DiscoveryFactsRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.facts_invalid\",\"message\":\"facts body is invalid\"}}\n", meta);
+    defer parsed.deinit();
+    if (parsed.value.schema_version != 1 or parsed.value.serial_number == null or std.mem.trim(u8, parsed.value.serial_number.?, " \t\r\n\x00").len == 0)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.serial_required\",\"message\":\"a non-empty serial_number is required\"}}\n", meta);
+    const arch = std.meta.stringToEnum(model.Arch, parsed.value.arch) orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.arch_invalid\",\"message\":\"arch is invalid\"}}\n", meta);
+    if (parsed.value.mac) |reported| {
+        var expected_mac: [17]u8 = undefined;
+        _ = std.fmt.bufPrint(&expected_mac, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ authenticated.mac[0], authenticated.mac[1], authenticated.mac[2], authenticated.mac[3], authenticated.mac[4], authenticated.mac[5] }) catch return error.InvalidDiscoveryMatch;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, reported, " \t\r\n"), &expected_mac)) return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.mac_mismatch\",\"message\":\"reported MAC does not match the DHCP lease\"}}\n", meta);
+    }
+    const facts_sha256 = discoveryFactsDigest(context.allocator, parsed.value) catch return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.facts_invalid\",\"message\":\"facts digest could not be computed\"}}\n", meta);
+    var matched: node_discovery.Entry = undefined;
+    if (context.discoveries.findMatchedFacts(session_id, &facts_sha256, unixNow())) |replayed| {
+        matched = replayed;
+    } else {
+        const pending = context.discoveries.findPendingSerial(parsed.value.serial_number.?, unixNow()) orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.no_unique_match\",\"message\":\"no unique pending node matches the reported serial\"}}\n", meta);
+        var mac_text: [17]u8 = undefined;
+        _ = std.fmt.bufPrint(&mac_text, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ authenticated.mac[0], authenticated.mac[1], authenticated.mac[2], authenticated.mac[3], authenticated.mac[4], authenticated.mac[5] }) catch return error.InvalidDiscoveryMatch;
+        while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
+        defer config_mutation_mutex.unlock();
+        context.models.lock();
+        defer context.models.unlock();
+        node_mutation.setNode(context.io, context.allocator, context.config, context.catalog.path, pending.node(), .{ .mac = &mac_text, .arch = arch }) catch |err| switch (err) {
+            error.DuplicateMac => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.mac_conflict\",\"message\":\"MAC is already assigned to another node\"}}\n", meta),
+            else => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.catalog_update_failed\",\"message\":\"node identity could not be updated\"}}\n", meta),
+        };
+        applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"discovery.catalog_publish_failed\",\"message\":\"node identity update was not published\"}}\n", meta);
+        matched = context.discoveries.markMatched(context.io, context.allocator, context.node_discovery_path, pending.node(), session_id, &mac_text, arch, &facts_sha256, unixNow()) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"discovery.state_publish_failed\",\"message\":\"discovery state could not be committed\"}}\n", meta);
+    }
+    context.sessions.finishDelivery(session_id, .completed, boot_session.monotonicNow(), unixNow());
+    const matched_mac = matched.mac() orelse return error.InvalidDiscoveryMatch;
+    const matched_arch = matched.observed_arch orelse return error.InvalidDiscoveryMatch;
+    var output: [768]u8 = undefined;
+    const response = try std.fmt.bufPrint(&output, "{{\"ok\":true,\"result\":{{\"node_id\":{f},\"session_id\":{f},\"serial_number\":{f},\"mac\":{f},\"arch\":{f},\"state\":{f},\"product_uuid\":{f},\"vendor\":{f},\"model\":{f}}}}}\n", .{ std.json.fmt(matched.node(), .{}), std.json.fmt(session_id, .{}), std.json.fmt(parsed.value.serial_number.?, .{}), std.json.fmt(matched_mac, .{}), std.json.fmt(@tagName(matched_arch), .{}), std.json.fmt(@tagName(matched.state), .{}), std.json.fmt(parsed.value.product_uuid, .{}), std.json.fmt(parsed.value.vendor, .{}), std.json.fmt(parsed.value.model, .{}) });
+    return json(request, .ok, response, meta);
+}
+
+fn discoveryFactsDigest(allocator: std.mem.Allocator, facts: DiscoveryFactsRequest) ![64]u8 {
+    const bytes = try std.json.Stringify.valueAlloc(allocator, facts, .{});
+    defer allocator.free(bytes);
+    var raw: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &raw, .{});
+    return std.fmt.bytesToHex(raw, .lower);
+}
 
 fn managementNodeClaim(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const body = request.body orelse return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.claim.invalid\",\"message\":\"missing request body\"}}\n", meta);
@@ -5940,7 +6499,7 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
     defer context.models.unlock();
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
     const value = parsed.value.modelValue();
-    node_mutation.addNode(context.io, context.allocator, context.config, context.catalog.path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .profile = value.profile, .pxe_ip_reservation = value.pxe.ip_reservation, .hostname = value.hostname, .overrides = value.overrides, .deploy = value.deploy, .http_accel = value.http_accel, .storage = value.storage, .network = value.network }) catch |err| switch (err) {
+    node_mutation.addNode(context.io, context.allocator, context.config, context.catalog.path, .{ .id = value.id, .mac = value.mac, .arch = value.arch, .hardware = value.hardware, .profile = value.profile, .pxe_ip_reservation = value.pxe.ip_reservation, .hostname = value.hostname, .overrides = value.overrides, .deploy = value.deploy, .http_accel = value.http_accel, .storage = value.storage, .network = value.network }) catch |err| switch (err) {
         error.ProfileNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"node.profile_not_found\",\"message\":\"referenced profile does not exist; create it with nodeforge profile create\"}}\n", meta),
         error.NodeAlreadyExists => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.already_exists\",\"message\":\"node identifier already exists\"}}\n", meta),
         error.DuplicateMac => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.duplicate_mac\",\"message\":\"MAC address is already assigned to another node\"}}\n", meta),
@@ -5985,6 +6544,7 @@ fn managementNodeRemove(request: zap.Request, context: *RouteContext, node_id: [
     if (!ifMatchCurrent(request, context)) return revisionConflict(request, meta);
     node_mutation.removeNode(context.io, context.allocator, context.config, context.catalog.path, node_id) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.mutation_failed\",\"message\":\"node could not be removed\"}}\n", meta);
     applyCatalogFromDisk(context) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"catalog.publish_failed\",\"message\":\"node persisted but snapshot publish failed\"}}\n", meta);
+    context.discoveries.remove(context.io, context.allocator, context.node_discovery_path, node_id, unixNow()) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"discovery.persist_failed\",\"message\":\"node was removed but discovery state cleanup failed\"}}\n", meta);
     try setRevisionEtag(request, context.catalog.currentRevision());
     return json(request, .ok, "{\"ok\":true,\"result\":{\"mutation\":\"applied_online\"}}\n", meta);
 }
@@ -6026,7 +6586,9 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
         } else null;
         var inventory = try context.inventories.getOwned(context.allocator, node.id);
         defer if (inventory) |*value| node_inventory.Store.freeOwned(context.allocator, value);
-        try output.writer.print("{{\"id\":{f},\"mac\":{f},\"pxe\":{{\"ip_reservation\":", .{ std.json.fmt(node.id, .{}), std.json.fmt(node.mac, .{}) });
+        try output.writer.print("{{\"id\":{f},\"mac\":", .{std.json.fmt(node.id, .{})});
+        if (node.mac.len == 0) try output.writer.writeAll("null") else try output.writer.print("{f}", .{std.json.fmt(node.mac, .{})});
+        try output.writer.writeAll(",\"pxe\":{\"ip_reservation\":");
         if (node.pxe.ip_reservation) |ip| try output.writer.print("{f}", .{std.json.fmt(ip, .{})}) else try output.writer.writeAll("null");
         try output.writer.print("}},\"profile\":{f},\"deploy\":{s},\"install_intent\":{f},\"pxe_ready\":{s},\"retry_pending\":{s},\"armed_generation\":{f},\"status\":", .{
             std.json.fmt(node.profile, .{}),
@@ -6068,7 +6630,21 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
             try output.writer.writeAll(",\"deployed_at\":null,\"drifted\":false,\"drift_state\":\"not-applicable\"");
         } else try output.writer.writeAll(",\"armed_at\":null,\"install_at\":null,\"finished_at\":null,\"deployed_at\":null,\"drifted\":false");
         try output.writer.writeAll(",\"serial_number\":");
-        if (inventory) |value| if (value.serial_number) |serial| try output.writer.print("{f}", .{std.json.fmt(serial, .{})}) else try output.writer.writeAll("null") else try output.writer.writeAll("null");
+        if (inventory) |value| if (value.serial_number) |serial| {
+            try output.writer.print("{f}", .{std.json.fmt(serial, .{})});
+        } else if (node.hardware.serial_number) |serial| {
+            try output.writer.print("{f}", .{std.json.fmt(serial, .{})});
+        } else try output.writer.writeAll("null") else if (node.hardware.serial_number) |serial| {
+            try output.writer.print("{f}", .{std.json.fmt(serial, .{})});
+        } else try output.writer.writeAll("null");
+        try output.writer.writeAll(",\"arch\":");
+        if (node.mac.len == 0) try output.writer.writeAll("null") else try output.writer.print("{f}", .{std.json.fmt(@tagName(node.arch), .{})});
+        try output.writer.writeAll(",\"discovery\":");
+        var discovery = context.discoveries.find(node.id, unixNow());
+        if (discovery) |*entry| {
+            if (entry.state == .pending and entry.expires_at <= unixNow()) entry.state = .expired;
+        }
+        try writeNodeDiscovery(&output.writer, discovery);
         try output.writer.writeByte('}');
     }
     try output.writer.writeByte(']');
@@ -6078,9 +6654,83 @@ fn managementNodes(request: zap.Request, context: *const RouteContext, meta: Req
     return json(request, .ok, output.written(), meta);
 }
 
+const NodeDiscoveryRequest = struct {
+    action: []const u8 = "start",
+    expires_in_seconds: ?i64 = null,
+};
+
+/// v0.4 discovery arm/status endpoint.  A draft can be armed only while its
+/// expected SN and reservation are present and its ordinary deploy gate is
+/// closed.  Discovery itself never creates a deployment generation.
+fn managementNodeDiscovery(request: zap.Request, context: *RouteContext, node_id: []const u8, meta: RequestMeta) !void {
+    const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return notFound(request, meta);
+    if (request.method.?[0] == 'G') {
+        var state = context.discoveries.find(node_id, unixNow());
+        if (state) |*entry| {
+            if (entry.state == .pending and entry.expires_at <= unixNow()) entry.state = .expired;
+        }
+        var output: std.Io.Writer.Allocating = .init(context.allocator);
+        defer output.deinit();
+        try output.writer.writeAll("{\"ok\":true,\"result\":{\"node_id\":");
+        try output.writer.print("{f},\"discovery\":", .{std.json.fmt(node_id, .{})});
+        try writeNodeDiscovery(&output.writer, state);
+        try output.writer.writeAll("}}\n");
+        return json(request, .ok, output.written(), meta);
+    }
+    if (node.hardware.serial_number == null or node.pxe.ip_reservation == null or node.mac.len != 0 or node.profile != null or node.deploy)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.node_not_draft\",\"message\":\"discovery requires a serial-only draft with a reservation and deploy=false\"}}\n", meta);
+    const body = request.body orelse "{}";
+    const parsed = std.json.parseFromSlice(NodeDiscoveryRequest, context.allocator, body, .{ .allocate = .alloc_always }) catch
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.invalid_request\",\"message\":\"invalid discovery action\"}}\n", meta);
+    defer parsed.deinit();
+    const now = unixNow();
+    if (std.mem.eql(u8, parsed.value.action, "cancel")) {
+        const state = context.discoveries.cancel(context.io, context.allocator, context.node_discovery_path, node_id, now) catch |err| switch (err) {
+            error.DiscoveryNotFound => return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"discovery.not_found\",\"message\":\"node has no discovery state\"}}\n", meta),
+            else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"discovery.persist_failed\",\"message\":\"discovery state could not be persisted\"}}\n", meta),
+        };
+        var output: std.Io.Writer.Allocating = .init(context.allocator);
+        defer output.deinit();
+        try output.writer.writeAll("{\"ok\":true,\"result\":{\"node_id\":");
+        try output.writer.print("{f},\"discovery\":", .{std.json.fmt(node_id, .{})});
+        try writeNodeDiscovery(&output.writer, state);
+        try output.writer.writeAll("}}\n");
+        return json(request, .ok, output.written(), meta);
+    }
+    if (!std.mem.eql(u8, parsed.value.action, "start") and !std.mem.eql(u8, parsed.value.action, "restart"))
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.invalid_action\",\"message\":\"action must be start, restart, or cancel\"}}\n", meta);
+    const expires_in = parsed.value.expires_in_seconds orelse 30 * 60;
+    const started = context.discoveries.start(context.io, context.allocator, context.node_discovery_path, node_id, context.catalog_snapshot.revision, node.hardware.serial_number.?, expires_in, now, std.mem.eql(u8, parsed.value.action, "restart")) catch |err| switch (err) {
+        error.DiscoveryAlreadyPending => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.already_pending\",\"message\":\"discovery is already pending with a different node revision or serial\"}}\n", meta),
+        error.DiscoveryTerminalRequiresRestart => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"discovery.restart_required\",\"message\":\"terminal discovery state requires an explicit restart after cancellation or expiry\"}}\n", meta),
+        error.InvalidNodeDiscoveryRequest => return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"discovery.invalid_request\",\"message\":\"expires_in_seconds is outside the supported range\"}}\n", meta),
+        else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"discovery.persist_failed\",\"message\":\"discovery state could not be persisted\"}}\n", meta),
+    };
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"node_id\":");
+    try output.writer.print("{f},\"reused\":{s},\"discovery\":", .{ std.json.fmt(node_id, .{}), if (started.reused) "true" else "false" });
+    try writeNodeDiscovery(&output.writer, started.entry);
+    try output.writer.writeAll("}}\n");
+    return json(request, if (started.reused) .ok else .created, output.written(), meta);
+}
+
+fn writeNodeDiscovery(writer: anytype, value: ?node_discovery.Entry) !void {
+    if (value) |entry| {
+        try writer.print("{{\"state\":{f},\"node_revision\":{d},\"expected_serial_sha256\":{f},\"serial_display\":{f},\"created_at\":{d},\"expires_at\":{d},\"matched_probe_session_id\":{f},\"observed_mac\":{f},\"observed_arch\":{f},\"last_error\":{f}}}", .{
+            std.json.fmt(@tagName(entry.state), .{}), entry.node_revision,            std.json.fmt(entry.expected_serial_sha256[0..], .{}),                        std.json.fmt(entry.serial(), .{}),       entry.created_at, entry.expires_at,
+            std.json.fmt(entry.session(), .{}),       std.json.fmt(entry.mac(), .{}), std.json.fmt(if (entry.observed_arch) |arch| @tagName(arch) else null, .{}), std.json.fmt(entry.errorMessage(), .{}),
+        });
+    } else try writer.writeAll("null");
+}
+
 fn managementNode(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const node = lookup.findNode(context.catalog_snapshot.value(), node_id) orelse return notFound(request, meta);
-    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile orelse return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"node.profile_unassigned\",\"message\":\"node has no bound profile\"}}\n", meta)) orelse return notFound(request, meta);
+    // v0.4 discovery 的 draft Node 是有意不绑定 Profile 的：它必须能被
+    // `node show`、discovery 和后续 claim 查询。不能把“没有业务 Profile”
+    // 错报成“Node 不存在”，否则 SN discovery 无法验证 draft 阶段的事实。
+    if (node.profile == null) return managementDraftNode(request, context, node, meta);
+    const profile = lookup.findProfile(context.catalog_snapshot.value(), node.profile.?) orelse return notFound(request, meta);
     const profile_source = lookup.findInstallSource(context.catalog_snapshot.value(), profile.install_source) orelse return notFound(request, meta);
     var effective_plan = @import("../profile/effective.zig").compile(context.allocator, context.catalog_snapshot.value(), node) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"effective.unavailable\",\"message\":\"effective node plan cannot be compiled\"}}\n", meta);
     defer effective_plan.deinit();
@@ -6098,7 +6748,9 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     // Node detail 的 profile 投影必须包含 kind/boot_bundle：它们决定 install 与
     // diskless 分支以及实际启动材料，也是 CLI Runtime 区域的权威数据源。
     try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{s},\"profile\":{{\"name\":{f},\"kind\":{f},\"boot_bundle\":{f},\"install_source\":{f},\"kernel_args\":{f},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, context.statuses.currentRevision(), context.deployments.currentRevision(), context.inventories.currentRevision(), node_json, std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.kind), .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.install_source, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile_source.distro, .{}), std.json.fmt(profile_source.version, .{}), std.json.fmt(@tagName(profile_source.arch), .{}) });
-    try writeTargetSystem(&output.writer, effective_plan.system);
+    // 普通 management/show 输出只能提供 redacted effective projection；
+    // renderer/agent 内部仍消费完整配置，密码不进入 preview、catalog 查询或日志。
+    try writeTargetSystemRedacted(&output.writer, effective_plan.system);
     try output.writer.print(",\"effective_software\":{f}", .{std.json.fmt(effective_plan.software, .{})});
     try output.writer.writeAll(",\"storage\":");
     try output.writer.print("{{\"direct\":{f},\"override\":{f},\"effective\":{f}}}", .{ std.json.fmt(node.storage, .{}), std.json.fmt(node.overrides.install.storage, .{}), std.json.fmt(effective_plan.install.storage, .{}) });
@@ -6148,6 +6800,57 @@ fn managementNode(request: zap.Request, context: *const RouteContext, node_id: [
     } else try output.writer.writeAll("null");
     try output.writer.writeAll(",\"inventory\":");
     if (inventory) |value| try output.writer.print("{f}", .{std.json.fmt(value, .{})}) else try output.writer.writeAll("null");
+    try output.writer.writeAll(",\"discovery\":");
+    var discovery = context.discoveries.find(node.id, unixNow());
+    if (discovery) |*entry| {
+        if (entry.state == .pending and entry.expires_at <= unixNow()) entry.state = .expired;
+    }
+    try writeNodeDiscovery(&output.writer, discovery);
+    try output.writer.writeAll("}}\n");
+    try setRevisionEtag(request, context.catalog_snapshot.revision);
+    return json(request, .ok, output.written(), meta);
+}
+
+/// 返回未绑定 Profile 的 draft Node 详情。
+///
+/// draft 只表达身份/预约和 discovery 生命周期，不允许生成普通 BootConfig、
+/// AgentPlan 或 deployment generation。因此这里明确返回 profile=null、status=null
+/// 和 disabled deployment，同时提供稳定的默认 effective system 形状，保持 CLI
+/// `node show` 与已绑定 Node 的 JSON 合同一致。
+fn managementDraftNode(request: zap.Request, context: *const RouteContext, node: *const model.NodeConfig, meta: RequestMeta) !void {
+    var inventory = try context.inventories.getOwned(context.allocator, node.id);
+    defer if (inventory) |*value| node_inventory.Store.freeOwned(context.allocator, value);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    const node_json = try dto.renderNode(context.allocator, node.*);
+    defer context.allocator.free(node_json);
+    const desired_revision = context.catalog_snapshot.revision;
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"view_revision\":{{\"config\":{d},\"catalog\":{d},\"node_status\":{d},\"deployment\":{d},\"inventory\":{d}}},\"node\":{s},\"profile\":null,\"effective_system\":", .{
+        context.config_revision,
+        context.catalog_snapshot.revision,
+        context.statuses.currentRevision(),
+        context.deployments.currentRevision(),
+        context.inventories.currentRevision(),
+        node_json,
+    });
+    try writeTargetSystemRedacted(&output.writer, .{ .ssh = .{ .root_password = null }, .users = &.{} });
+    try output.writer.print(",\"effective_software\":{{}},\"storage\":{{\"direct\":{f},\"override\":{f},\"effective\":{f}}},\"status\":null,\"deployment\":{{\"install_intent\":\"not-applicable\",\"pxe_ready\":false,\"retry_pending\":false,\"current_generation\":null,\"armed_generation\":null,\"consumed_generation\":null,\"terminal_generation\":null,\"requested_revision\":0,\"applied_revision\":0,\"desired_revision\":{d},\"requested_plan_digest\":null,\"applied_plan_digest\":null,\"desired_plan_digest\":null,\"drifted\":false,\"drift_state\":\"not-applicable\",\"requested_by\":null,\"armed_at\":0,\"install_at\":0,\"finished_at\":0,\"successful_generation\":0,\"deployed_at\":0}},\"inventory\":", .{
+        std.json.fmt(node.storage, .{}),
+        std.json.fmt(node.overrides.install.storage, .{}),
+        std.json.fmt(model.StorageConfig{}, .{}),
+        desired_revision,
+    });
+    if (inventory) |value| {
+        try output.writer.print("{f}", .{std.json.fmt(value, .{})});
+    } else {
+        try output.writer.writeAll("null");
+    }
+    try output.writer.writeAll(",\"discovery\":");
+    var discovery = context.discoveries.find(node.id, unixNow());
+    if (discovery) |*entry| {
+        if (entry.state == .pending and entry.expires_at <= unixNow()) entry.state = .expired;
+    }
+    try writeNodeDiscovery(&output.writer, discovery);
     try output.writer.writeAll("}}\n");
     try setRevisionEtag(request, context.catalog_snapshot.revision);
     return json(request, .ok, output.written(), meta);
@@ -6372,6 +7075,43 @@ fn writeTargetSystem(writer: *std.Io.Writer, system: model.TargetSystemConfig) !
     });
 }
 
+/// 管理面展示用的目标系统投影。
+///
+/// v0.4 的普通 JSON、preview 和 show 不得返回 root/user 明文密码。这里显式
+/// 重建用户项而不是对 JSON 做字符串替换，避免密码中的转义字符、重复字段或
+/// future field 变化绕过脱敏；内部 renderer 继续使用 `writeTargetSystem`。
+fn writeTargetSystemRedacted(writer: *std.Io.Writer, system: model.TargetSystemConfig) !void {
+    try writer.print("{{\"localization\":{f},\"connectivity\":{f},\"ssh\":{{\"enabled\":{s},\"password_authentication\":{s},\"root_login\":{f},\"root_password\":null,\"root_authorized_keys\":{f}}},\"security\":{f},\"users\":[", .{
+        std.json.fmt(system.localization, .{}),
+        std.json.fmt(system.connectivity, .{}),
+        if (system.ssh.enabled) "true" else "false",
+        if (system.ssh.password_authentication) "true" else "false",
+        std.json.fmt(@tagName(system.ssh.root_login), .{}),
+        std.json.fmt(system.ssh.root_authorized_keys, .{}),
+        std.json.fmt(system.security, .{}),
+    });
+    for (system.users, 0..) |user, index| {
+        if (index != 0) try writer.writeByte(',');
+        const redacted_user: model.TargetUserConfig = .{
+            .name = user.name,
+            .uid = user.uid,
+            .shell = user.shell,
+            .locked = user.locked,
+            .password = null,
+            .sudo = user.sudo,
+            .groups = user.groups,
+            .ssh_authorized_keys = user.ssh_authorized_keys,
+        };
+        try writer.print("{f}", .{std.json.fmt(redacted_user, .{})});
+    }
+    try writer.writeAll("],\"packages\":");
+    try std.json.Stringify.value(system.packages, .{}, writer);
+    try writer.print(",\"import_host_hosts\":{s},\"hosts_content\":{f}}}", .{
+        if (system.import_host_hosts) "true" else "false",
+        std.json.fmt(system.hosts_content, .{}),
+    });
+}
+
 test "management effective system exposes canonical password policy values" {
     var buffer: [2048]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
@@ -6414,7 +7154,7 @@ fn managementProfile(request: zap.Request, context: *const RouteContext, name: [
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     try output.writer.print("{{\"ok\":true,\"result\":{{\"model_revision\":{{\"config\":{d},\"catalog\":{d}}},\"name\":{f},\"kind\":{f},\"boot_bundle\":{f},\"kernel_args\":{f},\"install\":{f},\"validation\":{{\"valid\":true}},\"platform\":{{\"distro\":{f},\"version\":{f},\"arch\":{f}}},\"capability\":{{\"family\":{f},\"install_adapter\":{f},\"package_manager\":{f}}},\"effective_system\":", .{ context.config_revision, context.catalog_snapshot.revision, std.json.fmt(profile.name, .{}), std.json.fmt(@tagName(profile.kind), .{}), std.json.fmt(profile.boot_bundle, .{}), std.json.fmt(profile.kernel_args, .{}), std.json.fmt(profile.install, .{}), std.json.fmt(source.distro, .{}), std.json.fmt(source.version, .{}), std.json.fmt(@tagName(source.arch), .{}), std.json.fmt(@tagName(distro.family), .{}), std.json.fmt(@tagName(capability.install_adapter), .{}), std.json.fmt(@tagName(capability.package_manager), .{}) });
-    try writeEffectiveSystem(&output.writer, profile);
+    try writeTargetSystemRedacted(&output.writer, @import("../profile/install.zig").effectiveSystem(profile) catch return error.InvalidEffectiveSystem);
     try output.writer.print(",\"software\":{f}", .{std.json.fmt(profile.software, .{})});
     try output.writer.writeAll(",\"install_source\":");
     const catalog_snapshot = context.catalog_snapshot;

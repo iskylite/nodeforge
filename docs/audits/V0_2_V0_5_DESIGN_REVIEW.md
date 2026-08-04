@@ -52,14 +52,14 @@ initrd producer；`AssetKind.rootfs/nodeforge_initrd` 与 `BootBundleConfig` 没
 | P1 | 异步 operation 只有资源局部查询且 id 格式过早冻结 | 增统一 opaque `operation show/wait`；资源 status 只作上下文投影 |
 | P1 | v0.3 install-post retry/status 套用 diskless session 语义 | 以 install generation 标识；仅 installer execution 内自动 retry，耗尽后 install.failed |
 | P1 | v0.3 callback credential 只有 claim，raw token 交付路径不明 | 使用 per-generation credential capsule 以 0400 文件交付；服务端只持 hash，禁止 cmdline/catalog/log 泄漏 |
-| P1 | v0.4 节点构建与“无远程任务下发”矛盾 | 收敛为临时 PXE rootfs 构建 operation；不远程重启、不向运行中 agent 下发任务，产物只回服务端 cache |
-| P0 | v0.4 选择物理 builder 后才可能确定 capability class，导致 build CAS 不稳定 | compiler 在 plan 前唯一导出 class/ABI 并纳入 input digest；物理 Node 只匹配 immutable operation snapshot |
+| P1 | v0.4 远端构建与“无远程任务下发”矛盾 | 固定由 nodeforged 服务端生成 rootfs，不向运行中 agent 下发任务 |
+| P0 | 物理 Node 属性进入 build CAS 会导致共享 cache 不稳定 | 物理 Node 不参与 rootfs input digest |
 | P1 | v0.5 initrd 无法从不变的 BootConfig 得知 mode | v0.4 bootstrap transport 升 BootConfig v4、target topology 升 AgentPlan v2；v0.5 materialization 升 BootConfig v5 并要求 feature token |
 | P0 | v0.5 ram_rootfs 峰值漏算压缩副本且重复扣 initrd 已计入的 kernel 内存 | 规范化 available budget；峰值同时计 compressed/uncompressed，冻结 checked required-min 公式 |
 | P0 | 新 DHCP XID、BootConfig 重取与外部鉴权失败缺少准确 correlation/归责边界 | XID 可登记 transaction alias；BootConfig bounded replay；无 verified claim 的失败不得污染 victim session |
 | P0 | hash-only capsule 在 daemon restart 后被笼统宣称可恢复 | raw token 只驻内存；交付前/中未完整取得即 `recovery_incomplete`，客户端已取得后才可凭 hash 恢复 |
 | P0 | v0.4 bond/VLAN 不能承载 L3，static PXE 又没有 session bootstrap 路径 | 三类 link 共用 tagged IPv4；static 首次 config 请求以 source/L2 binding 和 CAS 创建 BootSession/capsule |
-| P0 | v0.4 网络切换、builder upload 与 install token exchange 缺少中断事务 | authenticated topology cutover；builder `.part` lease/recovery；first-boot `exchanging` 后 event ack 才 spent |
+| P0 | v0.4 网络切换与 install token exchange 缺少中断事务 | authenticated topology cutover；first-boot `exchanging` 后 event ack 才 spent |
 | P0 | schema rollback 被当作任意 downgrade，可能丢 v5-v7-only state | finalize 前 journal rollback；finalize 后 representability preflight，不可表达返回 `migration.non_representable` |
 | P0 | v0.5 删除压缩临时制品与升级前 active v4 session 未形成验收契约 | handoff 前删除 `.part` 并检查引用；旧 immutable v4 session 跨升级继续到终态 |
 | P0 | Node software override 不进共享 rootfs，若无固定执行契约会分叉交付路径 | 全部 target-system/software/service/security 差量编译为 immutable node-apply，由最终 rootfs 的 agent pre-init 按 pinned local repository/exact add-remove closure 重放；initrd 只 handoff，clone Profile 仅作公共重差异的效率优化 |
@@ -68,7 +68,7 @@ initrd producer；`AssetKind.rootfs/nodeforge_initrd` 与 `BootBundleConfig` 没
 | P1 | Node key/hosts override 可无意破坏 Profile 域 SSH 互信 | 自动 client public key 设为 mandatory；effective hosts 改变时用共享 host key 重算该节点 known_hosts |
 | P1 | 操作流程仍保留旧 asset import 与 `item add --phase` 双语法 | 统一到 CLI 事实源：`import NAME --from-file` 与唯一 `steps` collection 的 `phase=...` ItemSpec |
 | P1 | v0.5 把迁移后的 squashfs mode 写成“不声明”，且未固定 owner | v0.5 两种 mode 都显式取值；mode 是 Profile-only policy，不提供 Node override |
-| P1 | v0.4 builder placement 被纳入 Node desired digest，导致无内容变化的 deployment drift | placement 仅进 Profile revision/operation policy；class/ABI 进 rootfs input，物理 Node 只进 operation snapshot |
+| P1 | 物理 Node 构建策略被纳入 desired digest 会导致无内容变化的 deployment drift | 删除该策略；rootfs input 只绑定服务端构建闭包 |
 | P0 | 声称 diskless 复用完整 Node override，但细表禁 repository 且缺 per-Node postprocess bundle | software 全 collection 解析为 pinned node-apply closure；新增 `overrides.diskless.provision.bundle`，first-boot-only payload 由 agent pre-init 按 session AgentPlan 预取校验，first-boot 本地执行 |
 
 ## 3. 版本依赖与边界
@@ -77,11 +77,11 @@ initrd producer；`AssetKind.rootfs/nodeforge_initrd` 与 `BootBundleConfig` 没
 |---|---:|---|---|
 | v0.2 | 4 | UEFI diskless、builder、initrd、diskless agent、rootfs-build/node-apply/first-boot、恢复/失败闭环 | BIOS、多 NIC、rootfs mode |
 | v0.3 | 5 | BIOS PXELINUX install、`firmware.mode`、install-post | install agent、多 NIC |
-| v0.4 | 6 | ItemSpec 网络 topology、BootConfig v4 + AgentPlan v2、量化容量目标、临时 PXE rootfs 构建节点、install first-boot generation | 可切 rootfs 形态 |
+| v0.4 | 6 | ItemSpec 网络 topology、BootConfig v3 + AgentPlan v2、量化容量目标、服务端 rootfs、install first-boot generation | 可切 rootfs 形态 |
 | v0.5（历史标签，已撤销） | 7（历史草案） | `ram_rootfs` 考量已移至不编号保留稿；不再预占 BootConfig/schema | NFS/iPXE/persistent overlay |
 
 v0.3 的 BIOS 与发行版扩展应拆成两个可独立验收的 feature slice；共同点只有版本发布，不应让新增发行版阻塞
-PXELINUX。v0.4 的网络拓扑、容量、临时 PXE rootfs 构建节点和 install agent 是四个风险域，
+PXELINUX。v0.4 的网络拓扑、容量、服务端 rootfs 和 install agent 是四个风险域，
 schema 可同版但实现/验收必须独立。历史“v0.5”结论仅表示 `ram_rootfs` 只改变 rootfs materializer；若未来重新立项，
 是否升级 BootConfig 及具体编号必须从当时基线重新裁决，auth、状态机与 agent 不得无故分叉。
 

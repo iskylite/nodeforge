@@ -12,6 +12,7 @@ const catalog_store = @import("catalog/store.zig");
 const validate = @import("config/validate.zig");
 const model_transaction = @import("state/model_transaction.zig");
 const atomicWrite = @import("state/dhcp_store.zig").atomicWrite;
+const deployment_manifest = @import("state/deployment_manifest.zig");
 
 /// 默认安装根的登录 shell 环境脚本固定路径。
 pub const environment_path = "/etc/profile.d/nodeforge.sh";
@@ -48,7 +49,7 @@ pub const Network = struct {
 /// asset_root/repository_root 指向运行时路径中的目录。
 pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppConfig {
     return .{
-        .schema_version = 4,
+        .schema_version = 5,
         .server = .{ .bind_interface = network.bind_interface, .server_ip = network.server_ip, .http_port = network.http_port },
         .http = .{ .asset_root = p.iso_dir, .repository_root = p.repos_dir },
         .tftp = .{ .asset_root = p.boot_dir },
@@ -105,7 +106,6 @@ pub fn installBundle(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
         if (!samePath(io, allocator, initrd_source, initrd_destination)) try std.Io.Dir.copyFileAbsolute(initrd_source, initrd_destination, io, .{ .replace = true, .make_path = true });
         if (!samePath(io, allocator, agent_source, agent_destination)) try std.Io.Dir.copyFileAbsolute(agent_source, agent_destination, io, .{ .replace = true, .make_path = true });
     }
-    try atomicWrite(io, p.marker_path, "nodeforge-root-v1\n");
 }
 
 /// 执行首次安装初始化：校验配置、安装二进制对、写入 config/catalog/systemd unit。
@@ -113,16 +113,31 @@ pub fn installBundle(io: std.Io, allocator: std.mem.Allocator, p: *const paths_m
 /// 如果提供了 `imported_config`，使用该配置而非 `generatedConfig` 的输出。
 /// 空 catalog（无 distro 索引）是合法的首次安装状态——首个 ISO 导入会创建能力记录。
 pub fn initialize(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths, network: Network, imported_config: ?*const model.AppConfig) !void {
-    const config = if (imported_config) |candidate| candidate.* else generatedConfig(p, network);
+    var config = if (imported_config) |candidate| candidate.* else generatedConfig(p, network);
+    const deployment_id = try deployment_manifest.generateId(io, allocator);
+    defer allocator.free(deployment_id);
+    config.deployment_id = deployment_id;
     // 空 distro 索引是正常的首次安装状态；首个通过媒体布局校验的 ISO
     // 会与 install source 一起原子创建对应 family/version/arch 能力记录。
-    // schema 永久为 v5（catalog）；diskless profile 的 tagged union kind 需要 v4+。
-    // v0.2.3: catalog schema 从 v4 升级为 v5（Profile identity/provenance）。
-    const catalog: model.Catalog = .{ .schema_version = 5 };
+    // v0.4 fresh replacement 使用 AppConfig v5 / Catalog v6；不把旧 state 或
+    // delivery snapshot 复制进新部署。deployment_id 由 fresh setup 的 manifest
+    // 原语生成并在最终提交点回填。
+    const catalog: model.Catalog = .{ .schema_version = 6, .deployment_id = deployment_id };
     try validate.validate(&config, &catalog);
     try installBundle(io, allocator, p);
     try config_store.save(io, allocator, p.config_path, &config);
     try catalog_store.save(io, allocator, p.catalog_dir, &catalog);
+    const manifest: deployment_manifest.Manifest = .{
+        .deployment_id = deployment_id,
+        // The set is versioned by this product; it is not a loader for old
+        // state.  A later schema change must change this digest and fail closed.
+        .state_schema_set_sha256 = "5f4bbd83a54ce0a4e6e3d91a50d72ea2930d775d55c0f4f5ae9c92ccf2d5ad8a",
+        .created_at = std.Io.Clock.real.now(io).toSeconds(),
+    };
+    try deployment_manifest.write(io, allocator, p.deployment_manifest_path, manifest);
+    const marker = try deployment_manifest.renderMarker(allocator, deployment_id);
+    defer allocator.free(marker);
+    try atomicWrite(io, p.marker_path, marker);
     const unit = try renderSystemd(allocator, p);
     defer allocator.free(unit);
     try atomicWrite(io, p.service_path, unit);
@@ -181,7 +196,7 @@ pub fn resetState(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.
     defer manifest.deinit();
     try manifest.writer.writeAll("{\"schema_version\":1,\"files\":[");
     var first = true;
-    for ([_][]const u8{ p.leases_path, p.node_status_path, p.deployment_control_path, p.boot_sessions_path, p.node_inventory_path, p.operations_path, p.rootfs_artifacts_path }) |state_path| {
+    for ([_][]const u8{ p.leases_path, p.node_status_path, p.deployment_control_path, p.boot_sessions_path, p.node_inventory_path, p.node_discovery_path, p.operations_path, p.rootfs_artifacts_path }) |state_path| {
         if (!regularFile(io, state_path)) continue;
         const destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ backup, std.fs.path.basename(state_path) });
         defer allocator.free(destination);

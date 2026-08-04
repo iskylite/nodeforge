@@ -1,19 +1,23 @@
 //! # v0.2 diskless 投递 DTO
 //!
-//! `V0_2_DESIGN.md` §2.3 / §4.3 的 BootConfig v3 与 AgentPlan v1。两者均为独立
+//! v0.4 继续使用 BootConfig v3，并将 immutable AgentPlan 升级为 v2。两者均为独立
 //! 命名空间（`schema_version` 各自计数，见 `V0_2_IMPL_DETAILS.md` §5）。
 //!
-//! - BootConfig v3：initrd 用 config:read token 拉取的固定 immutable 快照，引用
-//!   rootfs 与 AgentPlan 的 URL/digest/size，不携带任何 token（token 经 per-session
-//!   credential capsule 交付）；v3 增加已认证 memory facts 上报 URL。相同 token/
-//!   相同 config digest 重复 GET 返回相同 bytes。
-//! - AgentPlan v1：agent pre-init 用 agent:read token 拉取的 immutable 运行根计划，
-//!   列出 content-addressed payload path/digest/size 供 agent 校验后清零 token。
+//! - BootConfig v3：initrd 通过 peer-IP 引导认证拉取的固定 immutable 快照，引用
+//!   rootfs 与 AgentPlan 的 URL/digest/size。v0.4 token 简化后，BootConfig 自身
+//!   额外携带引导认证签发的 `access` 对象（boot_session 能力 token + session_id），
+//!   仅供后续读取 AgentPlan 等小型敏感控制面资源。rootfs/payload 是由活动 DHCP
+//!   peer、session binding 与 immutable digest 共同约束的大对象数据面，不传播该
+//!   token。event:append token 仍由 capsule 单独交付（切网后 lease-IP 身份
+//!   可能变化，需要跨网络跳变存活的派生凭证）。v3 同时增加已认证 memory facts
+//!   上报 URL。
+//! - AgentPlan v2：agent pre-init 拉取的 immutable 运行根计划，列出
+//!   content-addressed payload path/digest/size 供 agent 校验。
 const std = @import("std");
 const model = @import("../model.zig");
 
 pub const boot_config_schema_version: u32 = 3;
-pub const agent_plan_schema_version: u32 = 1;
+pub const agent_plan_schema_version: u32 = 2;
 
 /// BootConfig v3 中引用的 rootfs 定位器。
 pub const RootfsLocator = struct {
@@ -21,7 +25,7 @@ pub const RootfsLocator = struct {
     /// rootfs 内容 SHA-512（immutable ETag）。
     sha512: []const u8,
     size: u64,
-    /// null 表示外部 rootfs 未提供展开大小；客户端必须跳过容量硬校验。
+    /// null 表示 nodeforged 构建时未能测得展开大小；客户端必须跳过容量硬校验。
     uncompressed_size: ?u64 = null,
 };
 
@@ -37,6 +41,17 @@ pub const OverlayBudget = struct {
     minimum_free_bytes: u64,
     safety_margin_bytes: u64,
     node_payload_size: u64 = 0,
+};
+
+/// 引导认证签发的控制面访问凭证。agent 用此 capability token + session header
+/// 读取 AgentPlan；rootfs/payload 大对象下载不携带此凭证。
+/// `session_header` / `authorization_header` 为客户端应使用的请求头名称。
+pub const AccessCredential = struct {
+    session_header: []const u8 = "X-NodeForge-Session",
+    session_id: []const u8,
+    authorization_header: []const u8 = "Authorization",
+    /// Bearer 前缀已去除；客户端发送时需自行拼接 "Bearer "。
+    bearer_token: []const u8,
 };
 
 /// BootConfig v3。initrd 下载 rootfs、上报可信 memory fact 并交接 agent_plan。
@@ -57,9 +72,11 @@ pub const BootConfig = struct {
     facts_url: []const u8,
     /// 过期时刻（Unix 秒）。
     expires_at: i64,
+    /// 引导认证签发的访问凭证（v0.4 token 简化：取代 per-scope capsule token）。
+    access: AccessCredential,
 };
 
-/// AgentPlan v1 中 content-addressed payload 条目。
+/// AgentPlan v2 中 content-addressed payload 条目。
 pub const PayloadEntry = struct {
     path: []const u8,
     digest: []const u8,
@@ -125,7 +142,7 @@ pub const NodeApplyProjection = struct {
     software_transaction: SoftwareTransaction = .{},
 };
 
-/// AgentPlan v1 的 first-boot 步骤；切根后由 agent 一次性按固定顺序重放。
+/// AgentPlan v2 的 first-boot 步骤；切根后由 agent 一次性按固定顺序重放。
 /// 小内容可内联；资产内容以 `payload_path` 引用 AgentPlan 中按
 /// path/digest/size 固定的 content-addressed payload。
 pub const FirstBootStep = struct {
@@ -144,13 +161,23 @@ pub const FirstBootStep = struct {
     packages: []const []const u8 = &.{},
 };
 
-/// AgentPlan v1。切根后 agent pre-init 拉取并校验的 immutable 运行根计划。
+/// AgentPlan v2。切根后 agent pre-init 拉取并校验的 immutable 运行根计划。
 pub const AgentPlan = struct {
     schema_version: u32 = agent_plan_schema_version,
+    /// v0.4 fresh deployment identity；不允许跨 deployment 重放。
+    deployment_id: []const u8 = "",
     node_id: []const u8,
     session_id: []const u8,
     plan_digest: []const u8,
     rootfs_input_digest: []const u8,
+    desired_plan_digest: []const u8 = "",
+    delivery_digest: []const u8 = "",
+    /// Bootstrap lease 是本次 DHCP BootSession 的快照，不是 target topology。
+    bootstrap_network: ?BootstrapNetwork = null,
+    /// v0.4 唯一的 target network owner；NodeApplyProjection.network 仅供旧
+    /// fixture 读取，新 session 必须填充此字段。
+    target_network: model.TargetNetworkConfig = .{},
+    required_agent_features: []const []const u8 = &.{},
     node_apply_projection: NodeApplyProjection,
     /// Node first-boot bundle（override 完整替换 Profile 继承值）。
     first_boot_bundle: ?[]const u8 = null,
@@ -168,12 +195,23 @@ pub const AgentPlan = struct {
     expires_at: i64,
 };
 
+pub const BootstrapNetwork = struct {
+    interface_mac: []const u8,
+    address: []const u8,
+    prefix_len: u8,
+    gateway: ?[]const u8 = null,
+    dhcp_server_id: ?[]const u8 = null,
+    lease_expires_at: i64 = 0,
+    server_ip: []const u8 = "",
+    server_port: u16 = 0,
+};
+
 /// 渲染 BootConfig v3 为 JSON。
 pub fn renderBootConfig(allocator: std.mem.Allocator, config: BootConfig) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, config, .{ .whitespace = .indent_2 });
 }
 
-/// 渲染 AgentPlan v1 为 JSON。
+/// 渲染 AgentPlan v2 为 JSON。
 pub fn renderAgentPlan(allocator: std.mem.Allocator, plan: AgentPlan) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, plan, .{ .whitespace = .indent_2 });
 }
@@ -215,6 +253,7 @@ test "boot config v3 renders stable canonical digest and facts endpoint" {
         .event_url = "https://srv/api/v1/nodes/n1/events",
         .facts_url = "https://srv/api/v1/nodes/n1/facts",
         .expires_at = 1234,
+        .access = .{ .session_id = "s1", .bearer_token = "tok" },
     };
     const first = try bootConfigDigest(std.testing.allocator, cfg);
     const second = try bootConfigDigest(std.testing.allocator, cfg);
@@ -225,9 +264,11 @@ test "boot config v3 renders stable canonical digest and facts endpoint" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"sha512\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"ab\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"facts_url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"access\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"bearer_token\"") != null);
 }
 
-test "agent plan v1 lists payload entries" {
+test "agent plan v2 lists payload entries" {
     const payload = [_]PayloadEntry{
         .{ .path = "payload/a.bin", .digest = "da", .size = 10 },
         .{ .path = "payload/b.bin", .digest = "db", .size = 20 },
@@ -268,7 +309,7 @@ test "agent plan v1 lists payload entries" {
     try std.testing.expectEqualSlices(u8, &digest, &again);
 }
 
-test "agent plan v1 round-trips first-boot steps" {
+test "agent plan v2 round-trips first-boot steps" {
     const steps = [_]FirstBootStep{
         .{ .id = "motd", .action = .managed_file, .content = "hello\n", .destination = "/etc/motd", .mode = 0o644 },
         .{ .id = "pkgs", .action = .package, .packages = &.{ "tmux", "vim" } },

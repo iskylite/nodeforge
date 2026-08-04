@@ -1,13 +1,15 @@
-//! `boot-sessions.json` 持久化投影（M4.3 引入，M4.9 修订为 schema 4）。
+//! `boot-sessions.json` 持久化投影（v0.4 schema 5）。
 //!
-//! checkpoint worker 在 DHCP/session mutex 之外将已获得 capability 的活动
-//! session 序列化到磁盘，使 daemon 重启后仍能继续未完成的安装交付。
+//! checkpoint worker 在 DHCP/session mutex 之外持久化已经接纳的 delivery
+//! authority。随机 boot-session capability 永不落盘；daemon 重启后恢复会话
+//! identity/TTL/immutable plan，节点必须再次通过 peer-IP bootstrap 获取新 token。
 //! daemon 是唯一 writer；CLI 只读。
 //!
 //! 恢复策略严格 fail closed：
-//! - schema 3 只有全局 u64 provenance，升级后不得恢复任何 capability；
-//! - schema 4 必须与 `deployment-control.json` 做 join 校验：
+//! - schema 4 及更早版本含旧 token 语义，v0.4 fresh layout 直接拒载；
+//! - schema 5 install session 必须与 `deployment-control.json` 做 join 校验：
 //!   generation + plan digest 都必须匹配，否则视为漂移并拒绝恢复；
+//! - diskless session 必须与 durable delivery authority join；
 //! - 若 deployment 已记录成功，即便 checkpoint 未来得及清理 token 也不复活；
 //! - install plan 的 pinned asset（kernel/initrd）若 digest 改变或消失则拒绝。
 
@@ -16,6 +18,7 @@ const model = @import("../model.zig");
 const boot_session = @import("boot_session.zig");
 const dhcp_store = @import("dhcp_store.zig");
 const deployment_control = @import("deployment_control.zig");
+const diskless_delivery = @import("diskless_delivery.zig");
 
 /// 磁盘上一条 session 记录的 JSON 投影。所有字符串借用自解析后的 JSON
 /// 缓冲区，由 `parsed.deinit()` 统一释放。
@@ -26,7 +29,7 @@ pub const Record = struct {
     node_id: []const u8,
     /// 关联 profile 名称。
     profile: []const u8,
-    /// 启动模式（当前仅 `install` 可被恢复）。
+    /// 启动模式；install 与 diskless session 均可恢复。
     mode: model.BootKind,
     /// 客户端 MAC 地址。
     mac: [6]u8,
@@ -38,8 +41,6 @@ pub const Record = struct {
     created_at: i64,
     /// 最近一次活动时间（Unix 秒）；恢复时换算回 monotonic 基准。
     last_seen_at: i64,
-    /// 256-bit bearer capability（64 字符十六进制）。
-    capability: [boot_session.capability_len]u8,
     /// 序列化时的 model revision；schema 4 中仅供诊断，授权以 plan_digest 为准。
     model_revision: u64 = 0,
     /// M4.9b 节点级 plan digest（64 字符小写十六进制）；`null` 视为未设置。
@@ -52,14 +53,14 @@ pub const Record = struct {
     install_plan_digest: ?[32]u8 = null,
 };
 
-/// `boot-sessions.json` 的顶层 schema。`schema_version=4` 为当前写入格式。
+/// `boot-sessions.json` 的顶层 schema。schema 5 首次禁止持久化 raw capability。
 pub const File = struct {
-    schema_version: u32 = 4,
+    schema_version: u32 = 5,
     saved_at: i64,
     sessions: []const Record,
 };
 
-/// 原子保存已获得 capability 的活动 session 快照。
+/// 原子保存已接纳 delivery 的活动 session 快照，不包含 raw capability。
 ///
 /// 调用方（checkpoint worker）通过 `store.snapshot` 在 mutex 内拷贝活动
 /// session 列表；本函数将其序列化为 JSON、`atomicWrite` 替换文件、再
@@ -81,7 +82,6 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
         .phase = session.phase,
         .created_at = session.created_at,
         .last_seen_at = session.last_seen_at,
-        .capability = session.capability,
         .model_revision = session.model_revision,
         .plan_digest = if (deployment_control.digestSet(session.model_plan_digest)) &session.model_plan_digest else null,
         .deployment_generation = session.deployment_generation,
@@ -108,39 +108,38 @@ fn chmod(io: std.Io, allocator: std.mem.Allocator, mode: []const u8, path: []con
     }
 }
 
-/// 加载 `boot-sessions.json` 并以 capability-issued 状态恢复未过期的 session。
-///
-/// `config` 参数仅用于保持公共签名兼容（schema 4 不再依赖 config）。
-/// 恢复过程严格 fail closed：
-/// 1. schema 3 直接返回 0（升级后不得复活任何 capability）；
-/// 2. schema 4 对每条记录做多重校验（见下文）；
-/// 3. install 模式必须与 `deployments` 的 generation + plan digest 匹配；
-/// 4. install plan 的 pinned asset（kernel/initrd）必须在 catalog 中存在
-///    且 sha256 完全一致，否则视为漂移并返回 `BootSessionAssetMismatch`。
+/// 加载 schema 5 checkpoint，恢复 authority 但不恢复随机 capability。
+/// install、diskless 分别与自己的 durable domain state 做 join；成功
+/// 恢复后 `delivery_accepted=true` 保留原 delivery TTL，`capability_issued=false`
+/// 强制客户端重新完成 peer-IP bootstrap。
 ///
 /// 返回成功恢复的 session 数。
-pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: *const model.AppConfig, catalog: *const model.Catalog, deployments: *deployment_control.Store, store: *boot_session.Store, utc_now: i64, mono_now: i64) !usize {
+pub fn load(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    config: *const model.AppConfig,
+    catalog: *const model.Catalog,
+    deployments: *deployment_control.Store,
+    diskless_store: *diskless_delivery.Store,
+    store: *boot_session.Store,
+    utc_now: i64,
+    mono_now: i64,
+) !usize {
     _ = config; // 为 checkpoint schema 兼容性而保留在公共签名中
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(bytes);
     const Header = struct { schema_version: u32 };
     const header = try std.json.parseFromSlice(Header, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer header.deinit();
-    // schema 3 只有全局 u64 provenance，升级后不得恢复任何 capability。
-    // 接受文件仅用于不中断 daemon 升级；下一次 checkpoint 会写 schema 4。
-    if (header.value.schema_version == 3) return 0;
-    if (header.value.schema_version != 4) return error.InvalidBootSessionState;
+    if (header.value.schema_version != 5) return error.InvalidBootSessionState;
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     if (parsed.value.sessions.len > boot_session.max_sessions or utc_now < parsed.value.saved_at) return error.InvalidBootSessionState;
     var restored: usize = 0;
     for (parsed.value.sessions) |record| {
-        // 基本合法性：session id 格式、capability 格式、时间单调性。
-        if (!boot_session.validId(record.boot_session_id) or !validCapability(&record.capability) or utc_now < record.last_seen_at) continue;
-        // schema 4 的完整 plan digest 才是恢复授权事实；u64 revision 仅保留
-        // 为读取兼容和诊断，不能继续作为 capability 的授权门槛。
+        if (!boot_session.validId(record.boot_session_id) or utc_now < record.last_seen_at) continue;
         const record_digest = try parsePlanDigest(record.plan_digest);
-        // 已超出 delivery TTL 的 session 不恢复（capability 已失效）。
         const elapsed = utc_now - record.last_seen_at;
         if (elapsed >= boot_session.delivery_ttl_seconds) continue;
         // Catalog 必须仍包含此节点，且其 MAC/profile 未被改动。
@@ -148,8 +147,6 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
         const node_mac = parseMac(node.mac) catch continue;
         if (node.profile == null or !std.mem.eql(u8, node.profile.?, record.profile) or !std.mem.eql(u8, &record.mac, &node_mac)) continue;
         _ = findProfile(catalog, record.profile) orelse continue;
-        // 当前只恢复 install 模式的 session（diskless 不需要跨重启续作）。
-        if (record.mode != .install) continue;
         if (record.mode == .install) {
             // M4.9：boot-sessions.json 与 deployment-control.json 分别原子写。
             // 恢复破坏性 delivery 前必须校验 join，避免只清理/回滚一个文件后
@@ -158,10 +155,15 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
             const deployment = deployments.view(record.node_id) orelse return error.BootSessionDeploymentMismatch;
             if (deployment.currentGeneration() != record.deployment_generation or !deployment_control.digestEqual(deployment.requested_plan_digest, record_digest))
                 return error.BootSessionDeploymentMismatch;
-            // 若 deployment 已记录成功而 terminal checkpoint 尚未来得及删除
-            // token，也不得复活 capability。
+            // 已完成 generation 不恢复 authority，也不会复活旧 capability。
             if (deployment.deployed_generation == record.deployment_generation) continue;
-        }
+        } else if (record.mode == .diskless) {
+            const delivery = diskless_store.findByNode(record.node_id) orelse return error.BootSessionDisklessMismatch;
+            if (delivery.phase.isTerminal() or delivery.expires_at <= utc_now or !std.mem.eql(u8, delivery.profileName(), record.profile))
+                return error.BootSessionDisklessMismatch;
+            if (record.install_plan_json != null or record.install_plan_digest != null or record.deployment_generation != 0)
+                return error.InvalidBootSessionState;
+        } else return error.InvalidBootSessionState;
         var id: [boot_session.id_len]u8 = undefined;
         @memcpy(&id, record.boot_session_id);
         // 以 wall-clock elapsed 反推 monotonic 时间戳，使 session 在运行期
@@ -176,16 +178,15 @@ pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, config: 
             .created_mono = mono_now - elapsed,
             .last_seen_mono = mono_now - elapsed,
             .phase = record.phase,
-            .capability_issued = true,
-            .capability = record.capability,
+            .delivery_accepted = true,
+            .capability_issued = false,
             .model_revision = record.model_revision,
             .model_plan_digest = record_digest,
             .deployment_generation = record.deployment_generation,
         };
         try boot_session.copyIdentity(&restored_session, record.node_id, record.profile);
         try store.restore(restored_session);
-        // install plan 必须在恢复 capability 后立即校验并捕获，
-        // 使后续 HTTP 安装配置请求能看到一致的 plan 快照。
+        // install immutable plan 与 authority 一起恢复，但 token 始终重新签发。
         if (record.install_plan_json) |plan_json| {
             if (record.mode != .install) return error.InvalidBootSessionState;
             var digest: [32]u8 = undefined;
@@ -248,13 +249,6 @@ fn parseMac(text: []const u8) ![6]u8 {
     return out;
 }
 
-/// 校验 64 字符十六进制 capability 字符串。大小写不敏感（接受 A-F/a-f）。
-fn validCapability(value: []const u8) bool {
-    if (value.len != boot_session.capability_len) return false;
-    for (value) |byte| if (!std.ascii.isHex(byte)) return false;
-    return true;
-}
-
 /// 将 64 字符小写十六进制 plan digest 解析为 `Digest`。
 /// `null` 或长度不为 64 视为文件损坏；大写字母视为损坏（强制小写规范）。
 fn parsePlanDigest(value: ?[]const u8) !deployment_control.Digest {
@@ -267,7 +261,7 @@ fn parsePlanDigest(value: ?[]const u8) !deployment_control.Digest {
     return result;
 }
 
-test "delivery checkpoint restores capability and remaining TTL" {
+test "schema 5 restores authority but rotates the in-memory capability" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/boot-sessions.json", .{tmp.sub_path});
@@ -284,10 +278,17 @@ test "delivery checkpoint restores capability and remaining TTL" {
     const plan = "{\"plan_digest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"kernel\":{\"name\":\"kernel\",\"kind\":\"kernel\",\"path\":\"install/kernel\",\"sha256\":\"aa\"},\"initrd\":{\"name\":\"initrd\",\"kind\":\"installer_initrd\",\"path\":\"install/initrd\",\"sha256\":\"bb\"}}";
     try before.captureInstallPlan(std.testing.allocator, issued.boot_session_id[0..], plan, 42, null);
     try save(std.testing.io, std.testing.allocator, path, &before, 1002);
+    const checkpoint = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(checkpoint);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, &issued.capability) == null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, "\"capability\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, "\"schema_version\": 5") != null);
     var after: boot_session.Store = .{};
     defer after.deinit();
     var deployments: deployment_control.Store = .{};
     try deployments.ensureInitial("n1", [_]u8{'4'} ** 64, 999);
+    var secret = [_]u8{1} ** 32;
+    var diskless_store = diskless_delivery.Store.init(std.testing.allocator, &secret, "deployment", "unused");
     const catalog: model.Catalog = .{
         .profiles = &.{.{ .name = "install", .install_source = "source" }},
         .nodes = &.{.{ .id = "n1", .mac = "02:aa:bb:cc:dd:ee", .arch = .aarch64, .profile = "install" }},
@@ -296,11 +297,100 @@ test "delivery checkpoint restores capability and remaining TTL" {
             .{ .name = "initrd", .kind = .installer_initrd, .path = "install/initrd", .sha256 = "bb" },
         },
     };
-    try std.testing.expectEqual(@as(usize, 1), try load(std.testing.io, std.testing.allocator, path, &config, &catalog, &deployments, &after, 1012, 500));
-    const restored = try after.authenticateCapability("n1", issued.boot_session_id[0..], issued.capability[0..], 501);
-    try std.testing.expectEqual(@as(u64, 42), restored.model_revision);
+    try std.testing.expectEqual(@as(usize, 1), try load(std.testing.io, std.testing.allocator, path, &config, &catalog, &deployments, &diskless_store, &after, 1012, 500));
+    try std.testing.expectError(error.ProofMismatch, after.authenticateCapability("n1", issued.boot_session_id[0..], issued.capability[0..], 501));
+    const bootstrap = try after.authenticateBootstrap("n1", 0xc0a81bc8, 501);
+    try std.testing.expect(!bootstrap.capability_issued);
+    const rotated = try after.issueCapability(std.testing.io, bootstrap.boot_session_id[0..], 502, 1013);
+    try std.testing.expect(!std.mem.eql(u8, &issued.capability, &rotated.capability));
+    try std.testing.expectEqual(@as(u64, 42), rotated.model_revision);
     before.finishDelivery(issued.boot_session_id[0..], .completed, 103, 1003);
     after.finishDelivery(issued.boot_session_id[0..], .completed, 502, 1013);
+}
+
+test "schema 4 checkpoint is rejected instead of reviving persisted tokens" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/boot-sessions-v4.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "{\"schema_version\":4,\"saved_at\":1,\"sessions\":[]}" });
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.27.128" } };
+    const catalog: model.Catalog = .{};
+    var deployments: deployment_control.Store = .{};
+    var secret = [_]u8{1} ** 32;
+    var diskless_store = diskless_delivery.Store.init(std.testing.allocator, &secret, "deployment", "unused");
+    var sessions: boot_session.Store = .{};
+    defer sessions.deinit();
+    try std.testing.expectError(error.InvalidBootSessionState, load(
+        std.testing.io,
+        std.testing.allocator,
+        path,
+        &config,
+        &catalog,
+        &deployments,
+        &diskless_store,
+        &sessions,
+        2,
+        2,
+    ));
+}
+
+test "schema 5 rejoins diskless delivery and rotates only its boot capability" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/diskless-boot-sessions.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.168.27.128" } };
+    const catalog: model.Catalog = .{
+        .profiles = &.{.{ .name = "diskless-profile", .install_source = "source" }},
+        .nodes = &.{.{ .id = "diskless-node", .mac = "02:aa:bb:cc:dd:f0", .arch = .aarch64, .profile = "diskless-profile" }},
+    };
+    var secret = [_]u8{2} ** 32;
+    var diskless_store = diskless_delivery.Store.init(std.testing.allocator, &secret, "deployment", "");
+    const delivery = try diskless_store.begin(
+        std.testing.io,
+        "diskless-node",
+        "diskless-profile",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        4096,
+        16384,
+        "6.8.0",
+        50,
+        64,
+        32,
+        100,
+        1000,
+    );
+    try diskless_store.pinAgentPlan(std.testing.io, &delivery.session_id, "{\"schema_version\":2}");
+    try diskless_store.issue(std.testing.io, &delivery.session_id, .event);
+    const event_token = delivery.event_token_raw;
+
+    var before: boot_session.Store = .{};
+    defer before.deinit();
+    const acquired = try before.acquireDhcp(std.testing.io, .{
+        .mac = &.{ 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xf0 },
+        .xid = 43,
+        .node_id = "diskless-node",
+        .profile = "diskless-profile",
+        .mode = .diskless,
+        .model_revision = 8,
+        .model_plan_digest = [_]u8{'8'} ** 64,
+    }, 100, 1000);
+    before.updateDhcp(acquired.link, .dhcp_ack, 0xc0a81bca, 101, 1001);
+    const issued = try before.issueCapability(std.testing.io, acquired.link.id().?, 102, 1002);
+    try save(std.testing.io, std.testing.allocator, path, &before, 1002);
+
+    var after: boot_session.Store = .{};
+    defer after.deinit();
+    var deployments: deployment_control.Store = .{};
+    try std.testing.expectEqual(@as(usize, 1), try load(std.testing.io, std.testing.allocator, path, &config, &catalog, &deployments, &diskless_store, &after, 1012, 500));
+    try std.testing.expectError(error.ProofMismatch, after.authenticateCapability("diskless-node", issued.boot_session_id[0..], issued.capability[0..], 501));
+    const bootstrap = try after.authenticateBootstrap("diskless-node", 0xc0a81bca, 501);
+    try std.testing.expect(!bootstrap.capability_issued);
+    const rotated = try after.issueCapability(std.testing.io, bootstrap.boot_session_id[0..], 502, 1013);
+    try std.testing.expect(!std.mem.eql(u8, &issued.capability, &rotated.capability));
+    try std.testing.expectEqualSlices(u8, &event_token, diskless_store.rawToken(delivery, .event));
 }
 
 test "resume rejects install session whose deployment provenance was reset" {
@@ -329,9 +419,11 @@ test "resume rejects install session whose deployment provenance was reset" {
 
     var reset_deployments: deployment_control.Store = .{};
     try reset_deployments.ensureInitial("n1", [_]u8{'9'} ** 64, 1003);
+    var secret = [_]u8{1} ** 32;
+    var diskless_store = diskless_delivery.Store.init(std.testing.allocator, &secret, "deployment", "unused");
     var after: boot_session.Store = .{};
     defer after.deinit();
-    try std.testing.expectError(error.BootSessionDeploymentMismatch, load(std.testing.io, std.testing.allocator, path, &config, &catalog, &reset_deployments, &after, 1012, 500));
+    try std.testing.expectError(error.BootSessionDeploymentMismatch, load(std.testing.io, std.testing.allocator, path, &config, &catalog, &reset_deployments, &diskless_store, &after, 1012, 500));
 }
 
 test "resume fails closed when a pinned asset digest changes or disappears" {

@@ -220,7 +220,11 @@ pub fn renderInstallPost(allocator: std.mem.Allocator, bundle: *const model.Prov
 
 pub const Callback = struct {
     event_url: []const u8,
-    token: []const u8,
+    /// Exactly one credential source is required. Production installer answers
+    /// use `token_file` so raw bearer bytes never appear in Kickstart/user-data;
+    /// `token` remains available for non-persisted callers and focused tests.
+    token: ?[]const u8 = null,
+    token_file: ?[]const u8 = null,
     boot_session_id: []const u8,
     max_attempts: u8 = 3,
 };
@@ -230,14 +234,21 @@ pub const Callback = struct {
 /// 任一 callback 失败都按终止错误处理：daemon 未持久接受已执行 action 的状态迁移时，
 /// installer 不得继续发布 `install.completed`，否则会绕过 canonical completion gate。
 pub fn renderInstallPostInstrumented(allocator: std.mem.Allocator, bundle: *const model.ProvisioningBundle, manager: model.PackageManager, callback: Callback) ![]u8 {
-    if (callback.max_attempts == 0) return error.InvalidStep;
+    if (callback.max_attempts == 0 or (callback.token == null) == (callback.token_file == null)) return error.InvalidStep;
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.writeAll("nf_post_event() { curl -fsS -H ");
-    const authorization = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{callback.token});
-    defer allocator.free(authorization);
-    try writeShellQuoted(w, authorization);
+    try w.writeAll("nf_post_event() { ");
+    if (callback.token_file) |path| {
+        try w.writeAll("NF_CALLBACK_TOKEN=$(cat ");
+        try writeShellQuoted(w, path);
+        try w.writeAll(") || return 1; curl -fsS -H \"Authorization: Bearer $NF_CALLBACK_TOKEN\"");
+    } else {
+        try w.writeAll("curl -fsS -H ");
+        const authorization = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{callback.token.?});
+        defer allocator.free(authorization);
+        try writeShellQuoted(w, authorization);
+    }
     try w.writeAll(" -H ");
     const session_header = try std.fmt.allocPrint(allocator, "X-NodeForge-Session: {s}", .{callback.boot_session_id});
     defer allocator.free(session_header);
@@ -291,6 +302,18 @@ test "renderInstallPost rejects legacy repository and standard_packages actions"
 
     const bundle_pkgs: model.ProvisioningBundle = .{ .name = "legacy", .steps = &.{.{ .name = "pkgs", .action = .standard_packages, .packages = &.{"curl"} }} };
     try std.testing.expectError(error.InvalidStep, renderInstallPost(std.testing.allocator, &bundle_pkgs, .dnf));
+}
+
+test "instrumented install-post can source bearer from a runtime credential file" {
+    const bundle: model.ProvisioningBundle = .{ .name = "runtime-auth", .steps = &.{} };
+    const bytes = try renderInstallPostInstrumented(std.testing.allocator, &bundle, .dnf, .{
+        .event_url = "http://srv/events",
+        .token_file = "/run/nodeforge-installer.token",
+        .boot_session_id = "0123456789abcdef0123456789abcdef",
+    });
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "cat '/run/nodeforge-installer.token'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Authorization: Bearer $NF_CALLBACK_TOKEN") != null);
 }
 
 test "renderInstallPost renders canonical package action" {

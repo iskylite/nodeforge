@@ -272,8 +272,8 @@ v0.2.1 **不限制** rootfs-build phase 只能安装 userspace 包。而是：
 3. **Ubuntu 宿主机消除风险**：如果宿主机是 Ubuntu（与目标版本一致），
    则 kernel-headers/内核版本完全匹配，DKMS 等内核相关包可正常编译。
    这是推荐的生产环境配置。
-4. **未来路径**：内核相关包构建也可通过 v0.4 的临时 PXE rootfs 构建节点
-   （在真实 Ubuntu 内核态下构建）解决。
+4. **生产路径**：内核相关包仍由与目标版本一致的 nodeforged 管理节点构建，
+   计算节点不承担 rootfs 生成。
 
 ### 4.3 风险 R2：initrd 内核模块来源与匹配（已消除）
 
@@ -458,7 +458,7 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
 - apt `--installroot` 跨根安装（替代 casper squashfs 方案）→ 未来版本评估。
 - 从 rootfs 构建 initrd（chroot + apt install linux-image + mkinitramfs）→
   仅保留历史实验记录，不进入当前产品路线图；除非未来出现独立需求并重新立项。
-- 临时 PXE rootfs 构建节点（在真实 Ubuntu 内核态构建）→ v0.4。
+- rootfs 统一由 nodeforged 服务端生成；计算节点只消费 ready artifact。
 
 ## 7. 版本规划变更
 
@@ -504,7 +504,7 @@ v0.2.1 的 casper squashfs 方案绕过了 OS 层构建，但 rootfs-build phase
 
 ### 8.3 casper initrd 复用方案：QEMU 完整验证（已通过）
 
-验证脚本：`tests/v0_2_1_casper_initrd_smoke.sh`
+历史验证夹具：`docs/archive/validation-fixtures/v0_2_1_casper_initrd_smoke.sh`
 验证环境：r97n0 Rocky 9.8 aarch64
 验证日期：2026-07-25
 
@@ -603,7 +603,7 @@ Ubuntu ISO/目标 sysroot 解析并复制完整 ELF interpreter/`DT_NEEDED` 闭�
 | QEMU 启动 | ✅ PASS | ✅ PASS |
 | diskless.running | ✅ PASS | ✅ PASS |
 | ubuntu boot evidence | ✅ PASS | ✅ PASS |
-| 验证脚本 | `v0_2_1_casper_initrd_smoke.sh` | `v0_2_1_mkinitramfs_smoke_v2.sh` |
+| 历史验证夹具 | `docs/archive/validation-fixtures/v0_2_1_casper_initrd_smoke.sh` | `docs/archive/validation-fixtures/v0_2_1_mkinitramfs_smoke_v2.sh` |
 
 ### 9.3 方案 B（mkinitramfs）验证中发现的问题
 
@@ -675,7 +675,7 @@ casper 还会把 `getty@tty1.service` vendor-mask 到 `/dev/null`，并用 drop-
 “getty 未启动”，不能作为最终通过证据；最终必须再次冷启动并等待标准 agetty
 自行输出登录提示。
 
-验证脚本（`v0_2_1_mkinitramfs_smoke_v2.sh`）中未使用此机制，直接使用了 rootfs 自带的公网源
+历史夹具（`docs/archive/validation-fixtures/v0_2_1_mkinitramfs_smoke_v2.sh`）中未使用此机制，直接使用了 rootfs 自带的公网源
 （`ports.ubuntu.com`），这是验证脚本的历史缺陷。只有未来通过新设计推翻 `V02-D03`
 并重新立项时，才需要使用 nodeforged 受管源；本文不构成实现承诺。
 
@@ -769,10 +769,10 @@ mkinitramfs 默认输出 zstd 压缩的 cpio 镜像（与 casper initrd 格式�
 
 | 脚本 | 方案 | 状态 |
 |---|---|---|
-| `tests/v0_2_1_casper_initrd_smoke.sh` | 方案 A | ✅ 通过 |
-| `tests/v0_2_1_mkinitramfs_smoke.sh` | 方案 B（v1，无清理） | ❌ InsufficientMemory |
-| `tests/v0_2_1_mkinitramfs_smoke_v2.sh` | 方案 B（v2，带清理，公网源） | ✅ 通过 |
-| `tests/v0_2_1_mkinitramfs_qemu_v3.sh` | 方案 B（v3，仅 QEMU） | ✅ 通过 |
+| `docs/archive/validation-fixtures/v0_2_1_casper_initrd_smoke.sh` | 方案 A | ✅ 通过 |
+| `docs/archive/validation-fixtures/v0_2_1_mkinitramfs_smoke.sh` | 方案 B（v1，无清理） | ❌ InsufficientMemory |
+| `docs/archive/validation-fixtures/v0_2_1_mkinitramfs_smoke_v2.sh` | 方案 B（v2，带清理，公网源） | ✅ 通过 |
+| `docs/archive/validation-fixtures/v0_2_1_mkinitramfs_qemu_v3.sh` | 方案 B（v3，仅 QEMU） | ✅ 通过 |
 
 > **注意**：方案 B 验证脚本使用了公网 apt 源而非 nodeforged 受管源，导致内核版本漂移
 > （见 §9.3.1）。正式实现时必须使用 nodeforged 受管源。

@@ -10,6 +10,7 @@ const model = @import("../model.zig");
 /// 不得序列化到 config.json——它们由 catalog store 独占写入。
 const SerializableConfig = struct {
     schema_version: u32,
+    deployment_id: ?[]const u8 = null,
     server: model.ServerConfig,
     http: model.HttpConfig = .{},
     tftp: model.TftpConfig = .{},
@@ -26,6 +27,7 @@ const SerializableConfig = struct {
 pub fn render(allocator: std.mem.Allocator, config: *const model.AppConfig) ![]u8 {
     const serializable = SerializableConfig{
         .schema_version = config.schema_version,
+        .deployment_id = config.deployment_id,
         .server = config.server,
         .http = config.http,
         .tftp = config.tftp,
@@ -81,7 +83,7 @@ fn chmod(io: std.Io, allocator: std.mem.Allocator, mode: []const u8, path: []con
 
 test "render produces parseable JSON" {
     const allocator = std.testing.allocator;
-    const config: model.AppConfig = .{ .schema_version = 4, .server = .{ .server_ip = "192.168.50.1" } };
+    const config: model.AppConfig = .{ .schema_version = 5, .server = .{ .server_ip = "192.168.50.1" } };
     const bytes = try render(allocator, &config);
     defer allocator.free(bytes);
 
@@ -94,7 +96,7 @@ test "render produces parseable JSON" {
 test "render excludes legacy catalog-owned entities" {
     const allocator = std.testing.allocator;
     const config: model.AppConfig = .{
-        .schema_version = 4,
+        .schema_version = 5,
         .server = .{ .server_ip = "192.168.50.1" },
         .profiles = &.{.{
             .name = "strict-ubuntu",
@@ -105,5 +107,5 @@ test "render excludes legacy catalog-owned entities" {
     const bytes = try render(allocator, &config);
     defer allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"profiles\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"schema_version\": 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"schema_version\": 5") != null);
 }

@@ -11,7 +11,7 @@
 //! 区分"dnf host-context / apt 不支持"，两者共用同一隔离原语（`isolation`
 //! 字段区分 `.chroot` 与 `.namespaced_package`）。
 //!
-//! 与 first-boot 的区别：rootfs-build 在服务端 builder 的 staging 目录内执行，
+//! 与 first-boot 的区别：rootfs-build 在 nodeforged 服务端 staging 目录内执行，
 //! 是 **fail-closed**——任一步渲染/执行失败即放弃整次构建，不发布半成品
 //! rootfs，不存在 journal/降级语义。OS 层/package 安装/chroot 调用属
 //! 环境相关执行边界（与 initrd/first_boot 一致），本模块只负责可单测的步骤编译

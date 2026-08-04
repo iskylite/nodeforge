@@ -22,8 +22,12 @@
 /// distros/profiles/nodes/provisioning_bundles 由 Catalog 独占持久化，
 /// 此处只保留投影字段以缩小协议模块的破坏面。
 pub const AppConfig = struct {
-    /// 配置文件 schema 版本。永久默认 4（最新）；setup 始终生成 v4，不存在版本迁移。
-    schema_version: u32 = 4,
+    /// v0.4 启动配置版本。v0.4 使用 fresh replacement，不读取 v0.3 的
+    /// config/state；旧版本字段仍保留在内存 DTO 中，仅用于历史测试夹具的明确诊断。
+    schema_version: u32 = 5,
+    /// fresh deployment 的 32 字符小写 hex 身份。旧 fixture 可省略；正式
+    /// setup/daemon 启动时由 deployment manifest 强制校验非空且一致。
+    deployment_id: ?[]const u8 = null,
     /// 单进程服务配置：实例名称、PXE 网卡、服务网 IP 和 HTTP 端口。
     server: ServerConfig,
     /// HTTP 大文件和发行版仓库目录配置。
@@ -54,9 +58,14 @@ pub const AppConfig = struct {
 /// 该文件只由 `nodeforged` 通过 catalog store 原子事务写入，CLI 不直接编辑。
 /// 磁盘布局为 manifest + 8 个 entity 文件，内存模型由本结构体表达。
 pub const Catalog = struct {
-    /// 内存 catalog schema 版本。永久默认 5（最新）；setup 始终生成 v5，不存在版本迁移。
+    /// v0.4 catalog schema。v0.4 只接受 fresh v6 catalog。
     /// 磁盘布局另由 manifest schema 约束。
+    // In-memory unit fixtures may omit deployment identity and use the legacy
+    // shape. A daemon-startable catalog is independently required to be v6
+    // and deployment-bound by DeploymentManifest validation.
     schema_version: u32 = 5,
+    /// 必须与 AppConfig 和 DeploymentManifest 完全一致。
+    deployment_id: ?[]const u8 = null,
     /// manifest 的单调 catalog revision；每次原子事务提交递增。legacy 单文件输入为 0。
     revision: u64 = 0,
     /// ISO 导入后自动形成的发行版能力索引。非操作员手动创建的策略对象。
@@ -181,11 +190,10 @@ pub const HttpConfig = struct {
     asset_root: []const u8 = "",
     /// 通过 `/artifacts/repositories/` 只读发布的仓库根目录。
     repository_root: []const u8 = "",
-    /// M4.2 F4 / M4.8: 最大并发 HTTP 连接数。0 = 不限制。
-    /// **当前为 advisory、未强制**：facil.io/zap 不暴露应用级连接上限，真正的并发墙在
-    /// OS 层（`ulimit -n`/`LimitNOFILE`，每下载 ~2 fd）。M6 压测后接上强制并设生产默认值。
-    /// 运维在 M6 前应直接提 `LimitNOFILE ≥ 8192` 而非依赖此字段。
-    max_connections: u16 = 0,
+    /// v0.4 hard ceiling for accepted HTTP connections.
+    max_connections: u16 = 256,
+    /// Connections reserved for loopback management traffic.
+    management_reserved_connections: u16 = 8,
 };
 
 /// TFTP 启动小文件配置。
@@ -257,6 +265,16 @@ pub const CapacityConfig = struct {
     /// NodeForge 人为上限，由动态 slice、allocator 和系统可用内存自然约束。
     /// 非 null 值限制的是 JSON 快照字节数，不是 ISO 文件大小。
     install_plan_max_bytes: ?u64 = null,
+    /// Active install/diskless sessions admitted before a PXE bootfile is sent.
+    max_active_boot_sessions: u16 = 64,
+    /// Concurrent rootfs response bodies; HEAD requests do not consume this slot.
+    max_rootfs_downloads: u16 = 64,
+    /// Telemetry/event refill rate and burst.
+    max_event_requests_per_second: u32 = 200,
+    event_burst: u32 = 400,
+    /// Lifecycle/control refill rate and burst.
+    max_control_requests_per_second: u32 = 128,
+    control_burst: u32 = 256,
 };
 
 /// 服务日志配置。业务事件仍写入独立的 `events.jsonl` 审计流。
@@ -667,7 +685,7 @@ pub const ProfileConfig = struct {
     /// install Profile 忽略此字段。
     boot_bundle: ?[]const u8 = null,
     /// diskless Profile 引用的构建 bundle（`rootfs_build` + `first_boot` 阶段步骤）。
-    /// builder 把 `rootfs_build` 步骤烤入只读 lower，把 `first_boot` 步骤作为固定
+    /// 服务端 rootfs builder 把 `rootfs_build` 步骤烤入只读 lower，把 `first_boot` 步骤作为固定
     /// payload 预置但不执行；install Profile 忽略此字段。
     bundle: ?[]const u8 = null,
     /// v0.2 diskless 启动预算与失败策略；install Profile 忽略。
@@ -868,6 +886,58 @@ pub const TargetNetworkConfig = struct {
     search_domains: []const []const u8 = &.{},
     /// 静态路由列表。
     routes: []const RouteConfig = &.{},
+    /// v0.4 canonical topology collections。旧的 mode/interface/address 字段
+    /// 仅作为历史兼容输入；有结构化 topology 时，renderer/plan 只能消费这些集合。
+    interfaces: []const TopologyInterface = &.{},
+    bonds: []const TopologyBond = &.{},
+    vlans: []const TopologyVlan = &.{},
+};
+
+/// v0.4 结构化 IPv4 配置。PXE bootstrap 永远不由此对象决定；它只描述
+/// 安装后目标系统或 diskless 最终网络。
+pub const TopologyIpv4Mode = enum { none, dhcp, static };
+pub const TopologyIpv4 = struct {
+    mode: TopologyIpv4Mode = .none,
+    address: ?[]const u8 = null,
+    prefix_len: ?u8 = null,
+    default_route: bool = true,
+};
+
+pub const TopologyInterface = struct {
+    id: []const u8,
+    mac: []const u8,
+    mtu: u16 = 1500,
+    ipv4: TopologyIpv4 = .{},
+};
+
+pub const BondMode = enum { active_backup, ieee8023ad };
+pub const PrimaryReselect = enum { always, better, failure };
+pub const LacpRate = enum { slow, fast };
+pub const XmitHashPolicy = enum { layer2, layer2_3, layer3_4 };
+
+pub const TopologyBond = struct {
+    id: []const u8,
+    mode: BondMode,
+    members: []const []const u8 = &.{},
+    mac_source_id: []const u8,
+    miimon_ms: u16 = 100,
+    up_delay_ms: u16 = 0,
+    down_delay_ms: u16 = 0,
+    primary_id: ?[]const u8 = null,
+    primary_reselect: PrimaryReselect = .failure,
+    lacp_rate: LacpRate = .fast,
+    xmit_hash_policy: XmitHashPolicy = .layer2_3,
+    min_links: u8 = 1,
+    mtu: ?u16 = null,
+    ipv4: TopologyIpv4 = .{},
+};
+
+pub const TopologyVlan = struct {
+    id: []const u8,
+    parent_id: []const u8,
+    vlan_id: u16,
+    mtu: ?u16 = null,
+    ipv4: TopologyIpv4 = .{},
 };
 
 /// 静态路由配置。
@@ -880,6 +950,9 @@ pub const RouteConfig = struct {
     gateway: []const u8,
     /// 可选路由 metric（优先级）。null 时使用系统默认。
     metric: ?u32 = null,
+    /// v0.4 route owner link. Required for structured topology; null is retained
+    /// only for the v0.3 flat-network compatibility shape.
+    interface_id: ?[]const u8 = null,
 };
 
 /// Node override 配置。
@@ -1436,6 +1509,9 @@ pub const NodeConfig = struct {
     /// 节点架构。必须与所绑定 install source 的 arch 一致。
     /// 从 DHCP RFC 4578 PXE 架构选项验证一致性。
     arch: Arch,
+    /// v0.4 物理身份事实。SN 只用于 discovery/matching 和审计，不进入
+    /// target desired digest，也不会单独打开 deploy gate。
+    hardware: NodeHardware = .{},
     /// 所绑定 profile 名称，必须能在 `Catalog.profiles` 中找到。
     /// null 表示未绑定（未认领的发现节点）。
     profile: ?[]const u8 = null,
@@ -1478,6 +1554,12 @@ pub const NodeConfig = struct {
     /// （只支持 TFTP），此字段对 BIOS 节点无效。
     /// 通过 `node set <id> http_accel=true` 启用。
     http_accel: bool = false,
+};
+
+/// v0.4 Node 的硬件身份事实。product serial 由站点录入或 discovery initrd
+/// 证明；它不能替代 PXE MAC，也不能作为 capability/token。
+pub const NodeHardware = struct {
+    serial_number: ?[]const u8 = null,
 };
 
 /// PXE lease 保留配置。Schema v3 canonical 保留地址。

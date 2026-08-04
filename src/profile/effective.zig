@@ -164,16 +164,11 @@ fn mergeKernelArgs(plan: *Plan, delta: model.StringSetDelta) !void {
 }
 
 fn effectiveNetwork(node: *const model.NodeConfig) model.TargetNetworkConfig {
-    var network = node.network;
-    if (network.mode == .dhcp) {
-        if (node.pxe.ip_reservation) |ip| {
-            network.mode = .static;
-            network.address = network.address orelse ip;
-            network.prefix_len = network.prefix_len orelse 24;
-            network.match_mac = network.match_mac orelse node.mac;
-        }
-    }
-    return network;
+    // v0.4: pxe.ip_reservation is a DHCP bootstrap lease only.  It must not
+    // silently become the target OS address; target DHCP/static/topology is an
+    // explicit Node-owned declaration and is consumed unchanged by install and
+    // diskless renderers.
+    return node.network;
 }
 
 fn kernelName(value: []const u8) []const u8 {
@@ -245,14 +240,14 @@ test "effective plan inherits install source repositories and honors node remova
     try std.testing.expectEqualSlices([]const u8, &.{"baseos"}, plan.software.repositories);
 }
 
-test "pxe reservation defaults target network to static" {
+test "pxe reservation does not change target DHCP network" {
     const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .x86_64, .source_asset = "iso", .installer_kernel = "kernel", .installer_initrd = "initrd" };
     const profile: model.ProfileConfig = .{ .name = "p", .install_source = "s" };
     const node: model.NodeConfig = .{ .id = "n", .mac = "02:00:00:00:00:01", .arch = .x86_64, .profile = "p", .pxe = .{ .ip_reservation = "192.0.2.10" } };
     const catalog: model.Catalog = .{ .profiles = &.{profile}, .nodes = &.{node}, .install_sources = &.{source} };
     var plan = try compile(std.testing.allocator, &catalog, &node);
     defer plan.deinit();
-    try std.testing.expectEqual(model.NetworkMode.static, plan.network.mode);
-    try std.testing.expectEqualStrings("192.0.2.10", plan.network.address.?);
-    try std.testing.expectEqual(@as(u8, 24), plan.network.prefix_len.?);
+    try std.testing.expectEqual(model.NetworkMode.dhcp, plan.network.mode);
+    try std.testing.expect(plan.network.address == null);
+    try std.testing.expect(plan.network.prefix_len == null);
 }

@@ -169,10 +169,14 @@ fn buildInternal(
     };
     try runCmd(io, allocator, &.{ "chmod", "0755", init_path });
 
-    // 6. 创建 /capsule 目录（boot-prepare 注入 token 文件）
-    std.log.scoped(.initrd_build).info("initrd build: stage 6/7 - creating /capsule directory", .{});
-    const capsule_dir = try std.fmt.allocPrint(a, "{s}/capsule", .{initrd_root});
-    try std.Io.Dir.cwd().createDirPath(io, capsule_dir);
+    // 6. Pre-create the parent directories used by the raw newc credential
+    // members loaded after this initrd. The kernel initramfs unpacker does not
+    // synthesize missing parents for file-only archive entries.
+    std.log.scoped(.initrd_build).info("initrd build: stage 6/7 - creating credential capsule directories", .{});
+    for ([_][]const u8{"capsule"}) |directory| {
+        const capsule_dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ initrd_root, directory });
+        try std.Io.Dir.cwd().createDirPath(io, capsule_dir);
+    }
     // vendor initrd 不保证在 archive 中保留空的伪文件系统挂载点。
     // nodeforge-initrd 作为 PID 1 会在任何用户态工具之前直接 mount(2)
     // `/proc,/sys,/dev,/run`；目标目录缺失会以 ENOENT 报 MountFailed。

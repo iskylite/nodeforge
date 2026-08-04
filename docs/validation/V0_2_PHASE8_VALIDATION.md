@@ -1,8 +1,12 @@
 # v0.2 Phase 8 r97n0 QEMU 验证
 
+> 历史归档：本页和 `docs/archive/validation-fixtures/v0_2_qemu_full.sh` 只证明冻结的 v0.2 三 token capsule 协议，
+> 不属于 v0.4 发布验证。脚本会拒绝 v0.4 二进制；v0.4 必须使用
+> [`V0_4_FULL_VALIDATION_RUNBOOK.md`](V0_4_FULL_VALIDATION_RUNBOOK.md)。
+
 日期：2026-07-23（2026-07-24 复验：同步已提交源码并改用本地交叉编译+同步工作流）  
 主机：`r97n0`（aarch64，Rocky Linux 9.7）  
-验证脚本：`tests/v0_2_qemu_full.sh`
+验证脚本：`docs/archive/validation-fixtures/v0_2_qemu_full.sh`
 
 ## 构建与验证工作流
 
@@ -11,7 +15,8 @@
 
 - 本地（macOS arm64）：`zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe`
 - 同步到 r97n0：`rsync -az --delete zig-out/bin/ root@r97n0:/root/NodeForge/zig-out/bin/`
-- `tests/v0_2_qemu_full.sh`、`tests/v0_2_rootfs_build.sh` 不再 `zig build`，改为校验
+- 历史夹具 `docs/archive/validation-fixtures/v0_2_qemu_full.sh` 与当前
+  `tests/v0_2_rootfs_build.sh` 不再 `zig build`，改为校验
   `zig-out/bin/{nodeforge,nodeforged,nodeforge-agent,nodeforge-initrd}` 已存在（缺失即 fail
   并提示本地交叉编译+同步）。
 
@@ -57,7 +62,7 @@ action=archive|script|package` 已实现。
   从 Profile build projection 构建内容寻址 rootfs：OS 层经发行版原生 install-root 工具
   （`dnf --installroot`，`src/provision/rootfs_os_builder.zig`）从 install source 受管 repository
   构建 chroot 基线 -> 叠加 rootfs-build phase 步骤（`rootfs_build_executor`，复用 first_boot 渲染）
-  -> `mksquashfs` -> 按 `rootfs_input_digest` 内容寻址登记（同 register 的 SHA-512 流式 + 幂等）。
+  -> `mksquashfs` -> 按 `rootfs_input_digest` 内容寻址发布（SHA-512 流式 + 幂等）。
 - OS 层构建使用 `file://` 指向构建主机本地 `repos_dir`（设计 file:// at build time），避免构建期
   dnf 回连本 daemon 造成自死锁；rootfs-build package action 同样以 `dnf --installroot` 在 host
   上下文从本地 `file://` 受管源安装到 staging（`rootfs_build_executor` package 步骤标记 `chroot=false`，
@@ -69,7 +74,7 @@ action=archive|script|package` 已实现。
   package action（`--installroot` + `tree`）于 2026-07-24 在 r97n0 端到端验证通过（`tests/v0_2_rootfs_build.sh`）：以 `dnf --installroot` 从本地 `file://` 源安装 `tree` 到 staging，产物内 `/usr/bin/tree` 可执行校验通过；二次构建命中缓存返回 `already_present`。
 - `tests/v0_2_rootfs_build.sh` 为可复现夹具（catalog 注入 + 仓库 symlink + 验证）。
 
-QEMU 全量验证重跑通过（`tests/v0_2_qemu_full.sh`，2026-07-23）：修复夹具中仓库 `base_url` 丢失
+QEMU 全量验证重跑通过（`docs/archive/validation-fixtures/v0_2_qemu_full.sh`，2026-07-23）：修复夹具中仓库 `base_url` 丢失
 `/Minimal` 子路径与缺失仓库文件两项问题（first-boot package action 因此可刷新元数据），并使
 first-boot agent 追加写 `firstboot.log`（diskless 下位于 volatile tmpfs，每次启动为空），保留验证
 二次执行的首次运行证据。rootfs-build package action `--installroot` 端到端已于 2026-07-24 验证通过（见上）；

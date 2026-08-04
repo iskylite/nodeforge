@@ -139,7 +139,8 @@ attempt；外部 401/403 探测不消耗预算。retry 以 If-Match 原子清 ga
 
 v0.1 `boot_session.Store` 以进程内 registry 为主，且 `boot_session_store` 明确只恢复 install；v0.2 必须
 新增 diskless delivery record：session/node/profile/kind、phase/event_seq、desired/config/rootfs/AgentPlan/payload digest、cache
-pin、config/rootfs/agent/event token claim 的 HMAC/hash（不存原 token）、scope/expiry/path allowlist、capsule delivery started/completed 审计位、failure bucket、
+pin、跨网络跳变 event token claim 的 HMAC/hash（不存原 token）、expiry/event-seq、
+短时 boot-session capability 状态、capsule delivery started/completed 审计位、failure bucket、
 created/last-progress wall time。
 未过期 session 仅在 delivery snapshot 完整时恢复；快照缺失、digest 漂移或 claim 无法验证时终止为
 `session.recovery_incomplete`，禁止重新编译计划续跑。

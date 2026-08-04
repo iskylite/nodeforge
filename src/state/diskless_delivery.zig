@@ -1,15 +1,16 @@
-//! # v0.2 无盘投递会话 + 作用域令牌存储
+//! # v0.4 diskless delivery + lifecycle capability store
 //!
 //! 自包含的 diskless 交付子系统：按 session 持有节点/profile/rootfs 定位器、
-//! 固定的 AgentPlan（immutable bytes + digest）以及 config/rootfs/agent/event 四类
-//! scoped token 的 HMAC hash + claim。raw token 只返回给调用方（capsule/响应），
-//! 持久化保存 [`diskless_credential.hashOf`] 及绑定完整 claim 的 MAC；raw token
-//! 仅驻进程内存并可由 master secret 确定性重建。session 持久化到
+//! 固定的 AgentPlan（immutable bytes + digest）以及跨网络切换使用的单一
+//! event token。BootConfig/rootfs/payload 由 boot-session 的 DHCP peer/session
+//! binding 认证，AgentPlan 才使用短时 boot-session capability；本 store 不保存
+//! 读取 token。event raw token 仅驻进程内存，
+//! 可由 master secret 确定性重建。session 持久化到
 //! `diskless-delivery.json`，跨 daemon 重启可验证（HMAC secret 也持久化）。
 //!
-//! 这是 install [`boot_session.Store`] 之外的独立 diskless 通路：install session
-//! 与 DHCP 耦合，diskless 用 capsule 交付的 scoped token 引导。两类 store 的
-//! persistence/credential 语义不同；管理投影在 node list/show 层统一。
+//! 这是与 [`boot_session.Store`] 配对的 diskless delivery/lifecycle 记录：canonical
+//! boot session 负责 DHCP peer 与短时 capability，capsule 只交付 delivery session id
+//! 和 event credential。管理投影在 node list/show 层统一。
 const std = @import("std");
 const cred = @import("diskless_credential.zig");
 const lifecycle = @import("diskless_session.zig");
@@ -26,14 +27,15 @@ pub const kernel_cap = 64;
 pub const agent_plan_cap = 16384;
 pub const default_ttl_seconds: i64 = 2 * 60 * 60;
 /// schema 3 adds mandatory per-slot claim MACs and directly replaces v1/v2;
-/// the reader intentionally accepts only this latest schema.
-/// Reader compatibility for schema 1 is explicit because both the historical
-/// (`created_at`/`started_at`) and the briefly emitted renamed shape used v1.
-pub const persistence_schema_version: u32 = 3;
+/// schema 4 fixes the durable model to `event-only-v1`. BootConfig/rootfs/
+/// AgentPlan access uses a separate random in-memory BootSession capability;
+/// old per-scope token checkpoints are rejected fail-closed.
+pub const persistence_schema_version: u32 = 4;
 
-/// 加载或首次创建 diskless capability master secret。文件保存 32-byte secret
+/// 加载或首次创建 daemon 主密钥（daemon_secret）。文件保存 32-byte secret
 /// 的 64 位小写 hex，权限固定 0600；格式损坏时拒绝启动，绝不静默换密钥使活动
-/// session 全部变成不可恢复状态。
+/// session 全部变成不可恢复状态。v0.4 中它只用于 diskless event 和
+/// first-boot 等必须跨网络或 daemon restart 的确定性凭证。
 pub fn loadOrCreateSecret(io: std.Io, allocator: std.mem.Allocator, path: []const u8, secret: *[32]u8) !void {
     const existing = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(65)) catch |err| switch (err) {
         error.FileNotFound => {
@@ -56,7 +58,7 @@ pub fn loadOrCreateSecret(io: std.Io, allocator: std.mem.Allocator, path: []cons
 pub const TokenSlot = struct {
     issued: bool = false,
     hash: [hash_len]u8 = [_]u8{0} ** hash_len,
-    scope: cred.Scope = .config_read,
+    scope: cred.Scope = .event_append,
     content_digest: [sha512_len]u8 = [_]u8{0} ** sha512_len,
     content_len: u8 = 0,
     expires_mono: i64 = 0,
@@ -93,20 +95,14 @@ pub const Session = struct {
     finished_at: i64 = 0,
     expires_at: i64 = 0,
     phase: lifecycle.Phase = .boot_tftp_complete,
-    config_token: TokenSlot = .{},
-    rootfs_token: TokenSlot = .{ .scope = .rootfs_read },
-    agent_token: TokenSlot = .{ .scope = .agent_read },
     event_token: TokenSlot = .{ .scope = .event_append },
-    /// raw token 只驻内存（不落盘）；boot-config 响应重放时返回相同 bytes。
-    config_token_raw: [token_len]u8 = [_]u8{0} ** token_len,
-    rootfs_token_raw: [token_len]u8 = [_]u8{0} ** token_len,
-    agent_token_raw: [token_len]u8 = [_]u8{0} ** token_len,
+    /// raw event token 只驻内存（不落盘）；capsule 重放时返回相同 bytes。
     event_token_raw: [token_len]u8 = [_]u8{0} ** token_len,
-    /// v0.2.3: 非 persistent 运行时标志。当 daemon 重启后无法安全重构同一
-    /// capability（master secret 变化或 hash 不匹配）时设为 true。该 session
-    /// 的全部 scope 不可用（HTTP 请求返回 capability.recovery_incomplete），
-    /// 不可自动恢复，按 TTL 自然过期后槽位回收。不改变持久化 canonical phase。
-    /// terminal phase session 不重构 capability，此标志保持 false。
+    /// 非 persistent 运行时标志。daemon 重启后若唯一 durable event token
+    /// 因 master secret 变化或 hash 不匹配而无法安全重构，则设为 true。
+    /// 这只关闭 `event:append`；读取链使用 BootSession authority 重新 bootstrap
+    /// 的随机内存 capability，不由本 store 恢复。session 按 TTL 回收且不改变
+    /// 持久 canonical phase；terminal session 不重构 event token。
     recovery_incomplete: bool = false,
 
     pub fn nodeId(self: *const Session) []const u8 {
@@ -135,21 +131,24 @@ pub const Session = struct {
 pub const Store = struct {
     allocator: std.mem.Allocator,
     secret: []const u8,
+    /// deployment_id 参与 durable event token 的域分离派生，使同一 master
+    /// secret 在不同 deployment 之间产生不兼容凭证。由 `init` 绑定。
+    deployment_id: []const u8,
     sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions,
     path: []const u8,
     revision: u64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, secret: []const u8, path: []const u8) Store {
-        return .{ .allocator = allocator, .secret = secret, .path = path };
+    pub fn init(allocator: std.mem.Allocator, secret: []const u8, deployment_id: []const u8, path: []const u8) Store {
+        return .{ .allocator = allocator, .secret = secret, .deployment_id = deployment_id, .path = path };
     }
 
     pub fn deinit(self: *Store) void {
         _ = self;
     }
 
-    /// 从 checkpoint 恢复尚未过期的 delivery session。raw capability 不在 JSON
-    /// 中；它由持久 master secret + session/scope 确定性重建，并再次核对保存的
-    /// HMAC hash，避免损坏 checkpoint 静默扩大权限。
+    /// 从 checkpoint 恢复尚未过期的 delivery session。这里只重构不落盘的 raw
+    /// `event:append` token，并核对持久 HMAC hash；随机 boot-session capability
+    /// 属于 BootSession store，restart 后必须由同 lease peer 重新 bootstrap。
     pub fn load(self: *Store, io: std.Io, now_mono: i64, now_utc: i64) !usize {
         if (self.path.len == 0) return 0;
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, self.path, self.allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
@@ -161,8 +160,10 @@ pub const Store = struct {
         defer header.deinit();
         switch (header.value.schema_version) {
             persistence_schema_version => {
-                const parsed = try std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always });
+                const parsed = std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always }) catch
+                    return error.InvalidDisklessDeliveryStore;
                 defer parsed.deinit();
+                if (!std.mem.eql(u8, parsed.value.credential_model, "event-only-v1")) return error.InvalidDisklessDeliveryStore;
                 return self.restorePersisted(parsed.value.revision, parsed.value.sessions, now_mono, now_utc);
             },
             else => return error.InvalidDisklessDeliveryStore,
@@ -181,18 +182,13 @@ pub const Store = struct {
             var session = try restoreSession(item, now_mono, now_utc);
             try requireClaimMacs(&session);
             if (session.phase.isTerminal()) {
-                // v0.2.3: terminal phase session 保留长期状态投影给 node list，
-                // 但不重构四类 raw token。terminal session 的四个 slot 在内存中
-                // 保持不可认证，任何 capability 请求均拒绝。
-                session.config_token.issued = false;
-                session.rootfs_token.issued = false;
-                session.agent_token.issued = false;
+                // Terminal facts remain visible, but lifecycle authority is gone.
                 session.event_token.issued = false;
             } else {
                 // 非 terminal 且未过期 session 才执行确定性重构和 hash 验证。
                 // 任一重构 token 与合法长度 hash 不匹配时，不恢复任何 scope、
                 // 清零已重构 raw bytes 并设 recovery_incomplete；其他 session 继续。
-                try reconstructAllOrMarkIncomplete(self.secret, &session);
+                try reconstructAllOrMarkIncomplete(self, &session);
                 // token hash 不匹配维持 recovery_incomplete 语义；只有 token 本身
                 // 可重构时，claim MAC 不匹配才证明 checkpoint claim 被篡改。
                 if (!session.recovery_incomplete) try verifyClaimMacs(self.secret, &session);
@@ -219,6 +215,7 @@ pub const Store = struct {
             count += 1;
         }
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, PersistedFile{
+            .credential_model = "event-only-v1",
             .revision = self.revision,
             .sessions = compact[0..count],
         }, .{ .whitespace = .indent_2 });
@@ -232,7 +229,7 @@ pub const Store = struct {
     }
 
     /// 创建一个 diskless session（不签发 token）。返回新 session 的只读引用；
-    /// config/agent/event token 由 prepare/boot-config 分别签发。
+    /// event token 由 prepare 签发；读取认证属于 boot-session store。
     pub fn begin(self: *Store, io: std.Io, node_id: []const u8, profile: []const u8, rootfs_input_digest: []const u8, rootfs_sha512: []const u8, rootfs_size: u64, rootfs_uncompressed_size: u64, kernel_release: []const u8, tmpfs_percent: u8, minimum_free_bytes: u64, safety_margin_bytes: u64, now_mono: i64, now_utc: i64) !*Session {
         // 同节点新 delivery 原位取代旧终态快照；每个节点最多保留一条长期事实。
         // 保存原值，checkpoint 失败时完整回滚。
@@ -262,15 +259,6 @@ pub const Store = struct {
         s.safety_margin_bytes = safety_margin_bytes;
         s.kernel_len = @intCast(@min(kernel_release.len, kernel_cap));
         @memcpy(s.kernel_buf[0..s.kernel_len], kernel_release[0..s.kernel_len]);
-        // config token 随会话过期；将内容绑定到 rootfs sha512。
-        s.config_token = .{ .issued = false, .scope = .config_read, .expires_mono = now_mono + default_ttl_seconds };
-        const cd_len = @min(sh_len, sha512_len);
-        @memcpy(s.config_token.content_digest[0..cd_len], rootfs_sha512[0..cd_len]);
-        s.config_token.content_len = @intCast(cd_len);
-        s.rootfs_token = .{ .issued = false, .scope = .rootfs_read, .expires_mono = now_mono + default_ttl_seconds };
-        @memcpy(s.rootfs_token.content_digest[0..cd_len], rootfs_sha512[0..cd_len]);
-        s.rootfs_token.content_len = @intCast(cd_len);
-        s.agent_token = .{ .issued = false, .scope = .agent_read, .expires_mono = now_mono + default_ttl_seconds };
         s.event_token = .{ .issued = false, .scope = .event_append, .expires_mono = now_mono + default_ttl_seconds };
         self.sessions[slot] = s;
         self.persist(io) catch {
@@ -299,59 +287,31 @@ pub const Store = struct {
         const s = self.find(session_id) orelse return error.DisklessSessionNotFound;
         const slot = self.slotOf(s, slot_kind);
         const previous_slot = slot.*;
-        const previous_raw = switch (slot_kind) {
-            .config => s.config_token_raw,
-            .rootfs => s.rootfs_token_raw,
-            .agent => s.agent_token_raw,
-            .event => s.event_token_raw,
-        };
+        const previous_raw = s.event_token_raw;
         var raw: [token_len]u8 = undefined;
-        deriveToken(self.secret, &s.session_id, slot_kind, &raw);
+        deriveToken(self, &s.session_id, slot_kind, &raw);
         slot.hash = cred.hashOf(&raw, self.secret);
         slot.issued = true;
-        switch (slot_kind) {
-            .config => @memcpy(&s.config_token_raw, &raw),
-            .rootfs => @memcpy(&s.rootfs_token_raw, &raw),
-            .agent => @memcpy(&s.agent_token_raw, &raw),
-            .event => @memcpy(&s.event_token_raw, &raw),
-        }
-        if (slot_kind == .agent) {
-            const cd_len = @min(s.agent_plan_digest.len, digest_len);
-            @memcpy(slot.content_digest[0..cd_len], s.agent_plan_digest[0..cd_len]);
-            slot.content_len = @intCast(cd_len);
-        }
+        @memcpy(&s.event_token_raw, &raw);
         self.persist(io) catch |err| {
             slot.* = previous_slot;
-            switch (slot_kind) {
-                .config => s.config_token_raw = previous_raw,
-                .rootfs => s.rootfs_token_raw = previous_raw,
-                .agent => s.agent_token_raw = previous_raw,
-                .event => s.event_token_raw = previous_raw,
-            }
+            s.event_token_raw = previous_raw;
             return err;
         };
     }
 
     pub fn rawToken(self: *Store, s: *const Session, kind: SlotKind) []const u8 {
         _ = self;
-        return switch (kind) {
-            .config => &s.config_token_raw,
-            .rootfs => &s.rootfs_token_raw,
-            .agent => &s.agent_token_raw,
-            .event => &s.event_token_raw,
-        };
+        _ = kind;
+        return &s.event_token_raw;
     }
 
-    pub const SlotKind = enum { config, rootfs, agent, event };
+    pub const SlotKind = enum { event };
 
     fn slotOf(self: *Store, s: *Session, kind: SlotKind) *TokenSlot {
         _ = self;
-        return switch (kind) {
-            .config => &s.config_token,
-            .rootfs => &s.rootfs_token,
-            .agent => &s.agent_token,
-            .event => &s.event_token,
-        };
+        _ = kind;
+        return &s.event_token;
     }
 
     /// 校验 raw token：定位 session（按 session_id），取对应 slot 的 hash + claim，
@@ -466,28 +426,13 @@ pub const Store = struct {
         const session = self.find(session_id) orelse return error.DisklessSessionNotFound;
         const slot = self.slotOf(session, kind);
         const previous_slot = slot.*;
-        const previous_raw = switch (kind) {
-            .config => session.config_token_raw,
-            .rootfs => session.rootfs_token_raw,
-            .agent => session.agent_token_raw,
-            .event => session.event_token_raw,
-        };
+        const previous_raw = session.event_token_raw;
         slot.issued = false;
         @memset(&slot.hash, 0);
-        switch (kind) {
-            .config => @memset(&session.config_token_raw, 0),
-            .rootfs => @memset(&session.rootfs_token_raw, 0),
-            .agent => @memset(&session.agent_token_raw, 0),
-            .event => @memset(&session.event_token_raw, 0),
-        }
+        @memset(&session.event_token_raw, 0);
         self.persist(io) catch |err| {
             slot.* = previous_slot;
-            switch (kind) {
-                .config => session.config_token_raw = previous_raw,
-                .rootfs => session.rootfs_token_raw = previous_raw,
-                .agent => session.agent_token_raw = previous_raw,
-                .event => session.event_token_raw = previous_raw,
-            }
+            session.event_token_raw = previous_raw;
             return err;
         };
     }
@@ -529,9 +474,6 @@ const PersistedSession = struct {
     finished_at: i64 = 0,
     expires_at: i64,
     phase: lifecycle.Phase,
-    config_token: PersistedSlot,
-    rootfs_token: PersistedSlot,
-    agent_token: PersistedSlot,
     event_token: PersistedSlot,
 };
 
@@ -541,6 +483,7 @@ const PersistedHeader = struct {
 
 const PersistedFile = struct {
     schema_version: u32 = persistence_schema_version,
+    credential_model: []const u8,
     revision: u64 = 0,
     sessions: []const PersistedSession = &.{},
 };
@@ -557,8 +500,8 @@ fn persistedSlot(slot: *const TokenSlot) PersistedSlot {
     };
 }
 
-/// 将内存中的 session 投影为可持久化形式：四类 capability 只存 hash+claim，
-/// raw token 从不落盘。
+/// 将内存中的 session 投影为可持久化形式：event capability 只存 hash+claim，
+/// raw token 从不落盘；读取 token 不属于该 schema。
 fn persistedSession(session: *const Session) PersistedSession {
     return .{
         .session_id = &session.session_id,
@@ -579,9 +522,6 @@ fn persistedSession(session: *const Session) PersistedSession {
         .finished_at = session.finished_at,
         .expires_at = session.expires_at,
         .phase = session.phase,
-        .config_token = persistedSlot(&session.config_token),
-        .rootfs_token = persistedSlot(&session.rootfs_token),
-        .agent_token = persistedSlot(&session.agent_token),
         .event_token = persistedSlot(&session.event_token),
     };
 }
@@ -623,9 +563,6 @@ fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session 
     @memcpy(session.agent_plan_buf[0..session.agent_plan_len], item.agent_plan_json);
     @memcpy(&session.agent_plan_digest, item.agent_plan_digest);
     const remaining = item.expires_at - now_utc;
-    session.config_token = try restoreSlot(item.config_token, now_mono + remaining);
-    session.rootfs_token = try restoreSlot(item.rootfs_token, now_mono + remaining);
-    session.agent_token = try restoreSlot(item.agent_token, now_mono + remaining);
     session.event_token = try restoreSlot(item.event_token, now_mono + remaining);
     return session;
 }
@@ -680,24 +617,15 @@ fn claimMac(secret: []const u8, session: *const Session, kind: Store.SlotKind, s
 }
 
 fn refreshClaimMacs(secret: []const u8, session: *Session) void {
-    session.config_token.claim_mac = claimMac(secret, session, .config, &session.config_token);
-    session.rootfs_token.claim_mac = claimMac(secret, session, .rootfs, &session.rootfs_token);
-    session.agent_token.claim_mac = claimMac(secret, session, .agent, &session.agent_token);
     session.event_token.claim_mac = claimMac(secret, session, .event, &session.event_token);
 }
 
 fn verifyClaimMacs(secret: []const u8, session: *const Session) !void {
-    try verifyClaimMac(secret, session, .config, &session.config_token);
-    try verifyClaimMac(secret, session, .rootfs, &session.rootfs_token);
-    try verifyClaimMac(secret, session, .agent, &session.agent_token);
     try verifyClaimMac(secret, session, .event, &session.event_token);
 }
 
 fn requireClaimMacs(session: *const Session) !void {
-    if (std.mem.allEqual(u8, &session.config_token.claim_mac, 0) or
-        std.mem.allEqual(u8, &session.rootfs_token.claim_mac, 0) or
-        std.mem.allEqual(u8, &session.agent_token.claim_mac, 0) or
-        std.mem.allEqual(u8, &session.event_token.claim_mac, 0))
+    if (std.mem.allEqual(u8, &session.event_token.claim_mac, 0))
         return error.InvalidDisklessDeliveryStore;
 }
 
@@ -708,23 +636,19 @@ fn verifyClaimMac(secret: []const u8, session: *const Session, kind: Store.SlotK
     if (!std.crypto.timing_safe.eql([hash_len]u8, expected, slot.claim_mac)) return error.InvalidDisklessDeliveryStore;
 }
 
-/// 从 master secret + session_id + capability kind 确定性派生 raw token
-/// （HMAC-SHA256 -> 64 位 hex）。确定性是 session 跨 daemon 重启可恢复的关键：
-/// 重启后用同一 secret+session_id+kind 重构出与签发时完全相同的 raw token。
+/// 从 master secret + deployment_id + session_id + `event:append` audience
+/// 确定性派生唯一 durable token，复用共享域分离原语。
+///
+/// 确定性是 session 跨 daemon 重启可恢复的关键：重启后用同一 secret +
+/// deployment_id + session_id + scope 重构出与签发时完全相同的 raw token。
 /// raw token 本身从不持久化，内存只存 `cred.hashOf(raw, secret)`。
-fn deriveToken(secret: []const u8, session_id: []const u8, kind: Store.SlotKind, destination: *[token_len]u8) void {
-    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(secret);
-    hmac.update("nodeforge-diskless-capability-v1\x00");
-    hmac.update(session_id);
-    hmac.update(switch (kind) {
-        .config => "\x00config",
-        .rootfs => "\x00rootfs",
-        .agent => "\x00agent",
-        .event => "\x00event",
-    });
-    var mac: [32]u8 = undefined;
-    hmac.final(&mac);
-    _ = std.fmt.bufPrint(destination, "{x}", .{mac}) catch unreachable;
+///
+/// audience 固定为 `event:append`，resource_id = session_id；generation/counter
+/// 固定 0（diskless delivery 无 generation/counter 概念）。
+fn deriveToken(self: *const Store, session_id: []const u8, kind: Store.SlotKind, destination: *[token_len]u8) void {
+    _ = kind;
+    const scope: cred.Scope = .event_append;
+    cred.deriveToken(destination, self.secret, self.deployment_id, scope.canonicalName(), session_id, 0, 0);
 }
 
 /// 重启恢复：用 `deriveToken` 重构 raw token，再与持久化 hash 比对验证。
@@ -734,45 +658,29 @@ fn deriveToken(secret: []const u8, session_id: []const u8, kind: Store.SlotKind,
 /// - hash 长度非法、claim 篡改、session id 篡改等结构性损坏 →
 ///   `InvalidDisklessDeliveryStore`（daemon 拒绝启动）
 /// terminal phase session 不调用此函数（由 `restorePersisted` 跳过）。
-fn reconstructAndVerifyRaw(secret: []const u8, session: *Session, kind: Store.SlotKind) !void {
-    const slot = switch (kind) {
-        .config => &session.config_token,
-        .rootfs => &session.rootfs_token,
-        .agent => &session.agent_token,
-        .event => &session.event_token,
-    };
+fn reconstructAndVerifyRaw(self: *const Store, session: *Session, kind: Store.SlotKind) !void {
+    const slot = &session.event_token;
     if (!slot.issued) return;
-    const raw = switch (kind) {
-        .config => &session.config_token_raw,
-        .rootfs => &session.rootfs_token_raw,
-        .agent => &session.agent_token_raw,
-        .event => &session.event_token_raw,
-    };
-    deriveToken(secret, &session.session_id, kind, raw);
-    const computed = cred.hashOf(raw, secret);
+    const raw = &session.event_token_raw;
+    deriveToken(self, &session.session_id, kind, raw);
+    const computed = cred.hashOf(raw, self.secret);
     if (!std.mem.eql(u8, &computed, &slot.hash)) return error.CapabilityRecoveryMismatch;
 }
 
-/// v0.2.3: Attempt to reconstruct all four scoped tokens. If any hash mismatch
-/// is found, mark the session as recovery_incomplete and clear all raw tokens.
-fn reconstructAllOrMarkIncomplete(secret: []const u8, session: *Session) !void {
-    const kinds = [_]Store.SlotKind{ .config, .rootfs, .agent, .event };
+/// Reconstruct the only durable scoped token (event). A hash mismatch marks the
+/// delivery recovery-incomplete and clears the raw token.
+fn reconstructAllOrMarkIncomplete(self: *const Store, session: *Session) !void {
+    const kinds = [_]Store.SlotKind{.event};
     for (kinds) |kind| {
-        reconstructAndVerifyRaw(secret, session, kind) catch |err| switch (err) {
+        reconstructAndVerifyRaw(self, session, kind) catch |err| switch (err) {
             // hash 内容不匹配（master secret 变化或 hash 被篡改）：
-            // 标记该 session 为 recovery_incomplete，全部 scope 不可用。
+            // 标记该 session 为 recovery_incomplete，durable event token 不可用。
             // 若 reconstructAndVerifyRaw 未来增加结构性损坏错误（如
             // InvalidDisklessDeliveryStore），编译器会在此处强制要求显式处理，
             // 确保结构性损坏不会降级为 recovery_incomplete。
             error.CapabilityRecoveryMismatch => {
                 session.recovery_incomplete = true;
-                @memset(&session.config_token_raw, 0);
-                @memset(&session.rootfs_token_raw, 0);
-                @memset(&session.agent_token_raw, 0);
                 @memset(&session.event_token_raw, 0);
-                session.config_token.issued = false;
-                session.rootfs_token.issued = false;
-                session.agent_token.issued = false;
                 session.event_token.issued = false;
                 return;
             },
@@ -809,7 +717,7 @@ fn hex(nibble: u8) u8 {
     return if (nibble < 10) '0' + nibble else 'a' + (nibble - 10);
 }
 
-test "delivery checkpoint restores session and reconstructs raw capabilities" {
+test "event-only checkpoint restores lifecycle capability without raw token" {
     var temp = std.testing.tmpDir(.{});
     defer temp.cleanup();
     const path = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -818,7 +726,7 @@ test "delivery checkpoint restores session and reconstructs raw capabilities" {
     defer std.testing.allocator.free(checkpoint);
     const secret = [_]u8{0x5a} ** 32;
 
-    var before = Store.init(std.testing.allocator, &secret, checkpoint);
+    var before = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     const session = try before.begin(
         std.testing.io,
         "node-1",
@@ -836,44 +744,36 @@ test "delivery checkpoint restores session and reconstructs raw capabilities" {
     );
     const session_id = session.session_id;
     try before.pinAgentPlan(std.testing.io, &session_id, "{\"schema_version\":1}");
-    try before.issue(std.testing.io, &session_id, .config);
-    try before.issue(std.testing.io, &session_id, .rootfs);
-    try before.issue(std.testing.io, &session_id, .agent);
     try before.issue(std.testing.io, &session_id, .event);
-    const config_raw = session.config_token_raw;
-    const rootfs_raw = session.rootfs_token_raw;
-    const agent_raw = session.agent_token_raw;
     const event_raw = session.event_token_raw;
 
     const persisted = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(persisted);
-    try std.testing.expect(std.mem.indexOf(u8, persisted, &config_raw) == null);
-    try std.testing.expect(std.mem.indexOf(u8, persisted, &rootfs_raw) == null);
-    try std.testing.expect(std.mem.indexOf(u8, persisted, &agent_raw) == null);
     try std.testing.expect(std.mem.indexOf(u8, persisted, &event_raw) == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "\"credential_model\": \"event-only-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "config_token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "rootfs_token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "agent_token") == null);
 
-    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1010));
     const restored = after.find(&session_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 4096), restored.rootfs_size);
     try std.testing.expectEqual(@as(u64, 16384), restored.rootfs_uncompressed_size);
-    try std.testing.expectEqualSlices(u8, &config_raw, &restored.config_token_raw);
-    try std.testing.expectEqualSlices(u8, &rootfs_raw, &restored.rootfs_token_raw);
-    try std.testing.expectEqualSlices(u8, &agent_raw, &restored.agent_token_raw);
     try std.testing.expectEqualSlices(u8, &event_raw, &restored.event_token_raw);
     try std.testing.expectEqual(cred.Decision.ok, after.verify(
         &session_id,
-        &restored.config_token_raw,
-        .config,
+        &restored.event_token_raw,
+        .event,
         "node-1",
         "",
-        restored.rootfsSha512(),
+        "",
         0,
         11,
     ));
 }
 
-test "checkpoint schema direct replacement rejects v1 and v2" {
+test "checkpoint rejects legacy schemas and pre-simplification v4" {
     var temp = std.testing.tmpDir(.{});
     defer temp.cleanup();
     const dir = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -882,18 +782,18 @@ test "checkpoint schema direct replacement rejects v1 and v2" {
     defer std.testing.allocator.free(checkpoint);
     const secret = [_]u8{0x61} ** 32;
 
-    for ([_]u32{ 1, 2 }) |version| {
+    for ([_]u32{ 1, 2, 3, 4 }) |version| {
         const bytes = try std.fmt.allocPrint(std.testing.allocator, "{{\"schema_version\":{d},\"revision\":0,\"sessions\":[]}}", .{version});
         defer std.testing.allocator.free(bytes);
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = bytes });
-        var store = Store.init(std.testing.allocator, &secret, checkpoint);
+        var store = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
         try std.testing.expectError(error.InvalidDisklessDeliveryStore, store.load(std.testing.io, 100, 1000));
     }
 }
 
 test "diskless event CAS is ordered and exact retry is idempotent" {
     const secret = [_]u8{0x33} ** 32;
-    var store = Store.init(std.testing.allocator, &secret, "");
+    var store = Store.init(std.testing.allocator, &secret, "dep-test", "");
     const session = try store.begin(
         std.testing.io,
         "n1",
@@ -949,7 +849,7 @@ test "diskless event CAS is ordered and exact retry is idempotent" {
 
 test "missing rootfs uncompressed size remains unknown" {
     const secret = [_]u8{0x44} ** 32;
-    var store = Store.init(std.testing.allocator, &secret, "");
+    var store = Store.init(std.testing.allocator, &secret, "dep-test", "");
     const session = try store.begin(
         std.testing.io,
         "n-unknown",
@@ -977,7 +877,7 @@ test "terminal phase session restores without capability reconstruction" {
     defer std.testing.allocator.free(checkpoint);
     const secret = [_]u8{0x6b} ** 32;
 
-    var before = Store.init(std.testing.allocator, &secret, checkpoint);
+    var before = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     const session = try before.begin(
         std.testing.io,
         "node-term",
@@ -995,7 +895,6 @@ test "terminal phase session restores without capability reconstruction" {
     );
     const session_id = session.session_id;
     try before.pinAgentPlan(std.testing.io, &session_id, "{\"schema_version\":1}");
-    try before.issue(std.testing.io, &session_id, .config);
     try before.issue(std.testing.io, &session_id, .event);
     try before.markBootConfigFetched(std.testing.io, &session_id);
     try before.issue(std.testing.io, &session_id, .event);
@@ -1010,24 +909,21 @@ test "terminal phase session restores without capability reconstruction" {
     try std.testing.expect(before.find(&session_id).?.phase.isTerminal());
 
     // reload with same secret — terminal session should be restored but without capability
-    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1800));
     const restored = after.find(&session_id) orelse return error.TestExpectedEqual;
     try std.testing.expect(restored.phase.isTerminal());
     try std.testing.expectEqual(@as(bool, false), restored.recovery_incomplete);
-    // terminal session: all slots marked unissued
-    try std.testing.expectEqual(@as(bool, false), restored.config_token.issued);
-    try std.testing.expectEqual(@as(bool, false), restored.rootfs_token.issued);
-    try std.testing.expectEqual(@as(bool, false), restored.agent_token.issued);
+    // terminal session: lifecycle capability is revoked
     try std.testing.expectEqual(@as(bool, false), restored.event_token.issued);
     // verify returns invalid_token (not recovery_incomplete) for terminal session
     try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(
         &session_id,
-        &restored.config_token_raw,
-        .config,
+        &restored.event_token_raw,
+        .event,
         "node-term",
         "",
-        restored.rootfsSha512(),
+        "",
         0,
         11,
     ));
@@ -1036,7 +932,7 @@ test "terminal phase session restores without capability reconstruction" {
 /// 构造一个已持久化为 terminal（diskless.running）的 checkpoint 并返回
 /// session id 与文件字节，供 §6.3 语义冻结负测篡改。
 fn terminalCheckpointBytes(io: std.Io, allocator: std.mem.Allocator, path: []const u8, secret: []const u8) !struct { session_id: [id_len]u8, bytes: []u8 } {
-    var before = Store.init(allocator, secret, path);
+    var before = Store.init(allocator, secret, "dep-test", path);
     const session = try before.begin(
         io,
         "node-term",
@@ -1054,7 +950,6 @@ fn terminalCheckpointBytes(io: std.Io, allocator: std.mem.Allocator, path: []con
     );
     const session_id = session.session_id;
     try before.pinAgentPlan(io, &session_id, "{\"schema_version\":1}");
-    try before.issue(io, &session_id, .config);
     try before.issue(io, &session_id, .event);
     try before.markBootConfigFetched(io, &session_id);
     try before.issue(io, &session_id, .event);
@@ -1139,14 +1034,11 @@ test "v0.2.3: terminal session hash 内容篡改不 fail closed 且 capability �
     try tamperHash(helper.bytes, 0, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = helper.bytes });
 
-    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1800));
     const restored = after.find(&helper.session_id) orelse return error.TestExpectedEqual;
     try std.testing.expect(restored.phase.isTerminal());
-    // 四 scope 全部拒绝（terminal session 不重构 capability，slots 不可认证）。
-    try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(&helper.session_id, &restored.config_token_raw, .config, "node-term", "", restored.rootfsSha512(), 0, 11));
-    try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(&helper.session_id, &restored.rootfs_token_raw, .rootfs, "node-term", "/rootfs.squashfs", restored.rootfsSha512(), 0, 11));
-    try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(&helper.session_id, &restored.agent_token_raw, .agent, "node-term", "", "", 0, 11));
+    // Terminal session does not reconstruct lifecycle authority.
     try std.testing.expectEqual(cred.Decision.invalid_token, after.verify(&helper.session_id, &restored.event_token_raw, .event, "node-term", "", "", 1, 11));
 }
 
@@ -1164,7 +1056,7 @@ test "v0.2.3: terminal session hash 长度非法仍 fail closed" {
     const tampered = try shortenHash(std.testing.allocator, helper.bytes, 0, "aa");
     defer std.testing.allocator.free(tampered);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = tampered });
-    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1800));
 }
 
@@ -1176,19 +1068,19 @@ test "v0.2.3: non-terminal checkpoint claim tampering fails closed" {
     const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/claim-tamper.json", .{dir});
     defer std.testing.allocator.free(checkpoint);
     const secret = [_]u8{0x4d} ** 32;
-    var before = Store.init(std.testing.allocator, &secret, checkpoint);
+    var before = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     const session = try before.begin(std.testing.io, "node-claim", "profile-claim", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1, 2, "6.8.0", 50, 1, 1, 100, 1000);
     const session_id = session.session_id;
-    try before.issue(std.testing.io, &session_id, .config);
+    try before.issue(std.testing.io, &session_id, .event);
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(bytes);
-    const needle = "\"scope\": \"config_read\"";
+    const needle = "\"node_id\": \"node-claim\"";
     const pos = std.mem.indexOf(u8, bytes, needle) orelse return error.TestUnexpectedResult;
-    @memcpy(bytes[pos + "\"scope\": \"".len .. pos + "\"scope\": \"".len + "rootfs_read".len], "rootfs_read");
+    bytes[pos + "\"node_id\": \"node-".len] = 'X';
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = bytes });
 
-    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1010));
 }
 
@@ -1200,14 +1092,14 @@ test "checkpoint schema v3 requires every claim MAC" {
     const checkpoint = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing-mac.json", .{dir});
     defer std.testing.allocator.free(checkpoint);
     const secret = [_]u8{0x5e} ** 32;
-    var before = Store.init(std.testing.allocator, &secret, checkpoint);
+    var before = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     _ = try before.begin(std.testing.io, "node-mac", "profile-mac", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1, 2, "6.8.0", 50, 1, 1, 100, 1000);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(bytes);
     const missing = try shortenClaimMac(std.testing.allocator, bytes, "");
     defer std.testing.allocator.free(missing);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = missing });
-    var after = Store.init(std.testing.allocator, &secret, checkpoint);
+    var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
     try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1010));
 }
 
@@ -1221,7 +1113,7 @@ test "master secret change causes recovery_incomplete for non-terminal session" 
     const secret_original = [_]u8{0x7c} ** 32;
     const secret_changed = [_]u8{0x8d} ** 32;
 
-    var before = Store.init(std.testing.allocator, &secret_original, checkpoint);
+    var before = Store.init(std.testing.allocator, &secret_original, "dep-test", checkpoint);
     const session = try before.begin(
         std.testing.io,
         "node-rec",
@@ -1239,30 +1131,24 @@ test "master secret change causes recovery_incomplete for non-terminal session" 
     );
     const session_id = session.session_id;
     try before.pinAgentPlan(std.testing.io, &session_id, "{\"schema_version\":1}");
-    try before.issue(std.testing.io, &session_id, .config);
-    try before.issue(std.testing.io, &session_id, .rootfs);
-    try before.issue(std.testing.io, &session_id, .agent);
     try before.issue(std.testing.io, &session_id, .event);
     // session is non-terminal (boot_tftp_complete)
     try std.testing.expect(!before.find(&session_id).?.phase.isTerminal());
 
     // reload with different secret — hash won't match, should set recovery_incomplete
-    var after = Store.init(std.testing.allocator, &secret_changed, checkpoint);
+    var after = Store.init(std.testing.allocator, &secret_changed, "dep-test", checkpoint);
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1010));
     const restored = after.find(&session_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(bool, true), restored.recovery_incomplete);
-    try std.testing.expectEqual(@as(bool, false), restored.config_token.issued);
-    try std.testing.expectEqual(@as(bool, false), restored.rootfs_token.issued);
-    try std.testing.expectEqual(@as(bool, false), restored.agent_token.issued);
     try std.testing.expectEqual(@as(bool, false), restored.event_token.issued);
     // verify returns recovery_incomplete for this session
     try std.testing.expectEqual(cred.Decision.recovery_incomplete, after.verify(
         &session_id,
-        &restored.config_token_raw,
-        .config,
+        &restored.event_token_raw,
+        .event,
         "node-rec",
         "",
-        restored.rootfsSha512(),
+        "",
         0,
         11,
     ));
@@ -1278,7 +1164,7 @@ test "multiple sessions: recovery_incomplete only affects mismatched session" {
     const secret_original = [_]u8{0x9e} ** 32;
     const secret_changed = [_]u8{0xae} ** 32;
 
-    var before = Store.init(std.testing.allocator, &secret_original, checkpoint);
+    var before = Store.init(std.testing.allocator, &secret_original, "dep-test", checkpoint);
     // session 1: non-terminal, will have hash mismatch
     const session1 = try before.begin(
         std.testing.io,
@@ -1296,7 +1182,7 @@ test "multiple sessions: recovery_incomplete only affects mismatched session" {
         1000,
     );
     try before.pinAgentPlan(std.testing.io, &session1.session_id, "{\"schema_version\":1}");
-    try before.issue(std.testing.io, &session1.session_id, .config);
+    try before.issue(std.testing.io, &session1.session_id, .event);
 
     // session 2: terminal, should restore without issues
     const session2 = try before.begin(
@@ -1315,7 +1201,6 @@ test "multiple sessions: recovery_incomplete only affects mismatched session" {
         1000,
     );
     try before.pinAgentPlan(std.testing.io, &session2.session_id, "{\"schema_version\":2}");
-    try before.issue(std.testing.io, &session2.session_id, .config);
     try before.issue(std.testing.io, &session2.session_id, .event);
     try before.markBootConfigFetched(std.testing.io, &session2.session_id);
     try before.issue(std.testing.io, &session2.session_id, .event);
@@ -1328,7 +1213,7 @@ test "multiple sessions: recovery_incomplete only affects mismatched session" {
     _ = try before.advanceEvent(std.testing.io, &session2.session_id, .diskless_agent_configuring, .diskless_running, 6, 1700);
 
     // reload with different secret
-    var after = Store.init(std.testing.allocator, &secret_changed, checkpoint);
+    var after = Store.init(std.testing.allocator, &secret_changed, "dep-test", checkpoint);
     try std.testing.expectEqual(@as(usize, 2), try after.load(std.testing.io, 10, 1800));
 
     const restored1 = after.find(&session1.session_id) orelse return error.TestExpectedEqual;

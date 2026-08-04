@@ -158,7 +158,7 @@ test "kickstart consumes the effective node storage override" {
     const node: model.NodeConfig = .{ .id = "n1", .mac = "02:00:00:00:00:01", .arch = .aarch64, .profile = "rocky", .storage = .{ .boot_disk = "/dev/nvme0n1" } };
     var scratch: [1][]const u8 = undefined;
     const install = try effectiveInstall(&node, &profile, &scratch);
-    const answer = try kickstart.renderEffective(std.testing.allocator, &node, install, .{}, node.network, .{}, "ssh-key", "http://repo", &.{"http://repo"}, null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const answer = try kickstart.renderEffective(std.testing.allocator, &node, install, .{}, node.network, .{}, "ssh-key", "http://repo", &.{"http://repo"}, null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null, null);
     defer std.testing.allocator.free(answer);
     try std.testing.expect(std.mem.indexOf(u8, answer, "clearpart --all --initlabel --drives=nvme0n1") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "--drives=sda") == null);

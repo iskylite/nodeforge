@@ -9,7 +9,7 @@
 //!
 //! v0.2（原生 HTTP）：直接用 Zig 实现 HTTP/1.1 客户端，同时编译进
 //! `nodeforge-initrd` 与 `nodeforge-agent`，不依赖目标 initrd/rootfs 中的
-//! curl 或其共享库。支持 GET/HEAD/POST/Range，响应体可写入文件或内存。
+//! curl 或其共享库。支持 GET/HEAD/POST/PATCH/Range，响应体可写入文件或内存。
 //!
 //! ## 功能矩阵
 //!
@@ -297,8 +297,6 @@ pub fn post(
     return resp.status;
 }
 
-/// POST 并返回 2xx 响应体。daemon 的 TFTP worker 用它调用 loopback
-/// management boot-prepare；独立于 lifecycle `post` 的“丢弃 body”契约。
 pub fn postForBody(io: std.Io, allocator: std.mem.Allocator, url: Url, headers: []const Header, body: []const u8) ![]u8 {
     var stream = try connect(url, io, 30);
     defer stream.close(io);

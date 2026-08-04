@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Historical v0.2.1 hand-assembled rootfs fixture; not a current product test.
 # v0.2.1 mkinitramfs approach smoke test.
 #
 # Tests building initrd from rootfs via chroot mkinitramfs (NOT casper initrd reuse).

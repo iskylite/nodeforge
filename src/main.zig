@@ -393,6 +393,26 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(node_claim);
     try addDebugFlag(node_claim);
 
+    const node_discovery = try zli.Command.init(init_options, .{ .name = "discovery", .description = "Arm and inspect serial-number discovery" }, showCurrentHelp);
+    const node_discovery_start = try zli.Command.init(init_options, .{ .name = "start", .description = "Arm discovery for a serial-only draft" }, nodeDiscoveryStartHandler);
+    try node_discovery_start.addPositionalArg(.{ .name = "node_id", .description = "Serial-only draft node identifier", .required = true });
+    try node_discovery_start.addFlag(.{ .name = "expires-in", .description = "Discovery lifetime in seconds", .type = .Int, .default_value = .{ .Int = 1800 } });
+    try node_discovery_start.addFlag(.{ .name = "restart", .description = "Explicitly restart an expired/cancelled discovery state", .type = .Bool, .default_value = .{ .Bool = false } });
+    try addConfigPathFlag(node_discovery_start);
+    try addOutputFlag(node_discovery_start);
+    try addDebugFlag(node_discovery_start);
+    const node_discovery_status = try zli.Command.init(init_options, .{ .name = "status", .description = "Show node discovery state" }, nodeDiscoveryStatusHandler);
+    try node_discovery_status.addPositionalArg(.{ .name = "node_id", .description = "Node identifier", .required = true });
+    try addConfigPathFlag(node_discovery_status);
+    try addOutputFlag(node_discovery_status);
+    try addDebugFlag(node_discovery_status);
+    const node_discovery_cancel = try zli.Command.init(init_options, .{ .name = "cancel", .description = "Cancel pending node discovery" }, nodeDiscoveryCancelHandler);
+    try node_discovery_cancel.addPositionalArg(.{ .name = "node_id", .description = "Node identifier", .required = true });
+    try addConfigPathFlag(node_discovery_cancel);
+    try addOutputFlag(node_discovery_cancel);
+    try addDebugFlag(node_discovery_cancel);
+    try node_discovery.addCommands(&.{ node_discovery_start, node_discovery_status, node_discovery_cancel });
+
     const node_trace = try zli.Command.init(init_options, .{
         .name = "trace",
         .description = "Reconstruct one node boot-session timeline from local events",
@@ -425,6 +445,24 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addOutputFlag(node_readiness);
     try addDebugFlag(node_readiness);
 
+    const node_topology = try zli.Command.init(init_options, .{
+        .name = "topology",
+        .description = "Validate a v0.4 target network topology without changing catalog state",
+        .usage = "nodeforge node topology validate --network-json PATH --bootstrap-mac MAC [--deploy]",
+        .help = "BOND-CLI帮助: active-backup 的交换机端口不能配置 LACP；802.3ad 必须预建同一 LACP LAG，跨交换机需要 stack/MLAG/MC-LAG。VLAN、DHCP snooping、DAI、IP source guard 和 port security 可能阻断 bootstrap IP/MAC 迁移；请先满足交换机前置条件，再把 topology 作为 Node direct 配置提交。",
+    }, showCurrentHelp);
+    const node_topology_validate = try zli.Command.init(init_options, .{
+        .name = "validate",
+        .description = "Validate structured interfaces/bonds/vlans/routes JSON",
+        .usage = "nodeforge node topology validate --network-json PATH --bootstrap-mac MAC [options]",
+    }, topologyValidateHandler);
+    try node_topology_validate.addFlag(.{ .name = "network-json", .description = "Path to TargetNetworkConfig JSON", .type = .String, .default_value = .{ .String = "" } });
+    try node_topology_validate.addFlag(.{ .name = "bootstrap-mac", .description = "PXE bootstrap NIC permanent MAC", .type = .String, .default_value = .{ .String = "" } });
+    try node_topology_validate.addFlag(.{ .name = "deploy", .description = "Apply deployable checks, including bootstrap MAC and required L3 (default: false)", .type = .Bool, .default_value = .{ .Bool = false } });
+    try addOutputFlag(node_topology_validate);
+    try addDebugFlag(node_topology_validate);
+    try node_topology.addCommands(&.{node_topology_validate});
+
     const node_session = try zli.Command.init(init_options, .{ .name = "session", .description = "Inspect and cancel diskless delivery sessions" }, showCurrentHelp);
     const node_session_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List active diskless delivery sessions" }, disklessSessionListHandler);
     try addConfigPathFlag(node_session_list);
@@ -435,7 +473,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(node_session_show);
     try addOutputFlag(node_session_show);
     try addDebugFlag(node_session_show);
-    const node_session_cancel = try zli.Command.init(init_options, .{ .name = "cancel", .description = "Cancel a delivery session and revoke all of its capabilities" }, disklessSessionCancelHandler);
+    const node_session_cancel = try zli.Command.init(init_options, .{ .name = "cancel", .description = "Cancel a delivery session and revoke its durable event credential" }, disklessSessionCancelHandler);
     try node_session_cancel.addPositionalArg(.{ .name = "session_id", .description = "32-character delivery session identifier", .required = true });
     try addConfigPathFlag(node_session_cancel);
     try addOutputFlag(node_session_cancel);
@@ -451,7 +489,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addDebugFlag(node_postprocess_show);
     try node_postprocess.addCommands(&.{node_postprocess_show});
 
-    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_render, node_retry, node_deploy, node_trace, node_boot, node_readiness, node_postprocess, node_session });
+    try node.addCommands(&.{ node_list, node_show, node_add, node_set, node_unset, node_remove, node_claim, node_discovery, node_render, node_retry, node_deploy, node_trace, node_boot, node_readiness, node_topology, node_postprocess, node_session });
     try addValuesCommands(node, init_options, "node");
     try addItemCommands(node, init_options, "node");
     try addNodeSoftwareCommands(node, init_options);
@@ -522,19 +560,12 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_unset);
     try addOutputFlag(profile_unset);
     try addDebugFlag(profile_unset);
-    const profile_rootfs = try zli.Command.init(init_options, .{ .name = "rootfs", .description = "Compile and register diskless rootfs artifacts" }, showCurrentHelp);
+    const profile_rootfs = try zli.Command.init(init_options, .{ .name = "rootfs", .description = "Build and inspect nodeforged-owned diskless rootfs artifacts" }, showCurrentHelp);
     const profile_rootfs_plan = try zli.Command.init(init_options, .{ .name = "plan", .description = "Compile a diskless profile rootfs input digest and cache state", .usage = "nodeforge profile rootfs plan <profile> [options]" }, profileRootfsPlanHandler);
     try profile_rootfs_plan.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
     try addConfigPathFlag(profile_rootfs_plan);
     try addOutputFlag(profile_rootfs_plan);
     try addDebugFlag(profile_rootfs_plan);
-    const profile_rootfs_register = try zli.Command.init(init_options, .{ .name = "register", .description = "Register a prebuilt rootfs artifact for a diskless profile", .usage = "nodeforge profile rootfs register <profile> --path <file> [--uncompressed-size <bytes>] [options]" }, profileRootfsRegisterHandler);
-    try profile_rootfs_register.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
-    try profile_rootfs_register.addFlag(.{ .name = "path", .description = "Path to the prebuilt squashfs rootfs file", .type = .String, .default_value = .{ .String = "" } });
-    try profile_rootfs_register.addFlag(.{ .name = "uncompressed-size", .description = "Logical uncompressed rootfs bytes; allowed: 0 (unknown) or a positive integer", .type = .Int, .default_value = .{ .Int = 0 } });
-    try addConfigPathFlag(profile_rootfs_register);
-    try addOutputFlag(profile_rootfs_register);
-    try addDebugFlag(profile_rootfs_register);
     const profile_rootfs_build = try zli.Command.init(init_options, .{ .name = "build", .description = "Build a content-addressed rootfs artifact for a diskless profile from its build projection", .usage = "nodeforge profile rootfs build <profile> [--if-input-digest <hex>] [options]" }, profileRootfsBuildHandler);
     try profile_rootfs_build.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
     try profile_rootfs_build.addFlag(.{ .name = "if-input-digest", .description = "Only build if the current rootfs input digest matches (anti-drift)", .type = .String, .default_value = .{ .String = "" } });
@@ -544,13 +575,14 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_rootfs_build);
     try addOutputFlag(profile_rootfs_build);
     try addDebugFlag(profile_rootfs_build);
-    const profile_rootfs_status = try zli.Command.init(init_options, .{ .name = "status", .description = "Show the registered rootfs artifact for a diskless profile", .usage = "nodeforge profile rootfs status <profile> [options]" }, profileRootfsStatusHandler);
+    const profile_rootfs_status = try zli.Command.init(init_options, .{ .name = "status", .description = "Show the nodeforged-built rootfs artifact for a diskless profile", .usage = "nodeforge profile rootfs status <profile> [options]" }, profileRootfsStatusHandler);
     try profile_rootfs_status.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
     try addConfigPathFlag(profile_rootfs_status);
     try addOutputFlag(profile_rootfs_status);
     try addDebugFlag(profile_rootfs_status);
-    try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_build, profile_rootfs_register, profile_rootfs_status });
+    try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_build, profile_rootfs_status });
     try profile.addCommands(&.{ profile_create, profile_clone, profile_remove, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
+
     try addValuesCommands(profile, init_options, "profile");
     try addItemCommands(profile, init_options, "profile");
     try addProfileSoftwareCommands(profile, init_options);
@@ -655,8 +687,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .usage = "nodeforge assets boot-bundle create <install-source> [--qualifier <value>] --kernel <asset> --initrd <asset> --distro <d> --version <v> --arch <a> --kernel-release <r> [options]",
         .help = "Links registered kernel and nodeforge_initrd assets into an immutable boot bundle. " ++
             "The bundle is referenced by diskless profiles via --boot-bundle. " ++
-            "The Profile-derived rootfs is built or registered after the Profile exists. " ++
-            "This command is part of the diskless CLI flow: setup -> assets import -> register initrd -> boot-bundle create -> profile create -> rootfs build -> node add.",
+            "The Profile-derived rootfs is built by nodeforged after the Profile exists. " ++
+            "This command is part of the diskless CLI flow: setup -> assets import -> build initrd -> boot-bundle create -> profile create -> rootfs build -> node add.",
     }, bootBundleCreateHandler);
     try boot_bundle_create.addPositionalArg(.{ .name = "install-source", .description = "Complete imported install source name", .required = true });
     try boot_bundle_create.addFlags(&.{
@@ -1542,8 +1574,8 @@ fn setupHandler(ctx: zli.CommandContext) !void {
             setExitCode(ctx, 1);
             return;
         };
-        if (imported_config.?.value.schema_version != 4 or imported_config.?.value.distros.len != 0 or imported_config.?.value.profiles.len != 0 or imported_config.?.value.nodes.len != 0 or imported_config.?.value.provisioning_bundles.len != 0) {
-            try errorWriter(ctx).writeAll("error: config: imported startup config must use schema 4 and must not embed catalog entities\n");
+        if (imported_config.?.value.schema_version != 5 or imported_config.?.value.distros.len != 0 or imported_config.?.value.profiles.len != 0 or imported_config.?.value.nodes.len != 0 or imported_config.?.value.provisioning_bundles.len != 0) {
+            try errorWriter(ctx).writeAll("error: config: imported startup config must use schema 5 and must not embed catalog entities\n");
             imported_config.?.deinit();
             setExitCode(ctx, 1);
             return;
@@ -1983,7 +2015,7 @@ fn configExportHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed_config.deinit();
     // schema 永久默认 v4；只拒绝 legacy 内联实体格式。
-    if (parsed_config.value.schema_version != 4 or parsed_config.value.distros.len != 0 or parsed_config.value.profiles.len != 0 or parsed_config.value.nodes.len != 0 or parsed_config.value.provisioning_bundles.len != 0) {
+    if (parsed_config.value.schema_version != 5 or parsed_config.value.distros.len != 0 or parsed_config.value.profiles.len != 0 or parsed_config.value.nodes.len != 0 or parsed_config.value.provisioning_bundles.len != 0) {
         try errorWriter(ctx).writeAll("error: config: legacy inline entities require nodeforge setup --reconfigure\n");
         setExitCode(ctx, 1);
         return;
@@ -2016,6 +2048,25 @@ fn catalogValidateHandler(ctx: zli.CommandContext) !void {
         return;
     };
     try renderCommandResult(ctx, "catalog valid", .{ .catalog = catalog_path });
+}
+
+/// v0.4 topology validator entry point.  It is intentionally a pure preview:
+/// reading JSON and validating it never writes catalog, opens a boot slot, or
+/// creates a capability.  The same typed validator is called by model
+/// validation before a deployable Node mutation.
+fn topologyValidateHandler(ctx: zli.CommandContext) !void {
+    const path = ctx.flag("network-json", []const u8);
+    const bootstrap_mac = ctx.flag("bootstrap-mac", []const u8);
+    if (path.len == 0 or bootstrap_mac.len == 0) return itemUsageError(ctx, "--network-json and --bootstrap-mac are required");
+    const bytes = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.allocator, .limited(256 * 1024)) catch return itemUsageError(ctx, "structured topology file is unreadable or too large");
+    defer ctx.allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(nodeforge.model.TargetNetworkConfig, ctx.allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return itemUsageError(ctx, "topology JSON is invalid or contains an unknown field");
+    defer parsed.deinit();
+    nodeforge.topology.validateNetwork(parsed.value, bootstrap_mac, ctx.flag("deploy", bool)) catch |err| {
+        try writeCommandError(ctx, "network.invalid", @errorName(err), 2);
+        return;
+    };
+    try renderCommandResult(ctx, "topology valid", .{ .interfaces = parsed.value.interfaces.len, .bonds = parsed.value.bonds.len, .vlans = parsed.value.vlans.len, .routes = parsed.value.routes.len, .deployable = ctx.flag("deploy", bool) });
 }
 
 /// 加载 catalog 并将规范化 JSON 写到 stdout；文件缺失时导出空 catalog。
@@ -2058,10 +2109,10 @@ fn initrdBuildOperationHandler(ctx: zli.CommandContext) !void {
     defer config.deinit();
     const response = try allocManagementResponse(ctx);
     defer ctx.allocator.free(response);
-    var reason: [256]u8 = undefined;
+    var reason: [256]u8 = [_]u8{0} ** 256;
     const detach = ctx.flag("detach", bool);
     const body = nodeforge.management_client.initrdBuildJson(ctx.io, config.value.server.http_port, name, source, kernel_release, detach, response, &reason) catch null orelse {
-        const detail = std.mem.sliceTo(&reason, 0);
+        const detail: []const u8 = std.mem.sliceTo(&reason, 0);
         try writeCommandError(ctx, "initrd.build_failed", if (detail.len == 0) "initrd durable operation failed" else detail, 1);
         return;
     };
@@ -3707,7 +3758,7 @@ fn nodeClaimHandler(ctx: zli.CommandContext) !void {
 const NodeListViewRevision = struct { config: u64, catalog: u64, node_status: u64, deployment: u64, inventory: u64 };
 const NodeListItem = struct {
     id: []const u8,
-    mac: []const u8,
+    mac: ?[]const u8,
     pxe: struct { ip_reservation: ?[]const u8 },
     profile: ?[]const u8,
     deploy: bool,
@@ -3806,7 +3857,7 @@ fn nodeListHandler(ctx: zli.CommandContext) !void {
         var finished_buf: [20]u8 = undefined;
         full_cells[index] = .{
             item.id,
-            item.mac,
+            item.mac orelse "-",
             item.pxe.ip_reservation orelse "-",
             item.profile orelse "<unassigned>",
             if (item.deploy) "true" else "false",
@@ -4345,9 +4396,9 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     if (ctx.flag("detach", bool)) {
         const response = try allocManagementResponse(ctx);
         defer ctx.allocator.free(response);
-        var reason: [256]u8 = undefined;
+        var reason: [256]u8 = [_]u8{0} ** 256;
         const body = nodeforge.management_client.rootfsBuildDetachJson(ctx.io, config.value.server.http_port, name, if_input_digest, new_ssh_keys, response, &reason) catch null orelse {
-            const detail = std.mem.sliceTo(&reason, 0);
+            const detail: []const u8 = std.mem.sliceTo(&reason, 0);
             try writeCommandError(ctx, "rootfs.build_failed", if (detail.len == 0) "rootfs operation submission failed" else detail, 1);
             return;
         };
@@ -4364,7 +4415,7 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     }
     try errorWriter(ctx).print("Requesting rootfs build for profile {s}...\n", .{name});
     if (if_input_digest) |d| try errorWriter(ctx).print("Anti-drift digest: {s}\n", .{d});
-    var reason: [256]u8 = undefined;
+    var reason: [256]u8 = [_]u8{0} ** 256;
     const result = nodeforge.management_client.rootfsBuild(ctx.io, config.value.server.http_port, name, if_input_digest, new_ssh_keys, &reason);
     if (!result.healthy) {
         try reportMutationFailure(ctx, result, "rootfs build failed: daemon unreachable");
@@ -4398,64 +4449,6 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
         .{ .key = "file", .value = r.file orelse "-", .section = "runtime" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Build {s}", .{r.profile});
-    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
-}
-
-fn profileRootfsRegisterHandler(ctx: zli.CommandContext) !void {
-    _ = outputFromContext(ctx) orelse return;
-    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
-        setExitCode(ctx, 1);
-        return;
-    };
-    defer config.deinit();
-    const name = ctx.getArg("name") orelse return;
-    const file_path = ctx.flag("path", []const u8);
-    const uncompressed_size_raw = ctx.flag("uncompressed-size", i64);
-    if (file_path.len == 0) {
-        try writeCommandError(ctx, "rootfs.invalid", "profile rootfs register: --path is required", 2);
-        return;
-    }
-    if (uncompressed_size_raw < 0) {
-        try writeCommandError(ctx, "rootfs.invalid", "profile rootfs register: --uncompressed-size cannot be negative", 2);
-        return;
-    }
-    // 0 是 CLI 的“未提供”哨兵，不代表空 rootfs。未知大小只降低内存
-    // readiness 的证明强度，不能阻止制品登记或后续部署。
-    if (uncompressed_size_raw == 0)
-        try errorWriter(ctx).writeAll("WARNING: rootfs uncompressed size is unknown; registration will continue and hard memory-capacity checks will be skipped.\n");
-    var reason: [256]u8 = undefined;
-    const result = nodeforge.management_client.rootfsRegister(ctx.io, config.value.server.http_port, name, file_path, @intCast(uncompressed_size_raw), &reason);
-    if (!result.healthy) {
-        try reportMutationFailure(ctx, result, "rootfs register failed: daemon unreachable");
-        return;
-    }
-    const response = try allocManagementResponse(ctx);
-    defer ctx.allocator.free(response);
-    const body = nodeforge.management_client.rootfsStatusJson(ctx.io, config.value.server.http_port, name, response) catch null;
-    if (body == null) {
-        const human = try std.fmt.allocPrint(ctx.allocator, "rootfs registered for profile {s}", .{name});
-        try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = "{}" });
-        return;
-    }
-    const Resp = struct { ok: bool, result: struct { profile: []const u8, rootfs_input_digest: []const u8, state: []const u8, content_sha512: ?[]const u8 = null, compressed_bytes: ?u64 = null, kernel_release: ?[]const u8 = null, file: ?[]const u8 = null } };
-    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
-        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
-        try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
-        return;
-    };
-    defer parsed.deinit();
-    const r = parsed.value.result;
-    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" } };
-    const fields = [_]nodeforge.cli_document.Field{
-        .{ .key = "profile", .value = r.profile, .section = "artifact" },
-        .{ .key = "rootfs_input_digest", .value = r.rootfs_input_digest, .section = "artifact" },
-        .{ .key = "state", .value = r.state, .section = "artifact" },
-        .{ .key = "content_sha512", .value = r.content_sha512 orelse "-", .section = "artifact" },
-        .{ .key = "compressed_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.compressed_bytes orelse 0}), .section = "artifact" },
-        .{ .key = "kernel_release", .value = r.kernel_release orelse "-", .section = "runtime" },
-        .{ .key = "file", .value = r.file orelse "-", .section = "runtime" },
-    };
-    const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Register {s}", .{r.profile});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
 }
 
@@ -4672,7 +4665,7 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
     // M4.2：webhook 上报对所有 Ubuntu 版本可用（curtin handler 相同）
     const preview_report_url: []const u8 = if (distro.family == .ubuntu) "<report-url>" else "";
     const answer = if (distro.family == .ubuntu)
-        try nodeforge.ubuntu_autoinstall.renderEffective(ctx.allocator, node, effective_plan.install, effective_plan.system, effective_plan.network, effective_plan.software, bootstrap_key, bundle, apt_primary_url, "<facts-url>", event_url, "<log-url>", preview_report_url, "<boot-session>", "<capability>", &preview_scope, effective_plan.kernel_args)
+        try nodeforge.ubuntu_autoinstall.renderEffective(ctx.allocator, node, effective_plan.install, effective_plan.system, effective_plan.network, effective_plan.software, bootstrap_key, bundle, apt_primary_url, "<facts-url>", event_url, "<log-url>", preview_report_url, "<boot-session>", "http://nodeforge.invalid/api/v1/nodes/preview/boot-config", &preview_scope, effective_plan.kernel_args, null)
     else blk: {
         const install_root = try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}/artifacts/repositories/{s}", .{ config.value.server.server_ip, config.value.server.http_port, source.name });
         defer ctx.allocator.free(install_root);
@@ -4687,7 +4680,7 @@ fn installRenderHandler(ctx: zli.CommandContext) !void {
             const marker_index = std.mem.indexOf(u8, repository.base_url, marker) orelse return error.ExternalEndpointForbidden;
             try repository_urls.append(ctx.allocator, try std.fmt.allocPrint(ctx.allocator, "http://{s}:{d}{s}", .{ config.value.server.server_ip, config.value.server.http_port, repository.base_url[marker_index..] }));
         }
-        break :blk try nodeforge.kickstart.renderEffective(ctx.allocator, node, effective_plan.install, effective_plan.system, effective_plan.network, effective_plan.software, bootstrap_key, install_root, repository_urls.items, bundle, "<facts-url>", event_url, "<log-url>", "<boot-session>", "<capability>", &preview_scope, effective_plan.kernel_args);
+        break :blk try nodeforge.kickstart.renderEffective(ctx.allocator, node, effective_plan.install, effective_plan.system, effective_plan.network, effective_plan.software, bootstrap_key, install_root, repository_urls.items, bundle, "<facts-url>", event_url, "<log-url>", "<boot-session>", "http://nodeforge.invalid/api/v1/nodes/preview/boot-config", &preview_scope, effective_plan.kernel_args, null);
     };
     defer ctx.allocator.free(answer);
     try ctx.writer.writeAll(answer);
@@ -4979,9 +4972,9 @@ fn nodeBootPreviewHandler(ctx: zli.CommandContext) !void {
     const node_id = ctx.getArg("node_id") orelse return;
     const response = try allocManagementResponse(ctx);
     defer ctx.allocator.free(response);
-    var reason: [256]u8 = undefined;
+    var reason: [256]u8 = [_]u8{0} ** 256;
     const body = nodeforge.management_client.nodeBootPreviewJson(ctx.io, config.value.server.http_port, node_id, response, &reason) catch null orelse {
-        const detail = std.mem.sliceTo(&reason, 0);
+        const detail: []const u8 = std.mem.sliceTo(&reason, 0);
         try writeCommandError(ctx, "preview.unavailable", if (detail.len == 0) "boot preview is unavailable" else detail, 1);
         return;
     };
@@ -5018,9 +5011,9 @@ fn installRetryHandler(ctx: zli.CommandContext) !void {
     const node_id = ctx.getArg("node_id") orelse return;
     const response = try allocManagementResponse(ctx);
     defer ctx.allocator.free(response);
-    var reason: [256]u8 = undefined;
+    var reason: [256]u8 = [_]u8{0} ** 256;
     const body = nodeforge.management_client.nodeRetryJson(ctx.io, config.value.server.http_port, node_id, ctx.flag("force", bool), response, &reason) catch null orelse {
-        const detail = std.mem.sliceTo(&reason, 0);
+        const detail: []const u8 = std.mem.sliceTo(&reason, 0);
         try writeCommandError(ctx, "retry.failed", if (detail.len == 0) "node retry failed" else detail, 1);
         return;
     };
@@ -5149,7 +5142,9 @@ fn nodeAddHandler(ctx: zli.CommandContext) !void {
     const node_id = ctx.getArg("node_id") orelse return;
     const parsed_node = parseNodeProperties(node_id, ctx.positional_args[1..]) catch |err| return nodePropertyError(ctx, err);
     const node_value = parsed_node.node;
-    if (!parsed_node.mac_set or !parsed_node.arch_set or !parsed_node.pxe_ip_reservation_set) return nodePropertyError(ctx, error.MissingRequiredAttribute);
+    if (!parsed_node.pxe_ip_reservation_set or
+        ((!parsed_node.mac_set or !parsed_node.arch_set) and !parsed_node.serial_set) or
+        (parsed_node.mac_set != parsed_node.arch_set)) return nodePropertyError(ctx, error.MissingRequiredAttribute);
     if (node_value.profile == null and node_value.deploy) return nodePropertyError(ctx, error.ProfileRequiredWhileDeployed);
 
     var config = loadConfig(ctx.io, ctx.allocator, config_path, errorWriter(ctx), ctx.flag("debug", bool)) orelse {
@@ -5209,7 +5204,7 @@ fn nodeUnsetHandler(ctx: zli.CommandContext) !void {
     try mutateScalarBatchCli(ctx, "node", node_id, mutations.items, ctx.flag("force", bool));
 }
 
-const ParsedNodeProperties = struct { node: model.NodeConfig, mac_set: bool = false, arch_set: bool = false, pxe_ip_reservation_set: bool = false };
+const ParsedNodeProperties = struct { node: model.NodeConfig, mac_set: bool = false, arch_set: bool = false, serial_set: bool = false, pxe_ip_reservation_set: bool = false };
 fn parseNodeProperties(node_id: []const u8, values: []const []const u8) !ParsedNodeProperties {
     var result: ParsedNodeProperties = .{ .node = .{ .id = node_id, .mac = "", .arch = .x86_64 } };
     var seen: std.StringHashMap(void) = .init(std.heap.page_allocator);
@@ -5229,8 +5224,14 @@ fn parseNodeProperties(node_id: []const u8, values: []const []const u8) !ParsedN
         nodeforge.scalar_mutation.applyNode(&result.node, key, value) catch return error.InvalidAttribute;
         if (std.mem.eql(u8, key, "mac")) result.mac_set = true;
         if (std.mem.eql(u8, key, "arch")) result.arch_set = true;
+        if (std.mem.eql(u8, key, "hardware.serial_number")) result.serial_set = true;
         if (std.mem.eql(u8, key, "pxe.ip_reservation")) result.pxe_ip_reservation_set = true;
     }
+    // v0.4 serial-only nodes are discovery drafts.  Their desired state is
+    // deliberately not deployable until discovery fills MAC/arch and an
+    // operator binds a profile, so omitted deploy defaults to false here.
+    if (result.serial_set and !result.mac_set and !result.arch_set and !seen.contains("deploy"))
+        result.node.deploy = false;
     return result;
 }
 
@@ -5263,6 +5264,17 @@ test "node add parser tracks required PXE reservation" {
     const missing = try parseNodeProperties("missing-ip", &.{ "mac=02:4e:46:00:00:02", "arch=aarch64", "deploy=false" });
     try std.testing.expect(!missing.pxe_ip_reservation_set);
 }
+
+test "serial-only node add defaults to a disabled draft" {
+    const parsed = try parseNodeProperties("serial-draft", &.{
+        "hardware.serial_number=SN-001",
+        "pxe.ip_reservation=192.168.27.190",
+    });
+    try std.testing.expect(parsed.serial_set);
+    try std.testing.expect(!parsed.mac_set);
+    try std.testing.expect(!parsed.arch_set);
+    try std.testing.expect(!parsed.node.deploy);
+}
 fn nodePropertyError(ctx: zli.CommandContext, err: anyerror) void {
     var message: [128]u8 = undefined;
     const rendered = std.fmt.bufPrint(&message, "node attributes: {s}", .{@errorName(err)}) catch "invalid node property";
@@ -5291,6 +5303,63 @@ fn nodeRemoveHandler(ctx: zli.CommandContext) !void {
     try renderCommandResult(ctx, human, .{ .node_id = node_id });
 }
 
+fn nodeDiscoveryStartHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const node_id = ctx.getArg("node_id") orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var reason: [512]u8 = undefined;
+    const action: []const u8 = if (ctx.flag("restart", bool)) "restart" else "start";
+    const result = nodeforge.management_client.nodeDiscoveryAction(ctx.io, config.value.server.http_port, node_id, action, ctx.flag("expires-in", i64), &reason);
+    if (!result.healthy) return reportMutationFailure(ctx, result, "node discovery start failed");
+    try renderCommandResult(ctx, "node discovery armed", .{ .node_id = node_id, .action = action, .expires_in_seconds = ctx.flag("expires-in", i64) });
+}
+
+fn nodeDiscoveryCancelHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const node_id = ctx.getArg("node_id") orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    var reason: [512]u8 = undefined;
+    const result = nodeforge.management_client.nodeDiscoveryAction(ctx.io, config.value.server.http_port, node_id, "cancel", null, &reason);
+    if (!result.healthy) return reportMutationFailure(ctx, result, "node discovery cancel failed");
+    try renderCommandResult(ctx, "node discovery cancelled", .{ .node_id = node_id, .action = "cancel" });
+}
+
+fn nodeDiscoveryStatusHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    const node_id = ctx.getArg("node_id") orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = (nodeforge.management_client.nodeDiscoveryJson(ctx.io, config.value.server.http_port, node_id, response) catch null) orelse {
+        try writeCommandError(ctx, "discovery.unavailable", "node discovery API unavailable", 1);
+        return;
+    };
+    const Envelope = struct { result: struct { node_id: []const u8, discovery: ?struct { state: []const u8, serial_display: []const u8, created_at: i64, expires_at: i64, observed_mac: ?[]const u8, observed_arch: ?[]const u8, last_error: ?[]const u8 } } };
+    const parsed = std.json.parseFromSlice(Envelope, ctx.allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+        try writeCommandError(ctx, "discovery.invalid_response", "daemon returned malformed node discovery state", 1);
+        return;
+    };
+    defer parsed.deinit();
+    const state = parsed.value.result.discovery;
+    const human = if (state) |value| blk: {
+        break :blk try std.fmt.allocPrint(ctx.allocator, "Node discovery {s}\n  State     {s}\n  Serial    {s}\n  Observed  {s} ({s})\n  Expires   {d}", .{ node_id, value.state, value.serial_display, value.observed_mac orelse "-", value.observed_arch orelse "-", value.expires_at });
+    } else try std.fmt.allocPrint(ctx.allocator, "Node discovery {s}\n  State     -", .{node_id});
+    defer ctx.allocator.free(human);
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = body });
+}
+
 fn nodeShowHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     const debug = ctx.flag("debug", bool);
@@ -5313,7 +5382,7 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
         result: struct {
             view_revision: struct { config: u64, catalog: u64, node_status: u64, deployment: u64, inventory: u64 },
             node: nodeforge.catalog_dto.Node,
-            profile: struct { name: []const u8, kind: []const u8, boot_bundle: ?[]const u8, install_source: []const u8, kernel_args: ?[]const u8, platform: struct { distro: []const u8, version: []const u8, arch: []const u8 } },
+            profile: ?struct { name: []const u8, kind: []const u8, boot_bundle: ?[]const u8, install_source: []const u8, kernel_args: ?[]const u8, platform: struct { distro: []const u8, version: []const u8, arch: []const u8 } },
             effective_system: struct {
                 localization: model.LocalizationConfig,
                 connectivity: model.ConnectivityPolicy,
@@ -5370,18 +5439,53 @@ fn nodeShowHandler(ctx: zli.CommandContext) !void {
     const network_dns = if (stored_node.network.dns.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.network.dns);
     const search_domains = if (stored_node.network.search_domains.len == 0) "<none>" else try std.mem.join(ctx.allocator, ", ", stored_node.network.search_domains);
     const network_routes = if (stored_node.network.routes.len == 0) "<none>" else try formatRoutes(ctx.allocator, stored_node.network.routes);
+    const hardware_serial = stored_node.hardware.serial_number orelse "<unset>";
     const fields = [_]nodeforge.cli_document.Field{
-        .{ .key = "id", .value = stored_node.id, .section = "stored", .json_path = "node.id" },                                                                                                                                                     .{ .key = "mac", .value = stored_node.mac, .section = "stored", .json_path = "node.mac" },                                                                                                                                                                    .{ .key = "arch", .value = @tagName(stored_node.arch), .section = "stored", .json_path = "node.arch" },                                                                                                                    .{ .key = "profile", .value = stored_node.profile orelse "<unset>", .section = "stored", .json_path = "node.profile" },
-        .{ .key = "pxe.ip_reservation", .value = stored_node.pxe.ip_reservation orelse "<unset>", .section = "stored", .json_path = "node.pxe.ip_reservation" },                                                                                    .{ .key = "hostname", .value = stored_node.hostname orelse "<unset>", .section = "stored", .json_path = "node.hostname" },                                                                                                                                    .{ .key = "deploy", .value = if (stored_node.deploy) "true" else "false", .section = "stored", .json_path = "node.deploy" },                                                                                               .{ .key = "http_accel", .value = if (stored_node.http_accel) "true" else "false", .section = "stored", .json_path = "node.http_accel" },
-        .{ .key = "storage.boot_disk", .value = stored_node.storage.boot_disk, .section = "stored", .json_path = "node.storage.boot_disk" },                                                                                                        .{ .key = "storage.additional_disks", .value = additional_disks, .section = "stored", .json_path = "node.storage.additional_disks" },                                                                                                                         .{ .key = "network.mode", .value = @tagName(stored_node.network.mode), .section = "stored", .json_path = "node.network.mode" },                                                                                            .{ .key = "network.interface_name", .value = stored_node.network.interface orelse "<auto>", .section = "stored", .json_path = "node.network.interface_name" },
-        .{ .key = "network.match_mac", .value = stored_node.network.match_mac orelse "<node mac>", .section = "stored", .json_path = "node.network.match_mac" },                                                                                    .{ .key = "network.address", .value = stored_node.network.address orelse "<unset>", .section = "stored", .json_path = "node.network.address" },                                                                                                               .{ .key = "network.prefix_len", .value = if (stored_node.network.prefix_len) |value| try std.fmt.allocPrint(ctx.allocator, "{d}", .{value}) else "<unset>", .section = "stored", .json_path = "node.network.prefix_len" }, .{ .key = "network.gateway", .value = stored_node.network.gateway orelse "<unset>", .section = "stored", .json_path = "node.network.gateway" },
-        .{ .key = "network.dns", .value = network_dns, .section = "stored", .json_path = "node.network.dns" },                                                                                                                                      .{ .key = "network.search_domains", .value = search_domains, .section = "stored", .json_path = "node.network.search_domains" },                                                                                                                               .{ .key = "network.routes", .value = network_routes, .section = "stored", .json_path = "node.network.routes" },                                                                                                            .{ .key = "overrides.install.storage.mode", .value = if (stored_node.overrides.install.storage.mode) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.mode" },
-        .{ .key = "overrides.install.storage.wipe", .value = if (stored_node.overrides.install.storage.wipe) |value| if (value) "true" else "false" else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.wipe" }, .{ .key = "overrides.install.storage.partition_table", .value = if (stored_node.overrides.install.storage.partition_table) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.partition_table" }, .{ .key = "overrides.system.localization.locale", .value = stored_node.overrides.system.localization.locale orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.locale" },        .{ .key = "overrides.system.localization.timezone", .value = stored_node.overrides.system.localization.timezone orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.timezone" },
-        .{ .key = "overrides.system.localization.keyboard", .value = stored_node.overrides.system.localization.keyboard orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.keyboard" },                   .{ .key = "effective.install.storage.mode", .value = @tagName(storage.mode), .section = "effective", .json_path = "storage.effective.mode" },                                                                                                                 .{ .key = "effective.install.storage.wipe", .value = if (storage.wipe) "true" else "false", .section = "effective", .json_path = "storage.effective.wipe" },                                                               .{ .key = "effective.install.storage.partition_table", .value = @tagName(storage.partition_table), .section = "effective", .json_path = "storage.effective.partition_table" },
-        .{ .key = "effective.install.storage.boot_disk", .value = storage.boot_disk, .section = "effective", .json_path = "storage.effective.boot_disk" },                                                                                          .{ .key = "effective.system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },                                                                        .{ .key = "effective.system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },                               .{ .key = "effective.system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
-        .{ .key = "effective.system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "true" else "false", .section = "effective", .json_path = "effective_system.ssh.enabled" },                                                     .{ .key = "effective.system.security.firewall", .value = @tagName(result.effective_system.security.firewall), .section = "effective", .json_path = "effective_system.security.firewall" },                                                                    .{ .key = "effective.system.security.selinux", .value = @tagName(result.effective_system.security.selinux), .section = "effective", .json_path = "effective_system.security.selinux" },                                    .{ .key = "effective.system.security.apparmor", .value = @tagName(result.effective_system.security.apparmor), .section = "effective", .json_path = "effective_system.security.apparmor" },
-        .{ .key = "runtime.phase", .value = status_phase, .section = "runtime", .json_path = "status.phase" },                                                                                                                                      .{ .key = "runtime.reason", .value = status_reason, .section = "runtime", .json_path = "status.reason" },                                                                                                                                                     .{ .key = "runtime.install_intent", .value = install_intent, .section = "runtime", .json_path = "deployment.install_intent" },                                                                                             .{ .key = "runtime.drift_state", .value = drift_state, .section = "runtime", .json_path = "deployment.drift_state" },
-        .{ .key = "runtime.serial_number", .value = inventory_serial, .section = "runtime", .json_path = "inventory.serial_number" },                                                                                                               .{ .key = "runtime.memory_bytes", .value = inventory_memory, .section = "runtime", .json_path = "inventory.memory_bytes" },                                                                                                                                   .{ .key = "runtime.profile_kind", .value = result.profile.kind, .section = "runtime", .json_path = "profile.kind" },                                                                                                       .{ .key = "runtime.boot_bundle", .value = result.profile.boot_bundle orelse "-", .section = "runtime", .json_path = "profile.boot_bundle" },
+        .{ .key = "hardware.serial_number", .value = hardware_serial, .section = "stored", .json_path = "node.hardware.serial_number" },
+        .{ .key = "id", .value = stored_node.id, .section = "stored", .json_path = "node.id" },
+        .{ .key = "mac", .value = stored_node.mac, .section = "stored", .json_path = "node.mac" },
+        .{ .key = "arch", .value = @tagName(stored_node.arch), .section = "stored", .json_path = "node.arch" },
+        .{ .key = "profile", .value = stored_node.profile orelse "<unset>", .section = "stored", .json_path = "node.profile" },
+        .{ .key = "pxe.ip_reservation", .value = stored_node.pxe.ip_reservation orelse "<unset>", .section = "stored", .json_path = "node.pxe.ip_reservation" },
+        .{ .key = "hostname", .value = stored_node.hostname orelse "<unset>", .section = "stored", .json_path = "node.hostname" },
+        .{ .key = "deploy", .value = if (stored_node.deploy) "true" else "false", .section = "stored", .json_path = "node.deploy" },
+        .{ .key = "http_accel", .value = if (stored_node.http_accel) "true" else "false", .section = "stored", .json_path = "node.http_accel" },
+        .{ .key = "storage.boot_disk", .value = stored_node.storage.boot_disk, .section = "stored", .json_path = "node.storage.boot_disk" },
+        .{ .key = "storage.additional_disks", .value = additional_disks, .section = "stored", .json_path = "node.storage.additional_disks" },
+        .{ .key = "network.mode", .value = @tagName(stored_node.network.mode), .section = "stored", .json_path = "node.network.mode" },
+        .{ .key = "network.interface_name", .value = stored_node.network.interface orelse "<auto>", .section = "stored", .json_path = "node.network.interface_name" },
+        .{ .key = "network.match_mac", .value = stored_node.network.match_mac orelse "<node mac>", .section = "stored", .json_path = "node.network.match_mac" },
+        .{ .key = "network.address", .value = stored_node.network.address orelse "<unset>", .section = "stored", .json_path = "node.network.address" },
+        .{ .key = "network.prefix_len", .value = if (stored_node.network.prefix_len) |value| try std.fmt.allocPrint(ctx.allocator, "{d}", .{value}) else "<unset>", .section = "stored", .json_path = "node.network.prefix_len" },
+        .{ .key = "network.gateway", .value = stored_node.network.gateway orelse "<unset>", .section = "stored", .json_path = "node.network.gateway" },
+        .{ .key = "network.dns", .value = network_dns, .section = "stored", .json_path = "node.network.dns" },
+        .{ .key = "network.search_domains", .value = search_domains, .section = "stored", .json_path = "node.network.search_domains" },
+        .{ .key = "network.routes", .value = network_routes, .section = "stored", .json_path = "node.network.routes" },
+        .{ .key = "overrides.install.storage.mode", .value = if (stored_node.overrides.install.storage.mode) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.mode" },
+        .{ .key = "overrides.install.storage.wipe", .value = if (stored_node.overrides.install.storage.wipe) |value| if (value) "true" else "false" else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.wipe" },
+        .{ .key = "overrides.install.storage.partition_table", .value = if (stored_node.overrides.install.storage.partition_table) |value| @tagName(value) else "<inherit>", .section = "overrides", .json_path = "node.overrides.install.storage.partition_table" },
+        .{ .key = "overrides.system.localization.locale", .value = stored_node.overrides.system.localization.locale orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.locale" },
+        .{ .key = "overrides.system.localization.timezone", .value = stored_node.overrides.system.localization.timezone orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.timezone" },
+        .{ .key = "overrides.system.localization.keyboard", .value = stored_node.overrides.system.localization.keyboard orelse "<inherit>", .section = "overrides", .json_path = "node.overrides.system.localization.keyboard" },
+        .{ .key = "effective.install.storage.mode", .value = @tagName(storage.mode), .section = "effective", .json_path = "storage.effective.mode" },
+        .{ .key = "effective.install.storage.wipe", .value = if (storage.wipe) "true" else "false", .section = "effective", .json_path = "storage.effective.wipe" },
+        .{ .key = "effective.install.storage.partition_table", .value = @tagName(storage.partition_table), .section = "effective", .json_path = "storage.effective.partition_table" },
+        .{ .key = "effective.install.storage.boot_disk", .value = storage.boot_disk, .section = "effective", .json_path = "storage.effective.boot_disk" },
+        .{ .key = "effective.system.localization.locale", .value = result.effective_system.localization.locale, .section = "effective", .json_path = "effective_system.localization.locale" },
+        .{ .key = "effective.system.localization.timezone", .value = result.effective_system.localization.timezone, .section = "effective", .json_path = "effective_system.localization.timezone" },
+        .{ .key = "effective.system.localization.keyboard", .value = result.effective_system.localization.keyboard, .section = "effective", .json_path = "effective_system.localization.keyboard" },
+        .{ .key = "effective.system.ssh.enabled", .value = if (result.effective_system.ssh.enabled) "true" else "false", .section = "effective", .json_path = "effective_system.ssh.enabled" },
+        .{ .key = "effective.system.security.firewall", .value = @tagName(result.effective_system.security.firewall), .section = "effective", .json_path = "effective_system.security.firewall" },
+        .{ .key = "effective.system.security.selinux", .value = @tagName(result.effective_system.security.selinux), .section = "effective", .json_path = "effective_system.security.selinux" },
+        .{ .key = "effective.system.security.apparmor", .value = @tagName(result.effective_system.security.apparmor), .section = "effective", .json_path = "effective_system.security.apparmor" },
+        .{ .key = "runtime.phase", .value = status_phase, .section = "runtime", .json_path = "status.phase" },
+        .{ .key = "runtime.reason", .value = status_reason, .section = "runtime", .json_path = "status.reason" },
+        .{ .key = "runtime.install_intent", .value = install_intent, .section = "runtime", .json_path = "deployment.install_intent" },
+        .{ .key = "runtime.drift_state", .value = drift_state, .section = "runtime", .json_path = "deployment.drift_state" },
+        .{ .key = "runtime.serial_number", .value = inventory_serial, .section = "runtime", .json_path = "inventory.serial_number" },
+        .{ .key = "runtime.memory_bytes", .value = inventory_memory, .section = "runtime", .json_path = "inventory.memory_bytes" },
+        .{ .key = "runtime.profile_kind", .value = if (result.profile) |profile| profile.kind else "-", .section = "runtime", .json_path = "profile.kind" },
+        .{ .key = "runtime.boot_bundle", .value = if (result.profile) |profile| profile.boot_bundle orelse "-" else "-", .section = "runtime", .json_path = "profile.boot_bundle" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Node {s}", .{stored_node.id});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });

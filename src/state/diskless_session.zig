@@ -140,10 +140,9 @@ fn orderIndex(phase: Phase) usize {
 
 test "canonical forward sequence advances one step at a time" {
     const seq = [_]Phase{
-        .boot_dhcp_discover, .boot_dhcp_offer, .boot_dhcp_ack, .boot_tftp_rrq, .boot_tftp_complete,
-        .boot_config_fetched, .diskless_initrd_started, .diskless_rootfs_downloading,
-        .diskless_rootfs_verified, .diskless_rootfs_mounted, .diskless_switching_root,
-        .diskless_agent_configuring, .diskless_running,
+        .boot_dhcp_discover,      .boot_dhcp_offer,            .boot_dhcp_ack,               .boot_tftp_rrq,            .boot_tftp_complete,
+        .boot_config_fetched,     .diskless_initrd_started,    .diskless_rootfs_downloading, .diskless_rootfs_verified, .diskless_rootfs_mounted,
+        .diskless_switching_root, .diskless_agent_configuring, .diskless_running,
     };
     var current = seq[0];
     for (seq[1..]) |target| {

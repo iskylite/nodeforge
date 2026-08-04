@@ -1,8 +1,9 @@
 //! # nodeforge-agent（v0.2 diskless 切根后 pre-init / first-boot）
 //!
 //! `V0_2_DESIGN.md` §4.3/§5.3。`switch_root` 后由 initrd exec 为 `--pre-init`：
-//! 从独立 0400 credential 文件取 agent:read token -> 拉取并校验 immutable AgentPlan v1
-//! 与其 content-addressed payload -> node-apply 写入 overlay upper -> 把校验过的 AgentPlan
+//! 从独立 0400 credential 文件取 boot_session 能力 token（v0.4 token 简化：替代 v0.2
+//! 的 agent:read scope token）-> 拉取并校验 immutable AgentPlan v2 与其
+//! content-addressed payload -> node-apply 写入 overlay upper -> 把校验过的 AgentPlan
 //! 覆盖写回 boot.json（供 first-boot 重放八步；boot.json 从不含 token）-> 清零内存 token ->
 //! `exec /sbin/init`。同一 binary 之后以 systemd unit 执行 effective `first-boot`（一次性、
 //! 无远程控制、无 reconciliation）：读 boot.json 内联步骤按固定顺序 managed_file -> package
@@ -42,20 +43,21 @@
 //! agent 不取得/解释 BootConfig 字段，不写 Profile 共享基线（已烤入 lower）；只重放
 //! Node 运行根差量。payload digest/size 不符或拉取失败时真正 init 不启动，不使用本地旧
 //! plan fallback（§10 fail-closed）。
-//! AgentPlan、payload、agent-consumed 与 lifecycle event 均复用
+//! AgentPlan、payload 与 lifecycle event 均复用
 //! `initrd/http.zig` 原生客户端，diskless 启动闭包不要求目标 rootfs 安装 curl。
 //! AgentPlan/events 使用 30 秒 socket 空闲超时，payload 使用 120 秒 socket
 //! 空闲超时；payload 持续有数据时没有总时长上限。Zig 0.16 POSIX Threaded Io
 //! 尚不能安全设置 connect deadline，建连暂由内核 TCP 超时负责。
 const std = @import("std");
 const first_boot = @import("provision/first_boot.zig");
+const install_first_boot = @import("provision/install_first_boot.zig");
 const node_apply = @import("provision/node_apply.zig");
 const diskless_dto = @import("http/diskless_dto.zig");
 const http = @import("initrd/http.zig");
 
 const handoff_path = "/var/lib/nodeforge/boot.json";
 const payload_dir = "/var/lib/nodeforge/payload";
-const agent_token_path = "/var/lib/nodeforge/credentials/agent.token";
+const capability_token_path = "/var/lib/nodeforge/credentials/capability.token";
 const event_token_path = "/var/lib/nodeforge/credentials/event.token";
 
 var current_stage: []const u8 = "process.start";
@@ -71,6 +73,7 @@ pub fn main(init: std.process.Init) void {
         // 则正常以非零语义结束，由 unit/journal 记录失败，不能永久占住服务。
         if (running_as_pid1_pre_init)
             while (true) std.Io.sleep(init.io, .fromSeconds(3600), .awake) catch {};
+        std.process.exit(1);
     };
 }
 
@@ -89,9 +92,143 @@ fn run(init: std.process.Init) !void {
         current_stage = "exec_system_init";
         execInit(io);
     }
+    if (arg1 != null and std.mem.eql(u8, arg1.?, "--install-first-boot")) {
+        current_stage = "install_first_boot";
+        return installFirstBoot(io, allocator);
+    }
+    if (arg1 != null) return error.UnknownAgentMode;
     // 无参数：作为 systemd unit 执行 effective first-boot。
     current_stage = "first_boot";
     try firstBoot(io, allocator);
+}
+
+fn installFirstBoot(io: std.Io, allocator: std.mem.Allocator) !void {
+    const generation_bytes = try readFile(io, allocator, install_first_boot.current_generation_path);
+    defer allocator.free(generation_bytes);
+    const generation = try std.fmt.parseInt(u64, std.mem.trim(u8, generation_bytes, " \t\r\n"), 10);
+    if (generation == 0) return error.InvalidInstallFirstBootIdentity;
+    const generation_dir = try std.fmt.allocPrint(allocator, "{s}/{d}", .{ install_first_boot.root, generation });
+    defer allocator.free(generation_dir);
+    const identity_path = try std.fmt.allocPrint(allocator, "{s}/identity.json", .{generation_dir});
+    defer allocator.free(identity_path);
+    const plan_path = try std.fmt.allocPrint(allocator, "{s}/plan.json", .{generation_dir});
+    defer allocator.free(plan_path);
+    const journal_path = try std.fmt.allocPrint(allocator, "{s}/journal.json", .{generation_dir});
+    defer allocator.free(journal_path);
+    const event_token_path_install = try std.fmt.allocPrint(allocator, "{s}/event.token", .{generation_dir});
+    defer allocator.free(event_token_path_install);
+    const pending_path = try std.fmt.allocPrint(allocator, "{s}/pending", .{generation_dir});
+    defer allocator.free(pending_path);
+
+    const identity_bytes = try readFile(io, allocator, identity_path);
+    defer allocator.free(identity_bytes);
+    var identity = try install_first_boot.parseIdentity(allocator, identity_bytes);
+    defer identity.deinit();
+    if (identity.value.install_generation != generation) return error.InstallFirstBootBindingMismatch;
+    const plan_bytes = try readFile(io, allocator, plan_path);
+    defer allocator.free(plan_bytes);
+    var verified = try install_first_boot.parseAndVerifyPlan(allocator, plan_bytes, identity.value.node_id, generation);
+    defer verified.deinit();
+    const plan = verified.value();
+    if (!std.mem.eql(u8, identity.value.first_boot_plan_digest, plan.first_boot_plan_digest)) return error.InstallFirstBootDigestMismatch;
+    try install_first_boot.validatePayloadClosure(io, generation_dir, plan.*);
+
+    var journal_parsed: ?std.json.Parsed(install_first_boot.LocalJournal) = null;
+    defer if (journal_parsed) |*parsed| parsed.deinit();
+    var journal: install_first_boot.LocalJournal = undefined;
+    const journal_bytes = readFile(io, allocator, journal_path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (journal_bytes) |bytes| {
+        defer allocator.free(bytes);
+        journal_parsed = std.json.parseFromSlice(install_first_boot.LocalJournal, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.InvalidInstallFirstBootJournal;
+        journal = journal_parsed.?.value;
+        try journal.validateBinding(plan.*);
+    } else {
+        journal = .{
+            .deployment_id = plan.deployment_id,
+            .node_id = plan.node_id,
+            .install_generation = plan.install_generation,
+            .bundle_revision = plan.bundle_revision,
+            .first_boot_plan_digest = plan.first_boot_plan_digest,
+        };
+        try install_first_boot.persistJournal(io, allocator, journal_path, journal);
+    }
+
+    if (journal.state == .completed_acknowledged or journal.state == .failed_acknowledged) {
+        try removeInstallPending(io, pending_path);
+        return;
+    }
+    var event_token: []u8 = undefined;
+    if (journal.state == .pending) {
+        const bootstrap = try readCredential(io, allocator, install_first_boot.bootstrap_token_path, false);
+        defer {
+            clearToken(bootstrap);
+            allocator.free(bootstrap);
+        }
+        event_token = try installFirstBootExchange(io, allocator, plan.exchange_url, bootstrap);
+        try install_first_boot.atomicWriteCredential(io, event_token_path_install, event_token);
+        try install_first_boot.removeCredential(io, install_first_boot.bootstrap_token_path);
+        clearToken(bootstrap);
+        const started_id = try installEventId(allocator, plan.first_boot_plan_digest, "started", null);
+        defer allocator.free(started_id);
+        try installFirstBootEvent(io, allocator, plan.event_url, event_token, 0, "exchanging", "first_boot.started", started_id, null);
+        try journal.begin();
+        try install_first_boot.persistJournal(io, allocator, journal_path, journal);
+    } else {
+        event_token = try readCredential(io, allocator, event_token_path_install, false);
+    }
+    defer {
+        clearToken(event_token);
+        allocator.free(event_token);
+    }
+
+    if (journal.state == .completed_pending_ack or journal.state == .failed_pending_ack) {
+        try resendInstallTerminal(io, allocator, plan.event_url, event_token, &journal, journal_path, event_token_path_install);
+        try removeInstallPending(io, pending_path);
+        return;
+    }
+    if (journal.state == .step_running) {
+        try journal.failStep(journal.running_step.?);
+        try persistAndSendInstallTerminal(io, allocator, plan.event_url, event_token, &journal, journal_path, event_token_path_install, false);
+        try removeInstallPending(io, pending_path);
+        return;
+    }
+
+    const order = try install_first_boot.orderedStepIndices(allocator, plan.steps);
+    defer allocator.free(order);
+    while (journal.next_step < order.len) {
+        const canonical_index = journal.next_step;
+        const step = plan.steps[order[canonical_index]];
+        try journal.beginStep(canonical_index);
+        try install_first_boot.persistJournal(io, allocator, journal_path, journal);
+        const started_id = try installEventId(allocator, plan.first_boot_plan_digest, "step-started", canonical_index);
+        defer allocator.free(started_id);
+        try installFirstBootEvent(io, allocator, plan.event_url, event_token, 1, if (canonical_index == 0) "started" else "running", "first_boot.step_started", started_id, canonical_index);
+        const command = try install_first_boot.renderStepCommand(allocator, generation_dir, plan.*, step);
+        defer allocator.free(command);
+        runInstallStep(io, allocator, command, step.timeout_s, if (step.retryable) 3 else 1) catch {
+            try journal.failStep(canonical_index);
+            try persistAndSendInstallTerminal(io, allocator, plan.event_url, event_token, &journal, journal_path, event_token_path_install, false);
+            try removeInstallPending(io, pending_path);
+            return;
+        };
+        const succeeded_id = try installEventId(allocator, plan.first_boot_plan_digest, "step-succeeded", canonical_index);
+        defer allocator.free(succeeded_id);
+        try installFirstBootEvent(io, allocator, plan.event_url, event_token, 1, "running", "first_boot.step_succeeded", succeeded_id, canonical_index);
+        try journal.completeStep(canonical_index);
+        try install_first_boot.persistJournal(io, allocator, journal_path, journal);
+    }
+    try persistAndSendInstallTerminal(io, allocator, plan.event_url, event_token, &journal, journal_path, event_token_path_install, true);
+    try removeInstallPending(io, pending_path);
+}
+
+fn removeInstallPending(io: std.Io, path: []const u8) !void {
+    install_first_boot.removeCredential(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
@@ -100,8 +237,10 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
     defer allocator.free(handoff);
     const h = try parseHandoff(allocator, handoff);
     defer freeHandoff(allocator, &h);
-    const agent_token = try readCredential(io, allocator, agent_token_path, true);
-    defer allocator.free(agent_token);
+    // v0.4 token 简化：capability.token 存储 boot_session 能力 token（读取用），
+    // event.token 存储 event:append 派生 token（lifecycle 用）。
+    const capability_token = try readCredential(io, allocator, capability_token_path, true);
+    defer allocator.free(capability_token);
     const event_token = try readCredential(io, allocator, event_token_path, false);
     defer allocator.free(event_token);
 
@@ -109,13 +248,16 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
     try postLifecycle(io, allocator, h.event_url, event_token, h.session, 5, "diskless.switching_root", "diskless.agent_configuring");
     errdefer postLifecycle(io, allocator, h.event_url, event_token, h.session, 6, "diskless.agent_configuring", "diskless.failed") catch {};
 
-    // 拉取 AgentPlan v1（agent:read token，session-bound）。
+    // 拉取 AgentPlan v2（boot_session 能力 token，session-bound）；v1 不提供 target
+    // topology/lease snapshot，必须 fail closed，不能回退到旧单 NIC 计划。
+    // 读取请求使用 read_session（boot_session id），而非 delivery session。
     current_stage = "agent_plan.download";
     std.debug.print("[nodeforge-agent] stage={s}: downloading AgentPlan\n", .{current_stage});
-    const plan_json = try nativeGet(io, allocator, h.agent_plan_url, agent_token, h.session);
+    const plan_json = try nativeGet(io, allocator, h.agent_plan_url, capability_token, h.read_session);
     defer allocator.free(plan_json);
     const parsed_plan = try std.json.parseFromSlice(diskless_dto.AgentPlan, allocator, plan_json, .{ .ignore_unknown_fields = false });
     defer parsed_plan.deinit();
+    if (parsed_plan.value.schema_version != diskless_dto.agent_plan_schema_version) return error.UnsupportedAgentPlanSchema;
     const plan = &parsed_plan.value;
 
     // 校验 plan digest（agent 不使用本地旧 plan fallback）。
@@ -134,7 +276,9 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
         try std.Io.Dir.cwd().createDirPath(io, parent);
         const url = try std.fmt.allocPrint(allocator, "{s}/payload/{s}", .{ h.agent_plan_url_root, entry.path });
         defer allocator.free(url);
-        try nativeDownload(io, allocator, url, agent_token, h.session, dest, entry.size);
+        // payload 是 digest 固定的数据面；服务端以 peer-IP、活动 session 和 plan
+        // allowlist 鉴别，不向普通下载传播 capability。
+        try nativeDownload(io, allocator, url, dest, entry.size);
         const payload_bytes = try readFile(io, allocator, dest);
         defer allocator.free(payload_bytes);
         if (payload_bytes.len != entry.size) return error.PayloadSizeMismatch;
@@ -142,11 +286,9 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
         defer allocator.free(got);
         if (!std.mem.eql(u8, got, entry.digest)) return error.PayloadDigestMismatch;
     }
-    const consumed_url = try std.fmt.allocPrint(allocator, "{s}/agent-consumed", .{h.agent_plan_url_root});
-    defer allocator.free(consumed_url);
-    current_stage = "agent_plan.consume";
-    try nativePostEmpty(io, allocator, consumed_url, agent_token, h.session);
-    clearToken(agent_token);
+    // 已删除旧 per-scope agent token，server 端不存在需要确认的“consume”动作；
+    // capability 仅用于 AgentPlan 控制读取，payload 校验完成后本地立即清零。
+    clearToken(capability_token);
 
     // node-apply：把 Node effective 运行根差量写入 overlay upper（真正 init 看到最终配置）。
     current_stage = "node_apply";
@@ -155,14 +297,19 @@ fn preInit(io: std.Io, allocator: std.mem.Allocator) !void {
 
     // 持久化已校验的 AgentPlan 到 boot.json（覆盖 handoff）。同时达成两件事：
     // (1) first-boot 在切根+systemd 后可直接读 boot.json 重放八步，无需远程控制；
-    // (2) credential 文件已经在读取时 unlink，agent:read token 随后只剩内存副本并被清零。
+    // (2) credential 文件已经在读取时 unlink，boot-session capability 随后只剩内存副本并被清零。
     current_stage = "handoff.persist_verified_plan";
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = handoff_path, .data = plan_json });
     std.debug.print("[nodeforge-agent] pre-init completed successfully\n", .{});
 }
 
 fn nodeApply(io: std.Io, allocator: std.mem.Allocator, plan: *const diskless_dto.AgentPlan, handoff_node: []const u8) !void {
-    const projection = plan.node_apply_projection;
+    var projection = plan.node_apply_projection;
+    // v0.4 AgentPlan v2 makes target_network the single network owner.  The
+    // legacy projection field is only used when reading an old local fixture;
+    // a production v2 plan with structured topology must never merge two views.
+    if (plan.target_network.interfaces.len > 0 or plan.target_network.bonds.len > 0 or plan.target_network.vlans.len > 0 or plan.target_network.routes.len > 0)
+        projection.network = plan.target_network;
     if (!std.mem.eql(u8, projection.node_id, handoff_node) or
         !std.mem.eql(u8, plan.node_id, handoff_node))
         return error.AgentPlanNodeMismatch;
@@ -235,9 +382,16 @@ fn firstBoot(io: std.Io, allocator: std.mem.Allocator) !void {
     std.Io.Dir.cwd().deleteFile(io, event_token_path) catch {};
 }
 
+/// v0.4 token 简化：handoff schema v2。`session` 是 delivery session id（event:append
+/// 用），`read_session` 是 boot_session id（capability 读取用）。两者来自不同的
+/// session store，在 initrd 引导认证时由服务端分别签发。
 const Handoff = struct {
     node: []u8,
+    /// delivery session id：配合 event_token 推进 lifecycle 事件。
     session: []u8,
+    /// boot_session id：配合 capability token 拉取 agent-plan/payload。
+    /// handoff schema v1 不含此字段，回退为 session（兼容旧 initrd 写入的 handoff）。
+    read_session: []u8,
     agent_plan_url: []u8,
     agent_plan_digest: []u8,
     event_url: []u8,
@@ -248,6 +402,7 @@ fn parseHandoff(allocator: std.mem.Allocator, json: []const u8) !Handoff {
     const P = struct {
         node: []const u8,
         session: []const u8,
+        read_session: ?[]const u8 = null,
         agent_plan_url: []const u8,
         agent_plan_digest: []const u8,
         event_url: []const u8,
@@ -262,6 +417,8 @@ fn parseHandoff(allocator: std.mem.Allocator, json: []const u8) !Handoff {
     return .{
         .node = try allocator.dupe(u8, p.value.node),
         .session = try allocator.dupe(u8, p.value.session),
+        // handoff schema v2 有 read_session；v1 回退为 session（兼容性）。
+        .read_session = try allocator.dupe(u8, p.value.read_session orelse p.value.session),
         .agent_plan_url = try allocator.dupe(u8, p.value.agent_plan_url),
         .agent_plan_digest = try allocator.dupe(u8, p.value.agent_plan_digest),
         .event_url = try allocator.dupe(u8, p.value.event_url),
@@ -272,6 +429,7 @@ fn parseHandoff(allocator: std.mem.Allocator, json: []const u8) !Handoff {
 fn freeHandoff(allocator: std.mem.Allocator, h: *const Handoff) void {
     allocator.free(h.node);
     allocator.free(h.session);
+    allocator.free(h.read_session);
     allocator.free(h.agent_plan_url);
     allocator.free(h.agent_plan_digest);
     allocator.free(h.event_url);
@@ -295,16 +453,130 @@ fn nativeGet(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: [
     });
 }
 
-fn nativeDownload(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, dest: []const u8, expected_size: u64) !void {
+fn nativeDownload(io: std.Io, allocator: std.mem.Allocator, url: []const u8, dest: []const u8, expected_size: u64) !void {
     const parsed = try http.Url.parse(url);
-    const headers = try nativeHeaders(allocator, token, session);
-    defer allocator.free(headers.auth);
-    defer allocator.free(headers.session);
-    const response_headers = try http.getToFile(io, allocator, parsed, &.{
-        .{ .name = "Authorization", .value = headers.auth },
-        .{ .name = "X-NodeForge-Session", .value = headers.session },
-    }, dest, 200, expected_size);
+    const response_headers = try http.getToFile(io, allocator, parsed, &.{}, dest, 200, expected_size);
     allocator.free(response_headers);
+}
+
+fn bearerHeader(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+}
+
+fn installFirstBootExchange(io: std.Io, allocator: std.mem.Allocator, url: []const u8, bootstrap: []const u8) ![]u8 {
+    const parsed_url = try http.Url.parse(url);
+    const auth_header = try bearerHeader(allocator, bootstrap);
+    defer allocator.free(auth_header);
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const response = http.postForBody(io, allocator, parsed_url, &.{
+            .{ .name = "Authorization", .value = auth_header },
+            .{ .name = "Content-Type", .value = "application/json" },
+        }, "{}") catch |err| {
+            if (attempt == 2) return err;
+            std.Io.sleep(io, .fromSeconds(@as(i64, 1) << @intCast(attempt)), .awake) catch {};
+            continue;
+        };
+        defer allocator.free(response);
+        const Response = struct { ok: bool, result: struct { event_token: []const u8, event_seq: u64 } };
+        const decoded = std.json.parseFromSlice(Response, allocator, response, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.InvalidFirstBootExchange;
+        defer decoded.deinit();
+        if (!decoded.value.ok or decoded.value.result.event_seq != 0 or decoded.value.result.event_token.len != 64) return error.InvalidFirstBootExchange;
+        for (decoded.value.result.event_token) |byte| if (!std.ascii.isHex(byte)) return error.InvalidFirstBootExchange;
+        return allocator.dupe(u8, decoded.value.result.event_token);
+    }
+    unreachable;
+}
+
+fn installEventBody(allocator: std.mem.Allocator, event_seq: u64, expected_state: []const u8, event: []const u8, event_id: []const u8, step_index: ?usize) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.print("{{\"schema_version\":1,\"event_seq\":{d},\"expected_state\":{f},\"event\":{f},\"event_id\":{f}", .{ event_seq, std.json.fmt(expected_state, .{}), std.json.fmt(event, .{}), std.json.fmt(event_id, .{}) });
+    if (step_index) |index| try output.writer.print(",\"step_index\":{d}", .{index});
+    try output.writer.writeAll("}\n");
+    return output.toOwnedSlice();
+}
+
+fn postInstallEventBody(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, body: []const u8) !void {
+    const parsed_url = try http.Url.parse(url);
+    const auth_header = try bearerHeader(allocator, token);
+    defer allocator.free(auth_header);
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const status = http.post(io, allocator, parsed_url, &.{
+            .{ .name = "Authorization", .value = auth_header },
+            .{ .name = "Content-Type", .value = "application/json" },
+        }, body) catch |err| {
+            if (attempt == 2) return err;
+            std.Io.sleep(io, .fromSeconds(@as(i64, 1) << @intCast(attempt)), .awake) catch {};
+            continue;
+        };
+        if (status >= 200 and status < 300) return;
+        return error.InstallFirstBootEventRejected;
+    }
+    unreachable;
+}
+
+fn installFirstBootEvent(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, event_seq: u64, expected_state: []const u8, event: []const u8, event_id: []const u8, step_index: ?usize) !void {
+    const body = try installEventBody(allocator, event_seq, expected_state, event, event_id, step_index);
+    defer allocator.free(body);
+    try postInstallEventBody(io, allocator, url, token, body);
+}
+
+fn installEventId(allocator: std.mem.Allocator, plan_digest: []const u8, kind: []const u8, index: ?usize) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("nodeforge-install-firstboot-event-v1\x00");
+    hasher.update(plan_digest);
+    hasher.update("\x00");
+    hasher.update(kind);
+    if (index) |value| {
+        var buffer: [24]u8 = undefined;
+        hasher.update(try std.fmt.bufPrint(&buffer, ":{d}", .{value}));
+    }
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    const result = try allocator.alloc(u8, 64);
+    _ = std.fmt.bufPrint(result, "{x}", .{raw}) catch unreachable;
+    return result;
+}
+
+fn persistAndSendInstallTerminal(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, journal: *install_first_boot.LocalJournal, journal_path: []const u8, token_path: []const u8, success: bool) !void {
+    const event_id = try installEventId(allocator, journal.first_boot_plan_digest, if (success) "succeeded" else "failed", null);
+    defer allocator.free(event_id);
+    const body = try installEventBody(allocator, 1, "running", if (success) "first_boot.succeeded" else "first_boot.failed", event_id, null);
+    defer allocator.free(body);
+    try journal.terminal(success, event_id, body);
+    try install_first_boot.persistJournal(io, allocator, journal_path, journal.*);
+    try postInstallEventBody(io, allocator, url, token, body);
+    try journal.acknowledge();
+    try install_first_boot.persistJournal(io, allocator, journal_path, journal.*);
+    try install_first_boot.removeCredential(io, token_path);
+}
+
+fn resendInstallTerminal(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, journal: *install_first_boot.LocalJournal, journal_path: []const u8, token_path: []const u8) !void {
+    const body = journal.terminal_event_body orelse return error.InvalidInstallFirstBootJournal;
+    if (journal.terminal_event_id == null) return error.InvalidInstallFirstBootJournal;
+    try postInstallEventBody(io, allocator, url, token, body);
+    try journal.acknowledge();
+    try install_first_boot.persistJournal(io, allocator, journal_path, journal.*);
+    try install_first_boot.removeCredential(io, token_path);
+}
+
+fn runInstallStep(io: std.Io, allocator: std.mem.Allocator, command: []const u8, timeout_s: u32, attempts: u8) !void {
+    const timeout = try std.fmt.allocPrint(allocator, "{d}", .{timeout_s});
+    defer allocator.free(timeout);
+    var attempt: u8 = 0;
+    while (attempt < attempts) : (attempt += 1) {
+        const result = try std.process.run(allocator, io, .{ .argv = &.{ "timeout", "--signal=TERM", timeout, "/bin/sh", "-c", command } });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code == 0) return,
+            else => {},
+        }
+        if (attempt + 1 < attempts) std.Io.sleep(io, .fromSeconds(1), .awake) catch {};
+    }
+    return error.InstallFirstBootStepFailed;
 }
 
 fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8, seq: u64, expected: []const u8, phase: []const u8) !void {
@@ -320,18 +592,6 @@ fn postLifecycle(io: std.Io, allocator: std.mem.Allocator, url: []const u8, toke
         .{ .name = "Content-Type", .value = "application/json" },
     }, body);
     if (status < 200 or status >= 300) return error.LifecycleEventRejected;
-}
-
-fn nativePostEmpty(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: []const u8, session: []const u8) !void {
-    const parsed = try http.Url.parse(url);
-    const headers = try nativeHeaders(allocator, token, session);
-    defer allocator.free(headers.auth);
-    defer allocator.free(headers.session);
-    const status = try http.post(io, allocator, parsed, &.{
-        .{ .name = "Authorization", .value = headers.auth },
-        .{ .name = "X-NodeForge-Session", .value = headers.session },
-    }, "");
-    if (status < 200 or status >= 300) return error.AgentConsumedRejected;
 }
 
 fn sha256Hex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -392,4 +652,30 @@ fn runChecked(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8
             return error.SubprocessFailed;
         },
     }
+}
+
+// ── v0.4 token 简化：两 session handoff 解析测试 ──────────────────────────
+
+test "handoff schema v2 separates read_session from delivery session" {
+    const json =
+        \\{"schema_version":2,"node":"n1","session":"delivery-sess","read_session":"boot-sess","agent_plan_url":"http://srv/api/v1/boot-sessions/delivery-sess/agent-plan/abcd","agent_plan_digest":"abcd","event_url":"http://srv/api/v1/nodes/n1/events"}
+    ;
+    const h = try parseHandoff(std.testing.allocator, json);
+    defer freeHandoff(std.testing.allocator, &h);
+    try std.testing.expectEqualStrings("n1", h.node);
+    try std.testing.expectEqualStrings("delivery-sess", h.session);
+    try std.testing.expectEqualStrings("boot-sess", h.read_session);
+    try std.testing.expectEqualStrings("abcd", h.agent_plan_digest);
+    try std.testing.expectEqualStrings("http://srv/api/v1/boot-sessions/delivery-sess", h.agent_plan_url_root);
+}
+
+test "handoff schema v1 falls back read_session to session for backward compat" {
+    const json =
+        \\{"schema_version":1,"node":"n1","session":"only-sess","agent_plan_url":"http://srv/api/v1/boot-sessions/only-sess/agent-plan/abcd","agent_plan_digest":"abcd","event_url":"http://srv/api/v1/nodes/n1/events"}
+    ;
+    const h = try parseHandoff(std.testing.allocator, json);
+    defer freeHandoff(std.testing.allocator, &h);
+    // v1 没有 read_session 字段，回退为 session。
+    try std.testing.expectEqualStrings("only-sess", h.session);
+    try std.testing.expectEqualStrings("only-sess", h.read_session);
 }

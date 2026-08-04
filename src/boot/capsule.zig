@@ -3,30 +3,23 @@
 
 const std = @import("std");
 
+/// PR3-1（token 简化）：diskless capsule 只携带 session id + event:append token。
+/// config/rootfs/agent 三个读取作用域 token 已删除 —— initrd 通过 peer-IP 引导
+/// 认证（boot_session.Store）获取 BootConfig/rootfs/payload；BootConfig 另签发
+/// 仅供 AgentPlan 的短时 capability。仅 event:append token 保留（diskless 有界切网后 lease-IP
+/// 身份可能变化，无法用 peer-IP 认证，但仍需推进生命周期 CAS）。
 pub const Values = struct {
     session: []const u8,
-    config_token: []const u8,
-    rootfs_token: []const u8,
-    agent_token: []const u8,
     event_token: []const u8,
 };
 
 pub fn render(allocator: std.mem.Allocator, values: Values) ![]u8 {
     try validateHex(values.session, 32);
-    try validateHex(values.config_token, 64);
-    try validateHex(values.rootfs_token, 64);
-    try validateHex(values.agent_token, 64);
     try validateHex(values.event_token, 64);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     var ino: u32 = 1;
     try appendEntry(&out.writer, ino, 0o100400, "capsule/session", values.session);
-    ino += 1;
-    try appendEntry(&out.writer, ino, 0o100400, "capsule/config.token", values.config_token);
-    ino += 1;
-    try appendEntry(&out.writer, ino, 0o100400, "capsule/rootfs.token", values.rootfs_token);
-    ino += 1;
-    try appendEntry(&out.writer, ino, 0o100400, "capsule/agent.token", values.agent_token);
     ino += 1;
     try appendEntry(&out.writer, ino, 0o100400, "capsule/event.token", values.event_token);
     try appendEntry(&out.writer, ino + 1, 0, "TRAILER!!!", "");
@@ -58,14 +51,15 @@ fn pad4(writer: *std.Io.Writer, length: usize) !void {
 test "renders a memory-only newc capsule" {
     const archive = try render(std.testing.allocator, .{
         .session = "1" ** 32,
-        .config_token = "2" ** 64,
-        .rootfs_token = "3" ** 64,
-        .agent_token = "4" ** 64,
         .event_token = "5" ** 64,
     });
     defer std.testing.allocator.free(archive);
     try std.testing.expect(std.mem.startsWith(u8, archive, "070701"));
     try std.testing.expect(std.mem.indexOf(u8, archive, "capsule/session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, archive, "capsule/event.token") != null);
     try std.testing.expect(std.mem.indexOf(u8, archive, "TRAILER!!!") != null);
-    try std.testing.expect(std.mem.indexOf(u8, archive, "config_url") == null);
+    // PR3-1: 不再包含 config/rootfs/agent token 文件。
+    try std.testing.expect(std.mem.indexOf(u8, archive, "config.token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, archive, "rootfs.token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, archive, "agent.token") == null);
 }

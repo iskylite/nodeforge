@@ -21,7 +21,7 @@ diskless 主流程完备可用，不追求 VMware 无法验证或非主流程的
 - NFS root（任何形态）、iPXE 菜单/脚本。
 - 多 NIC/VLAN/bonding、下载后切换目标地址/子网 → v0.4；PXE 继续使用 DHCPv4，稳定地址由
   `pxe.ip_reservation` 提供，不新增绕过 DHCP 的静态启动链。
-- 临时 PXE rootfs 构建节点 → v0.4。
+- rootfs 固定由 nodeforged 服务端生成；diskless Node 只消费 ready artifact。
 - 持久化 overlay、跨重启 rootfs partial → 永久非目标，具体语义见下文。
 - reconciliation/远程控制、可续期 enrollment credential → 永久非目标；per-boot 短时 capability token 保留。
 
@@ -108,8 +108,8 @@ rootfs = OS 层 + rootfs-build phase 业务内容 + Profile target-system 骨架
 
 **构建环境保真**：纯 userspace 动作只需 chroot；触及硬件/内核的动作（装驱动、dkms、重生成
 initramfs、装载内核模块）须 bind-mount `/dev`/`/proc`/`/sys` 并使用与目标 distro/version/arch/
-`kernel_release` 一致的内核（内核与 OS 一致时加载完整内核态）。更高保真的临时 PXE rootfs 构建节点
-延后 v0.4。详见 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §4.4。
+`kernel_release` 一致的内核（内核与 OS 一致时加载完整内核态）。所有构建均保留在 nodeforged
+服务端。详见 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §4.4。
 
 跨重启本地状态与 Profile SSH 基线的语义分别如下；它们不影响服务端持久保存 catalog、rootfs 成品和审计记录：
 
@@ -175,36 +175,37 @@ initrd 网络初始化按以下顺序收敛：先用 `SIOCGIFADDR` 查找已经�
 接口或假设 `eth0`。地址、netmask 与 gateway 设置失败均 fail closed。
 
 MAC 必须在第一次 BootConfig HTTP 请求前可得，因此当前作为无密钥 cmdline bootstrap fact；
-不能只放入需要网络才能取得的 BootConfig。它不是节点授权凭据，授权仍由 capsule 中的
-scope token 完成。
+不能只放入需要网络才能取得的 BootConfig。它不是单独凭据：服务端以 DHCP lease、
+boot session、Node/MAC/IP binding 共同完成引导认证。capsule 只保留切网后仍需使用的
+event credential，不再承载 config/rootfs/agent 读取 token。
 
 完整启动时序（其中 1-4 由 initrd 在 `switch_root` 前完成）：
 
 1. DHCP/TFTP 引导 boot bundle（kernel + 共享 NodeForge initrd）和 per-session credential capsule；GRUB 将
    极小 capsule 作为第二个 initrd cpio 追加加载。kernel cmdline 只携带无密钥的
    `nodeforge.config_url`、node identity、PXE IP/prefix/gateway/MAC 与 `kernel_args`。
-2. initrd 起后从 `config_url` 拉 BootConfig（单用途、仅容忍响应中断的有界重放 config token），校验 DTO、计划 snapshot、时钟窗口和
-   feature，再取得 rootfs 专用 artifact token；agent/event token 已在 credential capsule 中分域，initrd 不使用其读权限。
+2. initrd 起后以活动 DHCP peer/session binding 从 `config_url` 拉 BootConfig，校验 DTO、
+   计划 snapshot、时钟窗口和 feature。BootConfig 返回的短时 boot-session capability
+   只交给 agent 读取 AgentPlan；rootfs/payload 不使用该 token。
 3. initrd 先完成 rootfs HEAD/Range 下载、整文件校验，再建立 lower/upper/work/merged；它只把 AgentPlan
    URL/digest 等 locator 写入单一 `/var/lib/nodeforge/boot.json`，不下载/解析 plan 或 Node first-boot payload，
    也不写 merged root 的 target-system；lower 保持只读。
-4. initrd 做 pre-switch 验证，原子写交接目录，撤销并清零 config/rootfs-artifact token；把短时 `agent:read` 和
-   `event:append` token 分别以 0400 文件交给切根后的 agent。
+4. initrd 做 pre-switch 验证，原子写交接目录；把短时 boot-session capability 和
+   `event:append` token 分别以 0400 文件交给切根后的 agent，rootfs 下载全程不生成或传播 token。
 5. initrd 以 `nodeforge-agent --pre-init` 为切根入口；agent 使用继承的 bootstrap 网络从服务端拉取并校验
-   immutable AgentPlan 及全部 Node 专属 payload，写入 `/run` 后清零 `agent:read` token；然后在最终 root 中应用全部
+   immutable AgentPlan 及全部 Node 专属 payload，写入 `/run` 后清零 boot-session capability；然后在最终 root 中应用全部
    Node override，成功后原进程
    `exec /sbin/init`，NM/Netplan/sshd 等只看到最终状态。systemd 启动后 agent 的 first-boot unit 再执行 effective
    bundle；完成后删除 event token。token 过期或事件回传失败不影响本地执行结果。
 
 AgentPlan 可包含 Node override 派生的 password hash、authorized_keys 和 hosts 差量，但不包含明文密码或 Profile
-共享 SSH private keys；所有 secret 字段与 token 一样禁止进入日志/事件/`boot.json`。传输能力拆成四种不可互换的
-scope：`config:read`（initrd 单用途有界重放）、`artifact:read`（initrd 只读 rootfs/manifest）、`agent:read`
-（agent 只读固定 AgentPlan 及其显式 payload closure）和 `event:append`（限定本 session 的事件 POST）。四者都绑定 node、session、audience、method/path、计划
-digest 与绝对过期时间，不能访问其他 Node、不能列目录、不能写 catalog，也不能升级为 management
-credential。`/var/lib/nodeforge/boot.json` 只保存 plan/config digest 与非 secret 摘要，mode 0600；短时
-`event:append` token 单独保存于 `/var/lib/nodeforge/credentials/event.token`，mode 0400，不能进入 boot.json、
-日志或进程 argv。initrd 在 `switch_root` 前清零 config/rootfs-artifact token；agent 在预取并校验全部输入后、修改
-目标系统前清零 agent token，first-boot 结束后清零 event token。
+共享 SSH private keys；所有 secret 字段与 token 一样禁止进入日志/事件/`boot.json`。v0.4 只保留两类必要凭据：
+随机、仅驻内存的 boot-session capability 用于读取固定 AgentPlan；派生 `event:append` credential 用于推进本
+session 状态。BootConfig、rootfs 与 payload 由 DHCP peer/session/digest binding 认证，固定大对象不携带 token。
+两类凭据都不能访问其他 Node、不能列目录、不能写 catalog，也不能升级为 management credential。
+`/var/lib/nodeforge/boot.json` 只保存 plan/config digest 与非 secret 摘要，mode 0600；短时 capability/event token
+分别保存于 0400 credential 文件，不能进入 boot.json、日志或进程 argv。agent 在预取并校验 AgentPlan 后、修改
+目标系统前清零 capability，first-boot 结束后清零 event token。
 BootConfig DTO 自身 `schema_version` v3（与 catalog schema v5 分属不同命名空间）；
 v3 增加 `facts_url`，initrd 以 event/telemetry capability 上报 `MemTotal` + DMI 硬件事实
 （`product_serial`/`product_uuid`/`sys_vendor`/`product_name`），
@@ -231,10 +232,10 @@ JSON 计算 SHA-256。未知顶层字段默认拒绝，只有 `extensions` 容�
 | `rootfs` | 固定 digest 算法 `sha512`、hex digest、字节 `size`、`etag`、manifest digest、URL |
 | `overlay` | v0.2 固定 `tmpfs_percent`、`minimum_free_bytes`；不存在 mode 字段 |
 | `bootstrap_network` | 仅启动 NIC MAC、PXE 地址/lease 与 server endpoint；目标 renderer/topology 在 AgentPlan |
-| `agent_plan` | URL、digest、size、expiry 与 feature 摘要；完整内容由 agent 切根后按 `agent:read` 获取，不由 initrd 解析 |
+| `agent_plan` | URL、digest、size、expiry 与 feature 摘要；完整内容由 agent 切根后按 boot-session capability 获取，不由 initrd 解析 |
 | `facts_url` | 固定到本 node 的 facts POST；只接受本 session event/telemetry capability；上报 memory_bytes + DMI（serial/uuid/vendor/model），不推进 lifecycle event_seq |
 | `required_features` | `{initrd:[...],agent:[...]}`；分别是 initrd manifest 与 rootfs agent manifest features 的子集 |
-| `artifacts` / `events` | rootfs/AgentPlan/event URL 与 credential slot 引用；raw config/rootfs/agent/event token 只在 credential capsule/0400 文件，不进入 DTO；URL host 必须是配置的 `server_ip` 字面地址 |
+| `artifacts` / `events` | rootfs/AgentPlan/event URL；rootfs/payload 固定大对象只用 peer/session/digest binding，不携带 token；BootConfig 内的短时 capability 只供 AgentPlan 控制面读取并落入 0400 handoff，event token 只由 capsule/0400 文件交付；URL host 必须是配置的 `server_ip` 字面地址 |
 
 AgentPlan 的 canonical schema 单独包含 `node_apply_projection`：Node effective 相对 Profile 的全部运行根差量、
 effective first-boot descriptor、pinned payload closure 与 `required_features.agent`。BootConfig 只绑定其 digest/size，
@@ -253,13 +254,16 @@ effective first-boot descriptor、pinned payload closure 与 `required_features.
 | `payloads` | 内容寻址 URL/digest/size/mode/path allowlist；必须是 plan 的完整闭包，禁止 `latest` |
 | `required_features` | 只含 agent consumer feature；必须是 rootfs agent manifest 子集 |
 
-AgentPlan 响应不携带 raw token；`agent:read` token 只在独立 0400 文件和 Authorization header 中出现。agent 必须先将
-plan/payload 全部下载到 session-owned `.part`，逐一验证并原子发布到 `/run`，再清 token、进入 apply stage。
+AgentPlan 响应不携带 raw token；boot-session capability 只在独立 0400 文件和
+Authorization header 中出现。agent 必须先下载并验证固定 AgentPlan；payload 走
+peer/session/digest 数据面下载到 session-owned `.part`，逐一验证并原子发布到 `/run`，
+再清 capability、进入 apply stage。
 
 kernel cmdline 只允许携带无密钥的 `nodeforge.config_url`、`nodeforge.node_id`、`nodeforge.session` 和已编译的
-`kernel_args`，不得携带 password hash、任何 token 或整份 JSON。config token 位于 per-session
-`credential.cpio` 的 initramfs 私有目录（0400 文件）：`config.token`、`rootfs.token`、`agent.token`、`event.token`；
-四者 scope 不可互换。GRUB 用多个 `initrd` 参数/条目把 capsule 追加到共享 initrd。capsule 路径含不可猜 session id，
+`kernel_args`，不得携带 password hash、任何 token 或整份 JSON。per-session
+`credential.cpio` 的 initramfs 私有目录只含 delivery session id 与 `event.token`；
+boot-session capability 由 peer-authenticated BootConfig 签发后写入 0400 handoff。
+GRUB 用多个 `initrd` 参数/条目把 capsule 追加到共享 initrd。capsule 路径含不可猜 session id，
 TFTP/HTTP resolver 还须校验发起 IP 对应的活动 DHCP
 session；capsule 单次下载、短 TTL、日志全量脱敏。它只改善静态泄露面，不提供链路机密性，隔离 VLAN/ACL 仍是硬要求。
 
@@ -268,13 +272,13 @@ session；capsule 单次下载、短 TTL、日志全量脱敏。它只改善静�
 initrd 每一步写本地有界 journal，成功后 `fsync` 再推进；重入只允许在同一 session、同一 plan/config
 digest 内从安全检查点继续。具体顺序固定如下：
 
-1. **early mount**：先从 initramfs 私有路径读取并 unlink capsule token，再挂载 `/proc`、`/sys`、`/dev`、
+1. **early mount**：先从 initramfs 私有路径读取并 unlink delivery session/event credential，再挂载 `/proc`、`/sys`、`/dev`、
    `/run` 并解析 cmdline；重复 key、未知 `nodeforge.*` key、token owner/mode/session 不匹配或格式错误立即失败。
 2. **network-up**：只激活 DHCP 已使用的启动 NIC；校验其永久 MAC 等于 BootConfig。v0.2 不切 NIC、
    VLAN 或地址，不做 DNS。
-3. **config**：带 single-purpose config token 获取固定 BootConfig；响应中断可在短窗口重取相同 bytes，限制响应头
-   32 KiB、body 1 MiB、重定向 0 次；校验身份、时间、canonical digest、feature 和 URL allowlist，随后以携带相同
-   config digest 的 `diskless.initrd_started` 确认并令服务端撤销 token。
+3. **config**：以活动 DHCP peer/boot session 获取固定 BootConfig；响应中断可在短窗口重取相同 bytes，限制响应头
+   32 KiB、body 1 MiB、重定向 0 次；校验身份、时间、canonical digest、feature 和 URL allowlist，随后上报
+   `diskless.initrd_started`。BootConfig 内 capability 只为后续 AgentPlan 控制面读取签发。
 4. **memory gate**：读取 `/proc/meminfo`，直接以 `MemAvailable` 作为 `available_budget`，不能再扣当前 kernel/initrd。
    令 `node_payload_size` 为 Node first-boot override payload 的精确传输字节数（无 override 时为 0），
    `upper_limit=floor(available_budget*tmpfs_percent/100)`；检查 `minimum_free_bytes <= upper_limit` 且
@@ -290,11 +294,11 @@ digest 内从安全检查点继续。具体顺序固定如下：
    `upper`/`work`，以 `nodev,nosuid` 挂载 overlay 到 `merged`。lower 必须 `ro,nodev`。
 8. **handoff-agent**：校验 AgentPlan locator envelope 与 rootfs agent feature manifest，写
    单一 `/var/lib/nodeforge/boot.json`；不下载/解析 AgentPlan 或 Node payload，不写 target-system。
-   agent/event token 只写独立 0400 credential 文件，不进入 JSON。
+   boot-session capability/event token 只写独立 0400 credential 文件，不进入 JSON。
 9. **pre-switch**：确认 `/sbin/init` 与 `/usr/lib/nodeforge/nodeforge-agent` 可执行、modules ABI、挂载和 `/run`
-   move-mount 可持续；写 boot.json、agent/event token 和 journal，均禁止跟随 symlink。target-system/DNS/账号/renderer 的
+   move-mount 可持续；写 boot.json、capability/event token 和 journal，均禁止跟随 symlink。target-system/DNS/账号/renderer 的
    最终验证属于 agent pre-init，不得在 initrd 复制一套 parser。
-10. **handoff**：POST `switching_root`，撤销/清零 config/rootfs-artifact token，move-mount `/dev`、`/proc`、
+10. **handoff**：POST `switching_root`，确认 rootfs 已完成 digest 校验且未传播 token，move-mount `/dev`、`/proc`、
     `/sys`、`/run`，以 merged 为新根执行
     `switch_root ... /usr/lib/nodeforge/nodeforge-agent --pre-init`。pre-init 成功后再 exec `/sbin/init`；任一 exec 返回均视为失败。
 
@@ -354,14 +358,16 @@ v0.2 的接管不是重新配网，而是保持启动 NIC、MAC、IPv4 地址、
 
 ### 5.4 服务重启与断点续传
 
-v0.2 明确支持 daemon 重启后恢复**投递**，不恢复内存中的旧 socket：BootSession、计划快照、capability
-claim 的不可逆 hash、过期时间、rootfs snapshot ref 和最后确认 phase 必须原子持久化。原始 token 永不落盘。
+v0.4 支持 daemon 重启后基于持久 authority 重新 join **投递**，不恢复内存中的旧 socket：BootSession、
+计划快照、event credential claim 的不可逆 hash、过期时间、rootfs snapshot ref 和最后确认 phase 必须原子持久化。
+随机 boot-session capability 只驻内存，原始 token 永不落盘。
 
-- initrd 重试时用现有 token + session id 重新认证；服务端从 token hash 找到未过期 session，仅在 plan/rootfs
-  digest 相同且 session 未终止时恢复。无法验证就返回 401/410，initrd 进入稳定失败，不创建影子 session。
-- 恢复保证从客户端已完整取得 raw token 后开始。daemon 在 capsule 未交付或交付中重启，且客户端没有完整 token 时，
-  旧 session 标 `session.recovery_incomplete`，下一次 boot 生成新 session/token；持久化 delivery started/completed 审计位
-  不能用于重建 secret。客户端已取得完整 token 时，服务端才可用 hash 验证并恢复 config/download/event 阶段。
+- BootConfig/rootfs/payload 重试继续使用 DHCP peer/session/digest binding；服务端仅在 plan/rootfs digest
+  相同且 session 未终止时恢复。AgentPlan capability 丢失后必须经持久 authority fail-closed join 重新签发，
+  不能从持久数据反推旧随机 token，也不创建影子 session。
+- capsule 交付中断只影响 delivery session id/event credential；持久化 delivery started/completed 审计位
+  不能用于伪造 raw credential。无法证明完整交付时旧 session 标 `session.recovery_incomplete`，下一次 boot
+  创建新 session；rootfs 大对象恢复本身不依赖 capsule read token。
 - Range 恢复由客户端 partial 长度与服务端 immutable ETag 决定；服务端不保存 offset。`If-Range` 不匹配返回
   200 时，客户端必须先截断 partial 再完整接收，绝不能 append。
 - v0.2 不回收已经发布的 rootfs object；rename 发布镜像与 manifest 后才能 ready。daemon 重启发现未发布的
@@ -405,7 +411,7 @@ desired digest 变化会关闭旧计数并开始新 bucket，保留旧审计。
 
 initrd 切根到 node-bound agent（`nodeforge-agent --pre-init`，见 [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md)）。
 agent 框架先以继承的 bootstrap 网络从服务端拉取 session 固定的 AgentPlan 和全部 Node payload，校验后写入 `/run`
-并清零 `agent:read` token；随后在真正 init 前使用完整 rootfs 环境应用全部 Node effective override，成功后 exec `/sbin/init`；systemd 启动后
+并清零 boot-session capability；随后在真正 init 前使用完整 rootfs 环境应用全部 Node effective override，成功后 exec `/sbin/init`；systemd 启动后
 同一 binary 的 unit 再顺序执行 effective `first-boot`。后者默认承载 Profile 固定 bundle，
 `overrides.diskless.provision.bundle` 存在时完整替换为 agent pre-init 已预取校验的 Node first-boot-only payload：
 

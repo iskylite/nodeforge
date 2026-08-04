@@ -15,28 +15,33 @@
 //! 安全说明：
 //! - `boot_disk` 去掉 `/dev/` 前缀后用于 `clearpart --drives`，防止注入设备路径
 //! - 密码以明文传递给 Anaconda（`--iscrypted` 未设置），由 Anaconda 自行哈希存储
-//! - `%post` 中的 curl 命令携带 capability token 和 session id，用于事件关联
+//! - answer bytes 不内联 capability；`%pre/%post` 从 boot-config bootstrap 到
+//!   0400 `/run` 文件，curl 运行时读取并在终态后清理
 
 const std = @import("std");
 const model = @import("../../model.zig");
 const render = @import("../render.zig");
 const runner = @import("../../provision/runner.zig");
 const password_hash = @import("../password_hash.zig");
+const first_boot_handoff = @import("../../provision/install_first_boot_handoff.zig");
+const installer_auth = @import("installer_auth.zig");
 
 /// 测试夹具只负责把共享 system 字段投影为 canonical software 输入；生产代码
 /// 和测试最终都调用唯一的 `renderEffective`，不再维护第二套渲染逻辑。
-fn renderTestFixture(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, repo_url: []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
+fn renderTestFixture(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, bootstrap_key: []const u8, repo_url: []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, boot_config_url: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
     const network = node.network;
     const software: model.SoftwareSelection = .{ .packages = .{ .include = system.packages } };
-    return renderEffective(allocator, node, install, system, network, software, bootstrap_key, repo_url, &.{repo_url}, bundle, facts_url, event_url, log_url, session, token, password_scope, kernel_args);
+    return renderEffective(allocator, node, install, system, network, software, bootstrap_key, repo_url, &.{repo_url}, bundle, facts_url, event_url, log_url, session, boot_config_url, password_scope, kernel_args, null);
 }
 
 /// 从已编译的唯一 effective plan 渲染 Kickstart；调用方不得传入 raw Profile
 /// 或自行补默认值，避免校验、预览和实际安装产生不同答案。
-pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, network: model.TargetNetworkConfig, software: model.SoftwareSelection, bootstrap_key: []const u8, repo_url: []const u8, repository_urls: []const []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, token: []const u8, password_scope: []const u8, kernel_args: ?[]const u8) ![]u8 {
+pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConfig, install: model.InstallConfig, system: model.TargetSystemConfig, network: model.TargetNetworkConfig, software: model.SoftwareSelection, bootstrap_key: []const u8, repo_url: []const u8, repository_urls: []const []const u8, bundle: ?*const model.ProvisioningBundle, facts_url: []const u8, event_url: []const u8, log_url: []const u8, session: []const u8, boot_config_url: []const u8, password_scope: []const u8, kernel_args: ?[]const u8, install_first_boot: ?first_boot_handoff.Config) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
+    const auth_bootstrap = try installer_auth.bootstrapCommand(allocator, boot_config_url, session, installer_auth.token_path);
+    defer allocator.free(auth_bootstrap);
     try w.print("url --url={s}", .{repo_url});
     if (install.proxy.url) |proxy| try w.print(" --proxy={s}", .{proxy});
     try w.print("\nlang {s}\nkeyboard {s}\ntimezone {s} --utc\n", .{ system.localization.locale, system.localization.keyboard, system.localization.timezone });
@@ -139,15 +144,16 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     }
     if (system.ssh.enabled) try w.writeAll("services --enabled=sshd\n");
     try w.print("selinux --{s}\n", .{@tagName(system.security.selinux)});
-    try w.print("%pre\nnf_fact() {{ test -r /sys/class/dmi/id/$1 && head -c 256 /sys/class/dmi/id/$1 | tr -d '\\r\\n' | sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g'; }}\nNF_SERIAL=$(nf_fact product_serial); NF_UUID=$(nf_fact product_uuid); NF_VENDOR=$(nf_fact sys_vendor); NF_MODEL=$(nf_fact product_name)\nNF_MEM_KIB=$(awk '$1 == \"MemTotal:\" {{ print $2; exit }}' /proc/meminfo); case \"$NF_MEM_KIB\" in ''|*[!0-9]*) NF_MEM_KIB=0;; esac; NF_MEMORY_BYTES=$((NF_MEM_KIB * 1024))\nNF_FACTS=$(printf '{{\"serial_number\":\"%s\",\"product_uuid\":\"%s\",\"vendor\":\"%s\",\"model\":\"%s\",\"memory_bytes\":%s}}' \"$NF_SERIAL\" \"$NF_UUID\" \"$NF_VENDOR\" \"$NF_MODEL\" \"$NF_MEMORY_BYTES\")\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d \"$NF_FACTS\" {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"installer_started\"}}' {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"started\"}}' {s} || true\n%end\n", .{ token, session, facts_url, token, session, session, event_url, token, session, session, event_url });
+    try w.print("%pre\n{s}\nNF_TOKEN=$(cat {s})\nnf_fact() {{ test -r /sys/class/dmi/id/$1 && head -c 256 /sys/class/dmi/id/$1 | tr -d '\\r\\n' | sed 's/\\\\/\\\\\\\\/g;s/\"/\\\\\"/g'; }}\nNF_SERIAL=$(nf_fact product_serial); NF_UUID=$(nf_fact product_uuid); NF_VENDOR=$(nf_fact sys_vendor); NF_MODEL=$(nf_fact product_name)\nNF_MEM_KIB=$(awk '$1 == \"MemTotal:\" {{ print $2; exit }}' /proc/meminfo); case \"$NF_MEM_KIB\" in ''|*[!0-9]*) NF_MEM_KIB=0;; esac; NF_MEMORY_BYTES=$((NF_MEM_KIB * 1024))\nNF_FACTS=$(printf '{{\"serial_number\":\"%s\",\"product_uuid\":\"%s\",\"vendor\":\"%s\",\"model\":\"%s\",\"memory_bytes\":%s}}' \"$NF_SERIAL\" \"$NF_UUID\" \"$NF_VENDOR\" \"$NF_MODEL\" \"$NF_MEMORY_BYTES\")\ncurl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d \"$NF_FACTS\" {s} || true\ncurl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"installer_started\"}}' {s} || true\ncurl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"started\"}}' {s} || true\nunset NF_TOKEN\n%end\n", .{ auth_bootstrap, installer_auth.token_path, session, facts_url, session, session, event_url, session, session, event_url });
     try w.writeAll("%packages\n");
     if (software.environment) |environment| try w.print("@^{s}\n", .{environment}) else try w.writeAll("@^minimal-environment\n");
     for (software.groups) |group| try w.print("@{s}\n", .{group});
     if (system.ssh.enabled) try w.writeAll("openssh-server\n");
     if (bundleHasInstallPostArchive(bundle)) try w.writeAll("tar\n");
+    if (install_first_boot != null) try w.writeAll("python3\n");
     for (software.packages.include) |package| try w.print("{s}\n", .{package});
     for (software.packages.exclude) |package| try w.print("-{s}\n", .{package});
-    try w.writeAll("%end\n%post --erroronfail\n");
+    try w.print("%end\n%post --erroronfail\n{s}\n", .{auth_bootstrap});
     if (install.proxy.url) |proxy| {
         try w.print("install -d -m 0755 /etc/profile.d\nprintf '%s\\n' 'export http_proxy={s}' 'export https_proxy={s}'", .{ proxy, proxy });
         if (install.proxy.no_proxy.len != 0) {
@@ -193,13 +199,18 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     if (bundle) |value| {
         const script = try runner.renderInstallPostInstrumented(allocator, value, .dnf, .{
             .event_url = event_url,
-            .token = token,
+            .token_file = installer_auth.token_path,
             .boot_session_id = session,
         });
         defer allocator.free(script);
         try w.writeAll(script);
     }
-    try w.print("curl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"completed\"}}' {s} || true\n%end\n%onerror\nERRLOG=$(ls /tmp/anaconda-tb-*/anaconda-tb 2>/dev/null | head -1)\nSUMMARY=\"anaconda error\"\nif [ -n \"$ERRLOG\" ]; then\n  SUMMARY=\"anaconda error: $(head -c 1800 \"$ERRLOG\" 2>/dev/null | tr '\\n' ' ')\"\nfi\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' --data-urlencode 'v=1' --data-urlencode 'boot_session_id={s}' --data-urlencode 'reason=install.anaconda_error' --data-urlencode \"summary=$SUMMARY\" {s} || true\ncurl -fsS -H 'Authorization: Bearer {s}' -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"failed\"}}' {s} || true\n%end\n", .{ token, session, session, event_url, token, session, session, event_url, token, session, session, log_url, token, session, session, event_url });
+    if (install_first_boot) |handoff_config| {
+        const script = try first_boot_handoff.render(allocator, handoff_config);
+        defer allocator.free(script);
+        try w.writeAll(script);
+    }
+    try w.print("NF_TOKEN=$(cat {s})\ncurl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\ncurl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"completed\"}}' {s} || true\nunset NF_TOKEN\nrm -f {s} /root/anaconda-ks.cfg /root/original-ks.cfg\n%end\n%post --nochroot\nrm -f {s} {s}.part\n%end\n%onerror\nNF_TOKEN=$(cat {s} 2>/dev/null || true)\nERRLOG=$(ls /tmp/anaconda-tb-*/anaconda-tb 2>/dev/null | head -1)\nSUMMARY=\"anaconda error\"\nif [ -n \"$ERRLOG\" ]; then\n  SUMMARY=\"anaconda error: $(head -c 1800 \"$ERRLOG\" 2>/dev/null | tr '\\n' ' ')\"\nfi\nif [ -n \"$NF_TOKEN\" ]; then\n  curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' --data-urlencode 'v=1' --data-urlencode 'boot_session_id={s}' --data-urlencode 'reason=install.anaconda_error' --data-urlencode \"summary=$SUMMARY\" {s} || true\n  curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"failed\"}}' {s} || true\nfi\nunset NF_TOKEN\nrm -f {s} {s}.part /mnt/sysroot{s} /mnt/sysimage{s}\n%end\n", .{ installer_auth.token_path, session, session, event_url, session, session, event_url, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path, session, session, log_url, session, session, event_url, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path });
     try w.print("{s}\n", .{@tagName(install.completion.action)});
     return out.toOwnedSlice();
 }
@@ -429,18 +440,27 @@ fn renderUserGroups(w: *std.Io.Writer, user: model.TargetUserConfig) !void {
 // 测试：Kickstart 渲染包含 UEFI 默认分区和安装后事件上报 curl 命令。
 test "kickstart renders UEFI defaults and installer event hook" {
     const node: model.NodeConfig = .{ .id = "node-01", .mac = "00:11:22:33:44:55", .arch = .aarch64, .profile = "rocky" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "part /boot/efi") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "curl -fsS") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "rm -f /etc/yum.repos.d/*.repo") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/etc/yum.repos.d/nodeforge.repo") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "baseurl=http://repo") != null);
+    // The answer contains only the bootstrap locator and runtime variable. A
+    // concrete capability must never be copied into Anaconda's persisted
+    // answer/log files.
+    const raw_capability = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "http://srv/api/v1/nodes/n1/boot-config") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, installer_auth.token_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "Authorization: Bearer $NF_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, raw_capability) == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "rm -f /run/nodeforge-installer.token /root/anaconda-ks.cfg /root/original-ks.cfg") != null);
 }
 
 test "M4.1 kickstart renders root crypt and security defaults" {
     const node: model.NodeConfig = .{ .id = "node-02", .mac = "00:11:22:33:44:66", .arch = .aarch64, .profile = "rocky" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{ .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }}, .packages = &.{"vim"} }, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{ .users = &.{.{ .name = "admin", .password = "secret", .sudo = true }}, .packages = &.{"vim"} }, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "daemon:session:1", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "rootpw --iscrypted $6$") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "user --name=admin --password=$6$") != null);
@@ -460,7 +480,7 @@ test "M4.1 kickstart renders root crypt and security defaults" {
 
 test "M4.2 kickstart renders default nodeforge account" {
     const node: model.NodeConfig = .{ .id = "node-default", .mac = "00:11:22:33:44:67", .arch = .x86_64, .profile = "rocky" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "user --name=nodeforge --password=$6$") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--groups=wheel") != null);
@@ -468,14 +488,14 @@ test "M4.2 kickstart renders default nodeforge account" {
 
 test "M4.6 kickstart persists kernel args with bootloader append" {
     const node: model.NodeConfig = .{ .id = "node-kargs", .mac = "00:11:22:33:44:68", .arch = .aarch64, .profile = "rocky" };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "scope", "iommu=pt hugepages=4");
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", "iommu=pt hugepages=4");
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "bootloader --boot-drive=sda --append=\"iommu=pt hugepages=4\"") != null);
 }
 
 test "M4.1 kickstart static target network uses Anaconda netmask syntax" {
     const node: model.NodeConfig = .{ .id = "node-03", .mac = "00:11:22:33:44:77", .arch = .aarch64, .profile = "rocky", .network = .{ .mode = .static, .interface = "ens192", .match_mac = "00:11:22:33:44:77", .address = "192.168.50.20", .prefix_len = 24, .search_domains = &.{"nodeforge.local"} } };
-    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{ .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} } }, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "token", "daemon:session:1", null);
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{ .connectivity = .{ .time_sync = true, .ntp_servers = &.{"ntp.nodeforge.local"} } }, "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8w9Aw2QE0Wqg1MUJELZyaLlRC4V1hD2dNBo6w+ test", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "daemon:session:1", null);
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--netmask=255.255.255.0") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--prefix=") == null);

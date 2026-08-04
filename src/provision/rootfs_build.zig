@@ -65,8 +65,8 @@ pub const LocalOnlyViolation = struct {
 
 /// 已知公网 mirror/metalink/GeoIP/vendor 关键词。命中即违反 local-only 不变式。
 const forbidden_url_markers = [_][]const u8{
-    "mirrorlist", "metalink", "geoip", "mirror.", "mirrors.", "centos.org", "fedora.org",
-    "ubuntu.com", "archive.ubuntu", "ports.ubuntu", "rhui", "amazonaws", "cloudfront",
+    "mirrorlist", "metalink",       "geoip",        "mirror.", "mirrors.",  "centos.org", "fedora.org",
+    "ubuntu.com", "archive.ubuntu", "ports.ubuntu", "rhui",    "amazonaws", "cloudfront",
 };
 
 /// 校验单个 repository base_url 是否符合 local-only（无公网 mirror/metalink/GeoIP/vendor）。

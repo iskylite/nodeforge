@@ -41,12 +41,33 @@ pub fn renderPackageStep(
     staging: []const u8,
     preserve_sources_list: bool,
 ) !void {
+    return renderPackageStepWithReleasever(w, package_manager, packages, repository_urls, nogpgcheck, target, staging, preserve_sources_list, null);
+}
+
+/// rootfs 构建只使用 nodeforged 本机受管 repository；包管理器绝不接收
+/// Bearer、session header 或其他控制面凭据。
+pub fn renderPackageStepWithReleasever(
+    w: *std.Io.Writer,
+    package_manager: dto.FirstBootPackageManager,
+    packages: []const []const u8,
+    repository_urls: []const []const u8,
+    nogpgcheck: bool,
+    target: Target,
+    staging: []const u8,
+    preserve_sources_list: bool,
+    releasever: ?[]const u8,
+) !void {
     if (packages.len == 0) return error.NoPackages;
     if (repository_urls.len == 0) return error.NoManagedRepository;
     switch (package_manager) {
         .dnf => {
             try w.writeAll("dnf -y");
             if (target == .installroot) try w.print(" --installroot={s}", .{staging});
+            if (releasever) |version| {
+                if (version.len == 0) return error.InvalidReleaseVersion;
+                try w.writeAll(" --releasever=");
+                try writeQuoted(w, version);
+            }
             try w.writeAll(" --disablerepo='*'");
             for (repository_urls, 0..) |url, index| {
                 try w.print(" --repofrompath=nodeforge-{d},", .{index});
@@ -61,6 +82,7 @@ pub fn renderPackageStep(
             }
         },
         .apt => {
+            if (releasever != null) return error.AptReleaseVersionUnsupported;
             // apt/dpkg 没有等价 host-context 安装模式，恒须 chroot；不支持 installroot。
             if (target == .installroot) return error.AptInstallrootUnsupported;
             // 默认先禁用全部既有源（含 casper 层自带的 cdrom:/公网条目），只留
@@ -77,8 +99,9 @@ pub fn renderPackageStep(
                 try writeQuoted(w, url);
                 try w.writeAll(" >> /etc/apt/sources.list.d/nodeforge.list");
             }
-            try w.writeAll(" && apt-get update");
-            try w.writeAll(" && apt-get -y install");
+            try w.writeAll(" && apt-get");
+            try w.writeAll(" update && apt-get");
+            try w.writeAll(" -y install");
             for (packages) |pkg| {
                 try w.writeByte(' ');
                 try writeQuoted(w, pkg);
@@ -127,6 +150,22 @@ pub fn execute(
     timeout_s: u32,
     preserve_sources_list: bool,
 ) !void {
+    return executeWithReleasever(io, allocator, staging, package_manager, packages, repository_urls, nogpgcheck, target, timeout_s, preserve_sources_list, null);
+}
+
+pub fn executeWithReleasever(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    staging: []const u8,
+    package_manager: dto.FirstBootPackageManager,
+    packages: []const []const u8,
+    repository_urls: []const []const u8,
+    nogpgcheck: bool,
+    target: Target,
+    timeout_s: u32,
+    preserve_sources_list: bool,
+    releasever: ?[]const u8,
+) !void {
     // OS 层 bootstrap 没有 ProvisionStep 可携带 timeout，使用显式构建默认值；
     // 普通 package step 必须尊重模型中的 timeout_s，任何外部包管理器都不能
     // 让 durable operation 永久停在 running。
@@ -134,11 +173,12 @@ pub fn execute(
     if (effective_timeout > 86400) return error.InvalidStepTimeout;
     var step_body: std.Io.Writer.Allocating = .init(allocator);
     defer step_body.deinit();
-    try renderPackageStep(&step_body.writer, package_manager, packages, repository_urls, nogpgcheck, target, staging, preserve_sources_list);
+    try renderPackageStepWithReleasever(&step_body.writer, package_manager, packages, repository_urls, nogpgcheck, target, staging, preserve_sources_list, releasever);
 
     const step_script_rel = "/tmp/nodeforge-namespaced-step.sh";
     const step_script_full = try std.fmt.allocPrint(allocator, "{s}{s}", .{ staging, step_script_rel });
     defer allocator.free(step_script_full);
+    defer std.Io.Dir.cwd().deleteFile(io, step_script_full) catch {};
     // installroot target：staging 尚为空，需创建 staging 本身和 step script 的
     // 父目录 staging/tmp/。chroot target：staging 已是完整 rootfs，/tmp 已存在。
     if (target == .installroot) {
@@ -263,6 +303,40 @@ test "renderPackageStep fails closed with no packages or no repository" {
     defer out.deinit();
     try std.testing.expectError(error.NoPackages, renderPackageStep(&out.writer, .dnf, &.{}, &.{"file:///x"}, true, .chroot, "/staging", false));
     try std.testing.expectError(error.NoManagedRepository, renderPackageStep(&out.writer, .dnf, &.{"jq"}, &.{}, true, .chroot, "/staging", false));
+}
+
+test "package repository rendering never injects control-plane credentials" {
+    var dnf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer dnf.deinit();
+    try renderPackageStepWithReleasever(&dnf.writer, .dnf, &.{"bash"}, &.{"http://127.0.0.1/repo"}, true, .installroot, "/staging", false, "9");
+    try std.testing.expect(std.mem.indexOf(u8, dnf.written(), "--releasever='9'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dnf.written(), "http_headers") == null);
+
+    var apt: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer apt.deinit();
+    try renderPackageStep(&apt.writer, .apt, &.{"curl"}, &.{"http://127.0.0.1/repo"}, true, .chroot, "/staging", false);
+    try std.testing.expect(std.mem.indexOf(u8, apt.written(), "Acquire::http::Headers") == null);
+}
+
+test "dnf releasever is explicit and apt rejects it" {
+    var dnf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer dnf.deinit();
+    try renderPackageStepWithReleasever(&dnf.writer, .dnf, &.{"bash"}, &.{"file:///managed/dnf"}, true, .installroot, "/staging", false, "9");
+    try std.testing.expect(std.mem.indexOf(u8, dnf.written(), "--releasever='9'") != null);
+
+    var apt: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer apt.deinit();
+    try std.testing.expectError(error.AptReleaseVersionUnsupported, renderPackageStepWithReleasever(
+        &apt.writer,
+        .apt,
+        &.{"bash"},
+        &.{"file:///managed/apt"},
+        true,
+        .chroot,
+        "/staging",
+        false,
+        "24",
+    ));
 }
 
 test "renderPackageStep apt preserves existing sources when preserve_sources_list is set" {

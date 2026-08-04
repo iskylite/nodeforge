@@ -140,7 +140,7 @@ rootfs 发布到
 目录和文件名可直接识别 Profile，摘要前缀允许同一 Profile 的不同构建投影并存；
 完整 64 位摘要和 SHA-512 仍保存在 `rootfs-artifacts.json` 并参与不可变校验。
 当前仍为开发版本，只支持上述新布局，不提供旧目录探测、迁移或兼容读取。
-未来制品 GC、远端 object store、builder Node 上传与多副本实现必须以 state/catalog
+未来制品 GC、远端 object store 与多副本实现必须以 state/catalog
 中的完整摘要和逻辑 asset identity 为接口，不能依赖当前本地目录层级或把 16 位前缀
 提升为内容身份；因此这些未实现能力无需再次改写 BootConfig URL 或 runtime 校验语义。
 
@@ -199,7 +199,7 @@ nodeforge node readiness c001 --stage build
 Node override 不参与 rootfs build，但必须能编译为统一 AgentPlan/`node_apply_projection`；initrd 只交接 plan locator，完整
 target-system/software/service/security 差量由 agent pre-init 应用。readiness 必须验证全部 software capability、exact
 add/remove package closure、pinned local repository revision/GPG policy、protected package、agent feature 与本地 repository
-可达性；Node first-boot bundle 还必须 first-boot-only 且 payload closure/digest/size 可由 session-bound `agent:read`
+可达性；Node first-boot bundle 还必须 first-boot-only 且 payload closure/digest/size 可由 boot-session capability
 精确投递，不能退化成按 Node 构建、公网装包或拉取可变任务。
 此处必须发现：install-only storage 字段、缺 source/repository capability、跨架构不安全 step、读取/复制
 `/var/lib/nodeforge/credentials`、修改只读 lower 或篡改 session handoff 的 step、公网 repository、kernel/modules ABI
@@ -214,10 +214,8 @@ nodeforge profile rootfs build rocky-9.7-x86_64-diskless
 nodeforge profile rootfs status rocky-9.7-x86_64-diskless
 ```
 
-外部 squashfs 可用 `profile rootfs register <profile> --path <file>
-[--uncompressed-size <bytes>]` 登记。若第一次未提供展开大小，后续可对同一文件再次登记
-并补充可信数值；成功状态为 `metadata_updated`。内容摘要或不可变元数据不一致时请求
-在正式文件替换前被拒绝。
+rootfs 没有外部 register/import 入口。所有 ready squashfs 必须由 nodeforged 的
+`profile rootfs build` operation 生成、深验并原子发布。
 
 builder 的固定过程（6 阶段流水线，对应 `src/http/server.zig` `managementRootfsBuild`）：
 
@@ -280,14 +278,14 @@ NIC PXE DHCPDISCOVER
  -> DHCPOFFER/DHCPACK + GRUB UEFI bootfile
  -> TFTP/HTTP 取得 GRUB config、kernel、共享 NodeForge initrd 和 per-session credential.cpio
  -> GRUB 追加两个 initrd；kernel cmdline 只有 node/session/config URL，无 token
- -> initrd 从 capsule 读取 single-purpose config token
- -> 有界重放地获取固定 BootConfig，校验后以 config digest 确认并撤销 token
+ -> initrd 从 capsule 读取 delivery session/event credential
+ -> 以活动 DHCP peer/boot session 获取固定 BootConfig；短时 capability 只供 AgentPlan 读取
  -> HEAD/Range 下载 rootfs.part，完整 SHA-512 校验
  -> loop(ro) lower + tmpfs upper/work + overlay merged
  -> 校验 AgentPlan locator/expected digest/size/agent feature 摘要，交接到 /var/lib/nodeforge/boot.json
- -> pre-switch 检查，move-mount /run，清 config/rootfs-artifact token，保留短时 agent/event token
+ -> pre-switch 检查，move-mount /run；rootfs 未传播 token，保留短时 capability/event token
  -> switch_root 到 nodeforge-agent --pre-init
- -> agent 以 bootstrap 网络从服务端拉取并校验 immutable AgentPlan + 全部 Node payload，写 /run 后清 agent token
+ -> agent 以 capability 拉取 AgentPlan、以 peer/session/digest 数据面拉 payload，写 /run 后清 capability
  -> agent 应用全部 Node override，成功后 exec /sbin/init；renderer 接管同一 NIC/address
  -> systemd agent unit 上报 diskless.running，从 rootfs Profile payload 或 /run Node payload 执行 effective first-boot，删除 event token
 ```

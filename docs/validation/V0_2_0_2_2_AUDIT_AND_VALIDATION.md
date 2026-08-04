@@ -40,7 +40,7 @@ setup
 → assets initrd build（或 register 已校验制品）
 → assets boot-bundle create
 → profile create/set
-→ profile rootfs build/status（或 register）
+→ profile rootfs build/status
 → node add/set
 → node readiness --stage boot
 → PXE 自动 session/capsule

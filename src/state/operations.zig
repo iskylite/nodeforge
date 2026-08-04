@@ -56,7 +56,7 @@ pub const Entry = struct {
 
 /// 磁盘上的操作记录。字符串借用自 JSON 缓冲区。
 const DiskEntry = struct { id: []const u8, idempotency_key: []const u8, request_digest: ?[]const u8 = null, kind: Kind, state: State, created_at: i64, updated_at: i64, result: ?[]const u8 = null, error_code: ?[]const u8 = null };
-const File = struct { schema_version: u32 = 3, entries: []const DiskEntry = &.{} };
+const File = struct { schema_version: u32 = 4, entries: []const DiskEntry = &.{} };
 /// `begin` / `beginRequest` 的返回值。`reused=true` 表示命中已有成功或在途操作：
 /// 成功态调用方直接返回缓存 result，queued/running 则返回同一 operation 并且
 /// 不得重复入队；`reused=false` 表示创建了新操作，调用方负责实际工作及终态写入。
@@ -180,6 +180,7 @@ pub const Store = struct {
         };
         return null;
     }
+
     /// 快照当前所有操作到 `out`。调用方用于持久化或 CLI 展示。
     pub fn snapshot(self: *Store, out: *[max_operations]Entry) void {
         lock(&self.mutex);
@@ -207,15 +208,15 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     try chmod(io, allocator, "600", path);
 }
 
-/// 从磁盘加载操作快照。schema 2 增加 `rootfs_build` kind；schema 1 的字段布局
-/// 相同且历史上仅包含 install_source_import，因此显式兼容读取。loading 时会将
+/// 从磁盘加载 v0.4 operation 快照。旧 schema 按 fresh-v0.4 规则
+/// fail-closed。loading 时会将
 /// queued/running 强制转为 failed + `operation.interrupted`，提供确定性恢复语义。
 pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *Store, now: i64) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(2 * 1024 * 1024));
     defer allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(File, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    if ((parsed.value.schema_version < 1 or parsed.value.schema_version > 3) or parsed.value.entries.len > max_operations) return error.InvalidOperationsState;
+    if (parsed.value.schema_version != 4 or parsed.value.entries.len > max_operations) return error.InvalidOperationsState;
     for (parsed.value.entries, 0..) |disk, index| {
         if (!boot_session.validId(disk.id) or disk.idempotency_key.len == 0 or disk.idempotency_key.len > 128) return error.InvalidOperationsState;
         if ((disk.state == .queued or disk.state == .running)) {
@@ -332,4 +333,18 @@ test "expired terminal operation is no longer queryable" {
     const begun = try store.begin(std.testing.io, "key", .install_source_import, 1);
     _ = try store.succeed(begun.entry.idSlice(), "done", 2);
     try std.testing.expect(store.get(begun.entry.idSlice(), 2 + retention_seconds) == null);
+}
+
+test "v0.4 operation store rejects legacy schemas" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/legacy-operations.json", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    var store: Store = .{};
+    for (1..4) |version| {
+        var bytes: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&bytes, "{{\"schema_version\":{d},\"entries\":[]}}", .{version});
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = json });
+        try std.testing.expectError(error.InvalidOperationsState, load(std.testing.io, std.testing.allocator, path, &store, 1));
+    }
 }

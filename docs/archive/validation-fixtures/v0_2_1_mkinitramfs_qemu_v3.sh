@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Historical v0.2.1 hand-assembled rootfs fixture; not a current product test.
 set -euo pipefail
 repo=/root/NodeForge
 work=/tmp/nodeforge-v021-mkinit2
@@ -13,17 +14,15 @@ cleanup() { [[ -n "${qemu_pid:-}" ]] && { kill "$qemu_pid" 2>/dev/null || true; 
 trap cleanup EXIT
 cd "$repo"
 
-echo "=== rootfs size: $(du -h "$work/rootfs.squashfs" | cut -f1) ==="
-echo "=== initrd size: $(du -h "$work/initramfs.img" | cut -f1) ==="
+echo "=== rootfs2.squashfs: $(du -h "$work/rootfs2.squashfs" | cut -f1) ==="
+echo "=== initrd: $(du -h "$work/initramfs.img" | cut -f1) ==="
 echo "=== kernel: vmlinuz-$KREL ==="
 
-# Ensure assets in place
-mkdir -p "$install_root/assets/boot" "$install_root/assets/boot/diskless/ubuntu" "$install_root/assets/rootfs-ubuntu"
-cp "$work/vmlinuz-$KREL" "$install_root/assets/boot/vmlinuz-$KREL"
-cp "$work/initramfs.img" "$install_root/assets/boot/diskless/ubuntu/ub-mkinit2-initrd"
-cp "$work/rootfs.squashfs" "$install_root/assets/rootfs-ubuntu/ub-mkinit2-rootfs"
+# Update rootfs asset
+cp "$work/rootfs2.squashfs" "$install_root/assets/rootfs-ubuntu/ub-mkinit2-rootfs"
+rm -f "$install_root/state/rootfs-artifacts.json" 2>/dev/null || true
 
-# Start daemon
+# Restart daemon
 pkill -9 -f "nodeforged --install-root $install_root" 2>/dev/null || true
 sleep 1
 ip addr add 10.0.2.2/32 dev lo 2>/dev/null || true
@@ -32,11 +31,14 @@ sleep 2
 pgrep -f "nodeforged --install-root $install_root" >/dev/null || { echo "daemon failed"; cat "$work/nodeforged.log"; exit 1; }
 echo "daemon started"
 
-# Register rootfs
-rootfs_uncompressed_size=$(unsquashfs -lln "$work/rootfs.squashfs" | awk '$1 ~ /^-/ { total += $3 } END { print total + 0 }')
+# Re-register rootfs with new size
+rootfs_uncompressed_size=$(unsquashfs -lln "$work/rootfs2.squashfs" | awk '$1 ~ /^-/ { total += $3 } END { print total + 0 }')
 zig-out/bin/nodeforge --install-root "$install_root" profile rootfs register "$profile" \
-    --path "$work/rootfs.squashfs" --uncompressed-size "$rootfs_uncompressed_size" \
+    --path "$work/rootfs2.squashfs" --uncompressed-size "$rootfs_uncompressed_size" \
     --config "$config" --output json >/dev/null 2>&1 || true
+
+# Clear stale events
+> "$install_root/logs/events.jsonl" 2>/dev/null || true
 
 # Prepare boot
 prepare=$(curl -sS -H 'Content-Type: application/json' -H 'X-NodeForge-Internal-Capsule: 1' -d '{}' "http://127.0.0.1:$port/api/v1/management/nodes/$node/boot-prepare")
@@ -63,21 +65,21 @@ echo "=== QEMU boot ==="
     -kernel "$work/vmlinuz-$KREL" -initrd "$work/initramfs-final.img" \
     -append "nodeforge.config_url=$config_url nodeforge.session=$session nodeforge.node=$node console=ttyAMA0" \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-    -nographic -no-reboot >"$work/console.log" 2>&1 &
+    -nographic -no-reboot >"$work/console-v3.log" 2>&1 &
 qemu_pid=$!
 deadline=$((SECONDS + 600))
 while (( SECONDS < deadline )); do
-    if grep -q "NODEFORGE_UBUNTU_MKINIT2_VALIDATION_DONE" "$work/console.log" 2>/dev/null; then break; fi
+    if grep -q "NODEFORGE_UBUNTU_MKINIT2_VALIDATION_DONE" "$work/console-v3.log" 2>/dev/null; then break; fi
     kill -0 "$qemu_pid" 2>/dev/null || break
     sleep 1
 done
 kill "$qemu_pid" 2>/dev/null || true; wait "$qemu_pid" 2>/dev/null || true; qemu_pid=
 
 echo "=== console tail ==="
-tail -40 "$work/console.log"
+tail -50 "$work/console-v3.log"
 echo ""
 echo "=== assertions ==="
-grep -q "NODEFORGE_UBUNTU_MKINIT2_VALIDATION_DONE" "$work/console.log" && echo "PASS: validation done" || echo "FAIL: validation done"
+grep -q "NODEFORGE_UBUNTU_MKINIT2_VALIDATION_DONE" "$work/console-v3.log" && echo "PASS: validation done" || echo "FAIL: validation done"
 grep -q '"type":"diskless.running"' "$install_root/logs/events.jsonl" && echo "PASS: diskless.running" || echo "FAIL: diskless.running"
-grep -qiE "Ubuntu|switch_root|Reached target" "$work/console.log" && echo "PASS: ubuntu boot evidence" || echo "FAIL: ubuntu boot evidence"
-echo "MKINIT2_QEMU_DONE"
+grep -qiE "Ubuntu|switch_root|Reached target" "$work/console-v3.log" && echo "PASS: ubuntu boot evidence" || echo "FAIL: ubuntu boot evidence"
+echo "MKINIT3_QEMU_DONE"

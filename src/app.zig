@@ -33,11 +33,13 @@ const boot_session_store = @import("state/boot_session_store.zig");
 const node_status = @import("state/node_status.zig");
 const deployment_control = @import("state/deployment_control.zig");
 const node_inventory = @import("state/node_inventory.zig");
+const node_discovery = @import("state/node_discovery.zig");
 const operations = @import("state/operations.zig");
 const rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
 const diskless_delivery = @import("state/diskless_delivery.zig");
 const identity_store = @import("state/identity_store.zig");
 const install_post_journal = @import("state/install_post_journal.zig");
+const install_first_boot_store = @import("state/install_first_boot_store.zig");
 const model_transaction = @import("state/model_transaction.zig");
 const capacity = @import("state/capacity.zig");
 
@@ -90,6 +92,16 @@ pub fn run(
     deployments.* = .{};
     var inventories = node_inventory.Store.init(allocator);
     defer inventories.deinit();
+    const discoveries = try allocator.create(node_discovery.Store);
+    defer allocator.destroy(discoveries);
+    discoveries.* = .{};
+    node_discovery.Store.load(discoveries, io, allocator, paths.require().node_discovery_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {
+            observe_log.err("node-discovery: refusing startup with invalid state: {t}", .{err});
+            return err;
+        },
+    };
 
     // M4.8: 启动时按网段/受管节点数/CPU 派生有效容量，config 可覆盖。
     const lease_cap = capacity.leaseCapacity(config.dhcp.subnet, config.dhcp.max_leases);
@@ -125,12 +137,14 @@ pub fn run(
         },
         else => return err,
     };
-    // v0.2 diskless delivery：master secret 与 session/claim checkpoint 持久化，
-    // raw capability 不落盘，而是由 secret + session/scope 确定性重建。
-    var diskless_secret: [32]u8 = undefined;
-    diskless_delivery.loadOrCreateSecret(io, allocator, paths.require().diskless_secret_path, &diskless_secret) catch
+    // daemon_secret：daemon 进程级主密钥（32 字节随机，0600，持久化于
+    // state/diskless-secret）。它只用于跨网络/重启边界的 durable event 与
+    // first-boot 凭证。随机 boot-session capability 仅存在于内存，不由该
+    // secret 派生，也不写入任何 checkpoint。
+    var daemon_secret: [32]u8 = undefined;
+    diskless_delivery.loadOrCreateSecret(io, allocator, paths.require().daemon_secret_path, &daemon_secret) catch
         return error.DisklessSecretUnavailable;
-    var diskless_store = diskless_delivery.Store.init(allocator, &diskless_secret, paths.require().diskless_delivery_path);
+    var diskless_store = diskless_delivery.Store.init(allocator, &daemon_secret, config.deployment_id orelse "", paths.require().diskless_delivery_path);
     defer diskless_store.deinit();
     const restored_diskless = diskless_store.load(io, boot_session.monotonicNow(), current_time) catch |err| {
         observe_log.err("diskless-delivery: refusing startup with invalid checkpoint: {t}", .{err});
@@ -165,8 +179,8 @@ pub fn run(
         observe_log.warn("identity-store: recovered {d} pending transaction(s) at startup", .{recovered_journals});
     if (identities.count != 0)
         observe_log.info("identity-store: loaded {d} identity revision(s)", .{identities.count});
-    // v0.3 install-post journal：既有 BootSession credential 会持久化并在 daemon 重启
-    // 后恢复，因此重启本身不等于 run 不可恢复；只有无法匹配持久事实时才进入恢复失败。
+    // install-post journal 与 BootSession authority 独立持久化；随机 credential
+    // 不落盘，daemon 重启后由同一 lease peer 重新 bootstrap 获取新 capability。
     const install_post_journal_store = try allocator.create(install_post_journal.Store);
     defer allocator.destroy(install_post_journal_store);
     install_post_journal_store.* = .{};
@@ -178,6 +192,20 @@ pub fn run(
             observe_log.err("install-post-journal: refusing startup with invalid state: {t}", .{err});
             return err;
         },
+    };
+    rootfs_artifacts.auditRuntimeFiles(io, paths.require().rootfs_dir) catch |err| {
+        observe_log.err("rootfs-artifacts: runtime audit failed closed: {t}", .{err});
+        return err;
+    };
+    const install_first_boot_store_value = try allocator.create(install_first_boot_store.Store);
+    defer allocator.destroy(install_first_boot_store_value);
+    install_first_boot_store_value.* = .{};
+    // F4：加载 first-boot journal 时传入 daemon_secret，用于校验 secret 指纹。
+    // 密钥轮换（secret 文件重建）后，旧 entry 的指纹不匹配，被标记为
+    // recovery_incomplete，拒绝继续处理，要求节点重新发起 first-boot 交换。
+    install_first_boot_store_value.load(io, allocator, paths.require().install_first_boot_path, &daemon_secret) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
     };
     const model_revision = try deployment_control.revisionForModel(allocator, config, catalog);
     const config_revision = model_revision.config;
@@ -208,12 +236,13 @@ pub fn run(
         observe_log.err("install-post-journal: completion recovery failed: {t}", .{err});
         return err;
     };
+
     if (recovered_install_completions != 0)
         observe_log.warn("install-post-journal: recovered {d} completion transaction(s)", .{recovered_install_completions});
-    // M4.9：必须先加载 deployment-control，再恢复 capability。两个 checkpoint
-    // 分别原子写但不构成跨文件事务，因此恢复破坏性安装 session 前必须验证它
-    // 仍对应当时固定的 generation/revision，不能把旧 token 接到新 generation。
-    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, deployments, sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
+    // v0.4 schema 5 只恢复 delivery authority/绑定事实，随机 capability 不落盘。
+    // install、diskless 都先与各自 durable state join；客户端重连后必须
+    // 再次通过 peer-IP bootstrap 获取新 capability。
+    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, deployments, &diskless_store, sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
         error.FileNotFound => 0,
         else => {
             observe_log.err("boot-session: refusing invalid checkpoint: {t}", .{err});
@@ -221,9 +250,7 @@ pub fn run(
         },
     };
     if (restored_sessions != 0) observe_log.info("boot-session: resumed {d} delivery session(s)", .{restored_sessions});
-    // deployment/session/status 是同一个 M4.9b schema 窗口。旧 checkpoint
-    // 读取成功后立即重写，而不是等待下一次 DHCP/HTTP 事件或有序关机；这样
-    // 升级中途崩溃也不会长期留下混合 schema。旧 capability 已在 load 中丢弃。
+    // 启动审计后立即重写 canonical schema 5 authority snapshot。
     try boot_session_store.save(io, allocator, paths.require().boot_sessions_path, sessions, current_time);
     var migrated_status_snapshot: [node_status.max_statuses]node_status.Status = undefined;
     statuses.snapshot(&migrated_status_snapshot);
@@ -278,6 +305,7 @@ pub fn run(
         .models = &live_models,
         .bootstrap_key = bootstrap_key,
         .additional_keys = additional_keys,
+        .discoveries = discoveries,
     };
     // DHCP 需要 wildcard 接收 socket 以处理客户端广播。DHCP 服务器将配置的
     // PXE NIC 作为 Linux socket 级别的边界；TFTP 保持绑定在广告的 unicast 地址。
@@ -315,17 +343,20 @@ pub fn run(
         statuses,
         deployments,
         &inventories,
+        discoveries,
         &operation_store,
         &rootfs_artifacts,
         &diskless_store,
         identities,
         install_post_journal_store,
+        install_first_boot_store_value,
         config_revision,
         bootstrap_key,
         additional_keys,
         &daemon_instance_id,
         &status_io_mutex,
         paths.require().node_status_path,
+        paths.require().node_discovery_path,
         config_path,
     ) catch |err| {
         serve_error = err;
@@ -352,10 +383,12 @@ pub fn run(
     checkpoint_flush_stop.store(true, .release);
     checkpoint_thread.join();
 
-    // 已签发 capability 的 delivery session 在有序重启前保存到权限为 0600
-    // 的 checkpoint；下一实例继续使用同一 token 和 session 身份。
+    // 保存 delivery authority；随机 capability 只在本进程内存中存在。下一实例
+    // 恢复 session identity/TTL 后要求节点重新 peer-IP bootstrap。
     boot_session_store.save(io, allocator, paths.require().boot_sessions_path, sessions, now()) catch |err|
         observe_log.err("boot-session: checkpoint failed: {t}", .{err});
+    install_first_boot_store_value.save(io, allocator, paths.require().install_first_boot_path) catch |err|
+        observe_log.err("install-first-boot: checkpoint failed: {t}", .{err});
 
     // worker 已退出后才终止活动 session，确保不会再有 DHCP/TFTP 事件引用它们；
     // 每个 session 仍单独写审计终态，随后才写全局 service.stopped。

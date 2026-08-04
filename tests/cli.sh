@@ -267,11 +267,12 @@ grep -Fq 'preserves the ISO vendor initrd' "$tmp/initrd-build-help"
 grep -Fq 'rootfs input digest and cache state' "$tmp/profile-rootfs-plan-help"
 "$cli" profile rootfs build --help >"$tmp/profile-rootfs-build-help"
 grep -Fq -- '--if-input-digest' "$tmp/profile-rootfs-build-help"
-"$cli" profile rootfs register --help >"$tmp/profile-rootfs-register-help"
-grep -Fq -- '--uncompressed-size' "$tmp/profile-rootfs-register-help"
-grep -Fq -- '--path' "$tmp/profile-rootfs-register-help"
 "$cli" profile rootfs status --help >"$tmp/profile-rootfs-status-help"
-grep -Fq 'registered rootfs artifact' "$tmp/profile-rootfs-status-help"
+grep -Fq 'nodeforged-built rootfs artifact' "$tmp/profile-rootfs-status-help"
+if "$cli" profile rootfs register --help >"$tmp/profile-rootfs-register.out" 2>"$tmp/profile-rootfs-register.err"; then
+    echo "external rootfs register command must not exist" >&2
+    exit 1
+fi
 "$cli" node boot preview --help >"$tmp/node-boot-preview-help"
 grep -Fq 'without creating a session or token' "$tmp/node-boot-preview-help"
 if "$cli" node boot-prepare --help >"$tmp/node-boot-prepare-help" 2>&1; then
@@ -394,9 +395,9 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-"$cli" --version | grep -Eq '^nodeforge 0\.3\.1 \(commit [0-9a-f]{12}|unknown'
+"$cli" --version | grep -Eq '^nodeforge 0\.4\.0 \(commit [0-9a-f]{12}|unknown'
 "$cli" -v | grep -Fq 'built '
-"$daemon" --version | grep -Eq '^nodeforged 0\.3\.1 \(commit [0-9a-f]{12}|unknown'
+"$daemon" --version | grep -Eq '^nodeforged 0\.4\.0 \(commit [0-9a-f]{12}|unknown'
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then

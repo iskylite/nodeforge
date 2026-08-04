@@ -17,6 +17,8 @@ pub const AddParams = struct {
     mac: []const u8,
     /// 节点架构。
     arch: model.Arch,
+    /// v0.4 物理身份事实。
+    hardware: model.NodeHardware = .{},
     /// 绑定的 profile 名称；null 且 `deploy=true` 时返回错误。
     profile: ?[]const u8,
     /// PXE 静态保留 IP；null 时从 DHCP 地址池动态分配。
@@ -70,7 +72,7 @@ pub fn addNode(io: std.Io, allocator: std.mem.Allocator, config: *const model.Ap
     const nodes = try allocator.alloc(model.NodeConfig, parsed.value.nodes.len + 1);
     defer allocator.free(nodes);
     @memcpy(nodes[0..parsed.value.nodes.len], parsed.value.nodes);
-    nodes[parsed.value.nodes.len] = .{ .id = params.id, .mac = params.mac, .arch = params.arch, .profile = params.profile, .pxe = .{ .ip_reservation = params.pxe_ip_reservation }, .hostname = params.hostname, .overrides = params.overrides, .deploy = params.deploy, .http_accel = params.http_accel, .storage = params.storage, .network = params.network };
+    nodes[parsed.value.nodes.len] = .{ .id = params.id, .mac = params.mac, .arch = params.arch, .hardware = params.hardware, .profile = params.profile, .pxe = .{ .ip_reservation = params.pxe_ip_reservation }, .hostname = params.hostname, .overrides = params.overrides, .deploy = params.deploy, .http_accel = params.http_accel, .storage = params.storage, .network = params.network };
     var candidate = parsed.value;
     candidate.nodes = nodes;
     try validateCandidate(config, &candidate);

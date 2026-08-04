@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// NodeForge 产品版本的唯一构建事实源。发布新版本时同步更新 build.zig.zon。
-const nodeforge_version = "0.3.1";
+const nodeforge_version = "0.4.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -156,6 +156,15 @@ pub fn build(b: *std.Build) void {
     v03_install_post_e2e.addFileArg(b.path("tests/v0_3_install_post_e2e.sh"));
     const v03_install_post_e2e_step = b.step("test-v0.3-install-post-e2e", "Run the real PXE install-post v0.3 gate");
     v03_install_post_e2e_step.dependOn(&v03_install_post_e2e.step);
+
+    const v04_contract = b.addSystemCommand(&.{"sh"});
+    v04_contract.addFileArg(b.path("tests/v0_4_contract.sh"));
+    v04_contract.addArtifactArg(cli);
+    v04_contract.addArtifactArg(daemon);
+    v04_contract.addArtifactArg(agent);
+    v04_contract.addArtifactArg(initrd);
+    const v04_contract_step = b.step("test-v0.4-contract", "Run the local v0.4 strict contract gate");
+    v04_contract_step.dependOn(&v04_contract.step);
 }
 
 fn commandOutput(b: *std.Build, argv: []const []const u8) ?[]const u8 {

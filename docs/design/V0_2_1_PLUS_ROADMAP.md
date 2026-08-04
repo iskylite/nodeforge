@@ -18,7 +18,7 @@
 | v0.2.2 | 可运营性、持久化兼容、CLI 收敛、固定矩阵 | 保持 catalog v4 / BC v3 / AP v1；内部 persistence 独立升级 | 已完成并通过当前 aarch64 VMware 发布矩阵 |
 | v0.2.3 | Profile identity/provenance、recovery、ISO operation、exit mapping 收口 | catalog v5 / BC v3 / AP v1 | 已完成（含 aarch64 VMware 定向回归，2026-07-31） |
 | v0.3 | install-post canonical 扩展、callback generation 绑定与 journal | 保持 catalog v5 / BC v3 / AP v1 | 已完成；aarch64 UEFI install-post 与 diskless 发布回归通过（2026-08-01） |
-| v0.4 | 多 NIC/topology、容量、PXE builder、install first-boot、SN+IP draft Node discovery | AppConfig v5 / catalog v6 / BC v3 / AP v2 / BuilderPlan v1 / InstallFirstBootPlan v1 / NodeDiscoveryState v1 | 设计冻结，实现未开始 |
+| v0.4 | 多 NIC/topology、容量、服务端 rootfs、install first-boot、SN+IP draft Node discovery | AppConfig v5 / catalog v6 / BC v3 / AP v2 / InstallFirstBootPlan v1 / NodeDiscoveryState v1 | 设计冻结，实现进行中 |
 
 BC = BootConfig，AP = AgentPlan。catalog、节点 DTO、install callback、operation 和
 各 state file 是独立 schema namespace，绝不能因为版本号相同而共用升级判断。
@@ -47,7 +47,7 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 
 在更改 catalog schema 前完成：
 
-- durable builder operation；
+- durable rootfs build operation；
 - no-side-effect preview 与统一 retry；
 - inventory memory/readiness；
 - session/persistence recovery；
@@ -92,7 +92,7 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 每版只引入自己需要的持久 shape：
 
 - v0.3 / 保持 catalog v5：install-post canonical 扩展、callback generation 绑定与 journal；
-- v0.4 / AppConfig v5 + catalog v6：强制容量上限、target topology、builder placement/capability、Node hardware serial binding；BootConfig 保持 v3，AgentPlan 升 v2；
+- v0.4 / AppConfig v5 + catalog v6：强制容量上限、target topology、服务端 rootfs、Node hardware serial binding；BootConfig 保持 v3，AgentPlan 升 v2；
 
 v0.4 边界采用直接替换（见 v0.2.3 设计 §0）：旧 config/catalog/state/session/artifact
 不被加载、转换或延续，操作员必须 fresh `setup` 并重建输入与制品。
@@ -163,7 +163,7 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 - BootConfig 保持 v3；全部 fresh v0.4 diskless delivery 只使用 AgentPlan v2；
 - UEFI GRUB + DHCPv4 bootstrap 保持现状，支持动态 lease 或 `pxe.ip_reservation`，不新增 no-DHCP static PXE；
 - target topology 与 PXE transport 分离，diskless 事务切网、回滚和 adopt 闭环，容量 SLO；
-- PXE builder boot slot/upload claim/recovery；
+- nodeforged 服务端 rootfs operation、artifact 发布与恢复；
 - install first-boot 一次性交换与磁盘 journal；
 - SN+IP draft Node + per-Node 短时 discovery + 现有 initrd discovery mode 上报 SN + MAC/arch 原子回填；匹配后仍不自动部署。
 

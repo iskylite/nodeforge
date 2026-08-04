@@ -163,6 +163,19 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     const config_path = ctx.flag("config", []const u8);
     const catalog_path = ctx.flag("catalog", []const u8);
 
+    // v0.4 bootstrap is fail-closed for the normal install-root paths:
+    // deployment.json and the v2 marker are checked before any state loader.
+    // Explicit --config/--catalog overrides remain read-only diagnostic inputs
+    // for the v0.3 regression fixtures and never start the installed service.
+    const installed_paths = nodeforge.paths.require();
+    const using_installed_pair = std.mem.eql(u8, config_path, installed_paths.config_path) and std.mem.eql(u8, catalog_path, installed_paths.catalog_dir);
+    var deployment: ?std.json.Parsed(nodeforge.deployment_manifest.Manifest) = null;
+    if (using_installed_pair) {
+        deployment = try nodeforge.deployment_manifest.load(ctx.io, ctx.allocator, installed_paths.deployment_manifest_path);
+        try nodeforge.deployment_manifest.validateMarker(ctx.io, ctx.allocator, installed_paths.marker_path, deployment.?.value.deployment_id);
+    }
+    defer if (deployment) |*value| value.deinit();
+
     const transaction_dir = try nodeforge.model_transaction.directoryForConfig(ctx.allocator, config_path);
     defer ctx.allocator.free(transaction_dir);
     const recovered = nodeforge.model_transaction.recoverAll(ctx.io, ctx.allocator, transaction_dir) catch |err| {
@@ -204,6 +217,12 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     };
     defer parsed_catalog.deinit();
     var catalog_value = parsed_catalog.value;
+    if (deployment) |manifest| {
+        if (parsed.value.deployment_id == null or parsed_catalog.value.deployment_id == null or
+            !std.mem.eql(u8, parsed.value.deployment_id.?, manifest.value.deployment_id) or
+            !std.mem.eql(u8, parsed_catalog.value.deployment_id.?, manifest.value.deployment_id))
+            return error.DeploymentLayoutIncompatible;
+    }
     var effective_config = nodeforge.model.projectCatalog(parsed.value, &catalog_value);
     const catalog = &catalog_value;
 

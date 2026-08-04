@@ -62,7 +62,9 @@ x86_64 VMware 与重复 QEMU 不在当前完成闸，按
 - schema v4 `ProfileKind=install|diskless`、boot bundle 与内容寻址 rootfs；
 - ISO vendor initrd 原样前缀 + NodeForge gzip/newc overlay；
 - TFTP 内部 boot-prepare/capsule，公开 CLI 不返回 raw capability；
-- config/rootfs/agent/event 四域 token；
+- v0.4 已删除 config/rootfs/agent 四域 token：BootConfig/rootfs/payload 使用 DHCP
+  peer/session/digest binding，仅 AgentPlan 小型控制面读取使用短时 boot-session
+  capability，状态推进保留 event credential；
 - BootConfig v3、AgentPlan v1、node-bound GET/HEAD/Range；
 - rootfs SHA-512、ETag/If-Range、分块恢复、内存闸；
 - squashfs lower + tmpfs overlay upper + switch_root；
@@ -90,7 +92,7 @@ fresh CLI 与 Rocky 9.7/10.2、Ubuntu 22.04.5 aarch64 VMware 冷启动回归已�
 
 v0.2.2 把 v0.2 系列变成可长期维护的稳定底座，已落地：
 
-- **durable builder operation**：rootfs 与 initrd 均使用 daemon worker（8 槽有界队列），
+- **durable build operation**：rootfs 与 initrd 均使用 daemon worker（8 槽有界队列），
   handler 持久创建 queued operation 后返回，CLI 默认 follow、支持 `--detach`；
   daemon restart 后 queued/running 确定性恢复为 `operation.interrupted`；
 - **持久化升级兼容**：diskless delivery schema 1→2、deployment-control schema 3→4、
@@ -171,7 +173,7 @@ v0.2.2/v0.2.3 已把 [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../design/CURRENT_CLI_
 - node list/show/add/set/unset/remove/claim/render/retry/deploy/trace/readiness/
   session/boot preview/postprocess；
 - diskless boot-prepare/readiness/session（boot-prepare 已降为内部 transition）；
-- profile create/clone/remove/list/show/set/unset/rootfs plan|build|register|status；
+- profile create/clone/remove/list/show/set/unset/rootfs plan|build|status；
 - asset/register/import、initrd build、boot-bundle、provision-bundle；
 - operation show/wait/list/follow、runtime、events、discovery、status/setup。
 
@@ -252,7 +254,7 @@ initrd 都使用 session capability 上报，旧 generation/session 不可覆盖
 | `V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md` | identity/recovery/ISO worker/exit mapping，已完成 |
 | `V0_2_1_PLUS_ROADMAP.md` | v0.2.0–v0.2.3 已完成；v0.3 已完成；v0.4 设计冻结、实现未开始 |
 | `V0_3_DESIGN.md` | install-post canonical 扩展，已完成 |
-| `V0_4_DESIGN.md` | 多 NIC/topology/容量/PXE builder/install first-boot，设计冻结 |
+| `V0_4_DESIGN.md` | 多 NIC/topology/容量/服务端 rootfs/install first-boot，设计冻结 |
 | `DEFERRED_DESIGN_INDEX.md` | static PXE、BIOS/PXELINUX、`ram_rootfs` 均为不编号、未排期的独立保留设计，不进入 v0.4 |
 
 历史审计中的“v0.2 尚未实现项”保留用于追溯，不再作为当前实现清单。
@@ -265,7 +267,7 @@ v0.2.0 Rocky diskless 基线
   -> v0.2.2 operability + CLI convergence + fixed matrix（已完成）
   -> v0.2.3 Profile identity/recovery/ISO worker/exit mapping（已完成）
   -> v0.3/v0.3.1 install-post canonical extension + CLI（已完成，当前基线）
-  -> v0.4 topology/capacity/PXE builder/install first-boot（设计冻结，实现未开始）
+  -> v0.4 topology/capacity/服务端 rootfs/install first-boot（设计冻结，实现进行中）
 ```
 
 详细依赖、schema/DTO 表和每版完成闸见

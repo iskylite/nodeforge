@@ -97,8 +97,12 @@ const Override = struct {
 };
 pub const Node = struct {
     id: []const u8,
-    mac: []const u8,
-    arch: model.Arch,
+    /// v0.4 draft nodes intentionally serialize unknown PXE identity as null;
+    /// the internal legacy model uses an empty MAC plus a non-authoritative
+    /// placeholder arch until the nullable model migration is complete.
+    mac: ?[]const u8,
+    arch: ?model.Arch,
+    hardware: model.NodeHardware = .{},
     profile: ?[]const u8 = null,
     pxe: model.PxeConfig = .{},
     hostname: ?[]const u8 = null,
@@ -326,8 +330,9 @@ fn joinKernelArgs(allocator: std.mem.Allocator, values: []const []const u8) !?[]
 fn fromNode(value: model.NodeConfig) Node {
     return .{
         .id = value.id,
-        .mac = value.mac,
-        .arch = value.arch,
+        .mac = if (value.mac.len == 0) null else value.mac,
+        .arch = if (value.mac.len == 0) null else value.arch,
+        .hardware = value.hardware,
         .profile = value.profile,
         .pxe = value.pxe,
         .hostname = value.hostname,
@@ -356,8 +361,9 @@ fn fromNode(value: model.NodeConfig) Node {
 fn toNode(value: Node) model.NodeConfig {
     return .{
         .id = value.id,
-        .mac = value.mac,
-        .arch = value.arch,
+        .mac = value.mac orelse "",
+        .arch = value.arch orelse .x86_64,
+        .hardware = value.hardware,
         .profile = value.profile,
         .pxe = value.pxe,
         .hostname = value.hostname,

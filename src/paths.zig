@@ -20,6 +20,10 @@ pub const Paths = struct {
     install_root: []const u8,
     /// 根目录标记文件完整路径（`<root>/.nodeforge-root`）。
     marker_path: []const u8,
+    /// v0.4 DeploymentManifest v1；daemon 在加载任何 state 前校验它。
+    deployment_manifest_path: []const u8,
+    /// fresh replacement 正在 purge/发布时的 fail-closed 标记。
+    deployment_replacement_incomplete_path: []const u8,
     /// 二进制目录（`<root>/bin`），存放 `nodeforge` 和 `nodeforged`。
     bin_dir: []const u8,
     /// CLI 二进制完整路径（`<root>/bin/nodeforge`）。
@@ -91,23 +95,29 @@ pub const Paths = struct {
     /// 节点 inventory 文件路径（`<root>/state/node-inventory.json`）。
     /// 记录安装器上报的硬件事实（serial/UUID/vendor/model）。
     node_inventory_path: []const u8,
+    /// v0.4 per-node SN discovery lifecycle state.
+    node_discovery_path: []const u8,
     /// 操作记录文件路径（`<root>/state/operations.json`）。
     /// 记录管理 API 的持久操作（幂等 key + 状态轮询）。
     operations_path: []const u8,
-    /// rootfs 制品登记文件路径（`<root>/state/rootfs-artifacts.json`）。
+    /// nodeforged 已发布 ready rootfs 索引路径（`<root>/state/rootfs-artifacts.json`）。
     /// 记录已构建 diskless rootfs 的内容寻址制品（digest/sha512/size）。
     rootfs_artifacts_path: []const u8,
     /// Diskless delivery session checkpoint。只保存 capability hash/claim，
     /// 不保存可直接使用的 raw token。
     diskless_delivery_path: []const u8,
-    /// Diskless capability 派生主密钥（0600，32-byte hex）。
-    diskless_secret_path: []const u8,
+    /// Daemon 主密钥（0600，32-byte hex）：只用于 diskless event、first-boot
+    /// 和 discovery 等 durable token 的确定性派生。随机 boot-session capability
+    /// 不依赖此密钥。文件名保留 `state/diskless-secret`，但 v0.4 fresh layout
+    /// 不读取或迁移旧 deployment state。
+    daemon_secret_path: []const u8,
     /// v0.2.3: SSH identity store 文件路径（`<root>/state/identities.json`）。
     /// 存储 Profile SSH 密钥对，private key 不进入 catalog。
     identity_store_path: []const u8,
     /// v0.3: install-post journal 文件路径（`<root>/state/install-post-journal.json`）。
     /// 记录 install-post 步骤执行状态、attempt 计数和 run 状态机。
     install_post_journal_path: []const u8,
+    install_first_boot_path: []const u8,
     /// v0.2.3: SSH identity 密钥生成/校验暂存目录（`<root>/state/identity-staging`，
     /// 0700）。私钥只在暂存目录中出现，绝不进入 `/tmp` 或工作目录。
     identity_staging_dir: []const u8,
@@ -277,6 +287,8 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
     return .{
         .install_root = try allocator.dupe(u8, root),
         .marker_path = try join(allocator, root, root_marker_name),
+        .deployment_manifest_path = try join(allocator, root, "deployment.json"),
+        .deployment_replacement_incomplete_path = try join(allocator, root, ".nodeforge-replacement-incomplete"),
         .bin_dir = try join(allocator, root, "bin"),
         .nodeforge_path = try join(allocator, root, "bin/nodeforge"),
         .nodeforged_path = try join(allocator, root, "bin/nodeforged"),
@@ -308,12 +320,14 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .deployment_control_path = try join(allocator, root, "state/deployment-control.json"),
         .boot_sessions_path = try join(allocator, root, "state/boot-sessions.json"),
         .node_inventory_path = try join(allocator, root, "state/node-inventory.json"),
+        .node_discovery_path = try join(allocator, root, "state/node-discovery.json"),
         .operations_path = try join(allocator, root, "state/operations.json"),
         .rootfs_artifacts_path = try join(allocator, root, "state/rootfs-artifacts.json"),
         .diskless_delivery_path = try join(allocator, root, "state/diskless-delivery.json"),
-        .diskless_secret_path = try join(allocator, root, "state/diskless-secret"),
+        .daemon_secret_path = try join(allocator, root, "state/diskless-secret"),
         .identity_store_path = try join(allocator, root, "state/identities.json"),
         .install_post_journal_path = try join(allocator, root, "state/install-post-journal.json"),
+        .install_first_boot_path = try join(allocator, root, "state/install-first-boot.json"),
         .identity_staging_dir = try join(allocator, root, "state/identity-staging"),
         .identity_transactions_dir = try join(allocator, root, "state/identity-transactions"),
         .model_transactions_dir = try join(allocator, root, "state/model-transactions"),

@@ -38,7 +38,7 @@ v0.2.2 不增加新的部署形态。它把 v0.2.0/v0.2.1 已有能力收敛为�
 5. 无法恢复 capability raw secret 时进入稳定 `recovery_incomplete`，不得伪造新 secret；
 6. 损坏文件 fail closed，并给出文件、schema、字段和恢复建议。
 
-## 3. Durable builder operation
+## 3. Durable rootfs build operation
 
 ### 3.1 执行模型
 

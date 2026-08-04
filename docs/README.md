@@ -21,7 +21,7 @@ v0.3 及以前的版本设计均已随实现和验证结果冻结：这些文件
 - [v0.2.1 Ubuntu diskless](design/V0_2_1_UBUNTU_DISKLESS.md)：casper layer
   productization 与正式 rootfs builder 已完成，设计和验证结果冻结。
 - [v0.2.2 可运营性与矩阵](design/V0_2_2_OPERABILITY.md)：持久化升级、
-  durable builder operation、CLI 收敛、readiness 和固定发布矩阵。
+  durable rootfs build operation、CLI 收敛、readiness 和固定发布矩阵。
 - [v0.2.3 Profile identity 与恢复收口](design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)：
   catalog v5、稳定 SSH identity/provenance、完整 clone、recovery 与 ISO operation。
 - [当前环境不可验证项](design/LOCAL_VALIDATION_DEFERRED.md)：集中记录不进入当前
@@ -30,14 +30,15 @@ v0.3 及以前的版本设计均已随实现和验证结果冻结：这些文件
   已完成项和明确暂不做项；第 2 节稳定 ID 是非阻断范围的唯一权威索引。
 - [v0.3 设计：install-post canonical 扩展](design/V0_3_DESIGN.md)：install-post 四类 canonical action、callback generation 绑定与 journal/finalizer；保持 catalog schema v5。
 - [v0.3 验证记录](validation/V0_3_VALIDATION.md)：fresh 双机部署、Compute Use VMware 五项矩阵、generation 3 install-post、重启恢复与负路径证据，最终结论 PASS。
-- [v0.4 统一设计](design/V0_4_DESIGN.md)：UEFI DHCP PXE 与 target topology 分层、多 NIC/VLAN/bonding、容量闸、PXE rootfs builder、install first-boot、SN+IP draft Node 自动 discovery，以及无迁移的 fresh replacement 边界。
-- [v0.4 全量 fresh 验证运行手册](validation/V0_4_FULL_VALIDATION_RUNBOOK.md)：v0.4 完成后在 `r97n0/r97n1` 从空环境执行的发布闸，覆盖 v0.3 回归、topology、builder、first-boot、discovery、容量和 24 小时 soak。
+- [v0.4 统一设计](design/V0_4_DESIGN.md)：UEFI DHCP PXE 与 target topology 分层、多 NIC/VLAN/bonding、容量闸、nodeforged 服务端 rootfs 生成、install first-boot、SN+IP draft Node 自动 discovery，以及无迁移的 fresh replacement 边界。
+- [v0.4 全量 fresh 验证运行手册](validation/V0_4_FULL_VALIDATION_RUNBOOK.md)：在 `r97n0/r97n1` 从空环境执行的发布闸，覆盖 v0.3 回归、topology、服务端 rootfs、first-boot、discovery、容量和 24 小时 soak。
 - [独立保留设计索引](design/DEFERRED_DESIGN_INDEX.md)：集中登记所有不属于 v0.4 的保留设计及永久非目标，禁止在版本文档内预占未来字段或编号。
 - [DHCP-less static PXE bootstrap 保留设计](design/STATIC_PXE_BOOTSTRAP_DEFERRED.md)：保存 source/L2 binding、首次会话创建和防冒认考量；不进入 v0.4。
 - [BIOS PXELINUX 保留设计](design/BIOS_PXELINUX_DEFERRED.md)：独立、未排期且不绑定产品/schema 版本；不进入 v0.4。
 - [`ram_rootfs` 保留设计](design/RAM_ROOTFS_DEFERRED.md)：独立保存内存展开方案，不绑定产品版本；未来从当时基线重新分配 schema/DTO，不反向改变 v0.4。
 
-当前版本实施顺序固定到 v0.4；三份主题化保留设计均未排期，reconciliation/远程控制为永久非目标。
+当前版本实施顺序固定到 v0.4；三份主题化保留设计均未排期，reconciliation/远程控制为永久非目标。实现状态以代码和
+[`V0_4_FULL_VALIDATION_RUNBOOK.md`](validation/V0_4_FULL_VALIDATION_RUNBOOK.md) 的证据为准。
 
 ## v0.2 分册
 
@@ -47,7 +48,7 @@ v0.3 及以前的版本设计均已随实现和验证结果冻结：这些文件
 |---|---|
 | 系统采用什么 diskless 架构，启动与恢复如何工作？ | [架构：无盘最终方案](design/DISKLESS_FINAL.md) |
 | 三个程序分别负责什么，凭据归谁？ | [程序边界](design/V0_2_PROGRAM_DESIGN.md) |
-| 状态机、协议栈、readiness、builder 和迁移如何实现？ | [实现细节](design/V0_2_IMPL_DETAILS.md) |
+| 状态机、协议栈、readiness、rootfs 构建和迁移如何实现？ | [实现细节](design/V0_2_IMPL_DETAILS.md) |
 | CLI 命令、flag、CAS、输出和 exit code 是什么？ | [CLI 接口](design/V0_2_CLI.md) |
 | 操作员如何从空 catalog 走完构建、启用和恢复？ | [端到端流程](design/V0_2_DISKLESS_WORKFLOW.md) |
 | 为什么选择 squashfs overlay 而不是 NFS/iSCSI/iPXE？ | [开源方案对比](design/DISKLESS_OSS_COMPARISON.md) |

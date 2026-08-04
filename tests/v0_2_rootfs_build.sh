@@ -3,7 +3,7 @@
 #
 # Builds a real content-addressed rootfs for a diskless profile from the served
 # Rocky repository: OS layer (dnf --installroot) + rootfs-build phase steps
-# (managed_file/archive/script) + mksquashfs + register. Verifies the steps were
+# (managed_file/archive/script) + mksquashfs + atomic publish. Verifies the steps were
 # baked into the produced squashfs.
 set -euo pipefail
 

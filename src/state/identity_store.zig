@@ -1,7 +1,9 @@
 //! # v0.2.3 SSH Identity Store
 //!
 //! daemon-owned identity store for Profile SSH key pairs. Independent from
-//! `diskless-secret` (which stores the HMAC master secret for capability tokens).
+//! `daemon_secret` (state/diskless-secret, the HMAC master secret for durable
+//! diskless-event, first-boot, and discovery tokens). Random boot-session
+//! capabilities do not depend on this secret.
 //!
 //! Storage path: `<install-root>/state/identities.json` (0600)
 //! Key generation/verification staging: `<install-root>/state/identity-staging` (0700)

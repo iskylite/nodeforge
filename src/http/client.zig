@@ -14,7 +14,7 @@ threadlocal var diagnostic_out: ?*std.Io.Writer = null;
 /// 启用或关闭当前线程的 management client 诊断输出。
 ///
 /// 诊断默认只记录请求行、响应状态、长度和错误响应预览，不记录请求正文及认证类
-/// header，避免 `config_token`、幂等键或未来凭据意外进入终端日志。
+/// header，避免 boot-session capability、幂等键或未来凭据意外进入终端日志。
 pub fn configureDiagnostics(out: ?*std.Io.Writer) void {
     diagnostic_out = out;
 }
@@ -566,23 +566,6 @@ pub fn rootfsStatusJson(io: std.Io, port: u16, name: []const u8, output: []u8) !
     return managementJson(io, port, rendered, output);
 }
 
-/// `profile rootfs register`：登记一个已构建 rootfs 制品（内容寻址）。
-pub fn rootfsRegister(io: std.Io, port: u16, name: []const u8, file_path: []const u8, uncompressed_size: u64, reason_buf: []u8) Mutation {
-    if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
-    var body: [1024]u8 = undefined;
-    // 0 表示调用方没有可信的展开大小，因此直接省略 JSON 字段。服务端将其解释
-    // 为 unknown；不能发送 0 并让下游误认为“已测量且为空”。
-    const rendered = (if (uncompressed_size == 0)
-        std.fmt.bufPrint(&body, "{{\"path\":{f}}}", .{std.json.fmt(file_path, .{})})
-    else
-        std.fmt.bufPrint(&body, "{{\"path\":{f},\"uncompressed_size\":{d}}}", .{ std.json.fmt(file_path, .{}), uncompressed_size })) catch
-        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs register request is too large") };
-    var path: [256]u8 = undefined;
-    const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/register", .{name}) catch return .{ .reachable = false, .healthy = false };
-    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
-    return managementMutation(io, port, "POST", route, rendered, revision, reason_buf);
-}
-
 /// `profile rootfs build`：从 Profile build projection 构建内容寻址 rootfs 制品
 /// （OS 层 + rootfs-build phase 步骤 + mksquashfs + 登记）。`if_input_digest` 非空时
 /// 作为防漂移约束。v0.2.3 §3.3：`new_ssh_keys` 为 true 时 daemon 先轮换
@@ -654,7 +637,7 @@ pub fn rootfsBuildDetachJson(io: std.Io, port: u16, name: []const u8, if_input_d
     const route = try std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name});
     const reply = try managementPostJson(io, port, route, rendered, null, output, null);
     if (reply.status < 200 or reply.status >= 300) {
-        if (reply.body) |err_body| _ = formatErrorReason(reason_buf, err_body);
+        if (reply.body) |err_body| _ = keepReasonOnly(reason_buf, formatErrorReason(reason_buf, err_body).reason);
         return null;
     }
     return reply.body;
@@ -669,7 +652,7 @@ pub fn initrdBuildJson(io: std.Io, port: u16, name: []const u8, install_source: 
     var location: [256]u8 = undefined;
     var reply = try managementPostJson(io, port, "/api/v1/management/initrds/build", rendered, null, output, &location);
     if (reply.status < 200 or reply.status >= 300) {
-        if (reply.body) |err_body| _ = formatErrorReason(reason_buf, err_body);
+        if (reply.body) |err_body| _ = keepReasonOnly(reason_buf, formatErrorReason(reason_buf, err_body).reason);
         return null;
     }
     if (reply.status != 202 or detach) return reply.body;
@@ -700,8 +683,8 @@ pub fn initrdBuildJson(io: std.Io, port: u16, name: []const u8, install_source: 
     return null;
 }
 
-/// v0.2: 为 diskless 节点创建交付 session（POST boot-prepare）。
-/// 返回 capsule 交付所需的 config_token、session_id、agent_plan_digest 等。
+/// 为 diskless 节点创建交付 session（POST boot-prepare）。公开响应只返回
+/// session/plan 摘要；内部 TFTP capsule 路径额外取得 event token。
 pub fn bootPrepareJson(io: std.Io, port: u16, node_id: []const u8, output: []u8, reason_buf: []u8) !?[]const u8 {
     if (!querySafe(node_id)) return null;
     var path: [256]u8 = undefined;
@@ -805,6 +788,26 @@ pub fn nodeRemove(io: std.Io, port: u16, node_id: []const u8, reason_buf: []u8) 
     return managementMutation(io, port, "DELETE", value, "", revision, reason_buf);
 }
 
+pub fn nodeDiscoveryJson(io: std.Io, port: u16, node_id: []const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(node_id)) return null;
+    var path: [320]u8 = undefined;
+    const value = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/discovery", .{node_id}) catch return null;
+    return managementJson(io, port, value, output);
+}
+
+pub fn nodeDiscoveryAction(io: std.Io, port: u16, node_id: []const u8, action: []const u8, expires_in_seconds: ?i64, reason_buf: []u8) Mutation {
+    if (!querySafe(node_id) or !querySafe(action)) return .{ .reachable = false, .healthy = false };
+    var path: [320]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/nodes/{s}/discovery", .{node_id}) catch return .{ .reachable = false, .healthy = false };
+    var body: [256]u8 = undefined;
+    const rendered = if (expires_in_seconds) |seconds|
+        std.fmt.bufPrint(&body, "{{\"action\":{f},\"expires_in_seconds\":{d}}}", .{ std.json.fmt(action, .{}), seconds }) catch return .{ .reachable = true, .healthy = false }
+    else
+        std.fmt.bufPrint(&body, "{{\"action\":{f}}}", .{std.json.fmt(action, .{})}) catch return .{ .reachable = true, .healthy = false };
+    const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+    return managementMutation(io, port, "POST", route, rendered, revision, reason_buf);
+}
+
 pub fn nodeClaim(io: std.Io, port: u16, node_id: []const u8, mac: []const u8, arch: []const u8, observation_revision: u64, reason_buf: []u8) Mutation {
     if (!querySafe(node_id) or !querySafe(mac) or !querySafe(arch)) return .{ .reachable = false, .healthy = false };
     var path: [256]u8 = undefined;
@@ -905,22 +908,49 @@ fn formatErrorReason(out: []u8, body: []const u8) ErrorReason {
     out[code_len] = 0;
     const reason_region = out[code_len + 1 ..];
     return .{
-        .reason = std.fmt.bufPrint(reason_region, "{s}: {s} (request_id={s})", .{ e.code, e.message, e.request_id orelse "" }) catch
+        .reason = formatTerminated(reason_region, "{s}: {s} (request_id={s})", .{ e.code, e.message, e.request_id orelse "" }, "http: error") catch
             formatPlain(reason_region, e.code, e.message),
         .code = out[0..code_len],
     };
 }
 
 fn formatPlain(out: []u8, code: []const u8, message: []const u8) []const u8 {
-    return std.fmt.bufPrint(out, "{s}: {s}", .{ code, message }) catch "http: error";
+    return formatTerminated(out, "{s}: {s}", .{ code, message }, "http: error") catch "http: error";
 }
 
 fn formatTransportError(out: []u8, err: anyerror) []const u8 {
-    return std.fmt.bufPrint(out, "http: transport error ({t})", .{err}) catch "http: transport error";
+    return formatTerminated(out, "http: transport error ({t})", .{err}, "http: transport error") catch "http: transport error";
 }
 
 fn formatHttpStatus(out: []u8, status: u16) []const u8 {
-    return std.fmt.bufPrint(out, "http: {d} response with no body", .{status}) catch "http: non-2xx response";
+    return formatTerminated(out, "http: {d} response with no body", .{status}, "http: non-2xx response") catch "http: non-2xx response";
+}
+
+/// Render a diagnostic into a caller-owned C-style scratch buffer while also
+/// returning its exact slice. CLI handlers historically recovered the length
+/// with `sliceTo(0)`; reserving and writing the terminator prevents undefined
+/// tail bytes from becoming invalid UTF-8/JSON byte arrays.
+fn formatTerminated(out: []u8, comptime fmt: []const u8, args: anytype, fallback: []const u8) ![]const u8 {
+    if (out.len == 0) return fallback;
+    const payload = out[0 .. out.len - 1];
+    const rendered = std.fmt.bufPrint(payload, fmt, args) catch blk: {
+        const count = @min(payload.len, fallback.len);
+        @memcpy(payload[0..count], fallback[0..count]);
+        break :blk payload[0..count];
+    };
+    out[rendered.len] = 0;
+    return rendered;
+}
+
+/// `formatErrorReason` keeps both code and text in one buffer separated by a
+/// NUL for Mutation callers. JSON-only helpers need just the text at offset 0;
+/// compact it with overlap-safe copying and retain an explicit terminator.
+fn keepReasonOnly(out: []u8, reason: []const u8) []const u8 {
+    if (out.len == 0) return "";
+    const count = @min(out.len - 1, reason.len);
+    std.mem.copyForwards(u8, out[0..count], reason[0..count]);
+    out[count] = 0;
+    return out[0..count];
 }
 
 fn catalogRevision(io: std.Io, port: u16) ?u64 {
@@ -1116,10 +1146,10 @@ const OperationState = enum { succeeded, failed, pending };
 fn operationFailureReason(out: []u8, body: []const u8) []const u8 {
     const Envelope = struct { result: struct { error_code: []const u8 } };
     const parsed = std.json.parseFromSlice(Envelope, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch
-        return formatPlain(out, "operation.failed", "rootfs build operation failed");
+        return formatPlain(out, "operation.failed", "durable operation failed");
     defer parsed.deinit();
     const code = if (parsed.value.result.error_code.len == 0) "operation.failed" else parsed.value.result.error_code;
-    return formatPlain(out, code, "rootfs build operation failed");
+    return formatPlain(out, code, "durable operation failed");
 }
 
 /// 从 Operation 失败信封提取稳定 `error_code` 与诊断文本（与
@@ -1265,7 +1295,18 @@ test "operationState parses terminal and pending states" {
     const imported = operationImportResult("{\"ok\":true,\"result\":{\"state\":\"succeeded\",\"result\":\"rocky-9.7-aarch64-iso\"}}").?;
     try std.testing.expectEqualStrings("rocky-9.7-aarch64-iso", imported.name());
     var reason: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("rootfs.RootfsDigestDrift: rootfs build operation failed", operationFailureReason(&reason, "{\"ok\":true,\"result\":{\"state\":\"failed\",\"error_code\":\"rootfs.RootfsDigestDrift\"}}"));
+    const rendered = operationFailureReason(&reason, "{\"ok\":true,\"result\":{\"state\":\"failed\",\"error_code\":\"rootfs.RootfsDigestDrift\"}}");
+    try std.testing.expectEqualStrings("rootfs.RootfsDigestDrift: durable operation failed", rendered);
+    try std.testing.expectEqual(@as(u8, 0), reason[rendered.len]);
+}
+
+test "error reason compaction returns exact terminated UTF-8 text" {
+    var out: [128]u8 = undefined;
+    const envelope = formatErrorReason(&out, "{\"ok\":false,\"error\":{\"code\":\"operation.failed\",\"message\":\"package step failed\"}}");
+    const reason = keepReasonOnly(&out, envelope.reason);
+    try std.testing.expectEqualStrings("operation.failed: package step failed (request_id=)", reason);
+    try std.testing.expectEqual(@as(u8, 0), out[reason.len]);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(reason));
 }
 
 /// 向指定 IPv4:port 发送轻量探针并严格解析三位状态码。

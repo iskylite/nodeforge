@@ -116,12 +116,13 @@ pub const CapsuleStore = struct {
 
     /// 取出指定 node+session 的 capsule 内容。
     ///
-    /// 已交付（`delivered`）的 capsule 不再返回：capsule 携带四域 scoped
-    /// token，设计契约是**单次下载**。`markDelivered` 只在
+    /// 已交付（`delivered`）的 capsule 不再返回：diskless capsule 携带唯一
+    /// durable event credential，契约是**单次下载**，且不包含随机
+    /// boot-session capability。`markDelivered` 只在
     /// `transferVirtualCapsule` 传输成功后调用，因此传输失败的客户端仍可重试，
     /// 而成功取走后的重复请求一律拒绝——否则同一 boot session 有效期内
     /// 凭据可被无限次重放，且当 DHCP 地址被复用、另一台主机继承该 session
-    /// 时，它能取走前一节点的全部 scope token。
+    /// 时，它能取走前一节点的跨边界 credential/attempt identity。
     fn copy(self: *CapsuleStore, node_id: []const u8, session: []const u8, out: *[capsule_max_bytes]u8) ?[]const u8 {
         while (!self.mutex.tryLock()) std.Thread.yield() catch {};
         defer self.mutex.unlock();
@@ -143,6 +144,13 @@ pub const CapsuleStore = struct {
             return out;
         }
         return null;
+    }
+
+    fn hasPending(self: *CapsuleStore, node_id: []const u8, session: []const u8) bool {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| if (entry.active and !entry.delivered and std.mem.eql(u8, entry.node[0..entry.node_len], node_id) and std.mem.eql(u8, &entry.session, session)) return true;
+        return false;
     }
 
     fn markDelivered(self: *CapsuleStore, node_id: []const u8, session: []const u8) void {
@@ -328,7 +336,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
     const bytes_sent = if (is_virtual_config)
         transferVirtualConfig(io, allocator, &remote, request, config, catalog, sessions, capsules) catch |err| {
             runtime.tftp.finish(session, false);
-            if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
+            if (session_link) |link| if (sessions) |store| store.touchTftp(link, boot_session.monotonicNow(), now());
             switch (err) {
                 error.BootAccessDenied, error.BootTargetUnavailable, error.UnsupportedMode, error.InvalidOption => observe_log.warn("tftp: rejected virtual config {s} from {f}: {t}", .{ request.filename, remote, err }),
                 else => observe_log.err("tftp: virtual config transfer failed for {s}: {t}", .{ request.filename, err }),
@@ -340,7 +348,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
     else if (is_virtual_capsule)
         transferVirtualCapsule(io, &remote, request, config, sessions, capsules) catch |err| {
             runtime.tftp.finish(session, false);
-            if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
+            if (session_link) |link| if (sessions) |store| store.touchTftp(link, boot_session.monotonicNow(), now());
             emit(event_writer, io, allocator, &remote, request.filename, "tftp.transfer.error", "credential capsule transfer failed", 0, started.durationTo(std.Io.Clock.awake.now(io)).toMicroseconds(), tftpErrorReason(err), linked_node_id, if (session_link) |*link| link else null);
             if (initialErrorResponse(err)) |response| try sendEphemeralError(io, &remote, response.code, response.message);
             return;
@@ -348,7 +356,7 @@ fn handleRrq(io: std.Io, allocator: std.mem.Allocator, remote: std.Io.net.IpAddr
     else
         transfer(io, &remote, request, config.tftp.asset_root, catalog, config.tftp.windowsize, config.tftp.max_blksize) catch |err| {
             runtime.tftp.finish(session, false);
-            if (session_link) |link| if (sessions) |store| store.updateTftp(link, .failed, boot_session.monotonicNow(), now());
+            if (session_link) |link| if (sessions) |store| store.touchTftp(link, boot_session.monotonicNow(), now());
             switch (err) {
                 error.FileNotFound => observe_log.warn("tftp: not in catalog {s} from {f}", .{ request.filename, remote }),
                 error.FileNotAllowed => observe_log.warn("tftp: rejected unsafe path {s} from {f}", .{ request.filename, remote }),
@@ -488,7 +496,7 @@ fn transferVirtualConfig(
         // 渲染结果写入栈缓冲区，在 TFTP I/O 开始前就已完成自包含，
         // 因此慢速客户端不会长时间持有 catalog mutex。
         const target = boot_target.resolve(identity, config, catalog.value(), config.server.server_ip, config.server.http_port, &cmdline_buf) orelse return error.BootTargetUnavailable;
-        const node = lookup.findNode(catalog.value(), identity.nodeId()) orelse return error.BootTargetUnavailable;
+        const node = if (identity.discovery) null else lookup.findNode(catalog.value(), identity.nodeId()) orelse return error.BootTargetUnavailable;
         // M4.2 F4：node.http_accel 是实验性功能（默认 false）。
         // 启用时，initrd 路径渲染为 GRUB HTTP URL
         // `(http,server:port)/artifacts/boot/<path>` 而非 TFTP `/<path>`。
@@ -515,20 +523,20 @@ fn transferVirtualConfig(
         // `pxelinux.0`（只支持 TFTP），http_accel 对 BIOS 节点无效，
         // kernel/initrd 始终通过 TFTP 传输。
         const kernel_path = std.fmt.bufPrint(&kernel_grub, "/{s}", .{target.kernel_path}) catch return error.BootTargetUnavailable;
-        const initrd_path = if (node.http_accel)
+        const initrd_path = if (node != null and node.?.http_accel)
             std.fmt.bufPrint(&initrd_grub, "(http,{s}:{d})/artifacts/boot/{s}", .{ config.server.server_ip, config.server.http_port, target.initrd_path }) catch return error.BootTargetUnavailable
         else
             std.fmt.bufPrint(&initrd_grub, "/{s}", .{target.initrd_path}) catch return error.BootTargetUnavailable;
-        const additional_initrd_path: ?[]const u8 = if (profileIsDiskless(catalog.value(), identity.profileName())) cap: {
+        const additional_initrd_path: ?[]const u8 = if (!identity.discovery and profileIsDiskless(catalog.value(), identity.profileName())) cap: {
             const capsule_store = capsules orelse return error.BootTargetUnavailable;
             const delivery_session = try prepareDisklessCapsule(io, allocator, config.server.http_port, identity.nodeId(), capsule_store, &delivery_session_buf);
             break :cap std.fmt.bufPrint(&capsule_grub, "/{s}{s}{s}", .{ capsule_prefix, delivery_session, capsule_suffix }) catch return error.BootTargetUnavailable;
         } else null;
         break :blk grub.render(&config_buf, .{
-            .node_id = identity.nodeId(),
-            .hostname = node.hostname orelse node.id,
+            .node_id = if (identity.discovery) "discovery" else identity.nodeId(),
+            .hostname = if (identity.discovery) "discovery" else (node.?.hostname orelse node.?.id),
             .lease_ip = identity.lease_ip,
-            .profile = identity.profileName(),
+            .profile = if (identity.discovery) "discovery" else identity.profileName(),
             .kernel_path = kernel_path,
             .initrd_path = initrd_path,
             .additional_initrd_path = additional_initrd_path,
@@ -545,14 +553,14 @@ fn profileIsDiskless(catalog: *const model.Catalog, profile_name: []const u8) bo
     return profile.kind == .diskless;
 }
 
+/// PR3-1（token 简化）：diskless boot-prepare 响应只包含 session_id 和
+/// event_token。config/rootfs/agent token 已删除 —— initrd 通过 peer-IP 引导
+/// 认证获取 BootConfig/rootfs/payload；BootConfig 另签发仅供 AgentPlan 的短时 capability。
 const BootPrepareResponse = struct {
     ok: bool,
     result: struct {
         node_id: []const u8,
         session_id: []const u8,
-        config_token: []const u8,
-        rootfs_token: []const u8,
-        agent_token: []const u8,
         event_token: []const u8,
     },
 };
@@ -583,9 +591,6 @@ fn prepareDisklessCapsule(
         return error.InvalidCapsule;
     const archive = try capsule.render(allocator, .{
         .session = result.session_id,
-        .config_token = result.config_token,
-        .rootfs_token = result.rootfs_token,
-        .agent_token = result.agent_token,
         .event_token = result.event_token,
     });
     defer allocator.free(archive);
@@ -633,10 +638,10 @@ test "capsule store never overwrites an undelivered session at capacity" {
 
 // 回归：credential capsule 必须单次下载。
 //
-// capsule 携带 config/rootfs/agent/event 四域 scoped token。历史实现的
+// diskless capsule 携带唯一 durable event token。历史实现的
 // `copy` 只检查 `active` 而不检查 `delivered`（而 `pendingSession` 检查了，
 // 属明显遗漏），因此同一 boot session 有效期内凭据可被无限次重放；若 DHCP
-// 地址被复用、另一台主机继承该 session，它能取走前一节点的全部 scope token。
+// 地址被复用、另一台主机继承该 session，它能取走前一节点的跨边界 credential。
 test "delivered credential capsule cannot be replayed" {
     var store: CapsuleStore = .{};
     const archive = "070701";

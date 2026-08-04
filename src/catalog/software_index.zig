@@ -59,7 +59,10 @@ fn indexUbuntu(io: std.Io, allocator: std.mem.Allocator, root: []const u8, outpu
     const result = try std.process.run(allocator, io, .{ .argv = &.{ "find", root, "-type", "f", "-name", "Packages*", "-print" }, .stdout_limit = .limited(8 * 1024 * 1024), .stderr_limit = .limited(1024 * 1024) });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
-    switch (result.term) { .exited => |code| if (code != 0) return error.PackageMetadataSearchFailed, else => return error.PackageMetadataSearchFailed }
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.PackageMetadataSearchFailed,
+        else => return error.PackageMetadataSearchFailed,
+    }
     var paths = std.mem.tokenizeScalar(u8, result.stdout, '\n');
     var found = false;
     while (paths.next()) |path| {
@@ -96,7 +99,10 @@ fn parseXmlItems(allocator: std.mem.Allocator, xml: []const u8, container: []con
     while (std.mem.indexOfPos(u8, xml, cursor, open)) |start| {
         const end_pos = std.mem.indexOfPos(u8, xml, start, close) orelse break;
         const block = xml[start .. end_pos + close.len];
-        const id = xmlText(block, id_open, id_close) orelse { cursor = end_pos + close.len; continue; };
+        const id = xmlText(block, id_open, id_close) orelse {
+            cursor = end_pos + close.len;
+            continue;
+        };
         const name = xmlText(block, "<name>", "</name>") orelse id;
         const description = xmlText(block, "<description>", "</description>");
         try appendUnique(allocator, output, .{ .id = try allocator.dupe(u8, id), .name = try allocator.dupe(u8, name), .kind = kind, .description = if (description) |value| try allocator.dupe(u8, value) else null });
@@ -150,7 +156,16 @@ fn readMaybeCompressed(io: std.Io, allocator: std.mem.Allocator, path: []const u
     const command = if (std.mem.endsWith(u8, path, ".gz")) "gzip" else "xz";
     const result = try std.process.run(allocator, io, .{ .argv = &.{ command, "-cd", "--", path }, .stdout_limit = .limited(128 * 1024 * 1024), .stderr_limit = .limited(1024 * 1024) });
     allocator.free(result.stderr);
-    switch (result.term) { .exited => |code| if (code != 0) { allocator.free(result.stdout); return error.MetadataDecompressionFailed; }, else => { allocator.free(result.stdout); return error.MetadataDecompressionFailed; } }
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return error.MetadataDecompressionFailed;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return error.MetadataDecompressionFailed;
+        },
+    }
     return result.stdout;
 }
 fn hashPart(writer: *std.Io.Writer, name: []const u8, bytes: []const u8) !void {
@@ -170,7 +185,11 @@ fn sortCapabilities(values: []model.SoftwareCapability) void {
 test "indexes Debian packages tasks and metapackages" {
     var values: std.ArrayList(model.SoftwareCapability) = .empty;
     defer {
-        for (values.items) |value| { std.testing.allocator.free(value.id); std.testing.allocator.free(value.name); if (value.description) |description| std.testing.allocator.free(description); }
+        for (values.items) |value| {
+            std.testing.allocator.free(value.id);
+            std.testing.allocator.free(value.name);
+            if (value.description) |description| std.testing.allocator.free(description);
+        }
         values.deinit(std.testing.allocator);
     }
     try parseDebianPackages(std.testing.allocator, "Package: ubuntu-server\nSection: metapackages\nTask: server, ssh-server\nDescription: Server seed\n\nPackage: vim\nSection: editors\n", &values);

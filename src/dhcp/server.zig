@@ -23,6 +23,7 @@ const catalog_runtime = @import("../state/catalog_runtime.zig");
 const model_runtime = @import("../state/model_runtime.zig");
 const observe_log = @import("../observe/log.zig");
 const paths = @import("../paths.zig");
+const node_discovery = @import("../state/node_discovery.zig");
 const log = std.log.scoped(.dhcp);
 pub const port = packet.server_port;
 /// Linux 只将 `255.255.255.255:67` 的 DHCP 广播投递到 wildcard socket，
@@ -66,6 +67,7 @@ pub const Persistence = struct {
     models: *model_runtime.ModelRuntime,
     bootstrap_key: []const u8 = "",
     additional_keys: []const []const u8 = &.{},
+    discoveries: ?*node_discovery.Store = null,
 };
 
 fn persistenceRevision(value: *const Persistence) u64 {
@@ -123,15 +125,16 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, configs: *config_ru
         defer config_snapshot.release();
         const config = config_snapshot.value();
         expireSessions(io, persistence);
+        const effective_request = request;
         var session_link: ?boot_session.Link = null;
-        const request_kind = request.message_type orelse .inform;
-        if (request_kind == .discover) prepareAlwaysGeneration(io, persistence, config, &request);
-        if (request_kind == .discover or request_kind == .request) session_link = acquireSession(io, persistence, config, &request);
-        audit(io, persistence, config, requestEvent(request_kind), request_kind, request_kind, request.mac(), 0, request.xid, request.architecture, if (session_link) |*link| link else null);
+        const request_kind = effective_request.message_type orelse .inform;
+        if (request_kind == .discover) prepareAlwaysGeneration(io, persistence, config, &effective_request);
+        if (request_kind == .discover or request_kind == .request) session_link = acquireSession(io, persistence, config, &effective_request);
+        audit(io, persistence, config, requestEvent(request_kind), request_kind, request_kind, effective_request.mac(), 0, effective_request.xid, effective_request.architecture, if (session_link) |*link| link else null);
         if (request_kind == .release or request_kind == .decline) {
-            if (persistence) |p| p.sessions.clearLease(request.mac(), request.xid, boot_session.monotonicNow(), now());
+            if (persistence) |p| p.sessions.clearLease(effective_request.mac(), effective_request.xid, boot_session.monotonicNow(), now());
         }
-        var reply = offerAfterProbe(io, config, runtime, &request, persistence, if (session_link) |*link| link else null) orelse {
+        var reply = offerAfterProbe(io, config, runtime, &effective_request, persistence, if (session_link) |*link| link else null) orelse {
             continue;
         };
         // ISO import publishes content-addressed UEFI bootloaders. Resolve the
@@ -140,7 +143,7 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, configs: *config_ru
         // swap cannot leave Reply holding a retired snapshot string.
         var bootfile_storage: [128]u8 = undefined;
         if (reply.bootfile != null) {
-            if (catalogBootfile(persistence, request.architecture, &bootfile_storage)) |managed_bootfile| {
+            if (catalogBootfile(persistence, effective_request.architecture, &bootfile_storage)) |managed_bootfile| {
                 reply.bootfile = managed_bootfile;
             } else {
                 observe_log.err("dhcp: no managed bootloader for requested architecture", .{});
@@ -148,11 +151,11 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, configs: *config_ru
             }
         }
         var output: [1500]u8 = undefined;
-        const encoded = packet.encodeReply(&output, &request, reply) catch |err| {
+        const encoded = packet.encodeReply(&output, &effective_request, reply) catch |err| {
             observe_log.err("dhcp: response encoding failed: {t}", .{err});
             continue;
         };
-        const target = replyTarget(config, &request, &incoming.from) catch |err| {
+        const target = replyTarget(config, &effective_request, &incoming.from) catch |err| {
             observe_log.err("dhcp: response routing failed: {t}", .{err});
             continue;
         };
@@ -176,8 +179,8 @@ pub fn serveSocketOn(io: std.Io, socket: *std.Io.net.Socket, configs: *config_ru
             .ack => "dhcp.ack",
             .nak => "dhcp.nak",
             else => "dhcp.request",
-        }, request_kind, reply.kind, request.mac(), reply.yiaddr, request.xid, request.architecture, if (session_link) |*link| link else null);
-        logReply(config, &request, reply, session_link);
+        }, request_kind, reply.kind, effective_request.mac(), reply.yiaddr, effective_request.xid, effective_request.architecture, if (session_link) |*link| link else null);
+        logReply(config, &effective_request, reply, session_link);
     }
 }
 
@@ -261,6 +264,7 @@ fn prepareAlwaysGeneration(io: std.Io, persistence: ?*const Persistence, config:
 /// lease 碰撞。
 fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime_state.RuntimeState, request: *const packet.Packet, persistence: ?*const Persistence, session_link: ?*const boot_session.Link) ?packet.Reply {
     const initial = resolver.resolve(config, request.mac(), request.architecture);
+    const discovery_boot = !initial.known and if (persistence) |p| if (p.discoveries) |states| states.hasPending(now()) else false else false;
     const unknown_action: ?model.UnknownAction = if (!initial.known) if (persistence) |p| blk: {
         const pair = p.models.acquire();
         defer pair.release();
@@ -295,8 +299,9 @@ fn offerAfterProbe(io: std.Io, config: *const model.AppConfig, runtime: *runtime
         var reply = processWithDeployment(config, runtime, request, if (persistence) |p| p.deployments else null, digest) orelse return null;
         if (unknown_action == .record) {
             // 未知客户端仅获得一个诊断性租约。catalog 策略
-            // 绝不允许旧版启动 discovery profile 泄漏 PXE bootfile。
-            reply.bootfile = null;
+            // 只有明确 arm 的 v0.4 NodeDiscoveryState 才允许独立 discovery
+            // boot slot；它不经过普通 profile resolver/BootConfig。
+            reply.bootfile = if (discovery_boot) "discovery" else null;
             recordUnknownObservation(io, persistence, request, reply.yiaddr);
         }
         if (reply.kind != .offer) return reply;
@@ -575,6 +580,12 @@ fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const m
     const digest = if (preliminary.node_id) |node_id| persistencePlanDigest(p, node_id) else deployment_control.empty_digest;
     const decision = resolver.resolveWithDeployment(config, p.deployments, digest, request.mac(), request.architecture);
     if (decision.install_not_armed) return null;
+    const discovery = !decision.known and p.discoveries != null and p.discoveries.?.hasPending(now());
+    const discovery_arch: ?model.Arch = switch (request.architecture) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+        .unknown => null,
+    };
     const result = p.sessions.acquireDhcp(io, .{
         .mac = request.mac(),
         .xid = request.xid,
@@ -583,6 +594,8 @@ fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const m
         .mode = decision.mode,
         .model_revision = persistenceRevision(p),
         .model_plan_digest = if (decision.node_id) |node_id| persistencePlanDigest(p, node_id) else deployment_control.empty_digest,
+        .discovery = discovery,
+        .discovery_arch = discovery_arch,
     }, boot_session.monotonicNow(), now()) catch |err| {
         observe_log.warn("dhcp: boot session allocation unavailable: {t}", .{err});
         return .capacity_exhausted;

@@ -35,8 +35,7 @@ pub const RepositoryRevision = struct {
 pub const ProfileBuildProjection = struct {
     /// Bump whenever the built-in OS-layer baseline or materialization logic
     /// changes, so stale rootfs objects cannot be returned as cache hits.
-    builder_revision: []const u8 = "rootfs-os-v5",
-    profile_name: []const u8,
+    builder_revision: []const u8 = "rootfs-os-v7",
     kind: model.ProfileKind,
     install_source: []const u8,
     source_asset: []const u8,
@@ -60,10 +59,9 @@ pub const ProfileBuildProjection = struct {
     /// 影响 rootfs-build package 步骤是否删除 casper 自带源，必须进入
     /// `rootfs_input_digest`，否则切换开关后可能复用旧缓存 rootfs。
     apt_preserve_sources_list: bool = false,
-    /// v0.2.3: Profile revision 与 SSH identity 引用进入构建投影。identity
-    /// 变更（--new-ssh-keys）必须产生不同 `rootfs_input_digest`，否则换 key
-    /// 后旧 rootfs 会被错误缓存命中。fingerprint 已含在 catalog reference。
-    profile_revision: u64,
+    /// SSH identity revision/fingerprints are build inputs. The logical
+    /// Profile name/revision are deliberately excluded: two Profile revisions
+    /// with the same immutable closure must converge on one cache key.
     ssh_identity_id: []const u8,
     ssh_identity_revision: u64,
     client_public_fingerprint: []const u8,
@@ -166,7 +164,6 @@ pub fn compile(allocator: std.mem.Allocator, config: *const model.AppConfig, cat
     errdefer allocator.free(repository_revisions);
 
     const profile_build: ProfileBuildProjection = .{
-        .profile_name = profile.name,
         .kind = profile.kind,
         .install_source = source.name,
         .source_asset = source.source_asset,
@@ -185,7 +182,6 @@ pub fn compile(allocator: std.mem.Allocator, config: *const model.AppConfig, cat
         .casper_layers = source.casper_layers,
         .first_boot_fixed_steps = first_boot_fixed_steps,
         .apt_preserve_sources_list = profile.install.apt.preserve_sources_list,
-        .profile_revision = profile.revision,
         .ssh_identity_id = profile.ssh_identity.id,
         .ssh_identity_revision = profile.ssh_identity.revision,
         .client_public_fingerprint = profile.ssh_identity.client_public_fingerprint,
@@ -228,7 +224,7 @@ pub fn compile(allocator: std.mem.Allocator, config: *const model.AppConfig, cat
 }
 
 /// 计算一个 diskless Profile 的 `rootfs_input_digest`（Node-independent）。
-/// 供 `profile rootfs plan`/`register` 等不绑定具体 Node 的操作使用；
+/// 供 `profile rootfs plan`/`build` 等不绑定具体 Node 的操作使用；
 /// 结果与 `compile(...).rootfs_input_digest` 完全一致（profile_build 投影相同）。
 pub fn rootfsInputDigest(allocator: std.mem.Allocator, config: *const model.AppConfig, catalog: *const model.Catalog, profile: *const model.ProfileConfig) !Digest {
     _ = config;
@@ -247,7 +243,6 @@ pub fn rootfsInputDigest(allocator: std.mem.Allocator, config: *const model.AppC
     const repository_revisions = try resolveRepositoryRevisions(allocator, catalog, &profile.software);
     defer allocator.free(repository_revisions);
     const profile_build: ProfileBuildProjection = .{
-        .profile_name = profile.name,
         .kind = profile.kind,
         .install_source = source.name,
         .source_asset = source.source_asset,
@@ -266,7 +261,6 @@ pub fn rootfsInputDigest(allocator: std.mem.Allocator, config: *const model.AppC
         .casper_layers = source.casper_layers,
         .first_boot_fixed_steps = first_boot_fixed_steps,
         .apt_preserve_sources_list = profile.install.apt.preserve_sources_list,
-        .profile_revision = profile.revision,
         .ssh_identity_id = profile.ssh_identity.id,
         .ssh_identity_revision = profile.ssh_identity.revision,
         .client_public_fingerprint = profile.ssh_identity.client_public_fingerprint,
@@ -461,6 +455,19 @@ test "apt_preserve_sources_list changes rootfs input digest" {
     try std.testing.expect(!std.mem.eql(u8, &digest_off, &digest_on));
 }
 
+test "logical profile name and revision do not fragment an identical rootfs closure" {
+    const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .http_port = 18080 } };
+    const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
+    const bundle = model.BootBundleConfig{ .name = "bb", .distro = "rocky", .version = "9", .arch = .aarch64, .kernel_release = "5.14.0", .kernel = "k", .initrd = "i" };
+    var profile: model.ProfileConfig = .{ .name = "profile-a", .install_source = "s", .kind = .diskless, .boot_bundle = "bb", .revision = 3 };
+    const catalog: model.Catalog = .{ .install_sources = &.{source}, .boot_bundles = &.{bundle} };
+    const first = try rootfsInputDigest(std.testing.allocator, &config, &catalog, &profile);
+    profile.name = "profile-b";
+    profile.revision = 99;
+    const second = try rootfsInputDigest(std.testing.allocator, &config, &catalog, &profile);
+    try std.testing.expectEqualSlices(u8, &first, &second);
+}
+
 test "rootfsBuildSteps returns pinned profile-fixed rootfs-build steps" {
     const config: model.AppConfig = .{ .server = .{ .server_ip = "192.0.2.1", .http_port = 18080 } };
     const source: model.InstallSourceConfig = .{ .name = "s", .distro = "rocky", .version = "9", .arch = .aarch64, .source_asset = "iso", .installer_kernel = "k", .installer_initrd = "i" };
@@ -482,7 +489,7 @@ test "rootfsBuildSteps returns pinned profile-fixed rootfs-build steps" {
     try std.testing.expect(build[0].content_url != null);
     try std.testing.expectEqualStrings("managed/motd/3", build[0].content_url.?);
     try std.testing.expectEqualStrings("abc", build[0].content_sha256.?);
-    // content_asset 名称保留，供 builder 暂存使用。
+    // content_asset 名称保留，供 nodeforged 服务端构建暂存使用。
     try std.testing.expectEqualStrings("motd", build[0].content_asset.?);
 }
 

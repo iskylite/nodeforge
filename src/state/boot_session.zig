@@ -96,8 +96,17 @@ pub const Session = struct {
     last_seen_mono: i64 = 0,
     phase: Phase = .dhcp_discover,
     terminal_reason: ?TerminalReason = null,
+    /// The delivery authority has passed bootstrap admission. This remains true
+    /// across checkpoint recovery so the two-hour delivery TTL is preserved,
+    /// while `capability_issued` is deliberately reset on daemon restart.
+    delivery_accepted: bool = false,
     capability: [capability_len]u8 = [_]u8{0} ** capability_len,
     capability_issued: bool = false,
+    /// v0.4 discovery boot slot. This is deliberately separate from
+    /// install/diskless profile identity: a discovery session has no node or
+    /// profile and may only reach the discovery facts endpoint.
+    discovery: bool = false,
+    discovery_arch: ?model.Arch = null,
 
     pub fn active(self: *const Session) bool {
         return self.id[0] != 0 and self.terminal_reason == null;
@@ -165,6 +174,8 @@ pub const TftpBootIdentity = struct {
     mode: model.BootKind,
     mac: [6]u8,
     lease_ip: u32,
+    discovery: bool = false,
+    discovery_arch: ?model.Arch = null,
 
     pub fn nodeId(self: *const TftpBootIdentity) []const u8 {
         return self.node_id_buf[0..self.node_id_len];
@@ -211,6 +222,14 @@ pub const DhcpIdentity = struct {
     mode: ?model.BootKind,
     model_revision: u64 = 0,
     model_plan_digest: @import("deployment_control.zig").Digest = @import("deployment_control.zig").empty_digest,
+    discovery: bool = false,
+    discovery_arch: ?model.Arch = null,
+};
+
+pub const DiscoveryAuthenticated = struct {
+    session_id: [id_len]u8,
+    mac: [6]u8,
+    lease_ip: u32,
 };
 
 /// `acquireDhcp` 的附带结果；被替换的 session 必须由调用者写出终态事件。
@@ -532,6 +551,14 @@ pub const Store = struct {
         }
         const session = found orelse return null;
         if (sessionExpired(session, mono_now)) return null;
+        if (session.discovery) return .{
+            .boot_session_id = session.id,
+            .mode = .diskless,
+            .mac = session.mac,
+            .lease_ip = session.lease_ip,
+            .discovery = true,
+            .discovery_arch = session.discovery_arch,
+        };
         if (session.nodeId() == null or session.profileName() == null or session.mode == null) return null;
         var identity: TftpBootIdentity = .{
             .boot_session_id = session.id,
@@ -548,10 +575,51 @@ pub const Store = struct {
         return identity;
     }
 
+    /// Resolve an authenticated discovery probe. Discovery sessions are
+    /// intentionally not accepted by normal capability/bootstrap auth: they
+    /// carry no node/profile identity and are scoped to the leased peer IP.
+    pub fn authenticateDiscovery(self: *Store, session_id: []const u8, peer_ip: u32, mono_now: i64) !DiscoveryAuthenticated {
+        if (!validId(session_id)) return error.ProofMismatch;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.discovery or !std.mem.eql(u8, session.idSlice(), session_id)) continue;
+            // A completed discovery session remains as a bounded terminal
+            // record so the exact same facts body can be replayed idempotently.
+            // Failed/expired sessions and terminal records outside the normal
+            // delivery TTL are never accepted again.
+            if (!session.active() and session.terminal_reason != .completed) return error.SessionInactive;
+            if (session.active()) {
+                if (sessionExpired(session, mono_now)) return error.SessionInactive;
+            } else if (mono_now - session.last_seen_mono > delivery_ttl_seconds) return error.SessionInactive;
+            if (session.lease_ip != peer_ip) return error.ProofMismatch;
+            if (session.active()) session.last_seen_mono = mono_now;
+            return .{ .session_id = session.id, .mac = session.mac, .lease_ip = session.lease_ip };
+        }
+        return error.SessionInactive;
+    }
+
     /// 推进已关联的 TFTP session 阶段。委托给 `updateDhcp`，但不更新 lease_ip
     ///（传 0 表示不变更）。用于 TFTP 传输完成等阶段推进。
     pub fn updateTftp(self: *Store, link: Link, phase: Phase, mono_now: i64, utc_now: i64) void {
         self.updateDhcp(link, phase, 0, mono_now, utc_now);
+    }
+
+    /// A failed RRQ is not a failed boot session. GRUB deliberately probes a
+    /// sequence of optional configuration/module paths and falls back after a
+    /// TFTP file-not-found response. Keep the lease association alive while
+    /// recording activity; terminal boot failure is driven by an explicit
+    /// lifecycle event, not by one transport lookup miss.
+    pub fn touchTftp(self: *Store, link: Link, mono_now: i64, utc_now: i64) void {
+        const id = link.id() orelse return;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.sessions) |*session| {
+            if (!session.active() or !std.mem.eql(u8, session.idSlice(), id)) continue;
+            session.last_seen_mono = mono_now;
+            session.last_seen_at = utc_now;
+            return;
+        }
     }
 
     /// 仅使用 direct TCP peer 和活动 DHCP lease 验证 bootstrap proof。
@@ -649,6 +717,7 @@ pub const Store = struct {
                 try generateCapability(io, &session.capability);
                 session.capability_issued = true;
             }
+            session.delivery_accepted = true;
             session.phase = .boot_config_fetched;
             session.last_seen_mono = mono_now;
             session.last_seen_at = utc_now;
@@ -747,6 +816,8 @@ pub const Store = struct {
                 plan.release();
                 session.install_plan = null;
             }
+            @memset(&session.capability, 0);
+            session.capability_issued = false;
         }
     }
 
@@ -755,15 +826,35 @@ pub const Store = struct {
         defer self.mutex.unlock();
         var count: usize = 0;
         for (self.sessions) |session| {
-            if (!session.active() or !session.capability_issued) continue;
+            if (!session.active() or !session.delivery_accepted) continue;
             destination[count] = session;
+            // Checkpoint projection never needs bearer material. Redact it
+            // before the snapshot leaves the mutex so even a future serializer
+            // cannot accidentally persist the in-memory capability.
+            @memset(&destination[count].capability, 0);
+            destination[count].capability_issued = false;
             if (destination[count].install_plan) |plan| plan.retain();
             count += 1;
         }
         return count;
     }
 
+    /// Restore only durable authority. A caller can never use this low-level
+    /// API to revive a bearer captured before daemon restart: both the issued
+    /// bit and every raw capability byte must be clear. The schema loader may
+    /// attach an immutable install-plan snapshot only after this admission.
     pub fn restore(self: *Store, restored: Session) !void {
+        if (!validId(&restored.id) or
+            restored.terminal_reason != null or
+            !restored.delivery_accepted or
+            restored.capability_issued or
+            !std.mem.allEqual(u8, &restored.capability, 0) or
+            restored.install_plan != null or
+            restored.nodeId() == null or
+            restored.profileName() == null or
+            restored.mode == null or
+            restored.lease_ip == 0)
+            return error.InvalidRestoredSession;
         lock(&self.mutex);
         defer self.mutex.unlock();
         for (&self.sessions) |*slot| if (!slot.active()) {
@@ -839,6 +930,8 @@ fn newSession(io: std.Io, identity: DhcpIdentity, mono_now: i64, utc_now: i64, e
         .mode = identity.mode,
         .model_revision = identity.model_revision,
         .model_plan_digest = identity.model_plan_digest,
+        .discovery = identity.discovery,
+        .discovery_arch = identity.discovery_arch,
         .created_at = utc_now,
         .last_seen_at = utc_now,
         .created_mono = mono_now,
@@ -872,6 +965,12 @@ fn terminateLocked(session: *Session, reason: TerminalReason, mono_now: i64, utc
     if (session.install_plan) |plan| plan.release();
     session.install_plan = null;
     result.install_plan = null;
+    // Terminal audit snapshots need identity and phase only. Scrub the bearer
+    // in both the store slot and returned value before either leaves the lock.
+    @memset(&session.capability, 0);
+    session.capability_issued = false;
+    @memset(&result.capability, 0);
+    result.capability_issued = false;
     return result;
 }
 
@@ -906,7 +1005,7 @@ fn authenticated(session: *const Session) Authenticated {
 /// 判断 session 是否已过期。已获得 capability 的 session 使用 delivery TTL（2 小时），
 /// 未获得 capability 的使用 bootstrap TTL（15 分钟）。
 fn sessionExpired(session: *const Session, mono_now: i64) bool {
-    const ttl = if (session.capability_issued) delivery_ttl_seconds else bootstrap_ttl_seconds;
+    const ttl = if (session.delivery_accepted) delivery_ttl_seconds else bootstrap_ttl_seconds;
     return mono_now - session.last_seen_mono >= ttl;
 }
 
@@ -1044,11 +1143,13 @@ test "repeated installer DHCP renewals preserve bootstrap proof" {
 test "terminal install event releases retry gate" {
     var store: Store = .{};
     const id = "0123456789abcdef0123456789abcdef";
-    store.sessions[0] = .{ .id = id.*, .mode = .install, .last_seen_mono = 1 };
+    store.sessions[0] = .{ .id = id.*, .mode = .install, .last_seen_mono = 1, .capability = [_]u8{'a'} ** capability_len, .capability_issued = true };
     try copyIdentity(&store.sessions[0], "node-01", "install");
     try std.testing.expect(store.hasActiveNode("node-01", 2));
     store.finishDelivery(id, .failed, 3, 3);
     try std.testing.expect(!store.hasActiveNode("node-01", 4));
+    try std.testing.expect(!store.sessions[0].capability_issued);
+    try std.testing.expect(std.mem.allEqual(u8, &store.sessions[0].capability, 0));
 }
 
 test "capacity exhaustion remains explicit and bootstrap sessions expire" {
@@ -1108,7 +1209,7 @@ test "M3 bootstrap and capability proofs remain bound to one active lease" {
     try std.testing.expectError(error.SessionInactive, store.authenticateCapability("node-01", &session_id, &token, 100 + delivery_ttl_seconds));
 }
 
-test "M4.3 restored plaintext capability authenticates in constant time" {
+test "schema 5 restore rejects every form of plaintext capability revival" {
     const token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     var store: Store = .{};
     var id: [id_len]u8 = undefined;
@@ -1121,14 +1222,19 @@ test "M4.3 restored plaintext capability authenticates in constant time" {
         .last_seen_at = 100,
         .created_mono = 100,
         .last_seen_mono = 100,
+        .delivery_accepted = true,
         .capability_issued = true,
         .capability = token.*,
     };
     try copyIdentity(&restored_session, "node-01", "install");
+    try std.testing.expectError(error.InvalidRestoredSession, store.restore(restored_session));
+    restored_session.capability_issued = false;
+    try std.testing.expectError(error.InvalidRestoredSession, store.restore(restored_session));
+    @memset(&restored_session.capability, 0);
     try store.restore(restored_session);
-    const checked = try store.authenticateCapability("node-01", &id, token, 101);
-    try std.testing.expectEqualStrings("node-01", checked.nodeId());
-    try std.testing.expectError(error.ProofMismatch, store.authenticateCapability("node-01", &id, "0000000000000000000000000000000000000000000000000000000000000000", 101));
+    try std.testing.expectError(error.ProofMismatch, store.authenticateCapability("node-01", &id, token, 101));
+    const bootstrap = try store.authenticateBootstrap("node-01", 0xc0a81b10, 101);
+    try std.testing.expect(!bootstrap.capability_issued);
 }
 
 test "immutable install plan cannot change within one boot session" {

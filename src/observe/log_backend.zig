@@ -95,8 +95,8 @@ const FileSink = struct {
         return true;
     }
 
-/// 文件写入的内部实现。先检查是否需要滚动轮转，然后以追加模式写入文件。
-/// 文件不存在时自动创建。
+    /// 文件写入的内部实现。先检查是否需要滚动轮转，然后以追加模式写入文件。
+    /// 文件不存在时自动创建。
     fn writeLine(self: *FileSink, io: std.Io, line: []const u8) !void {
         const dir = std.Io.Dir.cwd();
         try rotateIfNeeded(io, dir, self.path, self.max_size_bytes, self.keep, line.len);

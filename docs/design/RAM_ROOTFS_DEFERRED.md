@@ -135,8 +135,8 @@ manifest feature 或解压后校验差异在 handoff 前失败，不能通过忽
   materialization mode。主机内存等 Node 特性只参与 readiness/实测预算，不反向改写或自动选择 mode。
 - v0.4 及更早不存在该字段（单值无选择意义）。fresh replacement 后新 Profile 缺省显式物化为
   `squashfs_overlay`；旧 config/catalog 不加载，因此不存在“缺字段兼容等价”或迁移时补默认值。
-- v0.4 BootConfig v3 的外部 rootfs 可将 `uncompressed_size` 留为 unknown（此时只告警并跳过容量硬校验）；
-  后续 DTO 若把它提升为 required，fresh deployment 中所有 artifact 都必须重新导入/构建并 deep validate 得到可信
+- v0.4 BootConfig v3 在 nodeforged 构建期测量失败时可将 `uncompressed_size` 留为 unknown（此时只告警并跳过容量硬校验）；
+  后续 DTO 若把它提升为 required，fresh deployment 中所有 artifact 都必须重新构建并 deep validate 得到可信
   manifest，不能复用旧 index、回填旧 artifact 或按压缩大小猜测。
 - `diskless.overlay.tmpfs_percent` 在 `squashfs_overlay` 下继续控制 upper 预算；在 `ram_rootfs` 下控制展开后
   writable root 可占 `MemAvailable` 的最大比例。这样既有字段不被静默忽略，范围仍为 10-80。

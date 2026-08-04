@@ -1,12 +1,8 @@
-//! # v0.2 无盘作用域能力令牌
+//! # v0.4 diskless lifecycle capability
 //!
-//! `V0_2_DESIGN.md` §2.3 / `V0_2_IMPL_DETAILS.md` §1.5 的分域、有界、一次性能力 token。
-//! raw token 只驻内存且不落盘；服务端只持 [`hashOf`]（HMAC-SHA256）与对应的 [`Claim`]。
-//! 校验时按 claim 的 scope/node/path/expiry 判定，无效 token 不关联任何 session
-//! （§10：不归责 victim），已验证 claim 越权归责该 claim 所属 session。
-//!
-//! 四类 scope：`config:read`（BootConfig）、`rootfs:read`（rootfs GET/HEAD/Range）、
-//! `agent:read`（AgentPlan/payload）、`event:append`（initrd/agent 事件上报）。
+//! Diskless 读取统一使用随机、内存中的 boot-session capability。这里只保留跨
+//! 有界网络切换继续存活的确定性 `event:append` token；旧的 config/rootfs/agent
+//! scope 已从 v0.4 runtime 与 checkpoint schema 删除。
 const std = @import("std");
 
 /// HMAC 输出十六进制长度（HMAC-SHA256 = 32 字节 = 64 hex）。
@@ -16,18 +12,11 @@ pub const Hash = [hash_len]u8;
 /// raw token 长度（32 字节随机 = 64 hex）。与 v0.1 capability_len 一致，便于复用 header。
 pub const token_len: usize = 64;
 
-/// 能力域。单一职责，不可跨域复用（§10：传输 token 不能用于管理 API）。
 pub const Scope = enum {
-    config_read,
-    rootfs_read,
-    agent_read,
     event_append,
 
     pub fn canonicalName(self: Scope) []const u8 {
         return switch (self) {
-            .config_read => "config:read",
-            .rootfs_read => "rootfs:read",
-            .agent_read => "agent:read",
             .event_append => "event:append",
         };
     }
@@ -60,8 +49,8 @@ pub const Decision = enum {
     path_not_allowed,
     content_mismatch,
     event_seq_mismatch,
-    /// v0.2.3: session 在 daemon restart 后无法安全重构同一 capability。
-    /// 该 session 的全部 scope 不可用，需新 boot session 重新走 bootstrap 认证。
+    /// Durable event credential 在 daemon restart 后无法安全重构。
+    /// 该 delivery 的跨网络生命周期写入 authority 不可用，需重新启动 delivery。
     recovery_incomplete,
 };
 
@@ -109,8 +98,31 @@ pub fn verify(
     if (!std.mem.eql(u8, claim.node_id, request_node)) return .node_mismatch;
     if (claim.path_allowlist.len != 0 and !contains(claim.path_allowlist, request_path)) return .path_not_allowed;
     if (claim.content_digest.len != 0 and !std.mem.eql(u8, claim.content_digest, request_content)) return .content_mismatch;
-    if (claim.scope == .event_append and claim.event_seq != request_event_seq) return .event_seq_mismatch;
+    if (claim.event_seq != request_event_seq) return .event_seq_mismatch;
     return .ok;
+}
+
+pub fn deriveToken(
+    out: *[token_len]u8,
+    master_secret: []const u8,
+    deployment_id: []const u8,
+    audience: []const u8,
+    resource_id: []const u8,
+    generation: u64,
+    counter: u64,
+) void {
+    var input: [1024]u8 = undefined;
+    const input_len = std.fmt.bufPrint(&input, "{s}\x00{s}\x00{s}\x00{s}\x00{d}\x00{d}", .{
+        deployment_id,
+        audience,
+        resource_id,
+        "nodeforge-capability-v1",
+        generation,
+        counter,
+    }) catch unreachable;
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, input_len, master_secret);
+    _ = std.fmt.bufPrint(out, "{x}", .{mac}) catch unreachable;
 }
 
 fn contains(values: []const []const u8, needle: []const u8) bool {
@@ -118,27 +130,19 @@ fn contains(values: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-test "valid token with matching claim verifies ok" {
-    const claim: Claim = .{ .scope = .rootfs_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .content_digest = "c", .path_allowlist = &.{"rootfs.squashfs"}, .expires_mono = 100 };
-    const secret = "server-secret";
-    const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"; // 64 位十六进制
-    const stored = hashOf(raw, secret);
-    try std.testing.expectEqual(Decision.ok, verify(raw, secret, &stored, &claim, .rootfs_read, "n1", "rootfs.squashfs", "c", 0, 50));
-}
-
 test "invalid token does not match stored hash" {
-    const claim: Claim = .{ .scope = .config_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .expires_mono = 100 };
+    const claim: Claim = .{ .scope = .event_append, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .expires_mono = 100 };
     const stored = hashOf("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2", "s");
     // 错误的 raw token -> hash 不匹配 -> invalid_token（无受害方）
     const wrong = "0000000000000000000000000000000000000000000000000000000000000000";
-    try std.testing.expectEqual(Decision.invalid_token, verify(wrong, "s", &stored, &claim, .config_read, "n1", "", "", 0, 50));
+    try std.testing.expectEqual(Decision.invalid_token, verify(wrong, "s", &stored, &claim, .event_append, "n1", "", "", 0, 50));
 }
 
 test "expired token is rejected" {
-    const claim: Claim = .{ .scope = .config_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .expires_mono = 100 };
+    const claim: Claim = .{ .scope = .event_append, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .expires_mono = 100 };
     const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
     const stored = hashOf(raw, "s");
-    try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .config_read, "n1", "", "", 0, 200));
+    try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .event_append, "n1", "", "", 0, 200));
 }
 
 // 回归：单调时钟不可读时 TTL 判定必须 fail-closed。
@@ -147,33 +151,15 @@ test "expired token is rejected" {
 // 仅为 `now_mono > expires_mono`，则 `0 > 100` 为 false，**所有已过期
 // token 全部复活**。这里固定该语义：now_mono <= 0 一律视为过期。
 test "unreadable monotonic clock fails closed instead of reviving tokens" {
-    const claim: Claim = .{ .scope = .config_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .expires_mono = 100 };
+    const claim: Claim = .{ .scope = .event_append, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .expires_mono = 100 };
     const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
     const stored = hashOf(raw, "s");
     // monotonicNow() 的失败返回值。
-    try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .config_read, "n1", "", "", 0, 0));
+    try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .event_append, "n1", "", "", 0, 0));
     // 防御性：负值同样不可用于判定。
-    try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .config_read, "n1", "", "", 0, -1));
+    try std.testing.expectEqual(Decision.expired, verify(raw, "s", &stored, &claim, .event_append, "n1", "", "", 0, -1));
     // 正常时钟下仍必须放行，避免修复引入误伤。
-    try std.testing.expectEqual(Decision.ok, verify(raw, "s", &stored, &claim, .config_read, "n1", "", "", 0, 50));
-}
-
-test "scope mismatch and cross-node rootfs access are rejected" {
-    const claim: Claim = .{ .scope = .rootfs_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .content_digest = "c", .path_allowlist = &.{"rootfs.squashfs"}, .expires_mono = 100 };
-    const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-    const stored = hashOf(raw, "s");
-    // config token 被复用于 rootfs scope
-    try std.testing.expectEqual(Decision.scope_mismatch, verify(raw, "s", &stored, &claim, .config_read, "n1", "rootfs.squashfs", "c", 0, 50));
-    // rootfs 被不同节点访问
-    try std.testing.expectEqual(Decision.node_mismatch, verify(raw, "s", &stored, &claim, .rootfs_read, "n2", "rootfs.squashfs", "c", 0, 50));
-}
-
-test "path not in allowlist is rejected" {
-    const claim: Claim = .{ .scope = .agent_read, .node_id = "n1", .session_id = "s1", .plan_digest = "p", .content_digest = "plan", .path_allowlist = &.{ "payload/a.bin", "payload/b.bin" }, .expires_mono = 100 };
-    const raw = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-    const stored = hashOf(raw, "s");
-    try std.testing.expectEqual(Decision.ok, verify(raw, "s", &stored, &claim, .agent_read, "n1", "payload/a.bin", "plan", 0, 50));
-    try std.testing.expectEqual(Decision.path_not_allowed, verify(raw, "s", &stored, &claim, .agent_read, "n1", "payload/evil.bin", "plan", 0, 50));
+    try std.testing.expectEqual(Decision.ok, verify(raw, "s", &stored, &claim, .event_append, "n1", "", "", 0, 50));
 }
 
 test "event append enforces monotonic event seq" {
@@ -182,4 +168,15 @@ test "event append enforces monotonic event seq" {
     const stored = hashOf(raw, "s");
     try std.testing.expectEqual(Decision.ok, verify(raw, "s", &stored, &claim, .event_append, "n1", "", "", 7, 50));
     try std.testing.expectEqual(Decision.event_seq_mismatch, verify(raw, "s", &stored, &claim, .event_append, "n1", "", "", 8, 50));
+}
+
+test "v0.4 capability derivation is deterministic and domain separated" {
+    var first: [token_len]u8 = undefined;
+    var second: [token_len]u8 = undefined;
+    var other_audience: [token_len]u8 = undefined;
+    deriveToken(&first, "master", "deployment", "first-boot:exchange", "node-1", 4, 2);
+    deriveToken(&second, "master", "deployment", "first-boot:exchange", "node-1", 4, 2);
+    deriveToken(&other_audience, "master", "deployment", "first-boot:event", "node-1", 4, 2);
+    try std.testing.expectEqualSlices(u8, &first, &second);
+    try std.testing.expect(!std.mem.eql(u8, &first, &other_audience));
 }

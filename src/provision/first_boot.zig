@@ -209,13 +209,18 @@ fn sleepSeconds(io: std.Io, allocator: std.mem.Allocator, seconds: u32) void {
 ///   - package 段以 `--disablerepo='*'` + `--repofrompath/--enablerepo` 把包安装
 ///     限制到 nodeforged 受管源，禁止访问系统/自由源。
 pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?dto.FirstBootPackageManager, repository_urls: []const []const u8, nogpgcheck: bool, installroot: ?[]const u8) !void {
+    return renderStepAtPayloadRoot(w, step, package_manager, repository_urls, nogpgcheck, installroot, "/var/lib/nodeforge/payload");
+}
+
+pub fn renderStepAtPayloadRoot(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?dto.FirstBootPackageManager, repository_urls: []const []const u8, nogpgcheck: bool, installroot: ?[]const u8, payload_root: []const u8) !void {
+    try safeDest(payload_root);
     switch (step.action) {
         .managed_file => {
             const dest = step.destination orelse return error.MissingDestination;
             try safeDest(dest);
             if (step.payload_path) |relative| {
                 try w.writeAll("cp -- ");
-                try writePayloadPath(w, relative);
+                try writePayloadPath(w, payload_root, relative);
                 try w.writeByte(' ');
                 try writeQuoted(w, dest);
             } else {
@@ -283,7 +288,7 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
                 // payload_path：agent pre-init 已下载校验的本地路径。
                 // 渲染 payload 路径后直接进入模式 A/B 判定。
                 var buf: [256]u8 = undefined;
-                const quoted = try writePayloadPathBuf(&buf, relative);
+                const quoted = try writePayloadPathBuf(&buf, payload_root, relative);
                 try runner.renderArchiveModeDetection(w, quoted, dest);
             } else {
                 // inline content：写入临时文件后进入模式 A/B 判定。
@@ -299,7 +304,7 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
         .script => {
             if (step.payload_path) |relative| {
                 try w.writeAll("sh ");
-                try writePayloadPath(w, relative);
+                try writePayloadPath(w, payload_root, relative);
             } else {
                 try w.writeAll("printf '%b' '");
                 try writeBytes(w, step.content orelse "");
@@ -312,13 +317,15 @@ pub fn renderStep(w: *std.Io.Writer, step: dto.FirstBootStep, package_manager: ?
     }
 }
 
-fn writePayloadPath(w: *std.Io.Writer, relative: []const u8) !void {
+fn writePayloadPath(w: *std.Io.Writer, payload_root: []const u8, relative: []const u8) !void {
     if (relative.len == 0 or relative[0] == '/' or std.mem.indexOfScalar(u8, relative, '%') != null)
         return error.InvalidPayloadPath;
     var parts = std.mem.splitScalar(u8, relative, '/');
     while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, ".."))
         return error.InvalidPayloadPath;
-    try w.writeAll("'/var/lib/nodeforge/payload/");
+    try w.writeByte('\'');
+    for (payload_root) |c| if (c == '\'') try w.writeAll("'\\''") else try w.writeByte(c);
+    try w.writeByte('/');
     for (relative) |c| if (c == '\'') try w.writeAll("'\\''") else try w.writeByte(c);
     try w.writeByte('\'');
 }
@@ -326,14 +333,16 @@ fn writePayloadPath(w: *std.Io.Writer, relative: []const u8) !void {
 /// 与 writePayloadPath 相同的验证逻辑，但写入 buffer 并返回切片。
 /// 用于需要将引号包裹的 payload 路径作为 shell 表达式传递给
 /// runner.renderArchiveModeDetection 的场景。
-fn writePayloadPathBuf(buf: []u8, relative: []const u8) ![]const u8 {
+fn writePayloadPathBuf(buf: []u8, payload_root: []const u8, relative: []const u8) ![]const u8 {
     if (relative.len == 0 or relative[0] == '/' or std.mem.indexOfScalar(u8, relative, '%') != null)
         return error.InvalidPayloadPath;
     var parts = std.mem.splitScalar(u8, relative, '/');
     while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, ".."))
         return error.InvalidPayloadPath;
     var writer = std.Io.Writer.fixed(buf);
-    try writer.writeAll("'/var/lib/nodeforge/payload/");
+    try writer.writeByte('\'');
+    for (payload_root) |c| if (c == '\'') try writer.writeAll("'\\''") else try writer.writeByte(c);
+    try writer.writeByte('/');
     for (relative) |c| if (c == '\'') try writer.writeAll("'\\''") else try writer.writeByte(c);
     try writer.writeByte('\'');
     return writer.buffered();
@@ -444,6 +453,13 @@ test "renderStep consumes validated local payload without embedding bytes" {
     out.deinit();
     out = .init(std.testing.allocator);
     try std.testing.expectError(error.InvalidPayloadPath, renderStep(&out.writer, .{ .id = "s", .action = .script, .payload_path = "../escape" }, null, &.{}, false, null));
+}
+
+test "install first-boot renderer uses generation-owned payload root" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try renderStepAtPayloadRoot(&out.writer, .{ .id = "s", .action = .script, .payload_path = "script/4" }, null, &.{}, false, null, "/var/lib/nodeforge/install-firstboot/7/payload");
+    try std.testing.expectEqualStrings("sh '/var/lib/nodeforge/install-firstboot/7/payload/script/4'", out.written());
 }
 
 test "journal upsert records attempts and succeeded entries become no-op" {

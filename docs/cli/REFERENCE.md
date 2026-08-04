@@ -37,7 +37,7 @@ profile list|show|capabilities|software
 profile set|unset
 profile add-values|remove-values|replace-values|clear-values|list-values
 profile item|replace-items|clear-items
-profile rootfs plan|build|status|register
+profile rootfs plan|build|status
 ```
 
 `profile clone` 只复制 desired configuration，不继承 runtime、session 或 operation。

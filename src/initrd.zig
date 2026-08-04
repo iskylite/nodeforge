@@ -1,11 +1,12 @@
 //! # nodeforge-initrd（v0.2 diskless 启动 init）
 //!
 //! `V0_2_DESIGN.md` §4.3 boot-time 序列。作为 dracut initrd 的 PID 1，在获得网络后：
-//! 从 per-session credential capsule 读取 config token -> 有界重试拉取 BootConfig v3 ->
+//! 用 DHCP lease peer-IP 引导认证拉取 BootConfig v3，并接收随机、仅内存的
+//! boot-session capability ->
 //! 下载并 SHA-512 校验 rootfs -> loop 挂载只读 lower + tmpfs upper -> overlay 合并 ->
 //! 写 `/var/lib/nodeforge/boot.json` handoff（仅 AgentPlan locator 等非 secret 元数据），
-//! agent/event token 分别写入 0400 credential 文件 ->
-//! 清除 config/rootfs token -> `switch_root` 执行 `nodeforge-agent --pre-init`。
+//! capability 与 durable event token 分别写入 0400 credential 文件 ->
+//! `switch_root` 执行 `nodeforge-agent --pre-init`；终态后删除 capability 文件。
 //!
 //! ## initrd 环境约束与设计决策
 //!
@@ -94,16 +95,18 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     if (initrd_log_fd >= 0) _ = std.c.write(initrd_log_fd, msg.ptr, msg.len);
 }
 
-const capsule_config_token_path = "/capsule/config.token";
-const capsule_rootfs_token_path = "/capsule/rootfs.token";
-const capsule_agent_token_path = "/capsule/agent.token";
+// PR3-1（token 简化）：diskless capsule 只携带 session id + event:append token。
+// config/rootfs/agent 读取作用域 token 已删除 —— initrd 通过 peer-IP 引导认证
+// （boot_session.Store）获取 BootConfig 和 rootfs/AgentPlan 等读取资源。
 const capsule_event_token_path = "/capsule/event.token";
 const capsule_session_path = "/capsule/session";
 const cmdline_path = "/proc/cmdline";
 const handoff_dir = "/merged/var/lib/nodeforge";
 const handoff_path = "/merged/var/lib/nodeforge/boot.json";
 const event_token_dir = "/merged/var/lib/nodeforge/credentials";
-const agent_token_path = "/merged/var/lib/nodeforge/credentials/agent.token";
+/// v0.4 token 简化：此文件存储 boot_session 能力 token（替代 v0.2 的 agent:read
+/// scope token），供 agent pre-init 拉取 agent-plan/payload。
+const capability_token_path = "/merged/var/lib/nodeforge/credentials/capability.token";
 const event_token_path = "/merged/var/lib/nodeforge/credentials/event.token";
 const rootfs_blob = "/run/rootfs.squashfs";
 const rootfs_part = "/run/rootfs.squashfs.part";
@@ -154,6 +157,9 @@ const Cmdline = struct {
     ip: ?[]const u8 = null,
     prefix: ?[]const u8 = null,
     gateway: ?[]const u8 = null,
+    discovery: bool = false,
+    discovery_session: ?[]const u8 = null,
+    discovery_url: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -209,6 +215,7 @@ fn run(init: std.process.Init) !void {
     try runIgnore(io, allocator, &.{ "/sbin/modprobe", "overlay" });
     const cmdline = try readCmdline(io, allocator);
     defer freeCmdline(allocator, cmdline);
+    log("[nodeforge-initrd] boot mode parsed: discovery={} node={}\n", .{ cmdline.discovery, cmdline.node != null });
 
     // 基本网络：按 IP/MAC 复用 PXE 租约；旧启动参数才调用 vendor DHCP client。
     current_stage = "network.configure";
@@ -216,20 +223,26 @@ fn run(init: std.process.Init) !void {
     try bringUpNetwork(io, allocator, &cmdline);
     log("[nodeforge-initrd] network setup done\n", .{});
 
-    const config_token = try readToken(io, allocator, capsule_config_token_path);
-    defer allocator.free(config_token);
-    const rootfs_token = try readToken(io, allocator, capsule_rootfs_token_path);
-    defer allocator.free(rootfs_token);
-    const agent_token = try readToken(io, allocator, capsule_agent_token_path);
-    defer allocator.free(agent_token);
+    if (cmdline.discovery) return discoveryProbe(io, allocator, &cmdline);
+
+    // PR3-1（token 简化）：diskless capsule 只携带 event:append token + delivery
+    // session id。config/rootfs/agent 三个读取作用域 token 已删除——initrd 通过
+    // peer-IP 引导认证获取 BootConfig，其中内嵌 boot_session 能力 token（access
+    // 对象），仅用于后续 AgentPlan 等小型敏感控制面读取。
+    //
+    // 两 session 模型：
+    // - `session`（delivery session，从 capsule/cmdline 读取）：配合 event_token
+    //   推进 lifecycle 事件与 facts 上报。event:append token 是跨网络跳变存活的
+    //   派生凭证，绑定 delivery session。
+    // - `bc.access_session_id`（boot_session id，从 BootConfig.access 解析）：
+    //   配合 `bc.access_bearer_token`（随机能力 token）读取 AgentPlan；rootfs/
+    //   payload 固定大对象只走 peer/session/digest 数据面，不携带 token。
     const event_token = try readToken(io, allocator, capsule_event_token_path);
     defer allocator.free(event_token);
 
-    // 拉取 BootConfig v3（config:read token，有界重放，3 次重试）。
-    // session 优先从 cmdline 读取（direct boot / QEMU -append 模式）；
-    // 不在 cmdline 时从 capsule 文件读取（PXE boot 模式，GRUB cmdline
-    // 不含 session，由 capsule 文件提供 diskless session ID）。
-    // 无论来源，统一由 allocator 持有，避免 cmdline buffer 与独立 free 冲突。
+    // delivery session 优先从 cmdline 读取（direct boot / QEMU -append 模式）；
+    // 不在 cmdline 时从 capsule 文件读取（PXE boot 模式，GRUB cmdline 不含
+    // session，由 capsule 文件提供 diskless delivery session ID）。
     const session = blk: {
         if (cmdline.session) |s| break :blk try allocator.dupe(u8, s);
         break :blk readCapsuleHex(io, allocator, capsule_session_path, 32) catch {
@@ -243,17 +256,14 @@ fn run(init: std.process.Init) !void {
     diagnostic_session = session;
     log("[nodeforge-initrd] session={s} node={s}\n", .{ session, node });
     current_stage = "boot_config.fetch";
-    log("[nodeforge-initrd] fetching BootConfig from {s}...\n", .{cmdline.config_url orelse "(none)"});
+    log("[nodeforge-initrd] fetching BootConfig from {s} (peer-IP bootstrap auth)...\n", .{cmdline.config_url orelse "(none)"});
+    // 引导认证：无 Authorization / X-NodeForge-Session header，服务端通过 peer-IP
+    // 匹配 DHCP lease-IP 认证（与 install 路径一致的 bootstrap proof）。
     const config_url_parsed = try http.Url.parse(cmdline.config_url orelse return error.MissingConfigUrl);
-    const config_auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{config_token});
-    defer allocator.free(config_auth);
-    const config_json = try http.getWithRetry(io, allocator, config_url_parsed, &.{
-        .{ .name = "Authorization", .value = config_auth },
-        .{ .name = "X-NodeForge-Session", .value = session },
-    }, 3);
+    const config_json = try http.getWithRetry(io, allocator, config_url_parsed, &.{}, 3);
     defer allocator.free(config_json);
     const bc = try parseBootConfig(allocator, config_json);
-    log("[nodeforge-initrd] BootConfig fetched, rootfs size={d}\n", .{bc.rootfs_size});
+    log("[nodeforge-initrd] BootConfig fetched, rootfs size={d} access_session={s}\n", .{ bc.rootfs_size, bc.access_session_id });
     defer freeBootConfig(allocator, &bc);
     var next_event_seq: u64 = 0;
     var current_phase: []const u8 = "boot.config_fetched";
@@ -261,7 +271,6 @@ fn run(init: std.process.Init) !void {
 
     // 下载 rootfs 并 SHA-512 校验。
     try postLifecycle(io, allocator, bc.event_url, event_token, session, next_event_seq, current_phase, "diskless.initrd_started");
-    @memset(config_token, 0);
     next_event_seq += 1;
     current_phase = "diskless.initrd_started";
     try postLifecycle(io, allocator, bc.event_url, event_token, session, next_event_seq, current_phase, "diskless.rootfs_downloading");
@@ -314,13 +323,13 @@ fn run(init: std.process.Init) !void {
     };
     current_stage = "rootfs.download";
     log("[nodeforge-initrd] stage={s}: starting rootfs download ({d} bytes)\n", .{ current_stage, bc.rootfs_size });
-    try downloadRootfs(io, allocator, &bc, rootfs_token, session);
+    // rootfs 是 peer-IP + immutable digest 数据面，不传播 BootConfig access token。
+    try downloadRootfs(io, allocator, &bc);
     current_stage = "rootfs.verify";
     log("[nodeforge-initrd] rootfs downloaded, verifying SHA-512...\n", .{});
     verifySha512(io, rootfs_blob, bc.rootfs_sha512) catch return error.RootfsHashMismatch;
     log("[nodeforge-initrd] rootfs verified, mounting...\n", .{});
     try postLifecycle(io, allocator, bc.event_url, event_token, session, next_event_seq, current_phase, "diskless.rootfs_verified");
-    @memset(rootfs_token, 0);
     next_event_seq += 1;
     current_phase = "diskless.rootfs_verified";
 
@@ -363,12 +372,14 @@ fn run(init: std.process.Init) !void {
     // handoff：AgentPlan locator + agent/event token 交给 agent pre-init（写入新根 /var/lib）。
     current_stage = "handoff.write";
     log("[nodeforge-initrd] stage={s}: writing AgentPlan locator and credentials\n", .{current_stage});
-    try writeHandoff(io, allocator, &bc, session, node, agent_token, event_token);
+    // handoff：AgentPlan locator + capability token（读取用）+ event_token（lifecycle 用）
+    // 交给 agent pre-init（写入新根 /var/lib）。read_session（boot_session id）也写入
+    // handoff，使 agent pre-init 能用正确的 session header 发起读取请求。
+    try writeHandoff(io, allocator, &bc, session, node, bc.access_bearer_token, event_token);
     try postLifecycle(io, allocator, bc.event_url, event_token, session, next_event_seq, current_phase, "diskless.switching_root");
     next_event_seq += 1;
     current_phase = "diskless.switching_root";
-    // token 已分别撤销或复制到 0400 handoff credential，清零 initrd 副本。
-    @memset(agent_token, 0);
+    // token 已分别复制到 0400 handoff credential，清零 initrd 内存副本。
     @memset(event_token, 0);
 
     // R11: 将 initrd 日志留存到无盘 overlay，使切根后可查看完整启动链日志。
@@ -419,6 +430,7 @@ fn bringUpNetwork(io: std.Io, allocator: std.mem.Allocator, cmdline: *const Cmdl
             try mustRun(io, allocator, &.{ "/sbin/ip", "route", "replace", "default", "via", gateway, "dev", interface });
         }
         log("[nodeforge-initrd] PXE lease configured with native ioctl\n", .{});
+        log("[nodeforge-initrd] PXE lease network stage returning\n", .{});
         return;
     } else {
         try runIgnore(io, allocator, &.{ "ip", "link", "set", "lo", "up" });
@@ -575,21 +587,27 @@ fn validPrefix(value: []const u8) bool {
 
 /// 把 AgentPlan locator + agent/event token 写入新根 `/var/lib/nodeforge`（boot.json +
 /// 0400 credential 文件），交给 agent pre-init；切根后持久可读。
-fn writeHandoff(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfig, session: ?[]const u8, node: ?[]const u8, agent_token: []const u8, event_token: []const u8) !void {
+/// handoff schema v2：在 v1 基础上增加 `read_session`（boot_session 能力认证用
+/// session id），与 `session`（delivery session id，event:append 用）分离。
+/// v0.4 token 简化后，agent pre-init 需要两个 session id：
+/// - `session`（delivery）：配合 event_token 推进 lifecycle 事件
+/// - `read_session`（boot_session）：配合 capability token 拉取 agent-plan/payload
+fn writeHandoff(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfig, session: ?[]const u8, node: ?[]const u8, capability_token: []const u8, event_token: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, handoff_dir);
     try std.Io.Dir.cwd().createDirPath(io, event_token_dir);
-    const json = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"node\":\"{s}\",\"session\":\"{s}\",\"agent_plan_url\":\"{s}\",\"agent_plan_digest\":\"{s}\",\"event_url\":\"{s}\"}}\n", .{
+    const json = try std.fmt.allocPrint(allocator, "{{\"schema_version\":2,\"node\":\"{s}\",\"session\":\"{s}\",\"read_session\":\"{s}\",\"agent_plan_url\":\"{s}\",\"agent_plan_digest\":\"{s}\",\"event_url\":\"{s}\"}}\n", .{
         node orelse "",
         session orelse "",
+        bc.access_session_id,
         bc.agent_plan_url,
         bc.agent_plan_digest,
         bc.event_url,
     });
     defer allocator.free(json);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = handoff_path, .data = json });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = agent_token_path, .data = agent_token });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = capability_token_path, .data = capability_token });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = event_token_path, .data = event_token });
-    try mustRun(io, allocator, &.{ "chmod", "0400", agent_token_path });
+    try mustRun(io, allocator, &.{ "chmod", "0400", capability_token_path });
     try mustRun(io, allocator, &.{ "chmod", "0400", event_token_path });
 }
 
@@ -604,7 +622,7 @@ const BootConfig = struct {
     facts_url: []u8,
     /// rootfs 字节大小，HEAD 与最终落盘大小都须与之精确相等。
     rootfs_size: u64,
-    /// null 表示外部 rootfs 未提供展开大小；此时跳过容量硬校验。
+    /// null 表示 nodeforged 构建时未能测得展开大小；此时跳过容量硬校验。
     rootfs_uncompressed_size: ?u64,
     /// tmpfs upper 占 MemAvailable 的百分比上限。
     tmpfs_percent: u8,
@@ -614,9 +632,14 @@ const BootConfig = struct {
     safety_margin_bytes: u64,
     /// Node 级 payload 预算（纳入 upper limit 扣减，防 first-boot 写爆 tmpfs）。
     node_payload_size: u64,
+    /// v0.4 token 简化：引导认证签发的 boot_session 能力凭证，仅用于
+    /// AgentPlan 控制面读取；rootfs/payload 大对象不携带此凭证。
+    access_session_id: []u8,
+    access_bearer_token: []u8,
 };
 
-/// 从 BootConfig v3 JSON 解析 rootfs/overlay/agent_plan/event/facts 定位与内存预算。
+/// 从 BootConfig v3 JSON 解析 rootfs/overlay/agent_plan/event/facts 定位与内存预算，
+/// 以及 v0.4 引导认证签发的 access 凭证（boot_session 能力 token + session_id）。
 fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
     const Parsed = struct {
         schema_version: u32,
@@ -630,6 +653,7 @@ fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
         agent_plan: struct { url: []const u8, digest: []const u8 },
         event_url: []const u8,
         facts_url: []const u8,
+        access: struct { session_id: []const u8, bearer_token: []const u8 },
     };
     const p = try std.json.parseFromSlice(Parsed, allocator, json, .{ .ignore_unknown_fields = true });
     defer p.deinit();
@@ -647,10 +671,12 @@ fn parseBootConfig(allocator: std.mem.Allocator, json: []const u8) !BootConfig {
         .minimum_free_bytes = p.value.overlay.minimum_free_bytes,
         .safety_margin_bytes = p.value.overlay.safety_margin_bytes,
         .node_payload_size = p.value.overlay.node_payload_size,
+        .access_session_id = try allocator.dupe(u8, p.value.access.session_id),
+        .access_bearer_token = try allocator.dupe(u8, p.value.access.bearer_token),
     };
 }
 
-/// 释放 `parseBootConfig` dupe 的字符串字段（URL/digest 等）。
+/// 释放 `parseBootConfig` dupe 的字符串字段（URL/digest/access 凭证等）。
 fn freeBootConfig(allocator: std.mem.Allocator, bc: *const BootConfig) void {
     allocator.free(bc.rootfs_url);
     allocator.free(bc.rootfs_sha512);
@@ -658,17 +684,21 @@ fn freeBootConfig(allocator: std.mem.Allocator, bc: *const BootConfig) void {
     allocator.free(bc.agent_plan_digest);
     allocator.free(bc.event_url);
     allocator.free(bc.facts_url);
+    allocator.free(bc.access_session_id);
+    allocator.free(bc.access_bearer_token);
 }
 
 test "BootConfig v3 requires authenticated facts URL" {
     const json =
-        \\{"schema_version":3,"rootfs":{"url":"http://s/rootfs","sha512":"ab","size":10,"uncompressed_size":20},"overlay":{"tmpfs_percent":50,"minimum_free_bytes":1,"safety_margin_bytes":2,"node_payload_size":3},"agent_plan":{"url":"http://s/plan","digest":"cd"},"event_url":"http://s/events","facts_url":"http://s/facts"}
+        \\{"schema_version":3,"rootfs":{"url":"http://s/rootfs","sha512":"ab","size":10,"uncompressed_size":20},"overlay":{"tmpfs_percent":50,"minimum_free_bytes":1,"safety_margin_bytes":2,"node_payload_size":3},"agent_plan":{"url":"http://s/plan","digest":"cd"},"event_url":"http://s/events","facts_url":"http://s/facts","access":{"session_id":"bs1","bearer_token":"cap1"}}
     ;
     const parsed = try parseBootConfig(std.testing.allocator, json);
     defer freeBootConfig(std.testing.allocator, &parsed);
     try std.testing.expectEqualStrings("http://s/facts", parsed.facts_url);
+    try std.testing.expectEqualStrings("bs1", parsed.access_session_id);
+    try std.testing.expectEqualStrings("cap1", parsed.access_bearer_token);
     try std.testing.expectError(error.UnsupportedBootConfigSchema, parseBootConfig(std.testing.allocator,
-        \\{"schema_version":2,"rootfs":{"url":"u","sha512":"a","size":1},"overlay":{"tmpfs_percent":50,"minimum_free_bytes":1,"safety_margin_bytes":1},"agent_plan":{"url":"u","digest":"d"},"event_url":"u","facts_url":"u"}
+        \\{"schema_version":2,"rootfs":{"url":"u","sha512":"a","size":1},"overlay":{"tmpfs_percent":50,"minimum_free_bytes":1,"safety_margin_bytes":1},"agent_plan":{"url":"u","digest":"d"},"event_url":"u","facts_url":"u","access":{"session_id":"s","bearer_token":"t"}}
     ));
 }
 
@@ -753,6 +783,52 @@ fn postFacts(io: std.Io, allocator: std.mem.Allocator, url: []const u8, token: [
     if (status < 200 or status >= 300) return error.FactsUploadRejected;
 }
 
+/// Discovery mode is intentionally a separate, non-destructive initrd path:
+/// it reads DMI facts, posts them over the lease-bound probe session, and then
+/// remains idle. It never fetches BootConfig/AgentPlan/rootfs, writes a block
+/// device, or starts an agent shell.
+fn discoveryProbe(io: std.Io, allocator: std.mem.Allocator, cmdline: *const Cmdline) !void {
+    const session = cmdline.discovery_session orelse return error.MissingDiscoverySession;
+    const url_text = cmdline.discovery_url orelse return error.MissingDiscoveryUrl;
+    const serial = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_serial");
+    defer if (serial) |value| allocator.free(value);
+    const uuid = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_uuid");
+    defer if (uuid) |value| allocator.free(value);
+    const vendor = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/sys_vendor");
+    defer if (vendor) |value| allocator.free(value);
+    const product = readSysfsTrimmed(io, allocator, "/sys/class/dmi/id/product_name");
+    defer if (product) |value| allocator.free(value);
+    const Payload = struct {
+        schema_version: u32 = 1,
+        mac: ?[]const u8 = null,
+        arch: []const u8,
+        serial_number: ?[]const u8 = null,
+        product_uuid: ?[]const u8 = null,
+        vendor: ?[]const u8 = null,
+        model: ?[]const u8 = null,
+    };
+    const body = try std.json.Stringify.valueAlloc(allocator, Payload{
+        .mac = cmdline.mac,
+        .arch = @tagName(builtin.cpu.arch),
+        .serial_number = sanitizeDmi(serial),
+        .product_uuid = sanitizeDmi(uuid),
+        .vendor = sanitizeDmi(vendor),
+        .model = sanitizeDmi(product),
+    }, .{});
+    defer allocator.free(body);
+    log("[nodeforge-initrd] discovery facts serial={s} arch={s} mac={s}\n", .{ sanitizeDmi(serial) orelse "(missing)", @tagName(builtin.cpu.arch), cmdline.mac orelse "(missing)" });
+    const url = try http.Url.parse(url_text);
+    const session_header = try std.fmt.allocPrint(allocator, "{s}", .{session});
+    defer allocator.free(session_header);
+    const status = try http.post(io, allocator, url, &.{
+        .{ .name = "X-NodeForge-Discovery-Session", .value = session_header },
+        .{ .name = "Content-Type", .value = "application/json" },
+    }, body);
+    if (status < 200 or status >= 300) return error.DiscoveryProbeRejected;
+    log("[nodeforge-initrd] discovery facts accepted session={s} serial={s}; remaining idle\n", .{ session, sanitizeDmi(serial) orelse "(missing)" });
+    while (true) std.Io.sleep(io, .fromSeconds(3600), .awake) catch {};
+}
+
 /// DMI 值进入 JSON body 前的卫生处理：截断到 255 字节并剔除 `< 0x20` 控制
 /// 字符；结果为空返回 null（server 端 `validateFacts` 对空串整包拒绝，宁可
 /// 丢该可选字段也不能损坏整包）。`"`/`\` 等 JSON 特殊字符由序列化器转义，
@@ -816,19 +892,13 @@ fn verifySha512(io: std.Io, path: []const u8, expected: []const u8) !void {
 /// 大小恢复）与有界重试（指数退避，最多 5 次）。逐块经 `download.validateRange`
 /// fail-closed 校验；全部块就绪后重命名为最终 blob，并清理临时文件。
 /// HTTP 请求由 `initrd/http.zig` 原生客户端发起，不依赖外部 `curl`。
-fn downloadRootfs(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfig, token: []const u8, session: []const u8) !void {
+fn downloadRootfs(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfig) !void {
     const rootfs_url = try http.Url.parse(bc.rootfs_url);
-    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
-    defer allocator.free(auth);
     const expected_etag = try std.fmt.allocPrint(allocator, "\"{s}\"", .{bc.rootfs_sha512});
     defer allocator.free(expected_etag);
 
     // HEAD：校验 rootfs 元数据（Content-Length/ETag/Accept-Ranges），3 次重试。
-    const head_bytes = try http.headWithRetry(io, allocator, rootfs_url, &.{
-        .{ .name = "Authorization", .value = auth },
-        .{ .name = "X-NodeForge-Session", .value = session },
-        .{ .name = "Accept-Encoding", .value = "identity" },
-    }, 3);
+    const head_bytes = try http.headWithRetry(io, allocator, rootfs_url, &.{.{ .name = "Accept-Encoding", .value = "identity" }}, 3);
     defer allocator.free(head_bytes);
     _ = try download.parseHead(head_bytes, bc.rootfs_size, expected_etag);
 
@@ -844,7 +914,7 @@ fn downloadRootfs(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfi
         const end = @min(bc.rootfs_size - 1, offset + chunk_size - 1);
         var attempts: u8 = 0;
         while (true) {
-            rangeOnce(io, allocator, rootfs_url, auth, session, expected_etag, offset, end, bc.rootfs_size) catch |err| {
+            rangeOnce(io, allocator, rootfs_url, expected_etag, offset, end, bc.rootfs_size) catch |err| {
                 attempts += 1;
                 cwd.deleteFile(io, rootfs_chunk) catch {};
                 log(
@@ -875,12 +945,10 @@ fn downloadRootfs(io: std.Io, allocator: std.mem.Allocator, bc: *const BootConfi
 /// 下载单块 Range：以 `If-Range` 绑定 HEAD 的 ETag，校验 206/Content-Range/ETag/
 /// Content-Length，并校验落盘块大小等于 `end-start+1`。
 /// HTTP 请求由 `initrd/http.zig` 原生客户端发起，响应体直接写入文件。
-fn rangeOnce(io: std.Io, allocator: std.mem.Allocator, url: http.Url, auth: []const u8, session: []const u8, etag: []const u8, start: u64, end: u64, total: u64) !void {
+fn rangeOnce(io: std.Io, allocator: std.mem.Allocator, url: http.Url, etag: []const u8, start: u64, end: u64, total: u64) !void {
     const range_value = try std.fmt.allocPrint(allocator, "bytes={d}-{d}", .{ start, end });
     defer allocator.free(range_value);
     const headers = try http.getToFile(io, allocator, url, &.{
-        .{ .name = "Authorization", .value = auth },
-        .{ .name = "X-NodeForge-Session", .value = session },
         .{ .name = "Accept-Encoding", .value = "identity" },
         .{ .name = "Range", .value = range_value },
         .{ .name = "If-Range", .value = etag },
@@ -907,6 +975,9 @@ fn readCmdline(io: std.Io, allocator: std.mem.Allocator) !Cmdline {
         if (std.mem.startsWith(u8, tok, "nodeforge.ip=")) c.ip = try allocator.dupe(u8, tok["nodeforge.ip=".len..]);
         if (std.mem.startsWith(u8, tok, "nodeforge.prefix=")) c.prefix = try allocator.dupe(u8, tok["nodeforge.prefix=".len..]);
         if (std.mem.startsWith(u8, tok, "nodeforge.gateway=")) c.gateway = try allocator.dupe(u8, tok["nodeforge.gateway=".len..]);
+        if (std.mem.eql(u8, tok, "nodeforge.discovery=1")) c.discovery = true;
+        if (std.mem.startsWith(u8, tok, "nodeforge.discovery_session=")) c.discovery_session = try allocator.dupe(u8, tok["nodeforge.discovery_session=".len..]);
+        if (std.mem.startsWith(u8, tok, "nodeforge.discovery_url=")) c.discovery_url = try allocator.dupe(u8, tok["nodeforge.discovery_url=".len..]);
     }
     return c;
 }
@@ -921,6 +992,8 @@ fn freeCmdline(allocator: std.mem.Allocator, c: Cmdline) void {
     if (c.ip) |s| allocator.free(s);
     if (c.prefix) |s| allocator.free(s);
     if (c.gateway) |s| allocator.free(s);
+    if (c.discovery_session) |s| allocator.free(s);
+    if (c.discovery_url) |s| allocator.free(s);
 }
 
 /// 运行子进程并返回 stdout；退出码非 0 即失败。

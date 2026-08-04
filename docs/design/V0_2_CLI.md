@@ -117,10 +117,8 @@ nodeforge assets boot-bundle create <install-source> [--qualifier <value>] \
 # profile name 可选：省略时自动派生为 <install-source>-diskless
 nodeforge profile create <install-source> [--qualifier <value>] --kind diskless
 
-# 5. 构建 Profile 派生 rootfs；外部构建时改用 register
+# 5. 由 nodeforged 构建 Profile 派生 rootfs
 nodeforge profile rootfs build <diskless-profile> [--if-input-digest <digest>]
-nodeforge profile rootfs register <diskless-profile> \
-  --path <squashfs-path> [--uncompressed-size <bytes>]
 
 # 6. 添加节点（保持 deploy=false）
 nodeforge node add <id> mac=<mac> arch=<a> profile=<diskless-profile>
@@ -131,10 +129,8 @@ nodeforge node readiness <id> --stage boot
 nodeforge node deploy <id> true
 ```
 
-外部制品首次省略 `--uncompressed-size` 时仍会登记成功，但容量状态为 unknown。
-之后可对同一文件再次执行 register 并提供可信正数；服务端返回
-`state=metadata_updated` 并持久化补全。已知值冲突或其他不可变元数据漂移会返回
-冲突，并保证不覆盖正式 rootfs 文件。
+rootfs 不接受外部制品登记；展开大小由 nodeforged 在 squashfs 发布前测量并随
+ready artifact 一次性记录。相同 input digest 的后续请求只允许命中完全一致的缓存。
 
 默认安装根初始化和 `setup --reconfigure` 必须原子生成 `/etc/profile.d/nodeforge.sh`（`0644`），
 幂等地将 `/opt/nodeforge/bin` 加入登录 shell 的 `PATH`。新登录会话可直接执行 `nodeforge`；当前会话可
@@ -329,11 +325,10 @@ vermagic/签名检查、碰撞清单和最终 digest。`plan` 先完成解析与
 只消费不可变计划。CLI 实现前，parser 不得提前接受这些 flag，以免形成把宿主内容
 静默注入目标 initrd 的半契约。
 
-外部 rootfs 注册可提供 `--uncompressed-size <bytes>`。该值是解压后文件树的
-apparent size，不是 squashfs 文件大小；有值时进入 BootConfig 并参与 diskless
-内存预算。缺失时登记为 unknown、输出 warning 并跳过内存容量硬校验，不阻止
-注册或部署。只有明确大小与可用内存证明预算不足时才拒绝启动。由 NodeForge
-构建的 rootfs 会在压缩前自动测量；测量失败同样降级为 unknown，而不是终止构建。
+nodeforged 在压缩前自动测量 rootfs 文件树的 apparent size；该值不是 squashfs
+文件大小，有值时进入 BootConfig 并参与 diskless 内存预算。测量失败时记录为
+unknown、输出 warning 并跳过容量硬校验，而不是开放外部补写接口。只有明确大小
+与可用内存证明预算不足时才拒绝启动。
 
 ## 5. 阶段 4：创建 diskless Profile
 
@@ -574,7 +569,7 @@ nodeforge node retry <node> [--force]
 ## 12. v0.3+ 命令隔离
 
 - v0.3 才提供 `install-post` canonical 扩展。
-- v0.4 才提供多 NIC/VLAN/bonding、临时 PXE rootfs 构建节点、install first-boot agent 和 SN+IP draft Node discovery。
+- v0.4 才提供多 NIC/VLAN/bonding、服务端 rootfs 构建强化、install first-boot agent 和 SN+IP draft Node discovery。
 
 这些字段/enum/handler 不得出现在 v0.2 help 或 parser 中；reconciliation、远程命令、NFS root、iPXE、IPv6
 永久没有对应 CLI。

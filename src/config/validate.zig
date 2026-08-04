@@ -9,6 +9,7 @@ const lookup = @import("../catalog.zig");
 const asset_validate = @import("../assets/validate.zig");
 const profile_install = @import("../profile/install.zig");
 const capacity = @import("../state/capacity.zig");
+const topology = @import("../network/topology.zig");
 
 /// 节点 ID 被复制到若干固定大小的运行时投影
 /// （`boot_session`、`deployment_control` 和 `node_status`）。
@@ -62,9 +63,11 @@ pub const ValidationError = error{
     MissingProfile,
     InvalidNodeIpv4,
     InvalidNodeMac,
+    InvalidNodeSerial,
     InvalidNodeHostname,
     DuplicateNodeId,
     DuplicateNodeMac,
+    DuplicateNodeSerial,
     InvalidUnknownNodePolicy,
     KernelReleaseMismatch,
     InvalidInstallStorage,
@@ -123,7 +126,7 @@ pub fn validateConfigShape(config: *const model.AppConfig) ValidationError!void 
 /// 校验 catalog 的结构形状：schema 版本、名称唯一性、节点 ID/MAC 格式和资产路径安全。
 /// 不校验跨文件引用关系——那由 `validate` 统一执行。
 pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version != 5) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version != 6 and !(catalog.schema_version == 5 and catalog.deployment_id == null)) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.DistroConfig, catalog.distros);
     try uniqueNamed(model.ProfileConfig, catalog.profiles);
     try uniqueNamed(model.ProvisioningBundle, catalog.provisioning_bundles);
@@ -134,13 +137,17 @@ pub fn validateCatalogShape(catalog: *const model.Catalog) ValidationError!void 
     try uniqueNamed(model.ProvisioningBundle, catalog.provisioning_bundles);
     for (catalog.nodes, 0..) |node, index| {
         if (!validNodeId(node.id)) return error.InvalidLogicalId;
-        if (!validMac(node.mac)) return error.InvalidNodeMac;
+        if (node.mac.len == 0) {
+            if (node.hardware.serial_number == null or node.profile != null or node.deploy or node.pxe.ip_reservation == null) return error.InvalidNodeMac;
+        } else if (!validMac(node.mac)) return error.InvalidNodeMac;
+        if (node.hardware.serial_number) |serial| if (!validSerial(serial)) return error.InvalidNodeSerial;
         // 与 validateNodes 同一约束，但在 catalog 形状校验阶段即拒绝，
         // 覆盖绕过 CLI 直接改写 catalog 文件的路径。
         if (node.hostname) |name| if (!validHostname(name)) return error.InvalidNodeHostname;
         for (catalog.nodes[index + 1 ..]) |other| {
             if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
-            if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
+            if (node.mac.len != 0 and other.mac.len != 0 and std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
+            if (node.hardware.serial_number) |serial| if (other.hardware.serial_number) |other_serial| if (sameSerial(serial, other_serial)) return error.DuplicateNodeSerial;
         }
     }
     for (catalog.assets) |asset| {
@@ -163,7 +170,7 @@ pub fn validateModel(config: *const model.AppConfig, catalog: *const model.Catal
 /// 不检查 catalog 引用关系，适用于 CLI 在 catalog 尚未加载时
 /// 对 config 做快速预检。
 pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
-    if (config.schema_version != 4) return error.UnsupportedSchemaVersion;
+    if (config.schema_version != 5) return error.UnsupportedSchemaVersion;
     if (config.server.name.len == 0) return error.EmptyServerName;
     if (config.server.bind_interface) |iface| {
         if (iface.len == 0) return error.EmptyBindInterface;
@@ -300,7 +307,7 @@ fn validateDhcp(dhcp: *const model.DhcpConfig) ValidationError!void {
 /// 检查 distros/profiles/nodes/assets/repositories/install_sources/boot_bundles/provisioning_bundles
 /// 的名称唯一性、引用有效性和语义不变量。
 pub fn validateCatalog(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
-    if (catalog.schema_version != 5) return error.UnsupportedSchemaVersion;
+    if (catalog.schema_version != 6 and !(catalog.schema_version == 5 and catalog.deployment_id == null)) return error.UnsupportedSchemaVersion;
     try uniqueNamed(model.RepositoryConfig, catalog.repositories);
     try uniqueNamed(model.AssetConfig, catalog.assets);
     try uniqueNamed(model.InstallSourceConfig, catalog.install_sources);
@@ -718,11 +725,20 @@ fn sameTuple(distro: []const u8, version: []const u8, arch: model.Arch, other_di
 fn validateNodes(config: *const model.AppConfig, catalog: *const model.Catalog) ValidationError!void {
     for (config.nodes, 0..) |node, i| {
         if (!validNodeId(node.id)) return error.InvalidLogicalId;
-        if (!validMac(node.mac)) return error.InvalidNodeMac;
+        if (node.mac.len == 0) {
+            if (node.hardware.serial_number == null or node.profile != null or node.deploy or node.pxe.ip_reservation == null) return error.InvalidNodeMac;
+        } else if (!validMac(node.mac)) return error.InvalidNodeMac;
+        if (node.hardware.serial_number) |serial| if (!validSerial(serial)) return error.InvalidNodeSerial;
         // hostname 会直接进入 Kickstart/Autoinstall 的主机名字段；必须限制在
         // RFC 1123 字母表内，否则换行可注入独立安装器指令（见 validHostname）。
         if (node.hostname) |name| if (!validHostname(name)) return error.InvalidNodeHostname;
         const profile_name = node.profile orelse {
+            if (node.mac.len != 0 and (node.network.interfaces.len > 0 or node.network.bonds.len > 0 or node.network.vlans.len > 0 or node.network.routes.len > 0))
+                topology.validateNetwork(node.network, node.mac, node.deploy) catch return error.InvalidTargetNetwork;
+            if (node.pxe.ip_reservation) |ip| {
+                const parsed_ip = std.Io.net.IpAddress.parseIp4(ip, 0) catch return error.InvalidNodeIpv4;
+                if (!inDhcpSubnet(config.dhcp.subnet, ipv4Value(parsed_ip))) return error.NodeOutsideDhcpSubnet;
+            }
             if (node.deploy) return error.MissingProfile;
             continue;
         };
@@ -758,7 +774,8 @@ fn validateNodes(config: *const model.AppConfig, catalog: *const model.Catalog) 
         try validateInstallConfig(config, system, install);
         for (config.nodes[i + 1 ..]) |other| {
             if (std.mem.eql(u8, node.id, other.id)) return error.DuplicateNodeId;
-            if (std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
+            if (node.mac.len != 0 and other.mac.len != 0 and std.ascii.eqlIgnoreCase(node.mac, other.mac)) return error.DuplicateNodeMac;
+            if (node.hardware.serial_number) |serial| if (other.hardware.serial_number) |other_serial| if (sameSerial(serial, other_serial)) return error.DuplicateNodeSerial;
             const other_network = other.network;
             if (target_network.address) |address| if (other_network.address) |other_address| if (std.mem.eql(u8, address, other_address)) return error.DuplicateStaticAddress;
         }
@@ -784,6 +801,12 @@ fn validateKernelTokenSet(values: []const []const u8, family: ?model.DistroFamil
 }
 
 fn validateTargetNetwork(config: *const model.AppConfig, node: model.NodeConfig, network: model.TargetNetworkConfig) ValidationError!void {
+    if (network.interfaces.len > 0 or network.bonds.len > 0 or network.vlans.len > 0) {
+        // BOND-校验原因：member 必须先脱离 L3，mode 专属字段不能混用，
+        // 否则 renderer 只能猜测目标网络，PXE bootstrap 迁移会失联。
+        topology.validateNetwork(network, node.mac, node.deploy) catch return error.InvalidTargetNetwork;
+        return;
+    }
     if (network.interface) |name| if (!validIdentifier(name)) return error.InvalidTargetNetwork;
     for (network.search_domains) |domain| if (!validNetworkName(domain)) return error.InvalidTargetNetwork;
     if (network.mode == .dhcp) return;
@@ -1034,6 +1057,30 @@ fn validMac(value: []const u8) bool {
     return true;
 }
 
+/// v0.4 SN canonical validation: trim only at the boundary, reject control/NUL
+/// and firmware placeholders; punctuation, internal spaces and leading zeroes
+/// remain part of the identity rather than being guessed away.
+fn validSerial(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n\x00");
+    if (trimmed.len == 0 or trimmed.len > 256) return false;
+    for (trimmed) |char| if (char < 0x20 or char == 0x7f) return false;
+    if (std.ascii.eqlIgnoreCase(trimmed, "to be filled by o.e.m.") or
+        std.ascii.eqlIgnoreCase(trimmed, "default string") or
+        std.ascii.eqlIgnoreCase(trimmed, "none") or
+        std.ascii.eqlIgnoreCase(trimmed, "unknown")) return false;
+    var all_zero = true;
+    var all_ff = true;
+    for (trimmed) |char| {
+        if (char != '0') all_zero = false;
+        if (char != 'f' and char != 'F') all_ff = false;
+    }
+    return !all_zero and !all_ff;
+}
+
+fn sameSerial(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, a, " \t\r\n\x00"), std.mem.trim(u8, b, " \t\r\n\x00"));
+}
+
 fn validSha256(value: []const u8) bool {
     if (value.len != 64) return false;
     for (value) |char|
@@ -1051,9 +1098,8 @@ test "最小配置和空 catalog 有效" {
 }
 
 test "config and catalog pass validateModel" {
-    // 回归：apply 经 validateModel 校验候选，catalog schema_version=5 不得被拒。
-    const config: model.AppConfig = .{ .schema_version = 4, .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
-    const cat: model.Catalog = .{ .schema_version = 5 };
+    const config: model.AppConfig = .{ .schema_version = 5, .server = .{ .bind_interface = "pxe0", .server_ip = "192.168.50.1" }, .http = test_http, .tftp = test_tftp };
+    const cat: model.Catalog = .{ .schema_version = 6 };
     try validateModel(&config, &cat);
 }
 

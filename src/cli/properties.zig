@@ -72,6 +72,7 @@ pub const properties = [_]PropertySpec{
     .{ .owner = .site, .path = "discovery.policy.observation_retention_days", .kind = .positive_integer },
     .{ .owner = .node, .path = "mac", .kind = .string },
     .{ .owner = .node, .path = "arch", .kind = .arch, .value_constraint = "x86_64|aarch64" },
+    .{ .owner = .node, .path = "hardware.serial_number", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "profile", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "pxe.ip_reservation", .kind = .string, .optional = true },
     .{ .owner = .node, .path = "hostname", .kind = .string, .optional = true },

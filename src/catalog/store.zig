@@ -21,6 +21,7 @@ const ManifestEntity = struct { name: []const u8, file: []const u8, sha256: []co
 const Manifest = struct {
     layout_schema_version: u32,
     catalog_schema_version: u32,
+    deployment_id: ?[]const u8 = null,
     catalog_revision: u64,
     transaction_id: []const u8,
     entities: []const ManifestEntity,
@@ -100,9 +101,10 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     // 版本先判，与 `config/validate.zig` 的 catalog schema 校验语义一致：
     // v4 及更旧目录必须报 `UnsupportedSchemaVersion`（操作员需重新 setup），
     // 而不是混进 `InvalidCatalogManifest` 变成"损坏"。
-    if (manifest.catalog_schema_version != 5) return error.UnsupportedSchemaVersion;
+    if (manifest.catalog_schema_version != 5 and manifest.catalog_schema_version != 6) return error.UnsupportedSchemaVersion;
     if (manifest.layout_schema_version != layout_schema_version or manifest.catalog_revision == 0 or manifest.transaction_id.len != 64 or manifest.entities.len != names.len)
         return error.InvalidCatalogManifest;
+    if (manifest.catalog_schema_version == 6 and (manifest.deployment_id == null or manifest.deployment_id.?.len != 32)) return error.InvalidCatalogManifest;
     var declared_tx: [64]u8 = undefined;
     try transactionId(manifest.catalog_revision, manifest.entities, &declared_tx);
     if (!std.mem.eql(u8, &declared_tx, manifest.transaction_id)) return error.InvalidCatalogManifest;
@@ -110,6 +112,7 @@ fn loadDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     var combined: std.Io.Writer.Allocating = .init(allocator);
     defer combined.deinit();
     try combined.writer.print("{{\"schema_version\":{d},\"revision\":{d}", .{ manifest.catalog_schema_version, manifest.catalog_revision });
+    if (manifest.deployment_id) |deployment_id| try combined.writer.print(",\"deployment_id\":{f}", .{std.json.fmt(deployment_id, .{})});
     for (names) |name| {
         const entity = findEntity(manifest.entities, name) orelse return error.InvalidCatalogManifest;
         const expected_file = try std.fmt.allocPrint(allocator, "{s}.json", .{name});
@@ -173,7 +176,7 @@ fn saveDirectory(io: std.Io, allocator: std.mem.Allocator, directory: []const u8
     const selected_entities = entities[0..names.len];
     var transaction_id: [64]u8 = undefined;
     try transactionId(revision, selected_entities, &transaction_id);
-    const manifest: Manifest = .{ .layout_schema_version = layout_schema_version, .catalog_schema_version = catalog.schema_version, .catalog_revision = revision, .transaction_id = &transaction_id, .entities = selected_entities };
+    const manifest: Manifest = .{ .layout_schema_version = layout_schema_version, .catalog_schema_version = catalog.schema_version, .deployment_id = catalog.deployment_id, .catalog_revision = revision, .transaction_id = &transaction_id, .entities = selected_entities };
     const manifest_bytes = try std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 });
     defer allocator.free(manifest_bytes);
     var manifest_digest: [64]u8 = undefined;

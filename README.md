@@ -79,7 +79,7 @@ NodeForge/
 - [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu
   casper 方案与正式 rootfs builder 已落地并完成验证。
 - [v0.2.2 可运营性设计](docs/design/V0_2_2_OPERABILITY.md)：持久化兼容、
-  durable builder operation、CLI 收敛和当前环境验证矩阵。
+  durable rootfs build operation、CLI 收敛和当前环境验证矩阵。
 - [当前环境不可验证项](docs/design/LOCAL_VALIDATION_DEFERRED.md)：集中记录
   x86_64 VMware 等当前无法执行的目标环境验证；QEMU 只作可选补充。
 - [v0.2 暂不做与发布后收口索引](docs/design/V0_2_POST_RELEASE_BACKLOG.md)：用稳定
@@ -87,7 +87,7 @@ NodeForge/
 - [v0.2.1+ 路线图](docs/design/V0_2_1_PLUS_ROADMAP.md)：v0.2.1-v0.4 的依赖、
   schema/DTO 演进与完成闸。
 - [v0.3 冻结设计与验证](docs/design/V0_3_DESIGN.md)：install-post canonical 扩展已落地并通过发布闸。
-- [v0.4 统一设计](docs/design/V0_4_DESIGN.md)：当前待实施的 topology、容量、PXE builder、install first-boot 与 SN discovery 契约。
+- [v0.4 统一设计](docs/design/V0_4_DESIGN.md)：v0.4 topology、fresh replacement、服务端 rootfs 生成、install first-boot 与 SN discovery 契约；共同底座已落地，发布闸按 runbook 执行。
 - [独立保留设计索引](docs/design/DEFERRED_DESIGN_INDEX.md)：统一登记不属于已排期版本的设计，不预占版本/schema/DTO。
 - [`ram_rootfs` 保留设计](docs/design/RAM_ROOTFS_DEFERRED.md)：未排期且不占用产品版本号，未来从当时基线重新分配 schema/DTO。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
@@ -143,7 +143,24 @@ IPv4 PXE 无人值守安装产品已完成；所有权模型、typed property re
 | M4.12 | 存储 override | 已由 canonical Node/Profile 所有权模型取代旧 fallback |
 | M4.13 | 模型修复、typed registry、软件能力索引和 schema v3 迁移 | 已完成 |
 
-### v0.3.1（当前版本）
+### v0.4.0（当前开发版本）
+
+v0.4 使用 fresh replacement：`nodeforge setup` 生成 AppConfig v5、Catalog v6、DeploymentManifest v1、
+`nodeforge-root-v2 <deployment_id>` marker，并拒绝 deployment id 不一致或缺失 manifest 的已安装服务。
+目标网络 topology 是 Node direct owner；`pxe.ip_reservation` 只保留 DHCP bootstrap lease，不会把 target DHCP 改成 static。
+`nodeforge node topology validate` 可在提交前对 interfaces/bonds/vlans/routes 做纯校验，AgentPlan wire schema 为 v2，
+BootConfig 继续为 v3。
+
+```bash
+nodeforge setup --install-root /opt/nodeforge --yes
+nodeforge node topology validate --network-json topology.json --bootstrap-mac 02:00:00:00:00:01 --deploy
+nodeforge node boot preview <node-id>
+```
+
+服务端 rootfs、install first-boot、SN-assisted discovery、容量 workload 和 VMware 双机全量验证必须以
+[`V0_4_FULL_VALIDATION_RUNBOOK.md`](docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md) 为准；缺少真实证据的项目仍为 NOT RUN/FAIL。
+
+### v0.3.1（冻结回归基线）
 
 v0.2.0 已落地 schema v4、diskless Profile、rootfs 制品登记、BootConfig v3 /
 AgentPlan v1、四域 capability、严格 HEAD + Range 下载、tmpfs overlay、node-apply、
@@ -160,8 +177,8 @@ exit mapping 收口；v0.3 已完成 install-post 四类 canonical action、call
 
 后续按以下边界推进：
 
-- **v0.4**：AppConfig v5/catalog v6 fresh replacement、多 NIC/topology、强制容量闸、PXE builder、
-  install first-boot 与 SN+IP draft Node discovery；
+- **v0.4 已落地底座**：AppConfig v5/catalog v6 fresh replacement、多 NIC/topology validator、AgentPlan v2、
+  reservation/target 分层；服务端 rootfs 生成、install first-boot、SN+IP draft Node discovery、容量闸和双机发布仍按 runbook 验证。
 - **BIOS PXELINUX**：独立保留工作项，不绑定产品/schema 版本号，也不进入 v0.4，见
   [`BIOS_PXELINUX_DEFERRED.md`](docs/design/BIOS_PXELINUX_DEFERRED.md)；
 - **DHCP-less static PXE**：独立保留设计，不进入 v0.4，见
@@ -377,22 +394,12 @@ nodeforge assets boot-bundle create rocky-9.7-aarch64-dvd \
   --kernel-release 5.14.0-611.5.1.el9_7.aarch64
 nodeforge profile create rocky-9.7-aarch64-dvd --kind diskless
 
-# 3. 构建并登记 rootfs。
+# 3. 由 nodeforged 构建并发布 rootfs。
 nodeforge profile rootfs plan rocky-9.7-aarch64-dvd-diskless --output json
 nodeforge profile rootfs build rocky-9.7-aarch64-dvd-diskless \
   --if-input-digest <rootfs_input_digest>
 nodeforge profile rootfs status rocky-9.7-aarch64-dvd-diskless
-
-# 外部 squashfs 也可直接登记；以下两种写法二选一，展开大小可选。
-# 未提供时会告警并跳过内存容量硬校验，但不会阻止登记或部署。
-nodeforge profile rootfs register rocky-9.7-aarch64-dvd-diskless \
-  --path /path/to/rootfs.squashfs
-# 或者，若已有可信测量值，可启用严格内存预算：
-nodeforge profile rootfs register rocky-9.7-aarch64-dvd-diskless \
-  --path /path/to/rootfs.squashfs --uncompressed-size <bytes>
-
-# 如果第一次登记时未提供展开大小，可对同一文件再次登记以补全元数据；
-# 成功状态为 metadata_updated。内容或已知元数据冲突不会覆盖现有制品。
+# 不提供外部 squashfs register/import；ready artifact 只能来自上述服务端 build。
 
 # 4. 绑定节点、检查 readiness、打开 deploy gate。
 nodeforge node set node-01 profile=rocky-9.7-aarch64-dvd-diskless

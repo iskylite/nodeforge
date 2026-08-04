@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# r97n0 full-OS v0.2 diskless validation fixture.
+# Archived r97n0 full-OS v0.2 diskless validation fixture (not a current test).
+# This script intentionally preserves the v0.2 three-token capsule protocol and
+# is not a v0.4 release gate. It refuses current binaries below so it cannot
+# accidentally validate the removed per-scope credential model as v0.4.
 set -euo pipefail
 
 repo=${NODEFORGE_REPO:-/root/NodeForge}
@@ -37,6 +40,10 @@ cd "$repo"
 for b in nodeforge nodeforged nodeforge-agent nodeforge-initrd; do
     [[ -x "zig-out/bin/$b" ]] || { echo "missing prebuilt $b: cross-compile locally and sync zig-out/bin/ (see docs/validation/V0_2_PHASE8_VALIDATION.md)" >&2; exit 1; }
 done
+if [[ "$(zig-out/bin/nodeforge --version | awk 'NR == 1 { print $2 }')" != "0.2.0" ]]; then
+    echo "archived v0.2 fixture: current binaries are not v0.2; use docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md" >&2
+    exit 2
+fi
 
 # Produce derived fixtures; preserve the historical base rootfs/initramfs.
 unsquashfs -d "$work/rootfs" "$base_rootfs" >/dev/null
