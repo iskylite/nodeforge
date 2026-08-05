@@ -37,6 +37,7 @@ pub const ValidationError = error{
     InvalidDhcpPingTimeout,
     InvalidDhcpCapacity,
     InvalidManagedCapacity,
+    InvalidDeploymentWaveCapacity,
     InvalidInstallPlanCapacity,
     InvalidLogRotation,
     InvalidEventsRotation,
@@ -194,6 +195,9 @@ pub fn validateConfig(config: *const model.AppConfig) ValidationError!void {
     try validateDhcp(&config.dhcp);
     if (config.capacity.managed_entries) |value| {
         if (value == 0 or value > capacity.store_ceiling) return error.InvalidManagedCapacity;
+    }
+    if (config.capacity.deployment_wave_max) |value| {
+        if (value == 0 or value > capacity.store_ceiling) return error.InvalidDeploymentWaveCapacity;
     }
     // null 是默认值，表示完整动态 slice 不受应用层人为上限约束。只有站点显式
     // 导入 config 并设置数值时才校验保护阈值；setup 不为此低频项提供参数。

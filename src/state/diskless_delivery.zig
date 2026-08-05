@@ -14,6 +14,7 @@
 const std = @import("std");
 const cred = @import("diskless_credential.zig");
 const lifecycle = @import("diskless_session.zig");
+const capacity = @import("capacity.zig");
 const atomicWrite = @import("dhcp_store.zig").atomicWrite;
 
 pub const id_len = 32;
@@ -21,16 +22,21 @@ pub const token_len = 64;
 pub const hash_len = 64;
 pub const digest_len = 64;
 pub const sha512_len = 128;
-pub const max_sessions = 64;
+/// Compile-time slot ceiling (matches capacity.store_ceiling).
+pub const max_sessions = capacity.store_ceiling;
+/// Design default active admission before explicit override.
+pub const default_effective_sessions = capacity.diskless_delivery_default;
+/// AgentPlan DTO ceiling: 256 KiB (not an in-session fixed buffer).
+pub const agent_plan_cap = capacity.agent_plan_max_bytes;
 pub const name_cap = 128;
 pub const kernel_cap = 64;
-pub const agent_plan_cap = 16384;
 pub const default_ttl_seconds: i64 = 2 * 60 * 60;
-/// schema 3 adds mandatory per-slot claim MACs and directly replaces v1/v2;
-/// schema 4 fixes the durable model to `event-only-v1`. BootConfig/rootfs/
-/// AgentPlan access uses a separate random in-memory BootSession capability;
-/// old per-scope token checkpoints are rejected fail-closed.
-pub const persistence_schema_version: u32 = 4;
+/// schema 6: sessions/terminals index only; AgentPlan bodies live as separate
+/// content-addressed files under `<state>/diskless-agent-plans/<digest>`.
+/// schema 5 may still embed plans in the index (one-shot import to files).
+/// schema 4 embeds plan JSON per session.
+pub const persistence_schema_version: u32 = 6;
+pub const checkpoint_read_max_bytes = capacity.checkpoint_index_read_max_bytes;
 
 /// 加载或首次创建 daemon 主密钥（daemon_secret）。文件保存 32-byte secret
 /// 的 64 位小写 hex，权限固定 0600；格式损坏时拒绝启动，绝不静默换密钥使活动
@@ -85,9 +91,10 @@ pub const Session = struct {
     safety_margin_bytes: u64 = 0,
     kernel_buf: [kernel_cap]u8 = [_]u8{0} ** kernel_cap,
     kernel_len: u8 = 0,
-    agent_plan_buf: [agent_plan_cap]u8 = [_]u8{0} ** agent_plan_cap,
-    agent_plan_len: u32 = 0,
+    /// Content-addressed AgentPlan digest (64 hex). Body lives in Store plan blobs.
     agent_plan_digest: [digest_len]u8 = [_]u8{0} ** digest_len,
+    /// Borrowed view into Store-owned plan blob; empty until pinAgentPlan.
+    agent_plan_json: []const u8 = &.{},
     armed_at: i64 = 0,
     /// 节点首次进入 initrd 阶段的 UTC 时间；供 node list 的 INSTALL 列投影。
     install_at: i64 = 0,
@@ -124,8 +131,39 @@ pub const Session = struct {
         return &self.agent_plan_digest;
     }
     pub fn agentPlanJson(self: *const Session) []const u8 {
-        return self.agent_plan_buf[0..self.agent_plan_len];
+        return self.agent_plan_json;
     }
+    pub fn agentPlanLen(self: *const Session) usize {
+        return self.agent_plan_json.len;
+    }
+};
+
+/// Lightweight durable terminal projection. Does not consume active admission.
+pub const TerminalSummary = struct {
+    used: bool = false,
+    session_id: [id_len]u8 = [_]u8{0} ** id_len,
+    node_buf: [name_cap]u8 = [_]u8{0} ** name_cap,
+    node_len: u8 = 0,
+    profile_buf: [name_cap]u8 = [_]u8{0} ** name_cap,
+    profile_len: u8 = 0,
+    phase: lifecycle.Phase = .diskless_running,
+    finished_at: i64 = 0,
+    rootfs_input_digest: [digest_len]u8 = [_]u8{0} ** digest_len,
+    agent_plan_digest: [digest_len]u8 = [_]u8{0} ** digest_len,
+
+    pub fn nodeId(self: *const TerminalSummary) []const u8 {
+        return self.node_buf[0..self.node_len];
+    }
+    pub fn profileName(self: *const TerminalSummary) []const u8 {
+        return self.profile_buf[0..self.profile_len];
+    }
+};
+
+const PlanBlob = struct {
+    used: bool = false,
+    digest: [digest_len]u8 = [_]u8{0} ** digest_len,
+    json: []u8 = &.{},
+    refs: u32 = 0,
 };
 
 pub const Store = struct {
@@ -135,15 +173,316 @@ pub const Store = struct {
     /// secret 在不同 deployment 之间产生不兼容凭证。由 `init` 绑定。
     deployment_id: []const u8,
     sessions: [max_sessions]Session = [_]Session{.{}} ** max_sessions,
+    plan_blobs: [max_sessions]PlanBlob = [_]PlanBlob{.{}} ** max_sessions,
+    terminal_summaries: [max_sessions]TerminalSummary = [_]TerminalSummary{.{}} ** max_sessions,
+    /// Structural slot ceiling (default 512, up to max_sessions). Product wave
+    /// admission is enforced by `wave` when non-null.
+    effective: usize = default_effective_sessions,
+    /// Shared install+diskless deployment-wave admission (daemon-owned).
+    wave: ?*capacity.DeploymentWaveAdmission = null,
     path: []const u8,
+    /// Directory for external AgentPlan files; derived from `path` when empty.
+    plan_dir: []const u8 = "",
     revision: u64 = 0,
+    /// When true, next persist rewrites the full session index. Lifecycle events
+    /// set this; plan files are write-once and never re-serialized here.
+    index_dirty: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, secret: []const u8, deployment_id: []const u8, path: []const u8) Store {
         return .{ .allocator = allocator, .secret = secret, .deployment_id = deployment_id, .path = path };
     }
 
+    fn ensurePlanDir(self: *Store, io: std.Io) !void {
+        if (self.path.len == 0) return;
+        if (self.plan_dir.len != 0) return;
+        const parent = std.fs.path.dirname(self.path) orelse ".";
+        const dir = try std.fmt.allocPrint(self.allocator, "{s}/diskless-agent-plans", .{parent});
+        errdefer self.allocator.free(dir);
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+        self.plan_dir = dir;
+    }
+
+    /// Strict 64-char lowercase hex only — rejects `/`, `..`, uppercase, etc.
+    fn validPlanDigest(digest: []const u8) bool {
+        if (digest.len != digest_len) return false;
+        for (digest) |c| {
+            const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    fn digestOf(json: []const u8, out: *[digest_len]u8) void {
+        var raw: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(json, &raw, .{});
+        _ = std.fmt.bufPrint(out, "{x}", .{raw}) catch unreachable;
+    }
+
+    fn planFilePathAlloc(self: *Store, io: std.Io, digest: []const u8) ![]u8 {
+        if (!validPlanDigest(digest)) return error.InvalidDisklessDeliveryStore;
+        try self.ensurePlanDir(io);
+        if (self.plan_dir.len == 0) return error.InvalidDisklessDeliveryStore;
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.plan_dir, digest });
+    }
+
+    /// Write-once external AgentPlan body. Existing files must match content digest.
+    fn writePlanFile(self: *Store, io: std.Io, digest: []const u8, json: []const u8) !void {
+        if (self.path.len == 0) return;
+        if (!validPlanDigest(digest)) return error.InvalidDisklessDeliveryStore;
+        const file_path = try self.planFilePathAlloc(io, digest);
+        defer self.allocator.free(file_path);
+        if (std.Io.Dir.cwd().openFile(io, file_path, .{})) |file| {
+            file.close(io);
+            // Existing write-once file: content must hash to the digest name.
+            const existing = std.Io.Dir.cwd().readFileAlloc(io, file_path, self.allocator, .limited(capacity.agent_plan_file_read_max_bytes)) catch
+                return error.InvalidDisklessDeliveryStore;
+            defer self.allocator.free(existing);
+            var computed: [digest_len]u8 = undefined;
+            digestOf(existing, &computed);
+            if (!std.mem.eql(u8, &computed, digest)) return error.InvalidDisklessDeliveryStore;
+            // Always re-tighten permissions (first write may have chmod-failed).
+            try chmod(self.allocator, io, "600", file_path);
+            return;
+        } else |_| {}
+        try atomicWrite(io, file_path, json);
+        try chmod(self.allocator, io, "600", file_path);
+    }
+
+    fn readPlanFile(self: *Store, io: std.Io, digest: []const u8) ![]u8 {
+        if (!validPlanDigest(digest)) return error.InvalidDisklessDeliveryStore;
+        const file_path = try self.planFilePathAlloc(io, digest);
+        defer self.allocator.free(file_path);
+        const json = std.Io.Dir.cwd().readFileAlloc(io, file_path, self.allocator, .limited(capacity.agent_plan_file_read_max_bytes)) catch
+            return error.InvalidDisklessDeliveryStore;
+        errdefer self.allocator.free(json);
+        if (json.len > agent_plan_cap) return error.InvalidDisklessDeliveryStore;
+        var computed: [digest_len]u8 = undefined;
+        digestOf(json, &computed);
+        if (!std.mem.eql(u8, &computed, digest)) return error.InvalidDisklessDeliveryStore;
+        return json;
+    }
+
+    /// After a successful index commit, delete unreferenced plan files.
+    fn gcPlanFiles(self: *Store, io: std.Io) void {
+        if (self.path.len == 0 or self.plan_dir.len == 0) return;
+        var live: [max_sessions][digest_len]u8 = undefined;
+        var live_count: usize = 0;
+        const mark = struct {
+            fn add(set: *[max_sessions][digest_len]u8, count: *usize, digest: []const u8) void {
+                if (!validPlanDigest(digest)) return;
+                var i: usize = 0;
+                while (i < count.*) : (i += 1) {
+                    if (std.mem.eql(u8, &set.*[i], digest)) return;
+                }
+                if (count.* >= set.len) return;
+                @memcpy(&set.*[count.*], digest);
+                count.* += 1;
+            }
+        }.add;
+        for (&self.sessions) |*s| {
+            if (!s.active) continue;
+            if (!std.mem.allEqual(u8, &s.agent_plan_digest, 0)) mark(&live, &live_count, &s.agent_plan_digest);
+        }
+        for (&self.terminal_summaries) |*t| {
+            if (!t.used) continue;
+            if (!std.mem.allEqual(u8, &t.agent_plan_digest, 0)) mark(&live, &live_count, &t.agent_plan_digest);
+        }
+        for (&self.plan_blobs) |*b| {
+            if (b.used and b.refs > 0) mark(&live, &live_count, &b.digest);
+        }
+        var dir = std.Io.Dir.cwd().openDir(io, self.plan_dir, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!validPlanDigest(entry.name)) {
+                // Only GC our own digest-named files; leave foreign names alone.
+                continue;
+            }
+            var referenced = false;
+            for (live[0..live_count]) |d| {
+                if (std.mem.eql(u8, &d, entry.name)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced) dir.deleteFile(io, entry.name) catch {};
+        }
+    }
+
+    pub fn setEffective(self: *Store, value: usize) void {
+        const active = self.activeAdmissionCount();
+        self.effective = @max(active, @max(@as(usize, 1), @min(value, max_sessions)));
+    }
+
+    pub fn setWave(self: *Store, wave: *capacity.DeploymentWaveAdmission) void {
+        self.wave = wave;
+    }
+
     pub fn deinit(self: *Store) void {
-        _ = self;
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used and blob.json.len != 0) self.allocator.free(blob.json);
+            blob.* = .{};
+        }
+        if (self.plan_dir.len != 0) {
+            self.allocator.free(self.plan_dir);
+            self.plan_dir = "";
+        }
+    }
+
+    /// Active admission counts only non-terminal delivery authorities.
+    /// Terminal sessions may remain as lightweight facts without consuming
+    /// the 512/2048 wave budget once their AgentPlan blob is released.
+    pub fn activeAdmissionCount(self: *const Store) usize {
+        var n: usize = 0;
+        for (self.sessions) |s| {
+            if (s.active and !s.phase.isTerminal()) n += 1;
+        }
+        return n;
+    }
+
+    fn upsertPlan(self: *Store, io: std.Io, json: []const u8) !struct { digest: [digest_len]u8, view: []const u8 } {
+        if (json.len > agent_plan_cap) return error.AgentPlanTooLarge;
+        var digest: [digest_len]u8 = undefined;
+        digestOf(json, &digest);
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used and std.mem.eql(u8, &blob.digest, &digest)) {
+                blob.refs += 1;
+                return .{ .digest = digest, .view = blob.json };
+            }
+        }
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used) continue;
+            const owned = try self.allocator.dupe(u8, json);
+            errdefer self.allocator.free(owned);
+            try self.writePlanFile(io, &digest, owned);
+            blob.* = .{ .used = true, .digest = digest, .json = owned, .refs = 1 };
+            return .{ .digest = digest, .view = owned };
+        }
+        return error.AgentPlanBlobCapacity;
+    }
+
+    /// Import a plan blob with refs=0 during checkpoint load. Sessions retain later.
+    fn importPlanBlob(self: *Store, io: std.Io, digest: []const u8, json: []const u8) !void {
+        if (!validPlanDigest(digest) or json.len == 0 or json.len > agent_plan_cap) return error.InvalidDisklessDeliveryStore;
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used and std.mem.eql(u8, &blob.digest, digest)) return;
+        }
+        var computed: [digest_len]u8 = undefined;
+        digestOf(json, &computed);
+        if (!std.mem.eql(u8, &computed, digest)) return error.InvalidDisklessDeliveryStore;
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used) continue;
+            const owned = try self.allocator.dupe(u8, json);
+            errdefer self.allocator.free(owned);
+            try self.writePlanFile(io, digest, owned);
+            var d: [digest_len]u8 = undefined;
+            @memcpy(&d, digest);
+            blob.* = .{ .used = true, .digest = d, .json = owned, .refs = 0 };
+            return;
+        }
+        return error.AgentPlanBlobCapacity;
+    }
+
+    fn loadPlanIntoMemory(self: *Store, io: std.Io, digest: []const u8) !void {
+        if (!validPlanDigest(digest)) return error.InvalidDisklessDeliveryStore;
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used and std.mem.eql(u8, &blob.digest, digest)) return;
+        }
+        // readPlanFile already verifies SHA-256 against digest and hex path safety.
+        const json = try self.readPlanFile(io, digest);
+        errdefer self.allocator.free(json);
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used) continue;
+            var d: [digest_len]u8 = undefined;
+            @memcpy(&d, digest);
+            blob.* = .{ .used = true, .digest = d, .json = json, .refs = 0 };
+            return;
+        }
+        self.allocator.free(json);
+        return error.AgentPlanBlobCapacity;
+    }
+
+    fn retainPlanDigest(self: *Store, io: std.Io, digest: []const u8, embedded_json: []const u8) ![]const u8 {
+        if (!validPlanDigest(digest)) return error.InvalidDisklessDeliveryStore;
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used and std.mem.eql(u8, &blob.digest, digest)) {
+                blob.refs += 1;
+                return blob.json;
+            }
+        }
+        if (embedded_json.len != 0) {
+            try self.importPlanBlob(io, digest, embedded_json);
+        } else {
+            try self.loadPlanIntoMemory(io, digest);
+        }
+        for (&self.plan_blobs) |*blob| {
+            if (blob.used and std.mem.eql(u8, &blob.digest, digest)) {
+                blob.refs += 1;
+                return blob.json;
+            }
+        }
+        return error.AgentPlanBlobCapacity;
+    }
+
+    fn releasePlanView(self: *Store, digest: []const u8) void {
+        if (digest.len != digest_len) return;
+        for (&self.plan_blobs) |*blob| {
+            if (!blob.used or !std.mem.eql(u8, &blob.digest, digest)) continue;
+            if (blob.refs > 0) blob.refs -= 1;
+            if (blob.refs == 0) {
+                if (blob.json.len != 0) self.allocator.free(blob.json);
+                blob.* = .{};
+            }
+            return;
+        }
+    }
+
+    fn recordTerminalSummary(self: *Store, session: *const Session) void {
+        // One latest terminal fact per node.
+        for (&self.terminal_summaries) |*slot| {
+            if (slot.used and std.mem.eql(u8, slot.nodeId(), session.nodeId())) {
+                slot.* = summaryFromSession(session);
+                return;
+            }
+        }
+        for (&self.terminal_summaries) |*slot| {
+            if (slot.used) continue;
+            slot.* = summaryFromSession(session);
+            return;
+        }
+        // Overwrite the oldest finished_at if full (bounded store).
+        var victim: ?*TerminalSummary = null;
+        for (&self.terminal_summaries) |*slot| {
+            if (!slot.used) continue;
+            if (victim == null or slot.finished_at < victim.?.finished_at) victim = slot;
+        }
+        if (victim) |slot| slot.* = summaryFromSession(session);
+    }
+
+    fn summaryFromSession(session: *const Session) TerminalSummary {
+        var s: TerminalSummary = .{
+            .used = true,
+            .phase = session.phase,
+            .finished_at = session.finished_at,
+        };
+        @memcpy(&s.session_id, &session.session_id);
+        s.node_len = session.node_len;
+        @memcpy(s.node_buf[0..session.node_len], session.node_buf[0..session.node_len]);
+        s.profile_len = session.profile_len;
+        @memcpy(s.profile_buf[0..session.profile_len], session.profile_buf[0..session.profile_len]);
+        @memcpy(&s.rootfs_input_digest, &session.rootfs_input_digest);
+        @memcpy(&s.agent_plan_digest, &session.agent_plan_digest);
+        return s;
+    }
+
+    pub fn terminalSummaryForNode(self: *Store, node_id: []const u8) ?*TerminalSummary {
+        var latest: ?*TerminalSummary = null;
+        for (&self.terminal_summaries) |*slot| {
+            if (!slot.used or !std.mem.eql(u8, slot.nodeId(), node_id)) continue;
+            if (latest == null or slot.finished_at > latest.?.finished_at) latest = slot;
+        }
+        return latest;
     }
 
     /// 从 checkpoint 恢复尚未过期的 delivery session。这里只重构不落盘的 raw
@@ -151,7 +490,7 @@ pub const Store = struct {
     /// 属于 BootSession store，restart 后必须由同 lease peer 重新 bootstrap。
     pub fn load(self: *Store, io: std.Io, now_mono: i64, now_utc: i64) !usize {
         if (self.path.len == 0) return 0;
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, self.path, self.allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, self.path, self.allocator, .limited(checkpoint_read_max_bytes)) catch |err| switch (err) {
             error.FileNotFound => return 0,
             else => return err,
         };
@@ -159,38 +498,46 @@ pub const Store = struct {
         const header = try std.json.parseFromSlice(PersistedHeader, self.allocator, bytes, .{ .ignore_unknown_fields = true });
         defer header.deinit();
         switch (header.value.schema_version) {
-            persistence_schema_version => {
-                const parsed = std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always }) catch
+            4, 5, persistence_schema_version => {
+                const parsed = std.json.parseFromSlice(PersistedFile, self.allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch
                     return error.InvalidDisklessDeliveryStore;
                 defer parsed.deinit();
                 if (!std.mem.eql(u8, parsed.value.credential_model, "event-only-v1")) return error.InvalidDisklessDeliveryStore;
-                return self.restorePersisted(parsed.value.revision, parsed.value.sessions, now_mono, now_utc);
+                // schema 4/5 may embed plan bodies in the index; import then externalize.
+                for (parsed.value.agent_plans) |plan| {
+                    if (plan.json.len != 0) try self.importPlanBlob(io, plan.digest, plan.json);
+                }
+                const active = try self.restorePersisted(io, parsed.value.revision, parsed.value.sessions, now_mono, now_utc);
+                for (parsed.value.terminal_summaries) |item| try self.restoreTerminalSummary(item);
+                self.index_dirty = false;
+                return active;
             },
             else => return error.InvalidDisklessDeliveryStore,
         }
     }
 
-    fn restorePersisted(self: *Store, revision: u64, items: []const PersistedSession, now_mono: i64, now_utc: i64) !usize {
+    fn restorePersisted(self: *Store, io: std.Io, revision: u64, items: []const PersistedSession, now_mono: i64, now_utc: i64) !usize {
         if (items.len > max_sessions) return error.InvalidDisklessDeliveryStore;
         self.revision = revision;
         var restored: usize = 0;
         for (items) |item| {
             // capability TTL 到期只淘汰未完成的 delivery。running/failed/expired
-            // 是节点长期运行事实，必须跨 daemon 重启保留给 node list 投影。
+            // 是节点长期运行事实，进入 terminal_summaries 而不占 active slot。
             if (item.expires_at <= now_utc and !item.phase.isTerminal()) continue;
-            const slot_index = self.findFree() orelse return error.DisklessSessionCapacity;
-            var session = try restoreSession(item, now_mono, now_utc);
+            var session = try restoreSession(self, io, item, now_mono, now_utc);
             try requireClaimMacs(&session);
+            const slot_index = self.findFreeSlotIncludingTerminal() orelse return error.DisklessSessionCapacity;
             if (session.phase.isTerminal()) {
-                // Terminal facts remain visible, but lifecycle authority is gone.
+                // Terminal facts remain listable; lifecycle authority is gone.
                 session.event_token.issued = false;
+                // Drop plan body ref on restore: summary digest is enough.
+                if (session.agent_plan_json.len != 0) {
+                    self.releasePlanView(&session.agent_plan_digest);
+                    session.agent_plan_json = &.{};
+                }
+                self.recordTerminalSummary(&session);
             } else {
-                // 非 terminal 且未过期 session 才执行确定性重构和 hash 验证。
-                // 任一重构 token 与合法长度 hash 不匹配时，不恢复任何 scope、
-                // 清零已重构 raw bytes 并设 recovery_incomplete；其他 session 继续。
                 try reconstructAllOrMarkIncomplete(self, &session);
-                // token hash 不匹配维持 recovery_incomplete 语义；只有 token 本身
-                // 可重构时，claim MAC 不匹配才证明 checkpoint claim 被篡改。
                 if (!session.recovery_incomplete) try verifyClaimMacs(self.secret, &session);
             }
             self.sessions[slot_index] = session;
@@ -199,14 +546,51 @@ pub const Store = struct {
         return restored;
     }
 
-    /// 原子 checkpoint。只序列化 active session 的 immutable snapshot、claim、
-    /// token HMAC 与 claim MAC；raw token 永不落盘。
+    fn restoreTerminalSummary(self: *Store, item: PersistedTerminal) !void {
+        if (item.session_id.len != id_len or item.node_id.len == 0 or item.node_id.len > name_cap or
+            item.profile.len > name_cap or item.rootfs_input_digest.len != digest_len or
+            item.agent_plan_digest.len != digest_len)
+            return error.InvalidDisklessDeliveryStore;
+        var s: TerminalSummary = .{
+            .used = true,
+            .phase = item.phase,
+            .finished_at = item.finished_at,
+        };
+        @memcpy(&s.session_id, item.session_id);
+        s.node_len = @intCast(item.node_id.len);
+        @memcpy(s.node_buf[0..s.node_len], item.node_id);
+        s.profile_len = @intCast(item.profile.len);
+        @memcpy(s.profile_buf[0..s.profile_len], item.profile);
+        @memcpy(&s.rootfs_input_digest, item.rootfs_input_digest);
+        @memcpy(&s.agent_plan_digest, item.agent_plan_digest);
+        // Prefer replacing same node.
+        for (&self.terminal_summaries) |*slot| {
+            if (slot.used and std.mem.eql(u8, slot.nodeId(), s.nodeId())) {
+                slot.* = s;
+                return;
+            }
+        }
+        for (&self.terminal_summaries) |*slot| {
+            if (!slot.used) {
+                slot.* = s;
+                return;
+            }
+        }
+    }
+
+    /// Rewrite the lightweight session/terminal index only.
+    /// AgentPlan bodies are write-once external files and are never re-encoded here.
     pub fn persist(self: *Store, io: std.Io) !void {
-        if (self.path.len == 0) return;
+        if (self.path.len == 0) {
+            self.index_dirty = false;
+            return;
+        }
         const previous_revision = self.revision;
         self.revision = std.math.add(u64, self.revision, 1) catch return error.DisklessRevisionOverflow;
         errdefer self.revision = previous_revision;
-        var compact: [max_sessions]PersistedSession = undefined;
+
+        const compact = try self.allocator.alloc(PersistedSession, max_sessions);
+        defer self.allocator.free(compact);
         var count: usize = 0;
         for (&self.sessions) |*session| {
             if (!session.active) continue;
@@ -214,14 +598,39 @@ pub const Store = struct {
             compact[count] = persistedSession(session);
             count += 1;
         }
+
+        const terminals = try self.allocator.alloc(PersistedTerminal, max_sessions);
+        defer self.allocator.free(terminals);
+        var term_count: usize = 0;
+        for (&self.terminal_summaries) |*slot| {
+            if (!slot.used) continue;
+            terminals[term_count] = .{
+                .session_id = &slot.session_id,
+                .node_id = slot.nodeId(),
+                .profile = slot.profileName(),
+                .phase = slot.phase,
+                .finished_at = slot.finished_at,
+                .rootfs_input_digest = &slot.rootfs_input_digest,
+                .agent_plan_digest = &slot.agent_plan_digest,
+            };
+            term_count += 1;
+        }
+
+        // schema 6: no embedded agent_plans bodies — only the index.
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, PersistedFile{
             .credential_model = "event-only-v1",
             .revision = self.revision,
+            .agent_plans = &.{},
             .sessions = compact[0..count],
+            .terminal_summaries = terminals[0..term_count],
         }, .{ .whitespace = .indent_2 });
         defer self.allocator.free(bytes);
+        if (bytes.len > checkpoint_read_max_bytes) return error.DisklessCheckpointTooLarge;
         try atomicWrite(io, self.path, bytes);
         try chmod(self.allocator, io, "600", self.path);
+        self.index_dirty = false;
+        // Index is durable: reclaim plan files no longer referenced by sessions/terminals.
+        self.gcPlanFiles(io);
     }
 
     pub fn currentRevision(self: *const Store) u64 {
@@ -231,8 +640,16 @@ pub const Store = struct {
     /// 创建一个 diskless session（不签发 token）。返回新 session 的只读引用；
     /// event token 由 prepare 签发；读取认证属于 boot-session store。
     pub fn begin(self: *Store, io: std.Io, node_id: []const u8, profile: []const u8, rootfs_input_digest: []const u8, rootfs_sha512: []const u8, rootfs_size: u64, rootfs_uncompressed_size: u64, kernel_release: []const u8, tmpfs_percent: u8, minimum_free_bytes: u64, safety_margin_bytes: u64, now_mono: i64, now_utc: i64) !*Session {
-        // 同节点新 delivery 原位取代旧终态快照；每个节点最多保留一条长期事实。
-        // 保存原值，checkpoint 失败时完整回滚。
+        // Shared wave admission before any structural side effect.
+        if (self.wave) |w| {
+            w.tryAcquire() catch return error.DisklessSessionCapacity;
+        } else if (self.activeAdmissionCount() >= self.effective) {
+            return error.DisklessSessionCapacity;
+        }
+        var wave_held = self.wave != null;
+        errdefer if (wave_held) if (self.wave) |w| w.release();
+
+        // Same-node new delivery supersedes prior terminal fact in-place.
         var replacement: ?usize = null;
         for (&self.sessions, 0..) |*existing, index| {
             if (existing.active and existing.phase.isTerminal() and std.mem.eql(u8, existing.nodeId(), node_id)) {
@@ -240,7 +657,14 @@ pub const Store = struct {
                 break;
             }
         }
-        const slot = replacement orelse self.findFree() orelse return error.DisklessSessionCapacity;
+        for (&self.terminal_summaries) |*slot| {
+            if (slot.used and std.mem.eql(u8, slot.nodeId(), node_id)) slot.* = .{};
+        }
+        const slot = replacement orelse self.findFreeSlotIncludingTerminal() orelse return error.DisklessSessionCapacity;
+        // Reclaiming a terminal slot: drop any leftover plan view.
+        if (self.sessions[slot].active and self.sessions[slot].agent_plan_json.len != 0) {
+            self.releasePlanView(&self.sessions[slot].agent_plan_digest);
+        }
         const previous_session = self.sessions[slot];
         var s: Session = .{ .active = true, .armed_at = now_utc, .expires_at = now_utc + default_ttl_seconds };
         try generateId(io, &s.session_id);
@@ -263,22 +687,29 @@ pub const Store = struct {
         self.sessions[slot] = s;
         self.persist(io) catch {
             self.sessions[slot] = previous_session;
+            if (wave_held) if (self.wave) |w| w.release();
+            wave_held = false;
             return error.DisklessSessionPersistFailed;
         };
+        wave_held = false; // committed
         return &self.sessions[slot];
     }
 
-    /// 固定 immutable AgentPlan JSON（boot-config 首次签发时写入），并计算其
-    /// canonical SHA-256 作为 agent_plan_digest。后续 agent-plan GET 返回相同 bytes。
+    /// Pin immutable AgentPlan once by digest. Identical digests share one blob.
     pub fn pinAgentPlan(self: *Store, io: std.Io, session_id: []const u8, json: []const u8) !void {
         const s = self.find(session_id) orelse return error.DisklessSessionNotFound;
-        if (json.len > agent_plan_cap) return error.AgentPlanTooLarge;
-        @memcpy(s.agent_plan_buf[0..json.len], json);
-        s.agent_plan_len = @intCast(json.len);
-        var raw: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(json, &raw, .{});
-        _ = std.fmt.bufPrint(&s.agent_plan_digest, "{x}", .{raw}) catch unreachable;
-        try self.persist(io);
+        const previous_digest = s.agent_plan_digest;
+        const previous_json = s.agent_plan_json;
+        const pinned = try self.upsertPlan(io, json);
+        s.agent_plan_digest = pinned.digest;
+        s.agent_plan_json = pinned.view;
+        self.persist(io) catch |err| {
+            s.agent_plan_digest = previous_digest;
+            s.agent_plan_json = previous_json;
+            self.releasePlanView(&pinned.digest);
+            return err;
+        };
+        if (previous_json.len != 0) self.releasePlanView(&previous_digest);
     }
 
     /// 签发一个 scoped token（32 字节随机 -> 64 hex）。持久 HMAC hash + claim，
@@ -359,10 +790,12 @@ pub const Store = struct {
         return latest;
     }
 
-    pub fn snapshot(self: *Store, out: *[max_sessions]Session) []const Session {
+    /// `out` must be heap-allocated when sized to `max_sessions`.
+    pub fn snapshot(self: *Store, out: []Session) []const Session {
         var count: usize = 0;
         for (self.sessions) |session| {
             if (!session.active) continue;
+            if (count >= out.len) break;
             out[count] = session;
             count += 1;
         }
@@ -376,11 +809,16 @@ pub const Store = struct {
     pub fn cancel(self: *Store, io: std.Io, session_id: []const u8) !void {
         const session = self.find(session_id) orelse return error.DisklessSessionNotFound;
         const previous = session.*;
+        const was_active = previous.active and !previous.phase.isTerminal();
+        const plan_digest = previous.agent_plan_digest;
+        const had_plan = previous.agent_plan_json.len != 0;
         session.* = .{};
         self.persist(io) catch |err| {
             session.* = previous;
             return err;
         };
+        if (had_plan) self.releasePlanView(&plan_digest);
+        if (was_active) if (self.wave) |w| w.release();
     }
 
     pub fn markBootConfigFetched(self: *Store, io: std.Io, session_id: []const u8) !void {
@@ -404,21 +842,67 @@ pub const Store = struct {
         if (event_seq != session.event_token.event_seq) return error.DisklessEventSequenceMismatch;
         if (expected != session.phase) return error.DisklessExpectedPhaseMismatch;
         const previous_phase = session.phase;
-        const previous_seq = session.event_token.event_seq;
+        const previous_token = session.event_token;
+        const previous_raw = session.event_token_raw;
         const previous_install_at = session.install_at;
         const previous_finished_at = session.finished_at;
+        const previous_plan = session.agent_plan_json;
+        const previous_digest = session.agent_plan_digest;
+        // Snapshot prior terminal summary for this node so persist failure rolls back.
+        var previous_summary: ?TerminalSummary = null;
+        var previous_summary_empty = false;
+        if (target.isTerminal()) {
+            if (self.terminalSummaryForNode(session.nodeId())) |slot| {
+                previous_summary = slot.*;
+            } else {
+                previous_summary_empty = true;
+            }
+        }
+
         session.phase = try lifecycle.advance(session.phase, target);
-        session.event_token.event_seq = std.math.add(u64, previous_seq, 1) catch return error.DisklessEventSequenceOverflow;
+        session.event_token.event_seq = std.math.add(u64, previous_token.event_seq, 1) catch return error.DisklessEventSequenceOverflow;
         // INSTALL 对无盘节点表示真正开始执行 initrd，而不是服务端 prepare。
         if (target == .diskless_initrd_started and session.install_at == 0) session.install_at = now_utc;
         if (target.isTerminal() and session.finished_at == 0) session.finished_at = now_utc;
+        // Terminal: free active admission (no longer counts) and drop plan body
+        // while keeping the session record for node-list / checkpoint projection.
+        if (target.isTerminal()) {
+            session.event_token.issued = false;
+            @memset(&session.event_token_raw, 0);
+            session.agent_plan_json = &.{};
+            self.recordTerminalSummary(session);
+        }
         self.persist(io) catch |err| {
             session.phase = previous_phase;
-            session.event_token.event_seq = previous_seq;
+            session.event_token = previous_token;
+            session.event_token_raw = previous_raw;
             session.install_at = previous_install_at;
             session.finished_at = previous_finished_at;
+            session.agent_plan_json = previous_plan;
+            session.agent_plan_digest = previous_digest;
+            if (target.isTerminal()) {
+                if (previous_summary) |sum| {
+                    // Restore prior summary for this node.
+                    for (&self.terminal_summaries) |*slot| {
+                        if (slot.used and std.mem.eql(u8, slot.nodeId(), sum.nodeId())) {
+                            slot.* = sum;
+                            break;
+                        }
+                    }
+                } else if (previous_summary_empty) {
+                    for (&self.terminal_summaries) |*slot| {
+                        if (slot.used and std.mem.eql(u8, slot.nodeId(), session.nodeId())) {
+                            slot.* = .{};
+                            break;
+                        }
+                    }
+                }
+            }
             return err;
         };
+        if (target.isTerminal() and previous_plan.len != 0) self.releasePlanView(&previous_digest);
+        // Terminal frees a shared wave slot (was non-terminal active).
+        if (target.isTerminal()) if (self.wave) |w| w.release();
         return .applied;
     }
 
@@ -438,7 +922,27 @@ pub const Store = struct {
     }
 
     fn findFree(self: *Store) ?usize {
+        if (self.activeAdmissionCount() >= self.effective) return null;
+        return self.findFreeSlotIncludingTerminal();
+    }
+
+    /// Slot finder for restore/begin: prefer empty, else reclaim a terminal fact.
+    fn findFreeSlotIncludingTerminal(self: *Store) ?usize {
         for (&self.sessions, 0..) |*s, i| if (!s.active) return i;
+        var victim: ?usize = null;
+        var oldest: i64 = std.math.maxInt(i64);
+        for (&self.sessions, 0..) |*s, i| {
+            if (!s.active or !s.phase.isTerminal()) continue;
+            if (s.finished_at <= oldest) {
+                oldest = s.finished_at;
+                victim = i;
+            }
+        }
+        if (victim) |i| {
+            if (self.sessions[i].agent_plan_json.len != 0) self.releasePlanView(&self.sessions[i].agent_plan_digest);
+            self.sessions[i] = .{};
+            return i;
+        }
         return null;
     }
 };
@@ -466,7 +970,8 @@ const PersistedSession = struct {
     minimum_free_bytes: u64,
     safety_margin_bytes: u64,
     kernel_release: []const u8,
-    agent_plan_json: []const u8,
+    /// Schema 4 may embed the body; schema 5 leaves this empty and uses agent_plans.
+    agent_plan_json: []const u8 = "",
     agent_plan_digest: []const u8,
     armed_at: i64,
     /// 进入 initrd 的生命周期时间；0 表示尚未进入。
@@ -477,6 +982,21 @@ const PersistedSession = struct {
     event_token: PersistedSlot,
 };
 
+const PersistedPlan = struct {
+    digest: []const u8,
+    json: []const u8,
+};
+
+const PersistedTerminal = struct {
+    session_id: []const u8,
+    node_id: []const u8,
+    profile: []const u8,
+    phase: lifecycle.Phase,
+    finished_at: i64,
+    rootfs_input_digest: []const u8,
+    agent_plan_digest: []const u8,
+};
+
 const PersistedHeader = struct {
     schema_version: u32,
 };
@@ -485,7 +1005,9 @@ const PersistedFile = struct {
     schema_version: u32 = persistence_schema_version,
     credential_model: []const u8,
     revision: u64 = 0,
+    agent_plans: []const PersistedPlan = &.{},
     sessions: []const PersistedSession = &.{},
+    terminal_summaries: []const PersistedTerminal = &.{},
 };
 
 /// 将内存中的 token slot 投影为可持久化形式（只存 hash+claim，不含 raw token）。
@@ -501,7 +1023,7 @@ fn persistedSlot(slot: *const TokenSlot) PersistedSlot {
 }
 
 /// 将内存中的 session 投影为可持久化形式：event capability 只存 hash+claim，
-/// raw token 从不落盘；读取 token 不属于该 schema。
+/// raw token 从不落盘；AgentPlan body 只通过 digest 引用 agent_plans。
 fn persistedSession(session: *const Session) PersistedSession {
     return .{
         .session_id = &session.session_id,
@@ -515,7 +1037,7 @@ fn persistedSession(session: *const Session) PersistedSession {
         .minimum_free_bytes = session.minimum_free_bytes,
         .safety_margin_bytes = session.safety_margin_bytes,
         .kernel_release = session.kernelRelease(),
-        .agent_plan_json = session.agentPlanJson(),
+        .agent_plan_json = "",
         .agent_plan_digest = session.agentPlanDigest(),
         .armed_at = session.armed_at,
         .install_at = session.install_at,
@@ -530,7 +1052,7 @@ fn persistedSession(session: *const Session) PersistedSession {
 /// （`InvalidDisklessDeliveryStore`）。按剩余 TTL（`expires_at - now_utc`）重算
 /// monotonic 过期时间。raw token 不在持久化文件中，由 `reconstructAndVerifyRaw`
 /// 在校验时按需重构。
-fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session {
+fn restoreSession(store: *Store, io: std.Io, item: PersistedSession, now_mono: i64, now_utc: i64) !Session {
     if (item.session_id.len != id_len or item.rootfs_input_digest.len != digest_len or
         item.rootfs_sha512.len != sha512_len or item.agent_plan_digest.len != digest_len or
         item.node_id.len > name_cap or item.profile.len > name_cap or
@@ -559,9 +1081,11 @@ fn restoreSession(item: PersistedSession, now_mono: i64, now_utc: i64) !Session 
     @memcpy(&session.rootfs_sha512, item.rootfs_sha512);
     session.kernel_len = @intCast(item.kernel_release.len);
     @memcpy(session.kernel_buf[0..session.kernel_len], item.kernel_release);
-    session.agent_plan_len = @intCast(item.agent_plan_json.len);
-    @memcpy(session.agent_plan_buf[0..session.agent_plan_len], item.agent_plan_json);
     @memcpy(&session.agent_plan_digest, item.agent_plan_digest);
+    // Unpinned plans leave the digest at all-zero; only retain a blob when set.
+    if (!std.mem.allEqual(u8, &session.agent_plan_digest, 0)) {
+        session.agent_plan_json = try store.retainPlanDigest(io, item.agent_plan_digest, item.agent_plan_json);
+    }
     const remaining = item.expires_at - now_utc;
     session.event_token = try restoreSlot(item.event_token, now_mono + remaining);
     return session;
@@ -727,6 +1251,7 @@ test "event-only checkpoint restores lifecycle capability without raw token" {
     const secret = [_]u8{0x5a} ** 32;
 
     var before = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer before.deinit();
     const session = try before.begin(
         std.testing.io,
         "node-1",
@@ -756,6 +1281,7 @@ test "event-only checkpoint restores lifecycle capability without raw token" {
     try std.testing.expect(std.mem.indexOf(u8, persisted, "agent_token") == null);
 
     var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer after.deinit();
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1010));
     const restored = after.find(&session_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 4096), restored.rootfs_size);
@@ -787,6 +1313,7 @@ test "checkpoint rejects legacy schemas and pre-simplification v4" {
         defer std.testing.allocator.free(bytes);
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = bytes });
         var store = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+        defer store.deinit();
         try std.testing.expectError(error.InvalidDisklessDeliveryStore, store.load(std.testing.io, 100, 1000));
     }
 }
@@ -794,6 +1321,7 @@ test "checkpoint rejects legacy schemas and pre-simplification v4" {
 test "diskless event CAS is ordered and exact retry is idempotent" {
     const secret = [_]u8{0x33} ** 32;
     var store = Store.init(std.testing.allocator, &secret, "dep-test", "");
+    defer store.deinit();
     const session = try store.begin(
         std.testing.io,
         "n1",
@@ -850,6 +1378,7 @@ test "diskless event CAS is ordered and exact retry is idempotent" {
 test "missing rootfs uncompressed size remains unknown" {
     const secret = [_]u8{0x44} ** 32;
     var store = Store.init(std.testing.allocator, &secret, "dep-test", "");
+    defer store.deinit();
     const session = try store.begin(
         std.testing.io,
         "n-unknown",
@@ -878,6 +1407,7 @@ test "terminal phase session restores without capability reconstruction" {
     const secret = [_]u8{0x6b} ** 32;
 
     var before = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer before.deinit();
     const session = try before.begin(
         std.testing.io,
         "node-term",
@@ -910,6 +1440,7 @@ test "terminal phase session restores without capability reconstruction" {
 
     // reload with same secret — terminal session should be restored but without capability
     var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer after.deinit();
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1800));
     const restored = after.find(&session_id) orelse return error.TestExpectedEqual;
     try std.testing.expect(restored.phase.isTerminal());
@@ -933,6 +1464,7 @@ test "terminal phase session restores without capability reconstruction" {
 /// session id 与文件字节，供 §6.3 语义冻结负测篡改。
 fn terminalCheckpointBytes(io: std.Io, allocator: std.mem.Allocator, path: []const u8, secret: []const u8) !struct { session_id: [id_len]u8, bytes: []u8 } {
     var before = Store.init(allocator, secret, "dep-test", path);
+    defer before.deinit();
     const session = try before.begin(
         io,
         "node-term",
@@ -1035,6 +1567,7 @@ test "v0.2.3: terminal session hash 内容篡改不 fail closed 且 capability �
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = helper.bytes });
 
     var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer after.deinit();
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1800));
     const restored = after.find(&helper.session_id) orelse return error.TestExpectedEqual;
     try std.testing.expect(restored.phase.isTerminal());
@@ -1057,6 +1590,7 @@ test "v0.2.3: terminal session hash 长度非法仍 fail closed" {
     defer std.testing.allocator.free(tampered);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = tampered });
     var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer after.deinit();
     try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1800));
 }
 
@@ -1069,6 +1603,7 @@ test "v0.2.3: non-terminal checkpoint claim tampering fails closed" {
     defer std.testing.allocator.free(checkpoint);
     const secret = [_]u8{0x4d} ** 32;
     var before = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer before.deinit();
     const session = try before.begin(std.testing.io, "node-claim", "profile-claim", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1, 2, "6.8.0", 50, 1, 1, 100, 1000);
     const session_id = session.session_id;
     try before.issue(std.testing.io, &session_id, .event);
@@ -1081,6 +1616,7 @@ test "v0.2.3: non-terminal checkpoint claim tampering fails closed" {
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = bytes });
 
     var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer after.deinit();
     try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1010));
 }
 
@@ -1093,6 +1629,7 @@ test "checkpoint schema v3 requires every claim MAC" {
     defer std.testing.allocator.free(checkpoint);
     const secret = [_]u8{0x5e} ** 32;
     var before = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer before.deinit();
     _ = try before.begin(std.testing.io, "node-mac", "profile-mac", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1, 2, "6.8.0", 50, 1, 1, 100, 1000);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, checkpoint, std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(bytes);
@@ -1100,6 +1637,7 @@ test "checkpoint schema v3 requires every claim MAC" {
     defer std.testing.allocator.free(missing);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = checkpoint, .data = missing });
     var after = Store.init(std.testing.allocator, &secret, "dep-test", checkpoint);
+    defer after.deinit();
     try std.testing.expectError(error.InvalidDisklessDeliveryStore, after.load(std.testing.io, 10, 1010));
 }
 
@@ -1114,6 +1652,7 @@ test "master secret change causes recovery_incomplete for non-terminal session" 
     const secret_changed = [_]u8{0x8d} ** 32;
 
     var before = Store.init(std.testing.allocator, &secret_original, "dep-test", checkpoint);
+    defer before.deinit();
     const session = try before.begin(
         std.testing.io,
         "node-rec",
@@ -1137,6 +1676,7 @@ test "master secret change causes recovery_incomplete for non-terminal session" 
 
     // reload with different secret — hash won't match, should set recovery_incomplete
     var after = Store.init(std.testing.allocator, &secret_changed, "dep-test", checkpoint);
+    defer after.deinit();
     try std.testing.expectEqual(@as(usize, 1), try after.load(std.testing.io, 10, 1010));
     const restored = after.find(&session_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(bool, true), restored.recovery_incomplete);
@@ -1165,6 +1705,7 @@ test "multiple sessions: recovery_incomplete only affects mismatched session" {
     const secret_changed = [_]u8{0xae} ** 32;
 
     var before = Store.init(std.testing.allocator, &secret_original, "dep-test", checkpoint);
+    defer before.deinit();
     // session 1: non-terminal, will have hash mismatch
     const session1 = try before.begin(
         std.testing.io,
@@ -1214,6 +1755,7 @@ test "multiple sessions: recovery_incomplete only affects mismatched session" {
 
     // reload with different secret
     var after = Store.init(std.testing.allocator, &secret_changed, "dep-test", checkpoint);
+    defer after.deinit();
     try std.testing.expectEqual(@as(usize, 2), try after.load(std.testing.io, 10, 1800));
 
     const restored1 = after.find(&session1.session_id) orelse return error.TestExpectedEqual;
@@ -1222,4 +1764,191 @@ test "multiple sessions: recovery_incomplete only affects mismatched session" {
     const restored2 = after.find(&session2.session_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(bool, false), restored2.recovery_incomplete);
     try std.testing.expect(restored2.phase.isTerminal());
+}
+
+test "v0.4 capacity: default 512 active admission; terminal frees wave budget" {
+    const secret = [_]u8{0x51} ** 32;
+    var store = Store.init(std.testing.allocator, &secret, "dep-cap", "");
+    defer store.deinit();
+    store.setEffective(default_effective_sessions);
+    try std.testing.expectEqual(@as(usize, 512), store.effective);
+
+    var first_id: [id_len]u8 = undefined;
+    var i: usize = 0;
+    while (i < default_effective_sessions) : (i += 1) {
+        var node_buf: [32]u8 = undefined;
+        const node = try std.fmt.bufPrint(&node_buf, "n{d}", .{i});
+        const session = try store.begin(
+            std.testing.io,
+            node,
+            "p",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            1,
+            2,
+            "k",
+            50,
+            1,
+            1,
+            100,
+            1000,
+        );
+        if (i == 0) first_id = session.session_id;
+    }
+    try std.testing.expectError(error.DisklessSessionCapacity, store.begin(
+        std.testing.io,
+        "overflow",
+        "p",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        1,
+        2,
+        "k",
+        50,
+        1,
+        1,
+        100,
+        1000,
+    ));
+
+    // Terminal no longer counts toward admission; a new active slot is available.
+    try store.markBootConfigFetched(std.testing.io, &first_id);
+    var seq: u64 = 0;
+    const chain = [_]lifecycle.Phase{
+        .diskless_initrd_started,
+        .diskless_rootfs_downloading,
+        .diskless_rootfs_verified,
+        .diskless_rootfs_mounted,
+        .diskless_switching_root,
+        .diskless_agent_configuring,
+        .diskless_running,
+    };
+    var expected: lifecycle.Phase = .boot_config_fetched;
+    for (chain) |target| {
+        _ = try store.advanceEvent(std.testing.io, &first_id, expected, target, seq, 1200 + @as(i64, @intCast(seq)));
+        expected = target;
+        seq += 1;
+    }
+    try std.testing.expect(store.find(&first_id).?.phase.isTerminal());
+    try std.testing.expectEqual(@as(usize, default_effective_sessions - 1), store.activeAdmissionCount());
+
+    _ = try store.begin(
+        std.testing.io,
+        "after-terminal",
+        "p",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        1,
+        2,
+        "k",
+        50,
+        1,
+        1,
+        100,
+        2000,
+    );
+    try std.testing.expectEqual(@as(usize, default_effective_sessions), store.activeAdmissionCount());
+}
+
+test "v0.4 capacity: AgentPlan accepts 256 KiB and shares digest blobs" {
+    const secret = [_]u8{0x52} ** 32;
+    var store = Store.init(std.testing.allocator, &secret, "dep-plan", "");
+    defer store.deinit();
+    const body = try std.testing.allocator.alloc(u8, agent_plan_cap);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'x');
+    // Minimal JSON wrapper is not required; pin stores opaque bytes with digest.
+    const s1 = try store.begin(
+        std.testing.io,
+        "node-a",
+        "p",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        1,
+        2,
+        "k",
+        50,
+        1,
+        1,
+        100,
+        1000,
+    );
+    try store.pinAgentPlan(std.testing.io, &s1.session_id, body);
+    try std.testing.expectEqual(@as(usize, agent_plan_cap), s1.agentPlanLen());
+
+    const s2 = try store.begin(
+        std.testing.io,
+        "node-b",
+        "p",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        1,
+        2,
+        "k",
+        50,
+        1,
+        1,
+        100,
+        1000,
+    );
+    try store.pinAgentPlan(std.testing.io, &s2.session_id, body);
+    try std.testing.expectEqualSlices(u8, s1.agentPlanDigest(), s2.agentPlanDigest());
+    var blob_count: usize = 0;
+    var shared_refs: u32 = 0;
+    for (store.plan_blobs) |blob| {
+        if (blob.used) {
+            blob_count += 1;
+            shared_refs = blob.refs;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), blob_count);
+    try std.testing.expectEqual(@as(u32, 2), shared_refs);
+
+    const too_big = try std.testing.allocator.alloc(u8, agent_plan_cap + 1);
+    defer std.testing.allocator.free(too_big);
+    @memset(too_big, 'y');
+    try std.testing.expectError(error.AgentPlanTooLarge, store.pinAgentPlan(std.testing.io, &s2.session_id, too_big));
+}
+
+test "v0.4 capacity: 1024 active admission when effective raised" {
+    const secret = [_]u8{0x53} ** 32;
+    var store = Store.init(std.testing.allocator, &secret, "dep-1k", "");
+    defer store.deinit();
+    store.setEffective(1024);
+    var i: usize = 0;
+    while (i < 1024) : (i += 1) {
+        var node_buf: [32]u8 = undefined;
+        const node = try std.fmt.bufPrint(&node_buf, "n{d}", .{i});
+        _ = try store.begin(
+            std.testing.io,
+            node,
+            "p",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            1,
+            2,
+            "k",
+            50,
+            1,
+            1,
+            100,
+            1000,
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 1024), store.activeAdmissionCount());
+    try std.testing.expectError(error.DisklessSessionCapacity, store.begin(
+        std.testing.io,
+        "overflow",
+        "p",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        1,
+        2,
+        "k",
+        50,
+        1,
+        1,
+        100,
+        1000,
+    ));
 }

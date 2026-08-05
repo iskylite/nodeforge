@@ -165,6 +165,16 @@ pub fn build(b: *std.Build) void {
     v04_contract.addArtifactArg(initrd);
     const v04_contract_step = b.step("test-v0.4-contract", "Run the local v0.4 strict contract gate");
     v04_contract_step.dependOn(&v04_contract.step);
+
+    // Capacity workload only — same core module, filtered to "v0.4 workload" tests.
+    // Does not re-run CLI/HTTP/setup shell suites.
+    const workload_tests = b.addTest(.{
+        .root_module = core,
+        .filters = &.{"v0.4 workload"},
+    });
+    const run_workload = b.addRunArtifact(workload_tests);
+    const v04_capacity_step = b.step("test-v0.4-capacity", "Run v0.4 logical capacity workload (256/512/1024 waves)");
+    v04_capacity_step.dependOn(&run_workload.step);
 }
 
 fn commandOutput(b: *std.Build, argv: []const []const u8) ?[]const u8 {

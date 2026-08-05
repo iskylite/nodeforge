@@ -779,28 +779,40 @@ pub const Store = struct {
     /// 调用方负责将 destination 中的记录写入事件日志。过期不影响已获得
     /// capability 的 session（它们使用更长的 delivery TTL），只影响
     /// 未完成 bootstrap 的 session。
-    pub fn expire(self: *Store, mono_now: i64, utc_now: i64, destination: *[max_sessions]Session) usize {
+    /// Copy expired sessions into `destination` (length must be >= max_sessions or
+    /// at least the active set). Callers must allocate the buffer on the heap when
+    /// using the full compile-time ceiling; stack arrays of `max_sessions` Session
+    /// values are forbidden on real ARM deployments.
+    pub fn expire(self: *Store, mono_now: i64, utc_now: i64, destination: []Session) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
         var count: usize = 0;
         for (&self.sessions) |*session| {
             if (!session.active() or !sessionExpired(session, mono_now)) continue;
-            destination[count] = terminateLocked(session, .expired, mono_now, utc_now);
-            count += 1;
+            const terminated = terminateLocked(session, .expired, mono_now, utc_now);
+            if (count < destination.len) {
+                destination[count] = terminated;
+                count += 1;
+            }
             session.* = .{};
         }
         return count;
     }
 
     /// 在 daemon 有序停止前终止所有活动 session，拷贝终态记录供事件日志使用。
-    pub fn terminateAll(self: *Store, mono_now: i64, utc_now: i64, destination: *[max_sessions]Session) usize {
+    /// `destination` must be heap-allocated when sized to `max_sessions`.
+    /// Sessions are always cleared even when `destination` is empty/full.
+    pub fn terminateAll(self: *Store, mono_now: i64, utc_now: i64, destination: []Session) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
         var count: usize = 0;
         for (&self.sessions) |*session| {
             if (!session.active()) continue;
-            destination[count] = terminateLocked(session, .daemon_shutdown, mono_now, utc_now);
-            count += 1;
+            const terminated = terminateLocked(session, .daemon_shutdown, mono_now, utc_now);
+            if (count < destination.len) {
+                destination[count] = terminated;
+                count += 1;
+            }
             session.* = .{};
         }
         return count;
@@ -821,12 +833,14 @@ pub const Store = struct {
         }
     }
 
-    pub fn snapshot(self: *Store, destination: *[max_sessions]Session) usize {
+    /// `destination` must be heap-allocated when sized to `max_sessions`.
+    pub fn snapshot(self: *Store, destination: []Session) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
         var count: usize = 0;
         for (self.sessions) |session| {
             if (!session.active() or !session.delivery_accepted) continue;
+            if (count >= destination.len) break;
             destination[count] = session;
             // Checkpoint projection never needs bearer material. Redact it
             // before the snapshot leaves the mutex so even a future serializer
@@ -1164,8 +1178,9 @@ test "capacity exhaustion remains explicit and bootstrap sessions expire" {
     const overflow = try store.acquireDhcp(std.testing.io, .{ .mac = &.{ 0, 1, 0, 0, 0, 1 }, .xid = 999, .node_id = null, .profile = null, .mode = null }, 1, 1);
     try std.testing.expectEqual(Link.capacity_exhausted, overflow.link);
 
-    var expired: [max_sessions]Session = undefined;
-    const count = store.expire(1 + bootstrap_ttl_seconds, 2, &expired);
+    const expired = try std.testing.allocator.alloc(Session, max_sessions);
+    defer std.testing.allocator.free(expired);
+    const count = store.expire(1 + bootstrap_ttl_seconds, 2, expired);
     try std.testing.expectEqual(@as(usize, 4), count);
     try std.testing.expectEqual(TerminalReason.expired, expired[0].terminal_reason.?);
 }

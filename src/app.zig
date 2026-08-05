@@ -144,14 +144,27 @@ pub fn run(
     var daemon_secret: [32]u8 = undefined;
     diskless_delivery.loadOrCreateSecret(io, allocator, paths.require().daemon_secret_path, &daemon_secret) catch
         return error.DisklessSecretUnavailable;
-    var diskless_store = diskless_delivery.Store.init(allocator, &daemon_secret, config.deployment_id orelse "", paths.require().diskless_delivery_path);
+    // Heap: active sessions + plan blobs + terminal summaries at the 2048 ceiling
+    // must not sit on the main thread stack (same class of ARM SIGSEGV as boot-session).
+    const diskless_store = try allocator.create(diskless_delivery.Store);
+    defer allocator.destroy(diskless_store);
+    diskless_store.* = diskless_delivery.Store.init(allocator, &daemon_secret, config.deployment_id orelse "", paths.require().diskless_delivery_path);
     defer diskless_store.deinit();
+    const capacity_policy = @import("state/capacity.zig");
+    // Structural slot ceiling (storage); product limit is the shared wave below.
+    diskless_store.setEffective(capacity_policy.store_ceiling);
+    const deployment_wave = try allocator.create(capacity_policy.DeploymentWaveAdmission);
+    defer allocator.destroy(deployment_wave);
+    deployment_wave.* = capacity_policy.DeploymentWaveAdmission.init(
+        capacity_policy.deploymentWaveCapacity(config.capacity.deployment_wave_max),
+    );
+    diskless_store.setWave(deployment_wave);
     const restored_diskless = diskless_store.load(io, boot_session.monotonicNow(), current_time) catch |err| {
         observe_log.err("diskless-delivery: refusing startup with invalid checkpoint: {t}", .{err});
         return err;
     };
     if (restored_diskless != 0)
-        observe_log.info("diskless-delivery: resumed {d} session(s)", .{restored_diskless});
+        observe_log.info("diskless-delivery: resumed {d} non-terminal session(s) (wave_limit={d})", .{ diskless_store.activeAdmissionCount(), deployment_wave.limit });
     // v0.2.3: SSH identity store。密钥生成/校验暂存目录先 mkdir 0700，再
     // fail-closed load：文件损坏、schema/长度/复合键违规、fingerprint 不匹配
     // 或 private/public 不成对时拒绝启动（与 diskless-secret 处理一致）。
@@ -200,6 +213,8 @@ pub fn run(
     const install_first_boot_store_value = try allocator.create(install_first_boot_store.Store);
     defer allocator.destroy(install_first_boot_store_value);
     install_first_boot_store_value.* = .{};
+    install_first_boot_store_value.setEffective(capacity_policy.store_ceiling);
+    install_first_boot_store_value.setWave(deployment_wave);
     // F4：加载 first-boot journal 时传入 daemon_secret，用于校验 secret 指纹。
     // 密钥轮换（secret 文件重建）后，旧 entry 的指纹不匹配，被标记为
     // recovery_incomplete，拒绝继续处理，要求节点重新发起 first-boot 交换。
@@ -207,6 +222,18 @@ pub fn run(
         error.FileNotFound => {},
         else => return err,
     };
+    // Reseed shared wave from durable non-terminal install + diskless counts.
+    // Never truncates: if config was lowered below in-flight occupancy, active may
+    // exceed limit and new admits stay fail-closed until drain.
+    deployment_wave.reseed(diskless_store.activeAdmissionCount() + install_first_boot_store_value.activeCount());
+    if (deployment_wave.overLimit()) {
+        observe_log.warn(
+            "capacity: deployment_wave restored active={d} exceeds limit={d}; refusing new install/diskless admits until in-flight nodes reach terminal",
+            .{ deployment_wave.count(), deployment_wave.limit },
+        );
+    } else {
+        observe_log.info("capacity: deployment_wave active={d} limit={d}", .{ deployment_wave.count(), deployment_wave.limit });
+    }
     const model_revision = try deployment_control.revisionForModel(allocator, config, catalog);
     const config_revision = model_revision.config;
     var live_config = try config_runtime.ConfigRuntime.init(allocator, config, config_revision);
@@ -242,7 +269,7 @@ pub fn run(
     // v0.4 schema 5 只恢复 delivery authority/绑定事实，随机 capability 不落盘。
     // install、diskless 都先与各自 durable state join；客户端重连后必须
     // 再次通过 peer-IP bootstrap 获取新 capability。
-    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, deployments, &diskless_store, sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
+    const restored_sessions = boot_session_store.load(io, allocator, paths.require().boot_sessions_path, config, catalog, deployments, diskless_store, sessions, current_time, boot_session.monotonicNow()) catch |err| switch (err) {
         error.FileNotFound => 0,
         else => {
             observe_log.err("boot-session: refusing invalid checkpoint: {t}", .{err});
@@ -346,7 +373,7 @@ pub fn run(
         discoveries,
         &operation_store,
         &rootfs_artifacts,
-        &diskless_store,
+        diskless_store,
         identities,
         install_post_journal_store,
         install_first_boot_store_value,
@@ -392,8 +419,13 @@ pub fn run(
 
     // worker 已退出后才终止活动 session，确保不会再有 DHCP/TFTP 事件引用它们；
     // 每个 session 仍单独写审计终态，随后才写全局 service.stopped。
-    var terminated: [boot_session.max_sessions]boot_session.Session = undefined;
-    const terminated_count = sessions.terminateAll(boot_session.monotonicNow(), now(), &terminated);
+    // Heap buffer: stack [max_sessions]Session is unsafe at the v0.4 ceiling.
+    const terminated = allocator.alloc(boot_session.Session, boot_session.max_sessions) catch null;
+    const terminated_count = if (terminated) |buf| sessions.terminateAll(boot_session.monotonicNow(), now(), buf) else blk: {
+        observe_log.err("boot-session: cannot allocate terminateAll buffer; clearing without event copies", .{});
+        break :blk sessions.terminateAll(boot_session.monotonicNow(), now(), &[_]boot_session.Session{});
+    };
+    defer if (terminated) |buf| allocator.free(buf);
     statuses.deactivateAll();
 
     // M3.1：最终保存 node-status.json，所有 session 标记为 inactive。
@@ -407,7 +439,7 @@ pub fn run(
             observe_log.err("status: final persistence failed: {t}", .{err});
     }
 
-    for (terminated[0..terminated_count]) |session| dhcp_server.emitSessionTermination(io, &persistence, session);
+    if (terminated) |buf| for (buf[0..terminated_count]) |session| dhcp_server.emitSessionTermination(io, &persistence, session);
 
     event_writer.appendWithFields(io, allocator, paths.require().events_path, "service.stopped", "orderly shutdown complete", &.{}) catch |err|
         observe_log.err("events: unable to record service stop: {t}", .{err});

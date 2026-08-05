@@ -258,6 +258,10 @@ pub const CapacityConfig = struct {
     /// 省略时按 config.nodes 数量派生；显式值只可放大派生值。
     /// 运行时仍受 2048 条编译期安全天花板约束。
     managed_entries: ?u32 = null,
+    /// Shared non-terminal install + diskless deployment wave limit.
+    /// Omitted => 512. Explicit values only enlarge the default; clamped to 2048.
+    /// This is the product admission budget — not a per-store duplicate quota.
+    deployment_wave_max: ?u32 = null,
     /// 单个 install boot session 可固定的完整 InstallPlan JSON 最大字节数。
     ///
     /// InstallPlan 保留 repository software_index.capabilities 的完整动态 slice，

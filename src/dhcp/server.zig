@@ -608,8 +608,13 @@ fn acquireSession(io: std.Io, persistence: ?*const Persistence, config: *const m
 /// session 只能等到下一次 DHCP 包才终止。
 fn expireSessions(io: std.Io, persistence: ?*const Persistence) void {
     const p = persistence orelse return;
-    var expired: [boot_session.max_sessions]boot_session.Session = undefined;
-    const count = p.sessions.expire(boot_session.monotonicNow(), now(), &expired);
+    // Heap buffer: stack [max_sessions]Session is unsafe at the v0.4 ceiling.
+    const expired = p.allocator.alloc(boot_session.Session, boot_session.max_sessions) catch {
+        observe_log.err("dhcp: cannot allocate expireSessions buffer", .{});
+        return;
+    };
+    defer p.allocator.free(expired);
+    const count = p.sessions.expire(boot_session.monotonicNow(), now(), expired);
     for (expired[0..count]) |session| emitSessionTermination(io, p, session);
 }
 

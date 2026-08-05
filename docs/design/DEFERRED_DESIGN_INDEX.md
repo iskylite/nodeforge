@@ -27,11 +27,12 @@
 |---|---|---|---|---|
 | `ENV-X86-VMWARE` / `V02-D01` | x86_64 VMware UEFI install/diskless 与 Rocky/Ubuntu 矩阵 | 当前 Apple Silicon + VMware Fusion 不能运行 x86_64 guest | x86_64 交叉编译、协议/架构 fixture、catalog/adapter/build 测试和静态审计 | 在 x86_64 VMware/物理机完成真实 PXE 产品链，Rocky/RHEL family 与 Ubuntu 至少各一次 E2E |
 | `ENV-V04-PRODUCTION-SCALE` | 256/512 台真实节点并发 install/diskless/mixed 的生产吞吐与完成时间 | 当前只有 r97n0/r97n1 双机，无法生成真实 firmware、DHCP/TFTP 风暴、并发 installer/rootfs 下载和交换机负载 | r97n1 单节点真实闭环；workload harness 的 256/512/1024 逻辑 session、admission、reaper、checkpoint、HTTP/TFTP 和资源回收 | 在记录 CPU/RAM/NVMe/NIC/交换机/地址池的规模环境中完成 256 与 512 台真实节点 install、diskless、mixed 矩阵并形成独立报告 |
+| `ENV-V04-RSS-STEADY` | 连续逻辑波次后真实 `nodeforged` 进程的 RSS 稳态与 allocator 高水位归因 | 本地 Zig 测试进程共享 testing/debug allocator、测试模块和 OS page cache；对象 leak、active/terminal、checkpoint、FD 与线程可以确定性校验，但测试进程 RSS 按轮增长不能区分产品泄漏、allocator freelist 与未归还 OS 的高水位页面 | 3×256 mixed 同 Node workload 的 allocator leak check 通过，active 回零，terminal summary、checkpoint、plan 目录、FD 与线程保持有界；继续记录当前/峰值 RSS，但不以测试进程 RSS 回落作为 v0.4 发布阻断条件 | 在 r97n0 上以独立候选 `nodeforged` 进程执行连续同 Node 波次，记录 allocator/OS、当前与峰值 RSS、checkpoint/compact；证明最后若干轮进入稳定带，或形成可复现的 allocator 高水位解释与站点容量预算 |
 | `ENV-TARGET-HARDWARE` | 依赖目标专用硬件的后续能力 | 本地无对应硬件或虚拟设备 | 模型、DTO、负向测试 | 在具备对应设备的环境建立专项验证记录 |
 
 这些项目不阻断当前版本。合成测试不能冒充目标环境 E2E；取得证据前，README、release note 和验证结论不得宣称相应生产环境已经验证。
 
-v0.4 当前边界是：r97n1 各完成至少一次真实 install 与 diskless 功能闭环；同一候选的 workload harness 完成 256 实现容量基线、512 标准合成扩展和 1024 合成压力验证。真实 256/512 节点规模验证仍保持 `ENV-V04-PRODUCTION-SCALE`。
+v0.4 当前边界是：r97n1 各完成至少一次真实 install 与 diskless 功能闭环；同一候选的 workload harness 完成 256 实现容量基线、512 标准合成扩展和 1024 合成压力验证，并对 allocator leak、active/terminal、checkpoint、plan 目录、FD 与线程执行确定性有界检查。真实 256/512 节点规模验证仍保持 `ENV-V04-PRODUCTION-SCALE`；测试进程 RSS 是否回落到稳定带单独按 `ENV-V04-RSS-STEADY` 验证，不能用来掩盖上述任一确定性资源增长。
 
 ## 3. 未排期、独立设计与上游阻塞
 

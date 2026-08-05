@@ -181,7 +181,9 @@ nodeforge profile rootfs status <profile> -o json
 - 随机 capability 已轮换；
 - rootfs 仍只由 r97n0 服务端 operation 处理。
 
-最后由 workload harness 连续执行 3 轮 256 mixed 逻辑波次，并各执行 1 轮 512 标准合成扩展和 1024 合成压力场景。跨波次采集 RSS、FD、线程、active/terminal session、operation/queue 数、journal/state 文件大小、checkpoint 写入量、DHCP/TFTP/HTTP 错误率与逻辑波次完成时间。每轮结束、全部逻辑节点进入终态并完成 retention/compact 后，资源应回到有界稳定区间，不得出现 session、queue、journal、FD、线程或 state 文件的未界定增长。本发布闸不要求等待固定小时数，也不要求启动 256/512 台真实 VM。
+最后由 workload harness 连续执行 3 轮 256 mixed 同 Node 逻辑波次，并各执行 1 轮 512 标准合成扩展和 1024 合成压力场景。跨波次采集当前/峰值 RSS、FD、线程、active/terminal session、operation/queue 数、journal/state 文件大小、checkpoint 写入量、DHCP/TFTP/HTTP 错误率与逻辑波次完成时间。每轮结束、全部逻辑节点进入终态并完成 retention/compact 后，allocator leak check、session、queue、journal、terminal summary、FD、线程、checkpoint、plan 目录和 state 文件必须保持确定性有界，不得出现未界定增长。
+
+测试进程 RSS 仍须原样记录和说明退化，但 Zig testing/debug allocator、同进程其他测试与 OS page cache 会保留已释放页面，仅凭 RSS 未回落不能区分产品泄漏与 allocator 高水位。独立候选 `nodeforged` 进程的连续波次 RSS 稳态按统一延期清单的 [`ENV-V04-RSS-STEADY`](../design/DEFERRED_DESIGN_INDEX.md) 补充验证，不单独使 v0.4 FAIL；若 allocator leak、checkpoint、terminal summary、FD、线程或其他确定性指标增长，仍必须判 FAIL，不能归入该延期项。本发布闸不要求等待固定小时数，也不要求启动 256/512 台真实 VM。
 
 ## 13. 发布结论
 

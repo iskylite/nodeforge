@@ -34,6 +34,7 @@ pub fn publicErrorCode(err: anyerror) ?[]const u8 {
         error.NodeDiscoveryCapacityExhausted,
         error.InventoryCapacityExhausted,
         error.IdentityStoreCapacity,
+        error.FirstBootJournalCapacity,
         => exhausted_code,
         else => null,
     };
@@ -143,6 +144,103 @@ pub fn managedCapacity(node_count: usize, config_override: ?u32) usize {
     return @max(cap, 1);
 }
 
+/// Shared non-terminal install + diskless deployment wave default (product limit).
+pub const deployment_wave_default: usize = 512;
+/// Legacy alias: diskless storage defaults track the wave default.
+pub const diskless_delivery_default: usize = deployment_wave_default;
+pub const first_boot_default: usize = deployment_wave_default;
+
+/// Shared wave capacity: one budget for non-terminal install + diskless nodes.
+/// Explicit override only enlarges the default; clamped to `store_ceiling`.
+pub fn deploymentWaveCapacity(config_override: ?u32) usize {
+    const derived = deployment_wave_default;
+    const cap = if (config_override) |o| @max(derived, @as(usize, o)) else derived;
+    return @min(@max(cap, 1), store_ceiling);
+}
+
+/// Structural diskless slot ceiling helper (not a separate product admission budget).
+pub fn disklessDeliveryCapacity(config_override: ?u32) usize {
+    return deploymentWaveCapacity(config_override);
+}
+
+/// Structural first-boot active slot helper (not a separate product admission budget).
+pub fn firstBootCapacity(managed: usize, config_override: ?u32) usize {
+    const derived = @max(first_boot_default, managed);
+    const cap = if (config_override) |o| @max(derived, @as(usize, o)) else derived;
+    return @min(@max(cap, 1), store_ceiling);
+}
+
+/// Daemon-level shared admission for non-terminal install + diskless deployments.
+/// Stores hold structural slots up to `store_ceiling`; this counter enforces the
+/// product wave limit (default 512, max 2048).
+///
+/// `active` is an atomic counter so lifecycle acquire/release and diagnostic
+/// readers (`count` / `remaining` / `overLimit`) never form a data race under
+/// Zig's memory model. `limit` is fixed after `init` and may be read plainly.
+pub const DeploymentWaveAdmission = struct {
+    active: std.atomic.Value(usize) = .init(0),
+    limit: usize = deployment_wave_default,
+
+    pub fn init(limit: usize) DeploymentWaveAdmission {
+        return .{ .limit = @max(@as(usize, 1), @min(limit, store_ceiling)) };
+    }
+
+    pub fn tryAcquire(self: *DeploymentWaveAdmission) !void {
+        // When restored active exceeds the configured limit (config lowered across
+        // restart), refuse new admits until real occupancy falls at/below limit.
+        while (true) {
+            const a = self.active.load(.acquire);
+            if (a >= self.limit) return error.CapacityExhausted;
+            if (self.active.cmpxchgWeak(a, a + 1, .acq_rel, .acquire) == null) return;
+        }
+    }
+
+    pub fn release(self: *DeploymentWaveAdmission) void {
+        while (true) {
+            const a = self.active.load(.acquire);
+            if (a == 0) return;
+            if (self.active.cmpxchgWeak(a, a - 1, .acq_rel, .acquire) == null) return;
+        }
+    }
+
+    /// After restore from disk, set active to the real sum of non-terminal
+    /// install+diskless. Never truncates to `limit`: in-flight objects must keep
+    /// counting even when config was lowered; `tryAcquire` stays fail-closed
+    /// until occupancy drops to/below the new limit.
+    pub fn reseed(self: *DeploymentWaveAdmission, active: usize) void {
+        self.active.store(active, .release);
+    }
+
+    pub fn count(self: *const DeploymentWaveAdmission) usize {
+        return self.active.load(.acquire);
+    }
+
+    pub fn remaining(self: *const DeploymentWaveAdmission) usize {
+        const a = self.active.load(.acquire);
+        return if (a >= self.limit) 0 else self.limit - a;
+    }
+
+    /// True when restored (or live) occupancy is above the configured product limit.
+    pub fn overLimit(self: *const DeploymentWaveAdmission) bool {
+        return self.active.load(.acquire) > self.limit;
+    }
+};
+
+/// AgentPlan / InstallFirstBootPlan wire DTO ceiling (bytes).
+pub const agent_plan_max_bytes: usize = 256 * 1024;
+
+/// Index checkpoint (sessions + digests + terminals) read ceiling.
+/// AgentPlan bodies are stored as separate content-addressed files and are not
+/// loaded through this limit. Sized for 2048 lightweight session records with
+/// JSON overhead, not for N×256 KiB plan bodies.
+pub const checkpoint_index_read_max_bytes: usize = 32 * 1024 * 1024;
+
+/// Legacy name kept for callers; equals the index ceiling after plan externalization.
+pub const checkpoint_read_max_bytes: usize = checkpoint_index_read_max_bytes;
+
+/// Single external plan file read ceiling (one AgentPlan body).
+pub const agent_plan_file_read_max_bytes: usize = agent_plan_max_bytes + 4096;
+
 /// TFTP 并发：config 覆盖优先，否则 max(128, 2×核)，封顶 u16。
 pub fn tftpConcurrency(cpu_count: usize, config_override: ?u16) u16 {
     if (config_override) |o| return o;
@@ -210,6 +308,87 @@ test "v0.4 Admission.tryAcquire exhausts with CapacityExhausted mapped to capaci
     try std.testing.expect(std.mem.indexOf(u8, exhaustedJsonBody(), "\"ok\":false") != null);
 }
 
+test "v0.4 diskless and first-boot capacity helpers honor defaults and ceiling" {
+    try std.testing.expectEqual(@as(usize, 512), deploymentWaveCapacity(null));
+    try std.testing.expectEqual(@as(usize, 1024), deploymentWaveCapacity(1024));
+    try std.testing.expectEqual(@as(usize, 512), deploymentWaveCapacity(64)); // never shrink below default
+    try std.testing.expectEqual(@as(usize, 2048), deploymentWaveCapacity(4096)); // clamp ceiling
+    try std.testing.expectEqual(@as(usize, 512), disklessDeliveryCapacity(null));
+    try std.testing.expectEqual(@as(usize, 512), firstBootCapacity(1, null));
+    try std.testing.expectEqual(@as(usize, 1024), firstBootCapacity(1024, null));
+    try std.testing.expectEqual(@as(usize, 2048), firstBootCapacity(100, 2048));
+    try std.testing.expectEqual(@as(usize, 256 * 1024), agent_plan_max_bytes);
+    // Index ceiling is far below N×256KiB plan bodies — bodies are external files.
+    try std.testing.expect(checkpoint_index_read_max_bytes < 256 * agent_plan_max_bytes);
+    try std.testing.expectEqual(checkpoint_index_read_max_bytes, checkpoint_read_max_bytes);
+}
+
+test "v0.4 shared deployment wave admits install+diskless under one limit" {
+    var wave = DeploymentWaveAdmission.init(4);
+    try wave.tryAcquire();
+    try wave.tryAcquire();
+    try wave.tryAcquire();
+    try wave.tryAcquire();
+    try std.testing.expectError(error.CapacityExhausted, wave.tryAcquire());
+    wave.release();
+    try wave.tryAcquire();
+    try std.testing.expectEqual(@as(usize, 4), wave.count());
+    wave.reseed(1);
+    try std.testing.expectEqual(@as(usize, 1), wave.count());
+}
+
+test "v0.4 reseed keeps real active above limit and blocks new admits until drain" {
+    var wave = DeploymentWaveAdmission.init(4);
+    // Checkpoint restored 6 non-terminal objects after config was lowered to 4.
+    wave.reseed(6);
+    try std.testing.expectEqual(@as(usize, 6), wave.count());
+    try std.testing.expect(wave.overLimit());
+    try std.testing.expectEqual(@as(usize, 0), wave.remaining());
+    try std.testing.expectError(error.CapacityExhausted, wave.tryAcquire());
+    // One terminal release → still above limit → still refuse.
+    wave.release();
+    try std.testing.expectEqual(@as(usize, 5), wave.count());
+    try std.testing.expectError(error.CapacityExhausted, wave.tryAcquire());
+    wave.release(); // 4
+    try std.testing.expectError(error.CapacityExhausted, wave.tryAcquire()); // active==limit
+    wave.release(); // 3
+    try wave.tryAcquire(); // back to limit
+    try std.testing.expectEqual(@as(usize, 4), wave.count());
+    try std.testing.expect(!wave.overLimit());
+}
+
+// Concurrent acquire/release + diagnostic reads must not data-race (atomic active).
+test "v0.4 DeploymentWaveAdmission concurrent acquire release and count" {
+    var wave = DeploymentWaveAdmission.init(64);
+    const Ctx = struct {
+        wave: *DeploymentWaveAdmission,
+        fn worker(ctx: *@This()) void {
+            var i: usize = 0;
+            while (i < 2000) : (i += 1) {
+                ctx.wave.tryAcquire() catch {
+                    _ = ctx.wave.count();
+                    _ = ctx.wave.remaining();
+                    _ = ctx.wave.overLimit();
+                    continue;
+                };
+                _ = ctx.wave.count();
+                _ = ctx.wave.remaining();
+                ctx.wave.release();
+            }
+        }
+    };
+    var ctx: Ctx = .{ .wave = &wave };
+    const t1 = try std.Thread.spawn(.{}, Ctx.worker, .{&ctx});
+    const t2 = try std.Thread.spawn(.{}, Ctx.worker, .{&ctx});
+    const t3 = try std.Thread.spawn(.{}, Ctx.worker, .{&ctx});
+    t1.join();
+    t2.join();
+    t3.join();
+    // All releases matched acquires → counter must drain to zero.
+    try std.testing.expectEqual(@as(usize, 0), wave.count());
+    try std.testing.expectEqual(@as(usize, 64), wave.remaining());
+}
+
 test "v0.4 DisklessSessionCapacity and SessionCapacityExhausted map to capacity.exhausted" {
     try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.DisklessSessionCapacity).?);
     try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.SessionCapacityExhausted).?);
@@ -217,6 +396,7 @@ test "v0.4 DisklessSessionCapacity and SessionCapacityExhausted map to capacity.
     try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.OperationCapacityExhausted).?);
     try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.NodeDiscoveryCapacityExhausted).?);
     try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.InventoryCapacityExhausted).?);
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.FirstBootJournalCapacity).?);
     try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.IdentityStoreCapacity).?);
     try std.testing.expect(publicErrorCode(error.OutOfMemory) == null);
     try std.testing.expect(publicErrorCode(error.FileNotFound) == null);

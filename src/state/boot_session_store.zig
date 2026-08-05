@@ -67,9 +67,16 @@ pub const File = struct {
 /// `chmod 600` 收紧权限，父目录设为 `700`。install plan 的引用计数在
 /// 序列化期间临时 retain，序列化完成或异常时 release。
 pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *boot_session.Store, utc_now: i64) !void {
-    var snapshot: [boot_session.max_sessions]boot_session.Session = undefined;
-    const count = store.snapshot(&snapshot);
-    defer for (snapshot[0..count]) |session| if (session.install_plan) |plan| plan.release();
+    // v0.4: never place [max_sessions]Session on the stack. On ARM with
+    // store_ceiling=2048 the temporary alone is large enough to SIGSEGV in
+    // memset during frame setup (observed on r97n0).
+    const snapshot = try allocator.alloc(boot_session.Session, boot_session.max_sessions);
+    var count: usize = 0;
+    defer {
+        for (snapshot[0..count]) |session| if (session.install_plan) |plan| plan.release();
+        allocator.free(snapshot);
+    }
+    count = store.snapshot(snapshot);
     const records = try allocator.alloc(Record, count);
     defer allocator.free(records);
     for (snapshot[0..count], 0..) |session, index| records[index] = .{
@@ -95,6 +102,24 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, path: []const u8, store: *
     try dhcp_store.atomicWrite(io, path, output.written());
     if (std.fs.path.dirname(path)) |parent| try chmod(io, allocator, "700", parent);
     try chmod(io, allocator, "600", path);
+}
+
+test "v0.4 checkpoint save uses heap snapshot for full ceiling without stack array" {
+    // Regression for r97n0 SIGSEGV: save must not place [max_sessions]Session on the stack.
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const dir = try temp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/boot-sessions.json", .{dir});
+    defer std.testing.allocator.free(path);
+
+    var store: boot_session.Store = .{};
+    defer store.deinit();
+    // Empty store save still exercises the heap allocation path.
+    try save(std.testing.io, std.testing.allocator, path, &store, 1_700_000_000);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"schema_version\": 5") != null or std.mem.indexOf(u8, bytes, "\"schema_version\":5") != null);
 }
 
 /// 调用 `chmod` 调整文件或目录权限。非零退出码返回 `PermissionUpdateFailed`。
@@ -347,6 +372,7 @@ test "schema 5 rejoins diskless delivery and rotates only its boot capability" {
     };
     var secret = [_]u8{2} ** 32;
     var diskless_store = diskless_delivery.Store.init(std.testing.allocator, &secret, "deployment", "");
+    defer diskless_store.deinit();
     const delivery = try diskless_store.begin(
         std.testing.io,
         "diskless-node",

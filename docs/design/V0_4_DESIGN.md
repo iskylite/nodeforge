@@ -240,6 +240,6 @@ v0.4 只有在以下条件全部满足时才可发布：
 4. r97n1 只下载 ready squashfs，initrd/agent 日志中没有 package-manager 或 squashfs 生成行为；
 5. topology、first-boot、discovery、容量、恢复和 v0.3 回归有真实证据；
 6. raw token 不进入 repository 请求、catalog、持久 state、日志或命令行；
-7. 关键资源边界与重复波次测试通过：workload harness 连续 3 轮 256 mixed 逻辑波次结束并完成 retention/compact 后，session、queue、journal、terminal summary、FD、线程、RSS 和 state 文件回到有界稳定区间；512 合成扩展通过，1024 合成压力档位给出资源曲线。不设置按小时计的发布闸，真实 256/512 节点生产规模验证不阻断 v0.4。
+7. 关键资源边界与重复波次测试通过：workload harness 连续 3 轮 256 mixed 同 Node 逻辑波次结束并完成 retention/compact 后，allocator leak check、session、queue、journal、terminal summary、FD、线程、checkpoint、plan 目录和 state 文件保持确定性有界；512 合成扩展通过，1024 合成压力档位给出资源曲线。测试仍采集当前/峰值 RSS，但测试进程受共享 allocator 与 OS 高水位页面影响，其跨轮回落稳态按统一延期清单的 `ENV-V04-RSS-STEADY` 在独立 `nodeforged` 进程验证，不单独阻断 v0.4，也不能替代其他资源边界。真实 256/512 节点生产规模验证仍按 `ENV-V04-PRODUCTION-SCALE` 延期。
 
 具体证据采集顺序见 [`V0_4_FULL_VALIDATION_RUNBOOK.md`](../validation/V0_4_FULL_VALIDATION_RUNBOOK.md)。

@@ -822,6 +822,18 @@ fn saveFirstBoot(context: *const RouteContext) !void {
     try context.install_first_boot.save(context.io, context.allocator, paths.require().install_first_boot_path);
 }
 
+/// Memory acknowledge, then durable save; only release shared wave after save
+/// commits. Undo on save failure restores the active entry while the wave slot
+/// remains held (no re-acquire race under concurrent admission).
+fn acknowledgeFirstBootDurable(context: *const RouteContext, node_id: []const u8, generation: u64, success: bool) !void {
+    var undo = try context.install_first_boot.acknowledge(node_id, generation, success);
+    saveFirstBoot(context) catch |err| {
+        context.install_first_boot.undoAcknowledge(&undo);
+        return err;
+    };
+    context.install_first_boot.commitAcknowledge(&undo);
+}
+
 fn firstBootResource(buffer: []u8, node_id: []const u8, generation: u64, plan_digest: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}/{d}/{s}", .{ node_id, generation, plan_digest });
 }
@@ -1301,8 +1313,7 @@ fn firstBootEvent(request: zap.Request, context: *const RouteContext, node_id: [
         const success = entry.journal.server == .succeeded;
         projectFirstBootTerminal(context, node_id, generation, success) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot publish first-boot terminal state\"}}\n", meta);
         if (entry.journal.local == .completed_pending_ack or entry.journal.local == .failed_pending_ack) {
-            try context.install_first_boot.acknowledge(node_id, generation, success);
-            try saveFirstBoot(context);
+            try acknowledgeFirstBootDurable(context, node_id, generation, success);
         }
         return requestWithNoContent(request, meta);
     }
@@ -1318,9 +1329,11 @@ fn firstBootEvent(request: zap.Request, context: *const RouteContext, node_id: [
     } else if (std.mem.eql(u8, parsed.value.event, "first_boot.succeeded") or std.mem.eql(u8, parsed.value.event, "first_boot.failed")) {
         const success = std.mem.eql(u8, parsed.value.event, "first_boot.succeeded");
         context.install_first_boot.terminal(node_id, generation, success, parsed.value.event_id) catch return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_conflict\",\"message\":\"first-boot terminal event was rejected (already terminal)\"}}\n", meta);
+        // Persist pending-ack first so crash mid-flight can resume; then durable acknowledge.
         try saveFirstBoot(context);
         projectFirstBootTerminal(context, node_id, generation, success) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"first_boot.persist_failed\",\"message\":\"cannot publish first-boot terminal state\"}}\n", meta);
-        try context.install_first_boot.acknowledge(node_id, generation, success);
+        try acknowledgeFirstBootDurable(context, node_id, generation, success);
+        return requestWithNoContent(request, meta);
     } else return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"first_boot.event_invalid\",\"message\":\"unknown first-boot event kind\"}}\n", meta);
     try saveFirstBoot(context);
     return requestWithNoContent(request, meta);
@@ -5487,7 +5500,7 @@ fn disklessBootConfig(request: zap.Request, context: *const RouteContext, node_i
             .safety_margin_bytes = session.safety_margin_bytes,
             .node_payload_size = node_payload_size,
         },
-        .agent_plan = .{ .url = agent_plan_url, .digest = session.agentPlanDigest(), .size = @intCast(session.agent_plan_len) },
+        .agent_plan = .{ .url = agent_plan_url, .digest = session.agentPlanDigest(), .size = @intCast(session.agentPlanLen()) },
         .event_url = event_url,
         .facts_url = facts_url,
         .expires_at = session.expires_at,
@@ -5767,8 +5780,10 @@ fn managementNodeRetry(request: zap.Request, context: *RouteContext, node_id: []
     const mono_now = boot_session.monotonicNow();
     const install_active = context.sessions.hasActiveNode(node_id, mono_now);
     var diskless_active = false;
-    var diskless_snapshot: [diskless_delivery.max_sessions]diskless_delivery.Session = undefined;
-    for (context.diskless_store.snapshot(&diskless_snapshot)) |session| if (std.mem.eql(u8, session.nodeId(), node_id) and !session.phase.isTerminal()) {
+    const diskless_snapshot = context.allocator.alloc(diskless_delivery.Session, diskless_delivery.max_sessions) catch
+        return json(request, .internal_server_error, "{\"ok\":false,\"error\":{\"code\":\"internal.error\",\"message\":\"out of memory\"}}\n", meta);
+    defer context.allocator.free(diskless_snapshot);
+    for (context.diskless_store.snapshot(diskless_snapshot)) |session| if (std.mem.eql(u8, session.nodeId(), node_id) and !session.phase.isTerminal()) {
         diskless_active = true;
         break;
     };
@@ -5836,8 +5851,9 @@ fn writeDisklessSession(writer: *std.Io.Writer, session: *const diskless_deliver
 }
 
 fn managementDisklessSessions(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
-    var snapshot: [diskless_delivery.max_sessions]diskless_delivery.Session = undefined;
-    const sessions = context.diskless_store.snapshot(&snapshot);
+    const snapshot = try context.allocator.alloc(diskless_delivery.Session, diskless_delivery.max_sessions);
+    defer context.allocator.free(snapshot);
+    const sessions = context.diskless_store.snapshot(snapshot);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     try output.writer.writeAll("{\"ok\":true,\"result\":{\"items\":[");
