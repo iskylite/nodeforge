@@ -609,7 +609,14 @@ pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]
     const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name}) catch return .{ .reachable = false, .healthy = false };
     var response: [16 * 1024]u8 = undefined;
     var location: [256]u8 = undefined;
-    var reply = managementPostJson(io, port, route, rendered, null, &response, &location) catch |err|
+    // Server requires If-Match when new_ssh_keys rotates identity + profile
+    // revision (see managementRootfsBuild). Cache-hit builds without rotation
+    // stay on the unconditioned POST path.
+    var reply = if (new_ssh_keys) blk: {
+        const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
+        break :blk postMutation(io, port, route, rendered, revision, &response, &location) catch |err|
+            return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+    } else managementPostJson(io, port, route, rendered, null, &response, &location) catch |err|
         return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
     if (reply.status == 0) return .{ .reachable = false, .healthy = false };
     if (reply.status < 200 or reply.status >= 300) {
@@ -660,7 +667,14 @@ pub fn rootfsBuildDetachJson(io: std.Io, port: u16, name: []const u8, if_input_d
         try std.fmt.bufPrint(&body, "{{\"new_ssh_keys\":{s}}}", .{if (new_ssh_keys) "true" else "false"});
     var path: [256]u8 = undefined;
     const route = try std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name});
-    const reply = try managementPostJson(io, port, route, rendered, null, output, null);
+    // Match rootfsBuild: identity rotation mutates catalog and requires If-Match.
+    const reply = if (new_ssh_keys) blk: {
+        const revision = catalogRevision(io, port) orelse {
+            _ = formatPlain(reason_buf, "http", "cannot read current catalog revision");
+            return null;
+        };
+        break :blk try postMutation(io, port, route, rendered, revision, output, null);
+    } else try managementPostJson(io, port, route, rendered, null, output, null);
     if (reply.status < 200 or reply.status >= 300) {
         if (reply.body) |err_body| _ = keepReasonOnly(reason_buf, formatErrorReason(reason_buf, err_body).reason);
         return null;
