@@ -593,7 +593,9 @@ fn route(request: zap.Request) !void {
         if (std.mem.eql(u8, method, "PATCH")) return managementDiscoveryPolicySet(request, context, meta);
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/discovery/observations")) return managementDiscoveryObservations(request, context, meta);
-    if (std.mem.eql(u8, method, "GET")) if (logicalPath(path, "/api/v1/management/discovery/observations/")) |mac| return managementDiscoveryObservation(request, context, mac, meta);
+    // Observation keys are MACs (`aa:bb:…`), not logical ids. logicalPath rejects
+    // colons via validLogicalId and would make `discovery show <mac>` always 404.
+    if (std.mem.eql(u8, method, "GET")) if (logicalMacPath(path, "/api/v1/management/discovery/observations/")) |mac| return managementDiscoveryObservation(request, context, mac, meta);
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/runtime/tftp")) {
         return tftpStatus(request, context.runtime, meta);
     }
@@ -672,6 +674,21 @@ fn logicalPath(path: []const u8, prefix: []const u8) ?[]const u8 {
     return if (config_validate.validLogicalId(value)) value else null;
 }
 
+/// Path segment for a MAC-keyed management resource.
+/// Accepts canonical `aa:bb:cc:dd:ee:ff` only; rejects traversal and percent-encoding.
+fn logicalMacPath(path: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const value = path[prefix.len..];
+    if (value.len != 17) return null;
+    if (std.mem.indexOfAny(u8, value, "/%?#") != null) return null;
+    for (value, 0..) |char, i| {
+        if (i % 3 == 2) {
+            if (char != ':') return null;
+        } else if (!std.ascii.isHex(char)) return null;
+    }
+    return value;
+}
+
 fn resourceWithSuffix(path: []const u8, prefix: []const u8, suffix: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
     const value = path[prefix.len .. path.len - suffix.len];
@@ -682,6 +699,17 @@ test "logical resource route accepts canonical dots but rejects encoded paths" {
     try std.testing.expectEqualStrings("ubuntu-22.04-install", logicalPath("/profiles/ubuntu-22.04-install", "/profiles/").?);
     try std.testing.expect(logicalPath("/profiles/ubuntu%2fescape", "/profiles/") == null);
     try std.testing.expect(logicalPath("/profiles/../escape", "/profiles/") == null);
+}
+
+test "discovery observation route accepts MAC path segments with colons" {
+    const prefix = "/api/v1/management/discovery/observations/";
+    try std.testing.expectEqualStrings("00:50:56:2a:23:db", logicalMacPath(prefix ++ "00:50:56:2a:23:db", prefix).?);
+    try std.testing.expectEqualStrings("AA:BB:CC:DD:EE:FF", logicalMacPath(prefix ++ "AA:BB:CC:DD:EE:FF", prefix).?);
+    try std.testing.expect(logicalMacPath(prefix ++ "0050562a23db", prefix) == null);
+    try std.testing.expect(logicalMacPath(prefix ++ "00%3A50%3A56%3A2a%3A23%3Adb", prefix) == null);
+    try std.testing.expect(logicalMacPath(prefix ++ "../escape", prefix) == null);
+    // logical ids still reject MACs (documents why a dedicated extractor is required)
+    try std.testing.expect(logicalPath(prefix ++ "00:50:56:2a:23:db", prefix) == null);
 }
 
 fn splitNodeRoute(tail: []const u8) ?NodeRoute {
