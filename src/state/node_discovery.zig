@@ -8,14 +8,17 @@ const std = @import("std");
 const model = @import("../model.zig");
 const dhcp_store = @import("dhcp_store.zig");
 
+/// discovery arm 槽位天花板（与 store_ceiling 对齐量级）。
 pub const max_states = 2048;
 pub const node_id_cap = 96;
 pub const serial_cap = 256;
 pub const error_cap = 256;
 pub const session_cap = 128;
 
+/// discovery arm 生命周期状态。
 pub const State = enum { pending, matched, failed, expired, cancelled };
 
+/// 单节点一次 discovery arm 的进程内/磁盘投影。
 pub const Entry = struct {
     used: bool = false,
     node_id: [node_id_cap]u8 = [_]u8{0} ** node_id_cap,
@@ -70,6 +73,7 @@ const DiskEntry = struct {
 };
 const File = struct { schema_version: u32 = 1, revision: u64 = 0, saved_at: i64 = 0, states: []const DiskEntry = &.{} };
 
+/// NodeDiscoveryState 持久化 store：与 catalog 分离的 arm 生命周期。
 pub const Store = struct {
     entries: [max_states]Entry = [_]Entry{.{}} ** max_states,
     revision: u64 = 0,
@@ -81,6 +85,7 @@ pub const Store = struct {
         return self.revision;
     }
 
+    /// 从 checkpoint 加载；schema 必须为 1，条数不超过 max_states。
     pub fn load(self: *Store, io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(2 * 1024 * 1024));
         defer allocator.free(bytes);
@@ -98,6 +103,7 @@ pub const Store = struct {
         self.revision = parsed.value.revision;
     }
 
+    /// 原子写回 checkpoint（compact 后的 used 条目）。
     pub fn save(self: *Store, io: std.Io, allocator: std.mem.Allocator, path: []const u8, now: i64) !void {
         var disk: [max_states]DiskEntry = undefined;
         lock(&self.mutex);
@@ -110,6 +116,7 @@ pub const Store = struct {
         try dhcp_store.atomicWrite(io, path, output.written());
     }
 
+    /// 按 node_id 查找 entry 快照（不因过期改写状态）。
     pub fn find(self: *const Store, node_id: []const u8, now: i64) ?Entry {
         _ = now;
         const mutable = @constCast(self);
@@ -121,10 +128,9 @@ pub const Store = struct {
         return null;
     }
 
-    /// Whether at least one arm is currently eligible to admit an unknown PXE
-    /// client. Expired pending entries are treated as inactive without
-    /// mutating the checkpoint; the next management read/start persists the
-    /// terminal projection.
+    /// 是否存在仍可接纳未知 PXE 客户端的 pending arm。
+    /// 过期 pending 视为 inactive，但不改写 checkpoint；下次管理面读/start
+    /// 再持久化终态投影。
     pub fn hasPending(self: *const Store, now: i64) bool {
         const mutable = @constCast(self);
         lock(&mutable.mutex);
@@ -133,6 +139,7 @@ pub const Store = struct {
         return false;
     }
 
+    /// 按序列号哈希查找唯一 pending arm；重复 SN 返回 null（歧义）。
     pub fn findPendingSerial(self: *const Store, serial: []const u8, now: i64) ?Entry {
         var hash: [64]u8 = undefined;
         serialHash(serial, &hash) catch return null;
@@ -143,15 +150,14 @@ pub const Store = struct {
         for (&self.entries) |*entry| {
             if (!entry.used or entry.state != .pending or entry.expires_at <= now) continue;
             if (!std.mem.eql(u8, entry.expected_serial_sha256[0..], hash[0..])) continue;
-            if (found != null) return null; // duplicate pending SN is ambiguous
+            if (found != null) return null; // 重复 pending SN 歧义
             found = entry.*;
         }
         return found;
     }
 
-    /// Locate a completed match for a bounded, idempotent facts replay. The
-    /// body digest is stored so a replay with changed optional facts cannot be
-    /// mistaken for the original terminal probe.
+    /// 定位已完成 match，供有界幂等 facts 重放。
+    /// 存储 body digest，避免可选 facts 变更被误当成原终态 probe。
     pub fn findMatchedFacts(self: *const Store, session_id: []const u8, facts_sha256: []const u8, now: i64) ?Entry {
         if (session_id.len == 0 or facts_sha256.len != 64) return null;
         const mutable = @constCast(self);
@@ -165,6 +171,7 @@ pub const Store = struct {
         return null;
     }
 
+    /// pending → matched，记录 probe session、MAC、arch 与 facts digest，并持久化。
     pub fn markMatched(self: *Store, io: std.Io, allocator: std.mem.Allocator, path: []const u8, node_id: []const u8, session_id: []const u8, mac: []const u8, arch: model.Arch, facts_sha256: []const u8, now: i64) !Entry {
         if (node_id.len == 0 or node_id.len > node_id_cap or session_id.len > session_cap or mac.len != 17 or facts_sha256.len != 64) return error.InvalidDiscoveryMatch;
         lock(&self.mutex);
@@ -187,6 +194,7 @@ pub const Store = struct {
     }
 
     pub const Start = struct { entry: Entry, reused: bool };
+    /// 启动或复用 discovery arm；同 revision+serial 的 pending 可幂等 reuse。
     pub fn start(self: *Store, io: std.Io, allocator: std.mem.Allocator, path: []const u8, node_id: []const u8, node_revision: u64, serial: []const u8, expires_in: i64, now: i64, allow_restart: bool) !Start {
         if (node_id.len == 0 or node_id.len > node_id_cap or serial.len == 0 or serial.len > serial_cap or expires_in <= 0 or expires_in > 7 * 24 * 60 * 60) return error.InvalidNodeDiscoveryRequest;
         var hash: [64]u8 = undefined;

@@ -37,7 +37,10 @@ git diff --check
 nodeforge profile rootfs plan --help-full
 nodeforge profile rootfs build --help-full
 nodeforge profile rootfs status --help-full
+nodeforge profile rootfs staging list --help-full
 ```
+
+可选运维特需（非发布阻断）：`build --keep-staging` 保留解包树，`build --from-staging` 再打包，`staging show/remove` 查询与清理；边界见设计文档 §1.1.1。
 
 ## 4. fresh 安装 r97n0
 

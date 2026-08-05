@@ -1,12 +1,19 @@
-//! NodeForge v0.4 target-network topology validator.
+//! # v0.4 目标网络拓扑校验器
 //!
-//! This module is deliberately independent of DHCP/PXE.  `node.mac` and
-//! `pxe.ip_reservation` describe the bootstrap transport; this validator only
-//! accepts the network that the installed or diskless target must adopt.
+//! 本模块刻意与 DHCP/PXE **解耦**：`node.mac` 与 `pxe.ip_reservation` 描述
+//! 的是 bootstrap 传输身份；本校验器只接受「装完后 / diskless 切换后」目标机
+//! 必须采用的目标网络（structured `interfaces`/`bonds`/`vlans`/`routes`）。
+//!
+//! 设计边界（见 `docs/design/V0_4_DESIGN.md`）：
+//! - 集合上限是协议硬边界，禁止静默截断过大 plan。
+//! - bond 成员口不得自带 L3；整网最多一个 DHCP L3 owner。
+//! - `deployable=true` 时要求 bootstrap MAC 落在 interfaces 上，且至少一条 L3。
+//! - 校验失败由调用方映射为 `network.invalid`，不得在渲染路径静默丢字段。
 
 const std = @import("std");
 const model = @import("../model.zig");
 
+/// structured topology 各集合的协议硬上限（不可通过配置放大）。
 pub const max_interfaces: usize = 64;
 pub const max_bonds: usize = 16;
 pub const max_vlans: usize = 64;
@@ -15,6 +22,8 @@ pub const max_dns: usize = 16;
 pub const max_search_domains: usize = 16;
 pub const max_bond_members: usize = 32;
 
+/// 拓扑校验失败码。调用方应映射为稳定公共错误（如 `network.invalid`），
+/// 不得吞掉后继续渲染。
 pub const ValidationError = error{
     TopologyTooLarge,
     InvalidLinkId,
@@ -57,9 +66,12 @@ pub const ValidationError = error{
     BootstrapMacMismatch,
 };
 
+/// 校验目标网络拓扑。
+///
+/// - `bootstrap_mac`：PXE/装机引导 MAC，仅在 `deployable=true` 且存在 interfaces 时强制匹配。
+/// - `deployable=false`：允许空/flat 拓扑（例如仅预约、尚未声明目标网）。
 pub fn validateNetwork(network: model.TargetNetworkConfig, bootstrap_mac: []const u8, deployable: bool) ValidationError!void {
-    // BOND-字段契约：structured collections 的上限是协议/plan 的硬边界，
-    // 不能通过截断来“修复”一个过大的 immutable plan。
+    // 集合上限是协议/plan 硬边界，不能靠截断“修复”过大的 immutable plan。
     if (network.interfaces.len > max_interfaces or network.bonds.len > max_bonds or
         network.vlans.len > max_vlans or network.routes.len > max_routes or
         network.dns.len > max_dns or network.search_domains.len > max_search_domains)
@@ -152,8 +164,10 @@ pub fn validateNetwork(network: model.TargetNetworkConfig, bootstrap_mac: []cons
     if (deployable and network.interfaces.len > 0 and !hasL3(network)) return error.MissingL3Link;
 }
 
+/// 查找 L3 归属时使用的精简链路视图（mode + 静态地址）。
 const Link = struct { mode: model.TopologyIpv4Mode, address: ?[]const u8, prefix_len: ?u8 };
 
+/// 校验单条链路的 IPv4 配置，并累计 DHCP/默认路由/静态地址去重表。
 fn validateIpv4(value: model.TopologyIpv4, dhcp_count: *usize, default_count: *usize, addresses: *[max_interfaces + max_bonds + max_vlans][]const u8, address_count: *usize) ValidationError!void {
     switch (value.mode) {
         .none => if (value.address != null or value.prefix_len != null) return error.UnexpectedIpv4Address,
@@ -175,6 +189,7 @@ fn validateIpv4(value: model.TopologyIpv4, dhcp_count: *usize, default_count: *u
     }
 }
 
+/// 是否存在任意 L3 归属（interface/bond/vlan 上 mode != none）。
 fn hasL3(network: model.TargetNetworkConfig) bool {
     for (network.interfaces) |i| if (i.ipv4.mode != .none) return true;
     for (network.bonds) |b| if (b.ipv4.mode != .none) return true;
@@ -195,6 +210,7 @@ fn findVlan(items: []const model.TopologyVlan, id: []const u8) ?model.TopologyVl
     return null;
 }
 
+/// 在 interfaces / bonds / vlans 中按 id 查找 L3 视图。
 fn findLink(network: model.TargetNetworkConfig, id: []const u8) ?Link {
     if (findInterface(network.interfaces, id)) |i| return .{ .mode = i.ipv4.mode, .address = i.ipv4.address, .prefix_len = i.ipv4.prefix_len };
     if (findBond(network.bonds, id)) |b| return .{ .mode = b.ipv4.mode, .address = b.ipv4.address, .prefix_len = b.ipv4.prefix_len };
@@ -202,18 +218,21 @@ fn findLink(network: model.TargetNetworkConfig, id: []const u8) ?Link {
     return null;
 }
 
+/// 向全局 link-id 表追加并拒绝重复。
 fn appendUniqueLink(buffer: *[max_interfaces + max_bonds + max_vlans][]const u8, count: *usize, value: []const u8) ValidationError!void {
     for (buffer.*[0..count.*]) |prior| if (std.mem.eql(u8, prior, value)) return error.DuplicateLinkId;
     buffer.*[count.*] = value;
     count.* += 1;
 }
 
+/// Linux 接口名约束：1–15 字符、字母开头、禁 `nf*` 前缀与保留名。
 fn validateLinkId(value: []const u8) ValidationError!void {
     if (value.len == 0 or value.len > 15 or !std.ascii.isAlphabetic(value[0]) or std.mem.startsWith(u8, value, "nf")) return error.InvalidLinkId;
     if (std.mem.eql(u8, value, "lo") or std.mem.eql(u8, value, "all") or std.mem.eql(u8, value, "default")) return error.InvalidLinkId;
     for (value) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return error.InvalidLinkId;
 }
 
+/// 仅接受 `aa:bb:cc:dd:ee:ff` 形式（小写十六进制 + 冒号）。
 fn validateMac(value: []const u8) ValidationError!void {
     if (value.len != 17) return error.InvalidMac;
     for (value, 0..) |c, i| if (i % 3 == 2) {
@@ -238,6 +257,7 @@ fn parseCidr(value: []const u8) !Cidr {
     const mask: u32 = if (prefix == 0) 0 else @as(u32, 0xffffffff) << @as(u5, @intCast(32 - prefix));
     return .{ .network = ip & mask, .prefix = prefix };
 }
+/// 静态地址场景下网关是否与链路同网段。
 fn sameSubnet(address: []const u8, other: []const u8, prefix: u8) bool {
     const a = parseIpv4(address) catch return false;
     const b = parseIpv4(other) catch return false;

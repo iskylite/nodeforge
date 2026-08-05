@@ -1,29 +1,30 @@
-//! v0.4 generation-bound first-boot journal store.
+//! # v0.4 generation 绑定的 first-boot journal 持久化 store
 //!
-//! F4 修复（v0.4 token 简化）：first-boot 确定性令牌依赖 `daemon_secret` 作为
-//! HMAC 主密钥。daemon 重启后，secret 从磁盘加载，令牌可确定性重建。但若
-//! secret 文件被删除/重建（密钥轮换），所有在途 first-boot 令牌将失效。
-//! 为检测此场景，store 在持久化时记录 secret 的 SHA-256 指纹（非 secret 本身）；
-//! 加载时比对当前 secret 指纹，不匹配则将该 entry 标记为 `recovery_incomplete`，
-//! 拒绝继续处理，要求节点重新发起 first-boot 交换。
+//! 进程内固定槽 + 原子 JSON checkpoint。活跃 entry 占用结构槽与可选共享波次；
+//! 终态 acknowledge 后迁入 `terminal_summaries`，释放 active 槽供同 node 新 generation。
+//!
+//! F4（v0.4 token 简化）：first-boot 确定性令牌依赖 `daemon_secret` 作 HMAC 主密钥。
+//! daemon 重启后 secret 从磁盘加载，令牌可确定性重建。若 secret 被删除/重建
+//! （密钥轮换），在途令牌全部失效。store 持久化 secret 的 SHA-256 指纹（非明文）；
+//! 加载时比对，不匹配则标记 `recovery_incomplete`，要求节点重新 handoff。
 
 const std = @import("std");
 const journal = @import("install_first_boot.zig");
 const capacity = @import("capacity.zig");
 const dhcp_store = @import("dhcp_store.zig");
 
-// Re-export for callers that set shared wave admission.
+// 供绑定共享波次准入的调用方使用。
 
-/// Compile-time ceiling (active + terminal projection slots each).
+/// 编译期槽位天花板（active 与 terminal 投影各一份）。
 pub const max_entries = capacity.store_ceiling;
-/// Design default effective active admission before managed-capacity expansion.
+/// 设计默认有效活跃准入（在 managed 扩容前）。
 pub const default_effective = capacity.first_boot_default;
 pub const node_cap = 96;
 pub const digest_cap = 64;
 pub const event_cap = 96;
 pub const fingerprint_cap = 64;
-/// schema 3: active entries + terminal_summaries; acknowledged gens free active slots.
-/// schema 2 still loads (all entries treated as active until acknowledged).
+/// schema 3：active entries + terminal_summaries；已 ack 的 gen 释放 active 槽。
+/// schema 2 仍可加载（全部 entry 视为 active，直到 ack）。
 pub const schema_version: u32 = 3;
 
 pub const Entry = struct {
@@ -85,7 +86,7 @@ const DiskFile = struct {
     terminal_summaries: []const DiskTerminal = &.{},
 };
 
-/// Durable terminal fact after acknowledge; does not consume active admission.
+/// acknowledge 后的持久终态事实；不占用 active 准入。
 pub const TerminalSummary = struct {
     used: bool = false,
     node_id: [node_cap]u8 = [_]u8{0} ** node_cap,
@@ -118,21 +119,24 @@ pub fn secretFingerprint(buffer: *[fingerprint_cap]u8, secret: []const u8) []con
 pub const Store = struct {
     entries: [max_entries]Entry = [_]Entry{.{}} ** max_entries,
     terminals: [max_entries]TerminalSummary = [_]TerminalSummary{.{}} ** max_entries,
-    /// Structural active slot ceiling. Product wave limit is `wave` when set.
+    /// 结构 active 槽上限。产品波次上限在绑定 `wave` 时由共享准入执行。
     effective: usize = default_effective,
     wave: ?*capacity.DeploymentWaveAdmission = null,
     revision: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
 
+    /// 设置结构槽上限；不得低于当前 active，也不得超过 max_entries。
     pub fn setEffective(self: *Store, value: usize) void {
         const active = self.activeCountUnlocked();
         self.effective = @max(active, @max(@as(usize, 1), @min(value, max_entries)));
     }
 
+    /// 绑定共享部署波次准入（install+diskless 共用）。
     pub fn setWave(self: *Store, wave: *capacity.DeploymentWaveAdmission) void {
         self.wave = wave;
     }
 
+    /// 当前占用的 active entry 数。
     pub fn activeCount(self: *const Store) usize {
         return self.activeCountUnlocked();
     }

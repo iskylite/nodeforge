@@ -67,11 +67,11 @@ pub fn generatedConfig(p: *const paths_mod.Paths, network: Network) model.AppCon
 /// 错误时部分目录可能已创建，但 `setup` 的幂等性保证重试可完成。
 pub fn repairDirectories(io: std.Io, allocator: std.mem.Allocator, p: *const paths_mod.Paths) !void {
     const cwd = std.Io.Dir.cwd();
-    inline for (.{ p.bin_dir, p.systemd_dir, p.config_dir, p.catalog_dir, p.state_dir, p.logs_dir, p.iso_dir, p.boot_dir, p.repos_dir, p.repository_indexes_dir, p.keys_dir, p.initrd_dir, p.rootfs_dir, p.bundles_dir, p.provisioned_dir, p.run_dir, p.work_dir, p.import_dir, p.model_transactions_dir }) |directory|
+    inline for (.{ p.bin_dir, p.systemd_dir, p.config_dir, p.catalog_dir, p.state_dir, p.logs_dir, p.iso_dir, p.boot_dir, p.repos_dir, p.repository_indexes_dir, p.keys_dir, p.initrd_dir, p.rootfs_dir, p.bundles_dir, p.provisioned_dir, p.run_dir, p.work_dir, p.import_dir, p.rootfs_staging_dir, p.model_transactions_dir }) |directory|
         try cwd.createDirPath(io, directory);
     inline for (.{ p.install_root, p.bin_dir, p.systemd_dir, p.logs_dir, p.assets_dir, p.iso_dir, p.boot_dir, p.repos_dir, p.repository_indexes_dir, p.initrd_dir, p.rootfs_dir, p.bundles_dir }) |directory|
         try chmod(io, allocator, "750", directory);
-    inline for (.{ p.config_dir, p.catalog_dir, p.state_dir, p.keys_dir, p.provisioned_dir, p.run_dir, p.work_dir, p.import_dir, p.model_transactions_dir }) |directory|
+    inline for (.{ p.config_dir, p.catalog_dir, p.state_dir, p.keys_dir, p.provisioned_dir, p.run_dir, p.work_dir, p.import_dir, p.rootfs_staging_dir, p.model_transactions_dir }) |directory|
         try chmod(io, allocator, "700", directory);
 }
 

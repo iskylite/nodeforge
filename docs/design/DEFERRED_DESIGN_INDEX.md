@@ -1,7 +1,7 @@
 # NodeForge 统一延期、保留与非目标清单
 
 状态：当前唯一权威登记表
-更新日期：2026-08-05
+更新日期：2026-08-06
 
 本文统一回答“现在不做或当前不能验证的事项在哪里、为什么不进入发布闸、什么条件下可以重新进入”。版本设计只描述该版本确定实施和可执行验收的内容；所有环境延期、规模延期、未排期设计、上游阻塞、可选证据、拒绝路径和永久非目标都只在本表维护状态。
 
@@ -49,6 +49,14 @@ v0.4 当前边界是：r97n1 各完成至少一次真实 install 与 diskless �
 | `V02-D12` Profile history / `--from-revision` | `UNSCHEDULED` | [`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md) | 当前无产品需求 | 明确历史保留、GC、查询和 clone 语义 |
 | rootfs cache GC | `UNSCHEDULED` | [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) | 当前只增不删并提供容量观测 | 获得真实容量数据后设计引用、并发删除与恢复规则 |
 | identity revision GC | `UNSCHEDULED` | [`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) | 当前保留历史无引用 revision，不进入既有版本完成闸 | 与 Profile history/retention 一起设计引用证明、并发删除和崩溃恢复 |
+| rootfs staging 会话（enter/exec、cgroup 挂载与限额、树内核导入） | 已排入 **v0.4.1**（设计中） | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) | 不再作为延期项；正式 CLI 为 `profile rootfs staging …`；**含** cgroup 限额参数；**不含** `pivot_root` 与顶层 `rootfs` 命令。实现与发布闸以 v0.4.1 设计为准，不阻断 v0.4；其余本版不含项见 `V041-D02`…`V041-D08` | v0.4.1 完成标准见该设计 §10 |
+| `V041-D01` staging 会话 `pivot_root` 切根 | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §3.2 / §5.3 | **从 v0.4.1 移出**。本版仅 `chroot`；更强隔离无产品需求与完成闸 | 明确隔离/安全需求后重新设计 pivot 序列、umount 旧根与失败清理，再排期 |
+| `V041-D02` staging 会话 net ns 隔离（`--net-isolated`） | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §4.1 | **从 v0.4.1 移出**；默认共享 host 网，隔离需自建连通性，无产品需求与完成闸 | 明确 net 隔离/连通性需求后设计 veth+NAT 与 DNS 契约，再排期 |
+| `V041-D03` staging 会话 cgroup `--io-max` 限额 | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §3.6 | **从 v0.4.1 移出**；本版交付 memory/swap/cpu/pids，io 限额实现难度高且无阻断场景 | 明确打盘带宽限制需求后设计 `io.max` 语义与 fail-closed，再排期 |
+| `V041-D04` staging 会话只读多读者 `--shared` | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §7.1 | **从 v0.4.1 移出**；首版仅排他锁，无多读者需求 | 明确并发只读消费方后设计共享锁与隔离契约，再排期 |
+| `V041-D05` staging HTTP 非交互 API（`exec` / `kernels`） | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §8 | **从 v0.4.1 移出**；首版仅 `nodeforge` 本机特权 CLI，无远程触发需求 | 明确远程触发/operation 日志消费方后设计鉴权与 worker 契约，再排期 |
+| `V041-D06` `rootfs-stagings.json` 索引可选字段（`last_session_at` / `detected_kernels`） | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §8 | **从 v0.4.1 移出**；首版只扫磁盘不写回，字段无消费方 | 明确索引字段消费方后设计 schema 版本与失效策略，再排期 |
+| `V041-D07` staging status 暴露 `session_active` | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §7.3 | **从 v0.4.1 移出**；非阻塞观测无消费方 | 明确状态观测消费方后设计 status 契约，再排期 |
 
 三项独立保留设计彼此不绑定：BIOS 不等于 static PXE，`ram_rootfs` 也不改变 firmware、bootloader 或 bootstrap 协议。
 
@@ -58,6 +66,8 @@ v0.4 当前边界是：r97n1 各完成至少一次真实 install 与 diskless �
 |---|---|---|
 | `V02-D02` 每个候选重复跑 QEMU | `OPTIONAL-EVIDENCE` | VMware 已证明同一产品链时不要求；仅用于诊断、故障注入或补充证据 |
 | `V02-D03` Ubuntu rootfs 内 `mkinitramfs` 方案 B | `REJECTED-PATH` | 不是生产路径；历史实验仅供追溯 |
+| 顶层 `nodeforge rootfs …` 命令树 | `REJECTED-PATH` | 违背资源-动作树（rootfs 归属 Profile）；正式面保持 `profile rootfs staging …`；见 [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §3.5；不得以别名半实现 |
+| `V041-D08` staging WebSocket / 远程 TTY | `REJECTED-PATH` | 明确不做：交互终端仅本机 `nodeforge` CLI（TTY 即当前终端），不做 `nodeforged` 网页/远程 TTY 服务；见 [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §3.4 |
 | `V02-D13` reconciliation、远程任务/通用命令、长期 enrollment | `PERMANENT-NONGOAL` | 违反一次性确定执行器和短期交付凭据边界 |
 | `V02-D14` IPv6、NFS root、iPXE | `PERMANENT-NONGOAL` | 已由现行顶层设计冻结为永久非目标；旧 backlog 的 `UNSCHEDULED` 状态被本文取代 |
 | 跨不可信网络的服务形态、持久化 overlay、by-id/serial/WWN 磁盘 selector | `PERMANENT-NONGOAL` | 不进入保留队列，也不预留 schema |

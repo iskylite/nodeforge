@@ -80,6 +80,9 @@ pub const Paths = struct {
     work_dir: []const u8,
     /// ISO 导入暂存子目录（`<root>/work/import`）。
     import_dir: []const u8,
+    /// v0.4 可选保留的 rootfs 构建解包树根（`<root>/work/rootfs-staging/<digest>/`）。
+    /// 仅 `profile rootfs build --keep-staging` 时写入；供 chroot 特需与 `--from-staging` 再打包。
+    rootfs_staging_dir: []const u8,
     /// 启动配置文件路径（`<root>/config/config.json`）。
     config_path: []const u8,
     /// DHCP lease 持久化文件路径（`<root>/state/leases.json`）。
@@ -103,6 +106,9 @@ pub const Paths = struct {
     /// nodeforged 已发布 ready rootfs 索引路径（`<root>/state/rootfs-artifacts.json`）。
     /// 记录已构建 diskless rootfs 的内容寻址制品（digest/sha512/size）。
     rootfs_artifacts_path: []const u8,
+    /// v0.4 rootfs 保留树索引（`<root>/state/rootfs-stagings.json`）。
+    /// 记录 digest→绝对路径/kept_at 等元数据，与 squashfs 制品索引分离。
+    rootfs_stagings_path: []const u8,
     /// Diskless delivery session checkpoint。只保存 capability hash/claim，
     /// 不保存可直接使用的 raw token。
     diskless_delivery_path: []const u8,
@@ -314,6 +320,7 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .run_dir = try join(allocator, root, "run"),
         .work_dir = try join(allocator, root, "work"),
         .import_dir = try join(allocator, root, "work/import"),
+        .rootfs_staging_dir = try join(allocator, root, "work/rootfs-staging"),
         .config_path = try join(allocator, root, "config/config.json"),
         .leases_path = try join(allocator, root, "state/leases.json"),
         .node_status_path = try join(allocator, root, "state/node-status.json"),
@@ -323,6 +330,7 @@ fn derive(allocator: std.mem.Allocator, root: []const u8) !Paths {
         .node_discovery_path = try join(allocator, root, "state/node-discovery.json"),
         .operations_path = try join(allocator, root, "state/operations.json"),
         .rootfs_artifacts_path = try join(allocator, root, "state/rootfs-artifacts.json"),
+        .rootfs_stagings_path = try join(allocator, root, "state/rootfs-stagings.json"),
         .diskless_delivery_path = try join(allocator, root, "state/diskless-delivery.json"),
         .daemon_secret_path = try join(allocator, root, "state/diskless-secret"),
         .identity_store_path = try join(allocator, root, "state/identities.json"),

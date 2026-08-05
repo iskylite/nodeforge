@@ -137,6 +137,20 @@ pub fn run(
         },
         else => return err,
     };
+    // v0.4：可选 rootfs 保留树索引（keep-staging / from-staging）。损坏 fail-closed。
+    var rootfs_stagings = @import("state/rootfs_staging_store.zig").Store.init(allocator, paths.require().rootfs_stagings_path);
+    defer rootfs_stagings.deinit();
+    rootfs_stagings.load(io) catch |err| switch (err) {
+        error.InvalidRootfsStagingStore => {
+            observe_log.err("rootfs-stagings: refusing startup with invalid state: {t}", .{err});
+            return err;
+        },
+        else => return err,
+    };
+    std.Io.Dir.cwd().createDirPath(io, paths.require().rootfs_staging_dir) catch |err| {
+        observe_log.err("rootfs-stagings: cannot create staging dir: {t}", .{err});
+        return err;
+    };
     // daemon_secret：daemon 进程级主密钥（32 字节随机，0600，持久化于
     // state/diskless-secret）。它只用于跨网络/重启边界的 durable event 与
     // first-boot 凭证。随机 boot-session capability 仅存在于内存，不由该
@@ -373,6 +387,7 @@ pub fn run(
         discoveries,
         &operation_store,
         &rootfs_artifacts,
+        &rootfs_stagings,
         diskless_store,
         identities,
         install_post_journal_store,

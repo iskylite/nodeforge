@@ -1,7 +1,13 @@
-//! v0.4 install first-boot server/local journal reducers.
+//! # v0.4 装机 first-boot 服务端/本地 journal 归约器
+//!
+//! 纯状态机：不碰磁盘、不签发 token。服务端 `ServerState` 与目标侧
+//! `LocalState` 同结构体推进，顺序强制为
+//! handoff → started → steps → terminal → acknowledge。
+//! 事件 id 幂等重放；id 漂移返回 `FirstBootReplay`。
 
 const std = @import("std");
 
+/// 服务端视角的 generation first-boot 状态。
 pub const ServerState = enum {
     not_required,
     pending_handoff,
@@ -14,6 +20,7 @@ pub const ServerState = enum {
     recovery_incomplete,
 };
 
+/// 目标机视角（与 provision/install_first_boot.LocalState 语义对齐）。
 pub const LocalState = enum {
     pending,
     started,
@@ -25,6 +32,7 @@ pub const LocalState = enum {
     recovery_incomplete,
 };
 
+/// 双端 journal 快照；由 store 持久化，本模块只做合法迁移。
 pub const Journal = struct {
     server: ServerState = .pending_handoff,
     local: LocalState = .pending,
@@ -36,19 +44,21 @@ pub const Journal = struct {
     terminal_event_id: ?[]const u8 = null,
     completed_step_count: usize = 0,
 
+    /// 装机 handoff 成功：pending_handoff → handoff_complete。
     pub fn handoff(self: *Journal) !void {
         if (self.server != .pending_handoff) return error.FirstBootStateConflict;
         self.server = .handoff_complete;
     }
 
+    /// 上报 started；同 event_id 幂等，不同 id 记为 replay。
     pub fn started(self: *Journal, event_id: []const u8) !void {
         if (event_id.len == 0) return error.FirstBootEventInvalid;
         if (self.server == .started or self.server == .running) {
             if (std.mem.eql(u8, self.started_event_id orelse "", event_id)) return;
             return error.FirstBootReplay;
         }
-        // 单个 generation event token 由 capsule 直接交付；handoff 后即可上报
-        // started，不再引入 bootstrap→event 的交换状态。
+        // generation event token 由 capsule 直接交付；handoff 后即可上报 started，
+        // 不再引入 bootstrap→event 交换状态。
         if (self.server != .handoff_complete) return error.FirstBootStateConflict;
         self.started_event_id = event_id;
         self.server = .started;
@@ -56,6 +66,7 @@ pub const Journal = struct {
         self.event_seq += 1;
     }
 
+    /// 按 completed_step_count 顺序进入 running/step_running。
     pub fn beginStep(self: *Journal, expected_step: usize) !void {
         if (self.server != .started and self.server != .running) return error.FirstBootStateConflict;
         if (expected_step != self.completed_step_count) return error.FirstBootStepOrder;
@@ -63,12 +74,14 @@ pub const Journal = struct {
         self.local = .step_running;
     }
 
+    /// 当前步骤成功，completed_step_count++。
     pub fn stepSucceeded(self: *Journal) !void {
         if (self.local != .step_running) return error.FirstBootStateConflict;
         self.completed_step_count += 1;
         self.local = .started;
     }
 
+    /// 写入终态；同 event_id 幂等。
     pub fn terminal(self: *Journal, success: bool, event_id: []const u8) !void {
         if (event_id.len == 0) return error.FirstBootEventInvalid;
         if (self.terminal_event_id) |existing| {
@@ -82,12 +95,14 @@ pub const Journal = struct {
         self.event_seq += 1;
     }
 
+    /// 服务端确认终态，释放后续 active 槽位（由 store 配合）。
     pub fn acknowledgeTerminal(self: *Journal, success: bool) !void {
         if (success and self.local != .completed_pending_ack) return error.FirstBootStateConflict;
         if (!success and self.local != .failed_pending_ack) return error.FirstBootStateConflict;
         self.local = if (success) .completed_acknowledged else .failed_acknowledged;
     }
 
+    /// secret 轮换或凭据丢失：两端进入 recovery_incomplete。
     pub fn markRecoveryIncomplete(self: *Journal) void {
         self.server = .recovery_incomplete;
         self.local = .recovery_incomplete;

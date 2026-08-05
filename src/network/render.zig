@@ -1,22 +1,24 @@
-//! v0.4 structured target-network renderer.
+//! # v0.4 结构化目标网络渲染器
 //!
-//! Canonical topology collections (`interfaces`/`bonds`/`vlans`/`routes` plus
-//! root DNS/search domains) must reach the target OS without silent field loss.
-//! This module is the single production renderer for:
-//! - install Ubuntu autoinstall netplan
-//! - install Kickstart %post NetworkManager materialization
+//! 规范拓扑集合（`interfaces`/`bonds`/`vlans`/`routes` 与根级 DNS/search domains）
+//! 必须完整落到目标 OS，**禁止静默丢字段**。本模块是生产路径的唯一渲染入口：
+//! - 装机 Ubuntu autoinstall netplan
+//! - 装机 Kickstart `%post` NetworkManager 物化（keyfile / ifcfg-rh）
 //! - diskless `node-apply renderNetwork`
 //!
-//! Flat single-NIC fields remain a compatibility path when structured
-//! collections are empty; callers branch with `hasStructured`.
+//! 当 structured 集合为空时，flat 单网卡字段仍是兼容路径；调用方用
+//! `hasStructured` 分支。渲染前应已通过 `topology.validateNetwork`。
 
 const std = @import("std");
 const model = @import("../model.zig");
 
+/// 是否声明了 structured 拓扑（任一 interface/bond/vlan 集合非空）。
 pub fn hasStructured(network: model.TargetNetworkConfig) bool {
     return network.interfaces.len > 0 or network.bonds.len > 0 or network.vlans.len > 0;
 }
 
+/// 渲染 netplan v2 YAML（Ubuntu autoinstall / diskless netplan 路径）。
+/// 返回调用方拥有的切片。
 pub fn renderNetplan(allocator: std.mem.Allocator, network: model.TargetNetworkConfig) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -64,6 +66,7 @@ pub fn renderNetplan(allocator: std.mem.Allocator, network: model.TargetNetworkC
     return out.toOwnedSlice();
 }
 
+/// 写入单条链路的 IPv4 段（none/dhcp/static + 归属路由 + DNS）。
 fn writeNetplanIpv4(w: *std.Io.Writer, network: model.TargetNetworkConfig, link_id: []const u8, ipv4: model.TopologyIpv4, indent: usize) !void {
     _ = indent;
     switch (ipv4.mode) {
@@ -77,8 +80,7 @@ fn writeNetplanIpv4(w: *std.Io.Writer, network: model.TargetNetworkConfig, link_
             try w.print("      addresses:\n        - {s}/{d}\n", .{ ipv4.address.?, ipv4.prefix_len.? });
             var wrote_routes = false;
             if (ipv4.default_route) {
-                // Default route via first route on this link if present; otherwise
-                // still emit a default route only when a matching route exists.
+                // 默认路由：仅当本链路上存在 destination 为 default/0.0.0.0/0 的 route 时写出。
                 for (network.routes) |route| {
                     if (!routeOwnsLink(route, link_id)) continue;
                     if (isDefaultDestination(route.destination)) {
@@ -122,13 +124,13 @@ fn writeNetplanNameservers(w: *std.Io.Writer, network: model.TargetNetworkConfig
     }
 }
 
-/// Render NetworkManager keyfile bodies for every structured link.
-/// Returns owned slices; caller frees via `freeKeyfiles`.
+/// NetworkManager keyfile 单文件（文件名 + 正文）；由 `renderNmKeyfiles` 分配。
 pub const Keyfile = struct {
     filename: []const u8,
     content: []const u8,
 };
 
+/// 释放 `renderNmKeyfiles` 返回的切片及其内容。
 pub fn freeKeyfiles(allocator: std.mem.Allocator, files: []Keyfile) void {
     for (files) |file| {
         allocator.free(file.filename);
@@ -137,6 +139,9 @@ pub fn freeKeyfiles(allocator: std.mem.Allocator, files: []Keyfile) void {
     allocator.free(files);
 }
 
+/// 为每条 structured 链路渲染 NetworkManager keyfile 正文。
+/// bond 成员额外生成 `*-slave.nmconnection`；L3 只挂在 bond/vlan 本体上。
+/// 返回拥有切片，调用方经 `freeKeyfiles` 释放。
 pub fn renderNmKeyfiles(allocator: std.mem.Allocator, network: model.TargetNetworkConfig) ![]Keyfile {
     var list: std.ArrayList(Keyfile) = .empty;
     errdefer {
@@ -179,7 +184,7 @@ pub fn renderNmKeyfiles(allocator: std.mem.Allocator, network: model.TargetNetwo
             },
         }
         if (bond.mtu) |mtu| try w.print("mtu={d}\n", .{mtu});
-        // Slave ethernet connections are separate; bond connection only owns L3.
+        // 从口连接单独成文件；bond 连接本体只承载 L3。
         try writeNmIpv4(w, network, bond.id, bond.ipv4);
         const body = try content.toOwnedSlice();
         errdefer allocator.free(body);
@@ -187,7 +192,7 @@ pub fn renderNmKeyfiles(allocator: std.mem.Allocator, network: model.TargetNetwo
         errdefer allocator.free(name);
         try list.append(allocator, .{ .filename = name, .content = body });
 
-        // Member links as bond-slave ethernet connections.
+        // bond 成员：ethernet + slave-type=bond，IPv4 关闭。
         for (network.interfaces) |iface| {
             if (!memberOf(bond.members, iface.id)) continue;
             var slave: std.Io.Writer.Allocating = .init(allocator);
@@ -257,12 +262,13 @@ fn writeNmDns(w: *std.Io.Writer, network: model.TargetNetworkConfig) !void {
     }
 }
 
-/// ifcfg-rh bodies (filename + content) for Rocky/RHEL NetworkManager ifcfg plugin.
+/// ifcfg-rh 单文件（Rocky/RHEL NetworkManager ifcfg 插件路径）。
 pub const IfcfgFile = struct {
     filename: []const u8,
     content: []const u8,
 };
 
+/// 释放 `renderIfcfg` 返回的切片及其内容。
 pub fn freeIfcfgFiles(allocator: std.mem.Allocator, files: []IfcfgFile) void {
     for (files) |file| {
         allocator.free(file.filename);
@@ -271,6 +277,8 @@ pub fn freeIfcfgFiles(allocator: std.mem.Allocator, files: []IfcfgFile) void {
     allocator.free(files);
 }
 
+/// 渲染 ifcfg-* 与 route-* 文件集合。
+/// 先写 bond 成员（明确 MASTER/SLAVE），再写独立以太网与 VLAN。
 pub fn renderIfcfg(allocator: std.mem.Allocator, network: model.TargetNetworkConfig) ![]IfcfgFile {
     var list: std.ArrayList(IfcfgFile) = .empty;
     errdefer {
@@ -281,7 +289,7 @@ pub fn renderIfcfg(allocator: std.mem.Allocator, network: model.TargetNetworkCon
         list.deinit(allocator);
     }
 
-    // Bond members first so MASTER/SLAVE is explicit.
+    // 先写 bond 成员，保证 MASTER/SLAVE 关系在文件集合中显式可见。
     for (network.bonds) |bond| {
         for (network.interfaces) |iface| {
             if (!memberOf(bond.members, iface.id)) continue;
@@ -397,11 +405,11 @@ fn maybeAppendRouteFile(allocator: std.mem.Allocator, list: *std.ArrayList(Ifcfg
     try list.append(allocator, .{ .filename = name, .content = body });
 }
 
+/// 路由是否归属指定链路。校验器已要求 `interface_id`；缺省时对单 L3 owner 兼容回落。
 fn routeOwnsLink(route: model.RouteConfig, link_id: []const u8) bool {
     if (route.interface_id) |id| return std.mem.eql(u8, id, link_id);
-    // Flat compatibility: routes without owner bind to every L3 link when only
-    // one structured L3 owner exists; multi-L3 without interface_id is rejected
-    // by the validator, so falling through is safe for single-owner cases.
+    // flat 兼容：无 owner 的 route 在校验器已拒绝多 L3 无 interface_id 后，
+    // 可安全绑定到唯一 L3 链路。
     return true;
 }
 

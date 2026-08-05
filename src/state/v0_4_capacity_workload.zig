@@ -1,9 +1,15 @@
-//! v0.4 logical capacity workload harness (no real PXE VMs).
+//! # v0.4 逻辑容量 workload harness（不启真实 PXE VM）
 //!
-//! Run alone: `zig build test-v0.4-capacity`
-//! Shared deployment-wave admission for install + diskless; 256/512/1024 waves;
-//! external AgentPlan files; structured [capacity-evidence] metrics (current RSS,
-//! peak RSS, FD, threads, checkpoint/dir sizes, ms-precision reload).
+//! 单独运行：`zig build test-v0.4-capacity`
+//!
+//! 覆盖：
+//! - install + diskless 共享部署波次准入（`DeploymentWaveAdmission`）
+//! - 256 / 512 / 1024 逻辑波次与 `capacity.exhausted` fail-closed
+//! - AgentPlan 正文外置；索引 checkpoint 不吃 N×256KiB
+//! - 结构化 `[capacity-evidence]`：当前/峰值 RSS、FD、线程、checkpoint/目录字节、重载毫秒
+//!
+//! 本模块证据是**逻辑节点** workload，不能冒充 256/512 台真实机生产吞吐
+//!（见延期项 `ENV-V04-PRODUCTION-SCALE`）。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,7 +23,7 @@ const rootfs_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const rootfs_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const plan_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Lifetime peak RSS in KiB (getrusage maxrss) — only rises; not for rollback proof.
+/// 进程生命周期峰值 RSS（KiB，getrusage maxrss）——只升不降，不能证明回落。
 fn samplePeakRssKb() usize {
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     const raw: i64 = usage.maxrss;
@@ -28,7 +34,7 @@ fn samplePeakRssKb() usize {
     };
 }
 
-/// Current resident set size in KiB (can fall after free/deinit). Best-effort.
+/// 当前常驻集大小（KiB）；free/deinit 后可下降。尽力而为。
 fn sampleCurrentRssKb() usize {
     const io = std.testing.io;
     switch (builtin.os.tag) {
@@ -51,6 +57,7 @@ fn sampleCurrentRssKb() usize {
     }
 }
 
+/// 从 /proc/self/status 文本解析 `key` 后的整数（如 VmRSS、Threads）。
 fn parseStatusKb(text: []const u8, key: []const u8) usize {
     const idx = std.mem.indexOf(u8, text, key) orelse return 0;
     var i = idx + key.len;
@@ -60,6 +67,7 @@ fn parseStatusKb(text: []const u8, key: []const u8) usize {
     return std.fmt.parseInt(usize, text[i..end], 10) catch 0;
 }
 
+/// 当前线程数（Linux /proc 或 macOS task_threads）。
 fn sampleThreadCount() usize {
     const io = std.testing.io;
     switch (builtin.os.tag) {
@@ -74,7 +82,7 @@ fn sampleThreadCount() usize {
             const task = std.c.mach_task_self();
             const kr = std.c.task_threads(task, &list, &count);
             if (kr != 0) return 0;
-            // Release each thread port right, then the kernel array.
+            // 释放每个线程 port right，再释放内核数组。
             var i: std.c.mach_msg_type_number_t = 0;
             while (i < count) : (i += 1) {
                 _ = std.c.mach_port_deallocate(task, list[i]);
@@ -87,7 +95,7 @@ fn sampleThreadCount() usize {
     }
 }
 
-/// Open FD count via /dev/fd or /proc/self/fd (best-effort; 0 if unavailable).
+/// 打开的 FD 数量（/dev/fd 或 /proc/self/fd；不可用则 0）。
 fn sampleFdCount() usize {
     const io = std.testing.io;
     var dir = std.Io.Dir.cwd().openDir(io, "/dev/fd", .{ .iterate = true }) catch
@@ -99,6 +107,7 @@ fn sampleFdCount() usize {
     return n;
 }
 
+/// 单文件表观字节数；失败返回 0。
 fn fileSizeBytes(path: []const u8) usize {
     if (path.len == 0) return 0;
     const io = std.testing.io;
@@ -108,6 +117,7 @@ fn fileSizeBytes(path: []const u8) usize {
     return @intCast(st.size);
 }
 
+/// 目录下一层普通文件总字节（非递归）。
 fn dirSizeBytes(path: []const u8) usize {
     if (path.len == 0) return 0;
     const io = std.testing.io;
@@ -129,11 +139,13 @@ fn nowMs() i64 {
     return std.Io.Clock.real.now(std.testing.io).toMilliseconds();
 }
 
+/// first-boot 终态 acknowledge 并 commit（测试辅助）。
 fn ackCommit(store: *install_first_boot_store.Store, node_id: []const u8, generation: u64) !void {
     var undo = try store.acknowledge(node_id, generation, true);
     store.commitAcknowledge(&undo);
 }
 
+/// 单波次证据快照，供 `assertEvidence` / `reportWave` 使用。
 const WaveEvidence = struct {
     tag: []const u8,
     wave: *const capacity.DeploymentWaveAdmission,
@@ -144,11 +156,11 @@ const WaveEvidence = struct {
     checkpoint_bytes: usize = 0,
     plan_dir_bytes: usize = 0,
     reload_ms: i64 = -1,
-    /// When true, require wave.count == diskless_active + install_active (no in-flight ack).
+    /// true 时要求 wave.count == diskless_active + install_active（无在途 ack）。
     require_wave_match: bool = true,
 };
 
-/// Hard gates for logical capacity evidence (not human-only log inspection).
+/// 逻辑容量证据硬闸（不仅靠人工读日志）。
 fn assertEvidence(ev: WaveEvidence) !void {
     const total = ev.diskless_active + ev.install_active;
     if (ev.require_wave_match) {
@@ -168,6 +180,7 @@ fn assertEvidence(ev: WaveEvidence) !void {
     }
 }
 
+/// 校验证据后打印 `[capacity-evidence]` 行（runbook 收集）。
 fn reportWave(ev: WaveEvidence) !void {
     try assertEvidence(ev);
     const total = ev.diskless_active + ev.install_active;
@@ -216,11 +229,13 @@ fn countInstallTerminals(store: *const install_first_boot_store.Store) usize {
     return n;
 }
 
+/// 断言错误映射到公共码 `capacity.exhausted`。
 fn expectCapacityExhaustedMapped(err: anyerror) !void {
     const code = capacity.publicErrorCode(err) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(capacity.exhausted_code, code);
 }
 
+/// 连续 begin 填充 `count` 个活跃 diskless session。
 fn fillDisklessWave(store: *diskless_delivery.Store, count: usize, name_prefix: []const u8) !void {
     var i: usize = 0;
     while (i < count) : (i += 1) {
@@ -244,6 +259,7 @@ fn fillDisklessWave(store: *diskless_delivery.Store, count: usize, name_prefix: 
     }
 }
 
+/// 将单个 diskless session 推到终态（canonical 事件链）。
 fn driveOneToTerminal(store: *diskless_delivery.Store, session_id: *const [diskless_delivery.id_len]u8) !void {
     try store.markBootConfigFetched(std.testing.io, session_id);
     var seq: u64 = 0;
@@ -264,6 +280,7 @@ fn driveOneToTerminal(store: *diskless_delivery.Store, session_id: *const [diskl
     }
 }
 
+/// 将 store 结构槽抬到 ceiling 并绑定共享波次准入。
 fn bindWave(diskless: *diskless_delivery.Store, first_boot: ?*install_first_boot_store.Store, wave: *capacity.DeploymentWaveAdmission) void {
     diskless.setEffective(capacity.store_ceiling);
     diskless.setWave(wave);
@@ -273,9 +290,9 @@ fn bindWave(diskless: *diskless_delivery.Store, first_boot: ?*install_first_boot
     }
 }
 
-/// Load a durable diskless checkpoint, assert every non-terminal session restored,
-/// and reseed a fresh shared-wave admission from the restored active count.
-/// Returns wall-clock reload duration in milliseconds plus the reseeded wave.
+/// 加载持久 diskless checkpoint，断言每个非终态 session 恢复，
+/// 并按恢复的 active 数 reseed 新的共享波次。
+/// 返回墙钟重载毫秒 + reseed 后的 wave。
 fn reloadDisklessCheckpoint(checkpoint: []const u8, expected_active: usize, wave_limit: usize) !struct { reload_ms: i64, wave: capacity.DeploymentWaveAdmission } {
     const after = try std.testing.allocator.create(diskless_delivery.Store);
     defer std.testing.allocator.destroy(after);
@@ -288,7 +305,7 @@ fn reloadDisklessCheckpoint(checkpoint: []const u8, expected_active: usize, wave
     try std.testing.expectEqual(expected_active, restored);
     try std.testing.expectEqual(expected_active, after.activeAdmissionCount());
 
-    // Enumerate every restored slot: all must be active, non-terminal, usable.
+    // 枚举每个恢复槽：须为 active、非终态、可用。
     var live: usize = 0;
     for (&after.sessions) |s| {
         if (!s.active) continue;
@@ -298,16 +315,16 @@ fn reloadDisklessCheckpoint(checkpoint: []const u8, expected_active: usize, wave
     }
     try std.testing.expectEqual(expected_active, live);
 
-    // Production restore path: reseed shared wave from real store occupancy.
+    // 生产恢复路径：按真实 store 占用 reseed 共享波次。
     var wave = capacity.DeploymentWaveAdmission.init(wave_limit);
     after.setWave(&wave);
     wave.reseed(after.activeAdmissionCount());
     try std.testing.expectEqual(expected_active, wave.count());
-    // At limit (or above), new admits stay fail-closed after reseed.
+    // 达限或超限时，reseed 后新准入仍 fail-closed。
     if (expected_active >= wave_limit) {
         try std.testing.expectEqual(@as(usize, 0), wave.remaining());
         try std.testing.expectError(error.CapacityExhausted, wave.tryAcquire());
-        // Store-bound begin must also fail closed under the reseeded wave.
+        // 绑定 store 的 begin 在 reseed 波次下同样 fail-closed。
         try std.testing.expectError(error.DisklessSessionCapacity, after.begin(
             std.testing.io,
             "reload-overflow",
@@ -327,8 +344,7 @@ fn reloadDisklessCheckpoint(checkpoint: []const u8, expected_active: usize, wave
     return .{ .reload_ms = t1 - t0, .wave = wave };
 }
 
-/// Bounded growth vs a post-retention baseline.
-/// `pct_num/pct_den` fractional headroom plus `absolute_slack`.
+/// 相对保留后基线的有界增长：`pct_num/pct_den` 比例余量 + `absolute_slack`。
 fn expectStableBand(value: usize, baseline: usize, pct_num: usize, pct_den: usize, absolute_slack: usize) !void {
     if (baseline == 0) return;
     const frac = if (pct_den == 0) 0 else (baseline * pct_num) / pct_den;
@@ -336,7 +352,7 @@ fn expectStableBand(value: usize, baseline: usize, pct_num: usize, pct_den: usiz
     try std.testing.expect(value <= allowed);
 }
 
-/// Durable size must stay essentially flat across same-Node reuse rounds.
+/// 同 Node 复用轮次中，持久化体积应基本持平。
 fn expectNearEqualSize(value: usize, baseline: usize, absolute_slack: usize) !void {
     if (baseline == 0 and value == 0) return;
     const hi = baseline + absolute_slack;
@@ -345,19 +361,18 @@ fn expectNearEqualSize(value: usize, baseline: usize, absolute_slack: usize) !vo
     try std.testing.expect(value >= lo);
 }
 
-/// Reject *runaway* RSS growth between successive post-release samples.
-/// Equal-sized freelist hops from JSON persist churn are expected under a
-/// process-global allocator; product retention bugs must show up as growing
-/// durable checkpoint / terminal counts (asserted separately). A second hop
-/// that is both large and substantially bigger than the first is not freelist
-/// noise — fail it.
+/// 拒绝连续释放采样之间的**失控** RSS 斜率。
+/// 进程级 allocator 下 JSON 持久化造成的等幅 freelist 跳动是预期的；
+/// 产品保留 bug 应体现为 checkpoint / terminal 计数增长（另有断言）。
+/// 第二次跳变既大又显著超过第一次时，不是 freelist 噪声——判 FAIL。
 fn expectNoRunawayRssSlope(delta_prev: usize, delta_now: usize) !void {
     const large: usize = 12 * 1024;
     if (delta_now <= large) return;
-    // Second hop must not exceed first by more than 4 MiB when already large.
+    // 第二次跳变在已较大时不得超过第一次 + 4 MiB。
     try std.testing.expect(delta_now <= delta_prev + 4 * 1024);
 }
 
+/// 将 install first-boot entry 推到 handoff→steps→terminal→ack。
 fn driveInstallToAck(store: *install_first_boot_store.Store, node: []const u8, gen: u64) !void {
     try store.handoff(node, gen);
     try store.started(node, gen, "s");
@@ -367,10 +382,9 @@ fn driveInstallToAck(store: *install_first_boot_store.Store, node: []const u8, g
     try ackCommit(store, node, gen);
 }
 
-/// Load first-boot checkpoint and verify active/terminal counts, fingerprint
-/// integrity, and journal slice rebinding. Does **not** leave `store.wave`
-/// pointing at a helper local — caller must `setWave` + `reseed` on its own
-/// wave storage after this returns.
+/// 加载 first-boot checkpoint，校验 active/terminal 计数、指纹完整性、
+/// journal 切片回绑。**不会**让 `store.wave` 指向辅助局部变量——调用方
+/// 返回后须对自有 wave 存储执行 `setWave` + `reseed`。
 fn reloadFirstBootCheckpoint(
     path: []const u8,
     expected_active: usize,
@@ -387,7 +401,7 @@ fn reloadFirstBootCheckpoint(
     try std.testing.expectEqual(expected_active, after.activeCount());
     try std.testing.expectEqual(expected_terminal, countInstallTerminals(after));
 
-    // Fingerprint + journal internal slices must rebind to entry-owned buffers.
+    // 指纹 + journal 内部切片须回绑到 entry 自有缓冲。
     var checked: usize = 0;
     for (&after.entries) |*e| {
         if (!e.used) continue;
@@ -401,15 +415,14 @@ fn reloadFirstBootCheckpoint(
             try std.testing.expectEqualStrings(e.terminalEvent(), e.journal.terminal_event_id.?);
         }
         checked += 1;
-        if (checked >= 8) break; // sample enough entries without O(N) print noise
+        if (checked >= 8) break; // 抽样即可，避免 O(N) 噪音
     }
     try std.testing.expect(checked > 0 or expected_active == 0);
 
     return .{ .reload_ms = t1 - t0, .store = after };
 }
 
-/// Bind store to caller-owned wave and reseed from real active count; optionally
-/// assert fail-closed when full.
+/// 将 store 绑定到调用方 wave，按真实 active reseed；满时可断言 fail-closed。
 fn reseedFirstBootWave(
     store: *install_first_boot_store.Store,
     wave: *capacity.DeploymentWaveAdmission,

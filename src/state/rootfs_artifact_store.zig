@@ -154,6 +154,35 @@ pub const Store = struct {
         return self.artifacts.items;
     }
 
+    /// 强制替换同一 `rootfs_input_digest` 下的已发布记录。
+    /// 供 v0.4 `--from-staging` 在 chroot 手改保留树后重新打包使用：接受新的
+    /// content_sha512/尺寸，路径与 digest 仍按内容寻址挂在同一输入摘要下。
+    /// 普通 full build 不得走此路径（仍用 publish 的幂等/漂移拒绝语义）。
+    pub fn replace(self: *Store, io: std.Io, artifact: Artifact) !PublishResult {
+        try validateArtifact(artifact);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.artifacts.items, 0..) |*existing, i| {
+            if (!std.mem.eql(u8, existing.rootfs_input_digest, artifact.rootfs_input_digest)) continue;
+            const owned = try dupArtifact(self.allocator, artifact);
+            freeArtifact(self.allocator, existing.*);
+            self.artifacts.items[i] = owned;
+            try self.persist(io);
+            return .replaced;
+        }
+        const owned = try dupArtifact(self.allocator, artifact);
+        self.appendOwned(owned) catch |err| {
+            freeArtifact(self.allocator, owned);
+            return err;
+        };
+        self.persist(io) catch |err| {
+            const removed = self.artifacts.pop().?;
+            freeArtifact(self.allocator, removed);
+            return err;
+        };
+        return .published;
+    }
+
     fn appendOwned(self: *Store, item: Artifact) !void {
         try self.artifacts.append(self.allocator, item);
     }
@@ -170,7 +199,7 @@ fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.Thread.yield() catch {};
 }
 
-pub const PublishResult = enum { published, already_present };
+pub const PublishResult = enum { published, already_present, replaced };
 
 fn sameImmutableMetadata(existing: Artifact, candidate: Artifact) bool {
     return existing.compressed_size == candidate.compressed_size and

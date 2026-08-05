@@ -1,8 +1,14 @@
-//! M4.8 启动时容量与并发的动态派生。
+//! # 启动时容量与并发派生（M4.8 + v0.4 共享部署波次）
 //!
-//! 替代硬编码的 256 上限与 TFTP 固定并发默认值。所有派生均取
+//! 替代硬编码上限与 TFTP 固定并发默认值。派生均取
 //! `max(按来源计算, config 显式覆盖)`，绝不因派生缩小运维意图。
-//! 详见 docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md §9.17 与
+//!
+//! v0.4 增量：
+//! - 稳定公共码 `capacity.exhausted`（HTTP 503 fail-closed）
+//! - `DeploymentWaveAdmission`：非终态 install + diskless 共用波次预算
+//! - plan 外置后的 checkpoint 索引读取上限
+//!
+//! 历史：docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md §9.17 与
 //! docs/archive/milestone-specs/2026-07-17-concurrency-capacity-scaling-design.md。
 
 const std = @import("std");
@@ -12,18 +18,16 @@ const std = @import("std");
 /// `effective` 是允许的已用条目数，而不是数组前缀长度。
 pub const store_ceiling: usize = 2048;
 
-/// v0.4 stable public error code for domain capacity exhaustion.
-/// Design requires DisklessSessionCapacity (and peer admission failures) to
-/// surface as this code with HTTP 503 fail-closed semantics.
+/// v0.4 领域容量耗尽的稳定公共错误码。
+/// DisklessSessionCapacity 及同类准入失败须映射为此码，HTTP 503 fail-closed。
 pub const exhausted_code = "capacity.exhausted";
 
-/// Canonical JSON error body for capacity exhaustion (HTTP 503).
+/// 容量耗尽的规范 JSON 错误体（HTTP 503）。
 pub fn exhaustedJsonBody() []const u8 {
     return "{\"ok\":false,\"error\":{\"code\":\"capacity.exhausted\",\"message\":\"capacity limit reached; retry after active slots free\"}}\n";
 }
 
-/// Map Zig capacity-exhaustion errors to the stable public code.
-/// Returns null for non-capacity errors so callers can fall through.
+/// 将 Zig 容量耗尽错误映射为稳定公共码；非容量错误返回 null 以便调用方继续分支。
 pub fn publicErrorCode(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.CapacityExhausted,
@@ -40,8 +44,10 @@ pub fn publicErrorCode(err: anyerror) ?[]const u8 {
     };
 }
 
+/// 热路径资源维度（HTTP 连接 / boot session / rootfs 下载槽）。
 pub const Resource = enum { http_connection, boot_session, rootfs_download };
 
+/// 进程内简单计数准入：达到 limit 返回 CapacityExhausted。
 pub const Admission = struct {
     http_connections: usize = 0,
     boot_sessions: usize = 0,
@@ -76,6 +82,7 @@ pub const Admission = struct {
     }
 };
 
+/// 秒级令牌桶：burst 突发 + refill_per_second 回补；耗尽返回 RateLimited。
 pub const TokenBucket = struct {
     tokens: u64,
     last_second: i64,
@@ -144,39 +151,40 @@ pub fn managedCapacity(node_count: usize, config_override: ?u32) usize {
     return @max(cap, 1);
 }
 
-/// Shared non-terminal install + diskless deployment wave default (product limit).
+/// 共享部署波次默认产品上限：非终态 install + diskless 合计。
 pub const deployment_wave_default: usize = 512;
-/// Legacy alias: diskless storage defaults track the wave default.
+/// 历史别名：diskless store 默认跟随波次默认。
 pub const diskless_delivery_default: usize = deployment_wave_default;
+/// first-boot 活跃槽默认，与波次默认一致。
 pub const first_boot_default: usize = deployment_wave_default;
 
-/// Shared wave capacity: one budget for non-terminal install + diskless nodes.
-/// Explicit override only enlarges the default; clamped to `store_ceiling`.
+/// 共享波次容量：install + diskless 共用一笔预算。
+/// 显式覆盖只放大默认，再夹到 `store_ceiling`。
 pub fn deploymentWaveCapacity(config_override: ?u32) usize {
     const derived = deployment_wave_default;
     const cap = if (config_override) |o| @max(derived, @as(usize, o)) else derived;
     return @min(@max(cap, 1), store_ceiling);
 }
 
-/// Structural diskless slot ceiling helper (not a separate product admission budget).
+/// diskless 结构槽帮助函数（不是独立产品准入预算，委托共享波次）。
 pub fn disklessDeliveryCapacity(config_override: ?u32) usize {
     return deploymentWaveCapacity(config_override);
 }
 
-/// Structural first-boot active slot helper (not a separate product admission budget).
+/// first-boot 结构槽帮助函数（不是独立产品准入预算）。
 pub fn firstBootCapacity(managed: usize, config_override: ?u32) usize {
     const derived = @max(first_boot_default, managed);
     const cap = if (config_override) |o| @max(derived, @as(usize, o)) else derived;
     return @min(@max(cap, 1), store_ceiling);
 }
 
-/// Daemon-level shared admission for non-terminal install + diskless deployments.
-/// Stores hold structural slots up to `store_ceiling`; this counter enforces the
-/// product wave limit (default 512, max 2048).
+/// Daemon 级共享准入：非终态 install + diskless。
+/// 各 store 可持有到 `store_ceiling` 的结构槽；本计数器执行产品波次上限
+/// （默认 512，最高 2048）。
 ///
-/// `active` is an atomic counter so lifecycle acquire/release and diagnostic
-/// readers (`count` / `remaining` / `overLimit`) never form a data race under
-/// Zig's memory model. `limit` is fixed after `init` and may be read plainly.
+/// `active` 为原子计数，生命周期 acquire/release 与诊断读
+/// （`count` / `remaining` / `overLimit`）在 Zig 内存模型下无数据竞争。
+/// `limit` 在 `init` 后固定，可普通读取。
 pub const DeploymentWaveAdmission = struct {
     active: std.atomic.Value(usize) = .init(0),
     limit: usize = deployment_wave_default,
@@ -186,8 +194,8 @@ pub const DeploymentWaveAdmission = struct {
     }
 
     pub fn tryAcquire(self: *DeploymentWaveAdmission) !void {
-        // When restored active exceeds the configured limit (config lowered across
-        // restart), refuse new admits until real occupancy falls at/below limit.
+        // 重启后若恢复的 active 已超过配置 limit（跨重启调低配置），
+        // 拒绝新准入直到真实占用回落到 limit 及以下。
         while (true) {
             const a = self.active.load(.acquire);
             if (a >= self.limit) return error.CapacityExhausted;
@@ -203,10 +211,9 @@ pub const DeploymentWaveAdmission = struct {
         }
     }
 
-    /// After restore from disk, set active to the real sum of non-terminal
-    /// install+diskless. Never truncates to `limit`: in-flight objects must keep
-    /// counting even when config was lowered; `tryAcquire` stays fail-closed
-    /// until occupancy drops to/below the new limit.
+    /// 从磁盘恢复后，将 active 设为真实非终态 install+diskless 之和。
+    /// **不**截断到 `limit`：在途对象必须继续计数；`tryAcquire` 在占用
+    /// 回到 limit 及以下前保持 fail-closed。
     pub fn reseed(self: *DeploymentWaveAdmission, active: usize) void {
         self.active.store(active, .release);
     }
@@ -220,25 +227,24 @@ pub const DeploymentWaveAdmission = struct {
         return if (a >= self.limit) 0 else self.limit - a;
     }
 
-    /// True when restored (or live) occupancy is above the configured product limit.
+    /// 恢复或运行中占用是否高于配置的产品上限。
     pub fn overLimit(self: *const DeploymentWaveAdmission) bool {
         return self.active.load(.acquire) > self.limit;
     }
 };
 
-/// AgentPlan / InstallFirstBootPlan wire DTO ceiling (bytes).
+/// AgentPlan / InstallFirstBootPlan 线协议 DTO 字节上限。
 pub const agent_plan_max_bytes: usize = 256 * 1024;
 
-/// Index checkpoint (sessions + digests + terminals) read ceiling.
-/// AgentPlan bodies are stored as separate content-addressed files and are not
-/// loaded through this limit. Sized for 2048 lightweight session records with
-/// JSON overhead, not for N×256 KiB plan bodies.
+/// 索引 checkpoint（sessions + digests + terminals）读取上限。
+/// AgentPlan 正文外置为内容寻址文件，不经过本限制。
+/// 按 2048 条轻量 session 记录 + JSON 开销估算，而非 N×256KiB 正文。
 pub const checkpoint_index_read_max_bytes: usize = 32 * 1024 * 1024;
 
-/// Legacy name kept for callers; equals the index ceiling after plan externalization.
+/// 兼容旧名：plan 外置后等于索引上限。
 pub const checkpoint_read_max_bytes: usize = checkpoint_index_read_max_bytes;
 
-/// Single external plan file read ceiling (one AgentPlan body).
+/// 单个外置 plan 文件读取上限（一份 AgentPlan 正文 + 余量）。
 pub const agent_plan_file_read_max_bytes: usize = agent_plan_max_bytes + 4096;
 
 /// TFTP 并发：config 覆盖优先，否则 max(128, 2×核)，封顶 u16。

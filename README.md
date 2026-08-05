@@ -402,6 +402,8 @@ nodeforge profile rootfs build rocky-9.7-aarch64-dvd-diskless \
   --if-input-digest <rootfs_input_digest>
 nodeforge profile rootfs status rocky-9.7-aarch64-dvd-diskless
 # 不提供外部 squashfs register/import；ready artifact 只能来自上述服务端 build。
+# 可选：--keep-staging 保留解包树（work/rootfs-staging/<digest>）供 chroot 特需；
+#       --from-staging 基于保留树再打包；profile rootfs staging list|show|remove 查询/清理。
 
 # 4. 绑定节点、检查 readiness、打开 deploy gate。
 nodeforge node set node-01 profile=rocky-9.7-aarch64-dvd-diskless

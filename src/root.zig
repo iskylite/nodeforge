@@ -113,6 +113,8 @@ pub const node_discovery = @import("state/node_discovery.zig");
 pub const artifact_layout = @import("provision/artifact_layout.zig");
 /// v0.2 rootfs artifact store：已构建 rootfs 制品按 rootfs_input_digest 内容寻址登记。
 pub const state_rootfs_artifact_store = @import("state/rootfs_artifact_store.zig");
+/// v0.4 rootfs 保留树索引：可选 keep-staging / from-staging 再打包。
+pub const state_rootfs_staging_store = @import("state/rootfs_staging_store.zig");
 /// v0.2 diskless delivery session + scoped token store（config/agent/event token）。
 pub const state_diskless_delivery = @import("state/diskless_delivery.zig");
 /// v0.4 logical capacity workload harness tests (filtered via test-v0.4-capacity).
@@ -239,6 +241,7 @@ test {
     _ = http_first_boot_dto;
     _ = provision_rootfs_build;
     _ = state_rootfs_artifact_store;
+    _ = state_rootfs_staging_store;
     _ = state_diskless_delivery;
     _ = state_v0_4_capacity_workload;
     _ = state_identity_store;

@@ -1,19 +1,30 @@
-//! Installer-side atomic handoff for generation-bound install first-boot.
+//! # 装机侧 generation 绑定 first-boot 原子 handoff 脚本
+//!
+//! 在 kickstart/autoinstall 的 late-command / %post 中执行：从 nodeforged 拉取
+//! plan、agent、payloads、capsule，落到目标根（`target_root`），原子提交
+//! current-generation 与 pending 标记，**最后**再 POST `/handoff`。
+//!
+//! 安全：answer 文件只嵌入 capability **路径**（0400 运行时文件），从不嵌入
+//! 原始 bearer；脚本校验 token 为 64 hex。
 
 const std = @import("std");
 
+/// handoff 脚本渲染输入。字段不得含空白或引号（防 shell 注入）。
 pub const Config = struct {
     node_id: []const u8,
     generation: u64,
     base_url: []const u8,
     boot_session_id: []const u8,
-    /// Runtime-only 0400 boot-session capability file. The answer file embeds
-    /// this path, never the raw bearer value.
+    /// 仅运行时存在的 0400 boot-session capability 文件路径；answer 只写路径。
     capability_file: []const u8,
+    /// 目标根前缀（如 `/target`）；空表示主机根。
     target_root: []const u8 = "",
+    /// 启用 first-boot unit 的命令（Ubuntu 可用 curtin in-target 包装）。
     enable_command: []const u8 = "systemctl enable nodeforge-install-firstboot.service",
 };
 
+/// 渲染 POSIX shell handoff 脚本（调用方拥有返回切片）。
+/// 提交顺序：凭据 part → agent → generation 目录 → current-generation → pending → handoff。
 pub fn render(allocator: std.mem.Allocator, config: Config) ![]u8 {
     if (config.node_id.len == 0 or config.generation == 0 or !std.mem.startsWith(u8, config.base_url, "http://")) return error.InvalidFirstBootHandoff;
     for ([_][]const u8{ config.node_id, config.boot_session_id, config.capability_file }) |value| if (value.len == 0 or std.mem.indexOfAny(u8, value, "'\n\r\t ") != null) return error.InvalidFirstBootHandoff;

@@ -1,4 +1,8 @@
-//! Generation-bound install first-boot target runtime.
+//! # generation 绑定的装机 first-boot 目标侧运行时
+//!
+//! 在目标机本地盘（`/var/lib/nodeforge/install-firstboot/<gen>`）上执行：
+//! 解析/校验 plan、维护本地 journal、校验 payload 闭包、按规范顺序编译步骤命令。
+//! 与服务端 `state/install_first_boot.zig` journal reducer 对称，但这里是 agent 侧状态机。
 
 const std = @import("std");
 const dto = @import("../http/first_boot_dto.zig");
@@ -7,10 +11,14 @@ const diskless_dto = @import("../http/diskless_dto.zig");
 const first_boot = @import("first_boot.zig");
 const dhcp_store = @import("../state/dhcp_store.zig");
 
+/// 目标机 first-boot 状态根目录。
 pub const root = "/var/lib/nodeforge/install-firstboot";
+/// 当前活跃 generation 指针文件路径。
 pub const current_generation_path = root ++ "/current-generation";
+/// handoff 写入的 bootstrap token（0400）；事件上报用。
 pub const bootstrap_token_path = "/var/lib/nodeforge/credentials/first-boot.token";
 
+/// 本地 identity.json：绑定 node + generation + plan digest。
 pub const Identity = struct {
     schema_version: u32 = 1,
     node_id: []const u8,
@@ -18,6 +26,7 @@ pub const Identity = struct {
     first_boot_plan_digest: []const u8,
 };
 
+/// 目标机本地 journal 状态。终态后 `actionsAllowed` 为 false，重启不得重跑步骤。
 pub const LocalState = enum {
     pending,
     started,
@@ -29,6 +38,7 @@ pub const LocalState = enum {
     recovery_incomplete,
 };
 
+/// 目标机 journal：与 plan 绑定字段必须一致，再允许步进。
 pub const LocalJournal = struct {
     schema_version: u32 = 1,
     deployment_id: []const u8,
@@ -42,6 +52,7 @@ pub const LocalJournal = struct {
     terminal_event_id: ?[]const u8 = null,
     terminal_event_body: ?[]const u8 = null,
 
+    /// 校验 journal 与 plan 的 generation 绑定不漂移。
     pub fn validateBinding(self: LocalJournal, plan: dto.InstallFirstBootPlan) !void {
         if (self.schema_version != 1 or
             !std.mem.eql(u8, self.deployment_id, plan.deployment_id) or
@@ -53,17 +64,20 @@ pub const LocalJournal = struct {
             return error.InstallFirstBootJournalMismatch;
     }
 
+    /// pending → started。
     pub fn begin(self: *LocalJournal) !void {
         if (self.state != .pending) return error.InstallFirstBootStateConflict;
         self.state = .started;
     }
 
+    /// 仅允许按 next_step 顺序进入 step_running。
     pub fn beginStep(self: *LocalJournal, index: usize) !void {
         if (self.state != .started or index != self.next_step) return error.InstallFirstBootStateConflict;
         self.state = .step_running;
         self.running_step = index;
     }
 
+    /// 步骤成功：推进 next_step，回到 started。
     pub fn completeStep(self: *LocalJournal, index: usize) !void {
         if (self.state != .step_running or self.running_step == null or self.running_step.? != index) return error.InstallFirstBootStateConflict;
         self.next_step += 1;
@@ -71,12 +85,14 @@ pub const LocalJournal = struct {
         self.state = .started;
     }
 
+    /// 步骤失败：回到 started（可重试策略由上层决定）。
     pub fn failStep(self: *LocalJournal, index: usize) !void {
         if (self.state != .step_running or self.running_step == null or self.running_step.? != index) return error.InstallFirstBootStateConflict;
         self.running_step = null;
         self.state = .started;
     }
 
+    /// 写入终态事件；成功时要求至少完成过一步（next_step > 0）。
     pub fn terminal(self: *LocalJournal, success: bool, event_id: []const u8, body: []const u8) !void {
         if (self.state != .started or event_id.len == 0 or body.len == 0) return error.InstallFirstBootStateConflict;
         if (success and self.next_step == 0) return error.InstallFirstBootStateConflict;
@@ -85,6 +101,7 @@ pub const LocalJournal = struct {
         self.terminal_event_body = body;
     }
 
+    /// 服务端 ACK 后进入最终 acknowledged。
     pub fn acknowledge(self: *LocalJournal) !void {
         self.state = switch (self.state) {
             .completed_pending_ack => .completed_acknowledged,
@@ -93,6 +110,7 @@ pub const LocalJournal = struct {
         };
     }
 
+    /// 终态/恢复态禁止再执行步骤（重启安全）。
     pub fn actionsAllowed(self: LocalJournal) bool {
         return switch (self.state) {
             .pending, .started, .step_running => true,
@@ -101,6 +119,7 @@ pub const LocalJournal = struct {
     }
 };
 
+/// 解析并完成 digest/绑定校验的 plan 包装；`deinit` 释放 JSON 分配。
 pub const VerifiedPlan = struct {
     parsed: std.json.Parsed(dto.InstallFirstBootPlan),
 
@@ -113,6 +132,7 @@ pub const VerifiedPlan = struct {
     }
 };
 
+/// 解析 plan JSON，校验 schema、node/generation 绑定与 digest 一致性。
 pub fn parseAndVerifyPlan(allocator: std.mem.Allocator, bytes: []const u8, expected_node: []const u8, expected_generation: u64) !VerifiedPlan {
     if (bytes.len == 0 or bytes.len > dto.max_plan_bytes) return error.InvalidInstallFirstBootPlan;
     var parsed = std.json.parseFromSlice(dto.InstallFirstBootPlan, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.InvalidInstallFirstBootPlan;
@@ -125,6 +145,7 @@ pub fn parseAndVerifyPlan(allocator: std.mem.Allocator, bytes: []const u8, expec
     return .{ .parsed = parsed };
 }
 
+/// 解析 identity.json；digest 必须为 64 位小写 hex。
 pub fn parseIdentity(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Identity) {
     const parsed = std.json.parseFromSlice(Identity, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.InvalidInstallFirstBootIdentity;
     errdefer parsed.deinit();
@@ -133,12 +154,14 @@ pub fn parseIdentity(allocator: std.mem.Allocator, bytes: []const u8) !std.json.
     return parsed;
 }
 
+/// 原子写本地 journal JSON。
 pub fn persistJournal(io: std.Io, allocator: std.mem.Allocator, path: []const u8, journal: LocalJournal) !void {
     const bytes = try std.json.Stringify.valueAlloc(allocator, journal, .{});
     defer allocator.free(bytes);
     try dhcp_store.atomicWrite(io, path, bytes);
 }
 
+/// 原子写入 0400 凭据文件（64 hex token + 换行）。
 pub fn atomicWriteCredential(io: std.Io, path: []const u8, token: []const u8) !void {
     if (token.len != 64) return error.InvalidCredential;
     for (token) |byte| if (!std.ascii.isHex(byte)) return error.InvalidCredential;
@@ -157,11 +180,13 @@ pub fn atomicWriteCredential(io: std.Io, path: []const u8, token: []const u8) !v
     try dhcp_store.syncParentDirectory(io, path);
 }
 
+/// 删除凭据并 fsync 父目录。
 pub fn removeCredential(io: std.Io, path: []const u8) !void {
     try std.Io.Dir.cwd().deleteFile(io, path);
     try dhcp_store.syncParentDirectory(io, path);
 }
 
+/// 校验 generation 目录下 payload 闭包：路径、大小、sha256 与 plan 一致。
 pub fn validatePayloadClosure(io: std.Io, base_dir: []const u8, plan: dto.InstallFirstBootPlan) !void {
     for (plan.payloads) |payload| {
         asset_validate.validateRelativePath(payload.path) catch return error.InvalidInstallFirstBootPayload;
@@ -177,6 +202,7 @@ pub fn validatePayloadClosure(io: std.Io, base_dir: []const u8, plan: dto.Instal
     }
 }
 
+/// 规范执行序：managed_file → package → archive → script，返回原 steps 下标。
 pub fn orderedStepIndices(allocator: std.mem.Allocator, steps: []const dto.Step) ![]usize {
     const indices = try allocator.alloc(usize, steps.len);
     errdefer allocator.free(indices);
@@ -190,6 +216,7 @@ pub fn orderedStepIndices(allocator: std.mem.Allocator, steps: []const dto.Step)
     return indices;
 }
 
+/// 将单步编译为可执行 shell 命令；payload 根为 `<generation_dir>/payload`。
 pub fn renderStepCommand(allocator: std.mem.Allocator, generation_dir: []const u8, plan: dto.InstallFirstBootPlan, step: dto.Step) ![]u8 {
     const payload_root = try std.fmt.allocPrint(allocator, "{s}/payload", .{generation_dir});
     defer allocator.free(payload_root);

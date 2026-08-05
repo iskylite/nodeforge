@@ -566,11 +566,13 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_rootfs_plan);
     try addOutputFlag(profile_rootfs_plan);
     try addDebugFlag(profile_rootfs_plan);
-    const profile_rootfs_build = try zli.Command.init(init_options, .{ .name = "build", .description = "Build a content-addressed rootfs artifact for a diskless profile from its build projection", .usage = "nodeforge profile rootfs build <profile> [--if-input-digest <hex>] [options]" }, profileRootfsBuildHandler);
+    const profile_rootfs_build = try zli.Command.init(init_options, .{ .name = "build", .description = "Build a content-addressed rootfs artifact for a diskless profile from its build projection", .usage = "nodeforge profile rootfs build <profile> [--if-input-digest <hex>] [--keep-staging] [--from-staging] [options]" }, profileRootfsBuildHandler);
     try profile_rootfs_build.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
     try profile_rootfs_build.addFlag(.{ .name = "if-input-digest", .description = "Only build if the current rootfs input digest matches (anti-drift)", .type = .String, .default_value = .{ .String = "" } });
     // v0.2.3 §3.3: --new-ssh-keys 先轮换 identity/Profile 再以新投影构建。
     try profile_rootfs_build.addFlag(.{ .name = "new-ssh-keys", .description = "Rotate the profile ssh identity (new immutable revision) before building", .type = .Bool, .default_value = .{ .Bool = false } });
+    try profile_rootfs_build.addFlag(.{ .name = "keep-staging", .description = "Retain the unpacked rootfs tree under work/rootfs-staging/<digest> for chroot inspection", .type = .Bool, .default_value = .{ .Bool = false } });
+    try profile_rootfs_build.addFlag(.{ .name = "from-staging", .description = "Re-pack squashfs from a previously retained staging tree (skip OS layer and rootfs-build steps)", .type = .Bool, .default_value = .{ .Bool = false } });
     try profile_rootfs_build.addFlag(.{ .name = "detach", .description = "Return immediately with the durable operation id", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(profile_rootfs_build);
     try addOutputFlag(profile_rootfs_build);
@@ -580,7 +582,23 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_rootfs_status);
     try addOutputFlag(profile_rootfs_status);
     try addDebugFlag(profile_rootfs_status);
-    try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_build, profile_rootfs_status });
+    const profile_rootfs_staging = try zli.Command.init(init_options, .{ .name = "staging", .description = "Query or remove retained rootfs staging trees", .usage = "nodeforge profile rootfs staging <list|show|remove> ..." }, showCurrentHelp);
+    const profile_rootfs_staging_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List retained rootfs staging trees", .usage = "nodeforge profile rootfs staging list [options]" }, profileRootfsStagingListHandler);
+    try addConfigPathFlag(profile_rootfs_staging_list);
+    try addOutputFlag(profile_rootfs_staging_list);
+    try addDebugFlag(profile_rootfs_staging_list);
+    const profile_rootfs_staging_show = try zli.Command.init(init_options, .{ .name = "show", .description = "Show retained staging for a diskless profile", .usage = "nodeforge profile rootfs staging show <profile> [options]" }, profileRootfsStagingShowHandler);
+    try profile_rootfs_staging_show.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try addConfigPathFlag(profile_rootfs_staging_show);
+    try addOutputFlag(profile_rootfs_staging_show);
+    try addDebugFlag(profile_rootfs_staging_show);
+    const profile_rootfs_staging_remove = try zli.Command.init(init_options, .{ .name = "remove", .description = "Remove retained staging for a diskless profile", .usage = "nodeforge profile rootfs staging remove <profile> [options]" }, profileRootfsStagingRemoveHandler);
+    try profile_rootfs_staging_remove.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try addConfigPathFlag(profile_rootfs_staging_remove);
+    try addOutputFlag(profile_rootfs_staging_remove);
+    try addDebugFlag(profile_rootfs_staging_remove);
+    try profile_rootfs_staging.addCommands(&.{ profile_rootfs_staging_list, profile_rootfs_staging_show, profile_rootfs_staging_remove });
+    try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_build, profile_rootfs_status, profile_rootfs_staging });
     try profile.addCommands(&.{ profile_create, profile_clone, profile_remove, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
 
     try addValuesCommands(profile, init_options, "profile");
@@ -4393,11 +4411,23 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     const if_input_digest: ?[]const u8 = if (if_input_digest_raw.len == 0) null else if_input_digest_raw;
     // v0.2.3 §3.3: --new-ssh-keys 时 daemon 先轮换 identity/Profile 再构建。
     const new_ssh_keys = ctx.flag("new-ssh-keys", bool);
+    const keep_staging = ctx.flag("keep-staging", bool);
+    const from_staging = ctx.flag("from-staging", bool);
+    if (from_staging and new_ssh_keys) {
+        try writeCommandError(ctx, "rootfs.invalid", "--from-staging cannot be combined with --new-ssh-keys", 2);
+        return;
+    }
+    const build_opts: nodeforge.management_client.RootfsBuildOptions = .{
+        .if_input_digest = if_input_digest,
+        .new_ssh_keys = new_ssh_keys,
+        .keep_staging = keep_staging,
+        .from_staging = from_staging,
+    };
     if (ctx.flag("detach", bool)) {
         const response = try allocManagementResponse(ctx);
         defer ctx.allocator.free(response);
         var reason: [256]u8 = [_]u8{0} ** 256;
-        const body = nodeforge.management_client.rootfsBuildDetachJson(ctx.io, config.value.server.http_port, name, if_input_digest, new_ssh_keys, response, &reason) catch null orelse {
+        const body = nodeforge.management_client.rootfsBuildDetachJson(ctx.io, config.value.server.http_port, name, build_opts, response, &reason) catch null orelse {
             const detail: []const u8 = std.mem.sliceTo(&reason, 0);
             try writeCommandError(ctx, "rootfs.build_failed", if (detail.len == 0) "rootfs operation submission failed" else detail, 1);
             return;
@@ -4415,8 +4445,10 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     }
     try errorWriter(ctx).print("Requesting rootfs build for profile {s}...\n", .{name});
     if (if_input_digest) |d| try errorWriter(ctx).print("Anti-drift digest: {s}\n", .{d});
+    if (keep_staging) try errorWriter(ctx).print("Keep staging: enabled\n", .{});
+    if (from_staging) try errorWriter(ctx).print("From staging: re-pack only\n", .{});
     var reason: [256]u8 = [_]u8{0} ** 256;
-    const result = nodeforge.management_client.rootfsBuild(ctx.io, config.value.server.http_port, name, if_input_digest, new_ssh_keys, &reason);
+    const result = nodeforge.management_client.rootfsBuild(ctx.io, config.value.server.http_port, name, build_opts, &reason);
     if (!result.healthy) {
         try reportMutationFailure(ctx, result, "rootfs build failed: daemon unreachable");
         return;
@@ -4429,7 +4461,21 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
         try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = "{}" });
         return;
     }
-    const Resp = struct { ok: bool, result: struct { profile: []const u8, rootfs_input_digest: []const u8, state: []const u8, content_sha512: ?[]const u8 = null, compressed_bytes: ?u64 = null, kernel_release: ?[]const u8 = null, file: ?[]const u8 = null } };
+    const Resp = struct {
+        ok: bool,
+        result: struct {
+            profile: []const u8,
+            rootfs_input_digest: []const u8,
+            state: []const u8,
+            content_sha512: ?[]const u8 = null,
+            compressed_bytes: ?u64 = null,
+            kernel_release: ?[]const u8 = null,
+            file: ?[]const u8 = null,
+            staging_kept: ?bool = null,
+            staging_path: ?[]const u8 = null,
+            staging_kept_at: ?i64 = null,
+        },
+    };
     const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
         const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
         try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
@@ -4438,7 +4484,8 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     defer parsed.deinit();
     const r = parsed.value.result;
     try errorWriter(ctx).print("Rootfs build complete: state={s} file={s}\n", .{ r.state, r.file orelse "-" });
-    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" } };
+    if (r.staging_path) |sp| try errorWriter(ctx).print("Staging retained: {s}\n", .{sp});
+    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" }, .{ .key = "staging", .title = "Staging" } };
     const fields = [_]nodeforge.cli_document.Field{
         .{ .key = "profile", .value = r.profile, .section = "artifact" },
         .{ .key = "rootfs_input_digest", .value = r.rootfs_input_digest, .section = "artifact" },
@@ -4447,9 +4494,120 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
         .{ .key = "compressed_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.compressed_bytes orelse 0}), .section = "artifact" },
         .{ .key = "kernel_release", .value = r.kernel_release orelse "-", .section = "runtime" },
         .{ .key = "file", .value = r.file orelse "-", .section = "runtime" },
+        .{ .key = "staging_kept", .value = if (r.staging_kept orelse false) "true" else "false", .section = "staging" },
+        .{ .key = "staging_path", .value = r.staging_path orelse "-", .section = "staging" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Build {s}", .{r.profile});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
+}
+
+fn profileRootfsStagingListHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.rootfsStagingListJson(ctx.io, config.value.server.http_port, response) catch null;
+    if (body == null) {
+        try writeCommandError(ctx, "rootfs.unavailable", "local daemon management API unavailable", 1);
+        return;
+    }
+    const Resp = struct {
+        ok: bool,
+        result: struct {
+            stagings: []const struct {
+                profile: []const u8,
+                rootfs_input_digest: []const u8,
+                path: []const u8,
+                kept_at: i64,
+                ready: bool,
+                apparent_bytes: u64 = 0,
+                operation_id: []const u8 = "",
+            },
+        },
+    };
+    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
+        try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
+        return;
+    };
+    defer parsed.deinit();
+    var lines: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer lines.deinit();
+    try lines.writer.writeAll("profile\tdigest\tready\tpath\n");
+    for (parsed.value.result.stagings) |st| {
+        try lines.writer.print("{s}\t{s}\t{s}\t{s}\n", .{ st.profile, st.rootfs_input_digest, if (st.ready) "true" else "false", st.path });
+    }
+    try renderOutputDocument(ctx, .{ .human = .{ .text = lines.written() }, .json = body.? });
+}
+
+fn profileRootfsStagingShowHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    const response = try allocManagementResponse(ctx);
+    defer ctx.allocator.free(response);
+    const body = nodeforge.management_client.rootfsStagingShowJson(ctx.io, config.value.server.http_port, name, response) catch null;
+    if (body == null) {
+        try writeCommandError(ctx, "rootfs.unavailable", "local daemon management API unavailable or staging missing", 1);
+        return;
+    }
+    const Resp = struct {
+        ok: bool,
+        result: struct {
+            profile: []const u8,
+            rootfs_input_digest: []const u8,
+            path: []const u8,
+            kept_at: i64,
+            ready: bool,
+            apparent_bytes: u64 = 0,
+            operation_id: []const u8 = "",
+        },
+    };
+    const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+        const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
+        try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
+        return;
+    };
+    defer parsed.deinit();
+    const r = parsed.value.result;
+    const sections = [_]nodeforge.cli_document.Section{.{ .key = "staging", .title = "Staging" }};
+    const fields = [_]nodeforge.cli_document.Field{
+        .{ .key = "profile", .value = r.profile, .section = "staging" },
+        .{ .key = "rootfs_input_digest", .value = r.rootfs_input_digest, .section = "staging" },
+        .{ .key = "path", .value = r.path, .section = "staging" },
+        .{ .key = "ready", .value = if (r.ready) "true" else "false", .section = "staging" },
+        .{ .key = "kept_at", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.kept_at}), .section = "staging" },
+        .{ .key = "apparent_bytes", .value = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.apparent_bytes}), .section = "staging" },
+        .{ .key = "operation_id", .value = if (r.operation_id.len == 0) "-" else r.operation_id, .section = "staging" },
+    };
+    const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Staging {s}", .{r.profile});
+    try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });
+}
+
+fn profileRootfsStagingRemoveHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    var reason: [256]u8 = [_]u8{0} ** 256;
+    const result = nodeforge.management_client.rootfsStagingRemove(ctx.io, config.value.server.http_port, name, &reason);
+    if (!result.healthy) {
+        try reportMutationFailure(ctx, result, "rootfs staging remove failed: daemon unreachable");
+        return;
+    }
+    const human = try std.fmt.allocPrint(ctx.allocator, "rootfs staging removed for profile {s}", .{name});
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = "{\"ok\":true}" });
 }
 
 fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
@@ -4467,7 +4625,24 @@ fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "rootfs.unavailable", "local daemon management API unavailable", 1);
         return;
     }
-    const Resp = struct { ok: bool, result: struct { profile: []const u8, rootfs_input_digest: []const u8, state: []const u8, content_sha512: ?[]const u8 = null, compressed_bytes: ?u64 = null, uncompressed_bytes: ?u64 = null, kernel_release: ?[]const u8 = null, file: ?[]const u8 = null, created_at: ?i64 = null } };
+    const Resp = struct {
+        ok: bool,
+        result: struct {
+            profile: []const u8,
+            rootfs_input_digest: []const u8,
+            state: []const u8,
+            content_sha512: ?[]const u8 = null,
+            compressed_bytes: ?u64 = null,
+            uncompressed_bytes: ?u64 = null,
+            kernel_release: ?[]const u8 = null,
+            file: ?[]const u8 = null,
+            created_at: ?i64 = null,
+            staging_kept: ?bool = null,
+            staging_path: ?[]const u8 = null,
+            staging_kept_at: ?i64 = null,
+            staging_ready: ?bool = null,
+        },
+    };
     const parsed = std.json.parseFromSlice(Resp, ctx.allocator, body.?, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
         const message = try std.fmt.allocPrint(ctx.allocator, "malformed daemon response ({t})", .{err});
         try writeCommandError(ctx, "rootfs.invalid_response", message, 1);
@@ -4479,7 +4654,7 @@ fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
         try std.fmt.allocPrint(ctx.allocator, "{d}", .{size})
     else
         "unknown";
-    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" } };
+    const sections = [_]nodeforge.cli_document.Section{ .{ .key = "artifact", .title = "Artifact" }, .{ .key = "runtime", .title = "Runtime" }, .{ .key = "staging", .title = "Staging" } };
     const fields = [_]nodeforge.cli_document.Field{
         .{ .key = "profile", .value = r.profile, .section = "artifact" },
         .{ .key = "rootfs_input_digest", .value = r.rootfs_input_digest, .section = "artifact" },
@@ -4489,6 +4664,9 @@ fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {
         .{ .key = "uncompressed_bytes", .value = uncompressed_text, .section = "artifact" },
         .{ .key = "kernel_release", .value = r.kernel_release orelse "-", .section = "runtime" },
         .{ .key = "file", .value = r.file orelse "-", .section = "runtime" },
+        .{ .key = "staging_kept", .value = if (r.staging_kept orelse false) "true" else "false", .section = "staging" },
+        .{ .key = "staging_path", .value = r.staging_path orelse "-", .section = "staging" },
+        .{ .key = "staging_ready", .value = if (r.staging_ready orelse false) "true" else "false", .section = "staging" },
     };
     const title = try std.fmt.allocPrint(ctx.allocator, "Rootfs Status {s}", .{r.profile});
     try renderOutputDocument(ctx, .{ .human = .{ .detail = .{ .title = title, .sections = &sections, .fields = &fields } }, .json = body.? });

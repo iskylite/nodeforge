@@ -1,16 +1,25 @@
-//! v0.4 install first-boot typed plan.
+//! # v0.4 装机 first-boot 类型化计划（InstallFirstBootPlan）
 //!
-//! This is intentionally not AgentPlan v2 and is not persisted in the
-//! diskless rootfs. Install generations own this plan and its payload closure.
+//! 有意**不是** AgentPlan v2，也不写入 diskless rootfs。
+//! 所有权在 install generation：计划本体与 payload 闭包由 generation 目录托管，
+//! 与 diskless switch_root 后的 postprocess 生命周期分离。
+//!
+//! 契约要点：
+//! - `first_boot_plan_digest` / `delivery_digest` 自引用字段在摘要计算时归零。
+//! - 有步骤时必须提供 agent 下载元数据与 event/exchange URL。
+//! - payload 路径禁止穿越；step.payload_path 必须落在 payloads 闭包内。
 
 const std = @import("std");
 const model = @import("../model.zig");
 const diskless = @import("diskless_dto.zig");
 const asset_validate = @import("../assets/validate.zig");
 
+/// InstallFirstBootPlan 线协议 schema 版本。
 pub const schema_version: u32 = 1;
+/// 单份 plan JSON 的字节上限（与 capacity.agent_plan_max_bytes 对齐）。
 pub const max_plan_bytes: usize = 256 * 1024;
 
+/// 计划附带的文件载荷元数据（相对 path + size + sha256）。
 pub const Payload = struct {
     path: []const u8,
     size: u64,
@@ -18,6 +27,7 @@ pub const Payload = struct {
     mode: u16 = 0o600,
 };
 
+/// first-boot 单步：动作类型复用 diskless FirstBootAction，载荷绑定不同。
 pub const Step = struct {
     id: []const u8,
     idempotency_key: []const u8,
@@ -33,6 +43,7 @@ pub const Step = struct {
     packages: []const []const u8 = &.{},
 };
 
+/// generation 绑定的装机 first-boot 计划全文（线协议 DTO）。
 pub const InstallFirstBootPlan = struct {
     schema_version: u32 = schema_version,
     deployment_id: []const u8,
@@ -54,10 +65,12 @@ pub const InstallFirstBootPlan = struct {
     expires_at: i64,
 };
 
+/// 是否声明了必须执行的 first-boot 工作（steps 非空）。
 pub fn hasRequiredWork(value: InstallFirstBootPlan) bool {
     return value.steps.len != 0;
 }
 
+/// 校验并序列化为 JSON；超限返回 `InstallFirstBootPlanTooLarge`。
 pub fn render(allocator: std.mem.Allocator, value: InstallFirstBootPlan) ![]u8 {
     try validate(value);
     const bytes = try std.json.Stringify.valueAlloc(allocator, value, .{});
@@ -68,9 +81,10 @@ pub fn render(allocator: std.mem.Allocator, value: InstallFirstBootPlan) ![]u8 {
     return bytes;
 }
 
+/// 计算 plan 的 canonical SHA-256（64 hex）。
+/// digest 字段自身会写入 plan，因此摘要时将 `delivery_digest` 与
+/// `first_boot_plan_digest` 替换为固定全零，避免自引用环。
 pub fn digest(allocator: std.mem.Allocator, value: InstallFirstBootPlan) ![64]u8 {
-    // The digest is carried by the plan itself. Hash the canonical projection
-    // with both self-referential fields replaced by fixed zero values.
     var projection = value;
     projection.delivery_digest = "0000000000000000000000000000000000000000000000000000000000000000";
     projection.first_boot_plan_digest = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -81,6 +95,7 @@ pub fn digest(allocator: std.mem.Allocator, value: InstallFirstBootPlan) ![64]u8
     return std.fmt.bytesToHex(raw, .lower);
 }
 
+/// 校验 plan 不变量：绑定字段、URL、payload 闭包、步骤与动作字段一致性。
 pub fn validate(value: InstallFirstBootPlan) !void {
     if (value.schema_version != schema_version or value.node_id.len == 0 or value.install_generation == 0 or value.expires_at <= 0) return error.InvalidInstallFirstBootPlan;
     try validateHex(value.deployment_id, 32);
@@ -120,6 +135,7 @@ pub fn validate(value: InstallFirstBootPlan) !void {
     }
 }
 
+/// 仅接受本机管理面风格 `http://host/path`，拒绝 fragment 与路径 `..`。
 fn validateLocalUrl(value: []const u8) !void {
     if (!std.mem.startsWith(u8, value, "http://")) return error.InvalidInstallFirstBootPlan;
     const rest = value["http://".len..];
@@ -127,6 +143,7 @@ fn validateLocalUrl(value: []const u8) !void {
     if (slash == 0 or rest[slash..].len < 2 or std.mem.indexOf(u8, rest[slash..], "..") != null or std.mem.indexOfScalar(u8, rest, '#') != null) return error.InvalidInstallFirstBootPlan;
 }
 
+/// 小写十六进制固定长度（digest / deployment_id 等）。
 fn validateHex(value: []const u8, expected_len: usize) !void {
     if (value.len != expected_len) return error.InvalidInstallFirstBootPlan;
     for (value) |byte| if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.InvalidInstallFirstBootPlan;

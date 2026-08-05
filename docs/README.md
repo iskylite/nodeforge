@@ -14,6 +14,7 @@
 | 安装、编译、操作示例 | 仓库根 [README.md](../README.md) |
 | 公开命令树与 exit code | [cli/REFERENCE.md](cli/REFERENCE.md)（参数以 `--help-full` 为准） |
 | 当前版本设计（v0.4） | [design/V0_4_DESIGN.md](design/V0_4_DESIGN.md) |
+| 下一增量设计（v0.4.1，设计中） | [design/V0_4_1_DESIGN.md](design/V0_4_1_DESIGN.md) — `profile rootfs staging` enter/exec、cgroup 挂载与限额、树内核导入（无 pivot_root / 无顶层 rootfs） |
 | 延期 / 非目标唯一状态表 | [design/DEFERRED_DESIGN_INDEX.md](design/DEFERRED_DESIGN_INDEX.md) |
 | 大更新公共发布闸 | [validation/PLATFORM_VALIDATION_RUNBOOK.md](validation/PLATFORM_VALIDATION_RUNBOOK.md) |
 | v0.4 增量发布闸 | [validation/V0_4_FULL_VALIDATION_RUNBOOK.md](validation/V0_4_FULL_VALIDATION_RUNBOOK.md) |

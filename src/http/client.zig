@@ -591,20 +591,41 @@ pub fn rootfsStatusJson(io: std.Io, port: u16, name: []const u8, output: []u8) !
     return managementJson(io, port, rendered, output);
 }
 
+/// `profile rootfs build` 请求体选项（与 management API JSON 字段对齐）。
+pub const RootfsBuildOptions = struct {
+    if_input_digest: ?[]const u8 = null,
+    new_ssh_keys: bool = false,
+    /// 构建成功后保留解包树（work/rootfs-staging/<digest>）并登记索引。
+    keep_staging: bool = false,
+    /// 跳过 OS 层与 rootfs-build 步骤，仅从已保留树 mksquashfs 再发布。
+    from_staging: bool = false,
+};
+
+fn renderRootfsBuildBody(body: []u8, opts: RootfsBuildOptions) ![]const u8 {
+    if (opts.if_input_digest) |digest|
+        return std.fmt.bufPrint(body, "{{\"if_input_digest\":{f},\"new_ssh_keys\":{s},\"keep_staging\":{s},\"from_staging\":{s}}}", .{
+            std.json.fmt(digest, .{}),
+            if (opts.new_ssh_keys) "true" else "false",
+            if (opts.keep_staging) "true" else "false",
+            if (opts.from_staging) "true" else "false",
+        });
+    return std.fmt.bufPrint(body, "{{\"new_ssh_keys\":{s},\"keep_staging\":{s},\"from_staging\":{s}}}", .{
+        if (opts.new_ssh_keys) "true" else "false",
+        if (opts.keep_staging) "true" else "false",
+        if (opts.from_staging) "true" else "false",
+    });
+}
+
 /// `profile rootfs build`：从 Profile build projection 构建内容寻址 rootfs 制品
 /// （OS 层 + rootfs-build phase 步骤 + mksquashfs + 登记）。`if_input_digest` 非空时
 /// 作为防漂移约束。v0.2.3 §3.3：`new_ssh_keys` 为 true 时 daemon 先轮换
 /// identity/Profile 再以新投影构建。daemon 返回 202 后按 Location 轮询持久化
 /// Operation；CLI 只有观察到 succeeded 才返回成功，避免把“已入队”误报为“已构建”。
-pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, new_ssh_keys: bool, reason_buf: []u8) Mutation {
+pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, opts: RootfsBuildOptions, reason_buf: []u8) Mutation {
     if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
     var body: [1024]u8 = undefined;
-    const rendered = if (if_input_digest) |digest|
-        std.fmt.bufPrint(&body, "{{\"if_input_digest\":{f},\"new_ssh_keys\":{s}}}", .{ std.json.fmt(digest, .{}), if (new_ssh_keys) "true" else "false" }) catch
-            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs build request is too large") }
-    else
-        std.fmt.bufPrint(&body, "{{\"new_ssh_keys\":{s}}}", .{if (new_ssh_keys) "true" else "false"}) catch
-            return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs build request is too large") };
+    const rendered = renderRootfsBuildBody(&body, opts) catch
+        return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "rootfs.invalid", "rootfs build request is too large") };
     var path: [256]u8 = undefined;
     const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name}) catch return .{ .reachable = false, .healthy = false };
     var response: [16 * 1024]u8 = undefined;
@@ -612,7 +633,7 @@ pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]
     // Server requires If-Match when new_ssh_keys rotates identity + profile
     // revision (see managementRootfsBuild). Cache-hit builds without rotation
     // stay on the unconditioned POST path.
-    var reply = if (new_ssh_keys) blk: {
+    var reply = if (opts.new_ssh_keys) blk: {
         const revision = catalogRevision(io, port) orelse return mutationUnreachable(reason_buf, "cannot read current catalog revision");
         break :blk postMutation(io, port, route, rendered, revision, &response, &location) catch |err|
             return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
@@ -658,17 +679,14 @@ pub fn rootfsBuild(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]
     return .{ .reachable = true, .healthy = false, .reason = formatPlain(reason_buf, "operation.timeout", "rootfs build did not finish within four hours") };
 }
 
-pub fn rootfsBuildDetachJson(io: std.Io, port: u16, name: []const u8, if_input_digest: ?[]const u8, new_ssh_keys: bool, output: []u8, reason_buf: []u8) !?[]const u8 {
+pub fn rootfsBuildDetachJson(io: std.Io, port: u16, name: []const u8, opts: RootfsBuildOptions, output: []u8, reason_buf: []u8) !?[]const u8 {
     if (!querySafe(name)) return null;
     var body: [1024]u8 = undefined;
-    const rendered = if (if_input_digest) |digest|
-        try std.fmt.bufPrint(&body, "{{\"if_input_digest\":{f},\"new_ssh_keys\":{s}}}", .{ std.json.fmt(digest, .{}), if (new_ssh_keys) "true" else "false" })
-    else
-        try std.fmt.bufPrint(&body, "{{\"new_ssh_keys\":{s}}}", .{if (new_ssh_keys) "true" else "false"});
+    const rendered = try renderRootfsBuildBody(&body, opts);
     var path: [256]u8 = undefined;
     const route = try std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/build", .{name});
     // Match rootfsBuild: identity rotation mutates catalog and requires If-Match.
-    const reply = if (new_ssh_keys) blk: {
+    const reply = if (opts.new_ssh_keys) blk: {
         const revision = catalogRevision(io, port) orelse {
             _ = formatPlain(reason_buf, "http", "cannot read current catalog revision");
             return null;
@@ -680,6 +698,36 @@ pub fn rootfsBuildDetachJson(io: std.Io, port: u16, name: []const u8, if_input_d
         return null;
     }
     return reply.body;
+}
+
+/// `profile rootfs staging list`：列出全部已保留的 rootfs 解包树。
+pub fn rootfsStagingListJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
+    return managementJson(io, port, "/api/v1/management/rootfs/stagings", output);
+}
+
+/// `profile rootfs staging show`：按 Profile 当前 rootfs_input_digest 查询保留树。
+pub fn rootfsStagingShowJson(io: std.Io, port: u16, name: []const u8, output: []u8) !?[]const u8 {
+    if (!querySafe(name)) return error.InvalidProfileName;
+    var path: [256]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/staging", .{name});
+    return managementJson(io, port, rendered, output);
+}
+
+/// `profile rootfs staging remove`：删除索引并删除磁盘保留树。
+pub fn rootfsStagingRemove(io: std.Io, port: u16, name: []const u8, reason_buf: []u8) Mutation {
+    if (!querySafe(name)) return .{ .reachable = false, .healthy = false };
+    var path: [256]u8 = undefined;
+    const route = std.fmt.bufPrint(&path, "/api/v1/management/profiles/{s}/rootfs/staging", .{name}) catch return .{ .reachable = false, .healthy = false };
+    var output: [4096]u8 = undefined;
+    const reply = managementDeleteJson(io, port, route, &output) catch |err|
+        return .{ .reachable = true, .healthy = false, .reason = formatTransportError(reason_buf, err) };
+    if (reply.status == 0) return .{ .reachable = false, .healthy = false };
+    if (reply.status >= 200 and reply.status < 300) return .{ .reachable = true, .healthy = true, .http_status = reply.status };
+    if (reply.body) |err_body| {
+        const envelope = formatErrorReason(reason_buf, err_body);
+        return .{ .reachable = true, .healthy = false, .http_status = reply.status, .error_code = envelope.code, .reason = envelope.reason };
+    }
+    return .{ .reachable = true, .healthy = false, .http_status = reply.status, .reason = formatHttpStatus(reason_buf, reply.status) };
 }
 
 /// 提交 initrd durable operation。`detach=true` 返回初始 operation；否则跟随

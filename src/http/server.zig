@@ -47,6 +47,7 @@ const node_inventory = @import("../state/node_inventory.zig");
 const node_discovery = @import("../state/node_discovery.zig");
 const operations = @import("../state/operations.zig");
 const rootfs_artifact_store = @import("../state/rootfs_artifact_store.zig");
+const rootfs_staging_store = @import("../state/rootfs_staging_store.zig");
 const repository_index_blob = @import("../state/repository_index_blob.zig");
 const diskless_delivery = @import("../state/diskless_delivery.zig");
 const diskless_credential = @import("../state/diskless_credential.zig");
@@ -76,12 +77,17 @@ const initrd_field_cap = 192;
 const iso_field_cap = 256;
 const iso_id_cap = 128;
 
+/// 后台 rootfs 构建任务。v0.4 增加 keep/from staging 标志，由 worker 消费。
 const RootfsBuildJob = struct {
     active: bool = false,
     operation_id: [boot_session.id_len]u8 = [_]u8{0} ** boot_session.id_len,
     profile: [rootfs_profile_cap]u8 = [_]u8{0} ** rootfs_profile_cap,
     profile_len: u8 = 0,
     input_digest: [rootfs_digest_len]u8 = [_]u8{0} ** rootfs_digest_len,
+    /// 成功后将解包树提升到 work/rootfs-staging/<digest> 并登记索引。
+    keep_staging: bool = false,
+    /// 跳过 stage 1–5，仅从已保留树 mksquashfs 并允许 replace 已发布制品。
+    from_staging: bool = false,
 };
 
 const RootfsBuildWorker = struct {
@@ -89,13 +95,18 @@ const RootfsBuildWorker = struct {
     mutex: std.atomic.Mutex = .unlocked,
     stop: std.atomic.Value(bool) = .init(false),
 
-    fn submit(self: *RootfsBuildWorker, operation_id: []const u8, profile: []const u8, input_digest: []const u8) !void {
+    fn submit(self: *RootfsBuildWorker, operation_id: []const u8, profile: []const u8, input_digest: []const u8, keep_staging: bool, from_staging: bool) !void {
         if (operation_id.len != boot_session.id_len or profile.len == 0 or profile.len > rootfs_profile_cap or input_digest.len != rootfs_digest_len)
             return error.InvalidRootfsBuildJob;
         while (!self.mutex.tryLock()) std.Thread.yield() catch {};
         defer self.mutex.unlock();
         for (&self.jobs) |*job| if (!job.active) {
-            job.* = .{ .active = true, .profile_len = @intCast(profile.len) };
+            job.* = .{
+                .active = true,
+                .profile_len = @intCast(profile.len),
+                .keep_staging = keep_staging,
+                .from_staging = from_staging,
+            };
             @memcpy(&job.operation_id, operation_id);
             @memcpy(job.profile[0..profile.len], profile);
             @memcpy(&job.input_digest, input_digest);
@@ -233,6 +244,7 @@ const RouteContext = struct {
     initrd_worker: *InitrdBuildWorker,
     iso_worker: *IsoImportWorker,
     rootfs_artifacts: *rootfs_artifact_store.Store,
+    rootfs_stagings: *rootfs_staging_store.Store,
     diskless_store: *diskless_delivery.Store,
     identities: *identity_store.Store,
     /// v0.3: install-post journal store。记录 install-post 步骤执行状态。
@@ -320,6 +332,7 @@ pub fn serve(
     discoveries: *node_discovery.Store,
     operation_store: *operations.Store,
     rootfs_artifacts: *rootfs_artifact_store.Store,
+    rootfs_stagings: *rootfs_staging_store.Store,
     diskless_store: *diskless_delivery.Store,
     identities: *identity_store.Store,
     install_post_journal_store: *install_post_journal.Store,
@@ -367,6 +380,7 @@ pub fn serve(
         .initrd_worker = &initrd_worker,
         .iso_worker = &iso_worker,
         .rootfs_artifacts = rootfs_artifacts,
+        .rootfs_stagings = rootfs_stagings,
         .diskless_store = diskless_store,
         .identities = identities,
         .install_post_journal = install_post_journal_store,
@@ -583,7 +597,10 @@ fn route(request: zap.Request) !void {
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/software/available")) |name| return managementProfileSoftware(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/plan")) |name| return managementRootfsPlan(request, context, name, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/build")) |name| return managementRootfsBuild(request, context, name, meta);
+    if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/staging")) |name| return managementRootfsStagingShow(request, context, name, meta);
+    if (std.mem.eql(u8, method, "DELETE")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs/staging")) |name| return managementRootfsStagingRemove(request, context, name, meta);
     if (std.mem.eql(u8, method, "GET")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/rootfs")) |name| return managementRootfsStatus(request, context, name, meta);
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/api/v1/management/rootfs/stagings")) return managementRootfsStagingList(request, context, meta);
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/v1/management/profiles")) return managementProfileCreate(request, context, meta);
     if (std.mem.eql(u8, method, "POST")) if (resourceWithSuffix(path, "/api/v1/management/profiles/", "/clone")) |name| return managementProfileClone(request, context, name, meta);
     if (std.mem.eql(u8, method, "DELETE")) if (logicalPath(path, "/api/v1/management/profiles/")) |name| return managementProfileRemove(request, context, name, meta);
@@ -4329,7 +4346,7 @@ fn managementProfileClone(request: zap.Request, context: *RouteContext, source: 
         return cloneBuildSubmitFailed(request, meta, "cannot create rootfs build operation");
     saveOperations(context) catch return cloneBuildSubmitFailed(request, meta, "cannot persist rootfs build operation");
     if (!begun.reused) {
-        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex) catch |err| {
+        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex, false, false) catch |err| {
             _ = context.operations.fail(begun.entry.idSlice(), if (err == error.RootfsBuildQueueFull) "rootfs.queue_full" else "rootfs.invalid_job", unixNow()) catch {};
             saveOperations(context) catch {};
             return cloneBuildSubmitFailed(request, meta, "rootfs build worker queue is unavailable");
@@ -4394,7 +4411,15 @@ fn applyCatalogFromDisk(context: *RouteContext) !void {
 
 /// v0.2.3 §3.3: `new_ssh_keys` 为 true 时先轮换 identity revision 并发布
 /// Profile（ssh_identity 引用 + revision+1），再以新投影提交 build。
-const RootfsBuildRequest = struct { if_input_digest: ?[]const u8 = null, new_ssh_keys: bool = false };
+/// POST .../rootfs/build 请求体。v0.4 增加 keep_staging / from_staging。
+const RootfsBuildRequest = struct {
+    if_input_digest: ?[]const u8 = null,
+    new_ssh_keys: bool = false,
+    /// 构建成功后保留解包树到 work/rootfs-staging/<digest>，并写入 rootfs-stagings 索引。
+    keep_staging: bool = false,
+    /// 基于已保留树重新打包：跳过 OS 层与 rootfs-build 步骤，可替换同 digest 制品。
+    from_staging: bool = false,
+};
 const InitrdBuildRequest = struct {
     name: []const u8,
     install_source: []const u8,
@@ -4465,6 +4490,10 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     }
     const if_input_digest = if (parsed_request) |parsed| parsed.value.if_input_digest else null;
     const new_ssh_keys = if (parsed_request) |parsed| parsed.value.new_ssh_keys else false;
+    const keep_staging = if (parsed_request) |parsed| parsed.value.keep_staging else false;
+    const from_staging = if (parsed_request) |parsed| parsed.value.from_staging else false;
+    if (from_staging and new_ssh_keys)
+        return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"from_staging cannot be combined with new_ssh_keys\"}}\n", meta);
 
     if (new_ssh_keys) {
         // v0.2.3 §3.3 操作序列：先创建新 identity revision（同 id，revision+1，
@@ -4528,19 +4557,46 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     if (if_input_digest) |expected| if (!std.mem.eql(u8, expected, digest_hex))
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.digest_drift\",\"message\":\"current rootfs input digest does not match if_input_digest\"}}\n", meta);
 
-    // rootfs 只由 nodeforged 服务端构建；物理 Node 不参与构建或发布。
-    if (context.rootfs_artifacts.find(digest_hex)) |existing| {
-        var output: std.Io.Writer.Allocating = .init(context.allocator);
-        defer output.deinit();
-        try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":\"already_present\",\"content_sha512\":{f},\"compressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(existing.content_sha512, .{}), existing.compressed_size, std.json.fmt(existing.kernel_release, .{}), std.json.fmt(existing.file, .{}) });
-        try output.writer.writeAll("}}\n");
-        return json(request, .ok, output.written(), meta);
+    // 缓存命中规则（v0.4）：
+    // - 普通 build：digest 已有 ready 制品则直接 already_present；
+    // - keep_staging：若制品已有且保留树也在，可短路；仅缺树时会再跑 full build 以产出树；
+    // - from_staging：不走缓存短路，必须重打包（允许内容替换）。
+    const staging_present = blk: {
+        if (context.rootfs_stagings.find(digest_hex)) |entry| {
+            break :blk rootfs_staging_store.treeLooksReady(context.io, entry.path);
+        }
+        const candidate = try rootfs_staging_store.retainedPath(context.allocator, paths.require().rootfs_staging_dir, digest_hex);
+        defer context.allocator.free(candidate);
+        break :blk rootfs_staging_store.treeLooksReady(context.io, candidate);
+    };
+    if (from_staging and !staging_present)
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.staging_not_found\",\"message\":\"no retained staging tree for this profile digest; build with --keep-staging first\"}}\n", meta);
+
+    if (!from_staging) {
+        if (context.rootfs_artifacts.find(digest_hex)) |existing| {
+            if (!keep_staging or staging_present) {
+                var output: std.Io.Writer.Allocating = .init(context.allocator);
+                defer output.deinit();
+                try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":\"already_present\",\"content_sha512\":{f},\"compressed_bytes\":{d},\"kernel_release\":{f},\"file\":{f}", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}), std.json.fmt(existing.content_sha512, .{}), existing.compressed_size, std.json.fmt(existing.kernel_release, .{}), std.json.fmt(existing.file, .{}) });
+                if (context.rootfs_stagings.find(digest_hex)) |st| {
+                    try output.writer.print(",\"staging_path\":{f},\"staging_kept_at\":{d}", .{ std.json.fmt(st.path, .{}), st.kept_at });
+                }
+                try output.writer.writeAll("}}\n");
+                return json(request, .ok, output.written(), meta);
+            }
+        }
     }
 
-    var idempotency_key_buffer: [80]u8 = undefined;
-    const idempotency_key = request.getHeader("idempotency-key") orelse
-        try std.fmt.bufPrint(&idempotency_key_buffer, "rootfs-{s}", .{digest_hex});
-    const begun = context.operations.beginQueuedRequest(context.io, idempotency_key, digest_hex, .rootfs_build, unixNow()) catch |err|
+    var idempotency_key_buffer: [128]u8 = undefined;
+    const now = unixNow();
+    const idempotency_key = request.getHeader("idempotency-key") orelse blk: {
+        if (from_staging)
+            break :blk try std.fmt.bufPrint(&idempotency_key_buffer, "rootfs-from-staging-{s}-{d}", .{ digest_hex[0..16], now });
+        if (keep_staging and context.rootfs_artifacts.find(digest_hex) != null)
+            break :blk try std.fmt.bufPrint(&idempotency_key_buffer, "rootfs-keep-{s}-{d}", .{ digest_hex[0..16], now });
+        break :blk try std.fmt.bufPrint(&idempotency_key_buffer, "rootfs-{s}", .{digest_hex});
+    };
+    const begun = context.operations.beginQueuedRequest(context.io, idempotency_key, digest_hex, .rootfs_build, now) catch |err|
         return json(request, .conflict, if (err == error.IdempotencyConflict)
             "{\"ok\":false,\"error\":{\"code\":\"operation.idempotency_conflict\",\"message\":\"Idempotency-Key was already used for a different rootfs input\"}}\n"
         else
@@ -4551,7 +4607,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
         return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"operation.persist_failed\",\"message\":\"cannot persist rootfs build operation\"}}\n", meta);
     };
     if (!begun.reused) {
-        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex) catch |err| {
+        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex, keep_staging, from_staging) catch |err| {
             _ = context.operations.fail(begun.entry.idSlice(), if (err == error.RootfsBuildQueueFull) "rootfs.queue_full" else "rootfs.invalid_job", unixNow()) catch {};
             saveOperations(context) catch {};
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"rootfs.queue_unavailable\",\"message\":\"rootfs build worker queue is unavailable\"}}\n", meta);
@@ -4575,39 +4631,57 @@ fn hostIsDebianFamily(io: std.Io, allocator: std.mem.Allocator) bool {
         std.mem.indexOf(u8, content, "ID=ubuntu") != null;
 }
 
-fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest: []const u8, operation_id: []const u8) !void {
+/// Worker 侧 rootfs 构建（不接触 HTTP 请求）。
+///
+/// - 默认：临时目录 `work/rootfs-build-<digest>-<op>/`，结束后 deleteTree。
+/// - keep_staging：成功后 rename 到 `work/rootfs-staging/<digest>/` 并登记索引。
+/// - from_staging：直接以保留树为源，跳过 stage 1–5，仅 mksquashfs + 深验 + replace 发布。
+fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest: []const u8, operation_id: []const u8, keep_staging: bool, from_staging: bool) !void {
     const catalog = context.catalog_snapshot.value();
     const profile = lookup.findProfile(catalog, name) orelse return error.MissingProfile;
     if (profile.kind != .diskless) return error.ProfileNotDiskless;
     const digest = try resolvedRootfsInputDigest(context, catalog, profile);
     const digest_hex: []const u8 = &digest;
     if (!std.mem.eql(u8, expected_digest, digest_hex)) return error.RootfsDigestDrift;
-    if (context.rootfs_artifacts.find(digest_hex) != null) return;
+    // 内容寻址缓存：仅普通 full build 在已有 ready 时直接返回；
+    // from_staging / keep_staging 由调用方决定是否重跑。
+    if (!from_staging and !keep_staging and context.rootfs_artifacts.find(digest_hex) != null) return;
     const bundle_name = profile.boot_bundle orelse return error.MissingBootBundle;
     const boot_bundle = lookup.findBootBundle(catalog, bundle_name) orelse return error.MissingBootBundle;
-    const install_source = lookup.findInstallSource(catalog, profile.install_source) orelse return error.MissingInstallSource;
-    const build_steps = try diskless.rootfsBuildSteps(context.allocator, context.config, catalog, profile);
-    defer if (build_steps.len != 0) context.allocator.free(build_steps);
 
-    // Worker-side builds consume the same managed repository closure directly
-    // from disk; no daemon HTTP callback participates in the build.
-    const base = try std.fmt.allocPrint(context.allocator, "file://{s}", .{paths.require().repos_dir});
-    defer context.allocator.free(base);
-    var repo_closure = try buildRepositoryClosure(context.allocator, catalog, profile, install_source, base);
-    defer repo_closure.deinit(context.allocator);
-    const dto_manager = repo_closure.package_manager orelse return error.NoPackageManager;
-    const os_package_manager: model.PackageManager = switch (dto_manager) {
-        .dnf => .dnf,
-        .apt => .apt,
-    };
-
-    // staging 目录（digest 命名）：OS 层构建 + rootfs-build 步骤叠加。
     const work_dir = paths.require().work_dir;
-    const staging = try std.fmt.allocPrint(context.allocator, "{s}/rootfs-build-{s}-{s}", .{ work_dir, digest_hex, operation_id });
-    defer context.allocator.free(staging);
-    std.Io.Dir.cwd().deleteTree(context.io, staging) catch {};
-    try std.Io.Dir.cwd().createDirPath(context.io, staging);
-    defer std.Io.Dir.cwd().deleteTree(context.io, staging) catch {};
+    const retained = try rootfs_staging_store.retainedPath(context.allocator, paths.require().rootfs_staging_dir, digest_hex);
+    defer context.allocator.free(retained);
+
+    // 解包树：full build 用临时目录；from_staging 直接用规范保留路径。
+    const staging_temp = try std.fmt.allocPrint(context.allocator, "{s}/rootfs-build-{s}-{s}", .{ work_dir, digest_hex, operation_id });
+    defer context.allocator.free(staging_temp);
+    const staging: []const u8 = if (from_staging) retained else staging_temp;
+    var discard_temp = !from_staging;
+    defer if (discard_temp) std.Io.Dir.cwd().deleteTree(context.io, staging_temp) catch {};
+
+    if (from_staging) {
+        if (!rootfs_staging_store.treeLooksReady(context.io, staging)) return error.RootfsStagingNotFound;
+        std.log.scoped(.rootfs_build).info("rootfs build [{s}]: from-staging re-pack (staging={s})", .{ name, staging });
+    } else {
+        std.Io.Dir.cwd().deleteTree(context.io, staging_temp) catch {};
+        try std.Io.Dir.cwd().createDirPath(context.io, staging_temp);
+
+        const install_source = lookup.findInstallSource(catalog, profile.install_source) orelse return error.MissingInstallSource;
+        const build_steps = try diskless.rootfsBuildSteps(context.allocator, context.config, catalog, profile);
+        defer if (build_steps.len != 0) context.allocator.free(build_steps);
+
+        // Worker-side builds consume the same managed repository closure directly
+        // from disk; no daemon HTTP callback participates in the build.
+        const base = try std.fmt.allocPrint(context.allocator, "file://{s}", .{paths.require().repos_dir});
+        defer context.allocator.free(base);
+        var repo_closure = try buildRepositoryClosure(context.allocator, catalog, profile, install_source, base);
+        defer repo_closure.deinit(context.allocator);
+        const dto_manager = repo_closure.package_manager orelse return error.NoPackageManager;
+        const os_package_manager: model.PackageManager = switch (dto_manager) {
+            .dnf => .dnf,
+            .apt => .apt,
+        };
 
     // 1. OS 层：dnf 走统一 namespace+chroot 隔离原语从受管 repository 构建；
     //    apt（Ubuntu）走同源 ISO 的 casper squashfs layer overlay。
@@ -4753,16 +4827,16 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
     // casper/apt 两分支一致），构建期不再调用 `ssh-keygen`；未命中返回
     // `IdentityNotFound` fail closed。此处仅为阶段日志，不再重复生成密钥。
     std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 5/6 - SSH identity baseline installed from identity store", .{name});
+    } // full build 的 stage 1–5 结束；from_staging 路径跳过以上步骤
 
     // ── Stage 6/6：squashfs 压缩 + SHA-512 校验 + 原子发布 ──────────
     // 设计依据：DISKLESS_FINAL.md §4「共享 rootfs 构建模型」、
-    //           V0_2_DESIGN.md §5.4「rootfs 缓存与共享」。
+    //           V0_2_DESIGN.md §5.4「rootfs 缓存与共享」、
+    //           V0_4_DESIGN.md §1.1 保留树 / from-staging。
     //
-    // 使用 mksquashfs 将构建暂存目录压缩为只读下层镜像，压缩算法为 zstd。
-    // 输出文件以 rootfs_input_digest 命名（内容寻址），先写请求独占的临时文件，
-    // 再在发布临界区内原子改名。
-    // SHA-512 流式校验确保下载端 initrd 可验证完整性。
-    // 同一 rootfs_input_digest 的构建输出可跨 Node 共享，只增不删。
+    // 使用 mksquashfs 将解包目录压缩为只读下层镜像，压缩算法为 zstd。
+    // 输出以 rootfs_input_digest 内容寻址；先写请求独占临时文件再原子发布。
+    // from_staging：仅重打包，手改后允许 replace 同 digest 的 CAS 对象。
     std.log.scoped(.rootfs_build).info("rootfs build [{s}]: stage 6/6 - compressing squashfs + SHA-512", .{name});
     // 必须在压缩前统计目录树的逻辑占用字节数。squashfs 文件属性只能得到压缩后
     // 大小，不能将其当作临时文件系统或内存就绪检查所需的展开大小。
@@ -4823,10 +4897,65 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
         .deep_validated = true,
         .deep_validation_version = rootfs_artifact_store.current_deep_validation_version,
     };
-    const result = try publishRootfsArtifact(context, part, dest, artifact);
+    const result = try publishRootfsArtifact(context, part, dest, artifact, from_staging);
     const state_str: []const u8 = @tagName(result);
     std.log.scoped(.rootfs_build).info("rootfs build [{s}]: DONE - state={s} file={s} size={d} bytes sha512={s}", .{ name, state_str, file_name, total_size, content_sha512[0..16] });
+
+    // 可选保留解包树：供 chroot 特需与后续 --from-staging 重打包。
+    if (keep_staging or from_staging) {
+        try retainRootfsStaging(context, name, digest_hex, staging, staging_temp, from_staging, operation_id, uncompressed_size, &discard_temp);
+    }
     return;
+}
+
+/// 将解包树提升/登记为规范保留路径 `work/rootfs-staging/<digest>`。
+/// full build：rename 临时目录到规范路径；from_staging：树已在规范路径，只刷新索引。
+fn retainRootfsStaging(
+    context: *RouteContext,
+    profile_name: []const u8,
+    digest_hex: []const u8,
+    staging: []const u8,
+    staging_temp: []const u8,
+    from_staging: bool,
+    operation_id: []const u8,
+    apparent_bytes: u64,
+    discard_temp: *bool,
+) !void {
+    const retained = try rootfs_staging_store.retainedPath(context.allocator, paths.require().rootfs_staging_dir, digest_hex);
+    defer context.allocator.free(retained);
+    try std.Io.Dir.cwd().createDirPath(context.io, paths.require().rootfs_staging_dir);
+
+    if (!from_staging) {
+        // 同一 digest 的旧保留树被新树替换。
+        if (!std.mem.eql(u8, staging, retained)) {
+            std.Io.Dir.cwd().deleteTree(context.io, retained) catch {};
+            std.Io.Dir.rename(std.Io.Dir.cwd(), staging_temp, std.Io.Dir.cwd(), retained, context.io) catch |err| {
+                // rename 失败时退化为索引临时路径，并取消 deleteTree。
+                std.log.scoped(.rootfs_build).warn("rootfs staging promote rename failed ({t}); indexing temp path", .{err});
+                try context.rootfs_stagings.upsert(context.io, .{
+                    .rootfs_input_digest = digest_hex,
+                    .profile = profile_name,
+                    .path = staging_temp,
+                    .kept_at = unixNow(),
+                    .operation_id = operation_id,
+                    .apparent_bytes = apparent_bytes,
+                });
+                discard_temp.* = false;
+                return;
+            };
+            discard_temp.* = false; // 已迁走，无需再删临时目录
+        }
+    }
+
+    try context.rootfs_stagings.upsert(context.io, .{
+        .rootfs_input_digest = digest_hex,
+        .profile = profile_name,
+        .path = retained,
+        .kept_at = unixNow(),
+        .operation_id = operation_id,
+        .apparent_bytes = apparent_bytes,
+    });
+    std.log.scoped(.rootfs_build).info("rootfs staging retained: profile={s} digest={s} path={s}", .{ profile_name, digest_hex[0..16], retained });
 }
 
 fn runRootfsBuildWorker(shared_context: *RouteContext, worker: *RootfsBuildWorker) void {
@@ -4855,7 +4984,7 @@ fn runRootfsBuildWorker(shared_context: *RouteContext, worker: *RootfsBuildWorke
         context.config = pair.config.value();
         context.config_revision = pair.config.revision;
         context.catalog_snapshot = pair.catalog;
-        performRootfsBuild(&context, profile, &job.input_digest, operation_id) catch |err| {
+        performRootfsBuild(&context, profile, &job.input_digest, operation_id, job.keep_staging, job.from_staging) catch |err| {
             pair.release();
             var error_buffer: [96]u8 = undefined;
             const error_code = std.fmt.bufPrint(&error_buffer, "rootfs.{s}", .{@errorName(err)}) catch "rootfs.build_failed";
@@ -5143,15 +5272,15 @@ test "rootfs worker queue copies jobs and rejects overflow" {
     var worker: RootfsBuildWorker = .{};
     const operation_id = "0123456789abcdef0123456789abcdef";
     const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    try worker.submit(operation_id, "profile-a", digest);
+    try worker.submit(operation_id, "profile-a", digest, false, false);
     const first = worker.take() orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(operation_id, &first.operation_id);
     try std.testing.expectEqualStrings("profile-a", first.profile[0..first.profile_len]);
     try std.testing.expectEqualStrings(digest, &first.input_digest);
     try std.testing.expect(worker.take() == null);
 
-    for (0..max_rootfs_build_jobs) |_| try worker.submit(operation_id, "profile-a", digest);
-    try std.testing.expectError(error.RootfsBuildQueueFull, worker.submit(operation_id, "profile-a", digest));
+    for (0..max_rootfs_build_jobs) |_| try worker.submit(operation_id, "profile-a", digest, false, false);
+    try std.testing.expectError(error.RootfsBuildQueueFull, worker.submit(operation_id, "profile-a", digest, false, false));
 }
 
 test "v0.2.3: iso worker queue holds one job and rejects concurrent submit" {
@@ -5289,14 +5418,28 @@ fn verifyCasperLayer(io: std.Io, path: []const u8, expected_size: u64, expected_
 /// 相同输入摘要的检查、正式文件原子改名和制品存储持久化由同一把变更互斥锁
 /// 串行化。已有制品时先执行不可变元数据校验，绝不替换正式文件；新制品只有在
 /// 原子改名成功后才登记，登记失败则删除刚发布但尚无记录的文件。
+/// 发布 rootfs CAS 对象。`replace_existing=true` 时用于 from-staging 手改后重打包。
 fn publishRootfsArtifact(
     context: *RouteContext,
     temporary_path: []const u8,
     destination_path: []const u8,
     artifact: rootfs_artifact_store.Artifact,
+    replace_existing: bool,
 ) !rootfs_artifact_store.PublishResult {
     while (!config_mutation_mutex.tryLock()) std.Thread.yield() catch {};
     defer config_mutation_mutex.unlock();
+
+    if (replace_existing) {
+        // 近似原子替换：删旧对象 → 装入新字节 → 更新制品索引。
+        std.Io.Dir.cwd().deleteFile(context.io, destination_path) catch {};
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), temporary_path, std.Io.Dir.cwd(), destination_path, context.io);
+        try dhcp_store.syncParentDirectory(context.io, destination_path);
+        return context.rootfs_artifacts.replace(context.io, artifact) catch |err| {
+            std.Io.Dir.cwd().deleteFile(context.io, destination_path) catch {};
+            dhcp_store.syncParentDirectory(context.io, destination_path) catch {};
+            return err;
+        };
+    }
 
     if (context.rootfs_artifacts.find(artifact.rootfs_input_digest) != null) {
         const result = try context.rootfs_artifacts.publish(context.io, artifact);
@@ -5390,6 +5533,7 @@ fn managementRootfsStatus(request: zap.Request, context: *RouteContext, name: []
     const digest = resolvedRootfsInputDigest(context, catalog, profile) catch |err| return validationError(request, err, meta);
     const digest_hex: []const u8 = digest[0..];
     const artifact = context.rootfs_artifacts.find(digest_hex);
+    const staging = context.rootfs_stagings.find(digest_hex);
     var output: std.Io.Writer.Allocating = .init(context.allocator);
     defer output.deinit();
     if (artifact) |a| {
@@ -5399,7 +5543,83 @@ fn managementRootfsStatus(request: zap.Request, context: *RouteContext, name: []
     } else {
         try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"state\":\"miss\"", .{ std.json.fmt(profile.name, .{}), std.json.fmt(digest_hex, .{}) });
     }
+    if (staging) |st| {
+        const ready = rootfs_staging_store.treeLooksReady(context.io, st.path);
+        try output.writer.print(",\"staging_kept\":true,\"staging_path\":{f},\"staging_kept_at\":{d},\"staging_ready\":{s},\"staging_apparent_bytes\":{d},\"staging_operation_id\":{f}", .{
+            std.json.fmt(st.path, .{}),
+            st.kept_at,
+            if (ready) "true" else "false",
+            st.apparent_bytes,
+            std.json.fmt(st.operation_id, .{}),
+        });
+    } else {
+        try output.writer.writeAll(",\"staging_kept\":false");
+    }
     try output.writer.writeAll("}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementRootfsStagingList(request: zap.Request, context: *RouteContext, meta: RequestMeta) !void {
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"ok\":true,\"result\":{\"stagings\":[");
+    var first = true;
+    for (context.rootfs_stagings.list()) |st| {
+        if (!first) try output.writer.writeAll(",");
+        first = false;
+        const ready = rootfs_staging_store.treeLooksReady(context.io, st.path);
+        try output.writer.print("{{\"profile\":{f},\"rootfs_input_digest\":{f},\"path\":{f},\"kept_at\":{d},\"ready\":{s},\"apparent_bytes\":{d},\"operation_id\":{f}}}", .{
+            std.json.fmt(st.profile, .{}),
+            std.json.fmt(st.rootfs_input_digest, .{}),
+            std.json.fmt(st.path, .{}),
+            st.kept_at,
+            if (ready) "true" else "false",
+            st.apparent_bytes,
+            std.json.fmt(st.operation_id, .{}),
+        });
+    }
+    try output.writer.writeAll("]}}\n");
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementRootfsStagingShow(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const catalog = context.catalog_snapshot.value();
+    const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
+    if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs staging is only available for diskless profiles\"}}\n", meta);
+    const digest = resolvedRootfsInputDigest(context, catalog, profile) catch |err| return validationError(request, err, meta);
+    const digest_hex: []const u8 = digest[0..];
+    const st = context.rootfs_stagings.find(digest_hex) orelse
+        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"rootfs.staging_not_found\",\"message\":\"no retained staging for this profile digest\"}}\n", meta);
+    const ready = rootfs_staging_store.treeLooksReady(context.io, st.path);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"path\":{f},\"kept_at\":{d},\"ready\":{s},\"apparent_bytes\":{d},\"operation_id\":{f}}}}}\n", .{
+        std.json.fmt(profile.name, .{}),
+        std.json.fmt(digest_hex, .{}),
+        std.json.fmt(st.path, .{}),
+        st.kept_at,
+        if (ready) "true" else "false",
+        st.apparent_bytes,
+        std.json.fmt(st.operation_id, .{}),
+    });
+    return json(request, .ok, output.written(), meta);
+}
+
+fn managementRootfsStagingRemove(request: zap.Request, context: *RouteContext, name: []const u8, meta: RequestMeta) !void {
+    const catalog = context.catalog_snapshot.value();
+    const profile = lookup.findProfile(catalog, name) orelse return notFound(request, meta);
+    if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs staging is only available for diskless profiles\"}}\n", meta);
+    const digest = resolvedRootfsInputDigest(context, catalog, profile) catch |err| return validationError(request, err, meta);
+    const digest_hex: []const u8 = digest[0..];
+    const removed = try context.rootfs_stagings.remove(context.io, digest_hex, true);
+    if (!removed)
+        return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"rootfs.staging_not_found\",\"message\":\"no retained staging for this profile digest\"}}\n", meta);
+    var output: std.Io.Writer.Allocating = .init(context.allocator);
+    defer output.deinit();
+    try output.writer.print("{{\"ok\":true,\"result\":{{\"profile\":{f},\"rootfs_input_digest\":{f},\"removed\":true}}}}\n", .{
+        std.json.fmt(profile.name, .{}),
+        std.json.fmt(digest_hex, .{}),
+    });
     return json(request, .ok, output.written(), meta);
 }
 

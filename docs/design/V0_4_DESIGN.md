@@ -2,7 +2,9 @@
 
 状态：设计冻结，按当前代码与本文件继续收口验证。
 
-v0.4 在 v0.3 的 install、diskless 与 install-post 基线上增加四项能力：目标网络 topology、install first-boot、SN+IP draft Node discovery、容量与恢复闸。本版本采用 fresh replacement，不迁移旧部署状态。容量目标按部署波次、传输并发和实现安全天花板分层定义，不把某个压力测试点写成产品最高上限。
+v0.4 在 v0.3 的 install、diskless 与 install-post 基线上增加能力：目标网络 topology、install first-boot、SN+IP draft Node discovery、容量与恢复闸，以及**可选 rootfs staging 保留与基于保留树再打包**（运维特需，不改变「rootfs 仅服务端生成」边界）。本版本采用 fresh replacement，不迁移旧部署状态。容量目标按部署波次、传输并发和实现安全天花板分层定义，不把某个压力测试点写成产品最高上限。
+
+> **v0.4.1（设计中，不阻断 v0.4）**：在保留树上提供规范会话环境（`profile rootfs staging enter` / `exec`、full 挂载含 cgroup 与限额、共享 host 网、树内核扫描与启动面导入；切根仅 chroot，无顶层 `rootfs` 命令）。见 [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md)。
 
 ## 1. 强制架构边界
 
@@ -18,13 +20,36 @@ POST /api/v1/management/profiles/:name/rootfs/build
 管理 API 创建 durable `rootfs_build` operation，后台 worker 在服务端完成以下步骤：
 
 1. 从固定 revision 的 install source、受管 repository、Profile software、provisioning bundle 与 SSH identity 编译 `rootfs_input_digest`；
-2. 在服务端 staging 目录构建发行版 OS layer；
+2. 在服务端**临时** staging 目录构建发行版 OS layer；
 3. 执行 `rootfs_build` phase；
 4. 注入 `nodeforge-agent`、first-boot unit 与固定身份材料；
 5. 生成 squashfs，计算 SHA-512，解包深验；
-6. 原子发布到服务端内容寻址 rootfs 目录并登记 ready artifact。
+6. 原子发布到服务端内容寻址 rootfs 目录并登记 ready artifact；
+7. （可选）在请求 `keep_staging` 时，将解包树提升为规范保留路径并登记索引（见 §1.1.1）。
 
 Profile 名、物理 Node、URL、时间戳和 operation id 不进入内容摘要。任何输入 revision、payload digest、软件闭包或身份 revision 改变都必须改变 `rootfs_input_digest`。
+
+默认构建结束后删除临时解包目录；**不**默认保留可 chroot 的原始树。
+
+### 1.1.1 可选 staging 保留与 from-staging 再打包
+
+实验室/特需场景允许操作员在管理节点上 chroot 进解包树做一次性调整，再重新打包发布。这仍是**服务端**路径，不引入节点侧 rootfs 构建，也不提供预制 squashfs import。
+
+| 能力 | CLI | API | 行为 |
+|---|---|---|---|
+| 保留解包树 | `profile rootfs build … --keep-staging` | `POST …/rootfs/build` body `keep_staging: true` | 成功后将树提升到 `<install-root>/work/rootfs-staging/<rootfs_input_digest>/`，并写入 `state/rootfs-stagings.json` |
+| 基于保留树再打包 | `profile rootfs build … --from-staging` | body `from_staging: true` | 跳过 OS 层与 rootfs-build 步骤，仅对保留树 `mksquashfs` + 深验；允许**替换**同一 digest 下已有 ready 制品（手改后 content_sha512 可变） |
+| 查询 | `profile rootfs staging list` / `show <profile>`；`status` 附带 staging 字段 | `GET /api/v1/management/rootfs/stagings`；`GET …/profiles/:name/rootfs/staging`；`GET …/rootfs` | 返回 path、kept_at、ready（磁盘树是否仍可用）等 |
+| 清理 | `profile rootfs staging remove <profile>` | `DELETE …/profiles/:name/rootfs/staging` | 删索引并删磁盘树 |
+
+约束：
+
+1. **保留树不是交付物**：diskless 节点只下载 ready squashfs；initrd 不得 chroot 到管理节点保留树。
+2. **`rootfs_input_digest` 语义不变**：仍只反映 Profile build projection。手改保留树再 `--from-staging` 不会改 digest，但会更新该 digest 对应的 CAS 文件与 `content_sha512`（`replace`）。正式可复现定制仍应写入 Profile `rootfs-build` 步骤。
+3. **`from_staging` 与 `new_ssh_keys` 互斥**（轮换 identity 会改变投影 digest，与「从旧树重打包」语义冲突）。
+4. **缺树 fail closed**：`from_staging` 时无可用保留树返回 `rootfs.staging_not_found`。
+5. **空间与生命周期**：保留树可能 GB 级；由操作员显式 `staging remove` 清理；`--purge-all` 删除 `work/` 时一并清除。
+6. **缓存短路**：普通 build 在 ready 命中时不重建；`keep_staging` 在「制品已有且保留树已有」时可短路，仅缺树时再跑 full build 以产出树；`from_staging` 不走 ready 短路。
 
 ### 1.2 diskless Node 只消费 ready artifact
 
@@ -206,6 +231,7 @@ deadline 分为：
 | diskless/install terminal summary | 复用既有 `node-status.json` / `deployment-control.json` 投影，不新增 durable domain |
 | rootfs operation | `operations.json` |
 | ready rootfs artifact | `rootfs-artifacts.json` + 内容寻址文件 |
+| optional rootfs staging tree | `rootfs-stagings.json` + `work/rootfs-staging/<digest>/`（非交付物，仅管理节点特需） |
 | install first-boot | `install-first-boot.json` |
 | discovery | `node-discovery.json` |
 
@@ -223,12 +249,24 @@ HTTP listener 必须实际接入可配置 `max_connections`/`max_clients`，默�
 
 ```text
 nodeforge profile rootfs plan <profile>
-nodeforge profile rootfs build <profile> [--if-input-digest <hex>] [--new-ssh-keys] [--detach]
+nodeforge profile rootfs build <profile> [--if-input-digest <hex>] [--new-ssh-keys] [--keep-staging] [--from-staging] [--detach]
 nodeforge profile rootfs status <profile>
+nodeforge profile rootfs staging list
+nodeforge profile rootfs staging show <profile>
+nodeforge profile rootfs staging remove <profile>
 ```
 
-不存在预制 squashfs 的 register/import API。测试也必须通过 nodeforged build operation
-得到 ready artifact，不能维护第二条生产路径或直接伪造 production state。
+对应 management API：
+
+```text
+POST /api/v1/management/profiles/:name/rootfs/build   # body 可含 keep_staging / from_staging
+GET  /api/v1/management/profiles/:name/rootfs
+GET  /api/v1/management/profiles/:name/rootfs/staging
+DELETE /api/v1/management/profiles/:name/rootfs/staging
+GET  /api/v1/management/rootfs/stagings
+```
+
+不存在预制 squashfs 的 register/import API。`--from-staging` 只消费本机**由 keep-staging 留下**的解包树，不是外部 rootfs 导入。测试也必须通过 nodeforged build operation 得到 ready artifact，不能维护第二条生产路径或直接伪造 production state。
 
 ## 10. 完成标准
 
