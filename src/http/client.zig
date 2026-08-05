@@ -272,21 +272,46 @@ pub fn bootBundlesJson(io: std.Io, port: u16, output: []u8) !?[]const u8 {
     return managementJson(io, port, "/api/v1/management/boot-bundles", output);
 }
 
-pub fn softwareCapabilitiesJson(io: std.Io, port: u16, resource: []const u8, name: []const u8, kind: ?[]const u8, search: ?[]const u8, output: []u8) !?[]const u8 {
+/// Build the management path for software capability queries.
+/// Profiles use `/software/available`; install-sources and repositories use `/software`.
+pub fn softwareCapabilitiesPath(buffer: []u8, resource: []const u8, name: []const u8, kind: ?[]const u8, search: ?[]const u8) ![]const u8 {
     if (!std.mem.eql(u8, resource, "install-sources") and !std.mem.eql(u8, resource, "repositories") and !std.mem.eql(u8, resource, "profiles")) return error.InvalidResource;
     if (!querySafe(name)) return error.InvalidResourceName;
     if (kind) |value| if (!querySafe(value)) return error.InvalidSoftwareKind;
     if (search) |value| if (!querySafe(value)) return error.InvalidSearch;
-    var path: [640]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&path);
-    try writer.print("/api/v1/management/{s}/{s}/software", .{ resource, name });
+    var writer = std.Io.Writer.fixed(buffer);
+    // Profile available-capabilities is a distinct route from install-source /
+    // repository software indexes. The server only exposes
+    // GET /profiles/:name/software/available (see routes.zig); using the flat
+    // /software suffix yields HTTP 404 and surfaces as software.query_failed.
+    if (std.mem.eql(u8, resource, "profiles")) {
+        try writer.print("/api/v1/management/profiles/{s}/software/available", .{name});
+    } else {
+        try writer.print("/api/v1/management/{s}/{s}/software", .{ resource, name });
+    }
     var separator: u8 = '?';
     if (kind) |value| {
         try writer.print("{c}kind={s}", .{ separator, value });
         separator = '&';
     }
     if (search) |value| try writer.print("{c}search={s}", .{ separator, value });
-    return managementJson(io, port, writer.buffered(), output);
+    return writer.buffered();
+}
+
+pub fn softwareCapabilitiesJson(io: std.Io, port: u16, resource: []const u8, name: []const u8, kind: ?[]const u8, search: ?[]const u8, output: []u8) !?[]const u8 {
+    var path: [640]u8 = undefined;
+    const rendered = try softwareCapabilitiesPath(&path, resource, name, kind, search);
+    return managementJson(io, port, rendered, output);
+}
+
+test "softwareCapabilitiesPath profiles use available suffix; sources use software" {
+    var buf: [640]u8 = undefined;
+    const profile_path = try softwareCapabilitiesPath(&buf, "profiles", "rocky-install", null, null);
+    try std.testing.expectEqualStrings("/api/v1/management/profiles/rocky-install/software/available", profile_path);
+    const source_path = try softwareCapabilitiesPath(&buf, "install-sources", "rocky", null, null);
+    try std.testing.expectEqualStrings("/api/v1/management/install-sources/rocky/software", source_path);
+    const filtered = try softwareCapabilitiesPath(&buf, "profiles", "p1", "package", "vim");
+    try std.testing.expectEqualStrings("/api/v1/management/profiles/p1/software/available?kind=package&search=vim", filtered);
 }
 
 pub fn valuesMutation(io: std.Io, port: u16, owner: []const u8, identity: []const u8, operation: []const u8, key: []const u8, values: []const []const u8, mutations: []const @import("../config/scalar_mutation.zig").Mutation, force: bool, reason_buf: []u8) Mutation {
