@@ -1,9 +1,13 @@
 # NodeForge 当前 CLI 全面优化与收敛方案
 
+> **归档**：已迁至 `docs/archive/design/`。多数 P0/P1 已落地；未完成项以
+> [`../../design/DEFERRED_DESIGN_INDEX.md`](../../design/DEFERRED_DESIGN_INDEX.md) 为准。
+> 现行命令树见 [`../../cli/REFERENCE.md`](../../cli/REFERENCE.md)。
+
 | 元数据 | 值 |
 |---|---|
 | 文档 ID | `CLI-PLAN-2026-07-28-01` |
-| 状态 | `proposed` |
+| 状态 | `archived`（原 `proposed`，2026-07-28） |
 | 创建时间 | `2026-07-28` |
 | 最后更新 | `2026-07-28` |
 | 适用范围 | 当前 CLI、management API、相关状态模型、代码注释、测试与 CLI 设计文档 |
@@ -91,7 +95,7 @@ docs/cli/REFERENCE.md        当前正式 CLI 接口
 docs/cli/WORKFLOWS.md        正常操作流程
 docs/cli/TROUBLESHOOTING.md  诊断、恢复和高级命令
 docs/design/*.md             目标架构、版本设计和决策记录
-docs/audits/*.md             某次代码/设计对照的审计证据
+docs/archive/audits/*.md     某次代码/设计对照的审计证据（已归档）
 ```
 
 在上述文件落地前，本文作为整体迁移基线。现有 `V0_2_CLI.md` 不应继续被解释为

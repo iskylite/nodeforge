@@ -203,4 +203,4 @@ NodeForge 不把远端可变内容伪装成 immutable asset。
 - r97n2 使用 Ubuntu 22.04.5 完成 UEFI PXE、NVMe 安装、本地盘启动和 force-retry generation 3。
 - active daemon 不响应时 readiness 在 6 秒内失败，unit link、enabled/active 状态和健康服务全部恢复。
 
-完整证据见 `docs/validation/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。
+完整证据见 `docs/archive/validation/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。

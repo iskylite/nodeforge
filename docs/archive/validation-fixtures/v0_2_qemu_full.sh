@@ -38,7 +38,7 @@ cd "$repo"
 #   Local build : zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
 #   Sync to host: rsync -az --delete zig-out/bin/ root@r97n0:/root/NodeForge/zig-out/bin/
 for b in nodeforge nodeforged nodeforge-agent nodeforge-initrd; do
-    [[ -x "zig-out/bin/$b" ]] || { echo "missing prebuilt $b: cross-compile locally and sync zig-out/bin/ (see docs/validation/V0_2_PHASE8_VALIDATION.md)" >&2; exit 1; }
+    [[ -x "zig-out/bin/$b" ]] || { echo "missing prebuilt $b: cross-compile locally and sync zig-out/bin/ (see docs/archive/validation/V0_2_PHASE8_VALIDATION.md)" >&2; exit 1; }
 done
 if [[ "$(zig-out/bin/nodeforge --version | awk 'NR == 1 { print $2 }')" != "0.2.0" ]]; then
     echo "archived v0.2 fixture: current binaries are not v0.2; use docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md" >&2

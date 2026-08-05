@@ -1004,7 +1004,7 @@ v0.2.3 只有同时满足以下条件才完成：
 | [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) | "重建时换全部 SSH keys"标记为已实现 |
 | [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) | schema 版本引用更新 |
 | [`docs/cli/REFERENCE.md`](../cli/REFERENCE.md) | `profile clone` 新增 flags、exit code 表；`node deploy` 缺省 true 语义说明 |
-| [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](CURRENT_CLI_OPTIMIZATION_PLAN.md) | P0/P1 完成状态更新 |
+| [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../archive/design/CURRENT_CLI_OPTIMIZATION_PLAN.md)（归档） | P0/P1 完成状态更新 |
 | [`V0_3_DESIGN.md`](V0_3_DESIGN.md) | 前置条件从 v0.2.2 改为 v0.2.3 |
 
 版本实施顺序固定为 v0.2.1 → v0.2.2 → v0.2.3 → v0.3 → v0.4。
@@ -1058,7 +1058,7 @@ v0.2.3 只有同时满足以下条件才完成：
 | `V0_2_CLI.md` | L127 | 示例 `node deploy <id> false` 保持不变（显式 false 仍有效） |
 | `V0_2_CLI.md` | L131、L509、L510、L577、L586、L597 | 示例可保留显式 `true`/`false` 写法（向后兼容），不强制改 |
 | `V0_2_DISKLESS_WORKFLOW.md` | L253、L259、L345 | 同上，保留显式写法 |
-| `CURRENT_CLI_OPTIMIZATION_PLAN.md` | L674、L1039、L1051 | 同上 |
+| `archive/design/CURRENT_CLI_OPTIMIZATION_PLAN.md` | L674、L1039、L1051 | 同上 |
 | `README.md` | L308、L388、L410 | 同上 |
 | `docs/cli/REFERENCE.md` | §Node 与生命周期 | 补一句“`node deploy <id>` 缺省等价于 `node deploy <id> true`” |
 

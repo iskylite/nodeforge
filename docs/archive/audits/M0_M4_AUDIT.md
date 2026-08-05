@@ -84,7 +84,7 @@ curtin action graph for explicit partitions.
   `--netmask=255.255.255.0` syntax. r97n1 completed DHCP, TFTP GRUB, kernel
   and initrd transfer in a fresh Computer Use run, then stopped at the
   documented 64 KiB-granule EFI error. The current session and byte-level
-  provenance are recorded in `docs/validation/ROCKY_8_10_VALIDATION.md`.
+  provenance are recorded in `docs/archive/validation/ROCKY_8_10_VALIDATION.md`.
 - ISO-import publication/copy failures now roll back only files owned by that
   invocation, catalog-publication failures clean all unpublished outputs, and
   read-only DVD work trees use a safe removal fallback so successful imports do

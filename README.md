@@ -71,21 +71,22 @@ NodeForge/
 
 ## 文档
 
-详细设计、审计和验证记录位于 [`docs/`](docs/)，入口见 [文档导航](docs/README.md)：
+入口见 [文档导航](docs/README.md)。日常只需：
 
-- [v0.2 冻结设计总纲](docs/design/V0_2_DESIGN.md)：已落地的 Rocky/RHEL diskless 主流程。
-- [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu
-  casper 方案与正式 rootfs builder 已落地并完成验证。
-- [v0.2.2 可运营性设计](docs/design/V0_2_2_OPERABILITY.md)：持久化兼容、
-  durable rootfs build operation、CLI 收敛和当前环境验证矩阵。
-- [v0.3 冻结设计与验证](docs/design/V0_3_DESIGN.md)：install-post canonical 扩展已落地并通过发布闸。
-- [v0.4 统一设计](docs/design/V0_4_DESIGN.md)：v0.4 topology、fresh replacement、服务端 rootfs 生成、install first-boot 与 SN discovery 契约；共同底座已落地，发布闸按 runbook 执行。
-- [v0.4 全量验证运行手册](docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md)：单节点真实闭环、逻辑容量 workload、恢复和资源边界发布闸。
-- [统一延期、保留与非目标清单](docs/design/DEFERRED_DESIGN_INDEX.md)：唯一登记环境/规模验证延期、未排期设计、上游阻塞、可选证据、拒绝路径和永久非目标。
-- [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
-- [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录（含 [Phase 8 QEMU 全量验证](docs/validation/V0_2_PHASE8_VALIDATION.md)）。
+- [v0.4 统一设计](docs/design/V0_4_DESIGN.md)：当前版本契约。
+- [统一延期与非目标清单](docs/design/DEFERRED_DESIGN_INDEX.md)：延期/非目标唯一状态表。
+- [通用平台验证运行手册](docs/validation/PLATFORM_VALIDATION_RUNBOOK.md)：大更新 fresh 公共发布闸。
+- [v0.4 全量验证运行手册](docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md)：v0.4 增量闸。
+- [CLI Reference](docs/cli/REFERENCE.md)：公开命令树（参数以 `--help-full` 为准）。
 
-文档冲突时的优先级：现行版本设计 > 当前代码 > 当前验证记录 > 统一延期清单 > 历史归档。
+冻结底座与历史证据：
+
+- [v0.3 install-post 设计](docs/design/V0_3_DESIGN.md)（契约）/
+  [实跑记录](docs/archive/validation/V0_3_VALIDATION.md)（归档）
+- [v0.2 diskless 总纲](docs/design/V0_2_DESIGN.md) 及分册（只读冻结）
+- 其余历史验证、审计、M0–M7 长文 → [`docs/archive/`](docs/archive/)
+
+文档冲突时的优先级：现行版本设计 > 当前代码 > 现行验证 runbook > 统一延期清单 > 冻结分册 > 历史归档。
 
 ## 实现
 
@@ -436,7 +437,7 @@ nodeforge node deploy node-01 false
 下面是 2026-08-02 在 `r97n0`（Rocky 9.8 aarch64 管理节点）和 VMware Fusion
 中的 `r97n1`（UEFI aarch64 计算节点）完成的 fresh 验收流程。示例地址和接口属于
 该验证环境，其他站点必须先替换；完整结果与 journal 证据见
-[`docs/validation/V0_3_VALIDATION.md`](docs/validation/V0_3_VALIDATION.md)。
+[`docs/archive/validation/V0_3_VALIDATION.md`](docs/archive/validation/V0_3_VALIDATION.md)。
 
 > **破坏性操作**：清场会停止 NodeForge 并删除 `/opt/nodeforge` 中的配置、Catalog、
 > ISO 副本、rootfs、状态和日志。执行前必须再次确认 `hostname`、安装根和 unit 路径；

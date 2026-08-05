@@ -1,7 +1,10 @@
 # NodeForge v0.2 CLI 接口
 
-状态：v0.2 接口分册，核心 CLI/API 已实现并持续按验证结果收口。总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文是 CLI
-命令树、flag、CAS、输出和 exit code 的唯一事实源。推荐操作顺序见
+状态：**冻结分册（只读）**。现行公开命令树以 [`../cli/REFERENCE.md`](../cli/REFERENCE.md)
+与 `nodeforge --help-full` 为准；本文保留 v0.2 时期完整 CLI 契约与设计意图，供对照，不作为
+日常操作入口。
+
+总纲以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准。推荐操作顺序见
 [`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md)。命令必须复用 v0.1
 资源-动作树、typed PropertySpec/CollectionSpec/ItemSpec、统一 OutputDocument 和 optimistic concurrency；
 预留 enum、help 或空 handler 不算实现。

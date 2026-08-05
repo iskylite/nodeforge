@@ -76,7 +76,7 @@ queued -> running -> succeeded | failed
 
 ## 4. CLI 收敛
 
-以 `CURRENT_CLI_OPTIMIZATION_PLAN.md` 为目标，v0.2.2 至少落地：
+以归档 [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../archive/design/CURRENT_CLI_OPTIMIZATION_PLAN.md) 为目标，v0.2.2 至少落地：
 
 - `profile clone`（无运行时继承）；
 - `node boot preview`：编译目标、路径、feature、memory budget，但不创建 session/token；

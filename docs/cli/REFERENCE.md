@@ -1,7 +1,9 @@
-# NodeForge v0.2.3 CLI Reference
+# NodeForge CLI Reference
 
-本文记录 v0.2.2 的正式公开命令树。命令自身的 `--help` 是参数、默认值和约束的
-唯一事实源；需要属性、集合或高级选项时使用 `--help-full`。
+现行公开命令树速查。命令自身的 `--help` / `--help-full` 是参数、默认值和约束的
+**唯一事实源**；本文可能滞后于代码，冲突时以 help 与源码为准。
+
+v0.2 时期完整接口论述见冻结分册 [`../design/V0_2_CLI.md`](../design/V0_2_CLI.md)（只读）。
 
 ```text
 nodeforge [-v|--version] [--install-root PATH] COMMAND [OPTIONS]

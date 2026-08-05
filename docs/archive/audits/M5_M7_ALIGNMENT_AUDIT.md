@@ -23,7 +23,7 @@ Node direct storage、Profile policy/Node override、effective compiler 和 sche
 主题化 `ram_rootfs` 保留设计。配套文档包括（[`DISKLESS_FINAL.md`](../../design/DISKLESS_FINAL.md)、
 [`V0_2_PROGRAM_DESIGN.md`](../../design/V0_2_PROGRAM_DESIGN.md)、[`V0_2_IMPL_DETAILS.md`](../../design/V0_2_IMPL_DETAILS.md)、
 [`V0_2_CLI.md`](../../design/V0_2_CLI.md)、[`RAM_ROOTFS_DEFERRED.md`](../../design/RAM_ROOTFS_DEFERRED.md)、
-[`DISKLESS_OSS_COMPARISON.md`](../../design/DISKLESS_OSS_COMPARISON.md)）。本轮收敛的硬性结论：
+[`DISKLESS_OSS_COMPARISON.md`](../design/DISKLESS_OSS_COMPARISON.md)）。本轮收敛的硬性结论：
 reconciliation/远程控制与可续期 enrollment credential 均升级为**永久非目标**；per-boot 短时 capability token 保留；
 收敛为每个 diskless Profile 单一共享 rootfs；canonical phase = `install-post|rootfs-build|first-boot`，**无 `runtime` phase**。
 

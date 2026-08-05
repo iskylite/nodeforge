@@ -16,7 +16,7 @@ v0.3 在 v0.2.3 完成（[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROF
 该结论由三类证据共同支撑：Zig/CLI/HTTP/setup 自动化；Rocky 9.7 install-post
 generation 3 真实 PXE E2E；Rocky 9.7、Rocky 10.2、Ubuntu 的两项 install 与三项
 diskless VMware 矩阵。完整命令、摘要、journal 和 Compute Use 操作边界见
-[`../validation/V0_3_VALIDATION.md`](../validation/V0_3_VALIDATION.md)。
+[`../archive/validation/V0_3_VALIDATION.md`](../archive/validation/V0_3_VALIDATION.md)。
 
 发布结论只覆盖本文范围，不代表多 NIC/VLAN/bonding、规模容量或其他
 未执行平台已经验证。旧 `repository`/`standard_packages` 被拒绝是预期产品结论，

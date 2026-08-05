@@ -41,8 +41,8 @@ v0.4 当前边界是：r97n1 各完成至少一次真实 install 与 diskless �
 | BIOS PXELINUX install | `INDEPENDENT-DESIGN` | [`BIOS_PXELINUX_DEFERRED.md`](BIOS_PXELINUX_DEFERRED.md) | 未排期，不属于 v0.4 | 获得可复用 x86_64 BIOS 环境，重新分配 schema/CLI |
 | `ram_rootfs` materialization | `INDEPENDENT-DESIGN` | [`RAM_ROOTFS_DEFERRED.md`](RAM_ROOTFS_DEFERRED.md) | 未排期，不属于 v0.4 | 重新评审峰值内存、metadata 保真、内存压力和目标环境证据 |
 | `V02-D07` Zig 显式 connect deadline | `UPSTREAM-BLOCKED` | [`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md) | Zig 0.16 runtime 路径会 panic，当前不能安全启用 | 上游行为修复后专项设计和故障注入 |
-| `V02-D08` 声明式 CommandSpec 自动生成全部文档 | `UNSCHEDULED` | [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](CURRENT_CLI_OPTIMIZATION_PLAN.md) | 维护性候选，无版本承诺 | 确认生成源、手写文档边界和迁移计划 |
-| `V02-D09` operation progress event | `UNSCHEDULED` | [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](CURRENT_CLI_OPTIMIZATION_PLAN.md) | 当前状态、日志和终态已满足发布 | 出现明确进度消费方后设计事件兼容契约 |
+| `V02-D08` 声明式 CommandSpec 自动生成全部文档 | `UNSCHEDULED` | [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../archive/design/CURRENT_CLI_OPTIMIZATION_PLAN.md)（归档） | 维护性候选，无版本承诺 | 确认生成源、手写文档边界和迁移计划 |
+| `V02-D09` operation progress event | `UNSCHEDULED` | [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../archive/design/CURRENT_CLI_OPTIMIZATION_PLAN.md)（归档） | 当前状态、日志和终态已满足发布 | 出现明确进度消费方后设计事件兼容契约 |
 | `V02-D10` 全域统一 `checks[]` schema | `UNSCHEDULED` | [`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md) | 现有契约已冻结可用 | 后续 DTO 确需升级时统一评估 |
 | `V02-D11` operation cancel | `UNSCHEDULED` | [`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md) | 当前无取消语义承诺 | 先设计状态机、部分产物清理和恢复契约 |
 | `V02-D12` Profile history / `--from-revision` | `UNSCHEDULED` | [`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md) | 当前无产品需求 | 明确历史保留、GC、查询和 clone 语义 |

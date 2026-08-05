@@ -80,7 +80,7 @@ first-boot agent 追加写 `firstboot.log`（diskless 下位于 volatile tmpfs�
 二次执行的首次运行证据。rootfs-build package action `--installroot` 端到端已于 2026-07-24 验证通过（见上）；
 x86_64 UEFI smoke 与 VMware（compute_use）实机矩阵因当前环境不具备（r97n0 仅有 aarch64 QEMU、无
 OVMF/qemu-system-x86_64；当前上下文无 compute_use 能力），整体推迟到 v0.2.2，见
-`docs/validation/V0_2_0_2_2_AUDIT_AND_VALIDATION.md`（传输断流/ETag 漂移/内容损坏已由
+`docs/archive/validation/V0_2_0_2_2_AUDIT_AND_VALIDATION.md`（传输断流/ETag 漂移/内容损坏已由
 `tests/v0_2_transfer_fault.sh` 验证）。
 
 ## 传输故障注入负测

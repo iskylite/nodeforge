@@ -996,13 +996,13 @@ M0 验收结果：
 - `nodeforged -d` 和 `logging.level = "debug"` 均输出 M0 的 HTTP method/path debug 日志。
 
 本段只记录 2026-07-11 当时的 M0 验收；随后完成的 TFTP、DHCP 等系统级验证见
-[`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md)。
+[`ROCKY_9_7_VALIDATION.md`](validation/ROCKY_9_7_VALIDATION.md)。
 
 ## 6. M1：PXE TFTP 闭环
 
 **完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0`
 完成系统级验证。** 验证命令、SHA-256、OACK/重传和安全负向用例记录于
-[`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md#m1-tftp-待验证)。
+[`ROCKY_9_7_VALIDATION.md`](validation/ROCKY_9_7_VALIDATION.md#m1-tftp-待验证)。
 
 ### 6.1 目标
 
@@ -1165,7 +1165,7 @@ nodeforge asset validate
 **完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0`
 完成验证。** `asset list/show`、`tftp show/session list` 与 `status` 已迁移到统一 view/table
 层；JSON 输出、退出码及 daemon API 保持兼容。验证记录见
-[`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md#m15-cli-输出验证)。
+[`ROCKY_9_7_VALIDATION.md`](validation/ROCKY_9_7_VALIDATION.md#m15-cli-输出验证)。
 
 ### 6.5.1 目标与边界
 
@@ -1302,7 +1302,7 @@ M1.5 完成后，**所有 `nodeforge` 命令的 human 业务输出**必须经过
 未知节点观察、PXE bootfile 决策和 ICMP Ping Probe。`r97n0` 的
 `192.168.27.0/24` 已完成 DISCOVER/OFFER/REQUEST/ACK、RELEASE、冲突隔离和管理 CLI/API
 验证。独立 VMware ARM UEFI 客户端已实际消费 DHCP option 67 的 `efi/grubaa64.efi`，经 TFTP
-进入 GRUB 2.06；详情见 [`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md#m2-dhcp-验证)。
+进入 GRUB 2.06；详情见 [`ROCKY_9_7_VALIDATION.md`](validation/ROCKY_9_7_VALIDATION.md#m2-dhcp-验证)。
 
 ### 7.1 目标
 
@@ -1483,7 +1483,7 @@ daemon 变更 DHCP/node 声明；在线变更属于后续配置管理阶段。
 
 > **完成状态（2026-07-11）：已实现并在 Rocky Linux 9.7 aarch64 的 `root@r97n0` 完成验证。**
 > Event v2 writer、注册表、日志后端、DHCP/TFTP/HTTP 接线和 `nodeforge events` 本机查询均已落地；
-> 验证记录见 [`ROCKY_9_7_VALIDATION.md`](../validation/ROCKY_9_7_VALIDATION.md#m25-结构化日志与事件验证)。
+> 验证记录见 [`ROCKY_9_7_VALIDATION.md`](validation/ROCKY_9_7_VALIDATION.md#m25-结构化日志与事件验证)。
 
 ### 7.5.0 跨阶段重构范围与实施门槛
 
@@ -5124,7 +5124,7 @@ CLI 是唯一消费者，同版本更新即可。
 ### 9.15 M4.6：自定义内核引导参数
 
 > **完成状态（2026-07-17）：已实现。** 本地与 `r97n0`（Rocky Linux 9.7 aarch64）全量回归通过；
-> r97n0 的 adapter/负向校验记录见 `docs/validation/ROCKY_9_7_VALIDATION.md`。真实 PXE 重装后的目标机
+> r97n0 的 adapter/负向校验记录见 `docs/archive/validation/ROCKY_9_7_VALIDATION.md`。真实 PXE 重装后的目标机
 > `/proc/cmdline` 验收仍需在下一次受控安装窗口执行，不能由 renderer/schema 验证替代。
 
 #### 9.15.1 阶段定位
@@ -5777,7 +5777,7 @@ provisioned markers 和可安全归档的 completed journal，保留 config/cata
 自动验证覆盖 202 个测试：custom root/marker/symlink/重复 init、双二进制 bundle、schema 1 迁移与迁移续跑、manifest
 digest、catalog 三个 crash point、无关 entity 不重写、reset digest 备份、config offline-only、M4.6 kernel_args 和
 node 完整视图/时间语义。本机及 aarch64-linux ReleaseSafe 构建属于可移植性验证；`systemctl` 激活、capability、
-owner/mode 和真实 `/healthz` rollback 仍须按 `docs/validation/M4_7_VALIDATION.md` 在 Rocky Linux root 环境执行，完成前不形成
+owner/mode 和真实 `/healthz` rollback 仍须按 `docs/archive/validation/M4_7_VALIDATION.md` 在 Rocky Linux root 环境执行，完成前不形成
 “生产部署已验收”结论。
 
 ### 9.17 M4.8：并发容量扩展与启动时动态派生
@@ -6029,7 +6029,7 @@ SHA-256；外部 mirror 只绑定声明 URL，NodeForge 不声称冻结远端内
 - r97n0 清空全部 NodeForge 受管数据后 fresh setup/import/node add 成功。
 - r97n1 在 VMware UEFI 拉取 GRUB/kernel/initrd，完成 Rocky 9.7 Anaconda 安装并从本地盘重启成功。
 - 上述 Rocky 证据属于 M4.9a 历史基线；M4.9b 的 r97n0/Ubuntu PXE、force-retry 和 systemd rollback
-  证据见 `docs/validation/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。
+  证据见 `docs/archive/validation/UBUNTU_22_04_M4_9_M4_10_VALIDATION.md`。
 
 ### 9.19 M4.10：CLI fresh-deployment 闭环补全
 
@@ -6086,7 +6086,7 @@ allowlist、类型/引号约束和可复制示例，并与 parser、show 测试�
 > 扩展该 fallback；现行所有权、完整 override 和 schema v3 迁移要求见
 > [`V0_1_DESIGN.md`](../design/V0_1_DESIGN.md)。
 
-M4.12 冻结并实现节点属性、节点 override、profile 默认值、profile 部署策略和派生字段的归属边界，解决 `boot_disk` 等 storage 字段同时具有“共享安装计划”和“单节点物理设备”语义的问题。完整设计、影响清单和迁移要求见 `docs/archive/milestone-specs/2026-07-19-m4_12-node-profile-ownership-design.md`；系统证据矩阵见 `docs/audits/M0_M4_12_SYSTEM_AUDIT.md`。
+M4.12 冻结并实现节点属性、节点 override、profile 默认值、profile 部署策略和派生字段的归属边界，解决 `boot_disk` 等 storage 字段同时具有“共享安装计划”和“单节点物理设备”语义的问题。完整设计、影响清单和迁移要求见 `docs/archive/milestone-specs/2026-07-19-m4_12-node-profile-ownership-design.md`；系统证据矩阵见 `docs/archive/audits/M0_M4_12_SYSTEM_AUDIT.md`。
 
 本设计的强制原则如下：
 

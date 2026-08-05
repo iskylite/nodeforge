@@ -1,15 +1,18 @@
 # NodeForge 无盘方案开源情报对比
 
+> **归档**：非规范性选型参考，已迁至 `docs/archive/design/`。不定义产品行为。
+
 状态：非规范性参考资料。本文调研主流开源 diskless/stateless 方案，对照 NodeForge v0.2 约束给出选型依据，
-是 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) §3 的完整版。最终方案见 [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md)，
-版本边界见 [`V0_2_DESIGN.md`](V0_2_DESIGN.md)。
+是 [`DISKLESS_FINAL.md`](../../design/DISKLESS_FINAL.md) §3 的完整版。最终方案见
+[`DISKLESS_FINAL.md`](../../design/DISKLESS_FINAL.md)，版本边界见
+[`V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md)。
 
 本文只解释“为什么这样选”，不定义产品行为；出现差异时以总纲和对应设计分册为准。
 
 ## 1. 调研范围与 NodeForge 约束
 
-NodeForge v0.2 的 diskless 必须满足以下硬约束（均来自 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §7 与
-[`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) §7）：
+NodeForge v0.2 的 diskless 必须满足以下硬约束（均来自 [`V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md) §7 与
+[`DISKLESS_FINAL.md`](../../design/DISKLESS_FINAL.md) §7）：
 
 - **local-only**：rootfs/initrd 恒离线，移除公网 mirror/metalink/GeoIP/vendor NTP，只引用本地 repository。
 - **IPv4-only**：DHCPv4/TFTP/HTTP，IPv6 是永久非目标。
@@ -51,7 +54,7 @@ NodeForge v0.2 的 diskless 必须满足以下硬约束（均来自 [`V0_2_DESIG
 - **机制**：iPXE 作为网络引导固件，执行脚本拉取 kernel/initrd 或 chainload。
 - **优点**：脚本化引导流程灵活，支持 HTTP/NFS/iSCSI 多源。
 - **否决理由**：引入第二引导栈（iPXE），增加 firmware 兼容与维护负担；v0.2 用 UEFI GRUB
-  DHCP/TFTP 已足够；iPXE 菜单/脚本属永久非目标（[`V0_2_DESIGN.md`](V0_2_DESIGN.md) §7）。
+  DHCP/TFTP 已足够；iPXE 菜单/脚本属永久非目标（[`V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md) §7）。
 - **结论**：排除。
 
 ### 3.4 HTTP-delivered 镜像到内存（Warewulf/xFedora livemedia）
@@ -80,7 +83,7 @@ NodeForge v0.2 的 diskless 必须满足以下硬约束（均来自 [`V0_2_DESIG
 | Ubuntu/Debian | debootstrap/live-build | 构建 OS 层 squashfs lower |
 
 builder 消费与 Profile 查询相同的 environment/group/task/package selection，按 local-only 移除公网源
-（[`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) §4）。
+（[`DISKLESS_FINAL.md`](../../design/DISKLESS_FINAL.md) §4）。
 
 ## 4. 约束匹配矩阵
 

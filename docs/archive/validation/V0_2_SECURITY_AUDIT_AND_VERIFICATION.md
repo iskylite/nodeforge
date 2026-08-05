@@ -8,7 +8,7 @@ v0.2 代码库完成了一轮完整的安全审计，发现并修复 3 条 P0、
 漏洞。所有修复均经过代码验证或实机验证确认阻断。实机验证覆盖 Rocky 9.7、
 Rocky 10.2 和 Ubuntu 22.04.5 三个发行版的安装及 diskless 路径，全部通过。
 
-前置审计上下文参见 `docs/audits/V0_2_CODE_REVIEW_FIXES.md`。
+前置审计上下文参见 `docs/archive/audits/V0_2_CODE_REVIEW_FIXES.md`。
 
 ---
 

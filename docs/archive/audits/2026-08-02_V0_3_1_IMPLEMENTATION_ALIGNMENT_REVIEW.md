@@ -22,7 +22,7 @@ Catalog schema：v5（`Catalog.schema_version`，v0.2.3 从 v4 直接替换升�
 - ISO import durable worker、CLI exit mapping 与死代码清理；
 - v0.3 install-post canonical runner、generation-bound callback、journal/finalizer 与 v0.3.1 CLI；
 - 当前 CLI command tree、shell contract tests、HTTP tests 和实机/QEMU 记录；
-- `docs/design/`、`docs/audits/`、`docs/validation/` 与 README 导航。
+- `docs/design/`、`docs/archive/audits/`、`docs/validation/`（及历史 `docs/archive/validation/`）与 README 导航。
 
 验证基线：
 
@@ -153,12 +153,12 @@ v0.2.3 是 v0.2 系列最后一个收口版本，不增加部署形态。已落�
 v0.3 已把 install-post 扩展到 `managed_file|package|archive|script` 四类 canonical action，复用现有
 BootSession callback credential并在 `installer.started` 后固定 install generation；install-post journal、step attempt、
 finalizer WAL/恢复与 `node postprocess show --phase install-post --generation` 已落地。fresh 双机 install/diskless 发布闸
-通过，证据见 [`V0_3_VALIDATION.md`](../../validation/V0_3_VALIDATION.md)。v0.3.1 只补 long node listing；AppConfig v4、
+通过，证据见 [`V0_3_VALIDATION.md`](../validation/V0_3_VALIDATION.md)。v0.3.1 只补 long node listing；AppConfig v4、
 catalog v5、BootConfig v3、AgentPlan v1 保持不变。v0.3 及更早版本设计按已落地冻结基线管理。
 
 ### 2.7 当前 CLI 与目标 CLI 的边界
 
-v0.2.2/v0.2.3 已把 [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../../design/CURRENT_CLI_OPTIMIZATION_PLAN.md)
+v0.2.2/v0.2.3 已把 [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../design/CURRENT_CLI_OPTIMIZATION_PLAN.md)
 中的主要 proposed 项落地为现行接口：
 
 - ✅ `profile clone`（含 `--new-ssh-keys`/`--build`/`--detach` 与 property patch）；

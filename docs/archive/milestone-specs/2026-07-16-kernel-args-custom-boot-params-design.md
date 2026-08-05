@@ -1,7 +1,7 @@
 # 自定义内核引导参数（kernel_args）设计
 
 - 日期：2026-07-16（2026-07-16 更新：补充 pykickstart/autoinstall 官方文档依据）
-- 状态：已实现并通过本地回归（2026-07-17）；r97n0 验证见 `docs/validation/ROCKY_9_7_VALIDATION.md`
+- 状态：已实现并通过本地回归（2026-07-17）；r97n0 验证见 `docs/archive/validation/ROCKY_9_7_VALIDATION.md`
 - 前置：M4.5
 - 权威位置：`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md` §9.15（M4.6）；本文件给出实现细化，冲突时以 §9.15 的后续修订为准
 - 目标：为 profile 增加 `kernel_args` 字段，使 `iommu=pt`、`intel_iommu=on`、`hugepagesz=1G hugepages=4` 等内核参数可配置，覆盖 PXE 引导和目标系统持久 GRUB 两条链路

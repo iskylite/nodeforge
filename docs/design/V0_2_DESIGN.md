@@ -498,9 +498,9 @@ SoftwareIndex JSON 以 SHA-256 digest 命名并跨 profile/node/session 复用�
 | 实现分册 | [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md) | 状态机、协议栈、compiler/readiness/validator、builder、迁移 | 操作员教程、方案选型论证 |
 | 接口分册 | [`V0_2_CLI.md`](V0_2_CLI.md) | CLI 命令树、参数、CAS、输出和 exit code | 内部模块如何实现 |
 | 流程分册 | [`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md) | 从空 catalog 到启用、观测和恢复的端到端操作顺序 | 穷举字段和内部状态转移 |
-| 参考资料 | [`DISKLESS_OSS_COMPARISON.md`](DISKLESS_OSS_COMPARISON.md) | 选型依据和开源方案对比 | 规范性产品行为 |
+| 参考资料 | [`DISKLESS_OSS_COMPARISON.md`](../archive/design/DISKLESS_OSS_COMPARISON.md)（归档） | 选型依据和开源方案对比 | 规范性产品行为 |
 
-审计文件位于 `docs/audits/`，只记录代码事实、发现和设计修订证据，不定义产品行为。
+历史审计位于 `docs/archive/audits/`，只记录代码事实、发现和设计修订证据，不定义产品行为。
 
 ### 0.2 推荐阅读
 
