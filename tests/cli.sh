@@ -622,7 +622,7 @@ grep -Fq '"kind":"daemon_restart_gap"' "$tmp/trace-session-json"
 "$cli" node trace node-01 --events-path "$events_dir/events.jsonl" >"$tmp/trace-session-human"
 grep -Fq 'daemon_restart_gap' "$tmp/trace-session-human"
 "$cli" node trace node-02 --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-capacity-json"
-grep -Fq '"kind":"capacity_exhausted"' "$tmp/trace-capacity-json"
+grep -Fq '"kind":"capacity.exhausted"' "$tmp/trace-capacity-json"
 
 # §12.4 --session 与 --latest 互斥，同时给出是 usage error。
 if "$cli" node trace node-01 --session "$session_id" --latest --events-path "$events_dir/events.jsonl" -o json >"$tmp/trace-conflicting-flags" 2>&1; then

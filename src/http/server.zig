@@ -54,6 +54,7 @@ const diskless_lifecycle = @import("../state/diskless_session.zig");
 const dhcp_store = @import("../state/dhcp_store.zig");
 const install_post_journal = @import("../state/install_post_journal.zig");
 const install_first_boot_store = @import("../state/install_first_boot_store.zig");
+const capacity_policy = @import("../state/capacity.zig");
 const diskless = @import("../profile/diskless.zig");
 const diskless_dto = @import("diskless_dto.zig");
 const first_boot_dto = @import("first_boot_dto.zig");
@@ -4130,7 +4131,7 @@ fn managementProfileCreate(request: zap.Request, context: *RouteContext, meta: R
         .created_at = now,
     };
     const identity = context.identities.create(context.io, context.allocator, now, &tx) catch |err| switch (err) {
-        error.IdentityStoreCapacity => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.capacity\",\"message\":\"identity store capacity exhausted\"}}\n", meta),
+        error.IdentityStoreCapacity => return json(request, .service_unavailable, capacity_policy.exhaustedJsonBody(), meta),
         error.IdentityStagingDirUnset => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.staging_unset\",\"message\":\"identity staging directory is not configured\"}}\n", meta),
         else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.create_failed\",\"message\":\"cannot create profile ssh identity\"}}\n", meta),
     };
@@ -4230,7 +4231,7 @@ fn managementProfileClone(request: zap.Request, context: *RouteContext, source: 
             .created_at = now,
         };
         const identity = context.identities.create(context.io, context.allocator, now, &tx) catch |err| switch (err) {
-            error.IdentityStoreCapacity => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.capacity\",\"message\":\"identity store capacity exhausted\"}}\n", meta),
+            error.IdentityStoreCapacity => return json(request, .service_unavailable, capacity_policy.exhaustedJsonBody(), meta),
             error.IdentityStagingDirUnset => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.staging_unset\",\"message\":\"identity staging directory is not configured\"}}\n", meta),
             else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.create_failed\",\"message\":\"cannot create clone ssh identity\"}}\n", meta),
         };
@@ -4452,7 +4453,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
         };
         const identity = context.identities.createRevision(context.io, context.allocator, existing.ssh_identity.id, now, &tx) catch |err| switch (err) {
             error.IdentityNotFound => return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"identity.not_found\",\"message\":\"identity referenced by profile is missing\"}}\n", meta),
-            error.IdentityStoreCapacity => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.capacity\",\"message\":\"identity store capacity exhausted\"}}\n", meta),
+            error.IdentityStoreCapacity => return json(request, .service_unavailable, capacity_policy.exhaustedJsonBody(), meta),
             else => return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"identity.create_failed\",\"message\":\"cannot create new ssh identity revision\"}}\n", meta),
         };
         errdefer if (tx.transaction_id) |tx_id| context.identities.rollback(context.io, context.allocator, tx_id) catch {};
@@ -6522,7 +6523,7 @@ fn managementNodeAdd(request: zap.Request, context: *RouteContext, meta: Request
                 .bootstrap_key = context.bootstrap_key,
                 .additional_keys = context.additional_keys,
             }, value.id) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"model.revision_unavailable\",\"message\":\"node persisted but initial install plan digest could not be computed\"}}\n", meta);
-            context.deployments.ensureInitial(value.id, desired_digest, unixNow()) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.capacity_exceeded\",\"message\":\"node persisted but initial install generation could not be allocated\"}}\n", meta);
+            context.deployments.ensureInitial(value.id, desired_digest, unixNow()) catch return json(request, .service_unavailable, capacity_policy.exhaustedJsonBody(), meta);
             deployment_control.save(context.io, context.allocator, paths.require().deployment_control_path, context.deployments) catch return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"deployment.persist_failed\",\"message\":\"node persisted but initial install generation could not be persisted\"}}\n", meta);
         };
     }
@@ -7293,6 +7294,11 @@ test "DHCP management expiry projects monotonic deadlines as Unix time" {
 
 /// 使用 NodeForge 的稳定错误信封渲染配置校验失败。
 fn validationError(request: zap.Request, err: anyerror, meta: RequestMeta) !void {
+    // v0.4: capacity exhaustion is fail-closed admission, not a client validation error.
+    // DisklessSessionCapacity (boot-prepare begin) and peers must return HTTP 503 + capacity.exhausted.
+    if (capacity_policy.publicErrorCode(err) != null) {
+        return json(request, .service_unavailable, capacity_policy.exhaustedJsonBody(), meta);
+    }
     var buffer: [512]u8 = undefined;
     const body = observe_error.renderJson(&buffer, observe_error.fromValidation(err)) catch
         "{\"ok\":false,\"error\":{\"code\":\"internal.buffer\",\"message\":\"response too large\"}}\n";

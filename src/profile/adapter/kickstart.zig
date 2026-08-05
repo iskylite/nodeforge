@@ -25,6 +25,7 @@ const runner = @import("../../provision/runner.zig");
 const password_hash = @import("../password_hash.zig");
 const first_boot_handoff = @import("../../provision/install_first_boot_handoff.zig");
 const installer_auth = @import("installer_auth.zig");
+const topology_render = @import("../../network/render.zig");
 
 /// 测试夹具只负责把共享 system 字段投影为 canonical software 输入；生产代码
 /// 和测试最终都调用唯一的 `renderEffective`，不再维护第二套渲染逻辑。
@@ -46,7 +47,12 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     if (install.proxy.url) |proxy| try w.print(" --proxy={s}", .{proxy});
     try w.print("\nlang {s}\nkeyboard {s}\ntimezone {s} --utc\n", .{ system.localization.locale, system.localization.keyboard, system.localization.timezone });
     if (system.connectivity.time_sync) for (system.connectivity.ntp_servers) |server| try w.print("timesource --ntp-server={s}\n", .{server});
-    if (network.mode == .dhcp) {
+    if (topology_render.hasStructured(network)) {
+        // Installer transport stays on the bootstrap link (DHCP by MAC). Full
+        // target topology (bonds/VLANs/routes/DNS) is materialized in %post so
+        // Kickstart cannot silently drop structured fields.
+        try w.print("network --bootproto=dhcp --device=link --hostname={s} --activate --onboot=on\n", .{render.hostname(node)});
+    } else if (network.mode == .dhcp) {
         // `--activate` 仅配置安装器环境。同时将连接持久化为开机
         // 启动的 profile，否则安装成功的系统可能在到达登录提示时
         // 没有任何路由可供 bootstrap SSH 使用。
@@ -171,10 +177,14 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
         .security => try w.writeAll("dnf -y update --security\n"),
         .all => try w.writeAll("dnf -y update\n"),
     }
-    for (network.routes) |route| {
-        try w.print("nmcli connection modify $(nmcli -t -f NAME connection show --active | head -n1) +ipv4.routes '{s} {s}", .{ route.destination, route.gateway });
-        if (route.metric) |metric| try w.print(" {d}", .{metric});
-        try w.writeAll("'\n");
+    if (topology_render.hasStructured(network)) {
+        try writeStructuredTopologyPost(w, allocator, network);
+    } else {
+        for (network.routes) |route| {
+            try w.print("nmcli connection modify $(nmcli -t -f NAME connection show --active | head -n1) +ipv4.routes '{s} {s}", .{ route.destination, route.gateway });
+            if (route.metric) |metric| try w.print(" {d}", .{metric});
+            try w.writeAll("'\n");
+        }
     }
     if (system.ssh.enabled) try w.print("mkdir -p /etc/ssh/sshd_config.d\nprintf '%s\\n' 'PermitRootLogin {s}' 'PasswordAuthentication {s}' > /etc/ssh/sshd_config.d/00-nodeforge.conf\n", .{ @tagName(system.ssh.root_login), if (system.ssh.password_authentication) "yes" else "no" });
     if (system.security.firewall == .disabled) try w.writeAll("systemctl disable --now firewalld || true\nsystemctl mask firewalld || true\n");
@@ -213,6 +223,32 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
     try w.print("NF_TOKEN=$(cat {s})\ncurl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"post\"}}' {s} || true\ncurl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"completed\"}}' {s} || true\nunset NF_TOKEN\nrm -f {s} /root/anaconda-ks.cfg /root/original-ks.cfg\n%end\n%post --nochroot\nrm -f {s} {s}.part\n%end\n%onerror\nNF_TOKEN=$(cat {s} 2>/dev/null || true)\nERRLOG=$(ls /tmp/anaconda-tb-*/anaconda-tb 2>/dev/null | head -1)\nSUMMARY=\"anaconda error\"\nif [ -n \"$ERRLOG\" ]; then\n  SUMMARY=\"anaconda error: $(head -c 1800 \"$ERRLOG\" 2>/dev/null | tr '\\n' ' ')\"\nfi\nif [ -n \"$NF_TOKEN\" ]; then\n  curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' --data-urlencode 'v=1' --data-urlencode 'boot_session_id={s}' --data-urlencode 'reason=install.anaconda_error' --data-urlencode \"summary=$SUMMARY\" {s} || true\n  curl -fsS -H \"Authorization: Bearer $NF_TOKEN\" -H 'X-NodeForge-Session: {s}' -H 'Content-Type: application/json' -d '{{\"v\":1,\"boot_session_id\":\"{s}\",\"stage\":\"failed\"}}' {s} || true\nfi\nunset NF_TOKEN\nrm -f {s} {s}.part /mnt/sysroot{s} /mnt/sysimage{s}\n%end\n", .{ installer_auth.token_path, session, session, event_url, session, session, event_url, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path, session, session, log_url, session, session, event_url, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path, installer_auth.token_path });
     try w.print("{s}\n", .{@tagName(install.completion.action)});
     return out.toOwnedSlice();
+}
+
+fn writeStructuredTopologyPost(w: *std.Io.Writer, allocator: std.mem.Allocator, network: model.TargetNetworkConfig) !void {
+    // Prefer ifcfg-rh on Rocky (Anaconda default) and always write keyfiles as a
+    // second representation so neither backend can silently lose bond/VLAN/routes.
+    const ifcfgs = try topology_render.renderIfcfg(allocator, network);
+    defer topology_render.freeIfcfgFiles(allocator, ifcfgs);
+    const keyfiles = try topology_render.renderNmKeyfiles(allocator, network);
+    defer topology_render.freeKeyfiles(allocator, keyfiles);
+
+    try w.writeAll("install -d -m 0755 /etc/sysconfig/network-scripts\ninstall -d -m 0700 /etc/NetworkManager/system-connections\n");
+    // Drop the temporary installer DHCP profile so target topology owns the NIC.
+    try w.writeAll("rm -f /etc/sysconfig/network-scripts/ifcfg-* /etc/sysconfig/network-scripts/route-* 2>/dev/null || true\nrm -f /etc/NetworkManager/system-connections/* 2>/dev/null || true\n");
+    for (ifcfgs, 0..) |file, index| {
+        try w.print("cat > /etc/sysconfig/network-scripts/{s} <<'NODEFORGE_IFCFG_{d}_EOF'\n", .{ file.filename, index });
+        try w.writeAll(file.content);
+        if (file.content.len == 0 or file.content[file.content.len - 1] != '\n') try w.writeByte('\n');
+        try w.print("NODEFORGE_IFCFG_{d}_EOF\nchmod 0600 /etc/sysconfig/network-scripts/{s}\n", .{ index, file.filename });
+    }
+    for (keyfiles, 0..) |file, index| {
+        try w.print("cat > /etc/NetworkManager/system-connections/{s} <<'NODEFORGE_NM_{d}_EOF'\n", .{ file.filename, index });
+        try w.writeAll(file.content);
+        if (file.content.len == 0 or file.content[file.content.len - 1] != '\n') try w.writeByte('\n');
+        try w.print("NODEFORGE_NM_{d}_EOF\nchmod 0600 /etc/NetworkManager/system-connections/{s}\n", .{ index, file.filename });
+    }
+    try w.writeAll("systemctl enable NetworkManager || true\n");
 }
 
 fn bundleHasInstallPostArchive(bundle: ?*const model.ProvisioningBundle) bool {
@@ -503,4 +539,48 @@ test "M4.1 kickstart static target network uses Anaconda netmask syntax" {
     try std.testing.expect(std.mem.indexOf(u8, bytes, "--ipv4-dns-search=nodeforge.local") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "timesource --ntp-server=ntp.nodeforge.local") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "server ntp.nodeforge.local iburst") != null);
+}
+
+test "v0.4 kickstart structured topology materializes bond vlan and routes in post" {
+    const node: model.NodeConfig = .{
+        .id = "node-topo",
+        .mac = "02:00:00:00:00:01",
+        .arch = .aarch64,
+        .profile = "rocky",
+        .network = .{
+            .interfaces = &.{
+                .{ .id = "eth0", .mac = "02:00:00:00:00:01", .ipv4 = .{} },
+                .{ .id = "eth1", .mac = "02:00:00:00:00:02", .ipv4 = .{} },
+            },
+            .bonds = &.{.{
+                .id = "bond0",
+                .mode = .active_backup,
+                .members = &.{ "eth0", "eth1" },
+                .mac_source_id = "eth0",
+                .primary_id = "eth0",
+                .ipv4 = .{ .mode = .static, .address = "192.0.2.20", .prefix_len = 24 },
+            }},
+            .vlans = &.{.{
+                .id = "vlan10",
+                .parent_id = "bond0",
+                .vlan_id = 10,
+                .ipv4 = .{ .mode = .dhcp },
+            }},
+            .routes = &.{
+                .{ .id = "svc", .destination = "10.0.0.0/8", .gateway = "192.0.2.1", .interface_id = "bond0" },
+            },
+            .dns = &.{"1.1.1.1"},
+        },
+    };
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", "http://repo", null, "http://facts", "http://event", "http://log", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "network --bootproto=dhcp --device=link") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "ifcfg-bond0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "ifcfg-vlan10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "TYPE=Bond") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "VLAN_ID=10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "route-bond0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "10.0.0.0/8 via 192.0.2.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "bond0.nmconnection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "mode=active-backup") != null);
 }

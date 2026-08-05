@@ -7,6 +7,7 @@
 const std = @import("std");
 const dto = @import("../http/diskless_dto.zig");
 const model = @import("../model.zig");
+const topology_render = @import("../network/render.zig");
 
 pub fn render(allocator: std.mem.Allocator, projection: dto.NodeApplyProjection) ![]u8 {
     return renderResolved(allocator, projection, null);
@@ -182,6 +183,43 @@ fn protectedPackage(package: []const u8) bool {
 }
 
 fn renderNetwork(w: *std.Io.Writer, allocator: std.mem.Allocator, projection: dto.NodeApplyProjection, resolved_interface: ?[]const u8) !void {
+    if (topology_render.hasStructured(projection.network))
+        return renderStructuredNetwork(w, allocator, projection.network);
+    return renderLegacySingleNicNetwork(w, allocator, projection, resolved_interface);
+}
+
+fn renderStructuredNetwork(w: *std.Io.Writer, allocator: std.mem.Allocator, network: model.TargetNetworkConfig) !void {
+    const netplan = try topology_render.renderNetplan(allocator, network);
+    defer allocator.free(netplan);
+    const keyfiles = try topology_render.renderNmKeyfiles(allocator, network);
+    defer topology_render.freeKeyfiles(allocator, keyfiles);
+    const ifcfgs = try topology_render.renderIfcfg(allocator, network);
+    defer topology_render.freeIfcfgFiles(allocator, ifcfgs);
+
+    // Prefer native netplan, then write all NM keyfiles / ifcfg-rh files so
+    // bonds, VLANs, multi-NIC, and interface-bound routes cannot be dropped.
+    try w.writeAll("rm -f /etc/NetworkManager/system-connections/nodeforge.nmconnection /etc/netplan/60-nodeforge.yaml\n");
+    try w.writeAll("if [ -d /etc/netplan ] && command -v netplan >/dev/null 2>&1; then ");
+    try emitFileInline(w, "/etc/netplan/60-nodeforge.yaml", netplan, 0o600);
+    try w.writeAll("; elif command -v NetworkManager >/dev/null 2>&1 && NetworkManager --print-config 2>/dev/null | grep -Eq 'plugins=.*ifcfg-rh'; then ");
+    try w.writeAll("install -d -m 0755 /etc/sysconfig/network-scripts");
+    for (ifcfgs) |file| {
+        try w.writeAll("; ");
+        const path = try std.fmt.allocPrint(allocator, "/etc/sysconfig/network-scripts/{s}", .{file.filename});
+        defer allocator.free(path);
+        try emitFileInline(w, path, file.content, 0o600);
+    }
+    try w.writeAll("; elif command -v NetworkManager >/dev/null 2>&1; then install -d -m 0700 /etc/NetworkManager/system-connections");
+    for (keyfiles) |file| {
+        try w.writeAll("; ");
+        const path = try std.fmt.allocPrint(allocator, "/etc/NetworkManager/system-connections/{s}", .{file.filename});
+        defer allocator.free(path);
+        try emitFileInline(w, path, file.content, 0o600);
+    }
+    try w.writeAll("; else echo 'nodeforge: no supported target network adapter for structured topology' >&2; exit 1; fi\n");
+}
+
+fn renderLegacySingleNicNetwork(w: *std.Io.Writer, allocator: std.mem.Allocator, projection: dto.NodeApplyProjection, resolved_interface: ?[]const u8) !void {
     const net = projection.network;
     const interface = net.interface orelse resolved_interface orelse return error.NetworkInterfaceUnresolved;
     const mac = net.match_mac orelse projection.mac;
@@ -731,6 +769,68 @@ test "static network projection contains capability-selected netplan keyfile and
     try std.testing.expect(std.mem.indexOf(u8, script, "command -v netplan") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "nmcli --offline connection add") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "NetworkManager --print-config") != null);
+}
+
+test "structured topology projection retains bonds vlans and interface-bound routes" {
+    const projection: dto.NodeApplyProjection = .{
+        .node_id = "n1",
+        .mac = "02:00:00:00:00:01",
+        .arch = .aarch64,
+        .hostname = null,
+        .network = .{
+            .dns = &.{"1.1.1.1"},
+            .interfaces = &.{
+                .{ .id = "eth0", .mac = "02:00:00:00:00:01", .ipv4 = .{} },
+                .{ .id = "eth1", .mac = "02:00:00:00:00:02", .ipv4 = .{} },
+            },
+            .bonds = &.{.{
+                .id = "bond0",
+                .mode = .active_backup,
+                .members = &.{ "eth0", "eth1" },
+                .mac_source_id = "eth0",
+                .primary_id = "eth0",
+                .ipv4 = .{},
+            }},
+            .vlans = &.{.{
+                .id = "vlan100",
+                .parent_id = "bond0",
+                .vlan_id = 100,
+                .ipv4 = .{ .mode = .static, .address = "10.0.0.20", .prefix_len = 24 },
+            }},
+            .routes = &.{
+                .{ .id = "def", .destination = "0.0.0.0/0", .gateway = "10.0.0.1", .interface_id = "vlan100" },
+            },
+        },
+        .system = .{
+            .localization = .{},
+            .connectivity = .{},
+            .ssh = .{ .enabled = false, .password_authentication = false, .root_login = .no },
+            .security = .{},
+            .users = &.{},
+        },
+        .software = .{},
+    };
+    const script = try render(std.testing.allocator, projection);
+    defer std.testing.allocator.free(script);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/netplan/60-nodeforge.yaml") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/NetworkManager/system-connections/bond0.nmconnection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/NetworkManager/system-connections/vlan100.nmconnection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/sysconfig/network-scripts/ifcfg-bond0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/sysconfig/network-scripts/ifcfg-vlan100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/etc/sysconfig/network-scripts/route-vlan100") != null);
+    // Octal-encoded content must still contain structured topology markers.
+    var encoded_bond: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded_bond.deinit();
+    try encodeOctal(&encoded_bond.writer, "mode: active-backup");
+    try std.testing.expect(std.mem.indexOf(u8, script, encoded_bond.written()) != null);
+    var encoded_vlan: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded_vlan.deinit();
+    try encodeOctal(&encoded_vlan.writer, "id: 100");
+    try std.testing.expect(std.mem.indexOf(u8, script, encoded_vlan.written()) != null);
+    var encoded_route: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded_route.deinit();
+    try encodeOctal(&encoded_route.writer, "10.0.0.20/24");
+    try std.testing.expect(std.mem.indexOf(u8, script, encoded_route.written()) != null);
 }
 
 test "sudo granted via portable sudoers drop-in; service enable best-effort" {

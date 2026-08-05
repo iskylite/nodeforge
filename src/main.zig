@@ -5668,8 +5668,8 @@ fn traceHandler(ctx: zli.CommandContext) !void {
     var gap_count: usize = 0;
     for (node_events[0..node_result.count]) |event| {
         const state = cli_events.field(event, "session_link_state") orelse continue;
-        if (std.mem.eql(u8, state, "capacity_exhausted")) addTraceGap(&gaps, &gap_count, .{
-            .kind = "capacity_exhausted",
+        if (std.mem.eql(u8, state, "capacity.exhausted") or std.mem.eql(u8, state, "capacity_exhausted")) addTraceGap(&gaps, &gap_count, .{
+            .kind = "capacity.exhausted",
             .start = event.ts,
             .end = event.ts,
             .summary = "DHCP continued without a trackable boot session because the active registry was full",

@@ -154,7 +154,8 @@ pub fn validCorrelationId(value: []const u8) bool {
 
 /// 校验无法安全关联时允许写入的、面向运维的稳定降级原因。
 pub fn validSessionLinkState(value: []const u8) bool {
-    return std.mem.eql(u8, value, "capacity_exhausted") or
+    return std.mem.eql(u8, value, "capacity.exhausted") or
+        std.mem.eql(u8, value, "capacity_exhausted") or // legacy event spelling
         std.mem.eql(u8, value, "no_active_lease_match") or
         std.mem.eql(u8, value, "ambiguous_lease_match");
 }

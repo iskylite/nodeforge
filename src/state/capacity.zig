@@ -12,6 +12,33 @@ const std = @import("std");
 /// `effective` 是允许的已用条目数，而不是数组前缀长度。
 pub const store_ceiling: usize = 2048;
 
+/// v0.4 stable public error code for domain capacity exhaustion.
+/// Design requires DisklessSessionCapacity (and peer admission failures) to
+/// surface as this code with HTTP 503 fail-closed semantics.
+pub const exhausted_code = "capacity.exhausted";
+
+/// Canonical JSON error body for capacity exhaustion (HTTP 503).
+pub fn exhaustedJsonBody() []const u8 {
+    return "{\"ok\":false,\"error\":{\"code\":\"capacity.exhausted\",\"message\":\"capacity limit reached; retry after active slots free\"}}\n";
+}
+
+/// Map Zig capacity-exhaustion errors to the stable public code.
+/// Returns null for non-capacity errors so callers can fall through.
+pub fn publicErrorCode(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.CapacityExhausted,
+        error.DisklessSessionCapacity,
+        error.SessionCapacityExhausted,
+        error.NodeStatusCapacityExhausted,
+        error.OperationCapacityExhausted,
+        error.NodeDiscoveryCapacityExhausted,
+        error.InventoryCapacityExhausted,
+        error.IdentityStoreCapacity,
+        => exhausted_code,
+        else => null,
+    };
+}
+
 pub const Resource = enum { http_connection, boot_session, rootfs_download };
 
 pub const Admission = struct {
@@ -171,4 +198,34 @@ test "v0.4 token buckets enforce refill and burst" {
     try std.testing.expectError(error.RateLimited, bucket.take(1, 1));
     try bucket.take(1, 2);
     try std.testing.expectError(error.InvalidTokenBucket, bucket.take(1, 1));
+}
+
+test "v0.4 Admission.tryAcquire exhausts with CapacityExhausted mapped to capacity.exhausted" {
+    var admission: Admission = .{};
+    try admission.tryAcquire(.boot_session, 1);
+    try std.testing.expectError(error.CapacityExhausted, admission.tryAcquire(.boot_session, 1));
+    const code = publicErrorCode(error.CapacityExhausted) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(exhausted_code, code);
+    try std.testing.expect(std.mem.indexOf(u8, exhaustedJsonBody(), "\"code\":\"capacity.exhausted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exhaustedJsonBody(), "\"ok\":false") != null);
+}
+
+test "v0.4 DisklessSessionCapacity and SessionCapacityExhausted map to capacity.exhausted" {
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.DisklessSessionCapacity).?);
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.SessionCapacityExhausted).?);
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.NodeStatusCapacityExhausted).?);
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.OperationCapacityExhausted).?);
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.NodeDiscoveryCapacityExhausted).?);
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.InventoryCapacityExhausted).?);
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.IdentityStoreCapacity).?);
+    try std.testing.expect(publicErrorCode(error.OutOfMemory) == null);
+    try std.testing.expect(publicErrorCode(error.FileNotFound) == null);
+}
+
+test "v0.4 boot session Link.state surfaces capacity.exhausted for trace and events" {
+    const boot_session = @import("boot_session.zig");
+    const link: boot_session.Link = .capacity_exhausted;
+    const state = link.state() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(exhausted_code, state);
+    try std.testing.expectEqualStrings(exhausted_code, publicErrorCode(error.DisklessSessionCapacity).?);
 }

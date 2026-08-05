@@ -67,6 +67,8 @@ pub const install_first_boot_state = @import("state/install_first_boot.zig");
 pub const install_first_boot_store = @import("state/install_first_boot_store.zig");
 /// v0.4 target-network topology schema and structural/deployable validator.
 pub const topology = @import("network/topology.zig");
+/// v0.4 structured topology renderer (netplan / NM keyfile / ifcfg).
+pub const topology_render = @import("network/render.zig");
 pub const deployment_manifest = @import("state/deployment_manifest.zig");
 /// PXE boot session 注册表：关联 DHCP→TFTP→HTTP 启动链路的进程内状态。
 pub const boot_session = @import("state/boot_session.zig");
@@ -95,6 +97,8 @@ pub const initrd_memory = @import("initrd/memory.zig");
 pub const initrd_download = @import("initrd/download.zig");
 
 test {
+    _ = topology;
+    _ = topology_render;
     _ = provision_node_apply;
     _ = provision_rootfs_build_executor;
     _ = provision_rootfs_os_builder;

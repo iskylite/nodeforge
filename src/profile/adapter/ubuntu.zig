@@ -43,6 +43,7 @@ const runner = @import("../../provision/runner.zig");
 const password_hash = @import("../password_hash.zig");
 const first_boot_handoff = @import("../../provision/install_first_boot_handoff.zig");
 const installer_auth = @import("installer_auth.zig");
+const topology_render = @import("../../network/render.zig");
 
 /// 测试夹具将共享 system 字段投影为 canonical software 输入；所有断言最终
 /// 覆盖唯一的 `renderEffective`，不会重新引入简化版 Autoinstall 路径。
@@ -143,55 +144,75 @@ pub fn renderEffective(allocator: std.mem.Allocator, node: *const model.NodeConf
         try w.writeAll("\n      level: INFO\n");
     }
     try renderStorageM41(w, install);
-    try w.writeAll("  network:\n    version: 2\n    ethernets:\n      ");
-    try w.writeAll(network.interface orelse "nodeforge");
-    try w.writeAll(":\n        match:\n          macaddress: ");
-    try render.yamlQuote(w, network.match_mac orelse node.mac);
-    if (network.interface) |interface| {
-        try w.writeAll("\n        set-name: ");
-        try render.yamlQuote(w, interface);
-    }
-    if (network.mode == .dhcp) {
-        try w.writeAll("\n        dhcp4: true\n");
-    } else {
-        try w.writeAll("\n        dhcp4: false\n        addresses: [");
-        const cidr = try std.fmt.allocPrint(allocator, "{s}/{d}", .{ network.address.?, network.prefix_len.? });
-        defer allocator.free(cidr);
-        try render.yamlQuote(w, cidr);
-        try w.writeAll("]\n");
-        if (network.gateway != null or network.routes.len != 0) {
-            try w.writeAll("        routes:\n");
-            if (network.gateway) |gateway| {
-                try w.writeAll("          - to: default\n            via: ");
-                try render.yamlQuote(w, gateway);
-                try w.writeByte('\n');
-            }
-            for (network.routes) |route| {
-                try w.writeAll("          - to: ");
-                try render.yamlQuote(w, route.destination);
-                try w.writeAll("\n            via: ");
-                try render.yamlQuote(w, route.gateway);
-                if (route.metric) |metric| try w.print("\n            metric: {d}", .{metric});
-                try w.writeByte('\n');
-            }
+    if (topology_render.hasStructured(network)) {
+        // Autoinstall network is netplan; indent the canonical structured document
+        // under autoinstall so bonds/VLANs/routes/DNS cannot be silently dropped.
+        const netplan = try topology_render.renderNetplan(allocator, network);
+        defer allocator.free(netplan);
+        try w.writeAll("  ");
+        var first_line = true;
+        var rest = netplan;
+        while (rest.len != 0) {
+            const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+            const line = rest[0..nl];
+            if (!first_line) try w.writeAll("  ");
+            try w.writeAll(line);
+            if (nl < rest.len) try w.writeByte('\n');
+            first_line = false;
+            rest = if (nl < rest.len) rest[nl + 1 ..] else rest[nl..];
         }
-        if (network.dns.len != 0 or network.search_domains.len != 0) {
-            try w.writeAll("        nameservers:\n");
-            if (network.dns.len != 0) {
-                try w.writeAll("          addresses: [");
-                for (network.dns, 0..) |dns, i| {
-                    if (i != 0) try w.writeAll(", ");
-                    try render.yamlQuote(w, dns);
+        if (netplan.len == 0 or netplan[netplan.len - 1] != '\n') try w.writeByte('\n');
+    } else {
+        try w.writeAll("  network:\n    version: 2\n    ethernets:\n      ");
+        try w.writeAll(network.interface orelse "nodeforge");
+        try w.writeAll(":\n        match:\n          macaddress: ");
+        try render.yamlQuote(w, network.match_mac orelse node.mac);
+        if (network.interface) |interface| {
+            try w.writeAll("\n        set-name: ");
+            try render.yamlQuote(w, interface);
+        }
+        if (network.mode == .dhcp) {
+            try w.writeAll("\n        dhcp4: true\n");
+        } else {
+            try w.writeAll("\n        dhcp4: false\n        addresses: [");
+            const cidr = try std.fmt.allocPrint(allocator, "{s}/{d}", .{ network.address.?, network.prefix_len.? });
+            defer allocator.free(cidr);
+            try render.yamlQuote(w, cidr);
+            try w.writeAll("]\n");
+            if (network.gateway != null or network.routes.len != 0) {
+                try w.writeAll("        routes:\n");
+                if (network.gateway) |gateway| {
+                    try w.writeAll("          - to: default\n            via: ");
+                    try render.yamlQuote(w, gateway);
+                    try w.writeByte('\n');
                 }
-                try w.writeAll("]\n");
+                for (network.routes) |route| {
+                    try w.writeAll("          - to: ");
+                    try render.yamlQuote(w, route.destination);
+                    try w.writeAll("\n            via: ");
+                    try render.yamlQuote(w, route.gateway);
+                    if (route.metric) |metric| try w.print("\n            metric: {d}", .{metric});
+                    try w.writeByte('\n');
+                }
             }
-            if (network.search_domains.len != 0) {
-                try w.writeAll("          search: [");
-                for (network.search_domains, 0..) |domain, i| {
-                    if (i != 0) try w.writeAll(", ");
-                    try render.yamlQuote(w, domain);
+            if (network.dns.len != 0 or network.search_domains.len != 0) {
+                try w.writeAll("        nameservers:\n");
+                if (network.dns.len != 0) {
+                    try w.writeAll("          addresses: [");
+                    for (network.dns, 0..) |dns, i| {
+                        if (i != 0) try w.writeAll(", ");
+                        try render.yamlQuote(w, dns);
+                    }
+                    try w.writeAll("]\n");
                 }
-                try w.writeAll("]\n");
+                if (network.search_domains.len != 0) {
+                    try w.writeAll("          search: [");
+                    for (network.search_domains, 0..) |domain, i| {
+                        if (i != 0) try w.writeAll(", ");
+                        try render.yamlQuote(w, domain);
+                    }
+                    try w.writeAll("]\n");
+                }
             }
         }
     }
@@ -752,6 +773,51 @@ test "preserve_sources_list keeps the original target sources in the late comman
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/apt/sources.list.d/*.sources") == null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "/target/etc/apt/sources.list.d/nodeforge.list") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "deb [trusted=yes] http://repo %s %s") != null);
+}
+
+test "v0.4 autoinstall structured topology renders native bonds vlans and routes" {
+    const node: model.NodeConfig = .{
+        .id = "node-topo",
+        .mac = "02:00:00:00:00:01",
+        .arch = .aarch64,
+        .profile = "ubuntu",
+        .network = .{
+            .interfaces = &.{
+                .{ .id = "eth0", .mac = "02:00:00:00:00:01", .ipv4 = .{} },
+                .{ .id = "eth1", .mac = "02:00:00:00:00:02", .ipv4 = .{} },
+            },
+            .bonds = &.{.{
+                .id = "bond0",
+                .mode = .active_backup,
+                .members = &.{ "eth0", "eth1" },
+                .mac_source_id = "eth0",
+                .primary_id = "eth0",
+                .ipv4 = .{ .mode = .static, .address = "10.0.0.20", .prefix_len = 24 },
+            }},
+            .vlans = &.{.{
+                .id = "vlan50",
+                .parent_id = "bond0",
+                .vlan_id = 50,
+                .ipv4 = .{ .mode = .dhcp },
+            }},
+            .routes = &.{
+                .{ .id = "def", .destination = "0.0.0.0/0", .gateway = "10.0.0.1", .interface_id = "bond0" },
+            },
+            .dns = &.{"8.8.8.8"},
+        },
+    };
+    const bytes = try renderTestFixture(std.testing.allocator, &node, .{}, .{}, "ssh-key", null, "http://repo", "http://facts", "http://event", "http://log", "", "0123456789abcdef0123456789abcdef", "http://srv/api/v1/nodes/n1/boot-config", "scope", null);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "  network:\n    version: 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "bonds:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "mode: active-backup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "vlans:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "id: 50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "link: bond0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "10.0.0.20/24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "to: default") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "via: 10.0.0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "8.8.8.8") != null);
 }
 
 test "M4.1 autoinstall renders target defaults and static network" {

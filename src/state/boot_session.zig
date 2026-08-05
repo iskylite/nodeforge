@@ -206,7 +206,7 @@ pub const Link = union(enum) {
     pub fn state(self: Link) ?[]const u8 {
         return switch (self) {
             .linked => null,
-            .capacity_exhausted => "capacity_exhausted",
+            .capacity_exhausted => "capacity.exhausted",
             .no_active_lease_match => "no_active_lease_match",
             .ambiguous_lease_match => "ambiguous_lease_match",
         };

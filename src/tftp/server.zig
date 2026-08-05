@@ -1102,7 +1102,9 @@ fn tftpErrorReason(err: anyerror) []const u8 {
         error.InvalidOption => "invalid_option",
         error.BootAccessDenied => "access_denied",
         error.BootTargetUnavailable => "target_unavailable",
-        error.DisklessSessionCapacity => "session_capacity",
+        error.DisklessSessionCapacity => "capacity.exhausted",
+        error.SessionCapacityExhausted => "capacity.exhausted",
+        error.CapacityExhausted => "capacity.exhausted",
         error.StaleSource => "stale_source",
         else => "io_error",
     };
