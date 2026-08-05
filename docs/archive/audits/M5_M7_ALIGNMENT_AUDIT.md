@@ -1,18 +1,18 @@
-# M5-M7 设计与实现对齐审计
+# M5-M7 设计与实现对齐审计（归档）
 
 > 历史快照：本文记录 2026-07-22 的实现与设计状态，不定义当前版本范围。当前实现以
-> [`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md) 为准，
+> [`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](2026-08-02_V0_3_1_IMPLEMENTATION_ALIGNMENT_REVIEW.md) 为准，
 > 当前路线与 schema 编号以
 > [`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准；其中 BIOS PXELINUX
 > 已从 v0.3 剥离为不绑定版本号的独立延后项。下文旧版 v0.3/BIOS 及“纯静态 PXE 延后 v0.4”
 > 表述仅作审计追溯；当前 v0.4 不新增 no-DHCP static PXE，以
-> [`V0_4_DESIGN.md`](../design/V0_4_DESIGN.md) 为准；独立保留项以
-> [`DEFERRED_DESIGN_INDEX.md`](../design/DEFERRED_DESIGN_INDEX.md) 为准。
+> [`V0_4_DESIGN.md`](../../design/V0_4_DESIGN.md) 为准；独立保留项以
+> [`DEFERRED_DESIGN_INDEX.md`](../../design/DEFERRED_DESIGN_INDEX.md) 为准。
 
-> M5-M7 归入 [`docs/design/V0_2_DESIGN.md`](../design/V0_2_DESIGN.md)，必须等待
-> [`docs/design/V0_1_DESIGN.md`](../design/V0_1_DESIGN.md) 的 schema v3 与全部进入条件验收完成。
+> M5-M7 归入 [`docs/design/V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md)，必须等待
+> [`docs/design/V0_1_DESIGN.md`](../../design/V0_1_DESIGN.md) 的 schema v3 与全部进入条件验收完成。
 > 本文只记录当前代码证据和实现缺口；契约冲突时以版本设计为准，不能用历史
-> [`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md`](../archive/M0_M7_LEGACY_DETAILED_DESIGN.md)
+> [`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md`](../M0_M7_LEGACY_DETAILED_DESIGN.md)
 > 中的预留类型、命令或旧 phase 名证明能力已经存在。
 
 审计更新：2026-07-22。审计基线是 M4.13 所有权代码落地后的当前 HEAD：Profile 和 BootKind 仅支持 install，
@@ -20,17 +20,17 @@ Node direct storage、Profile policy/Node override、effective compiler 和 sche
 `docs/design/V0_1_DESIGN.md` 的自动化、迁移和双发行版验收决定；本审计不替它提前宣告完成。
 
 设计收敛状态是本审计当时的历史结论；当前 v0.3 及以前已冻结、v0.4 为唯一待实施版本，旧“v0.5”标签已撤销并改为
-主题化 `ram_rootfs` 保留设计。配套文档包括（[`DISKLESS_FINAL.md`](../design/DISKLESS_FINAL.md)、
-[`V0_2_PROGRAM_DESIGN.md`](../design/V0_2_PROGRAM_DESIGN.md)、[`V0_2_IMPL_DETAILS.md`](../design/V0_2_IMPL_DETAILS.md)、
-[`V0_2_CLI.md`](../design/V0_2_CLI.md)、[`RAM_ROOTFS_DEFERRED.md`](../design/RAM_ROOTFS_DEFERRED.md)、
-[`DISKLESS_OSS_COMPARISON.md`](../design/DISKLESS_OSS_COMPARISON.md)）。本轮收敛的硬性结论：
+主题化 `ram_rootfs` 保留设计。配套文档包括（[`DISKLESS_FINAL.md`](../../design/DISKLESS_FINAL.md)、
+[`V0_2_PROGRAM_DESIGN.md`](../../design/V0_2_PROGRAM_DESIGN.md)、[`V0_2_IMPL_DETAILS.md`](../../design/V0_2_IMPL_DETAILS.md)、
+[`V0_2_CLI.md`](../../design/V0_2_CLI.md)、[`RAM_ROOTFS_DEFERRED.md`](../../design/RAM_ROOTFS_DEFERRED.md)、
+[`DISKLESS_OSS_COMPARISON.md`](../../design/DISKLESS_OSS_COMPARISON.md)）。本轮收敛的硬性结论：
 reconciliation/远程控制与可续期 enrollment credential 均升级为**永久非目标**；per-boot 短时 capability token 保留；
 收敛为每个 diskless Profile 单一共享 rootfs；canonical phase = `install-post|rootfs-build|first-boot`，**无 `runtime` phase**。
 
 审计范围：M5（无盘启动）、M6（支持矩阵/PXELINUX）和 M7（补充包与后处理），对照
-[`docs/design/V0_2_DESIGN.md`](../design/V0_2_DESIGN.md) 及配套文档、
-[`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md`](../archive/M0_M7_LEGACY_DETAILED_DESIGN.md)、
-[`docs/archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md`](../archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md) 以及当前 `src/`、`tests/`。
+[`docs/design/V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md) 及配套文档、
+[`docs/archive/M0_M7_LEGACY_DETAILED_DESIGN.md`](../M0_M7_LEGACY_DETAILED_DESIGN.md)、
+[`docs/archive/M0_M7_LEGACY_OVERVIEW_DESIGN.md`](../M0_M7_LEGACY_OVERVIEW_DESIGN.md) 以及当前 `src/`、`tests/`。
 
 ## 结论
 
@@ -86,13 +86,13 @@ rootfs build manifest、joint readiness、最小 typed BootConfig、typed AgentP
 MAC reservation；传输 token 不进入 URL/boot.json/log，initrd 的 config/rootfs token 在 `switch_root` 前清零，
 agent 的 session-bound 读 token 在 plan/payload 预取后、修改目标系统前清零；跨 Node、过期、错绑和 Range
 负向请求 fail closed。传输 token 与 management credential 是不同凭据类型、不同鉴权路径，不得互通
-（[`V0_2_PROGRAM_DESIGN.md`](../design/V0_2_PROGRAM_DESIGN.md) §5）。
+（[`V0_2_PROGRAM_DESIGN.md`](../../design/V0_2_PROGRAM_DESIGN.md) §5）。
 
 M5 的状态验收必须从 `dhcp_discover` 覆盖至 `diskless_running`（canonical 状态机见
-[`V0_2_IMPL_DETAILS.md`](../design/V0_2_IMPL_DETAILS.md) §1.1），保留早期 PXE/TFTP 诊断状态，验证任意非终态
+[`V0_2_IMPL_DETAILS.md`](../../design/V0_2_IMPL_DETAILS.md) §1.1），保留早期 PXE/TFTP 诊断状态，验证任意非终态
 到 `failed`、服务端 `expired`、幂等重传、非法跳跃/回退以及与 session phase 分离的 Node quarantine gate。
 install 侧 installer 进度移出 BootSession，仅在 `node_status` 部署投影保留。至少一条受支持架构完成真实
-dracut + QEMU diskless smoke，其他架构按 [`docs/design/V0_2_DESIGN.md`](../design/V0_2_DESIGN.md) 的矩阵验收。
+dracut + QEMU diskless smoke，其他架构按 [`docs/design/V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md) 的矩阵验收。
 
 M6 必须以 schema v5 增加 confirmed firmware、PXELINUX fixture/目标机验证和显式 initrd 网络 capability；M5 未支持的
 纯静态 PXE、多 NIC、VLAN、bonding 或跨子网切换不能仅凭脚本存在即宣称支持（延后 v0.4）。
@@ -104,10 +104,10 @@ schema v4 交付 v0.2 所需 `rootfs-build|first-boot`，schema v5 只扩展 `in
 成功后 exec init；`first-boot` 再由 systemd unit 执行（一次性、固定顺序文件更新 -> package -> archive -> script、
 确定性 + 幂等）。身份由 `nodeforge.node_id`、
 session snapshot 与短时 `event:append` token claim 共同证明，**无可续期 enrollment credential、无 reconciliation、无远程控制**
-（[`V0_2_DESIGN.md`](../design/V0_2_DESIGN.md) §5.3/§7）。状态/异常经 `event_url` best-effort 回传，失败本地
+（[`V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md) §5.3/§7）。状态/异常经 `event_url` best-effort 回传，失败本地
 兜底不阻塞。package action 的 selector 只能在 pinned effective software/capability 与本地 repository revision 中解析，
 不得保留 `standard_packages` 旧字段或未固定/在线安装入口。v0.2 rootfs-build 由服务端 builder 执行（无节点 agent），node-apply/first-boot 由 agent 执行，三者共用同一
-action/ItemSpec/八步契约（[`V0_2_DESIGN.md`](../design/V0_2_DESIGN.md) §5.4）。
+action/ItemSpec/八步契约（[`V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md) §5.4）。
 
 任何阶段完成标记都必须同步更新本审计、版本设计、配套设计文档、代码注释、CLI help、fixture 和
 实机/模拟验收记录；预留 enum、空 handler、通用导入能力和设计命令一律不算实现证据。

@@ -1,9 +1,8 @@
 # NodeForge BIOS PXELINUX 保留设计
 
-状态：独立保留设计，实现未排期。不绑定产品版本号或既定 schema 号。
+状态：独立保留设计，实现未排期。不绑定产品版本号或既定 schema 号。当前排期状态以 [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) 为准。
 前置条件：获得可重复使用的 x86_64 BIOS 物理机或 VMware x86_64 guest 验证环境。
-关联文档：[`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) `ENV-X86-VMWARE`。
-统一索引：[`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md)。
+环境约束：统一清单 [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) 中的 `ENV-X86-VMWARE`。
 
 本文从 v0.3 设计中剥离，收录所有 BIOS x86 PXELINUX install 相关的设计决策。
 BIOS 不再绑定 v0.3 或任何产品版本号；只有在其验证环境约束（`ENV-X86-VMWARE`）

@@ -87,7 +87,7 @@ queued -> running -> succeeded | failed
 
 完整声明式 CommandSpec 与自动文档生成按 `V02-D08` 列为未排期 CLI P2 候选，
 不进入 v0.2.2 产品完成闸。v0.2 发布后的真实差异与明确移出项统一见
-[`V0_2_POST_RELEASE_BACKLOG.md`](V0_2_POST_RELEASE_BACKLOG.md)。
+[`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md)。
 
 preview 与 prepare 必须使用不同 handler/type。preview 不能写 state、创建 operation、
 消耗 generation 或签发 credential。
@@ -155,7 +155,7 @@ BootConfig v3 `facts_url` 上报 MemTotal，安装器 facts 同样携带该字�
 x86_64 VMware（`V02-D01` / `ENV-X86-VMWARE`）当前无法在本地环境执行，不进入
 v0.2.2 完成闸；QEMU（`V02-D02`）为可选诊断和故障注入工具，VMware 产品链已经
 通过时不要求重复执行。不可验证项和解除条件统一见
-[`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md)。
+[`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md)。
 
 ## 8. 完成标准
 

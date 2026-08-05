@@ -4,8 +4,8 @@
 风险分析和实现范围。
 总纲与跨版本不变式以 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) 为准；本文不重复 v0.2 已冻结的架构、
 程序边界和 CLI 契约，只定义 v0.2.1 新增的 Ubuntu diskless 能力及其与 v0.2 的差异。
-当前实现差距以 [`../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)
-为准，后续版本闸以 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md) 为准。
+当时的实现差距见归档 [`2026-08-02_V0_3_1_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../archive/audits/2026-08-02_V0_3_1_IMPLEMENTATION_ALIGNMENT_REVIEW.md)，
+历史版本闸见归档 [`V0_2_1_PLUS_ROADMAP.md`](../archive/design/V0_2_1_PLUS_ROADMAP.md)。
 
 日期：2026-07-30
 
@@ -26,7 +26,7 @@
 > Ubuntu 22.04.5 冷启动回归，并修复/复验 Ubuntu 标准 tty1 登录控制台。
 > v0.2.2 的现行完成闸只要求当前可用的 aarch64 VMware 矩阵。QEMU 为可选补充；
 > x86_64 VMware 归入 `V02-D01` / `ENV-X86-VMWARE`，详见
-> [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md)，不阻塞版本完成。
+> [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md)，不阻塞版本完成。
 
 ## 0. 版本定位
 

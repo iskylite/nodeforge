@@ -278,4 +278,4 @@ VMware Fusion aarch64 r97n1 的复验结果：
 
 本地 `zig build test --summary all` 为 397/397 通过，CLI、HTTP 与 setup shell
 契约步骤全部成功。x86_64 VMware 仍按
-`docs/design/LOCAL_VALIDATION_DEFERRED.md` 不进入本地完成闸。
+`docs/design/DEFERRED_DESIGN_INDEX.md` 中的环境延期项不进入本地完成闸。

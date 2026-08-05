@@ -1,12 +1,12 @@
-# NodeForge v0.2.1+ 实施路线图
+# NodeForge v0.2.1+ 实施路线图（归档）
 
-状态：现行跨版本路线图
+状态：历史归档；v0.4 当前目标与完成闸以 `docs/design/V0_4_DESIGN.md` 为准
 基线：产品 v0.3.1 / config schema v4 + catalog schema v5 / BootConfig v3 / AgentPlan v1
-更新日期：2026-08-02
+更新日期：2026-08-05
 
 本文只定义版本依赖、实施顺序、schema/DTO 演进和完成闸。每个版本的领域细节仍由
 对应设计文档负责；当前实现状态以
-[`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)
+[`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/2026-08-02_V0_3_1_IMPLEMENTATION_ALIGNMENT_REVIEW.md)
 为准。
 
 ## 1. 路线总览
@@ -71,7 +71,7 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 - CLI exit mapping。
 
 非目标与完成闸见
-[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)。
+[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](../../design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)。
 
 ### Gate 4：v0.3 install-post canonical 扩展
 
@@ -85,7 +85,7 @@ schema 2 均已有旧 checkpoint→保存→重载 fixture。
 - aarch64 UEFI install 回归。
 
 非目标与完成闸见
-[`V0_3_DESIGN.md`](V0_3_DESIGN.md)。
+[`V0_3_DESIGN.md`](../../design/V0_3_DESIGN.md)。
 
 ### Gate 5：v0.4 schema 直接替换
 
@@ -126,8 +126,8 @@ v0.4 边界采用直接替换（见 v0.2.3 设计 §0）：旧 config/catalog/st
 - VMware Ubuntu aarch64 UEFI PXE 完整链；**已通过，并复验 tty1/SSH/systemd**
 - 同一候选版本的 Rocky 回归不退化；**Rocky 9.7/10.2 已通过**
 
-独立 QEMU launcher 和 x86_64 VMware 不再作为版本阻断闸，统一按
-[`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) 管理。现有
+独立 QEMU launcher 和 x86_64 VMware 不再作为版本阻断闸，按统一延期清单
+[`DEFERRED_DESIGN_INDEX.md`](../../design/DEFERRED_DESIGN_INDEX.md) 管理。现有
 `tests/v0_2_1_ubuntu_casper_smoke.sh` 保留为实验室回归入口；它当前要求
 x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 
@@ -162,9 +162,11 @@ x86_64 launcher，不能冒充本轮 aarch64 产品验证证据。
 - AppConfig v5/catalog v6 直接替换；旧 config/catalog/state/session/artifact 全部拒载，不迁移、不共存；
 - BootConfig 保持 v3；全部 fresh v0.4 diskless delivery 只使用 AgentPlan v2；
 - UEFI GRUB + DHCPv4 bootstrap 保持现状，支持动态 lease 或 `pxe.ip_reservation`，不新增 no-DHCP static PXE；
-- target topology 与 PXE transport 分离，diskless 事务切网、回滚和 adopt 闭环，容量 SLO；
+- target topology 与 PXE bootstrap 分离；install adapter 与 diskless `node-apply renderNetwork` 均完整渲染 interfaces/bonds/VLANs/routes/DNS，网络实际连通性不作为 first-boot 成功闸；
 - nodeforged 服务端 rootfs operation、artifact 发布与恢复；
-- install first-boot 一次性交换与磁盘 journal；
+- install first-boot 一次性交换与磁盘 journal；它与 diskless node-apply、diskless systemd first-boot 的计划、凭据、存储和事件相互独立；
+- 256 逻辑节点 install/diskless/mixed 波次为实现容量基线，512 为标准合成扩展，1024 为合成压力验证点而非最高上限；运行时覆盖受当前 2048 实现安全天花板约束，真实 256/512 节点生产规模验证按统一清单 `ENV-V04-PRODUCTION-SCALE` 延后；
+- diskless/install first-boot 的 active authority 与复用既有状态域的 per-Node terminal summary 分离，不新增 durable domain；终态释放、非终态 reaper、同一 diskless domain 内的 AgentPlan/增量 checkpoint、HTTP/TFTP/FD 边界和 install-post retention 均通过重复波次资源测试；
 - SN+IP draft Node + per-Node 短时 discovery + 现有 initrd discovery mode 上报 SN + MAC/arch 原子回填；匹配后仍不自动部署。
 
 ## 5. 变更管理

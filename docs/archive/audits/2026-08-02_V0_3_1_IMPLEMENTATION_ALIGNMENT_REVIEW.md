@@ -1,6 +1,6 @@
-# NodeForge 当前实现与设计对齐审查
+# NodeForge v0.3.1 实现与设计对齐审查（归档）
 
-状态：当前实现事实审计
+状态：历史归档；基线为 v0.3.1，不代表当前 v0.4 实现状态
 审查基线：`a29ca69`（2026-08-02）
 产品版本：`0.3.1`
 配置 schema：v4（config.json，`AppConfig.schema_version`）
@@ -33,9 +33,9 @@ zig build test --summary all
 
 环境型 QEMU/VMware 脚本未在本轮重复执行；aarch64 VMware Rocky/Ubuntu diskless
 定向回归已通过（2026-07-31，见
-[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](../design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §10）。
+[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](../../design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §10）。
 x86_64 VMware 与重复 QEMU 不在当前完成闸，按
-[`LOCAL_VALIDATION_DEFERRED.md`](../design/LOCAL_VALIDATION_DEFERRED.md) 管理。
+[`DEFERRED_DESIGN_INDEX.md`](../../design/DEFERRED_DESIGN_INDEX.md) 管理。
 
 ## 2. 当前实现事实
 
@@ -53,7 +53,7 @@ x86_64 VMware 与重复 QEMU 不在当前完成闸，按
 
 “schema v3 已完成”只能描述 v0.1 历史里程碑，不能描述当前文件格式；“两个二进制”
 也不再是构建事实。catalog schema 变更一律直接替换（不迁移，见
-[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](../design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §0）。
+[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](../../design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §0）。
 
 ### 2.2 v0.2 diskless 已实现（v0.2.0 基线）
 
@@ -85,7 +85,7 @@ Ubuntu ISO 导入和 casper rootfs 构建，并在 VMware `r97n1` 连续两次�
 fresh CLI 与 Rocky 9.7/10.2、Ubuntu 22.04.5 aarch64 VMware 冷启动回归已通过。
 
 独立 QEMU launcher（`tests/v0_2_1_ubuntu_casper_smoke.sh`）和 x86_64 VMware 不作为
-版本阻断闸，统一按 [`LOCAL_VALIDATION_DEFERRED.md`](../design/LOCAL_VALIDATION_DEFERRED.md)
+版本阻断闸，统一按 [`DEFERRED_DESIGN_INDEX.md`](../../design/DEFERRED_DESIGN_INDEX.md)
 管理；现有 smoke 脚本保留为实验室回归入口。
 
 ### 2.4 v0.2.2 可运营性（已完成）
@@ -153,12 +153,12 @@ v0.2.3 是 v0.2 系列最后一个收口版本，不增加部署形态。已落�
 v0.3 已把 install-post 扩展到 `managed_file|package|archive|script` 四类 canonical action，复用现有
 BootSession callback credential并在 `installer.started` 后固定 install generation；install-post journal、step attempt、
 finalizer WAL/恢复与 `node postprocess show --phase install-post --generation` 已落地。fresh 双机 install/diskless 发布闸
-通过，证据见 [`V0_3_VALIDATION.md`](../validation/V0_3_VALIDATION.md)。v0.3.1 只补 long node listing；AppConfig v4、
+通过，证据见 [`V0_3_VALIDATION.md`](../../validation/V0_3_VALIDATION.md)。v0.3.1 只补 long node listing；AppConfig v4、
 catalog v5、BootConfig v3、AgentPlan v1 保持不变。v0.3 及更早版本设计按已落地冻结基线管理。
 
 ### 2.7 当前 CLI 与目标 CLI 的边界
 
-v0.2.2/v0.2.3 已把 [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../design/CURRENT_CLI_OPTIMIZATION_PLAN.md)
+v0.2.2/v0.2.3 已把 [`CURRENT_CLI_OPTIMIZATION_PLAN.md`](../../design/CURRENT_CLI_OPTIMIZATION_PLAN.md)
 中的主要 proposed 项落地为现行接口：
 
 - ✅ `profile clone`（含 `--new-ssh-keys`/`--build`/`--detach` 与 property patch）；

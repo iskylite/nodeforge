@@ -10,6 +10,8 @@
 
 整个任务中不得改变上述角色。r97n1 不安装构建工具，不运行 package-manager 来生成 diskless rootfs，不生成或上传 squashfs。
 
+r97n0/r97n1 用于证明真实固件和单节点端到端功能；256/512/1024 容量矩阵使用同一候选二进制的协议/workload harness，在当前 r97n0 环境生成逻辑 Node/session/client。报告必须记录 CPU、RAM、磁盘、NIC 速率、文件系统、DHCP subnet/address pool 和所有容量覆盖值。合成 workload 不能替代至少一台 r97n1 的真实 install 与 diskless 闭环，也不能作为 256/512 台真实节点生产吞吐证据。后者按统一清单的 [`ENV-V04-PRODUCTION-SCALE`](../design/DEFERRED_DESIGN_INDEX.md) 延后，不阻断 v0.4。
+
 ## 2. 证据规则
 
 每一阶段记录：候选 commit、构建时间、二进制 SHA-256、config/catalog schema、命令、退出码、UTC 时间、r97n0 service 日志、r97n1 console 截图或串口日志，以及相关 state/artifact digest。
@@ -69,7 +71,17 @@ nodeforge profile rootfs status --help-full
 
 负测包括重复 MAC、未知 member、环、重复默认 route、越界 MTU、无管理面可达路径和 topology digest 漂移。失败必须在 arm/boot-prepare 前被拒绝。
 
+不能只检查 validator 或 AgentPlan。逐后端检查实际目标系统文件：
+
+- Rocky/kickstart 与 diskless NetworkManager ifcfg/keyfile 均包含多 interface、bond、VLAN 和按 `route.interface_id` 绑定的 route；
+- Ubuntu install 与 diskless netplan 均包含完整 `ethernets`、`bonds`、`vlans`、routes、DNS/search domains；
+- 结构化 topology 的任一字段不得在 adapter 或 `node-apply renderNetwork` 中静默丢失；无结构化 topology 时单 NIC 路径保持回归通过。
+
+不把 first-boot 网络连通性检查作为部署完成条件，也不验证不存在的 installer/target 内核切换；交换机或集群网络不可达应作为独立运维故障记录。
+
 ## 7. install first-boot
+
+本节只验证安装写盘并从本地盘启动后的 v0.4 `InstallFirstBootPlan`。diskless `switch_root` 后、真正 init 前的 `node-apply renderNetwork` 属第 10 节；diskless systemd first-boot canonical postprocess 也不得复用本节的 generation、凭据、journal 或事件结论。
 
 1. 创建包含 first_boot step 的 provisioning bundle；
 2. 执行新 install generation；
@@ -134,9 +146,31 @@ nodeforge profile rootfs status <profile> -o json
 - management API 从非 loopback peer 访问必须拒绝；
 - 大对象固定 digest 数据面不得因为漏 token 而触发 package-manager 定制 header。
 
-## 12. capacity、恢复与 soak
+## 12. capacity、恢复与资源边界
 
-逐项压满 boot session、diskless delivery、operation、first-boot journal、discovery observation、worker queue 与 HTTP body 上限。达到上限时须在创建副作用前返回稳定错误；释放或过期后容量可复用。
+容量以尚未进入终态的 install + diskless 节点总数定义，不能用 HTTP connection 数或 TFTP transfer 数替代。依次执行：
+
+| 档位 | install | diskless | mixed | 结论用途 |
+|---|---:|---:|---:|---|
+| 实现容量基线 | 256 | 256 | 128+128 | 合成发布闸必过 |
+| 标准合成扩展 | 512 | 512 | 256+256 | 合成配置覆盖必过 |
+| 合成压力验证 | 1024 | 1024 | 512+512 | 记录退化与资源曲线，不作为最高上限 |
+
+表中三个 workload 是分别执行的场景，不是同时相加。v0.4 运行时配置可以覆盖到当前 2048 实现安全天花板；超过 2048 必须在启动前拒绝，不能截断或运行中失败。256 使用至少容纳 256 个动态 lease 的 `/23`，512 使用 `/22`，1024 使用 `/21` 或更大的 subnet/address pool，并为 nodeforged、网关等基础设施地址留出空间。
+
+逐项压满 boot session、diskless active delivery、install active first-boot、operation、discovery observation、worker queue、HTTP connection 与 HTTP body 上限。达到上限时须在创建副作用前返回稳定错误；`DisklessSessionCapacity` 等 admission 错误返回 `capacity.exhausted`/HTTP 503。终态、取消或过期后 active 容量可复用。
+
+每个档位至少验证：
+
+- diskless 与 install first-boot 终态不再占 active slot，下一完整波次可立即复用容量；超时非终态可由 reaper 回收；
+- terminal summary 经既有 node status/deployment control 可查询该档位中每个 Node 的最新终态；512 个终态不能因 256 条 history 环覆盖而丢失 node-list 权威状态，也不能为此增加新的 durable domain；
+- install-post 连续 3 轮 256 mixed 逻辑波次后按 retention/compact 收敛，不无界保留 terminal run；
+- diskless 列表/查询不在请求栈复制完整 Session 大数组，RSS 与线程栈不随编译期天花板产生危险峰值；
+- lifecycle event 不重写全部 active AgentPlan；记录每波 checkpoint/journal 写入字节、event 响应延迟、恢复时间和 compact 结果，确认不存在随节点数平方增长的全量写放大；
+- daemon 可从各档位的合法最大 checkpoint 恢复，不受固定 4 MiB 等低于合法格式最大值的读取上限阻断；
+- HTTP listener 的配置值真实限制 accepted connections，生成的 systemd unit 有匹配的 `LimitNOFILE`；management loopback 在负载下仍可观测，但不宣称单 listener 提供无法兑现的保留连接；
+- TFTP 默认 128 限制同时在传的小文件，不限制部署波次；超出 transfer admission 的客户端经重试/错峰完成，记录最后一个节点完成 TFTP 的时间；
+- DHCP lease、boot session、status、inventory 与 deployment control 在 256/512/1024 场景下均未提前触及小于 workload 的隐含上限。
 
 在 queued、running、artifact rename 前后、state rename 前后、first-boot step 中和 diskless delivery 中重启 daemon。恢复后校验：
 
@@ -147,10 +181,10 @@ nodeforge profile rootfs status <profile> -o json
 - 随机 capability 已轮换；
 - rootfs 仍只由 r97n0 服务端 operation 处理。
 
-最后运行 24 小时 mixed workload，持续采集 RSS、FD、线程、session/operation 数、state 文件大小、DHCP/TFTP/HTTP 错误率与 r97n1 重启成功率。
+最后由 workload harness 连续执行 3 轮 256 mixed 逻辑波次，并各执行 1 轮 512 标准合成扩展和 1024 合成压力场景。跨波次采集 RSS、FD、线程、active/terminal session、operation/queue 数、journal/state 文件大小、checkpoint 写入量、DHCP/TFTP/HTTP 错误率与逻辑波次完成时间。每轮结束、全部逻辑节点进入终态并完成 retention/compact 后，资源应回到有界稳定区间，不得出现 session、queue、journal、FD、线程或 state 文件的未界定增长。本发布闸不要求等待固定小时数，也不要求启动 256/512 台真实 VM。
 
 ## 13. 发布结论
 
-PASS 必须同时满足：本地测试全绿、v0.3 回归、topology、first-boot、discovery、Rocky/Ubuntu 服务端 rootfs 生成、diskless ready artifact 交付、token 负测、capacity/recovery 和 24 小时 soak。
+PASS 必须同时满足：本地测试全绿、v0.3 回归、r97n1 单节点 topology/first-boot/discovery/install/diskless 闭环、Rocky/Ubuntu 服务端 rootfs 生成、token 负测、capacity/recovery、256 合成容量基线和关键资源边界测试。512 标准合成扩展必须给出 PASS；1024 合成压力验证必须给出证据和退化说明，但不是产品最高上限。256/512 台真实节点生产规模验证属于延期项，缺少该证据不使 v0.4 FAIL，也不得据此宣称已验证生产吞吐。
 
 报告应明确列出每项 PASS/FAIL/NOT RUN 和证据路径。任一必需项为 FAIL 或 NOT RUN，v0.4 总结论即 FAIL。

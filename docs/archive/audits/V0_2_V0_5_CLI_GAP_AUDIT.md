@@ -1,4 +1,4 @@
-# NodeForge v0.2-v0.5 CLI 流程查漏补缺审计
+# NodeForge v0.2-v0.5 CLI 流程查漏补缺审计（归档）
 
 状态：2026-07-22 设计审计。本文记录对 `docs/design/` 下 v0.2-v0.5 全部设计文档的系统性 CLI 流程
 审查，对照现有 v0.1 实现（`src/main.zig`、`src/model.zig`、`build.zig`、`tests/cli.sh`），识别缺口、
@@ -7,9 +7,9 @@
 
 本文是历史快照；下文的 `firmware.mode`/BIOS、v0.4 static bootstrap、BootConfig v4、跨版本
 active session 和 DTO 迁移条目仅作当时的审计记录，不再定义当前范围或协议。当前 v0.4 行为以
-[`V0_4_DESIGN.md`](../design/V0_4_DESIGN.md) 为准，版本号和顺序以
+[`V0_4_DESIGN.md`](../../design/V0_4_DESIGN.md) 为准，版本号和顺序以
 [`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准。标题和下文的“v0.5”是已撤销的历史标签；
-当前对应内容只作为 [`ram_rootfs` 独立保留设计](../design/RAM_ROOTFS_DEFERRED.md)，不代表后续产品版本。
+当前对应内容只作为 [`ram_rootfs` 独立保留设计](../../design/RAM_ROOTFS_DEFERRED.md)，不代表后续产品版本。
 
 ## 1. 审查范围
 

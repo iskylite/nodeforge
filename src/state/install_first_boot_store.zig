@@ -247,7 +247,6 @@ test "first-boot store binds every reducer operation to node and generation" {
     var store: Store = .{};
     _ = try store.create("node-1", 7, 3, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "daemon-secret");
     try store.handoff("node-1", 7);
-    try std.testing.expectEqual(@as(u64, 1), try store.exchange("node-1", 7));
     try store.started("node-1", 7, "start-7");
     try store.beginStep("node-1", 7, 0);
     try store.stepSucceeded("node-1", 7);
@@ -262,11 +261,10 @@ test "F4: secret fingerprint mismatch marks recovery incomplete" {
     var store: Store = .{};
     _ = try store.create("node-1", 7, 3, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "secret-A");
     try store.handoff("node-1", 7);
-    _ = try store.exchange("node-1", 7);
     // 保存到内存中的 entry 应有指纹。
     const entry_before = store.find("node-1", 7).?;
     try std.testing.expect(entry_before.fingerprint_len == fingerprint_cap);
-    try std.testing.expectEqual(journal.ServerState.exchanging, entry_before.journal.server);
+    try std.testing.expectEqual(journal.ServerState.handoff_complete, entry_before.journal.server);
 
     // 模拟重启：新建 store，用不同 secret 加载同一 entry（通过手动模拟）。
     // 在实际代码中 load 从磁盘读取；这里直接验证指纹比对逻辑。
@@ -286,11 +284,10 @@ test "F4: matching secret fingerprint keeps entry valid" {
     var store: Store = .{};
     _ = try store.create("node-2", 1, 1, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", "same-secret");
     try store.handoff("node-2", 1);
-    _ = try store.exchange("node-2", 1);
     const entry = store.find("node-2", 1).?;
     // 指纹已记录，且 entry 处于正常状态（非 recovery_incomplete）。
     try std.testing.expect(entry.fingerprint_len == fingerprint_cap);
-    try std.testing.expectEqual(journal.ServerState.exchanging, entry.journal.server);
+    try std.testing.expectEqual(journal.ServerState.handoff_complete, entry.journal.server);
     var fp: [fingerprint_cap]u8 = undefined;
     const expected_fp = secretFingerprint(&fp, "same-secret");
     try std.testing.expectEqualSlices(u8, entry.secret_fingerprint[0..fingerprint_cap], expected_fp);

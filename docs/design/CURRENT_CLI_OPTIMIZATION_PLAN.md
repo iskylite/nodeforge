@@ -905,7 +905,7 @@ exit/error mapping
 | `design/DISKLESS_FINAL.md` | boot-prepare 标记内部 transition；Preview 不生成 authority |
 | `design/V0_3_DESIGN.md` | 标记已提前完成与仍缺能力，不再仅按版本隔离 CLI |
 | `design/V0_4_DESIGN.md` | 保持新增能力映射到当前分层 CLI |
-| `audits/V0_2_V0_5_CLI_GAP_AUDIT.md` | 标记为历史审计；记录被本方案取代的 `--wait`/通用 CAS 决策 |
+| `archive/audits/V0_2_V0_5_CLI_GAP_AUDIT.md` | 历史审计；记录被本方案取代的 `--wait`/通用 CAS 决策 |
 | `docs/cli/REFERENCE.md` | 从实际 command tree 建立当前正式接口 |
 | `docs/cli/WORKFLOWS.md` | 只使用 primary 命令描述正常流程 |
 | `docs/cli/TROUBLESHOOTING.md` | session/events/runtime/discovery/operation 诊断流程 |
@@ -985,8 +985,8 @@ exit/error mapping
 
 ## 16. 实施顺序
 
-本节保留最初的依赖排序，但实施状态以
-[`V0_2_POST_RELEASE_BACKLOG.md`](V0_2_POST_RELEASE_BACKLOG.md) 为准。已完成项不得
+本节保留最初的依赖排序；当时实施状态见归档
+[`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md)。已完成项不得
 因下列原始列表仍存在而重新计为残留；P2 也不构成 v0.2.2 发布阻断。
 
 ### P0：修正关键数据与原子边界

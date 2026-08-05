@@ -9,9 +9,9 @@ v0.2.3 是 v0.2 系列最后一个收口版本，不增加部署形态。它只�
 确认的四组真实差异：Profile identity/provenance/clone、capability restart 语义、
 ISO import 后台 operation、CLI exit mapping。
 
-明确暂不做项统一引用
-[`V0_2_POST_RELEASE_BACKLOG.md`](V0_2_POST_RELEASE_BACKLOG.md) §2 的稳定 ID；该表是
-唯一范围裁决源，不得重新加入本版本完成闸。
+当时明确暂不做项的稳定 ID 见归档
+[`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md) §2；跨版本当前状态以
+[`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) 为唯一范围裁决源。
 
 ## 0. 基本常识
 
@@ -996,8 +996,8 @@ v0.2.3 只有同时满足以下条件才完成：
 
 | 文档 | 变更点 |
 |---|---|
-| [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md) | v0.2.3 状态从"待实现"改为"已实现" |
-| [`V0_2_POST_RELEASE_BACKLOG.md`](V0_2_POST_RELEASE_BACKLOG.md) | §3 真实差异标记为已关闭 |
+| [`V0_2_1_PLUS_ROADMAP.md`](../archive/design/V0_2_1_PLUS_ROADMAP.md) | v0.2.3 状态从"待实现"改为"已实现" |
+| [`V0_2_POST_RELEASE_BACKLOG.md`](../archive/design/V0_2_POST_RELEASE_BACKLOG.md) | §3 真实差异标记为已关闭 |
 | [`V0_2_DESIGN.md`](V0_2_DESIGN.md) | §4.4 SSH keys 描述更新为 identity store |
 | [`V0_2_CLI.md`](V0_2_CLI.md) | §8 L517 "唯一启用入口"不变量更新；deploy/readiness 示例保留显式 true |
 | [`V0_2_DISKLESS_WORKFLOW.md`](V0_2_DISKLESS_WORKFLOW.md) | deploy 示例保留显式 true 写法 |

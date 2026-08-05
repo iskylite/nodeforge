@@ -1,6 +1,6 @@
 # NodeForge DHCP-less static PXE bootstrap 保留设计
 
-状态：独立保留设计，实现未排期；不属于 v0.4，也不绑定产品版本号或既定 schema/DTO 编号。
+状态：独立保留设计，实现未排期；不属于 v0.4，也不绑定产品版本号或既定 schema/DTO 编号。当前排期状态以 [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) 为准。
 
 本文保存“不通过 DHCP 建立 PXE bootstrap”的设计考量。当前产品以及 v0.4 仍只支持 UEFI GRUB + DHCPv4：
 动态 lease 和 `pxe.ip_reservation` 都由 DHCP 建立 Node/MAC/BootSession 关联，initrd 复用已经确认的 lease facts。

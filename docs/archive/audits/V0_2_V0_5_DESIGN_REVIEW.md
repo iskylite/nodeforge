@@ -1,16 +1,16 @@
-# NodeForge v0.2-v0.5 设计评审（基于 v0.1 M0-M4.13 实现）
+# NodeForge v0.2-v0.5 设计评审（归档，基于 v0.1 M0-M4.13 实现）
 
 状态：2026-07-22 设计审计基线。本文回答“现有代码能复用什么、后续版本还缺什么、按什么顺序实现”。
 本文是历史快照；下文旧版 v0.3/BIOS 以及 v0.4 static bootstrap、BootConfig v4、跨版本
 active session 和 DTO 迁移结论只用于追溯，不再定义当前行为。v0.4 以
-[`V0_4_DESIGN.md`](../design/V0_4_DESIGN.md) 为准，版本号和顺序以
+[`V0_4_DESIGN.md`](../../design/V0_4_DESIGN.md) 为准，版本号和顺序以
 [`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准。
 标题和下文“v0.5”是本审计当时使用、现已撤销的版本标签；对应设计只以
-[`RAM_ROOTFS_DEFERRED.md`](../design/RAM_ROOTFS_DEFERRED.md) 作为未排期主题保留稿，不代表 v0.4 后必然发布 v0.5。
-权威行为以各版本总纲及其职责分册为准：v0.2 入口是 [`V0_2_DESIGN.md`](../design/V0_2_DESIGN.md)，
-diskless 架构细节由 [`DISKLESS_FINAL.md`](../design/DISKLESS_FINAL.md) 负责。
+[`RAM_ROOTFS_DEFERRED.md`](../../design/RAM_ROOTFS_DEFERRED.md) 作为未排期主题保留稿，不代表 v0.4 后必然发布 v0.5。
+权威行为以各版本总纲及其职责分册为准：v0.2 入口是 [`V0_2_DESIGN.md`](../../design/V0_2_DESIGN.md)，
+diskless 架构细节由 [`DISKLESS_FINAL.md`](../../design/DISKLESS_FINAL.md) 负责。
 当前实现状态与后续版本编号以
-[`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md) 和
+[`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](2026-08-02_V0_3_1_IMPLEMENTATION_ALIGNMENT_REVIEW.md) 和
 [`V0_2_1_PLUS_ROADMAP.md`](../design/V0_2_1_PLUS_ROADMAP.md) 为准；下表中的 BootConfig
 版本号已按当前 v0.2.0 使用 v3 的事实重排。
 

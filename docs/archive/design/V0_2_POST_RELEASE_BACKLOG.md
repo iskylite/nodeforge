@@ -1,6 +1,6 @@
-# NodeForge v0.2 发布后收口清单
+# NodeForge v0.2 发布后收口清单（归档）
 
-状态：范围裁决完成；真实差异已由 v0.2.3 全部关闭  
+状态：历史归档；范围裁决完成，真实差异已由 v0.2.3 全部关闭  
 建立日期：2026-07-30  
 适用基线：v0.2.2 / `dd95376`
 
@@ -11,13 +11,13 @@
 
 历史设计和验证记录可以继续提到已经发生的 QEMU、x86_64 或实验方案，但不能据此
 重新扩大当前完成闸。范围冲突时，v0.2.2 以
-[`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md) §8 为准。
+[`V0_2_2_OPERABILITY.md`](../../design/V0_2_2_OPERABILITY.md) §8 为准。
 
-本文第 2 节是“明确暂不做/不纳入当前完成闸”项目的**唯一权威索引**。其他现行设计
-只引用这里的稳定 ID，不复制或重新解释裁决。历史记录出现同名项目时，以本表状态为准。
+本文第 2 节保留 v0.2 当时的稳定 ID 与裁决快照，不再作为跨版本当前状态的权威索引。所有仍延期、未排期、上游阻塞、可选证据、拒绝路径和永久非目标的当前状态统一见
+[`DEFERRED_DESIGN_INDEX.md`](../../design/DEFERRED_DESIGN_INDEX.md)。
 
 真实差异的权威目标设计现为
-[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)；
+[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](../../design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md)；
 本文不再单独扩展实现范围。
 
 ## 1. 已完成，不再列入残留
@@ -33,7 +33,7 @@
 
 源码中未绑定命令树的旧同步 initrd handler 属死代码清理，不代表产品路径仍同步执行。
 
-## 2. 明确暂不做/不纳入当前完成闸（权威索引）
+## 2. 明确暂不做/不纳入当前完成闸（历史 ID 与裁决快照）
 
 状态分类：
 
@@ -47,7 +47,7 @@
 
 | ID | 项目 | 状态 | 裁决与唯一去向 |
 |---|---|---|---|
-| `V02-D01` | x86_64 VMware UEFI E2E 与 Rocky/Ubuntu 矩阵 | `ENV-DEFERRED` | 不属于 v0.2.2/v0.2.3 完成闸；解除条件见 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) `ENV-X86-VMWARE` |
+| `V02-D01` | x86_64 VMware UEFI E2E 与 Rocky/Ubuntu 矩阵 | `ENV-DEFERRED` | 不属于 v0.2.2/v0.2.3 完成闸；当前解除条件见 [`DEFERRED_DESIGN_INDEX.md`](../../design/DEFERRED_DESIGN_INDEX.md) `ENV-X86-VMWARE` |
 | `V02-D02` | 每个候选重复跑 QEMU | `OPTIONAL-EVIDENCE` | VMware 已证明同一产品链时不要求；仅作诊断、故障注入或补充证据 |
 | `V02-D03` | Ubuntu 方案 B（rootfs 内 mkinitramfs） | `REJECTED-PATH` | 不是生产路径，不实施；实验记录仅供追溯，不进入路线图 |
 | `V02-D05` | 多 NIC/topology、大规模容量/SLO | `SCHEDULED` | 不属于 v0.2；进入 v0.4 |
@@ -74,7 +74,7 @@
 ## 3. 真实 v0.2 设计差异（已由 v0.2.3 全部关闭）
 
 以下差异已由 v0.2.3 全部关闭，保留作为历史追溯。详见
-[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §10 完成标准。
+[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](../../design/V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §10 完成标准。
 
 ### 3.1 Profile identity、provenance 与 clone
 

@@ -4,7 +4,7 @@
 [`V0_2_DESIGN.md`](V0_2_DESIGN.md) §2 版本表一致。
 v0.3 在 v0.2.3 完成（[`V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md`](V0_2_3_PROFILE_IDENTITY_AND_RECOVERY.md) §10
 完成标准）后启动。跨版本顺序见
-[`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md)，实现细节与状态机见
+[`V0_2_1_PLUS_ROADMAP.md`](../archive/design/V0_2_1_PLUS_ROADMAP.md)，实现细节与状态机见
 [`V0_2_IMPL_DETAILS.md`](V0_2_IMPL_DETAILS.md)，共用 CLI 契约见 [`V0_2_CLI.md`](V0_2_CLI.md) §0，
 程序边界见 [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md) §7。
 

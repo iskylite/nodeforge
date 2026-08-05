@@ -6126,7 +6126,7 @@ node/resource API 使用 cursor 和目标 ETag，M5 不新增无分页大 collec
 实现审计状态（2026-07-21）：M4.13 后 Profile/BootKind 仅支持 install；当前只保留 rootfs/initrd asset kind、
 基础 BootBundleConfig tuple 和 state/event enum，UEFI target resolver 也只调用 install 分支。下表列出的
 `profile/diskless.zig`、rootfs/initrd/boot-bundle 校验器、dracut module、overlay 执行器和 diskless CLI/HTTP payload
-均尚未落地。具体缺口和证据见 `docs/audits/M5_M7_ALIGNMENT_AUDIT.md`。
+均尚未落地。具体缺口和证据见 `docs/archive/audits/M5_M7_ALIGNMENT_AUDIT.md`。
 
 | 模块 | 任务 |
 | --- | --- |

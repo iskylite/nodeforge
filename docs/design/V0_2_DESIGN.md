@@ -8,9 +8,9 @@
 > Rocky aarch64 QEMU/VMware UEFI diskless 和 content-addressed first-boot payload
 > 已完成。rootfs durable operation、旧状态迁移与可信 memory inventory/readiness
 > 已落地；Ubuntu casper 正式 builder 已完成，其余 CLI 收敛仍在进行。当前环境无法
-> 执行的 x86_64 VMware 验证按 `V02-D01` / `ENV-X86-VMWARE` 单独跟踪，不阻塞 v0.2.2。详见
-> [`CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)；
-> 后续顺序见 [`V0_2_1_PLUS_ROADMAP.md`](V0_2_1_PLUS_ROADMAP.md)。
+> 执行的 x86_64 VMware 验证按 `V02-D01` / `ENV-X86-VMWARE` 单独跟踪，不阻塞 v0.2.2。当时证据见归档
+> [`2026-08-02_V0_3_1_IMPLEMENTATION_ALIGNMENT_REVIEW.md`](../archive/audits/2026-08-02_V0_3_1_IMPLEMENTATION_ALIGNMENT_REVIEW.md)；
+> 历史实施顺序见归档 [`V0_2_1_PLUS_ROADMAP.md`](../archive/design/V0_2_1_PLUS_ROADMAP.md)。
 
 ## 实现修订记录
 
@@ -539,7 +539,7 @@ v0.2 聚焦 diskless 主流程。VMware 是当前可执行的必验环境，不�
 |---|---|---|
 | v0.2.0 | Rocky/RHEL diskless | M5 内存无盘启动 + M7 diskless 后处理；aarch64 QEMU/VMware 已验证 |
 | v0.2.1 | Ubuntu diskless | Ubuntu casper productization，见 [`V0_2_1_UBUNTU_DISKLESS.md`](V0_2_1_UBUNTU_DISKLESS.md) |
-| v0.2.2 | 可运营性和当前环境矩阵 | 持久化兼容、durable rootfs build、CLI 收敛、memory readiness、aarch64 VMware UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md)；本地不可验证项见 [`LOCAL_VALIDATION_DEFERRED.md`](LOCAL_VALIDATION_DEFERRED.md) |
+| v0.2.2 | 可运营性和当前环境矩阵 | 持久化兼容、durable rootfs build、CLI 收敛、memory readiness、aarch64 VMware UEFI 矩阵，见 [`V0_2_2_OPERABILITY.md`](V0_2_2_OPERABILITY.md)；本地不可验证项见 [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) |
 | v0.3 | install-post canonical 扩展 | install-post 四类 canonical action、callback generation 绑定与 journal；保持 catalog schema v5，见 `V0_3_DESIGN.md` |
 | v0.4 | 延后增强项 | 多 NIC/VLAN/bonding、大规模容量压测、服务端 rootfs 构建强化；install 侧 first-boot agent 与 diskless 同一确定性执行（无 reconciliation，见 §7），见 `V0_4_DESIGN.md` |
 

@@ -73,27 +73,19 @@ NodeForge/
 
 详细设计、审计和验证记录位于 [`docs/`](docs/)，入口见 [文档导航](docs/README.md)：
 
-- [当前实现对齐审查](docs/audits/CURRENT_IMPLEMENTATION_ALIGNMENT_REVIEW.md)：基于
-  当前 v0.3.1 基线的代码、测试、持久化和文档差距清单。
 - [v0.2 冻结设计总纲](docs/design/V0_2_DESIGN.md)：已落地的 Rocky/RHEL diskless 主流程。
 - [v0.2.1 Ubuntu diskless 设计](docs/design/V0_2_1_UBUNTU_DISKLESS.md)：Ubuntu
   casper 方案与正式 rootfs builder 已落地并完成验证。
 - [v0.2.2 可运营性设计](docs/design/V0_2_2_OPERABILITY.md)：持久化兼容、
   durable rootfs build operation、CLI 收敛和当前环境验证矩阵。
-- [当前环境不可验证项](docs/design/LOCAL_VALIDATION_DEFERRED.md)：集中记录
-  x86_64 VMware 等当前无法执行的目标环境验证；QEMU 只作可选补充。
-- [v0.2 暂不做与发布后收口索引](docs/design/V0_2_POST_RELEASE_BACKLOG.md)：用稳定
-  `V02-Dxx` 标识区分环境延后、拒绝路径、后续版本和永久非目标，避免被再次误报为残留。
-- [v0.2.1+ 路线图](docs/design/V0_2_1_PLUS_ROADMAP.md)：v0.2.1-v0.4 的依赖、
-  schema/DTO 演进与完成闸。
 - [v0.3 冻结设计与验证](docs/design/V0_3_DESIGN.md)：install-post canonical 扩展已落地并通过发布闸。
 - [v0.4 统一设计](docs/design/V0_4_DESIGN.md)：v0.4 topology、fresh replacement、服务端 rootfs 生成、install first-boot 与 SN discovery 契约；共同底座已落地，发布闸按 runbook 执行。
-- [独立保留设计索引](docs/design/DEFERRED_DESIGN_INDEX.md)：统一登记不属于已排期版本的设计，不预占版本/schema/DTO。
-- [`ram_rootfs` 保留设计](docs/design/RAM_ROOTFS_DEFERRED.md)：未排期且不占用产品版本号，未来从当时基线重新分配 schema/DTO。
+- [v0.4 全量验证运行手册](docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md)：单节点真实闭环、逻辑容量 workload、恢复和资源边界发布闸。
+- [统一延期、保留与非目标清单](docs/design/DEFERRED_DESIGN_INDEX.md)：唯一登记环境/规模验证延期、未排期设计、上游阻塞、可选证据、拒绝路径和永久非目标。
 - [`docs/audits/`](docs/audits/)：代码事实、设计对齐和缺口审计。
 - [`docs/validation/`](docs/validation/)：自动化、虚拟机和实机验证记录（含 [Phase 8 QEMU 全量验证](docs/validation/V0_2_PHASE8_VALIDATION.md)）。
 
-文档冲突时的优先级：现行版本设计 > 当前代码与审计证据 > 验证记录 > 历史归档。
+文档冲突时的优先级：现行版本设计 > 当前代码 > 当前验证记录 > 统一延期清单 > 历史归档。
 
 ## 实现
 
@@ -149,7 +141,15 @@ v0.4 使用 fresh replacement：`nodeforge setup` 生成 AppConfig v5、Catalog 
 `nodeforge-root-v2 <deployment_id>` marker，并拒绝 deployment id 不一致或缺失 manifest 的已安装服务。
 目标网络 topology 是 Node direct owner；`pxe.ip_reservation` 只保留 DHCP bootstrap lease，不会把 target DHCP 改成 static。
 `nodeforge node topology validate` 可在提交前对 interfaces/bonds/vlans/routes 做纯校验，AgentPlan wire schema 为 v2，
-BootConfig 继续为 v3。
+BootConfig 继续为 v3。canonical topology 必须同时由 install adapter 和 diskless `node-apply renderNetwork` 完整渲染；
+校验通过但在 kickstart/Ubuntu/netplan/NetworkManager 输出中静默丢弃 bond、VLAN、多 interface 或 route 的实现不符合 v0.4。
+
+v0.4 把部署规模定义为同一 nodeforged 中尚未终态的 install + diskless 节点总数：256 逻辑节点波次为实现容量基线，
+512 为标准合成扩展验证，1024 为合成压力验证点而不是最高上限。运行时容量可以显式覆盖到当前 2048 实现安全天花板；
+HTTP connection、TFTP active transfer 和部署波次分别限流，其中 TFTP 默认 128 只限制同时在传的小文件数。
+install first-boot 与 diskless node-apply/systemd first-boot 是计划、凭据、存储和事件均不同的执行阶段；
+first-boot 不承担目标网络连通性或不存在的 installer/target 内核切换验证。
+当前 VMware 双机环境只验证单节点真实功能闭环和逻辑节点 workload；256/512 台真实节点的生产吞吐与端到端规模验证按统一延期清单的 `ENV-V04-PRODUCTION-SCALE` 管理，不阻断 v0.4，也不能由合成结果冒充。
 
 ```bash
 nodeforge setup --install-root /opt/nodeforge --yes
@@ -178,7 +178,8 @@ exit mapping 收口；v0.3 已完成 install-post 四类 canonical action、call
 后续按以下边界推进：
 
 - **v0.4 已落地底座**：AppConfig v5/catalog v6 fresh replacement、多 NIC/topology validator、AgentPlan v2、
-  reservation/target 分层；服务端 rootfs 生成、install first-boot、SN+IP draft Node discovery、容量闸和双机发布仍按 runbook 验证。
+  reservation/target 分层；服务端 rootfs 生成、install/diskless 完整 topology 渲染、install first-boot、SN+IP draft Node discovery、
+  256/512/1024 合成容量闸和双机单节点发布仍按 runbook 验证；真实 256/512 节点生产规模验证延后。
 - **BIOS PXELINUX**：独立保留工作项，不绑定产品/schema 版本号，也不进入 v0.4，见
   [`BIOS_PXELINUX_DEFERRED.md`](docs/design/BIOS_PXELINUX_DEFERRED.md)；
 - **DHCP-less static PXE**：独立保留设计，不进入 v0.4，见

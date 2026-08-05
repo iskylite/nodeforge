@@ -1,6 +1,6 @@
 # NodeForge `ram_rootfs` materialization 保留设计
 
-状态：独立保留设计，短期不计划实现；不属于 v0.4 设计、实现或完成闸，也不占用当前产品版本号。
+状态：独立保留设计，短期不计划实现；不属于 v0.4 设计、实现或完成闸，也不占用当前产品版本号。当前排期状态以 [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) 为准。
 
 统一索引：[`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md)。
 

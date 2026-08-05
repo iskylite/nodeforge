@@ -7,7 +7,7 @@
 ## 1. 范围
 
 v0.2 Phase 1 = schema v4 模型基础与 v3→v4 迁移入口，对应 `V0_2_DESIGN.md` §3.1 / §6 与
-`V0_2_V0_5_DESIGN_REVIEW.md` §5 的“未修复实现差距”中可独立落地的数据模型与迁移子集：
+归档 `docs/archive/audits/V0_2_V0_5_DESIGN_REVIEW.md` §5 的“未修复实现差距”中可独立落地的数据模型与迁移子集：
 
 - `BootKind` 扩 `install | diskless`，新增 `ProfileKind` 别名（设计名 = 代码 `BootKind`）。
 - `AssetKind` 增 `runtime_kernel`、`archive`、`script`。
