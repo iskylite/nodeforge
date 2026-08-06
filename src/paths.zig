@@ -272,8 +272,10 @@ pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator, args: std.process.Arg
     _ = iterator.next();
     var explicit: ?[]const u8 = null;
     var setup = false;
+    var help = false;
     while (iterator.next()) |arg| {
         if (std.mem.eql(u8, arg, "setup")) setup = true;
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) help = true;
         if (std.mem.eql(u8, arg, "--install-root")) {
             explicit = iterator.next() orelse return error.MissingInstallRootValue;
         } else if (std.mem.startsWith(u8, arg, "--install-root=")) {
@@ -281,8 +283,16 @@ pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator, args: std.process.Arg
             if (explicit.?.len == 0) return error.MissingInstallRootValue;
         }
     }
+    // `setup` 和 `--help` 是允许在 marker 不存在时运行的场景。无显式 --install-root
+    // 时使用默认根作为 candidate（不要求 marker / 成对二进制存在），让 setup
+    // 进入交互式流程或使用默认路径安装，让 --help 在尚未安装的发布包中也能工作。
+    if ((setup or help) and explicit == null) {
+        const value = try Paths.candidate(io, allocator, default_install_root);
+        try init(value);
+        return;
+    }
     const value = if (explicit) |root|
-        if (setup) try Paths.candidate(io, allocator, root) else try Paths.resolve(io, allocator, root)
+        if (setup or help) try Paths.candidate(io, allocator, root) else try Paths.resolve(io, allocator, root)
     else
         try Paths.discover(io, allocator);
     try init(value);
