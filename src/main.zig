@@ -1626,7 +1626,7 @@ fn promptU16(ctx: zli.CommandContext, prompt: []const u8, default_value: u16) !u
 
 /// 列出可用网卡（排除 lo），读取 /sys/class/net。
 fn listNetworkInterfaces(ctx: zli.CommandContext) !void {
-    var dir = std.Io.Dir.cwd().openDir(ctx.io, "/sys/class/net", .{ .iterate = true, .follow_symlinks = false }) catch return;
+    var dir = std.Io.Dir.cwd().openDir(ctx.io, "/sys/class/net", .{ .iterate = true }) catch return;
     defer dir.close(ctx.io);
     var iter = dir.iterate();
     try ctx.writer.print("Available network interfaces:\n", .{});
@@ -1752,35 +1752,73 @@ fn setupHandler(ctx: zli.CommandContext) !void {
         if (!reset_then_reconfigure) return;
     }
 
-    const config_exists = blk: {
+    var config_exists = blk: {
         _ = std.Io.Dir.cwd().statFile(ctx.io, p.config_path, .{ .follow_symlinks = false }) catch break :blk false;
         break :blk true;
     };
-    // 首次安装且非 --non-interactive 且无 --import-config 时进入交互式网络配置。
-    // 操作员可逐项确认或覆盖默认值；空行回车接受方括号内的默认值。
-    if (!config_exists and !ctx.flag("non-interactive", bool) and import_config_path.len == 0 and !dry_run) {
-        try ctx.writer.print("\n=== NodeForge Initial Setup ===\n", .{});
-        try ctx.writer.print("Install root: {s}\n\n", .{p.install_root});
-        listNetworkInterfaces(ctx) catch {};
-        network.bind_interface = try promptWithDefault(ctx, "PXE bind interface", network.bind_interface);
-        network.server_ip = try promptWithDefault(ctx, "Server IP", network.server_ip);
-        network.http_port = try promptU16(ctx, "HTTP/management port", network.http_port);
-        network.subnet = try promptWithDefault(ctx, "DHCP subnet CIDR", network.subnet);
-        network.pool_start = try promptWithDefault(ctx, "DHCP pool start", network.pool_start);
-        network.pool_end = try promptWithDefault(ctx, "DHCP pool end", network.pool_end);
-        try ctx.writer.print("\nConfiguration summary:\n", .{});
-        try ctx.writer.print("  Install root:    {s}\n", .{p.install_root});
-        try ctx.writer.print("  Bind interface:  {s}\n", .{network.bind_interface});
-        try ctx.writer.print("  Server IP:       {s}\n", .{network.server_ip});
-        try ctx.writer.print("  HTTP port:       {d}\n", .{network.http_port});
-        try ctx.writer.print("  DHCP subnet:     {s}\n", .{network.subnet});
-        try ctx.writer.print("  DHCP pool:       {s} - {s}\n", .{ network.pool_start, network.pool_end });
-        try ctx.writer.flush();
-        const confirm = try promptWithDefault(ctx, "\nProceed with installation?", "y");
-        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, confirm, " \t\r"), "y") and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, confirm, " \t\r"), "yes")) {
-            try ctx.writer.writeAll("Installation cancelled.\n");
-            setExitCode(ctx, 1);
-            return;
+    // 交互式模式：首次安装时提示网络配置；已存在部署时提示是否重新初始化。
+    const non_interactive = ctx.flag("non-interactive", bool);
+    if (!non_interactive and import_config_path.len == 0 and !dry_run and operation_count == 0) {
+        if (config_exists) {
+            // 已有部署：提示是否清理重新初始化，还是保持 reconfigure。
+            try ctx.writer.print("\n=== NodeForge Setup ===\n", .{});
+            try ctx.writer.print("An existing deployment was found at {s}.\n", .{p.install_root});
+            const action = try promptWithDefault(ctx, "Reconfigure existing, or wipe and reinitialize? [reconfigure/wipe]", "reconfigure");
+            const trimmed_action = std.mem.trim(u8, action, " \t\r");
+            if (std.ascii.eqlIgnoreCase(trimmed_action, "wipe")) {
+                // 检查 daemon 是否在运行。
+                var running_config = nodeforge.config.load(ctx.io, ctx.allocator, p.config_path) catch null;
+                defer if (running_config) |*rc| rc.deinit();
+                if (running_config) |*rc| {
+                    if (nodeforge.management_client.health(ctx.io, rc.value.server.http_port).reachable) {
+                        try errorWriter(ctx).writeAll("error: daemon is running; stop it before wiping\n");
+                        setExitCode(ctx, 1);
+                        return;
+                    }
+                }
+                try ctx.writer.print("This will delete all state, catalog, assets, and config under {s}.\n", .{p.install_root});
+                const confirm = try promptWithDefault(ctx, "Type 'yes' to confirm wipe", "no");
+                if (!std.mem.eql(u8, std.mem.trim(u8, confirm, " \t\r"), "yes")) {
+                    try ctx.writer.writeAll("Wipe cancelled.\n");
+                    setExitCode(ctx, 1);
+                    return;
+                }
+                // 执行清理：删除 catalog/assets/state/config，保留 bin/systemd/marker。
+                std.Io.Dir.cwd().deleteTree(ctx.io, p.catalog_dir) catch {};
+                std.Io.Dir.cwd().deleteTree(ctx.io, p.assets_dir) catch {};
+                std.Io.Dir.cwd().deleteTree(ctx.io, p.state_dir) catch {};
+                std.Io.Dir.cwd().deleteTree(ctx.io, p.logs_dir) catch {};
+                std.Io.Dir.cwd().deleteTree(ctx.io, p.work_dir) catch {};
+                std.Io.Dir.cwd().deleteFile(ctx.io, p.config_path) catch {};
+                std.Io.Dir.cwd().deleteFile(ctx.io, p.deployment_manifest_path) catch {};
+                std.Io.Dir.cwd().deleteFile(ctx.io, p.marker_path) catch {};
+                config_exists = false;
+            }
+        }
+        if (!config_exists) {
+            try ctx.writer.print("\n=== NodeForge Initial Setup ===\n", .{});
+            try ctx.writer.print("Install root: {s}\n\n", .{p.install_root});
+            listNetworkInterfaces(ctx) catch {};
+            network.bind_interface = try promptWithDefault(ctx, "PXE bind interface", network.bind_interface);
+            network.server_ip = try promptWithDefault(ctx, "Server IP", network.server_ip);
+            network.http_port = try promptU16(ctx, "HTTP/management port", network.http_port);
+            network.subnet = try promptWithDefault(ctx, "DHCP subnet CIDR", network.subnet);
+            network.pool_start = try promptWithDefault(ctx, "DHCP pool start", network.pool_start);
+            network.pool_end = try promptWithDefault(ctx, "DHCP pool end", network.pool_end);
+            try ctx.writer.print("\nConfiguration summary:\n", .{});
+            try ctx.writer.print("  Install root:    {s}\n", .{p.install_root});
+            try ctx.writer.print("  Bind interface:  {s}\n", .{network.bind_interface});
+            try ctx.writer.print("  Server IP:       {s}\n", .{network.server_ip});
+            try ctx.writer.print("  HTTP port:       {d}\n", .{network.http_port});
+            try ctx.writer.print("  DHCP subnet:     {s}\n", .{network.subnet});
+            try ctx.writer.print("  DHCP pool:       {s} - {s}\n", .{ network.pool_start, network.pool_end });
+            try ctx.writer.flush();
+            const confirm = try promptWithDefault(ctx, "\nProceed with installation?", "y");
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, confirm, " \t\r"), "y") and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, confirm, " \t\r"), "yes")) {
+                try ctx.writer.writeAll("Installation cancelled.\n");
+                setExitCode(ctx, 1);
+                return;
+            }
         }
     }
     if (!config_exists) {

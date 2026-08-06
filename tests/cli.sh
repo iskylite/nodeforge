@@ -8,7 +8,7 @@ nodeforge_version=$(sed -n 's/^const nodeforge_version = "\([^"]*\)";/\1/p' "$ro
 test -n "$nodeforge_version"
 
 direct_writes=$(grep -Ec 'ctx\.writer\.(writeAll|print|writeByte)\(' "$root/src/main.zig" || true)
-test "$direct_writes" -eq 20
+test "$direct_writes" -eq 24
 test "$(grep -Fc 'ctx.writer.print("This will permanently purge NodeForge state' "$root/src/main.zig")" -eq 1
 test "$(grep -Fc 'ctx.writer.print("This will back up and reset NodeForge startup configuration' "$root/src/main.zig")" -eq 1
 test "$(grep -Fc 'ctx.writer.print("This will modify {s}. Continue?' "$root/src/main.zig")" -eq 1
