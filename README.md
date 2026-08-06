@@ -333,7 +333,7 @@ nodeforge assets install-source show rocky-9.7-aarch64-dvd
 nodeforge node add node-01 mac=00:50:56:2a:23:db arch=aarch64 profile=rocky-9 \
   pxe.ip_reservation=192.168.50.110 deploy=false
 nodeforge node set node-01 storage.boot_disk=/dev/sda
-nodeforge profile set rocky-9 'kernel_args=iommu=pt hugepages=4'
+nodeforge profile add-values rocky-9 kernel_args iommu=pt hugepages=4
 nodeforge node show node-01
 nodeforge profile show rocky-9
 
@@ -374,6 +374,133 @@ nodeforge node software show node-01
 
 Rocky 默认 `minimal-environment`。comps environment/group 默认安装 mandatory/default 包，
 不包含 optional 包；NodeForge 当前没有隐式“安装 group 全部 optional 包”的开关。
+
+RAID 由 Node 物理设备（`storage.boot_disk` + `storage.additional_disks`）和存储拓扑模式
+（Profile `install.storage.mode` 或 Node `overrides.install.storage.mode`）组合而成。成员盘
+列表自动由 `boot_disk` + `additional_disks` 拼成。以下示例用 `/dev/sda` 和 `/dev/sdb` 做
+RAID1 镜像启动：
+
+```bash
+# 1. 指定主启动盘（默认 /dev/sda，此处为明确意图）
+nodeforge node set node-01 storage.boot_disk=/dev/sda
+
+# 2. 把 /dev/sdb 加入 additional_disks（集合属性，用 add-values）
+nodeforge node add-values node-01 storage.additional_disks /dev/sdb
+
+# 3. 设置 RAID 级别——只对 node-01 做 RAID1（Node 级 override）：
+nodeforge node set node-01 overrides.install.storage.mode=raid1
+#    或对绑定该 profile 的所有节点统一做 RAID1（Profile 级基线）：
+nodeforge profile set rocky-9 install.storage.mode=raid1
+
+# 4. 验证
+nodeforge node show node-01
+```
+
+ESP 只在 `boot_disk` 上创建；`/boot` 始终使用所有成员盘组成 RAID1；根和数据分区使用指定
+RAID 级别。单主 ESP 方案不承诺主盘完全损坏后固件能自动从其他盘启动。两块盘可选 `raid0`、
+`raid1`、`raid0-lvm`、`raid1-lvm`；三块盘可加 `raid5`/`raid5-lvm`；四块盘可加 `raid6`/`raid10`
+及对应 `-lvm` 变体。
+
+目标系统网络是 Node 直接属性。PXE 引导阶段始终使用 DHCP；`network.mode=static` 时安装器将
+静态配置写入目标系统（Kickstart `network --bootproto=static` 或 Autoinstall Netplan）。已绑定
+`pxe.ip_reservation` 时，`network.address` 必须与之相同，否则校验报 `StaticAddressMismatch`：
+
+```bash
+# 设置静态网络（标量属性用 node set）
+nodeforge node set node-01 \
+  network.mode=static \
+  network.address=192.168.50.110 \
+  network.prefix_len=24 \
+  network.gateway=192.168.50.1
+
+# DNS 和搜索域是集合属性，用 add-values 添加
+nodeforge node add-values node-01 network.dns 192.168.50.1
+nodeforge node add-values node-01 network.dns 8.8.8.8
+nodeforge node add-values node-01 network.search_domains nodeforge.local
+
+# 验证
+nodeforge node show node-01
+```
+
+`network.prefix_len` 范围 1-32；`network.gateway` 可选但通常需要；`network.interface_name`
+可选，不指定时安装器按 MAC 匹配网卡。以上 `network.*` 属性也可在 `node add` 时一次性传入：
+
+```bash
+nodeforge node add node-01 mac=00:50:56:2a:23:db arch=aarch64 profile=rocky-9 \
+  pxe.ip_reservation=192.168.50.110 \
+  network.mode=static \
+  network.address=192.168.50.110 \
+  network.prefix_len=24 \
+  network.gateway=192.168.50.1 \
+  deploy=false
+```
+
+### 内核参数调整
+
+内核参数（`kernel_args`）是**集合属性**，不能通过 `set` 命令设置，必须使用
+`add-values`/`remove-values` 命令管理。每个参数是一个独立的 CLI 位置参数，不需要引号：
+
+```bash
+# 以下三条命令等价——每个 key=value 都是独立参数，shell 自动按空格拆分：
+nodeforge profile add-values rocky-9 kernel_args iommu=pt amd_iommu=on intremap=on
+nodeforge profile add-values rocky-9 kernel_args "iommu=pt" "amd_iommu=on" "intremap=on"
+nodeforge profile add-values rocky-9 kernel_args iommu=pt \
+  amd_iommu=on intremap=on
+```
+
+支持两种参数形式：
+
+- `key=value`：带值参数（如 `iommu=pt`），同 key 后添加会覆盖旧值
+- `key`：无值开关参数（如 `nosplash`）
+
+**Profile 级别**（基线，绑定该 profile 的所有节点共享）：
+
+```bash
+# 添加内核参数
+nodeforge profile add-values rocky-9 kernel_args iommu=pt amd_iommu=on intremap=on
+nodeforge profile add-values rocky-9 kernel_args hugepages=4
+
+# 查看当前 kernel_args（按参数名列表输出）
+nodeforge profile list-values rocky-9 kernel_args
+
+# 按参数名移除（只需指定 key 或 key=value，匹配参数名即移除）
+nodeforge profile remove-values rocky-9 kernel_args hugepages
+
+# 清空全部 kernel_args
+nodeforge profile clear-values rocky-9 kernel_args
+```
+
+**Node 级别 override**（覆盖 Profile 基线，只影响单个节点）：
+
+```bash
+# 添加 Node 级 override：追加到 Profile 基线（同名参数覆盖 Profile 值）
+nodeforge node add-values node-01 overrides.kernel_args.add iommu=pt
+nodeforge node add-values node-01 overrides.kernel_args.add amd_iommu=on
+
+# 移除 Node 级 override：从继承的 Profile 基线中剔除指定参数
+nodeforge node add-values node-01 overrides.kernel_args.remove hugepages
+
+# 查看节点的 override
+nodeforge node list-values node-01 overrides.kernel_args.add
+nodeforge node list-values node-01 overrides.kernel_args.remove
+
+# 清空 Node 级 override
+nodeforge node clear-values node-01 overrides.kernel_args.add
+
+# 验证最终生效的配置（Profile 基线 + Node override 合并后的 effective 值）
+nodeforge node show node-01
+```
+
+Node override 合并规则（`effective.compileInputs`）：
+
+1. 以 Profile `kernel_args` 为基线
+2. `overrides.kernel_args.remove` 中的参数名从基线中剔除
+3. `overrides.kernel_args.add` 中的参数追加到结果（同名参数覆盖基线值）
+4. 最终合并结果写入 Kickstart GRUB `--append` 或 Autoinstall `kernel-command-line`
+
+例如 Profile 设置了 `iommu=pt hugepages=4`，Node override `add=iommu=off` +
+`remove=hugepages`，则 effective 为 `iommu=off`。`remove` 不修改 Profile 本身，
+只影响该 Node 的 effective 合并结果。
 
 ### Diskless 流程
 

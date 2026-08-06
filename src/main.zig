@@ -120,7 +120,7 @@ fn helpOnly(args: std.process.Args) bool {
     var iterator = args.iterate();
     _ = iterator.next();
     while (iterator.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help-full")) return true;
     }
     return false;
 }
@@ -152,15 +152,53 @@ fn renderFullHelp(command: *zli.Command) std.Io.Writer.Error!void {
     const owner = commandOwner(command);
     try writer.writeAll("\nDetailed help\n");
     if (owner) |value| {
-        try writer.writeAll("\nScalar properties\nKEY\tTYPE\tVALUES/CONSTRAINT\tOPTIONAL\tAPPLICABILITY\n");
+        // Scalar properties — compute column widths for aligned output.
+        var w_key: usize = 3; // "KEY"
+        var w_type: usize = 4; // "TYPE"
+        var w_values: usize = 16; // "VALUES/CONSTRAINT"
+        var w_opt: usize = 8; // "OPTIONAL"
+        var w_app: usize = 13; // "APPLICABILITY"
         for (cli_properties.properties) |spec| {
             if (spec.owner != value or spec.mutability != .mutable) continue;
-            try writer.print("{s}\t{s}\t{s}\t{s}\t{s}\n", .{ spec.path, @tagName(spec.kind), cli_properties.valueConstraint(spec.kind, spec.value_constraint), if (spec.optional) "true" else "false", @tagName(spec.applicability) });
+            const vc = cli_properties.valueConstraint(spec.kind, spec.value_constraint);
+            const opt_str: []const u8 = if (spec.optional) "true" else "false";
+            w_key = @max(w_key, spec.path.len);
+            w_type = @max(w_type, @tagName(spec.kind).len);
+            w_values = @max(w_values, vc.len);
+            w_opt = @max(w_opt, opt_str.len);
+            w_app = @max(w_app, @tagName(spec.applicability).len);
         }
-        try writer.writeAll("\nCollection properties\nKEY\tSEMANTICS\tOPERATIONS\n");
+        try writer.writeAll("\nScalar properties\n");
+        try writePadded(writer, "KEY", w_key); try writer.writeAll("  ");
+        try writePadded(writer, "TYPE", w_type); try writer.writeAll("  ");
+        try writePadded(writer, "VALUES/CONSTRAINT", w_values); try writer.writeAll("  ");
+        try writePadded(writer, "OPTIONAL", w_opt); try writer.writeAll("  ");
+        try writePadded(writer, "APPLICABILITY", w_app); try writer.writeByte('\n');
+        for (cli_properties.properties) |spec| {
+            if (spec.owner != value or spec.mutability != .mutable) continue;
+            const vc = cli_properties.valueConstraint(spec.kind, spec.value_constraint);
+            const opt_str: []const u8 = if (spec.optional) "true" else "false";
+            try writePadded(writer, spec.path, w_key); try writer.writeAll("  ");
+            try writePadded(writer, @tagName(spec.kind), w_type); try writer.writeAll("  ");
+            try writePadded(writer, vc, w_values); try writer.writeAll("  ");
+            try writePadded(writer, opt_str, w_opt); try writer.writeAll("  ");
+            try writePadded(writer, @tagName(spec.applicability), w_app); try writer.writeByte('\n');
+        }
+        // Collection properties — compute column widths.
+        var cw_key: usize = 3; // "KEY"
+        var cw_sem: usize = 9; // "SEMANTICS"
         for (cli_properties.collections) |spec| {
             if (spec.owner != value or spec.mutability != .mutable) continue;
-            try writer.print("{s}\t{s}\tlist, add, remove, replace, clear\n", .{ spec.path, @tagName(spec.semantics) });
+            cw_key = @max(cw_key, spec.path.len);
+            cw_sem = @max(cw_sem, @tagName(spec.semantics).len);
+        }
+        try writer.writeAll("\nCollection properties\n");
+        try writePadded(writer, "KEY", cw_key); try writer.writeAll("  ");
+        try writePadded(writer, "SEMANTICS", cw_sem); try writer.writeAll("  OPERATIONS\n");
+        for (cli_properties.collections) |spec| {
+            if (spec.owner != value or spec.mutability != .mutable) continue;
+            try writePadded(writer, spec.path, cw_key); try writer.writeAll("  ");
+            try writePadded(writer, @tagName(spec.semantics), cw_sem); try writer.writeAll("  list, add, remove, replace, clear\n");
             if (spec.item_spec) |item_name| if (findItemSpec(item_name)) |item| {
                 try writer.print("  item {s}; identity={s}; fields=", .{ item.name, item.identity });
                 for (item.fields, 0..) |field, index| try writer.print("{s}{s}:{s}[{s}]{s}", .{ if (index == 0) "" else ",", field.name, @tagName(field.kind), cli_properties.valueConstraint(field.kind, field.value_constraint), if (field.required) "!" else "" });
@@ -171,6 +209,15 @@ fn renderFullHelp(command: *zli.Command) std.Io.Writer.Error!void {
         try writer.writeAll("\nBehavior\n  Keys are canonical persisted/API paths. Mutations are atomic and validated before publication.\n  Collections use values/item commands; clear on Node overrides restores Profile inheritance where applicable.\n");
     } else {
         try writer.writeAll("  This leaf command has no mutable PropertySpec. It validates all inputs before accessing deployment state.\n");
+    }
+}
+
+/// 将字符串右侧填充空格到指定宽度后写入 writer，用于表格对齐输出。
+fn writePadded(writer: *std.Io.Writer, s: []const u8, width: usize) !void {
+    try writer.writeAll(s);
+    if (s.len < width) {
+        var i: usize = s.len;
+        while (i < width) : (i += 1) try writer.writeByte(' ');
     }
 }
 
@@ -1636,6 +1683,49 @@ fn listNetworkInterfaces(ctx: zli.CommandContext) !void {
     }
 }
 
+/// 捕获命令的 stdout（调用方负责释放）。
+fn captureOutput(ctx: zli.CommandContext, argv: []const []const u8) ![]u8 {
+    const result = try std.process.run(ctx.allocator, ctx.io, .{ .argv = argv, .stdout_limit = .limited(8192), .stderr_limit = .limited(4096) });
+    defer ctx.allocator.free(result.stderr);
+    if (!successfulTerm(result.term)) {
+        ctx.allocator.free(result.stdout);
+        return error.CommandFailed;
+    }
+    return result.stdout;
+}
+
+/// 通过 `ip -o -4 addr show` 探测网卡的 IPv4 地址，失败返回 null。
+fn detectInterfaceIP(ctx: zli.CommandContext, iface: []const u8) ?[]const u8 {
+    const output = captureOutput(ctx, &.{ "ip", "-o", "-4", "addr", "show", iface }) catch return null;
+    defer ctx.allocator.free(output);
+    // 输出格式: "2: eno1    inet 10.2.12.196/24 brd 10.2.12.255 scope global eno1"
+    const inet_tag = "inet ";
+    if (std.mem.indexOf(u8, output, inet_tag)) |pos| {
+        const ip_start = pos + inet_tag.len;
+        if (std.mem.indexOfScalar(u8, output[ip_start..], '/')) |slash_pos| {
+            const ip_str = std.mem.trim(u8, output[ip_start .. ip_start + slash_pos], " \t");
+            return ctx.allocator.dupe(u8, ip_str) catch null;
+        }
+    }
+    return null;
+}
+
+/// 从 IPv4 地址推导 /24 子网 CIDR（如 "10.2.12.196" → "10.2.12.0/24"）。
+fn deriveSubnet(allocator: std.mem.Allocator, ip: []const u8) ![]const u8 {
+    if (std.mem.lastIndexOfScalar(u8, ip, '.')) |last_dot| {
+        return try std.fmt.allocPrint(allocator, "{s}.0/24", .{ip[0..last_dot]});
+    }
+    return error.InvalidIp;
+}
+
+/// 从子网 CIDR 推导 DHCP 池地址（如 "10.2.12.0/24" + "100" → "10.2.12.100"）。
+fn derivePoolAddr(allocator: std.mem.Allocator, subnet: []const u8, suffix: []const u8) ![]const u8 {
+    if (std.mem.lastIndexOfScalar(u8, subnet, '.')) |last_dot| {
+        return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ subnet[0..last_dot], suffix });
+    }
+    return error.InvalidSubnet;
+}
+
 fn setupHandler(ctx: zli.CommandContext) !void {
     const p = nodeforge.paths.require();
     const dry_run = ctx.flag("dry-run", bool);
@@ -1800,9 +1890,41 @@ fn setupHandler(ctx: zli.CommandContext) !void {
             try ctx.writer.print("Install root: {s}\n\n", .{p.install_root});
             listNetworkInterfaces(ctx) catch {};
             network.bind_interface = try promptWithDefault(ctx, "PXE bind interface", network.bind_interface);
+
+            // 级联 1：选择网卡后自动探测该网卡 IPv4 地址作为 Server IP 默认值。
+            const server_ip_explicit = ctx.command.flag_values.get("server-ip") != null;
+            if (!server_ip_explicit) {
+                if (detectInterfaceIP(ctx, network.bind_interface)) |detected| {
+                    network.server_ip = detected;
+                    try ctx.writer.print("(detected {s} on {s})\n", .{ detected, network.bind_interface });
+                    try ctx.writer.flush();
+                }
+            }
             network.server_ip = try promptWithDefault(ctx, "Server IP", network.server_ip);
+
+            // 级联 2：根据 Server IP 推导 /24 子网 CIDR 作为默认值。
+            const subnet_explicit = ctx.command.flag_values.get("subnet") != null;
+            if (!subnet_explicit) {
+                if (deriveSubnet(ctx.allocator, network.server_ip) catch null) |derived| {
+                    network.subnet = derived;
+                }
+            }
             network.http_port = try promptU16(ctx, "HTTP/management port", network.http_port);
             network.subnet = try promptWithDefault(ctx, "DHCP subnet CIDR", network.subnet);
+
+            // 级联 3：根据子网 CIDR 推导 DHCP 池范围作为默认值。
+            const pool_start_explicit = ctx.command.flag_values.get("pool-start") != null;
+            const pool_end_explicit = ctx.command.flag_values.get("pool-end") != null;
+            if (!pool_start_explicit) {
+                if (derivePoolAddr(ctx.allocator, network.subnet, "100") catch null) |derived| {
+                    network.pool_start = derived;
+                }
+            }
+            if (!pool_end_explicit) {
+                if (derivePoolAddr(ctx.allocator, network.subnet, "200") catch null) |derived| {
+                    network.pool_end = derived;
+                }
+            }
             network.pool_start = try promptWithDefault(ctx, "DHCP pool start", network.pool_start);
             network.pool_end = try promptWithDefault(ctx, "DHCP pool end", network.pool_end);
             try ctx.writer.print("\nConfiguration summary:\n", .{});
@@ -2409,7 +2531,9 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "install-source.invalid_arch", "unsupported --arch", 2);
         return;
     }
-    const staged = stageInstallIso(ctx.io, ctx.allocator, iso_path) catch |err| {
+    try errorWriter(ctx).print("Staging ISO from {s}...\n", .{iso_path});
+    try errorWriter(ctx).flush();
+    const staged = stageInstallIso(ctx.io, ctx.allocator, iso_path, errorWriter(ctx)) catch |err| {
         if (debug) try errorWriter(ctx).print("debug: install-source: stage cause={t}\n", .{err});
         try writeCommandError(ctx, "install-source.stage_failed", "cannot stage ISO", 1);
         return;
@@ -2419,7 +2543,11 @@ fn installSourceImportHandler(ctx: zli.CommandContext) !void {
         ctx.allocator.free(staged.filename);
         ctx.allocator.free(staged.path);
     }
-    try errorWriter(ctx).print("Staged ISO ({d} bytes) from {s}; validating and importing\n", .{ staged.size, iso_path });
+    var size_buf: [32]u8 = undefined;
+    const human_size = formatHumanSize(&size_buf, staged.size);
+    try errorWriter(ctx).print("Staged {d} bytes ({s}), SHA-256: {s}\n", .{ staged.size, human_size, staged.sha256 });
+    try errorWriter(ctx).print("Validating ISO layout and importing to daemon...\n", .{});
+    try errorWriter(ctx).flush();
     const import_key = installImportKey(staged.sha256, if (name.len == 0) null else name, if (qualifier.len == 0) null else qualifier, if (distro.len == 0) null else distro, if (version.len == 0) null else version, if (arch.len == 0) null else arch);
     const imported = nodeforge.management_client.importInstallSource(ctx.io, parsed_config.value.server.http_port, .{
         .filename = staged.filename,
@@ -2454,15 +2582,77 @@ const StagedInstallIso = struct {
     sha256: [64]u8,
 };
 
+/// 将字节数格式化为人类可读的大小（如 4570365952 → "4.3 GiB"）。
+fn formatHumanSize(buf: []u8, bytes: u64) []const u8 {
+    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB" };
+    var value: f64 = @floatFromInt(bytes);
+    var unit_index: usize = 0;
+    while (value >= 1024 and unit_index < units.len - 1) {
+        value /= 1024;
+        unit_index += 1;
+    }
+    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ value, units[unit_index] }) catch "?";
+}
+
+/// 分块拷贝文件并在拷贝过程中同时计算 SHA-256，每 10% 输出进度到 progress writer。
+///
+/// 合并拷贝和校验和计算避免了第二次完整读取，对大文件（如 4 GiB ISO）减半 I/O。
+/// 进度信息写入 stderr（通过 `progress` writer），不影响 stdout 的结构化输出。
+fn copyFileWithProgress(
+    io: std.Io,
+    source: []const u8,
+    destination: []const u8,
+    total_size: u64,
+    hash: ?*std.crypto.hash.sha2.Sha256,
+    progress: ?*std.Io.Writer,
+) !void {
+    var input = try std.Io.Dir.cwd().openFile(io, source, .{ .follow_symlinks = false });
+    defer input.close(io);
+    // 使用 .exclusive = true 保持与原 copyFile(replace=false) 一致的防覆盖语义：
+    // 如果目标已存在则立即失败，防止 immutable revision 被静默覆盖。
+    var output = try std.Io.Dir.cwd().createFile(io, destination, .{ .exclusive = true, .permissions = .default_file });
+    defer output.close(io);
+    errdefer std.Io.Dir.cwd().deleteFile(io, destination) catch {};
+
+    var buffer: [1024 * 1024]u8 = undefined; // 1 MiB
+    var offset: u64 = 0;
+    var last_percent: u8 = 0;
+    while (true) {
+        const n = try input.readPositionalAll(io, &buffer, offset);
+        if (n == 0) break;
+        if (hash) |h| h.update(buffer[0..n]);
+        try output.writeStreamingAll(io, buffer[0..n]);
+        offset += n;
+        if (progress) |w| {
+            const percent: u8 = if (total_size > 0)
+                @intCast(@min(offset * 100 / total_size, 100))
+            else
+                100;
+            // 只在跨越 10% 里程碑时输出，避免 last_percent 跳过未打印的里程碑。
+            while (last_percent + 10 <= percent) {
+                last_percent += 10;
+                w.print("{d}%...", .{last_percent}) catch {};
+                w.flush() catch {};
+            }
+        }
+    }
+    try output.sync(io);
+    if (progress) |w| {
+        w.writeAll("done\n") catch {};
+        w.flush() catch {};
+    }
+}
+
 /// 将管理员指定的 ISO 原子复制到 daemon 受管的暂存目录。
 ///
 /// 安全设计：
 /// - daemon 永远不会收到任意宿主路径，只收到暂存目录中的不透明 basename。
 /// - 管理员可以选择任何可读的普通 ISO 文件（拒绝符号链接）。
 /// - 文件名前缀 12 字节安全随机 hex，防止文件名碰撞和预测。
-/// - 复制使用 replace=false，如果目标已存在则失败（防止竞态覆盖）。
+/// - 复制使用 exclusive create，如果目标已存在则失败（防止竞态覆盖）。
 /// - 调用方通过 defer 删除暂存文件，确保不会残留。
-fn stageInstallIso(io: std.Io, allocator: std.mem.Allocator, source: []const u8) !StagedInstallIso {
+/// - `progress` 可选地指向 stderr writer，用于输出拷贝和校验进度。
+fn stageInstallIso(io: std.Io, allocator: std.mem.Allocator, source: []const u8, progress: ?*std.Io.Writer) !StagedInstallIso {
     var input = try std.Io.Dir.cwd().openFile(io, source, .{ .follow_symlinks = false });
     defer input.close(io);
     const stat = try input.stat(io);
@@ -2478,9 +2668,13 @@ fn stageInstallIso(io: std.Io, allocator: std.mem.Allocator, source: []const u8)
     const destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ nodeforge.paths.require().import_dir, filename });
     errdefer allocator.free(destination);
     try std.Io.Dir.cwd().createDirPath(io, nodeforge.paths.require().import_dir);
-    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, io, .{ .permissions = .default_file, .replace = false });
-    var checksum: [64]u8 = undefined;
-    try nodeforge.asset_validate.sha256File(io, nodeforge.paths.require().import_dir, filename, &checksum);
+
+    // 合并拷贝和 SHA-256 计算为单遍 I/O，进度输出到 stderr。
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    try copyFileWithProgress(io, source, destination, stat.size, &hash, progress);
+    var raw_digest: [32]u8 = undefined;
+    hash.final(&raw_digest);
+    const checksum: [64]u8 = std.fmt.bytesToHex(raw_digest, .lower);
     return .{ .filename = filename, .path = destination, .size = stat.size, .sha256 = checksum };
 }
 
@@ -3228,7 +3422,16 @@ fn contentAssetImportHandler(ctx: zli.CommandContext, kind: nodeforge.model.Asse
     const destination = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ assets_root, relative });
     defer ctx.allocator.free(destination);
     try std.Io.Dir.cwd().createDirPath(ctx.io, std.fs.path.dirname(destination) orelse return error.InvalidPath);
-    std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, ctx.io, .{ .permissions = .default_file, .replace = false }) catch return itemUsageError(ctx, "managed-file immutable revision already exists");
+    // 大文件（> 1 MiB）使用分块拷贝并输出进度到 stderr。
+    if (stat.size > 1024 * 1024) {
+        var size_buf: [32]u8 = undefined;
+        const human_size = formatHumanSize(&size_buf, stat.size);
+        try errorWriter(ctx).print("Importing {s} ({s})...\n", .{ name, human_size });
+        try errorWriter(ctx).flush();
+        copyFileWithProgress(ctx.io, source, destination, stat.size, null, errorWriter(ctx)) catch return itemUsageError(ctx, "managed-file immutable revision already exists");
+    } else {
+        std.Io.Dir.copyFile(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, ctx.io, .{ .permissions = .default_file, .replace = false }) catch return itemUsageError(ctx, "managed-file immutable revision already exists");
+    }
     var published = false;
     defer if (!published) std.Io.Dir.cwd().deleteFile(ctx.io, destination) catch {};
     const ok = nodeforge.management_client.importAsset(ctx.io, config.value.server.http_port, .{ .name = name, .kind = @tagName(kind), .path = relative, .revision = revision, .size = stat.size, .media_type = media_type }) catch false;
@@ -3237,7 +3440,9 @@ fn contentAssetImportHandler(ctx: zli.CommandContext, kind: nodeforge.model.Asse
         return;
     }
     published = true;
-    const human = try std.fmt.allocPrint(ctx.allocator, "imported {s} revision {d} ({d} bytes)", .{ name, revision, stat.size });
+    var size_buf: [32]u8 = undefined;
+    const human_size = formatHumanSize(&size_buf, stat.size);
+    const human = try std.fmt.allocPrint(ctx.allocator, "imported {s} revision {d} ({d} bytes, {s})", .{ name, revision, stat.size, human_size });
     try renderCommandResult(ctx, human, .{ .name = name, .revision = revision, .size = stat.size, .media_type = media_type });
 }
 
@@ -5058,7 +5263,16 @@ fn profileSetHandler(ctx: zli.CommandContext) !void {
         try writeCommandError(ctx, "property.list_operation_required", message, 2);
         return;
     }
-    if (nodeforge.cli_properties.property(.profile, key) == null) return profilePropertyError(ctx, error.InvalidProfileProperty);
+    if (nodeforge.cli_properties.property(.profile, key) == null) {
+        // 精确匹配失败，尝试模糊搜索集合路径给出建议。
+        if (nodeforge.cli_properties.suggestCollection(key, .profile)) |spec| {
+            const owner_cmd: []const u8 = if (spec.owner == .node) "node" else "profile";
+            const message = try std.fmt.allocPrint(ctx.allocator, "'{s}' is not a scalar profile property; to manage collections, use: {s} add-values {s} {s} <values>", .{ key, owner_cmd, name, spec.path });
+            try writeCommandError(ctx, "property.collection_hint", message, 2);
+            return;
+        }
+        return profilePropertyError(ctx, error.InvalidProfileProperty);
+    }
     return mutateScalarCli(ctx, "profile", name, key, value);
 }
 
@@ -5739,7 +5953,16 @@ fn nodeSetHandler(ctx: zli.CommandContext) !void {
             try writeCommandError(ctx, "property.list_operation_required", message, 2);
             return;
         }
-        if (nodeforge.cli_properties.property(.node, key) == null) return nodePropertyError(ctx, error.UnknownAttribute);
+        if (nodeforge.cli_properties.property(.node, key) == null) {
+            // 精确匹配失败，尝试模糊搜索集合路径给出建议。
+            if (nodeforge.cli_properties.suggestCollection(key, .node)) |spec| {
+                const owner_cmd: []const u8 = if (spec.owner == .profile) "profile" else "node";
+                const message = try std.fmt.allocPrint(ctx.allocator, "'{s}' is not a scalar node property; to manage kernel args or other collections, use: {s} add-values {s} {s} <values>", .{ key, owner_cmd, node_id, spec.path });
+                try writeCommandError(ctx, "property.collection_hint", message, 2);
+                return;
+            }
+            return nodePropertyError(ctx, error.UnknownAttribute);
+        }
         try mutations.append(ctx.allocator, .{ .key = key, .value = value });
     }
     try mutateScalarBatchCli(ctx, "node", node_id, mutations.items, ctx.flag("force", bool));

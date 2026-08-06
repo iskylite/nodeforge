@@ -217,6 +217,25 @@ pub fn collection(owner: Owner, path: []const u8) ?*const CollectionSpec {
     return null;
 }
 
+/// 模糊搜索集合路径，帮助用户在精确匹配失败时找到正确的 collection key。
+///
+/// 搜索策略：
+/// 1. 在指定 owner 的集合中查找路径包含 `key` 的条目（如 `kernel_args` 匹配 `overrides.kernel_args.add`）。
+/// 2. 如果未找到，在所有 owner 的集合中查找（如 node 上找不到时发现 profile 有 `kernel_args`）。
+///
+/// 返回找到的 CollectionSpec 指针；找不到返回 null。
+pub fn suggestCollection(key: []const u8, owner: Owner) ?*const CollectionSpec {
+    // 优先在指定 owner 中查找包含 key 的路径。
+    for (&collections) |*spec| {
+        if (spec.owner == owner and std.mem.indexOf(u8, spec.path, key) != null) return spec;
+    }
+    // 回退到全局搜索：用户可能在 node 上用了 profile 级别的 key（反之亦然）。
+    for (&collections) |*spec| {
+        if (spec.owner != owner and std.mem.indexOf(u8, spec.path, key) != null) return spec;
+    }
+    return null;
+}
+
 /// 返回帮助中展示的输入约束。显式约束优先；通用标量类型使用统一 token/range。
 pub fn valueConstraint(kind: ValueKind, explicit: ?[]const u8) []const u8 {
     if (explicit) |value| return value;

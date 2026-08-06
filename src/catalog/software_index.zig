@@ -151,10 +151,24 @@ fn xmlText(block: []const u8, open: []const u8, close: []const u8) ?[]const u8 {
     return std.mem.trim(u8, block[start..end], " \t\r\n");
 }
 fn readMaybeCompressed(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (!std.mem.endsWith(u8, path, ".gz") and !std.mem.endsWith(u8, path, ".xz"))
+    // RHEL/CentOS 系 ISO 的 repodata 可能使用 gzip(.gz)、xz(.xz)、zstd(.zst)
+    // 或 bzip2(.bz2) 压缩。Kylin V11（2503）等新版 RHEL 系发行版默认使用
+    // zstd 压缩 primary.xml / comps.xml。仅 .gz/.xz 时旧实现会把 .zst 文件
+    // 当作普通文本读取，导致 parseXmlItems 在压缩二进制中搜索不到标签，
+    // 最终生成空的 capabilities 列表。
+    const command: ?[]const u8 = if (std.mem.endsWith(u8, path, ".gz"))
+        "gzip"
+    else if (std.mem.endsWith(u8, path, ".xz"))
+        "xz"
+    else if (std.mem.endsWith(u8, path, ".zst"))
+        "zstd"
+    else if (std.mem.endsWith(u8, path, ".bz2"))
+        "bzip2"
+    else
+        null;
+    if (command == null)
         return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(128 * 1024 * 1024));
-    const command = if (std.mem.endsWith(u8, path, ".gz")) "gzip" else "xz";
-    const result = try std.process.run(allocator, io, .{ .argv = &.{ command, "-cd", "--", path }, .stdout_limit = .limited(128 * 1024 * 1024), .stderr_limit = .limited(1024 * 1024) });
+    const result = try std.process.run(allocator, io, .{ .argv = &.{ command.?, "-cd", "--", path }, .stdout_limit = .limited(128 * 1024 * 1024), .stderr_limit = .limited(1024 * 1024) });
     allocator.free(result.stderr);
     switch (result.term) {
         .exited => |code| if (code != 0) {
