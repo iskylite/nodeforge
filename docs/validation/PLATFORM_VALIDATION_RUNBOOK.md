@@ -2,7 +2,8 @@
 
 状态：现行通用发布闸流程。大版本或重大功能落地后，按本文从 **fresh 空环境** 完整执行。
 
-版本专属增量（例如 v0.4 topology / first-boot / discovery / 容量 harness）见对应
+版本专属增量（例如 v0.4 topology / first-boot / discovery / 容量 harness，以及 v0.4.1
+staging session / tree-kernel import）见对应
 `V0_x_*_VALIDATION*.md` 或 `V0_x_FULL_VALIDATION_RUNBOOK.md`；本文是**跨版本公共底座**，
 不替代版本专属闸，也不记录某次实跑结果（结果写入 `docs/validation/` 下带日期的记录）。
 
@@ -32,6 +33,7 @@
 | 不复用旧部署 | 禁止导入旧 config/catalog/state；禁止把旧 rootfs/ISO 副本当成本轮产物 |
 | README 对齐 | 命令以 README 与 `nodeforge --help-full` 为准；发现 CLI / 实现 / 文档不一致必须先修后重测 |
 | 修复即重跑 | 修完后重新编译、彻底清场，从阶段 1 完整重测，不得局部“补跑成功”顶替全量 |
+| 本地交叉编译 | 四二进制在**开发机本地**交叉编译后通过 `scp` 同步到管理节点；**禁止在管理节点（r97n0）上安装 Zig 工具链或直接编译**；管理节点仅接收成品二进制 |
 | 管理面本机 | `nodeforge` 管理命令只在管理节点 loopback 执行 |
 | 计算节点角色 | 计算节点不安装构建工具、不本地生成 squashfs、不上传 rootfs |
 
@@ -124,6 +126,8 @@ export NF_ISO_DIR=/root               # 原始 ISO 必须在 install-root 之外
 export NF_ISO_ROCKY97=Rocky-9.7-aarch64-minimal.iso
 export NF_ISO_ROCKY102=Rocky-10.2-aarch64-dvd1.iso
 export NF_ISO_UBUNTU=ubuntu-22.04.5-live-server-arm64.iso
+export NF_ISO_UBUNTU_2604=ubuntu-26.04-desktop-arm64.iso
+export NF_ISO_UBUNTU_2604_LOCAL=/Users/iskylite/Downloads/ISO/ubuntu-26.04-desktop-arm64.iso
 
 # ── 目标磁盘（install 用）────────────────────────────
 export NF_BOOT_DISK=/dev/nvme0n1
@@ -150,9 +154,10 @@ export NF_BOOT_DISK=/dev/nvme0n1
 |---|---|
 | 构建 | 四二进制交叉编译、架构、版本、SHA-256 |
 | Fresh 部署 | 精确清场、setup 非交互、systemd、status/config/catalog validate |
-| 介质 | Rocky 9.x、Rocky 10.x、Ubuntu LTS ISO 导入；distro/version/arch/repo/kernel/initrd |
+| 介质 | Rocky 9.x、Rocky 10.x、Ubuntu 22.04 与 Ubuntu 26.04 ISO 导入；distro/version/arch/repo/kernel/initrd |
 | Install | 至少 Rocky 9.x install 完整 generation；Ubuntu install 至少一项 |
-| Diskless | 三套 Profile：initrd → boot-bundle → rootfs plan/build/status=ready |
+| Diskless | 三套可管理 Profile：initrd → boot-bundle → rootfs plan/build/status=ready；至少一套必须走 v0.4.1 stage。Ubuntu desktop 介质若缺少 SSH/server rootfs 基线，记录为 import-only，不得伪造 ready |
+| v0.4.1 stage | `--keep-staging`、staging enter/exec/kernels、并发锁/cgroup/超时、`--from-staging` 与 kernel import；stage 产物必须完成真实 diskless PXE 启动 |
 | 实机矩阵 | Rocky install、Rocky diskless×发行版、Ubuntu diskless（见阶段 7） |
 | 节点控制面 | hosts 读 IP、node add/show、readiness、boot preview、deploy、retry |
 | 目标契约 | hosts 注入、受管 repo、bootstrap SSH、kernel 匹配、diskless overlay 根 |
@@ -252,6 +257,10 @@ zig fmt --check src build.zig
 ### 4.2 确认目标主机（破坏性操作前必须）
 
 ```bash
+# 若新增介质只在工作站，先传入管理节点的原始介质目录；不得传入 install-root，
+# 也不得把上轮已导入的副本当成本轮产物。
+scp "$NF_ISO_UBUNTU_2604_LOCAL" "$NF_MGMT_SSH:$NF_ISO_DIR/$NF_ISO_UBUNTU_2604"
+
 ssh "$NF_MGMT_SSH" '
   set -euo pipefail
   hostname
@@ -316,11 +325,17 @@ nodeforge setup --reset-all --purge-all --reconfigure --yes
 
 ---
 
-## 6. 阶段 2：交叉编译、核验、部署二进制
+## 6. 阶段 2：本地交叉编译、核验、同步部署二进制
 
-### 6.1 构建
+> **硬约束**：以下所有构建命令在**开发机本地**（macOS / Linux 工作站）执行，
+> 通过交叉编译产出目标架构二进制后用 `scp` 上传。**禁止 SSH 到管理节点执行
+> `zig build` 或在管理节点安装 Zig 工具链。** 管理节点（r97n0）只负责运行
+> 成品二进制，不参与编译过程。
+
+### 6.1 本地交叉编译
 
 ```bash
+# ── 在开发机本地执行（NOT on r97n0）──
 # 调试可固定 build-time 避免缓存膨胀；发布记录真实时间可省略 -Dbuild-time
 zig build -Dtarget="$NF_TARGET_TRIPLE" -Doptimize=ReleaseSafe
 
@@ -330,22 +345,25 @@ for program in nodeforge nodeforged nodeforge-initrd nodeforge-agent; do
   shasum -a 256 "zig-out/bin/$program"
 done
 
-# 管理客户端版本可读
+# 管理客户端版本可读（在本地验证，不涉及远端）
 ./zig-out/bin/nodeforge --version
 ```
 
 **注意**：`nodeforge-initrd` 是 initramfs PID 1，**禁止**把直接执行
 `nodeforge-initrd --version` 当作普通版本检查（会进入 bootstrap）。它与
 `nodeforge-agent` 通过同构建、ELF 架构、摘要、注入与 diskless 实机共同核验。
+v0.4.3 起 agent **强制子命令**：initrd 须 `exec … pre-init`，firstboot unit 须 `… first-boot`；**initrd 与 agent 同构建同发版**，禁止旧 initrd + 新 agent 混搭（见 [`../design/V0_4_3_DESIGN.md`](../design/V0_4_3_DESIGN.md) §3.3）。
 
 Make 等价：`make linux-arm64` / `make linux-amd64` / `make dist-linux-arm64`。
 
-### 6.2 上传到管理节点
+### 6.2 同步到管理节点（scp 上传，非远端编译）
 
 ```bash
+# ── 仍在开发机本地执行；将成品二进制 scp 到管理节点 ──
 ssh "$NF_MGMT_SSH" "rm -rf $NF_BUNDLE_DIR && mkdir -p $NF_BUNDLE_DIR"
 scp zig-out/bin/{nodeforge,nodeforged,nodeforge-initrd,nodeforge-agent} \
   "$NF_MGMT_SSH:$NF_BUNDLE_DIR/"
+# 仅验证远端收到的二进制可执行与版本（不涉及编译）
 ssh "$NF_MGMT_SSH" "$NF_BUNDLE_DIR/nodeforge --version"
 ```
 
@@ -353,7 +371,8 @@ ssh "$NF_MGMT_SSH" "$NF_BUNDLE_DIR/nodeforge --version"
 
 重复阶段 1 的精确删除，再进入 setup。
 
-**PASS**：四 ELF 架构匹配 `$NF_ARCH`；版本字符串与候选 commit/构建选项一致；摘要已记录。
+**PASS**：四 ELF 架构匹配 `$NF_ARCH`；版本字符串与候选 commit/构建选项一致；摘要已记录；
+管理节点无 Zig 工具链残留、无 `zig-out/` 或 `zig-cache/` 目录（确认未在远端编译）。
 
 ---
 
@@ -440,7 +459,8 @@ ssh "$NF_MGMT_SSH" '
   for source in \
     rocky-9.7-aarch64-minimal \
     rocky-10.2-aarch64-dvd1 \
-    ubuntu-22.04.5-live-server-arm64
+    ubuntu-22.04.5-live-server-arm64 \
+    ubuntu-26.04-desktop-arm64
   do
     echo "==== $source ===="
     '"$NF_CLI"' assets install-source show "$source" --output json
@@ -472,6 +492,34 @@ ISO 导入为 **durable operation**：CLI 默认跟随终态；超时不取消 d
 
 对每个 install-source 执行：`initrd build` → `boot-bundle create` → `profile create --kind diskless` →
 `rootfs plan` → `rootfs build --if-input-digest` → `rootfs status`。
+
+### 9.0 v0.4.1 stage 增量（公共闸内必跑）
+
+至少选择一套可启动 Profile（推荐 Rocky 10.2；Ubuntu desktop 布局若缺少
+/sbin/init 或 usr/sbin/sshd 等 server rootfs 基线，则按 import-only 处理），
+并在同一轮 fresh deployment 中执行：
+
+`staging kernels` 以 `/boot/vmlinuz-*` 为主候选，并按 release 检查
+`/lib/modules` 或 `/usr/lib/modules`；只有 modules 目录时不得伪造候选，但允许
+Rocky/RHEL 10 的 `<modules>/<release>/vmlinuz` 作为 `/boot` 缺失时的回退。
+`auto` 与显式 kernel release 必须同时具备 vmlinuz 和匹配 modules。
+
+```bash
+$CLI profile rootfs build <profile> --keep-staging --output json
+$CLI profile rootfs staging list
+$CLI profile rootfs staging show <profile>
+$CLI profile rootfs staging kernels <profile>
+$CLI profile rootfs staging exec <profile> -- uname -r
+$CLI profile rootfs staging exec <profile> --timeout 2 -- sleep 10  # exit 124
+$CLI profile rootfs build <profile> --from-staging --kernel-release auto --output json
+$CLI profile rootfs status <profile> --output json
+```
+
+另开会话保持 `staging enter` 占锁时，第二个 enter 与并发 `--from-staging` 必须
+fail-closed；退出后确认 lock、mount、cgroup 无残留。使用 `--memory-max`、`--pids-max`
+和 `--no-cgroup` 留下 `/proc/self/cgroup` 证据。记录 kernel import、catalog asset、
+boot-bundle 与 digest；最终必须把这个 `--from-staging` 产物用于阶段 7 的真实 PXE
+diskless 启动，不能用管理面 `state=ready` 替代节点侧证据。
 
 ```bash
 ssh "$NF_MGMT_SSH" '
@@ -710,8 +758,9 @@ ssh "$NF_MGMT_SSH" '
 | Rocky 9.7 install | | | | | n/a | | |
 | Ubuntu install | | | | | n/a | | |
 | Rocky 9.7 diskless | | | | | | | |
-| Rocky 10.2 diskless | | | | | | | |
-| Ubuntu diskless | | | | | | | |
+| Rocky 10.2 diskless（stage source） | | | | | | | |
+| Ubuntu 22.04 diskless | | | | | | | |
+| Ubuntu 26.04 diskless（stage source，至少此项真实 PXE） | | | | | | | |
 
 ---
 
@@ -792,7 +841,8 @@ nodeforge assets archive build /tmp/nf-arc.tar.xz --compression xz ...
 install-post 全流程结束后，再跑一轮任意已 ready 的 diskless Profile 冷启动（可缩短为 Rocky 10.2 一项），
 确认 session running + overlay + SSH 仍 PASS。
 
-**PASS**：E2E 脚本或手动清单全部满足；负向三项 archive + 旧 action 拒绝；重启后 journal 可读。
+**PASS**：E2E 脚本或手动清单全部满足；负向三项 archive + 旧 action 拒绝；重启后 journal 可读；
+且至少一个由 `--from-staging` 生成的 rootfs 已真实 diskless 启动并满足 overlay、kernel、hosts、repo、SSH 与 session 契约。
 
 ---
 
@@ -866,6 +916,15 @@ zig build test-v0.4-contract   # v0.4+；旧发布可 N/A
 zig build test-v0.3-install-post-e2e
 # 或 bash tests/v0_3_install_post_e2e.sh
 ```
+
+install-post 的 package action 必须选择该 install source 的**本地软件索引中存在**的包，
+不能跨发行版固定使用某个包名。脚本默认 Rocky 使用 `tree`、Ubuntu 使用基础包 `bash`，
+也可通过 `NODEFORGE_E2E_PACKAGE=<package>` 显式指定；目标侧必须用 rpm/dpkg 数据库验证。
+
+Ubuntu desktop ISO 可用于介质导入和 installer 能力评估，但其 casper squashfs 只有在
+形成完整 layer 链，且最终树具备 init、SSH、网络组件、匹配 kernel modules 和完整本地
+APT 包闭包时，才可发布为可管理 diskless rootfs。否则保持 import-only；不得只补一个
+`openssh-server` 包就绕过 server rootfs 基线检查。
 
 `zig build test` 当前聚合：
 
@@ -962,8 +1021,8 @@ nodeforge setup --reconfigure --log-level info --yes
 ## 测试矩阵
 | 项 | 结果 | 证据 |
 | 清场与 setup | | |
-| ISO ×3 | | |
-| diskless rootfs ×3 | | |
+| ISO ×4（含 Ubuntu 26.04） | | |
+| diskless rootfs ×3（含至少一项 stage；desktop ISO 可 import-only） | | |
 | Rocky install | | |
 | Ubuntu install | | |
 | Rocky 9 diskless | | |
@@ -994,10 +1053,11 @@ nodeforge setup --reconfigure --log-level info --yes
 
 - [ ] 0 主机与 ISO 确认，无误操作风险
 - [ ] 1 彻底清场，系统服务未受损
-- [ ] 2 四二进制交叉编译与摘要
+- [ ] 2 四二进制**本地交叉编译** + scp 同步 + 摘要（管理节点无 Zig 残留）
 - [ ] 3 fresh setup + status/config/catalog + 重启
-- [ ] 4 三 ISO 导入与 show/software/catalog
-- [ ] 5 三 diskless rootfs ready
+- [ ] 4 四 ISO 导入与 show/software/catalog（含 Ubuntu 26.04）
+- [ ] 5 四 diskless rootfs ready，至少一项 `--from-staging`
+- [ ] 5a v0.4.1 staging enter/exec/kernels/lock/cgroup/kernel import
 - [ ] 6 节点 IP 来自 hosts；readiness/preview
 - [ ] 7 实机 install + diskless 矩阵
 - [ ] 8 install-post 顺序/journal/gate/负向/重启
@@ -1012,7 +1072,7 @@ nodeforge setup --reconfigure --log-level info --yes
 | 原步骤 | 本文阶段 | 优化点 |
 |---|---|---|
 | 1 清场 | 1 + 部署后再清 | 增加预检、变量化、setup reset 语义说明 |
-| 2 交叉编译 | 2 | 明确 initrd 不可 `--version`、摘要与 Make 入口 |
+| 2 交叉编译 | 2 | 明确 initrd 不可 `--version`、摘要与 Make 入口；**本地交叉编译后 scp 同步，禁止远端编译** |
 | 3 部署与 setup | 2–3 | schema/布局抽查、ready 轮询、冷启动 |
 | 4 导入 ISO | 4 | software index、operation、catalog 校验 |
 | 5 diskless profile | 5 | plan digest 门禁、clone/identity、cache |
@@ -1027,7 +1087,7 @@ exit code 抽样、不一致时全量重测纪律、版本增量分流。
 ## 附录 B：主路径一句话
 
 ```text
-确认主机 → 清场 → 交叉编译部署 → setup → import ISO
+确认主机 → 清场 → 本地交叉编译+scp 同步部署 → setup → import ISO
 → initrd/boot-bundle/diskless rootfs → node add(IP from hosts)
 → install/diskless 矩阵 → install-post E2E → 负向与重启
 → zig build test → 写报告 → PASS/FAIL

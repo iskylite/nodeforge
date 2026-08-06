@@ -14,12 +14,16 @@
 | 安装、编译、操作示例 | 仓库根 [README.md](../README.md) |
 | 公开命令树与 exit code | [cli/REFERENCE.md](cli/REFERENCE.md)（参数以 `--help-full` 为准） |
 | 当前版本设计（v0.4） | [design/V0_4_DESIGN.md](design/V0_4_DESIGN.md) |
-| 下一增量设计（v0.4.1，设计中） | [design/V0_4_1_DESIGN.md](design/V0_4_1_DESIGN.md) — `profile rootfs staging` enter/exec、cgroup 挂载与限额、树内核导入（无 pivot_root / 无顶层 rootfs） |
+| v0.4.1（已实现） | [design/V0_4_1_DESIGN.md](design/V0_4_1_DESIGN.md) — staging enter/exec、cgroup 限额、树内核导入；验证见 [validation/V0_4_1_VALIDATION_RUNBOOK.md](validation/V0_4_1_VALIDATION_RUNBOOK.md) |
+| 下一增量设计（v0.4.2，设计中） | [design/V0_4_2_DESIGN.md](design/V0_4_2_DESIGN.md) — `os_layer.mode` minimal/full、full 命名 qualifier、交互配方、`include_optional` |
+| v0.4.3（设计中） | [design/V0_4_3_DESIGN.md](design/V0_4_3_DESIGN.md) — diskless 本地 `inspect`；agent 子命令骨架 |
+| v0.4.4（设计中） | [design/V0_4_4_DESIGN.md](design/V0_4_4_DESIGN.md) — nodeforge 备料/register + 节点 agent 本机 build/stage |
+| v0.4.5（骨架） | [design/V0_4_5_DESIGN.md](design/V0_4_5_DESIGN.md) — 克隆打包与本地盘恢复（细节待定） |
 | 延期 / 非目标唯一状态表 | [design/DEFERRED_DESIGN_INDEX.md](design/DEFERRED_DESIGN_INDEX.md) |
 | 大更新公共发布闸 | [validation/PLATFORM_VALIDATION_RUNBOOK.md](validation/PLATFORM_VALIDATION_RUNBOOK.md) |
 | v0.4 增量发布闸 | [validation/V0_4_FULL_VALIDATION_RUNBOOK.md](validation/V0_4_FULL_VALIDATION_RUNBOOK.md) |
 
-当前产品版本为 **v0.4**。实现是否完成以代码与上述 runbook 的证据为准，不以历史验证记录为准。
+当前产品版本为 **v0.4**（含 v0.4.1 能力时以代码与对应 runbook 为准）。**v0.4.2–v0.4.5 为后续设计（v0.4.5 仅骨架），均不阻断 v0.4 / v0.4.1。**
 
 ### 运维与诊断（仍有效）
 

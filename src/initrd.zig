@@ -42,11 +42,11 @@
 //! **安全**：切根前清零 capability；raw token 只驻内存（来自 capsule），不落盘。
 //! `switch_root` 以 `execve`（replace）接管 PID 1：子进程无法删除 PID-1 旧根。
 //!
-//! **构建配置**（见 `build.zig`）：`single_threaded = true` 避免 Zig stdlib
-//! 引入 libpthread 依赖（glibc < 2.34 的 `libpthread.so.0` 在最小 initrd 中
-//! 可能不存在）。该开关不降低 GLIBC symbol version，旧发行版仍须使用对应
-//! sysroot 交叉编译；取消时必须随 `/init` 提供目标 ISO/sysroot 的完整 ELF
-//! interpreter/DT_NEEDED 闭包，不能复制构建宿主库。`strip = true` 减小体积。
+//! **构建配置**（见 `build.zig`）：initrd **始终** `single_threaded = true`，
+//! 避免 NEEDED libpthread 而最小 initrd overlay 又不提供该库。与构建主机是
+//! Linux 还是 macOS 无关；取消时必须自行注入目标闭包的完整 DT_NEEDED（严禁
+//! 复制宿主库）。`strip = true` 减小 TFTP/HTTP 体积。agent 线程策略见 build.zig
+//! （Linux 本机构建默认可多线程）。
 const std = @import("std");
 const builtin = @import("builtin");
 const memory = @import("initrd/memory.zig");

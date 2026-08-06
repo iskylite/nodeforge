@@ -4,6 +4,8 @@ set -eu
 cli=$1
 daemon=$2
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+nodeforge_version=$(sed -n 's/^const nodeforge_version = "\([^"]*\)";/\1/p' "$root/build.zig")
+test -n "$nodeforge_version"
 
 direct_writes=$(grep -Ec 'ctx\.writer\.(writeAll|print|writeByte)\(' "$root/src/main.zig" || true)
 test "$direct_writes" -eq 7
@@ -395,9 +397,9 @@ if grep -Eq '^   .*--(config|output)' "$tmp/catalog-export-help"; then
     exit 1
 fi
 
-"$cli" --version | grep -Eq '^nodeforge 0\.4\.0 \(commit [0-9a-f]{12}|unknown'
+"$cli" --version | grep -Eq "^nodeforge $nodeforge_version \\(commit ([0-9a-f]{12}|unknown)"
 "$cli" -v | grep -Fq 'built '
-"$daemon" --version | grep -Eq '^nodeforged 0\.4\.0 \(commit [0-9a-f]{12}|unknown'
+"$daemon" --version | grep -Eq "^nodeforged $nodeforge_version \\(commit ([0-9a-f]{12}|unknown)"
 
 for removed_command in help version; do
     if "$cli" "$removed_command" >"$tmp/removed-$removed_command" 2>&1; then

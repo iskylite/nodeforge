@@ -209,7 +209,7 @@ DisklessEffectivePlan = compile(resource capabilities, diskless profile policy,
   输入；第二项只含必须在 kernel/rootfs 之前生效的 kernel arguments、transport/overlay/session 参数；第三项包含全部
   target-system/software/service 与 first-boot descriptor。只有第一项进入 `rootfs_input_digest`，后两项进入
   `desired_plan_digest`。server compiler 将全部运行根差量规范化进 immutable AgentPlan；给 initrd 的 BootConfig 只引用
-  plan URL/digest/size/expiry。`nodeforge-agent --pre-init` 切根后以 bootstrap 网络从服务端取得 expected digest 的 plan/
+  plan URL/digest/size/expiry。`nodeforge-agent pre-init` 切根后以 bootstrap 网络从服务端取得 expected digest 的 plan/
   payload，校验并清零 `agent:read` token 后，在真正 init 前执行。Node 的
   `overrides.diskless.provision.bundle` 也编译进 node-apply projection：只允许 first-boot item，记录 bundle/payload/
   package closure digest，并完整替换该 Node 从 Profile 继承的 first-boot；Profile rootfs-build projection 永不读取此 override。

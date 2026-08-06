@@ -767,7 +767,7 @@ time sync/NTP、password、users、`authorized_keys.add/remove`、sshd、securit
 repositories/environment/groups/tasks/packages include/exclude，以及 kernel args 都参与 Node effective plan；它们只改变 `desired_plan_digest`，不改变
 `rootfs_input_digest`。服务端把完整 Node effective 差量编译为 immutable AgentPlan/`node_apply_projection`，随
 session snapshot 固定；给 initrd 的最小 BootConfig 只包含 AgentPlan locator/digest/size/expiry，不包含高层配置。
-`switch_root` 直接进入 rootfs 内的 `nodeforge-agent --pre-init`：agent 使用继承的 bootstrap 网络从服务端拉取并校验
+`switch_root` 直接进入 rootfs 内的 `nodeforge-agent pre-init`：agent 使用继承的 bootstrap 网络从服务端拉取并校验
 AgentPlan 与全部 Node payload，清零短时 boot-session capability 后，使用完整运行根的库和工具先执行 pinned software transaction，再运行 TargetSystem
 finalizer，把 password/users/SSH/hosts/network/NTP/localization/security/machine-id 等最终结果写入 overlay upper，最后
 `exec /sbin/init`。systemd、renderer、sshd 和业务服务因此只会看到覆写后的最终状态。所有 Node override 每次 PXE 启动重放，
@@ -1034,7 +1034,7 @@ network、rootfs URL/digest/size + Range recovery、overlay 配置、AgentPlan l
 （kernel + 共享 NodeForge initrd）和只含 delivery session/event credential 的 capsule；kernel cmdline 只携带无密钥的 config URL、
 node/session 与 `kernel_args`；② initrd 以 DHCP peer/session binding 拉取固定 BootConfig；③ initrd 下载、校验并挂载
 ready rootfs lower，建立 upper/merged，只将 AgentPlan locator 与 capability/event token 写入 `/run` handoff，不下载
-Node 配置/payload、不写目标系统配置；④ `switch_root` 执行 `nodeforge-agent --pre-init`，agent 通过 bootstrap 网络拉取并校验
+Node 配置/payload、不写目标系统配置；④ `switch_root` 执行 `nodeforge-agent pre-init`，agent 通过 bootstrap 网络拉取并校验
 AgentPlan/全部 payload、清除 capability，再应用全部 Node override 后 `exec /sbin/init`；⑤ NM/Netplan/sshd 等只看到
 最终配置，同一 agent 的 systemd unit 再执行 effective `first-boot`。
 token 与 `/var/lib/nodeforge/boot.json` 边界见本节上文。
@@ -1172,7 +1172,7 @@ script 修改最终运行根。v0.2 固定落地顺序，以便同一 effective 
 |---|---|---|---|---|
 | `rootfs-build` | Profile / server builder | packages、users/UID/GID、password hash、hosts、sshd policy、Profile SSH client/host keys、authorized_keys/ssh_known_hosts、公共文件与服务 | `rootfs_input_digest` | 只构建 Profile 公用 lower，不读 Node override |
 | `boot-project` | Node + BootSession / server effective compiler | 把 hostname/network/machine-id、完整 target-system 与 software/service/security Node effective 差量编译为 immutable AgentPlan | `desired_plan_digest`，交付时再入 `delivery_digest` | 只编译/签名，不操作 rootfs；BootConfig 只引用 plan digest/locator |
-| `node-apply` | Node effective / `nodeforge-agent --pre-init` | 从服务端获取并验证 AgentPlan/payload，清除读 token；先做 exact software add/remove transaction，再以 TargetSystem finalizer 写 users/password/SSH/hosts/network/NTP/localization/security/machine-id 与 service enablement | `desired_plan_digest` + session snapshot | `switch_root` 后、`/sbin/init` 前执行；成功后 exec 真正 init，只用 session-pinned local-only 输入 |
+| `node-apply` | Node effective / `nodeforge-agent pre-init` | 从服务端获取并验证 AgentPlan/payload，清除读 token；先做 exact software add/remove transaction，再以 TargetSystem finalizer 写 users/password/SSH/hosts/network/NTP/localization/security/machine-id 与 service enablement | `desired_plan_digest` + session snapshot | `switch_root` 后、`/sbin/init` 前执行；成功后 exec 真正 init，只用 session-pinned local-only 输入 |
 | `first-boot` | effective bundle / node agent | managed-file、package、archive、script，力度与 install postprocess 一致 | Profile payload manifest 入 `rootfs_input_digest`；Node override payload digest 只入 desired/delivery，执行身份入 session | 默认执行 Profile bundle；`overrides.diskless.provision.bundle` 可按 Node 完整替换 first-boot，禁止其含 rootfs-build item |
 
 `rootfs-build` 和 `first-boot` 是 provision bundle 的声明 phase；`boot-project` 与 `node-apply` 是 effective compiler
@@ -1257,7 +1257,7 @@ boot-session capability claim 一致后固定为 session snapshot，initrd 只�
 `/var/lib/nodeforge/boot.json`（非 secret locator/摘要）；capability/event token 使用
 独立 0400 credential 文件并在读取后 unlink。未来 AgentPlan schema 扩展继续演进
 这一 handoff，不新增内容重复的第二份 JSON。
-`switch_root` 以 `nodeforge-agent --pre-init` 为入口；agent 校验身份，使用 boot-session capability 从服务端获取 expected digest 的
+`switch_root` 以 `nodeforge-agent pre-init` 为入口；agent 校验身份，使用 boot-session capability 从服务端获取 expected digest 的
 AgentPlan，以 peer/session/digest 数据面获取 Node payload，清除 capability，应用 immutable `node_apply_projection` 后 exec 真正 init。systemd 启动后同一 binary
 的 first-boot unit 再读取 rootfs Profile payload 或 agent pre-init 预下载的 Node override payload，固定顺序
 文件更新 -> package -> archive -> script，一次性。两种入口都不接受远程任务下发、不做 reconciliation、不做通用远程命令或配置
@@ -1571,12 +1571,12 @@ known_hosts 重算保证标准路径的域内互信。统一 rootfs cache key、
 
 **第二十七轮（initrd / Node override 边界复审）**：删除 initrd 内静态配置 projector 的设计残留。nodeforged 只编译
 immutable `node_apply_projection`；initrd 只 transport/verify/mount/handoff，并以 rootfs 内
-`nodeforge-agent --pre-init` 为 `switch_root` 入口。agent 使用最终 rootfs 的 TargetSystem/package/renderer 能力应用全部
+`nodeforge-agent pre-init` 为 `switch_root` 入口。agent 使用最终 rootfs 的 TargetSystem/package/renderer 能力应用全部
 Node override，成功后在同一 PID `exec /sbin/init`；systemd 启动后的同一 binary 只执行 effective first-boot。
 `required_features` 按 initrd/agent consumer 分域，pre-init 失败属于 boot failure，first-boot 失败才属于 degraded postprocess。
 
 **第二十八轮（agent 拉取模型复审）**：进一步将 initrd handoff 缩减为最小 BootConfig + AgentPlan locator。
-`nodeforge-agent --pre-init` 定义为单次启动执行框架：继承 bootstrap 网络，从服务端拉取 session-pinned AgentPlan 和全部
+`nodeforge-agent pre-init` 定义为单次启动执行框架：继承 bootstrap 网络，从服务端拉取 session-pinned AgentPlan 和全部
 Node payload，校验 digest/feature 后清零 boot-session capability，再按固定 stage 应用 Node override。initrd 不下载 AgentPlan/
 Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或远程命令，节点侧也不重新 merge Profile/Node。
 
@@ -1625,7 +1625,7 @@ Node payload；first-boot 不再联网。该模型不是 enrollment、轮询或�
    # 节点网络启动后自动执行：
    #   DHCP → TFTP bootloader → kernel + nodeforge-initrd →
    #   HTTP BootConfig → HTTP rootfs download → squashfs mount → overlay →
-   #   switch_root → nodeforge-agent --pre-init → /sbin/init
+   #   switch_root → nodeforge-agent pre-init → /sbin/init
    ```
    上述每一步都通过 CLI → management API → daemon → catalog store 原子事务完成。
    操作员不需要在任何步骤中手动编辑 `catalog/boot_bundles.json` 或其他 catalog JSON 文件。

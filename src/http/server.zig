@@ -2584,7 +2584,11 @@ fn isFirmwarePlaceholder(value: []const u8) bool {
 fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: []const u8, meta: RequestMeta) !void {
     const checked = auth.authenticateWebhook(context.sessions, node_id, meta.client_ip, boot_session.monotonicNow()) catch |err| return nodeAuthError(request, err, meta);
     if (checked.session.mode != .install) return nodeAuthError(request, error.ProofMismatch, meta);
-    if (!bodyWithin(request, 4 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"subiquity report body too large\"}}\n", meta);
+    // Curtin may include command output in `description`; legitimate package
+    // failure reports observed in the platform matrix exceed 4 KiB. Keep the
+    // endpoint bounded, but accept the protocol's practical payload size and
+    // truncate the description before it reaches the durable event stream.
+    if (!bodyWithin(request, 64 * 1024)) return json(request, .content_too_large, "{\"ok\":false,\"error\":{\"code\":\"http.body_too_large\",\"message\":\"subiquity report body too large\"}}\n", meta);
     try request.parseBody();
     var params = try request.parametersToOwnedList(context.allocator);
     defer params.deinit();
@@ -2596,7 +2600,8 @@ fn subiquityReport(request: zap.Request, context: *const RouteContext, node_id: 
         if (std.mem.eql(u8, param.key, "name")) {
             event_name = stringParam(param.value);
         } else if (std.mem.eql(u8, param.key, "description")) {
-            message = stringParam(param.value) orelse "";
+            const description = stringParam(param.value) orelse "";
+            message = description[0..@min(description.len, @import("contracts.zig").max_message_bytes)];
         } else if (std.mem.eql(u8, param.key, "event_type")) {
             event_type = stringParam(param.value);
         } else if (std.mem.eql(u8, param.key, "result")) {

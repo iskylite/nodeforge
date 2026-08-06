@@ -51,7 +51,7 @@ restart 仍是显式运维动作，避免 reconfigure 在无确认时改变服�
 | server compile | 节点启动前 | 读取 pinned Profile/Node/resource snapshot | 生成 BootConfig、AgentPlan、digest；只给敏感控制面读取签发 capability | 不操作节点 rootfs |
 | firmware/GRUB | kernel 之前 | boot config/capsule | 选择 kernel/initrd、追加 `kernel_args`、传递无密钥 node/session/config URL | 不配置目标系统 |
 | `nodeforge-initrd` | `switch_root` 前 | 最小 BootConfig、共享 rootfs | 维持 bootstrap NIC/address，下载/校验 rootfs，建立 lower/upper，写 AgentPlan locator/token handoff | 不取得 AgentPlan，不写 `/etc`、用户、SSH、hosts、软件或目标网络 |
-| agent `--pre-init` | `switch_root` 后、`/sbin/init` 前 | immutable AgentPlan 与全部 Node payload | 预取校验后清 capability；写最终 rootfs 的 network/hostname/machine-id/users/password/SSH/hosts/NTP/localization/security/software/services | 不读取 latest catalog，不接远程临时命令，不 daemonize |
+| agent `pre-init` 子命令 | `switch_root` 后、`/sbin/init` 前 | immutable AgentPlan 与全部 Node payload | 预取校验后清 capability；写最终 rootfs 的 network/hostname/machine-id/users/password/SSH/hosts/NTP/localization/security/software/services | 不读取 latest catalog，不接远程临时命令，不 daemonize；v0.4.3 起强制子命令 argv |
 | agent `--first-boot` | 真正 init/systemd 后 | 不再获取配置；只读 pre-init/rootfs 本地 payload | 按固定 action 顺序执行后处理并上报结果 | 不重复 merge/apply Node baseline，不做 reconciliation |
 
 这里“initrd 写 handoff”与“更新 rootfs 配置”是两类动作：前者只写 `/var/lib/nodeforge/*` 的 locator、摘要和短时凭据，
@@ -116,7 +116,7 @@ initrd 内完成上述职责；它不链接 TargetSystem/effective runner，不�
    digest 和非 secret 元数据），将独立 boot-session capability 与 `event:append` token 写入
    0400 credential 文件。不得再增加内容重复的 `agent-handoff.json`。
 8. pre-switch 检查通过后确认 rootfs 已完整验签且下载未传播 token，move-mount `/run`，保留 capability/event token，
-   以 merged root 执行 `switch_root ... /usr/lib/nodeforge/nodeforge-agent --pre-init`。
+   以 merged root 执行 `switch_root ... /usr/lib/nodeforge/nodeforge-agent pre-init`。
 
 ### 3.3 实现要点
 
@@ -135,7 +135,7 @@ initrd 内完成上述职责；它不链接 TargetSystem/effective runner，不�
 
 agent **仅服务 diskless**，是消费服务端 immutable AgentPlan 的一次性执行框架；同一 executable 有两个固定入口：
 
-1. `--pre-init`：作为 `switch_root` 后、真正 `/sbin/init` 前的短生命周期 PID 1，使用继承的 bootstrap 网络从服务端
+1. `pre-init` 子命令：作为 `switch_root` 后、真正 `/sbin/init` 前的短生命周期 PID 1，使用继承的 bootstrap 网络从服务端
    拉取并校验 session 固定的 AgentPlan/payload，应用全部 Node override，成功后 `exec /sbin/init`，不 fork 常驻、不返回。
 2. `--first-boot`：由 systemd unit 调用，执行 effective first-boot steps（默认 rootfs Profile payload，Node bundle
    override 时为 agent pre-init 已校验的 `/run` payload）。
@@ -216,7 +216,7 @@ nodeforged 生成 BootConfig（per immutable DisklessEffectivePlan snapshot）
   -> DHCP/TFTP 引导 boot bundle（kernel + shared nodeforge-initrd + per-session credential capsule）
   -> nodeforge-initrd: 拉最小 BootConfig、下载/校验/挂载 rootfs、交接 AgentPlan locator
      （不下载 AgentPlan；rootfs 下载不创建或传播 token）
-  -> switch_root ... nodeforge-agent --pre-init
+  -> switch_root ... nodeforge-agent pre-init
   -> agent: 以 capability 拉取 AgentPlan、以 peer/session/digest 数据面拉 payload，校验后清零 capability
   -> agent: 应用全部 Node override，exec /sbin/init
   -> systemd: nodeforge-agent --first-boot 执行 effective bundle、best-effort 回传事件

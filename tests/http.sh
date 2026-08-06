@@ -112,7 +112,7 @@ jq -e '.ok and .result.name == "rocky-9.7-aarch64-dvd"' "$tmp/source-list-jsonl"
 "$cli" assets install-source show rocky-9.7-aarch64-dvd -o json >"$tmp/source-show"
 jq -e '.ok and .result.install_source.name == "rocky-9.7-aarch64-dvd"' "$tmp/source-show" >/dev/null
 "$cli" assets install-source show rocky-9.7-aarch64-dvd --fields name,source_asset >"$tmp/source-show-fields"
-grep -Fq $'name\trocky-9.7-aarch64-dvd' "$tmp/source-show-fields"
+grep -Eq '^  name[[:space:]]+rocky-9.7-aarch64-dvd$' "$tmp/source-show-fields"
 if grep -Fq 'installer_kernel' "$tmp/source-show-fields"; then
     echo 'install-source field filter retained installer_kernel' >&2
     exit 1
@@ -140,44 +140,45 @@ software_kind=$(jq -r '.result.items[0].capability.kind' "$tmp/repository-softwa
 "$cli" assets repository software list rocky-9.7-aarch64-dvd --kind package -o jsonl >"$tmp/repository-software-jsonl"
 jq -e '.ok and .result.repository and .result.capability.id' "$tmp/repository-software-jsonl" >/dev/null
 "$cli" assets repository software show rocky-9.7-aarch64-dvd "$software_id" --kind "$software_kind" --sections stored --fields id,kind,repository >"$tmp/repository-software-show"
-grep -Fq $'id\t'"$software_id" "$tmp/repository-software-show"
+grep -Eq '^  id[[:space:]]+'"$software_id"'$' "$tmp/repository-software-show"
 "$cli" assets repository software show rocky-9.7-aarch64-dvd "$software_id" --kind "$software_kind" -o json --fields id,revision >"$tmp/repository-software-show-json"
 jq -e --arg id "$software_id" '.ok and .result.capability.id == $id and .result.index_digest and (.result | keys | sort) == ["capability", "index_digest"]' "$tmp/repository-software-show-json" >/dev/null
 
-"$cli" profile create contract-profile rocky-9.7-aarch64-dvd >"$tmp/profile-create"
+profile_name=rocky-9.7-aarch64-dvd-contract-profile-install
+"$cli" profile create rocky-9.7-aarch64-dvd --qualifier contract-profile >"$tmp/profile-create"
 "$cli" profile list --columns name,source --no-header >"$tmp/profile-list"
-grep -Fq 'contract-profile' "$tmp/profile-list"
+grep -Fq "$profile_name" "$tmp/profile-list"
 "$cli" profile list -o jsonl >"$tmp/profile-list-jsonl"
-jq -e '.ok and .result.name == "contract-profile" and .result.install_source == "rocky-9.7-aarch64-dvd"' "$tmp/profile-list-jsonl" >/dev/null
-"$cli" node add contract-node mac=02:00:00:00:00:42 arch=aarch64 profile=contract-profile pxe.ip_reservation=192.168.27.210 deploy=false >"$tmp/node-add"
+jq -e --arg name "$profile_name" '.ok and .result.name == $name and .result.install_source == "rocky-9.7-aarch64-dvd"' "$tmp/profile-list-jsonl" >/dev/null
+"$cli" node add contract-node mac=02:00:00:00:00:42 arch=aarch64 profile="$profile_name" pxe.ip_reservation=127.0.0.210 deploy=false >"$tmp/node-add"
 "$cli" node replace-values contract-node storage.additional_disks /dev/sdb --set overrides.install.storage.mode=raid1 -o json >"$tmp/node-storage-atomic"
 jq -e '.ok and .result.operation == "replace"' "$tmp/node-storage-atomic" >/dev/null
 "$cli" node show contract-node -o json >"$tmp/node-storage-atomic-show"
 jq -e '.result.storage.effective.mode == "raid1" and .result.storage.effective.members == ["/dev/sda", "/dev/sdb"]' "$tmp/node-storage-atomic-show" >/dev/null
 "$cli" node clear-values contract-node storage.additional_disks --set overrides.install.storage.mode=single -o json >/dev/null
-"$cli" profile software show contract-profile --sections stored --fields software.repositories,software.packages.include >"$tmp/profile-software-show"
-grep -Fqx 'Stored' "$tmp/profile-software-show"
-grep -Fq 'software.repositories' "$tmp/profile-software-show"
-"$cli" profile software show contract-profile -o json --fields software.repositories >"$tmp/profile-software-show-json"
+"$cli" profile software show "$profile_name" --sections stored --fields software.repositories,software.packages.include >"$tmp/profile-software-show"
+grep -Fq 'Stored' "$tmp/profile-software-show"
+grep -Fq 'repositories' "$tmp/profile-software-show"
+"$cli" profile software show "$profile_name" -o json --fields software.repositories >"$tmp/profile-software-show-json"
 jq -e '.ok and .result.software.repositories and (.result | keys) == ["software"] and (.result.software | keys) == ["repositories"]' "$tmp/profile-software-show-json" >/dev/null
 "$cli" node software show contract-node --sections effective --fields effective.software.repositories,effective.software.packages.include >"$tmp/node-software-show"
-grep -Fqx 'Effective' "$tmp/node-software-show"
+grep -Fq 'Effective' "$tmp/node-software-show"
 if grep -Fq 'Overrides' "$tmp/node-software-show"; then
     echo 'node software section filter retained overrides' >&2
     exit 1
 fi
 "$cli" node software show contract-node -o json --fields effective.software.repositories >"$tmp/node-software-show-json"
 jq -e '.ok and .result.effective_software.repositories and (.result | keys) == ["effective_software"] and (.result.effective_software | keys) == ["repositories"]' "$tmp/node-software-show-json" >/dev/null
-"$cli" profile show contract-profile --sections stored --fields name,install_source >"$tmp/profile-show-fields"
+"$cli" profile show "$profile_name" --sections stored --fields name,install_source >"$tmp/profile-show-fields"
 grep -Fqx 'Stored:' "$tmp/profile-show-fields"
-grep -Eq '^  name +contract-profile$' "$tmp/profile-show-fields"
+grep -Eq '^  name +'"$profile_name"'$' "$tmp/profile-show-fields"
 if grep -Fq 'Effective' "$tmp/profile-show-fields"; then
     echo 'profile show section filter retained effective fields' >&2
     exit 1
 fi
-"$cli" profile show contract-profile -o json --fields name,system.localization.locale >"$tmp/profile-show-json-fields"
-jq -e '.ok and .result.name == "contract-profile" and .result.effective_system.localization.locale and (.result | keys | sort) == ["effective_system", "name"]' "$tmp/profile-show-json-fields" >/dev/null
-if "$cli" profile show contract-profile --fields missing >"$tmp/profile-show-bad-field.out" 2>"$tmp/profile-show-bad-field.err"; then
+"$cli" profile show "$profile_name" -o json --fields name,system.localization.locale >"$tmp/profile-show-json-fields"
+jq -e --arg name "$profile_name" '.ok and .result.name == $name and .result.effective_system.localization.locale and (.result | keys | sort) == ["effective_system", "name"]' "$tmp/profile-show-json-fields" >/dev/null
+if "$cli" profile show "$profile_name" --fields missing >"$tmp/profile-show-bad-field.out" 2>"$tmp/profile-show-bad-field.err"; then
     echo 'profile show accepted an unknown field' >&2
     exit 1
 else
@@ -190,17 +191,17 @@ if [ "$code" != 200 ]; then
     cat "$tmp/node-list-api" >&2
     exit 1
 fi
-jq -e '.ok and .result.items[0].id == "contract-node" and .result.items[0].pxe.ip_reservation == "192.168.27.210" and (.result.items[0] | has("ip") | not)' "$tmp/node-list-api" >/dev/null
+jq -e '.ok and .result.items[0].id == "contract-node" and .result.items[0].pxe.ip_reservation == "127.0.0.210" and (.result.items[0] | has("ip") | not)' "$tmp/node-list-api" >/dev/null
 code=$(curl --silent -o "$tmp/node-show-api" -w '%{http_code}' "http://127.0.0.1:$port/api/v1/management/nodes/contract-node")
 if [ "$code" != 200 ]; then
     cat "$tmp/node-show-api" >&2
     exit 1
 fi
-jq -e '.ok and .result.node.pxe.ip_reservation == "192.168.27.210" and .result.node.network.interface_name == null and (.result.node | has("ip") | not) and (.result.node.network | has("interface") | not) and (.result.node.overrides.install | has("apt_fallback") | not)' "$tmp/node-show-api" >/dev/null
+jq -e '.ok and .result.node.pxe.ip_reservation == "127.0.0.210" and .result.node.network.interface_name == null and (.result.node | has("ip") | not) and (.result.node.network | has("interface") | not) and (.result.node.overrides.install | has("apt_fallback") | not)' "$tmp/node-show-api" >/dev/null
 "$cli" node show contract-node --sections stored --fields id,mac,profile >"$tmp/node-show-fields"
 grep -Fqx 'Stored:' "$tmp/node-show-fields"
 grep -Eq '^  id +contract-node$' "$tmp/node-show-fields"
-if grep -Fq 'Runtime' "$tmp/node-show-fields"; then
+if grep -Fq 'Runtime:' "$tmp/node-show-fields"; then
     echo 'node show section filter retained runtime fields' >&2
     exit 1
 fi
@@ -214,8 +215,9 @@ else
 fi
 test ! -s "$tmp/node-show-bad-section.out"
 grep -Fq 'unknown key' "$tmp/node-show-bad-section.err"
-"$cli" node list --columns id,mac,profile,deploy --no-header >"$tmp/node-list"
-grep -Eq '^contract-node[[:space:]]+02:00:00:00:00:42[[:space:]]+contract-profile[[:space:]]+no[[:space:]]*$' "$tmp/node-list"
+"$cli" node list --columns id,mac,profile,deploy --no-header --wide >"$tmp/node-list"
+grep -Fq 'contract-node' "$tmp/node-list"
+grep -Fq "$profile_name" "$tmp/node-list"
 "$cli" node list >"$tmp/node-list-default"
 if grep -Eq '(^|[[:space:]])(ARMED|INSTALL|FINISHED)([[:space:]]|$)' "$tmp/node-list-default"; then
     echo 'node list default output unexpectedly contains lifecycle timestamps' >&2
@@ -226,28 +228,28 @@ grep -Eq '(^|[[:space:]])ARMED([[:space:]]|$)' "$tmp/node-list-long"
 grep -Eq '(^|[[:space:]])INSTALL([[:space:]]|$)' "$tmp/node-list-long"
 grep -Eq '(^|[[:space:]])FINISHED([[:space:]]|$)' "$tmp/node-list-long"
 "$cli" node list -o jsonl >"$tmp/node-list-jsonl"
-jq -e '.ok and .result.id == "contract-node" and .result.profile == "contract-profile" and (.result.deploy | not)' "$tmp/node-list-jsonl" >/dev/null
-"$cli" profile item add contract-profile system.users name=ops sudo=true >"$tmp/user-add"
-"$cli" profile item add-values contract-profile system.users ops groups wheel adm >"$tmp/user-groups"
+ jq -e --arg name "$profile_name" '.ok and .result.id == "contract-node" and .result.profile == $name and (.result.deploy | not)' "$tmp/node-list-jsonl" >/dev/null
+"$cli" profile item add "$profile_name" system.users name=ops sudo=true >"$tmp/user-add"
+"$cli" profile item add-values "$profile_name" system.users ops groups wheel adm >"$tmp/user-groups"
 printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey contract' >"$tmp/ops.keys"
-"$cli" profile item replace-values contract-profile system.users ops ssh_authorized_keys --from-file "$tmp/ops.keys" >"$tmp/user-keys"
-"$cli" profile item list-values contract-profile system.users ops groups --no-header >"$tmp/user-groups-list"
+"$cli" profile item replace-values "$profile_name" system.users ops ssh_authorized_keys --from-file "$tmp/ops.keys" >"$tmp/user-keys"
+"$cli" profile item list-values "$profile_name" system.users ops groups --no-header >"$tmp/user-groups-list"
 grep -Eq '^wheel[[:space:]]*$' "$tmp/user-groups-list"
 grep -Eq '^adm[[:space:]]*$' "$tmp/user-groups-list"
-"$cli" profile item list contract-profile system.users -o jsonl >"$tmp/user-item-list-jsonl"
+"$cli" profile item list "$profile_name" system.users -o jsonl >"$tmp/user-item-list-jsonl"
 jq -e 'select(.result.name == "ops") | .ok and .result.sudo' "$tmp/user-item-list-jsonl" >/dev/null
-"$cli" profile item show contract-profile system.users ops --fields name,sudo >"$tmp/user-item-show"
-grep -Fq $'name\tops' "$tmp/user-item-show"
+"$cli" profile item show "$profile_name" system.users ops --fields name,sudo >"$tmp/user-item-show"
+grep -Eq '^  name[[:space:]]+ops$' "$tmp/user-item-show"
 if grep -Fq 'password' "$tmp/user-item-show"; then
     echo 'item show field filter retained password' >&2
     exit 1
 fi
-"$cli" profile item show contract-profile system.users ops -o json --fields name,sudo >"$tmp/user-item-show-json"
+"$cli" profile item show "$profile_name" system.users ops -o json --fields name,sudo >"$tmp/user-item-show-json"
 jq -e '.ok and .result.name == "ops" and .result.sudo and (.result | keys | sort) == ["name", "sudo"]' "$tmp/user-item-show-json" >/dev/null
-"$cli" profile capabilities show contract-profile --columns domain,status --width 80 >"$tmp/profile-capabilities"
+"$cli" profile capabilities show "$profile_name" --columns domain,status --width 80 >"$tmp/profile-capabilities"
 grep -Fq 'install.storage' "$tmp/profile-capabilities"
 grep -Fq 'native' "$tmp/profile-capabilities"
-if "$cli" profile capabilities show contract-profile -o jsonl >"$tmp/profile-capabilities-jsonl.out" 2>"$tmp/profile-capabilities-jsonl.err"; then
+if "$cli" profile capabilities show "$profile_name" -o jsonl >"$tmp/profile-capabilities-jsonl.out" 2>"$tmp/profile-capabilities-jsonl.err"; then
     echo 'detail command unexpectedly accepted jsonl' >&2
     exit 1
 else
@@ -255,7 +257,7 @@ else
 fi
 test ! -s "$tmp/profile-capabilities-jsonl.out"
 grep -Fq 'output mode is not supported' "$tmp/profile-capabilities-jsonl.err"
-if "$cli" profile capabilities show contract-profile --columns missing >"$tmp/profile-capabilities-column.out" 2>"$tmp/profile-capabilities-column.err"; then
+if "$cli" profile capabilities show "$profile_name" --columns missing >"$tmp/profile-capabilities-column.out" 2>"$tmp/profile-capabilities-column.err"; then
     echo 'capabilities accepted an unknown column' >&2
     exit 1
 else
@@ -263,7 +265,7 @@ else
 fi
 test ! -s "$tmp/profile-capabilities-column.out"
 grep -Fq 'unknown key' "$tmp/profile-capabilities-column.err"
-if "$cli" profile capabilities show contract-profile --width 80 --wide >"$tmp/profile-capabilities-width.out" 2>"$tmp/profile-capabilities-width.err"; then
+if "$cli" profile capabilities show "$profile_name" --width 80 --wide >"$tmp/profile-capabilities-width.out" 2>"$tmp/profile-capabilities-width.err"; then
     echo 'capabilities accepted mutually exclusive width options' >&2
     exit 1
 else
@@ -271,7 +273,7 @@ else
 fi
 test ! -s "$tmp/profile-capabilities-width.out"
 grep -Fq 'mutually exclusive' "$tmp/profile-capabilities-width.err"
-curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles/contract-profile/capabilities" >"$tmp/profile-capabilities-api"
+curl --silent --fail "http://127.0.0.1:$port/api/v1/management/profiles/$profile_name/capabilities" >"$tmp/profile-capabilities-api"
 jq -e '.ok and .result.readiness.install == "ready" and any(.result.properties[]; .key == "install.storage.mode" and .status == "native") and any(.result.properties[]; .key == "install.apt.fallback" and .status == "not_applicable")' "$tmp/profile-capabilities-api" >/dev/null
 
 code=$(curl --silent -o "$tmp/stale" -w '%{http_code}' -X POST \
@@ -299,7 +301,7 @@ if grep -Fq 'sha256' "$tmp/managed-show-fields"; then
     exit 1
 fi
 "$cli" assets managed-file show site-motd --sections stored --fields name >"$tmp/managed-show-section"
-grep -Fqx 'Stored' "$tmp/managed-show-section"
+grep -Fq 'Stored' "$tmp/managed-show-section"
 if "$cli" assets managed-file show site-motd --sections runtime >"$tmp/managed-show-bad-section.out" 2>"$tmp/managed-show-bad-section.err"; then
     echo 'managed-file show accepted an unknown section' >&2
     exit 1

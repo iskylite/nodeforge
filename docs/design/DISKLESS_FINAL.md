@@ -36,7 +36,7 @@ squashfs_overlay = squashfs 只读 lower + tmpfs overlay upper
 - **lower**：squashfs 单文件镜像，由服务端 rootfs builder 构建，按 `rootfs_input_digest` 缓存、
   跨 Node 共享，经 HTTP GET/HEAD/Range 下载、sha512 校验、loop 挂载为只读。
 - **upper**：tmpfs 写入层，per-boot 易失。initrd 只建立/挂载 upper，不写 target-system；`switch_root` 后
-  `nodeforge-agent --pre-init` 在真正 init 前写入完整 Node override，first-boot 业务输出随后继续写 upper。
+  `nodeforge-agent pre-init` 在真正 init 前写入完整 Node override，first-boot 业务输出随后继续写 upper。
 
 选择理由：
 
@@ -192,7 +192,7 @@ event credential，不再承载 config/rootfs/agent 读取 token。
    也不写 merged root 的 target-system；lower 保持只读。
 4. initrd 做 pre-switch 验证，原子写交接目录；把短时 boot-session capability 和
    `event:append` token 分别以 0400 文件交给切根后的 agent，rootfs 下载全程不生成或传播 token。
-5. initrd 以 `nodeforge-agent --pre-init` 为切根入口；agent 使用继承的 bootstrap 网络从服务端拉取并校验
+5. initrd 以 `nodeforge-agent pre-init` 为切根入口；agent 使用继承的 bootstrap 网络从服务端拉取并校验
    immutable AgentPlan 及全部 Node 专属 payload，写入 `/run` 后清零 boot-session capability；然后在最终 root 中应用全部
    Node override，成功后原进程
    `exec /sbin/init`，NM/Netplan/sshd 等只看到最终状态。systemd 启动后 agent 的 first-boot unit 再执行 effective
@@ -300,7 +300,7 @@ digest 内从安全检查点继续。具体顺序固定如下：
    最终验证属于 agent pre-init，不得在 initrd 复制一套 parser。
 10. **handoff**：POST `switching_root`，确认 rootfs 已完成 digest 校验且未传播 token，move-mount `/dev`、`/proc`、
     `/sys`、`/run`，以 merged 为新根执行
-    `switch_root ... /usr/lib/nodeforge/nodeforge-agent --pre-init`。pre-init 成功后再 exec `/sbin/init`；任一 exec 返回均视为失败。
+    `switch_root ... /usr/lib/nodeforge/nodeforge-agent pre-init`。pre-init 成功后再 exec `/sbin/init`；任一 exec 返回均视为失败。
 
 禁止直接把下载流 pipe 给 mount、在 digest 校验前解析 squashfs、接受 HTTP redirect/content-encoding、跨 ETag
 拼接 partial，或失败后回退本地磁盘/NFS/旧 rootfs。
@@ -409,7 +409,7 @@ desired digest 变化会关闭旧计数并开始新 bucket，保留旧审计。
 
 ## 6. Agent pre-init Node apply 与 first-boot 后处理
 
-initrd 切根到 node-bound agent（`nodeforge-agent --pre-init`，见 [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md)）。
+initrd 切根到 node-bound agent（`nodeforge-agent pre-init`，见 [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md)）。
 agent 框架先以继承的 bootstrap 网络从服务端拉取 session 固定的 AgentPlan 和全部 Node payload，校验后写入 `/run`
 并清零 boot-session capability；随后在真正 init 前使用完整 rootfs 环境应用全部 Node effective override，成功后 exec `/sbin/init`；systemd 启动后
 同一 binary 的 unit 再顺序执行 effective `first-boot`。后者默认承载 Profile 固定 bundle，

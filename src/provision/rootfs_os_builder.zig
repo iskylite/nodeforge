@@ -27,7 +27,7 @@ pub const IdentityMaterial = struct {
 /// 缺失会导致普通 rootfs 无法启动或无法由 Agent 收敛的核心包；该集合严格失败。
 const dnf_core_packages = [_][]const u8{
     "bash",    "coreutils",      "dnf",            "systemd",   "shadow-utils", "util-linux",
-    "iproute", "NetworkManager", "openssh-server", "procps-ng",
+    "iproute", "NetworkManager", "openssh-server", "procps-ng", "kernel-core", "kernel-modules",
 };
 
 /// archive 并非每个 Profile 都会使用。服务端 rootfs 构建默认尝试提供这些工具，但缺失只

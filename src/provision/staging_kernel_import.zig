@@ -25,13 +25,15 @@ pub const KernelInfo = struct {
 
 /// 扫描保留树，返回发现的内核列表。
 ///
-/// 扫描路径：
-/// - `<staging>/lib/modules/*/` → 模块 releases
-/// - `<staging>/boot/vmlinuz-*` → 内核镜像
+/// 扫描路径（按优先级）：
+/// - `<staging>/boot/vmlinuz-*` → 主候选内核镜像
 /// - `<staging>/boot/initramfs-*` 或 `initrd-*` → 可选 initramfs
+/// - `<staging>/lib/modules/*/`、`usr/lib/modules/*/` → 配套 modules 校验
+/// - `<modules>/<release>/vmlinuz` → `/boot` 缺失时的内核镜像回退
 ///
-/// 合并策略：以 modules 目录的 release 为基准，匹配 vmlinuz 和 initramfs。
-/// 只有 vmlinuz 而无 modules 的 release 也包含（但标记 modules_path=null）。
+/// 合并策略：以 `/boot` 中的 vmlinuz 为主导候选，再按同一 release 关联 modules。
+/// 只有 vmlinuz 而无 modules 的 release 仍会列出（但不可被选为启动面内核）；
+/// 纯 modules 目录不会制造候选，除非目录内同时提供回退 `vmlinuz`。
 pub fn scanKernels(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -49,43 +51,18 @@ pub fn scanKernels(
         releases.deinit();
     }
 
-    // 1. 扫描 /lib/modules/<release>/
-    const modules_dir_path = try std.fmt.allocPrint(allocator, "{s}/lib/modules", .{staging});
-    defer allocator.free(modules_dir_path);
-
-    var modules_dir = std.Io.Dir.cwd().openDir(io, modules_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => {
-            // 没有 modules 目录，继续扫描 /boot
-            return try scanBootOnly(io, allocator, staging);
-        },
-        else => return err,
-    };
-    defer modules_dir.close(io);
-
-    var modules_iter = modules_dir.iterate();
-    while (try modules_iter.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        if (entry.name.len == 0 or entry.name[0] == '.') continue;
-        const release = try allocator.dupe(u8, entry.name);
-        const mod_path = try std.fmt.allocPrint(allocator, "{s}/lib/modules/{s}", .{ staging, release });
-        try releases.put(release, .{
-            .release = release,
-            .modules_path = mod_path,
-        });
-    }
-
-    // 2. 扫描 /boot/vmlinuz-<release>
+    // 1. 先扫描 /boot：它是用户可见 kernel image 的权威主候选。
     const boot_dir_path = try std.fmt.allocPrint(allocator, "{s}/boot", .{staging});
     defer allocator.free(boot_dir_path);
 
     var boot_dir = std.Io.Dir.cwd().openDir(io, boot_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return finalizeResults(allocator, releases),
+        error.FileNotFound => null,
         else => return err,
     };
-    defer boot_dir.close(io);
+    defer if (boot_dir) |*dir| dir.close(io);
 
-    var boot_iter = boot_dir.iterate();
-    while (try boot_iter.next(io)) |entry| {
+    var boot_iter = if (boot_dir) |*dir| dir.iterate() else null;
+    while (if (boot_iter) |*iter| try iter.next(io) else null) |entry| {
         if (entry.kind != .file) continue;
         // 匹配 vmlinuz-<release>
         if (std.mem.startsWith(u8, entry.name, "vmlinuz-")) {
@@ -123,45 +100,42 @@ pub fn scanKernels(
         }
     }
 
+    // 2. modules 不主导候选，只验证 `/boot` 候选；若 modules 目录自身带
+    // vmlinuz（Rocky/RHEL 10），才作为 `/boot` 缺失时的回退候选。
+    try mergeModules(io, allocator, staging, "/lib/modules", &releases);
+    try mergeModules(io, allocator, staging, "/usr/lib/modules", &releases);
+
     return finalizeResults(allocator, releases);
 }
 
-/// 仅扫描 /boot 目录（无 /lib/modules 的情况）。
-fn scanBootOnly(io: std.Io, allocator: std.mem.Allocator, staging: []const u8) ![]KernelInfo {
-    var releases = std.StringHashMap(KernelInfo).init(allocator);
-    defer {
-        var iter = releases.iterator();
-        while (iter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            if (entry.value_ptr.vmlinuz_path) |p| allocator.free(p);
-            if (entry.value_ptr.initramfs_path) |p| allocator.free(p);
-        }
-        releases.deinit();
-    }
-
-    const boot_dir_path = try std.fmt.allocPrint(allocator, "{s}/boot", .{staging});
-    defer allocator.free(boot_dir_path);
-
-    var boot_dir = std.Io.Dir.cwd().openDir(io, boot_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return try allocator.alloc(KernelInfo, 0),
+fn mergeModules(io: std.Io, allocator: std.mem.Allocator, staging: []const u8, modules_root: []const u8, releases: *std.StringHashMap(KernelInfo)) !void {
+    const modules_dir_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ staging, modules_root });
+    defer allocator.free(modules_dir_path);
+    var modules_dir = std.Io.Dir.cwd().openDir(io, modules_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
         else => return err,
     };
-    defer boot_dir.close(io);
+    defer modules_dir.close(io);
 
-    var boot_iter = boot_dir.iterate();
-    while (try boot_iter.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (std.mem.startsWith(u8, entry.name, "vmlinuz-")) {
-            const release = try allocator.dupe(u8, entry.name["vmlinuz-".len..]);
-            const vmlinuz_full = try std.fmt.allocPrint(allocator, "{s}/boot/{s}", .{ staging, entry.name });
-            try releases.put(release, .{
-                .release = release,
-                .vmlinuz_path = vmlinuz_full,
-            });
+    var iter = modules_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .directory or entry.name.len == 0 or entry.name[0] == '.') continue;
+        const modules_path = try std.fmt.allocPrint(allocator, "{s}{s}/{s}", .{ staging, modules_root, entry.name });
+        if (releases.getPtr(entry.name)) |existing| {
+            // Prefer the canonical /lib spelling if both aliases are visible.
+            if (existing.modules_path == null) existing.modules_path = modules_path else allocator.free(modules_path);
+            continue;
+        }
+
+        const fallback_vmlinuz = try std.fmt.allocPrint(allocator, "{s}{s}/{s}/vmlinuz", .{ staging, modules_root, entry.name });
+        if (std.Io.Dir.cwd().statFile(io, fallback_vmlinuz, .{})) |_| {
+            const release = try allocator.dupe(u8, entry.name);
+            try releases.put(release, .{ .release = release, .vmlinuz_path = fallback_vmlinuz, .modules_path = modules_path });
+        } else |_| {
+            allocator.free(fallback_vmlinuz);
+            allocator.free(modules_path);
         }
     }
-
-    return finalizeResults(allocator, releases);
 }
 
 /// 将 hashmap 转为排序后的数组。
@@ -347,6 +321,44 @@ test "scanKernels handles missing /lib/modules" {
     try std.testing.expectEqualStrings("6.1.0", kernels[0].release);
     try std.testing.expect(kernels[0].vmlinuz_path != null);
     try std.testing.expect(kernels[0].modules_path == null);
+}
+
+test "scanKernels ignores modules-only releases without a boot image" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root: []const u8 = root_buf[0..root_len];
+    const modules = try std.fmt.allocPrint(std.testing.allocator, "{s}/lib/modules/6.1.0", .{root});
+    defer std.testing.allocator.free(modules);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, modules);
+
+    const kernels = try scanKernels(std.testing.io, std.testing.allocator, root);
+    defer freeKernels(std.testing.allocator, kernels);
+    try std.testing.expectEqual(@as(usize, 0), kernels.len);
+}
+
+test "scanKernels falls back to a modules-local vmlinuz" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const root: []const u8 = root_buf[0..root_len];
+    const modules = try std.fmt.allocPrint(std.testing.allocator, "{s}/usr/lib/modules/6.12.0", .{root});
+    defer std.testing.allocator.free(modules);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, modules);
+    const vmlinuz = try std.fmt.allocPrint(std.testing.allocator, "{s}/vmlinuz", .{modules});
+    defer std.testing.allocator.free(vmlinuz);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = vmlinuz, .data = "fake" });
+
+    const kernels = try scanKernels(std.testing.io, std.testing.allocator, root);
+    defer freeKernels(std.testing.allocator, kernels);
+    try std.testing.expectEqual(@as(usize, 1), kernels.len);
+    try std.testing.expectEqualStrings("6.12.0", kernels[0].release);
+    try std.testing.expect(std.mem.endsWith(u8, kernels[0].vmlinuz_path.?, "/usr/lib/modules/6.12.0/vmlinuz"));
+    try std.testing.expect(std.mem.endsWith(u8, kernels[0].modules_path.?, "/usr/lib/modules/6.12.0"));
 }
 
 test "scanKernels returns empty for tree without kernels" {

@@ -6549,6 +6549,7 @@ fn isUsageError(err: anyerror) bool {
         error.InvalidFlagValue,
         error.InvalidFlagNegation,
         error.InvalidFlagShortcut,
+        error.InvalidItemUsage,
         error.InvalidPositionalArgOrder,
         error.MissingArgs,
         error.MissingFlagValue,

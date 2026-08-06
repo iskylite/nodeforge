@@ -77,7 +77,9 @@ for code in first_boot.binding_mismatch first_boot.event_invalid first_boot.even
     strings "$bundle/nodeforged" | grep -Fq "$code"
 done
 
-test "$(printf '%s\n' "$($run_cli --version)" | awk '{print $1" "$2}')" = "nodeforge 0.4.0"
+nodeforge_version=$(sed -n 's/^const nodeforge_version = "\([^"]*\)";/\1/p' "$root/build.zig")
+test -n "$nodeforge_version"
+test "$(printf '%s\n' "$($run_cli --version)" | awk '{print $1" "$2}')" = "nodeforge $nodeforge_version"
 install=$tmp/install
 $run_cli setup --install-root "$install" --non-interactive --yes >"$tmp/setup.json"
 test "$(jq -r '.schema_version' "$install/config/config.json")" = 5

@@ -432,7 +432,7 @@ nodeforge node show <id>
 - Node direct 字段不进入 overrides；diskless 不消费 storage，非空 install-only override 使 readiness 失败。
 - diskless 支持 v0.1 全部跨 kind 的 system/software/kernel args override，canonical path 与 merge 语义不改；服务端
   boot-project 只编译 immutable pre-init plan，不操作 rootfs。password、users、`authorized_keys.add/remove`、sshd、
-  localization、NTP、security、hosts、network/machine-id 与 software 全部由 `nodeforge-agent --pre-init` 写 upper；Profile 自动生成的
+  localization、NTP、security、hosts、network/machine-id 与 software 全部由 `nodeforge-agent pre-init` 写 upper；Profile 自动生成的
   client public key 是 mandatory 域内 key，标准 remove 不能删除，hosts 改变时同步以共享 host public key 重算
   `ssh_known_hosts`。software 的 repositories/environment/groups/tasks/packages include/exclude 全部按 v0.1 merge 后进入
   AgentPlan/`node_apply_projection`；initrd 只交接 AgentPlan URL/digest/size/expiry 与短时 `agent:read` token，不取得或

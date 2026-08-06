@@ -284,7 +284,7 @@ NIC PXE DHCPDISCOVER
  -> loop(ro) lower + tmpfs upper/work + overlay merged
  -> 校验 AgentPlan locator/expected digest/size/agent feature 摘要，交接到 /var/lib/nodeforge/boot.json
  -> pre-switch 检查，move-mount /run；rootfs 未传播 token，保留短时 capability/event token
- -> switch_root 到 nodeforge-agent --pre-init
+ -> switch_root 到 nodeforge-agent pre-init
  -> agent 以 capability 拉取 AgentPlan、以 peer/session/digest 数据面拉 payload，写 /run 后清 capability
  -> agent 应用全部 Node override，成功后 exec /sbin/init；renderer 接管同一 NIC/address
  -> systemd agent unit 上报 diskless.running，从 rootfs Profile payload 或 /run Node payload 执行 effective first-boot，删除 event token

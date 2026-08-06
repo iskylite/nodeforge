@@ -22,6 +22,15 @@ node_ip=${NODEFORGE_NODE_IP:-192.168.27.210}
 vmx=${NODEFORGE_VMX:-/Users/iskylite/Virtual\ Machines.localized/r97n1.vmwarevm/r97n1.vmx}
 vmrun=${NODEFORGE_VMRUN:-/Applications/VMware\ Fusion.app/Contents/Public/vmrun}
 install_profile=${NODEFORGE_INSTALL_PROFILE:-rocky-9.7-aarch64-minimal-install}
+# The package action must use a package available from the selected profile's
+# local-only repository. `tree` is present on Rocky media but not on the Ubuntu
+# 22.04 live-server ISO used by the platform matrix. Allow an explicit override
+# and use Ubuntu's base `bash` package to exercise the idempotent apt path.
+case "$install_profile" in
+    ubuntu-*) default_e2e_package=bash ;;
+    *) default_e2e_package=tree ;;
+esac
+e2e_package=${NODEFORGE_E2E_PACKAGE:-$default_e2e_package}
 timeout=${NODEFORGE_TIMEOUT:-1200}
 poll=${NODEFORGE_POLL:-10}
 cli=/opt/nodeforge/bin/nodeforge
@@ -128,12 +137,12 @@ remote_cli "assets provision-bundle item add $bundle steps \
     mode=0644 owner=root group=root" >/dev/null
 echo "  step: managed_file -> /etc/motd"
 
-# package action (installs tree package)
+# package action (package must be available from this profile's local repository)
 remote_cli "assets provision-bundle item add $bundle steps \
     name=e2e-pkg action=package phase=install-post \
     idempotency_key=e2e-pkg-v1 timeout_s=120 retryable=true \
-    packages=tree" >/dev/null
-echo "  step: package -> tree"
+    packages=$e2e_package" >/dev/null
+echo "  step: package -> $e2e_package"
 
 # archive Mode A (tar with .nf.install.sh -> extract to tmpdir + execute)
 remote_cli "assets provision-bundle item add $bundle steps \
@@ -307,11 +316,12 @@ if target_sh "true" 2>/dev/null; then
         exit 1
     fi
 
-    # package: tree should be installed
-    if target_sh "which tree" 2>/dev/null | grep -q tree; then
-        echo "  PASS: package -> tree installed"
+    # package: query the native package database instead of assuming the
+    # package installs a same-named executable.
+    if target_sh "if command -v dpkg-query >/dev/null; then dpkg-query -W -f='\${Status}' '$e2e_package' | grep -q 'install ok installed'; else rpm -q '$e2e_package' >/dev/null; fi"; then
+        echo "  PASS: package -> $e2e_package installed"
     else
-        echo "FAIL: tree package not found" >&2
+        echo "FAIL: package $e2e_package not installed" >&2
         exit 1
     fi
 

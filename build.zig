@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// NodeForge 产品版本的唯一构建事实源。发布新版本时同步更新 build.zig.zon。
 const nodeforge_version = "0.4.1";
@@ -61,21 +62,14 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli);
 
-    // nodeforge-initrd：v0.2 diskless 启动 init（PID 1），运行在 dracut userspace。
+    // nodeforge-initrd：diskless 启动 PID 1，跑在最小 initramfs 闭包里。
     //
-    // single_threaded=true 只约束早期启动二进制，不影响 daemon/CLI。Zig stdlib
-    // 在 link_libc=true 时默认引用 pthread 符号
-    // （如 pthread_create/pthread_mutex_init）。glibc >= 2.34 将 pthread 合并入 libc，
-    // 但 Rocky 9 / Ubuntu 22.04 等可能使用 glibc < 2.34 的 sysroot 交叉编译，
-    // 导致链接产物包含 NEEDED libpthread.so.0。最小 initrd 环境中不包含该库，
-    // 二进制无法加载。single_threaded=true 阻止 stdlib 引入任何 pthread 符号。
-    // 代价是该程序及其依赖不能创建线程或依赖线程同步；当前 PID 1 是顺序状态机。
-    // 此设置不降低 GLIBC symbol version：CentOS 7 仍须用 gnu.2.17 sysroot 构建。
-    // 若未来取消，构建器必须从目标 ISO/sysroot 注入 interpreter + 递归
-    // DT_NEEDED（glibc < 2.34 包括 libpthread.so.0），严禁复制宿主库。
-    //
-    // strip=true：ReleaseSafe/ReleaseFast 时 strip 调试信息。initrd 二进制通过
-    // TFTP/HTTP 传输到节点，体积直接影响启动延迟。Debug 模式保留符号便于开发调试。
+    // 始终 single_threaded=true：Zig 在 link_libc 且非 single_threaded 时可能引入
+    // pthread 符号，链接结果常带 NEEDED libpthread.so.0。NodeForge overlay 故意
+    // 不注入宿主/sysroot 的 libc/pthread（防 ABI 混配），最小 initrd 往往也无该库，
+    // 一加载即失败。PID 1 本身是顺序状态机，无线程收益。
+    // 与「是否在 Mac 上交叉」无关：任何主机上编出的 initrd 都不得依赖 pthread。
+    // strip=true：Release* 去调试信息，减小 TFTP/HTTP 传输体积。
     const initrd = b.addExecutable(.{
         .name = "nodeforge-initrd",
         .root_module = b.createModule(.{
@@ -89,10 +83,20 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(initrd);
 
-    // nodeforge-agent：v0.2 切根后 pre-init / first-boot。
-    // single_threaded=true 和 strip=true 的理由与 nodeforge-initrd 相同。未来若
-    // agent 确需并行下载/心跳，可只对 agent 启用线程并消费完整目标 rootfs 闭包，
-    // 无需同时扩大最早期 /init 的 ABI 依赖面。
+    // nodeforge-agent：切根后 pre-init / first-boot /（后续）inspect 与本机构建。
+    // 跑在完整目标 rootfs 用户态（glibc 自带 pthread 或已并入 libc），与 initrd 不同。
+    //
+    // 线程模型默认按**构建主机** OS：
+    // - Linux 本机编译：single_threaded=false（允许多线程，依赖目标 rootfs 的 glibc）
+    // - 非 Linux（如 macOS 交叉）：single_threaded=true，避免交叉 sysroot 下轻易
+    //   NEEDED libpthread 而与「最小闭包/旧 sysroot」纠缠；可用 -Dagent-single-threaded=
+    //   显式覆盖。
+    // initrd 仍始终单线程；不因 agent 开线程去改 /init 或往 initrd 塞 libpthread。
+    const agent_single_threaded = b.option(
+        bool,
+        "agent-single-threaded",
+        "Force nodeforge-agent single_threaded (default: false on Linux hosts, true otherwise)",
+    ) orelse (builtin.os.tag != .linux);
     const agent = b.addExecutable(.{
         .name = "nodeforge-agent",
         .root_module = b.createModule(.{
@@ -100,7 +104,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .single_threaded = true,
+            .single_threaded = agent_single_threaded,
             .strip = optimize == .ReleaseSafe or optimize == .ReleaseFast,
         }),
     });

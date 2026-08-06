@@ -1002,9 +1002,21 @@ const UbuntuTuple = struct { version: []const u8, arch: model.Arch };
 /// 保留完整介质版本，使多个 point release 可以作为独立 source/profile 共存。
 /// 架构从字符串中的 `arm64` 或 `amd64` 关键字检测。
 fn parseUbuntuDiskInfo(info: []const u8) ?UbuntuTuple {
-    if (!std.mem.containsAtLeast(u8, info, 1, "Ubuntu-Server")) return null;
-    const start = std.mem.indexOf(u8, info, "Ubuntu-Server") orelse return null;
-    var tokens = std.mem.tokenizeAny(u8, info[start + "Ubuntu-Server".len ..], " \t\r\n");
+    // Ubuntu Server uses `Ubuntu-Server <version>`, while newer desktop media
+    // uses `Ubuntu <version> ...` (for example `Ubuntu 26.04 "Resolute ..."`).
+    // Authenticate both forms from the .disk/info prefix; do not infer a
+    // version from the filename or from an arbitrary later numeric token.
+    // `.disk/info` must identify Ubuntu at the beginning of the media
+    // metadata.  This covers both `Ubuntu-Server ...` and `Ubuntu ...`
+    // desktop media while rejecting arbitrary later mentions of Ubuntu.
+    if (!std.mem.startsWith(u8, info, "Ubuntu")) return null;
+    if (info.len > "Ubuntu".len and info["Ubuntu".len] != ' ' and info["Ubuntu".len] != '-') return null;
+    var suffix = info["Ubuntu".len..];
+    // Keep the product-family marker out of the version token for the
+    // historical `Ubuntu-Server <version>` spelling.  Desktop media uses
+    // the plain `Ubuntu <version>` spelling and needs no special handling.
+    if (std.mem.startsWith(u8, suffix, "-Server")) suffix = suffix["-Server".len..];
+    var tokens = std.mem.tokenizeAny(u8, suffix, " -\t\r\n");
     const release = tokens.next() orelse return null;
     _ = std.mem.indexOfScalar(u8, release, '.') orelse return null;
     const version = release;
@@ -1835,6 +1847,17 @@ test "Ubuntu disk metadata detects the profile tuple without CLI flags" {
     try std.testing.expectEqualStrings("22.04.5", tuple.version);
     try std.testing.expectEqualStrings("22.04", ubuntuSeries(tuple.version));
     try std.testing.expectEqual(model.Arch.aarch64, tuple.arch);
+}
+
+test "Ubuntu desktop disk metadata detects the profile tuple" {
+    const tuple = parseUbuntuDiskInfo("Ubuntu 26.04 \"Resolute Raccoon\" - Release arm64 (20260423.1)").?;
+    try std.testing.expectEqualStrings("26.04", tuple.version);
+    try std.testing.expectEqual(model.Arch.aarch64, tuple.arch);
+}
+
+test "Ubuntu disk metadata requires the Ubuntu prefix" {
+    try std.testing.expect(parseUbuntuDiskInfo("Custom media Ubuntu 26.04 arm64") == null);
+    try std.testing.expect(parseUbuntuDiskInfo("UbuntuX 26.04 arm64") == null);
 }
 
 fn writeCasperLayer(temp: *std.testing.TmpDir, casper_dir: []const u8, name: []const u8, content: []const u8) !void {
