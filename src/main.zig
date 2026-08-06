@@ -77,11 +77,18 @@ pub fn main(init: std.process.Init) !void {
     var stdin_buffer: [1024]u8 = undefined;
     var stdin_file = std.Io.File.Reader.init(.stdin(), init.io, &stdin_buffer);
 
-    // `--version` 是纯构建溯源查询，不依赖安装根。必须和 daemon 一样在 paths
-    // bootstrap 前短路，否则尚未 setup 的发布包无法执行最基本的版本核验。
+    // `--version` 和 `--help` 是纯元数据查询，不依赖安装根。必须在 paths
+    // bootstrap 前短路，否则尚未 setup 的发布包无法执行版本核验或获取帮助。
     if (versionOnly(init.minimal.args)) {
         try printVersion(out);
         try out.flush();
+        return;
+    }
+    if (helpOnly(init.minimal.args)) {
+        const exit_code = try run(init, out, err_out, &stdin_file.interface);
+        out.flush() catch {};
+        err_out.flush() catch {};
+        if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
 
@@ -104,6 +111,18 @@ fn versionOnly(args: std.process.Args) bool {
     _ = iterator.next();
     const flag = iterator.next() orelse return false;
     return (std.mem.eql(u8, flag, "--version") or std.mem.eql(u8, flag, "-v")) and iterator.next() == null;
+}
+
+/// 检测 `--help`/`-h`（包括带子命令的形式如 `setup --help`、`profile rootfs --help`）。
+/// 这些请求不需要安装根，在 bootstrap 前短路，否则尚未 setup 的发布包
+/// 无法获取任何帮助信息。
+fn helpOnly(args: std.process.Args) bool {
+    var iterator = args.iterate();
+    _ = iterator.next();
+    while (iterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
 }
 
 /// 构建命令树并执行一次参数解析。
@@ -422,7 +441,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try node_trace.addFlags(&.{
         .{ .name = "session", .description = "Exact 32-character boot session identifier", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "latest", .description = "Select the latest retained session (default behavior; mutually exclusive with --session)", .type = .Bool, .default_value = .{ .Bool = false } },
-        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.require().events_path } },
+        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = "" } },
     });
     try addOutputFlag(node_trace);
 
@@ -858,8 +877,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
         .help = "All filesystem effects are bounded by the bootstrapped install root. --reset-state backs up and clears runtime state only. --reset-all also regenerates startup config but preserves catalog/assets unless combined with --purge-data or --purge-all. --purge-all is the irreversible fresh-replacement path and may be followed by --reconfigure. Destructive non-interactive operations require --yes; reset/purge requires the daemon to be stopped. Examples: `nodeforge setup --reset-state --yes`; fresh replacement: `nodeforge setup --reset-all --purge-all --reconfigure --yes`. Constraints: --purge-data/--purge-all require --reset-all and are mutually exclusive; only --reset-all may compose with --reconfigure.",
     }, setupHandler);
     try setup.addFlags(&.{
-        .{ .name = "install-root", .description = "New or existing absolute install root", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "non-interactive", .description = "Do not prompt for input", .type = .Bool, .default_value = .{ .Bool = false } },
+        .{ .name = "install-root", .description = "Install root path (processed before CLI parsing; also accepted here for --help clarity)", .type = .String, .default_value = .{ .String = "" } },
+        .{ .name = "non-interactive", .description = "Skip interactive prompts; use flag defaults or --yes for destructive ops", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "yes", .description = "Confirm a destructive or service lifecycle action", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "reconfigure", .description = "Validate config/catalog and republish the systemd unit without starting or restarting it; may follow --reset-all", .type = .Bool, .default_value = .{ .Bool = false } },
         .{ .name = "import-config", .description = "Import a complete startup config JSON during initialization or reconfiguration", .type = .String, .default_value = .{ .String = "" } },
@@ -1584,6 +1603,39 @@ fn itemUsageError(ctx: zli.CommandContext, message: []const u8) error{InvalidIte
     return error.InvalidItemUsage;
 }
 
+/// 交互式提示：显示提示和默认值，读取用户输入。空行返回默认值。
+fn promptWithDefault(ctx: zli.CommandContext, prompt: []const u8, default_value: []const u8) ![]const u8 {
+    try ctx.writer.print("{s} [{s}]: ", .{ prompt, default_value });
+    try ctx.writer.flush();
+    const maybe_line = ctx.reader.takeDelimiter('\n') catch return default_value;
+    const line = maybe_line orelse return default_value;
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return default_value;
+    return try ctx.allocator.dupe(u8, trimmed);
+}
+
+/// 交互式提示 u16 值；非法输入回落到默认值。
+fn promptU16(ctx: zli.CommandContext, prompt: []const u8, default_value: u16) !u16 {
+    const default_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{default_value});
+    const input = try promptWithDefault(ctx, prompt, default_str);
+    return std.fmt.parseInt(u16, input, 10) catch {
+        try errorWriter(ctx).print("warn: invalid number, using default {d}\n", .{default_value});
+        return default_value;
+    };
+}
+
+/// 列出可用网卡（排除 lo），读取 /sys/class/net。
+fn listNetworkInterfaces(ctx: zli.CommandContext) !void {
+    var dir = std.Io.Dir.cwd().openDir(ctx.io, "/sys/class/net", .{ .iterate = true, .follow_symlinks = false }) catch return;
+    defer dir.close(ctx.io);
+    var iter = dir.iterate();
+    try ctx.writer.print("Available network interfaces:\n", .{});
+    while (try iter.next(ctx.io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "lo")) continue;
+        try ctx.writer.print("  {s}\n", .{entry.name});
+    }
+}
+
 fn setupHandler(ctx: zli.CommandContext) !void {
     const p = nodeforge.paths.require();
     const dry_run = ctx.flag("dry-run", bool);
@@ -1624,7 +1676,7 @@ fn setupHandler(ctx: zli.CommandContext) !void {
             return;
         }
     }
-    const network: nodeforge.setup.Network = .{
+    var network: nodeforge.setup.Network = .{
         .log_level = requested_log_level orelse .debug,
         .bind_interface = ctx.flag("bind-interface", []const u8),
         .server_ip = ctx.flag("server-ip", []const u8),
@@ -1704,6 +1756,33 @@ fn setupHandler(ctx: zli.CommandContext) !void {
         _ = std.Io.Dir.cwd().statFile(ctx.io, p.config_path, .{ .follow_symlinks = false }) catch break :blk false;
         break :blk true;
     };
+    // 首次安装且非 --non-interactive 且无 --import-config 时进入交互式网络配置。
+    // 操作员可逐项确认或覆盖默认值；空行回车接受方括号内的默认值。
+    if (!config_exists and !ctx.flag("non-interactive", bool) and import_config_path.len == 0 and !dry_run) {
+        try ctx.writer.print("\n=== NodeForge Initial Setup ===\n", .{});
+        try ctx.writer.print("Install root: {s}\n\n", .{p.install_root});
+        listNetworkInterfaces(ctx) catch {};
+        network.bind_interface = try promptWithDefault(ctx, "PXE bind interface", network.bind_interface);
+        network.server_ip = try promptWithDefault(ctx, "Server IP", network.server_ip);
+        network.http_port = try promptU16(ctx, "HTTP/management port", network.http_port);
+        network.subnet = try promptWithDefault(ctx, "DHCP subnet CIDR", network.subnet);
+        network.pool_start = try promptWithDefault(ctx, "DHCP pool start", network.pool_start);
+        network.pool_end = try promptWithDefault(ctx, "DHCP pool end", network.pool_end);
+        try ctx.writer.print("\nConfiguration summary:\n", .{});
+        try ctx.writer.print("  Install root:    {s}\n", .{p.install_root});
+        try ctx.writer.print("  Bind interface:  {s}\n", .{network.bind_interface});
+        try ctx.writer.print("  Server IP:       {s}\n", .{network.server_ip});
+        try ctx.writer.print("  HTTP port:       {d}\n", .{network.http_port});
+        try ctx.writer.print("  DHCP subnet:     {s}\n", .{network.subnet});
+        try ctx.writer.print("  DHCP pool:       {s} - {s}\n", .{ network.pool_start, network.pool_end });
+        try ctx.writer.flush();
+        const confirm = try promptWithDefault(ctx, "\nProceed with installation?", "y");
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, confirm, " \t\r"), "y") and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, confirm, " \t\r"), "yes")) {
+            try ctx.writer.writeAll("Installation cancelled.\n");
+            setExitCode(ctx, 1);
+            return;
+        }
+    }
     if (!config_exists) {
         try nodeforge.setup.initialize(ctx.io, ctx.allocator, p, network, if (imported_config) |*candidate| &candidate.value else null);
         try views.success(ctx.writer, "NodeForge initialized", &.{ .{ .label = "Install root", .value = p.install_root }, .{ .label = "Config", .value = p.config_path }, .{ .label = "Catalog", .value = p.catalog_dir } });
@@ -5949,7 +6028,9 @@ fn eventsListHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     const filters = eventFiltersFromContext(ctx, true) orelse return;
     var events: [1000]nodeforge.events.ReadEvent = undefined;
-    const result = cli_events.read(ctx.io, ctx.allocator, ctx.flag("events-path", []const u8), &filters, &events) catch |err| {
+    const ep = ctx.flag("events-path", []const u8);
+    const events_path = if (ep.len != 0) ep else nodeforge.paths.require().events_path;
+    const result = cli_events.read(ctx.io, ctx.allocator, events_path, &filters, &events) catch |err| {
         const message = try std.fmt.allocPrint(ctx.allocator, "cannot read local history ({t})", .{err});
         try writeCommandError(ctx, "events.read_failed", message, 1);
         return;
@@ -5999,7 +6080,8 @@ fn eventsFollowHandler(ctx: zli.CommandContext) !void {
         return;
     }
     const filters = eventFiltersFromContext(ctx, false) orelse return;
-    const path = ctx.flag("events-path", []const u8);
+    const ep = ctx.flag("events-path", []const u8);
+    const path = if (ep.len != 0) ep else nodeforge.paths.require().events_path;
     var offset: u64 = blk: {
         var file = std.Io.Dir.cwd().openFile(ctx.io, path, .{}) catch |err| {
             const message = try std.fmt.allocPrint(ctx.allocator, "events: active file unavailable ({t})", .{err});
@@ -6059,7 +6141,8 @@ fn traceHandler(ctx: zli.CommandContext) !void {
     _ = outputFromContext(ctx) orelse return;
     const node_id = ctx.getArg("node_id") orelse return;
     const requested_session = ctx.flag("session", []const u8);
-    const events_path = ctx.flag("events-path", []const u8);
+    const ep = ctx.flag("events-path", []const u8);
+    const events_path = if (ep.len != 0) ep else nodeforge.paths.require().events_path;
     if (requested_session.len != 0 and !nodeforge.events.validCorrelationId(requested_session)) {
         try writeCommandError(ctx, "trace.invalid_session", "--session must be 32 lowercase hexadecimal characters", 2);
         return;
@@ -6234,7 +6317,7 @@ fn addEventsFilterFlags(command: *zli.Command, comptime include_limit: bool) !vo
         .{ .name = "session", .description = "Filter by boot_session_id", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "since", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
         .{ .name = "until", .description = "Inclusive RFC 3339 UTC or unix:<seconds> bound", .type = .String, .default_value = .{ .String = "" } },
-        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = nodeforge.paths.require().events_path } },
+        .{ .name = "events-path", .description = "Local Event JSONL path (development or recovery override)", .type = .String, .default_value = .{ .String = "" } },
     });
     if (include_limit) try command.addFlag(.{ .name = "limit", .description = "Latest matching records (1-1000)", .type = .Int, .default_value = .{ .Int = 100 } });
     try addOutputFlag(command);
@@ -6362,24 +6445,24 @@ fn jsonDisplay(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const u8
 
 /// 为一个命令声明默认 config 路径覆盖参数。
 fn addConfigPathFlag(command: *zli.Command) !void {
-    try command.addFlag(.{
-        .name = "config",
-        .shortcut = "c",
-        .description = "Config JSON path",
-        .type = .String,
-        .default_value = .{ .String = nodeforge.config.defaultPath() },
-    });
+try command.addFlag(.{
+.name = "config",
+.shortcut = "c",
+.description = "Config JSON path",
+.type = .String,
+.default_value = .{ .String = "" },
+});
 }
 
 /// 为一个命令声明默认 catalog 路径覆盖参数。
 fn addCatalogPathFlag(command: *zli.Command) !void {
-    try command.addFlag(.{
-        .name = "catalog",
-        .shortcut = "C",
-        .description = "Catalog directory path",
-        .type = .String,
-        .default_value = .{ .String = nodeforge.catalog_store.defaultPath() },
-    });
+try command.addFlag(.{
+.name = "catalog",
+.shortcut = "C",
+.description = "Catalog directory path",
+.type = .String,
+.default_value = .{ .String = "" },
+});
 }
 
 /// 为支持 human 或 JSON 结果的命令声明输出格式参数。
@@ -6487,16 +6570,17 @@ const CatalogLoad = struct {
 
 /// 加载 catalog；文件不存在按 M0 初始空 catalog 处理，其他错误输出后返回 null。
 fn loadCatalogOrEmpty(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    out: *std.Io.Writer,
-    debug: bool,
+io: std.Io,
+allocator: std.mem.Allocator,
+path: []const u8,
+out: *std.Io.Writer,
+debug: bool,
 ) ?CatalogLoad {
-    const parsed = nodeforge.catalog_store.load(io, allocator, path) catch |err| switch (err) {
+    const resolved_path = if (path.len != 0) path else nodeforge.paths.require().catalog_dir;
+    const parsed = nodeforge.catalog_store.load(io, allocator, resolved_path) catch |err| switch (err) {
         error.FileNotFound => return .{ .parsed = null, .empty = nodeforge.catalog_store.empty() },
         else => {
-            printLoadError(out, "catalog", path, err, debug) catch {};
+            printLoadError(out, "catalog", resolved_path, err, debug) catch {};
             return null;
         },
     };
@@ -6505,22 +6589,23 @@ fn loadCatalogOrEmpty(
 
 /// 加载并执行单文件配置校验；失败时负责输出错误并释放已分配内容。
 fn loadConfig(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    out: *std.Io.Writer,
-    debug: bool,
+io: std.Io,
+allocator: std.mem.Allocator,
+path: []const u8,
+out: *std.Io.Writer,
+debug: bool,
 ) ?std.json.Parsed(nodeforge.model.AppConfig) {
+const resolved_path = if (path.len != 0) path else nodeforge.paths.require().config_path;
     // CLI 每次只执行一个命令；在公共配置入口同步当前线程的 HTTP 诊断目标，
     // 使所有 management client 调用共享一致的 `--debug` 行为，无需把布尔参数
     // 逐层穿透六十余个资源包装函数。false 必须显式清空，避免同进程测试串线。
     nodeforge.management_client.configureDiagnostics(if (debug) out else null);
-    var parsed = nodeforge.config.load(io, allocator, path) catch |err| {
-        printLoadError(out, "config", path, err, debug) catch {};
+    var parsed = nodeforge.config.load(io, allocator, resolved_path) catch |err| {
+        printLoadError(out, "config", resolved_path, err, debug) catch {};
         return null;
     };
     nodeforge.config_validate.validateConfig(&parsed.value) catch |err| {
-        printValidationError(out, "config", path, err, debug) catch {};
+        printValidationError(out, "config", resolved_path, err, debug) catch {};
         parsed.deinit();
         return null;
     };

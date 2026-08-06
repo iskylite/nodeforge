@@ -23,6 +23,12 @@ pub fn main(init: std.process.Init) void {
         stdout_file.interface.flush() catch {};
         return;
     }
+    if (helpOnly(init.minimal.args)) {
+        const exit_code = run(init, &stdout_file.interface, &stdin_file.interface) catch 1;
+        stdout_file.interface.flush() catch {};
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    }
 
     nodeforge.paths.bootstrap(init.io, init.arena.allocator(), init.minimal.args) catch |err| {
         nodeforge.observe_log.err("install root bootstrap failed: {t}", .{err});
@@ -40,6 +46,16 @@ fn versionOnly(args: std.process.Args) bool {
     _ = iterator.next();
     const flag = iterator.next() orelse return false;
     return (std.mem.eql(u8, flag, "--version") or std.mem.eql(u8, flag, "-v")) and iterator.next() == null;
+}
+
+/// 检测 `--help`/`-h`，在路径自举前短路，使未安装环境也能获取帮助。
+fn helpOnly(args: std.process.Args) bool {
+    var iterator = args.iterate();
+    _ = iterator.next();
+    while (iterator.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return true;
+    }
+    return false;
 }
 
 /// 构建并执行一次 `nodeforged` 参数解析。
@@ -65,17 +81,12 @@ fn run(init: std.process.Init, out: *std.Io.Writer, in: *std.Io.Reader) !u8 {
 /// 声明 `nodeforged` 的完整命令树、默认路径和三种运行模式。
 /// 正常部署无需路径参数；`--config` 和 `--catalog` 仅用于开发、迁移或诊断覆盖。
 fn buildCli(init_options: zli.InitOptions) !*zli.Command {
-    const help = try std.fmt.allocPrint(
-        init_options.allocator,
-        "Normal deployments load config and catalog from {s}.\nUse overrides for development, testing, migration, or temporary diagnostics.",
-        .{nodeforge.paths.require().install_root},
-    );
     const root = try zli.Command.init(init_options, .{
         .name = "nodeforged",
         .description = "NodeForge daemon",
         .version = semantic_version,
         .usage = "nodeforged [options]",
-        .help = help,
+        .help = "Normal deployments load config and catalog from the bootstrapped install root.\nUse overrides for development, testing, migration, or temporary diagnostics.",
     }, daemonHandler);
     try root.addFlags(&.{
         .{
@@ -96,14 +107,14 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
             .shortcut = "c",
             .description = "Override config JSON path",
             .type = .String,
-            .default_value = .{ .String = nodeforge.config.defaultPath() },
+            .default_value = .{ .String = "" },
         },
         .{
             .name = "catalog",
             .shortcut = "C",
             .description = "Override catalog JSON path",
             .type = .String,
-            .default_value = .{ .String = nodeforge.catalog_store.defaultPath() },
+            .default_value = .{ .String = "" },
         },
         .{
             .name = "check-config",
@@ -160,14 +171,16 @@ fn daemonHandler(ctx: zli.CommandContext) !void {
     const default_logging: nodeforge.model.LoggingConfig = .{};
     configureLogOutput(ctx.io, requested_log_output, log_file_override, &default_logging);
     if (debug) nodeforge.observe_log.setLevel(.debug);
-    const config_path = ctx.flag("config", []const u8);
-    const catalog_path = ctx.flag("catalog", []const u8);
+    const config_path_raw = ctx.flag("config", []const u8);
+    const catalog_path_raw = ctx.flag("catalog", []const u8);
 
     // v0.4 bootstrap is fail-closed for the normal install-root paths:
     // deployment.json and the v2 marker are checked before any state loader.
     // Explicit --config/--catalog overrides remain read-only diagnostic inputs
     // for the v0.3 regression fixtures and never start the installed service.
     const installed_paths = nodeforge.paths.require();
+    const config_path = if (config_path_raw.len != 0) config_path_raw else installed_paths.config_path;
+    const catalog_path = if (catalog_path_raw.len != 0) catalog_path_raw else installed_paths.catalog_dir;
     const using_installed_pair = std.mem.eql(u8, config_path, installed_paths.config_path) and std.mem.eql(u8, catalog_path, installed_paths.catalog_dir);
     var deployment: ?std.json.Parsed(nodeforge.deployment_manifest.Manifest) = null;
     if (using_installed_pair) {
