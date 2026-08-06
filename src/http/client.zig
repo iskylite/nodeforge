@@ -599,20 +599,26 @@ pub const RootfsBuildOptions = struct {
     keep_staging: bool = false,
     /// 跳过 OS 层与 rootfs-build 步骤，仅从已保留树 mksquashfs 再发布。
     from_staging: bool = false,
+    /// v0.4.1: from-staging 时启动面内核选择（keep|auto|<release>）。
+    /// keep = 不改启动面（与 v0.4 兼容）；非 keep 时扫描树内内核并导入。
+    kernel_release: ?[]const u8 = null,
 };
 
 fn renderRootfsBuildBody(body: []u8, opts: RootfsBuildOptions) ![]const u8 {
+    const kr: []const u8 = opts.kernel_release orelse "keep";
     if (opts.if_input_digest) |digest|
-        return std.fmt.bufPrint(body, "{{\"if_input_digest\":{f},\"new_ssh_keys\":{s},\"keep_staging\":{s},\"from_staging\":{s}}}", .{
+        return std.fmt.bufPrint(body, "{{\"if_input_digest\":{f},\"new_ssh_keys\":{s},\"keep_staging\":{s},\"from_staging\":{s},\"kernel_release\":{f}}}", .{
             std.json.fmt(digest, .{}),
             if (opts.new_ssh_keys) "true" else "false",
             if (opts.keep_staging) "true" else "false",
             if (opts.from_staging) "true" else "false",
+            std.json.fmt(kr, .{}),
         });
-    return std.fmt.bufPrint(body, "{{\"new_ssh_keys\":{s},\"keep_staging\":{s},\"from_staging\":{s}}}", .{
+    return std.fmt.bufPrint(body, "{{\"new_ssh_keys\":{s},\"keep_staging\":{s},\"from_staging\":{s},\"kernel_release\":{f}}}", .{
         if (opts.new_ssh_keys) "true" else "false",
         if (opts.keep_staging) "true" else "false",
         if (opts.from_staging) "true" else "false",
+        std.json.fmt(kr, .{}),
     });
 }
 

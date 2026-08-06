@@ -852,6 +852,17 @@ fn parseArgs(self: *Command, argsIterator: *std.process.Args.Iterator) CommandPa
         try current_cmd.init_options.writer.flush();
         const reverse_idx = argsIterator.inner.remaining.len;
 
+        // NodeForge vendor patch: support "--" as end-of-options separator.
+        // When encountered, all remaining arguments are treated as positional,
+        // regardless of whether they start with "-". The "--" itself is not
+        // included in positional_args. This follows the POSIX convention.
+        if (std.mem.eql(u8, arg, "--")) {
+            while (argsIterator.next()) |remaining_arg| {
+                try positional_args.append(allocator, remaining_arg);
+            }
+            break;
+        }
+
         const arg_type = assessArgType(arg);
 
         switch (arg_type) {

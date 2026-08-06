@@ -93,6 +93,10 @@ pub const provision_rootfs_os_builder = @import("provision/rootfs_os_builder.zig
 pub const provision_namespaced_chroot_executor = @import("provision/namespaced_chroot_executor.zig");
 /// v0.2 initrd builder：用 dracut 构建最小 initramfs，注入 nodeforge-initrd 二进制和 /init 脚本。
 pub const provision_initrd_build_executor = @import("provision/initrd_build_executor.zig");
+/// v0.4.1 rootfs staging 会话环境：enter/exec 交互 shell 与非交互命令执行。
+pub const provision_staging_session = @import("provision/staging_session.zig");
+/// v0.4.1 rootfs staging 内核扫描：扫描保留树内的 vmlinuz/modules 并支持选择。
+pub const provision_staging_kernel_import = @import("provision/staging_kernel_import.zig");
 pub const initrd_memory = @import("initrd/memory.zig");
 pub const initrd_download = @import("initrd/download.zig");
 
@@ -104,6 +108,8 @@ test {
     _ = provision_rootfs_os_builder;
     _ = provision_namespaced_chroot_executor;
     _ = provision_initrd_build_executor;
+    _ = provision_staging_session;
+    _ = provision_staging_kernel_import;
     _ = initrd_memory;
     _ = initrd_download;
 }

@@ -573,6 +573,8 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try profile_rootfs_build.addFlag(.{ .name = "new-ssh-keys", .description = "Rotate the profile ssh identity (new immutable revision) before building", .type = .Bool, .default_value = .{ .Bool = false } });
     try profile_rootfs_build.addFlag(.{ .name = "keep-staging", .description = "Retain the unpacked rootfs tree under work/rootfs-staging/<digest> for chroot inspection", .type = .Bool, .default_value = .{ .Bool = false } });
     try profile_rootfs_build.addFlag(.{ .name = "from-staging", .description = "Re-pack squashfs from a previously retained staging tree (skip OS layer and rootfs-build steps)", .type = .Bool, .default_value = .{ .Bool = false } });
+    // v0.4.1 §6.4: from-staging 时选择启动面内核（keep|auto|<release>）。
+    try profile_rootfs_build.addFlag(.{ .name = "kernel-release", .description = "Kernel release selection for from-staging: keep (default), auto, or explicit release string", .type = .String, .default_value = .{ .String = "keep" } });
     try profile_rootfs_build.addFlag(.{ .name = "detach", .description = "Return immediately with the durable operation id", .type = .Bool, .default_value = .{ .Bool = false } });
     try addConfigPathFlag(profile_rootfs_build);
     try addOutputFlag(profile_rootfs_build);
@@ -582,7 +584,7 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_rootfs_status);
     try addOutputFlag(profile_rootfs_status);
     try addDebugFlag(profile_rootfs_status);
-    const profile_rootfs_staging = try zli.Command.init(init_options, .{ .name = "staging", .description = "Query or remove retained rootfs staging trees", .usage = "nodeforge profile rootfs staging <list|show|remove> ..." }, showCurrentHelp);
+    const profile_rootfs_staging = try zli.Command.init(init_options, .{ .name = "staging", .description = "Query, remove, or enter retained rootfs staging trees (v0.4.1: enter/exec/kernels)", .usage = "nodeforge profile rootfs staging <list|show|remove|enter|exec|kernels> ..." }, showCurrentHelp);
     const profile_rootfs_staging_list = try zli.Command.init(init_options, .{ .name = "list", .description = "List retained rootfs staging trees", .usage = "nodeforge profile rootfs staging list [options]" }, profileRootfsStagingListHandler);
     try addConfigPathFlag(profile_rootfs_staging_list);
     try addOutputFlag(profile_rootfs_staging_list);
@@ -597,7 +599,52 @@ fn buildCli(init_options: zli.InitOptions) !*zli.Command {
     try addConfigPathFlag(profile_rootfs_staging_remove);
     try addOutputFlag(profile_rootfs_staging_remove);
     try addDebugFlag(profile_rootfs_staging_remove);
-    try profile_rootfs_staging.addCommands(&.{ profile_rootfs_staging_list, profile_rootfs_staging_show, profile_rootfs_staging_remove });
+    // v0.4.1 §3.5: profile rootfs staging enter/exec/kernels
+    const profile_rootfs_staging_enter = try zli.Command.init(init_options, .{ .name = "enter", .description = "Enter an interactive shell on a retained staging tree (v0.4.1)", .usage = "nodeforge profile rootfs staging enter <profile> [options]" }, profileRootfsStagingEnterHandler);
+    try profile_rootfs_staging_enter.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "digest", .description = "Use a specific staging digest instead of the profile's current one", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "shell", .description = "Shell path inside the session (default /bin/bash)", .type = .String, .default_value = .{ .String = "/bin/bash" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "workdir", .description = "Working directory inside the chroot", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "env", .description = "Comma-separated KEY=VALUE environment variables", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "bind", .description = "Comma-separated host:guest bind mounts", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "no-cgroup", .description = "Disable cgroup mounting (mutually exclusive with limit flags)", .type = .Bool, .default_value = .{ .Bool = false } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "memory-max", .description = "cgroup v2 memory.max limit (e.g. 2G → bytes)", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "memory-swap", .description = "cgroup v2 memory.swap.max limit (e.g. 0 or 1G)", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "cpu-max", .description = "cgroup v2 cpu.max (percent like 50% or 'quota period')", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "pids-max", .description = "cgroup v2 pids.max limit", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "persist-tmp", .description = "Use in-tree /tmp instead of tmpfs", .type = .Bool, .default_value = .{ .Bool = false } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "hostname", .description = "uts hostname for the session", .type = .String, .default_value = .{ .String = "nodeforge-staging" } });
+    try profile_rootfs_staging_enter.addFlag(.{ .name = "quiet", .description = "Reduce step logging (errors and result only)", .type = .Bool, .default_value = .{ .Bool = false } });
+    try addConfigPathFlag(profile_rootfs_staging_enter);
+    try addOutputFlag(profile_rootfs_staging_enter);
+    try addDebugFlag(profile_rootfs_staging_enter);
+    const profile_rootfs_staging_exec = try zli.Command.init(init_options, .{ .name = "exec", .description = "Execute a command non-interactively on a retained staging tree (v0.4.1)", .usage = "nodeforge profile rootfs staging exec <profile> [options] [--script PATH | -- <cmd>...]" }, profileRootfsStagingExecHandler);
+    try profile_rootfs_staging_exec.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try profile_rootfs_staging_exec.addPositionalArg(.{ .name = "command", .description = "Command to execute (use -- to separate); mutually exclusive with --script", .required = false, .variadic = true });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "digest", .description = "Use a specific staging digest instead of the profile's current one", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "script", .description = "Host script path to bind and execute inside the session (mutually exclusive with positional command)", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "workdir", .description = "Working directory inside the chroot", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "env", .description = "Comma-separated KEY=VALUE environment variables", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "bind", .description = "Comma-separated host:guest bind mounts", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "no-cgroup", .description = "Disable cgroup mounting (mutually exclusive with limit flags)", .type = .Bool, .default_value = .{ .Bool = false } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "memory-max", .description = "cgroup v2 memory.max limit (e.g. 2G → bytes)", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "memory-swap", .description = "cgroup v2 memory.swap.max limit (e.g. 0 or 1G)", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "cpu-max", .description = "cgroup v2 cpu.max (percent like 50% or 'quota period')", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "pids-max", .description = "cgroup v2 pids.max limit", .type = .String, .default_value = .{ .String = "" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "persist-tmp", .description = "Use in-tree /tmp instead of tmpfs", .type = .Bool, .default_value = .{ .Bool = false } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "hostname", .description = "uts hostname for the session", .type = .String, .default_value = .{ .String = "nodeforge-staging" } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "timeout", .description = "Command timeout in seconds (0 = no timeout)", .type = .Int, .default_value = .{ .Int = 0 } });
+    try profile_rootfs_staging_exec.addFlag(.{ .name = "quiet", .description = "Reduce step logging (errors and result only)", .type = .Bool, .default_value = .{ .Bool = false } });
+    try addConfigPathFlag(profile_rootfs_staging_exec);
+    try addOutputFlag(profile_rootfs_staging_exec);
+    try addDebugFlag(profile_rootfs_staging_exec);
+    const profile_rootfs_staging_kernels = try zli.Command.init(init_options, .{ .name = "kernels", .description = "Scan a retained staging tree for kernel releases (v0.4.1)", .usage = "nodeforge profile rootfs staging kernels <profile> [options]" }, profileRootfsStagingKernelsHandler);
+    try profile_rootfs_staging_kernels.addPositionalArg(.{ .name = "name", .description = "Diskless profile name", .required = true });
+    try profile_rootfs_staging_kernels.addFlag(.{ .name = "digest", .description = "Use a specific staging digest instead of the profile's current one", .type = .String, .default_value = .{ .String = "" } });
+    try addConfigPathFlag(profile_rootfs_staging_kernels);
+    try addOutputFlag(profile_rootfs_staging_kernels);
+    try addDebugFlag(profile_rootfs_staging_kernels);
+    try profile_rootfs_staging.addCommands(&.{ profile_rootfs_staging_list, profile_rootfs_staging_show, profile_rootfs_staging_remove, profile_rootfs_staging_enter, profile_rootfs_staging_exec, profile_rootfs_staging_kernels });
     try profile_rootfs.addCommands(&.{ profile_rootfs_plan, profile_rootfs_build, profile_rootfs_status, profile_rootfs_staging });
     try profile.addCommands(&.{ profile_create, profile_clone, profile_remove, profile_list, profile_show, profile_set, profile_unset, profile_rootfs });
 
@@ -4413,6 +4460,7 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     const new_ssh_keys = ctx.flag("new-ssh-keys", bool);
     const keep_staging = ctx.flag("keep-staging", bool);
     const from_staging = ctx.flag("from-staging", bool);
+    const kernel_release_raw = ctx.flag("kernel-release", []const u8);
     if (from_staging and new_ssh_keys) {
         try writeCommandError(ctx, "rootfs.invalid", "--from-staging cannot be combined with --new-ssh-keys", 2);
         return;
@@ -4422,6 +4470,7 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
         .new_ssh_keys = new_ssh_keys,
         .keep_staging = keep_staging,
         .from_staging = from_staging,
+        .kernel_release = if (kernel_release_raw.len > 0) kernel_release_raw else null,
     };
     if (ctx.flag("detach", bool)) {
         const response = try allocManagementResponse(ctx);
@@ -4447,6 +4496,7 @@ fn profileRootfsBuildHandler(ctx: zli.CommandContext) !void {
     if (if_input_digest) |d| try errorWriter(ctx).print("Anti-drift digest: {s}\n", .{d});
     if (keep_staging) try errorWriter(ctx).print("Keep staging: enabled\n", .{});
     if (from_staging) try errorWriter(ctx).print("From staging: re-pack only\n", .{});
+    if (kernel_release_raw.len > 0 and !std.mem.eql(u8, kernel_release_raw, "keep")) try errorWriter(ctx).print("Kernel release: {s}\n", .{kernel_release_raw});
     var reason: [256]u8 = [_]u8{0} ** 256;
     const result = nodeforge.management_client.rootfsBuild(ctx.io, config.value.server.http_port, name, build_opts, &reason);
     if (!result.healthy) {
@@ -4608,6 +4658,214 @@ fn profileRootfsStagingRemoveHandler(ctx: zli.CommandContext) !void {
     }
     const human = try std.fmt.allocPrint(ctx.allocator, "rootfs staging removed for profile {s}", .{name});
     try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = "{\"ok\":true}" });
+}
+
+// ── v0.4.1: staging enter / exec / kernels ──────────────────────────
+
+/// 解析逗号分隔的 KEY=VALUE 环境变量列表。
+fn parseCommaList(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    if (raw.len == 0) return &.{};
+    var list = std.ArrayList([]const u8).empty;
+    defer list.deinit(allocator);
+    var iter = std.mem.splitScalar(u8, raw, ',');
+    while (iter.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) try list.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// 从 staging store 或 --digest 查找保留树路径。
+fn resolveStagingTree(
+    ctx: zli.CommandContext,
+    name: []const u8,
+    digest_override: []const u8,
+) !?struct { path: []const u8, digest: []const u8 } {
+    const p = nodeforge.paths.require();
+    var staging_store = nodeforge.state_rootfs_staging_store.Store.init(ctx.allocator, p.rootfs_stagings_path);
+    defer staging_store.deinit();
+    staging_store.load(ctx.io) catch |err| {
+        try errorWriter(ctx).print("error: cannot load staging store: {t}\n", .{err});
+        return null;
+    };
+
+    if (digest_override.len > 0) {
+        if (staging_store.find(digest_override)) |entry| {
+            return .{ .path = try ctx.allocator.dupe(u8, entry.path), .digest = try ctx.allocator.dupe(u8, entry.rootfs_input_digest) };
+        }
+        try errorWriter(ctx).print("error: no staging tree found for digest {s}\n", .{digest_override});
+        return null;
+    }
+
+    if (staging_store.findByProfile(name)) |entry| {
+        return .{ .path = try ctx.allocator.dupe(u8, entry.path), .digest = try ctx.allocator.dupe(u8, entry.rootfs_input_digest) };
+    }
+    try errorWriter(ctx).print("error: no retained staging tree found for profile {s}\n", .{name});
+    return null;
+}
+
+/// 构建 cgroup 限额参数。
+fn buildCgroupLimits(ctx: zli.CommandContext) nodeforge.provision_staging_session.CgroupLimits {
+    const memory_max = ctx.flag("memory-max", []const u8);
+    const memory_swap = ctx.flag("memory-swap", []const u8);
+    const cpu_max = ctx.flag("cpu-max", []const u8);
+    const pids_max = ctx.flag("pids-max", []const u8);
+    return .{
+        .memory_max = if (memory_max.len > 0) memory_max else null,
+        .memory_swap = if (memory_swap.len > 0) memory_swap else null,
+        .cpu_max = if (cpu_max.len > 0) cpu_max else null,
+        .pids_max = if (pids_max.len > 0) pids_max else null,
+    };
+}
+
+fn profileRootfsStagingEnterHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    const digest_override = ctx.flag("digest", []const u8);
+
+    const resolved = (try resolveStagingTree(ctx, name, digest_override)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+
+    // 收集 env 和 bind 列表
+    const env_raw = ctx.flag("env", []const u8);
+    const bind_raw = ctx.flag("bind", []const u8);
+    const env_list = try parseCommaList(ctx.allocator, env_raw);
+    const bind_list = try parseCommaList(ctx.allocator, bind_raw);
+
+    const workdir_raw = ctx.flag("workdir", []const u8);
+    const shell = ctx.flag("shell", []const u8);
+
+    const opts: nodeforge.provision_staging_session.SessionOptions = .{
+        .staging_path = resolved.path,
+        .digest = resolved.digest,
+        .shell = if (shell.len > 0) shell else "/bin/bash",
+        .workdir = if (workdir_raw.len > 0) workdir_raw else null,
+        .env = env_list,
+        .binds = bind_list,
+        .no_cgroup = ctx.flag("no-cgroup", bool),
+        .limits = buildCgroupLimits(ctx),
+        .persist_tmp = ctx.flag("persist-tmp", bool),
+        .hostname = ctx.flag("hostname", []const u8),
+        .quiet = ctx.flag("quiet", bool),
+    };
+
+    const p = nodeforge.paths.require();
+    const result = nodeforge.provision_staging_session.executeSession(ctx.io, ctx.allocator, opts, p.run_dir, errorWriter(ctx)) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "staging session failed: {t}", .{err});
+        try writeCommandError(ctx, "rootfs.staging_session_error", msg, 1);
+        return;
+    };
+    defer result.deinit(ctx.allocator);
+    setExitCode(ctx, result.exit_code);
+}
+
+fn profileRootfsStagingExecHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    const digest_override = ctx.flag("digest", []const u8);
+
+    const script_raw = ctx.flag("script", []const u8);
+    const cmd_parts = if (ctx.positional_args.len > 1) ctx.positional_args[1..] else &.{};
+    if (script_raw.len > 0 and cmd_parts.len > 0) {
+        try writeCommandError(ctx, "rootfs.staging_exec_invalid", "--script and positional command are mutually exclusive", 2);
+        return;
+    }
+    if (script_raw.len == 0 and cmd_parts.len == 0) {
+        try writeCommandError(ctx, "rootfs.staging_exec_missing_command", "no command specified (use --script PATH or -- <cmd>...)", 2);
+        return;
+    }
+    const command: ?[]const u8 = if (cmd_parts.len > 0) try std.mem.join(ctx.allocator, " ", cmd_parts) else null;
+
+    const resolved = (try resolveStagingTree(ctx, name, digest_override)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+
+    const env_raw = ctx.flag("env", []const u8);
+    const bind_raw = ctx.flag("bind", []const u8);
+    const env_list = try parseCommaList(ctx.allocator, env_raw);
+    const bind_list = try parseCommaList(ctx.allocator, bind_raw);
+    const workdir_raw = ctx.flag("workdir", []const u8);
+
+    const timeout_val: i32 = ctx.flag("timeout", i32);
+
+    const opts: nodeforge.provision_staging_session.SessionOptions = .{
+        .staging_path = resolved.path,
+        .digest = resolved.digest,
+        .workdir = if (workdir_raw.len > 0) workdir_raw else null,
+        .env = env_list,
+        .binds = bind_list,
+        .no_cgroup = ctx.flag("no-cgroup", bool),
+        .limits = buildCgroupLimits(ctx),
+        .persist_tmp = ctx.flag("persist-tmp", bool),
+        .hostname = ctx.flag("hostname", []const u8),
+        .quiet = ctx.flag("quiet", bool),
+        .command = command,
+        .script_host = if (script_raw.len > 0) script_raw else null,
+        .timeout = if (timeout_val > 0) @intCast(timeout_val) else null,
+    };
+
+    const p = nodeforge.paths.require();
+    const result = nodeforge.provision_staging_session.executeSession(ctx.io, ctx.allocator, opts, p.run_dir, errorWriter(ctx)) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "staging exec failed: {t}", .{err});
+        try writeCommandError(ctx, "rootfs.staging_exec_error", msg, 1);
+        return;
+    };
+    defer result.deinit(ctx.allocator);
+    setExitCode(ctx, result.exit_code);
+}
+
+fn profileRootfsStagingKernelsHandler(ctx: zli.CommandContext) !void {
+    _ = outputFromContext(ctx) orelse return;
+    var config = loadConfig(ctx.io, ctx.allocator, ctx.flag("config", []const u8), errorWriter(ctx), ctx.flag("debug", bool)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+    defer config.deinit();
+    const name = ctx.getArg("name") orelse return;
+    const digest_override = ctx.flag("digest", []const u8);
+
+    const resolved = (try resolveStagingTree(ctx, name, digest_override)) orelse {
+        setExitCode(ctx, 1);
+        return;
+    };
+
+    const kernels = nodeforge.provision_staging_kernel_import.scanKernels(ctx.io, ctx.allocator, resolved.path) catch |err| {
+        const msg = try std.fmt.allocPrint(ctx.allocator, "kernel scan failed: {t}", .{err});
+        try writeCommandError(ctx, "rootfs.staging_kernel_scan_error", msg, 1);
+        return;
+    };
+    defer nodeforge.provision_staging_kernel_import.freeKernels(ctx.allocator, kernels);
+
+    const human = try nodeforge.provision_staging_kernel_import.formatKernelList(ctx.allocator, kernels);
+
+    // 构建 JSON 输出
+    var json_buf: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer json_buf.deinit();
+    try json_buf.writer.writeAll("{\"ok\":true,\"result\":{\"kernels\":[");
+    for (kernels, 0..) |k, i| {
+        if (i > 0) try json_buf.writer.writeAll(",");
+        try json_buf.writer.print("{{\"release\":{f}", .{std.json.fmt(k.release, .{})});
+        if (k.vmlinuz_path) |vp| try json_buf.writer.print(",\"vmlinuz_path\":{f}", .{std.json.fmt(vp, .{})});
+        if (k.modules_path) |mp| try json_buf.writer.print(",\"modules_path\":{f}", .{std.json.fmt(mp, .{})});
+        if (k.initramfs_path) |ip| try json_buf.writer.print(",\"initramfs_path\":{f}", .{std.json.fmt(ip, .{})});
+        try json_buf.writer.writeAll("}");
+    }
+    try json_buf.writer.writeAll("]}}");
+
+    try renderOutputDocument(ctx, .{ .human = .{ .text = human }, .json = json_buf.written() });
 }
 
 fn profileRootfsStatusHandler(ctx: zli.CommandContext) !void {

@@ -48,6 +48,8 @@ const node_discovery = @import("../state/node_discovery.zig");
 const operations = @import("../state/operations.zig");
 const rootfs_artifact_store = @import("../state/rootfs_artifact_store.zig");
 const rootfs_staging_store = @import("../state/rootfs_staging_store.zig");
+const staging_session = @import("../provision/staging_session.zig");
+const staging_kernel_import = @import("../provision/staging_kernel_import.zig");
 const repository_index_blob = @import("../state/repository_index_blob.zig");
 const diskless_delivery = @import("../state/diskless_delivery.zig");
 const diskless_credential = @import("../state/diskless_credential.zig");
@@ -71,6 +73,7 @@ const log = std.log.scoped(.http);
 const max_rootfs_build_jobs = 8;
 const rootfs_profile_cap = 128;
 const rootfs_digest_len = 64;
+const rootfs_kernel_release_cap = 128;
 const initrd_field_cap = 192;
 /// ISO 导入 job 的文本字段上限：staged 不透明文件名（24 hex + 原 basename）
 /// 与 logical id（≤128）都远小于此。
@@ -88,6 +91,9 @@ const RootfsBuildJob = struct {
     keep_staging: bool = false,
     /// 跳过 stage 1–5，仅从已保留树 mksquashfs 并允许 replace 已发布制品。
     from_staging: bool = false,
+    /// v0.4.1: from-staging 时启动面内核选择模式（keep|auto|<release>）。
+    kernel_release: [rootfs_kernel_release_cap]u8 = [_]u8{0} ** rootfs_kernel_release_cap,
+    kernel_release_len: u8 = 0,
 };
 
 const RootfsBuildWorker = struct {
@@ -95,8 +101,8 @@ const RootfsBuildWorker = struct {
     mutex: std.atomic.Mutex = .unlocked,
     stop: std.atomic.Value(bool) = .init(false),
 
-    fn submit(self: *RootfsBuildWorker, operation_id: []const u8, profile: []const u8, input_digest: []const u8, keep_staging: bool, from_staging: bool) !void {
-        if (operation_id.len != boot_session.id_len or profile.len == 0 or profile.len > rootfs_profile_cap or input_digest.len != rootfs_digest_len)
+    fn submit(self: *RootfsBuildWorker, operation_id: []const u8, profile: []const u8, input_digest: []const u8, keep_staging: bool, from_staging: bool, kernel_release: []const u8) !void {
+        if (operation_id.len != boot_session.id_len or profile.len == 0 or profile.len > rootfs_profile_cap or input_digest.len != rootfs_digest_len or kernel_release.len > rootfs_kernel_release_cap)
             return error.InvalidRootfsBuildJob;
         while (!self.mutex.tryLock()) std.Thread.yield() catch {};
         defer self.mutex.unlock();
@@ -106,10 +112,12 @@ const RootfsBuildWorker = struct {
                 .profile_len = @intCast(profile.len),
                 .keep_staging = keep_staging,
                 .from_staging = from_staging,
+                .kernel_release_len = @intCast(kernel_release.len),
             };
             @memcpy(&job.operation_id, operation_id);
             @memcpy(job.profile[0..profile.len], profile);
             @memcpy(&job.input_digest, input_digest);
+            @memcpy(job.kernel_release[0..kernel_release.len], kernel_release);
             return;
         };
         return error.RootfsBuildQueueFull;
@@ -4346,7 +4354,7 @@ fn managementProfileClone(request: zap.Request, context: *RouteContext, source: 
         return cloneBuildSubmitFailed(request, meta, "cannot create rootfs build operation");
     saveOperations(context) catch return cloneBuildSubmitFailed(request, meta, "cannot persist rootfs build operation");
     if (!begun.reused) {
-        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex, false, false) catch |err| {
+        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex, false, false, "keep") catch |err| {
             _ = context.operations.fail(begun.entry.idSlice(), if (err == error.RootfsBuildQueueFull) "rootfs.queue_full" else "rootfs.invalid_job", unixNow()) catch {};
             saveOperations(context) catch {};
             return cloneBuildSubmitFailed(request, meta, "rootfs build worker queue is unavailable");
@@ -4419,6 +4427,8 @@ const RootfsBuildRequest = struct {
     keep_staging: bool = false,
     /// 基于已保留树重新打包：跳过 OS 层与 rootfs-build 步骤，可替换同 digest 制品。
     from_staging: bool = false,
+    /// v0.4.1: from-staging 时启动面内核选择（keep|auto|<release>）。
+    kernel_release: ?[]const u8 = null,
 };
 const InitrdBuildRequest = struct {
     name: []const u8,
@@ -4492,6 +4502,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     const new_ssh_keys = if (parsed_request) |parsed| parsed.value.new_ssh_keys else false;
     const keep_staging = if (parsed_request) |parsed| parsed.value.keep_staging else false;
     const from_staging = if (parsed_request) |parsed| parsed.value.from_staging else false;
+    const kernel_release = if (parsed_request) |parsed| (parsed.value.kernel_release orelse "keep") else "keep";
     if (from_staging and new_ssh_keys)
         return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"rootfs.invalid\",\"message\":\"from_staging cannot be combined with new_ssh_keys\"}}\n", meta);
 
@@ -4572,6 +4583,10 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
     if (from_staging and !staging_present)
         return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.staging_not_found\",\"message\":\"no retained staging tree for this profile digest; build with --keep-staging first\"}}\n", meta);
 
+    // v0.4.1: from-staging 与活跃会话锁互斥（快速失败；worker 侧再做一次以防 TOCTOU）
+    if (from_staging and staging_session.isLocked(context.io, context.allocator, paths.require().run_dir, digest_hex))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.staging_locked\",\"message\":\"staging tree is locked by an active enter/exec session; exit the session first\"}}\n", meta);
+
     if (!from_staging) {
         if (context.rootfs_artifacts.find(digest_hex)) |existing| {
             if (!keep_staging or staging_present) {
@@ -4607,7 +4622,7 @@ fn managementRootfsBuild(request: zap.Request, context: *RouteContext, name: []c
         return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"operation.persist_failed\",\"message\":\"cannot persist rootfs build operation\"}}\n", meta);
     };
     if (!begun.reused) {
-        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex, keep_staging, from_staging) catch |err| {
+        context.rootfs_worker.submit(begun.entry.idSlice(), profile.name, digest_hex, keep_staging, from_staging, kernel_release) catch |err| {
             _ = context.operations.fail(begun.entry.idSlice(), if (err == error.RootfsBuildQueueFull) "rootfs.queue_full" else "rootfs.invalid_job", unixNow()) catch {};
             saveOperations(context) catch {};
             return json(request, .service_unavailable, "{\"ok\":false,\"error\":{\"code\":\"rootfs.queue_unavailable\",\"message\":\"rootfs build worker queue is unavailable\"}}\n", meta);
@@ -4636,7 +4651,7 @@ fn hostIsDebianFamily(io: std.Io, allocator: std.mem.Allocator) bool {
 /// - 默认：临时目录 `work/rootfs-build-<digest>-<op>/`，结束后 deleteTree。
 /// - keep_staging：成功后 rename 到 `work/rootfs-staging/<digest>/` 并登记索引。
 /// - from_staging：直接以保留树为源，跳过 stage 1–5，仅 mksquashfs + 深验 + replace 发布。
-fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest: []const u8, operation_id: []const u8, keep_staging: bool, from_staging: bool) !void {
+fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest: []const u8, operation_id: []const u8, keep_staging: bool, from_staging: bool, kernel_release: []const u8) !void {
     const catalog = context.catalog_snapshot.value();
     const profile = lookup.findProfile(catalog, name) orelse return error.MissingProfile;
     if (profile.kind != .diskless) return error.ProfileNotDiskless;
@@ -4662,6 +4677,20 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
 
     if (from_staging) {
         if (!rootfs_staging_store.treeLooksReady(context.io, staging)) return error.RootfsStagingNotFound;
+        // v0.4.1: 检查会话锁，避免与活跃 enter/exec 会话并发改树
+        if (staging_session.isLocked(context.io, context.allocator, paths.require().run_dir, digest_hex)) {
+            std.log.scoped(.rootfs_build).warn("rootfs build [{s}]: from-staging refused — staging tree locked by active session", .{name});
+            return error.RootfsStagingLocked;
+        }
+        // 在昂贵 mksquashfs 之前 fail closed 校验 --kernel-release 可选核
+        if (!std.mem.eql(u8, kernel_release, "keep")) {
+            const preflight = try staging_kernel_import.scanKernels(context.io, context.allocator, staging);
+            defer staging_kernel_import.freeKernels(context.allocator, preflight);
+            _ = staging_kernel_import.selectKernel(preflight, kernel_release, boot_bundle.kernel_release) catch |err| {
+                std.log.scoped(.rootfs_build).err("rootfs build [{s}]: kernel-release preflight failed ({t})", .{ name, err });
+                return err;
+            };
+        }
         std.log.scoped(.rootfs_build).info("rootfs build [{s}]: from-staging re-pack (staging={s})", .{ name, staging });
     } else {
         std.Io.Dir.cwd().deleteTree(context.io, staging_temp) catch {};
@@ -4883,6 +4912,18 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
     var expected_agent_sha256: [64]u8 = undefined;
     try asset_validate.sha256File(context.io, paths.require().bin_dir, "nodeforge-agent", &expected_agent_sha256);
     try deepValidateRootfsArtifact(context, operation_id, part, &expected_agent_sha256);
+
+    // v0.4.1 §6.5：先完成启动面选核/导入，再发布 squashfs，避免「新 rootfs + 旧 PXE 核」半成功。
+    // keep：artifact 沿用 boot_bundle 当前 release；非 keep：import 返回选定 release 供登记。
+    var artifact_kernel_release: []const u8 = boot_bundle.kernel_release;
+    var imported_release_owned: ?[]u8 = null;
+    defer if (imported_release_owned) |r| context.allocator.free(r);
+    if (from_staging and !std.mem.eql(u8, kernel_release, "keep")) {
+        const selected = try importKernelToBootFace(context, staging, boot_bundle.name, kernel_release, boot_bundle.kernel_release);
+        imported_release_owned = selected;
+        artifact_kernel_release = selected;
+    }
+
     // 6. 在同一发布临界区内校验已有记录、原子替换文件并持久化登记。
     // 临时文件包含请求标识；相同摘要的并发构建不会共享或删除彼此的临时文件。
     const artifact: rootfs_artifact_store.Artifact = .{
@@ -4891,7 +4932,7 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
         .content_sha512 = content_sha512[0..],
         .compressed_size = total_size,
         .uncompressed_size = uncompressed_size,
-        .kernel_release = boot_bundle.kernel_release,
+        .kernel_release = artifact_kernel_release,
         .file = file_name,
         .created_at = unixNow(),
         .deep_validated = true,
@@ -4906,6 +4947,131 @@ fn performRootfsBuild(context: *RouteContext, name: []const u8, expected_digest:
         try retainRootfsStaging(context, name, digest_hex, staging, staging_temp, from_staging, operation_id, uncompressed_size, &discard_temp);
     }
     return;
+}
+
+/// v0.4.1 §6.5: 从保留树导入内核到启动面（Layer B）。
+/// 扫描树内 kernel → 按 mode 选择 → 拷 vmlinuz 到 assets → 登记 catalog asset →
+/// 更新 boot bundle 引用 → 验证 → 原子保存发布。
+///
+/// 返回调用方拥有的选定 release 副本（失败不分配）。
+/// `current_release` 用于 auto 模式差集（比 Profile 当前记录「新」）。
+fn importKernelToBootFace(
+    context: *RouteContext,
+    staging: []const u8,
+    boot_bundle_name: []const u8,
+    kernel_release_mode: []const u8,
+    current_release: []const u8,
+) ![]u8 {
+    const allocator = context.allocator;
+
+    // 1. 扫描树内内核
+    std.log.scoped(.rootfs_build).info("kernel import: scanning staging tree (mode={s} current={s})", .{ kernel_release_mode, current_release });
+    const kernels = try staging_kernel_import.scanKernels(context.io, allocator, staging);
+    defer staging_kernel_import.freeKernels(allocator, kernels);
+
+    // 2. 选择内核（keep 由调用方排除，此处不应收到）
+    const sel = staging_kernel_import.selectKernel(kernels, kernel_release_mode, current_release) catch |err| switch (err) {
+        error.KernelSelectionNotNeeded => return error.KernelSelectionNotNeeded,
+        error.NoKernelsFound => {
+            std.log.scoped(.rootfs_build).err("kernel import: no eligible (vmlinuz+modules) kernels found for auto/explicit selection", .{});
+            return err;
+        },
+        error.MultipleKernelsFound => {
+            std.log.scoped(.rootfs_build).err("kernel import: multiple candidate kernels found; specify --kernel-release <release> explicitly", .{});
+            return err;
+        },
+        error.KernelReleaseNotFound => {
+            std.log.scoped(.rootfs_build).err("kernel import: requested release not found in staging tree", .{});
+            return err;
+        },
+        error.KernelVmlinuzNotFound => {
+            std.log.scoped(.rootfs_build).err("kernel import: kernel found but vmlinuz missing", .{});
+            return err;
+        },
+        error.KernelModulesNotFound => {
+            std.log.scoped(.rootfs_build).err("kernel import: kernel found but /lib/modules/<release> missing", .{});
+            return err;
+        },
+    };
+    // 在 freeKernels 前复制 release，供 artifact 登记与调用方使用
+    const selected_release = try allocator.dupe(u8, sel.release);
+    errdefer allocator.free(selected_release);
+
+    // 3. 拷贝 vmlinuz 到 assets 目录
+    const assets_dir = paths.require().assets_dir;
+    const kernel_rel_path = try std.fmt.allocPrint(allocator, "kernels/staging/{s}/vmlinuz", .{selected_release});
+    defer allocator.free(kernel_rel_path);
+    const kernel_abs_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ assets_dir, kernel_rel_path });
+    defer allocator.free(kernel_abs_path);
+    if (std.fs.path.dirname(kernel_abs_path)) |parent| try std.Io.Dir.cwd().createDirPath(context.io, parent);
+    try std.Io.Dir.copyFileAbsolute(sel.vmlinuz_path, kernel_abs_path, context.io, .{ .replace = true, .make_path = true });
+
+    // 4. 计算 SHA-256
+    var sha256_hex: [64]u8 = undefined;
+    try asset_validate.sha256File(context.io, assets_dir, kernel_rel_path, &sha256_hex);
+
+    // 5. 生成资产名称（稳定标识，便于后续 from-staging 覆盖更新）
+    const asset_name = try std.fmt.allocPrint(allocator, "{s}-staging-kernel", .{boot_bundle_name});
+    defer allocator.free(asset_name);
+
+    // 6. 加载 catalog，添加/更新 kernel asset，更新 boot bundle
+    var loaded = try catalog_store.load(context.io, allocator, context.catalog.path);
+    defer loaded.deinit();
+
+    // 添加或更新 kernel asset
+    var assets_list = std.ArrayList(model.AssetConfig).empty;
+    defer assets_list.deinit(allocator);
+    try assets_list.appendSlice(allocator, loaded.value.assets);
+    var asset_found = false;
+    for (assets_list.items) |*a| {
+        if (std.mem.eql(u8, a.name, asset_name)) {
+            a.kind = .kernel;
+            a.path = kernel_rel_path;
+            a.kernel_release = selected_release;
+            a.sha256 = sha256_hex[0..];
+            asset_found = true;
+            break;
+        }
+    }
+    if (!asset_found) {
+        try assets_list.append(allocator, .{
+            .name = asset_name,
+            .kind = .kernel,
+            .path = kernel_rel_path,
+            .kernel_release = selected_release,
+            .sha256 = sha256_hex[0..],
+        });
+    }
+    loaded.value.assets = assets_list.items;
+
+    // 更新 boot bundle 的 kernel_release 和 kernel 引用
+    var bundles_list = std.ArrayList(model.BootBundleConfig).empty;
+    defer bundles_list.deinit(allocator);
+    try bundles_list.appendSlice(allocator, loaded.value.boot_bundles);
+    for (bundles_list.items) |*b| {
+        if (std.mem.eql(u8, b.name, boot_bundle_name)) {
+            const old_release = b.kernel_release;
+            b.kernel_release = selected_release;
+            b.kernel = asset_name;
+            std.log.scoped(.rootfs_build).info("kernel import: boot bundle {s} kernel_release {s} -> {s}, kernel -> {s}", .{ boot_bundle_name, old_release, selected_release, asset_name });
+            break;
+        }
+    }
+    loaded.value.boot_bundles = bundles_list.items;
+
+    // 7. 验证
+    const projected = model.projectCatalog(context.config.*, &loaded.value);
+    config_validate.validate(&projected, &loaded.value) catch |err| {
+        std.log.scoped(.rootfs_build).err("kernel import: catalog validation failed ({t})", .{err});
+        return err;
+    };
+
+    // 8. 保存并发布
+    try catalog_store.save(context.io, allocator, context.catalog.path, &loaded.value);
+    applyCatalogFromDisk(context) catch return error.CatalogPublishFailed;
+
+    std.log.scoped(.rootfs_build).info("kernel import: DONE - vmlinuz={s} asset={s} release={s} sha256={s} modules={s}", .{ sel.vmlinuz_path, asset_name, selected_release, sha256_hex[0..16], sel.modules_path });
+    return selected_release;
 }
 
 /// 将解包树提升/登记为规范保留路径 `work/rootfs-staging/<digest>`。
@@ -4984,7 +5150,7 @@ fn runRootfsBuildWorker(shared_context: *RouteContext, worker: *RootfsBuildWorke
         context.config = pair.config.value();
         context.config_revision = pair.config.revision;
         context.catalog_snapshot = pair.catalog;
-        performRootfsBuild(&context, profile, &job.input_digest, operation_id, job.keep_staging, job.from_staging) catch |err| {
+        performRootfsBuild(&context, profile, &job.input_digest, operation_id, job.keep_staging, job.from_staging, job.kernel_release[0..job.kernel_release_len]) catch |err| {
             pair.release();
             var error_buffer: [96]u8 = undefined;
             const error_code = std.fmt.bufPrint(&error_buffer, "rootfs.{s}", .{@errorName(err)}) catch "rootfs.build_failed";
@@ -5272,15 +5438,15 @@ test "rootfs worker queue copies jobs and rejects overflow" {
     var worker: RootfsBuildWorker = .{};
     const operation_id = "0123456789abcdef0123456789abcdef";
     const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    try worker.submit(operation_id, "profile-a", digest, false, false);
+    try worker.submit(operation_id, "profile-a", digest, false, false, "keep");
     const first = worker.take() orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings(operation_id, &first.operation_id);
     try std.testing.expectEqualStrings("profile-a", first.profile[0..first.profile_len]);
     try std.testing.expectEqualStrings(digest, &first.input_digest);
     try std.testing.expect(worker.take() == null);
 
-    for (0..max_rootfs_build_jobs) |_| try worker.submit(operation_id, "profile-a", digest, false, false);
-    try std.testing.expectError(error.RootfsBuildQueueFull, worker.submit(operation_id, "profile-a", digest, false, false));
+    for (0..max_rootfs_build_jobs) |_| try worker.submit(operation_id, "profile-a", digest, false, false, "keep");
+    try std.testing.expectError(error.RootfsBuildQueueFull, worker.submit(operation_id, "profile-a", digest, false, false, "keep"));
 }
 
 test "v0.2.3: iso worker queue holds one job and rejects concurrent submit" {
@@ -5611,6 +5777,9 @@ fn managementRootfsStagingRemove(request: zap.Request, context: *RouteContext, n
     if (profile.kind != .diskless) return json(request, .bad_request, "{\"ok\":false,\"error\":{\"code\":\"profile.not_diskless\",\"message\":\"rootfs staging is only available for diskless profiles\"}}\n", meta);
     const digest = resolvedRootfsInputDigest(context, catalog, profile) catch |err| return validationError(request, err, meta);
     const digest_hex: []const u8 = digest[0..];
+    // 与活跃 enter/exec 会话互斥，避免会话中删树
+    if (staging_session.isLocked(context.io, context.allocator, paths.require().run_dir, digest_hex))
+        return json(request, .conflict, "{\"ok\":false,\"error\":{\"code\":\"rootfs.staging_locked\",\"message\":\"staging tree is locked by an active enter/exec session; exit the session first\"}}\n", meta);
     const removed = try context.rootfs_stagings.remove(context.io, digest_hex, true);
     if (!removed)
         return json(request, .not_found, "{\"ok\":false,\"error\":{\"code\":\"rootfs.staging_not_found\",\"message\":\"no retained staging for this profile digest\"}}\n", meta);

@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// NodeForge 产品版本的唯一构建事实源。发布新版本时同步更新 build.zig.zon。
-const nodeforge_version = "0.4.0";
+const nodeforge_version = "0.4.1";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -175,6 +175,25 @@ pub fn build(b: *std.Build) void {
     const run_workload = b.addRunArtifact(workload_tests);
     const v04_capacity_step = b.step("test-v0.4-capacity", "Run v0.4 logical capacity workload (256/512/1024 waves)");
     v04_capacity_step.dependOn(&run_workload.step);
+
+    // v0.4.1 staging session unit tests — filtered to staging_kernel_import + staging_session tests.
+    const staging_unit_tests = b.addTest(.{
+        .root_module = core,
+        .filters = &.{ "staging_kernel_import", "staging_session" },
+    });
+    const run_staging_unit = b.addRunArtifact(staging_unit_tests);
+    const v041_staging_unit_step = b.step("test-v0.4.1-staging-unit", "Run v0.4.1 staging session + kernel import unit tests");
+    v041_staging_unit_step.dependOn(&run_staging_unit.step);
+
+    // v0.4.1 staging session contract gate — CLI surface + negative binary assertions.
+    const v041_staging_contract = b.addSystemCommand(&.{"sh"});
+    v041_staging_contract.addFileArg(b.path("tests/v0_4_1_staging_session.sh"));
+    v041_staging_contract.addArtifactArg(cli);
+    v041_staging_contract.addArtifactArg(daemon);
+    v041_staging_contract.addArtifactArg(agent);
+    v041_staging_contract.addArtifactArg(initrd);
+    const v041_staging_step = b.step("test-v0.4.1-staging", "Run v0.4.1 staging session contract gate");
+    v041_staging_step.dependOn(&v041_staging_contract.step);
 }
 
 fn commandOutput(b: *std.Build, argv: []const []const u8) ?[]const u8 {

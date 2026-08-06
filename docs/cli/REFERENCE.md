@@ -40,7 +40,34 @@ profile set|unset
 profile add-values|remove-values|replace-values|clear-values|list-values
 profile item|replace-items|clear-items
 profile rootfs plan|build|status
+profile rootfs staging list|show|remove
+profile rootfs staging enter|exec|kernels
 ```
+
+v0.4.1 会话与换核（详情以 `--help-full` 为准）：
+
+```text
+# 交互 / 非交互会话（管理节点本机 root；不经 nodeforged）
+sudo nodeforge profile rootfs staging enter <profile> [--digest HEX]
+  [--shell PATH] [--workdir PATH] [--env K=V,...] [--bind host:guest,...]
+  [--no-cgroup | --memory-max SIZE --memory-swap SIZE --cpu-max SPEC --pids-max N]
+  [--persist-tmp] [--hostname NAME] [--quiet]
+
+sudo nodeforge profile rootfs staging exec <profile> [--script /host/path.sh | -- <cmd>...]
+  [同上限额/bind/env/timeout 等]
+
+# 扫描保留树内内核
+nodeforge profile rootfs staging kernels <profile> [--digest HEX]
+
+# 再打包 + 可选启动面换核（默认 keep = 与 v0.4 一致）
+nodeforge profile rootfs build <profile> --from-staging
+  [--kernel-release keep|auto|<uname-r>]
+```
+
+- 限额单位：`memory-max` 支持 `2G`/`512M` 等，内部换算为 cgroup v2 字节；写失败 **fail closed**。
+- `--no-cgroup` 与任一限额 flag 互斥。
+- `--script` 与位置命令互斥；脚本从宿主 bind 进会话后执行。
+- 同 digest 会话锁与 `from-staging` / `staging remove` 互斥。
 
 `profile clone` 只复制 desired configuration，不继承 runtime、session 或 operation。
 `profile show` 已包含 Stored 与 Effective 投影，不另设 `profile effective`。

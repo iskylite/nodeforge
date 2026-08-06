@@ -1,6 +1,6 @@
 # NodeForge v0.4.1 设计：Rootfs Staging 会话环境
 
-状态：**设计中**（本文件为 v0.4.1 唯一设计入口；实现未开始）
+状态：**已实现**（v0.4.1 实现完成；本文件为 v0.4.1 唯一设计入口）
 
 v0.4.1 在 v0.4 已落地的 **可选 rootfs staging 保留 / from-staging 再打包** 之上，增加管理节点侧的 **staging 会话环境**（`enter` / `exec`）：在保留的解包树上以近似实机的命名空间与挂载矩阵打开可交互 shell 或执行脚本，支持复杂驱动/软件（含 Lustre 等会在树内产出新内核的场景），再通过既有 `--from-staging` 发布 ready squashfs。
 
@@ -484,8 +484,8 @@ nodeforge profile rootfs build <profile> --from-staging \
 3. exit
 4. profile rootfs staging kernels   # 确认 release
 5. profile rootfs build --from-staging --kernel-release <release>
-6. 验证 BootConfig / TFTP 文件与 ready squashfs
-7. 节点 diskless 启动验证模块 vermagic
+6. 验证 BootConfig / TFTP 文件与 ready squashfs（**管理面**，本版发布闸）
+7. 节点 diskless 启动验证模块 vermagic（**节点侧实机**；环境延期 `ENV-V041-KERNEL-VERMAGIC` / `V041-D09`，见 [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md)）
 ```
 
 ### 6.6 明确不做什么
@@ -493,7 +493,8 @@ nodeforge profile rootfs build <profile> --from-staging \
 - 不在 shell 会话中自动改 catalog（避免半会话状态）；
 - 不在 from-staging 默认静默换核（默认 `keep`）；
 - 不要求 host 与 stage 内核一致；
-- 不把「能在管理节点 modprobe 成功」作为发布闸。
+- 不把「能在管理节点 modprobe 成功」作为发布闸；
+- **不把**「换核后节点 vermagic / Lustre-class 实机 E2E」作为 v0.4.1 发布闸（环境延期 `ENV-V041-KERNEL-VERMAGIC`）。
 
 ---
 
@@ -595,11 +596,17 @@ nodeforge profile rootfs build <profile> --from-staging \
 6. 同 digest 第二会话/并发 from-staging 被锁拒绝并给出明确错误。
 7. `profile rootfs staging kernels` 能列出树内 modules/vmlinuz；`--kernel-release` 显式选择后 from-staging 更新启动面资产（或明确报告已对齐）。
 8. 默认 `--kernel-release keep` 时行为与 v0.4 from-staging 一致。
-9. diskless 路径回归：未换核时 initrd/BootConfig 不变；换核后节点能用新 vermagic 加载树内模块（至少在实验室矩阵验证一次 Lustre-class 或等价「树内新 release + 模块」场景）。
+9. diskless **管理面**回归：未换核（`keep`）时不静默改写 initrd/BootConfig/启动核引用；换核路径在管理节点侧可观测（catalog / boot_bundle / artifact `kernel_release` 更新摘要）。
 10. **步骤日志默认开启**（§3.7）：失败能看出卡在哪一步；中文模块注释与 README 示例更新。
 11. 不引入 Docker/Podman 硬依赖；不引入节点侧构建或 squashfs import；**不经 nodeforged 做交互 shell**。
 12. **不引入** 顶层 `nodeforge rootfs …`；help / REFERENCE / 完成闸只认 `profile rootfs staging …`。
 13. **不实现** `pivot_root`；切根仅 chroot（遗留 `V041-D01`）。
+
+**不在本版发布闸（环境延期）：**
+
+| 项 | 说明 |
+|---|---|
+| 换核后 **节点侧** vermagic / Lustre-class 实机闭环 | 树内新 release + 模块 → 启动面导入 → diskless 节点启动并加载模块（vermagic 对齐）。能力与操作序已实现/文档化（§6.5），**实机证据**记入 [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) `ENV-V041-KERNEL-VERMAGIC`（`V041-D09`），不阻断 v0.4.1 发布闸。 |
 
 ---
 
@@ -621,7 +628,8 @@ nodeforge profile rootfs build <profile> --from-staging \
 | 默认 cgroup 挂载 | 无 | 有 |
 | 会话 cgroup 资源限额 CLI | 无 | **有**（§3.6） |
 | 共享 host 网 + 会话 HTTP 源 | 无产品入口 | 有 |
-| 树内核扫描与启动面导入 | 无 | 有（显式） |
+| 树内核扫描与启动面导入 | 无 | 有（显式，管理面） |
+| 节点 vermagic / Lustre 实机闭环证据 | 无 | **环境延期** `ENV-V041-KERNEL-VERMAGIC` |
 | `pivot_root` | 无 | **仍无**（遗留 `V041-D01`） |
 | 顶层 `nodeforge rootfs …` | 无 | **仍无**（违背资源树） |
 | 自动把会话步骤固化为 Profile | 无 | 仍无 |
@@ -633,10 +641,11 @@ nodeforge profile rootfs build <profile> --from-staging \
 | 阶段 | 内容 | 可演示结果 |
 |---|---|---|
 | **P0** | `profile rootfs staging enter`/`exec` + full 挂载 + cgroup **挂载** + **限额参数**（§3.6）+ 锁 + 清理 + **完整步骤日志** | 可安全会话运维并保护管理节点 |
-| **P1** | kernels 扫描；from-staging `--kernel-release` | Lustre 类换核可闭环 |
+| **P1** | kernels 扫描；from-staging `--kernel-release` 启动面导入 | 管理面换核可闭环（catalog/boot_bundle） |
 
-P0+P1 构成 v0.4.1 **最小可发布集**（含 cgroup 限额）。  
-**不在本版分期：** `pivot_root`（`V041-D01`）、顶层 `rootfs` 命令、WebSocket TTY、net ns 隔离。
+P0+P1 构成 v0.4.1 **最小可发布集**（含 cgroup 限额；**不含**节点 vermagic 实机证据）。  
+**不在本版分期：** `pivot_root`（`V041-D01`）、顶层 `rootfs` 命令、WebSocket TTY、net ns 隔离。  
+**环境延期（非实现缺口）：** 节点侧 vermagic / Lustre-class 实机闭环 → `ENV-V041-KERNEL-VERMAGIC`。
 
 ---
 
