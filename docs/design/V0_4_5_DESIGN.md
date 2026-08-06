@@ -4,7 +4,7 @@
 
 ## 0. 定位
 
-在 v0.4.4（nodeforge 备料 + agent 本机 build/stage + 管理面 register）之后，v0.4.5 规划：
+在 v0.4.4（nodeforge 备料 + **`nodeforge-builder`** 本机 build/stage + 管理面 register）之后，v0.4.5 规划：
 
 | 能力 | 一句话 |
 |---|---|
@@ -12,7 +12,16 @@
 | **恢复本地盘** | 将镜像/包恢复到本机磁盘，使节点从 diskless 或裸机状态落为本地安装式运行 |
 | **同步**（若需要） | 与 nodeforged / 制品库之间的镜像登记与拉取（**具体协议待定**） |
 
-形态预期（与 v0.4.3/v0.4.4 一致）：**`nodeforge-agent` 子命令、单次进程、非常驻服务**。
+### 0.1 二进制形态（与 v0.4.4 对齐）
+
+| 二进制 | 角色 |
+|---|---|
+| `nodeforge-agent` | 生命周期 only（v0.4.2）；**不**承载克隆/擦盘 |
+| `nodeforge-builder` | rootfs 构建（v0.4.4）；**不**承载克隆 |
+| **`nodeforge-imager`** | **本版**候选名：磁盘 **镜像** 打包与恢复（**按需下发**，默认不部署到全体节点） |
+
+形态预期：**独立二进制 + 强制子命令 + root-only + 单次进程、非常驻**；由 nodeforge 在操作前同步到目标节点（同 v0.4.4 prepare 模式）。  
+命名语义：**imager** = 面向块设备/系统镜像，区别于 builder（制品构建）与 agent（启动收敛）。
 
 **本版不写：** 完成闸、API schema、命令 flag 全集、与 install Profile 的字段映射——**待定**。
 
@@ -20,7 +29,7 @@
 
 - 涉及 **块设备、分区、bootloader、双盘、数据保留**，复杂度远高于 rootfs CAS 构建。  
 - 与 diskless「共享只读 lower + 易失 upper」模型张力大，错误设计易污染黄金镜像或误擦盘。  
-- 依赖 v0.4.4 的 agent CLI 骨架与（可选）publish/制品通道，但 **业务域独立**。
+- 依赖 v0.4.4 的 **按需下发工具二进制** 与（可选）publish/制品通道，但 **业务域独立**。
 
 ## 2. 范围边界（当前共识）
 
@@ -29,12 +38,14 @@
 - 克隆：生成可运输产物（格式/介质 **待定**）。  
 - 恢复：向指定磁盘写入并处理 boot 链（步骤 **待定**）。  
 - 与 NodeForge 身份/ profile 的关联方式（是否登记 catalog **待定**）。  
-- 危险操作的显式确认与 dry-run（原则：**要做**，细节待定）。
+- 危险操作的显式确认与 dry-run（原则：**要做**，细节待定）。  
+- 大文件拉回/下发：对齐 v0.4.4 collect 的空间预检、续传与哈希（细节待定）。
 
 ### 2.2 明确不在此偷做
 
 - 不替代 v0.4.4 的 ISO/rootfs/staging。  
 - 不引入常驻 agent 平台。  
+- 不把克隆逻辑塞进 `nodeforge-agent` 或默认 rootfs。  
 - 不默认把 diskless upper 当可克隆黄金源（若未来支持，必须显式声明 upper 策略）。
 
 ## 3. 开放问题（后续填）
@@ -44,23 +55,26 @@
 3. 是否必须经 nodeforged 登记才算「集群内镜像」？  
 4. 恢复与现有 **install Profile / kickstart** 的关系：替代还是并行？  
 5. 网络装机 vs 本机介质恢复的优先级。  
-6. 密钥与敏感数据：克隆时红action 策略。  
-7. 与 v0.4.2 `os_layer`、v0.4.1 staging 的交叉（一般无直接耦合）。
+6. 密钥与敏感数据：克隆时 redaction 策略。  
+7. 与 v0.4.3 `os_layer`、v0.4.1 staging 的交叉（一般无直接耦合）。  
+8. `nodeforge-imager` 最终命名是否在实现前再评审一次。
 
 ## 4. 文档与版本关系
 
 | 文档 | 角色 |
 |---|---|
 | 本文件 | v0.4.5 **立项与边界**；细节待定 |
-| [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md) | 指定节点本机构建前置 |
-| [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md) | inspect |
+| [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md) | 指定节点构建前置；builder 下发与 collect 模式可复用 |
+| [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md) | agent 子命令 / inspect（生命周期） |
+| [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md) | OS 层 minimal/full |
 | [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) | 状态表指向本文件 |
 
 ## 5. 裁决摘要（仅当前能定的）
 
 1. **克隆打包 + 恢复本地盘 = v0.4.5**，不塞进 v0.4.4。  
 2. **细节后续待定**；实现前须另开评审补全本章。  
-3. 形态倾向 **agent 单次 CLI**，非常驻。
+3. **独立二进制 `nodeforge-imager`（候选名）**，按需下发，非常驻；**不**进默认 agent。  
+4. 危险操作必须显式确认（原则已定，细节待定）。
 
 ---
 

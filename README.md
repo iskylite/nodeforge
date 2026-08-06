@@ -64,7 +64,7 @@ NodeForge/
 - **`nodeforge`**：管理客户端，通过 `127.0.0.1` 调用 daemon 的管理 API。
 - **`nodeforge-initrd`**：diskless initramfs 中的 PID 1，负责网络、下载、
   校验、overlay 和 switch_root。
-- **`nodeforge-agent`**：目标 rootfs 内执行器（v0.4.3 起强制子命令：`pre-init` / `first-boot` / `inspect` 等；设计见 [V0_4_3](docs/design/V0_4_3_DESIGN.md)）。
+- **`nodeforge-agent`**：目标 rootfs 内执行器（v0.4.2 起强制子命令：`pre-init` / `first-boot` / `install-first-boot` / `inspect` 等；设计见 [V0_4_2](docs/design/V0_4_2_DESIGN.md)）。
 
 默认安装根为 `/opt/nodeforge`。`nodeforge setup` 会生成 `/etc/profile.d/nodeforge.sh`，新登录 shell
 自动将 `/opt/nodeforge/bin` 加入 `PATH`；当前 shell 可执行 `source /etc/profile.d/nodeforge.sh` 立即生效。
@@ -75,10 +75,10 @@ NodeForge/
 
 - [v0.4 统一设计](docs/design/V0_4_DESIGN.md)：当前版本契约。
 - [v0.4.1 staging 会话设计](docs/design/V0_4_1_DESIGN.md)：已实现；验证见 [V0_4_1 runbook](docs/validation/V0_4_1_VALIDATION_RUNBOOK.md)。
-- [v0.4.2 OS 层 minimal/full 设计](docs/design/V0_4_2_DESIGN.md)：**设计中**，不阻断 v0.4 / v0.4.1。
-- [v0.4.3 节点本地 inspect](docs/design/V0_4_3_DESIGN.md)：**设计中** — diskless `inspect`，agent 子命令骨架。
-- [v0.4.4 指定节点 rootfs 构建](docs/design/V0_4_4_DESIGN.md)：**设计中** — nodeforge 备料/register，agent 本机 build/stage。
-- [v0.4.5 克隆与本地盘恢复](docs/design/V0_4_5_DESIGN.md)：**骨架**，细节待定。
+- [v0.4.2 agent 子命令 + inspect](docs/design/V0_4_2_DESIGN.md)：**设计中** — 子命令硬切（含 install-first-boot）+ diskless `inspect`。
+- [v0.4.3 OS 层 minimal/full 设计](docs/design/V0_4_3_DESIGN.md)：**设计中**，不阻断 v0.4 / v0.4.1。
+- [v0.4.4 指定节点 rootfs 构建](docs/design/V0_4_4_DESIGN.md)：**设计中** — nodeforge 备料/register + **`nodeforge-builder`**（默认 HTTP 源）。
+- [v0.4.5 克隆与本地盘恢复](docs/design/V0_4_5_DESIGN.md)：**骨架** — 候选 **`nodeforge-imager`**，细节待定。
 - [统一延期与非目标清单](docs/design/DEFERRED_DESIGN_INDEX.md)：延期/非目标唯一状态表。
 - [通用平台验证运行手册](docs/validation/PLATFORM_VALIDATION_RUNBOOK.md)：大更新 fresh 公共发布闸。
 - [v0.4 全量验证运行手册](docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md)：v0.4 增量闸。

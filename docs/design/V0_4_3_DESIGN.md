@@ -1,245 +1,515 @@
-# NodeForge v0.4.3 设计：节点本地部署信息查询（agent 子命令）
+# NodeForge v0.4.3 设计：Rootfs OS 层模式（minimal / full）与交互配方
 
 状态：**设计中**（v0.4.3 唯一设计入口；实现前评审）
 
-## 0. 定位
+v0.4.3 在 v0.4 / v0.4.1 已落地的 diskless rootfs 构建与 staging 会话之上，为 **OS 层** 增加显式模式与可复现软件配方：
 
-运维 SSH 登录 **diskless 目标节点** 后，管理 API 通常在管理节点本机（如 `127.0.0.1`），无法远程 `node show`。  
-本版只解决：在节点上用 **`nodeforge-agent inspect`** 读取 **本机已有** NodeForge 部署事实（**只读、不连 nodeforged**）。
+- `os_layer.mode = minimal | full`（默认 / 缺省 / 非法值 **fallback `minimal`** = 当前硬编码保护闭包行为）；
+- **full** Profile / BootBundle 使用命名 qualifier `full`；**minimal 命名不变**；
+- full 下消费 install source 的 environment / group / task / package；**optional 仅整组属性**；
+- human CLI 交互补全配方；非交互缺字段 **fail closed**。
 
-| 做 | 不做 |
+**不改变**既有强制边界：
+
+- rootfs **只**由 `nodeforged` 所在管理节点生成；
+- diskless 节点 **只**消费 ready squashfs；
+- **local-only** 受管源；不因 full 拉公网 archive；
+- v0.4.1 staging enter/exec 仍是运维特需路径，与 mode **正交**。
+
+与前序版本关系：
+
+| 版本 | 交付 |
 |---|---|
-| diskless 节点本地 inspect | **install 节点不在本版范围**（无对等 plan 痕迹需求） |
-| 只读本机文件 | 连接 nodeforged / 管理 API |
-| 子命令式 CLI 重构（与 0.4.4 共用骨架） | 写配置、诊断包、构建 rootfs |
+| v0.4 | keep-staging / from-staging、共享 rootfs 边界 |
+| v0.4.1 | staging 会话、内核扫描/启动面导入（管理面） |
+| v0.4.2（设计中） | agent 子命令骨架 + diskless `inspect`（与本版正交） |
+| **v0.4.3** | **OS 层 minimal/full + 交互配方 + include_optional** |
+| v0.4.4 / v0.4.5 | `nodeforge-builder` 指定节点构建 / `nodeforge-imager` 克隆恢复 |
 
-后续：本机构建 → [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md)；克隆/恢复 → [`V0_4_5_DESIGN.md`](V0_4_5_DESIGN.md)。
+v0.4 / v0.4.1 发布闸 **不依赖** 本文件。
 
----
-
-## 1. 目标
-
-1. **`nodeforge-agent` 改为子命令入口**（见 §3），`inspect` 为正式子命令。  
-2. **仅 diskless**：输出本机部署摘要；数据 **只来自本机**。  
-3. **仅 root 可执行**（`euid==0`，否则非 0 退出）。  
-4. human + `--output json`；无新常驻服务。
+关联：[`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) §4、[`V0_2_DESIGN.md`](V0_2_DESIGN.md) software 模型、[`naming.zig`](../../src/profile/naming.zig)、[`V0_4_DESIGN.md`](V0_4_DESIGN.md)、[`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md)、[`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md)、[`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md)、[`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md)。
 
 ---
 
-## 2. 数据源与字段契约（对齐代码）
+## 1. 问题与目标
 
-pre-init 成功后，`/var/lib/nodeforge/boot.json` **内容为已校验的 AgentPlan v2 JSON**（**不含 token**）。  
-initrd 另写 `/var/lib/nodeforge/session-id`。
+### 1.1 现状
 
-### 2.1 字段 ← 来源（实现必须按此映射）
+- diskless **OS 层**实现为硬编码保护闭包（dnf 一小撮包；Ubuntu casper 叠层），**不**消费 Profile `software.environment/groups/tasks/packages`。
+- install 路径 Kickstart 已能渲染 environment/groups/packages；默认 `@^minimal-environment`。
+- Ubuntu live-server 受管 `Packages` 常 **无 `Task:`**，`--kind task` 为空是介质事实，不是 CLI 故障。
+- comps **optional** 默认不装（mandatory+default）；Kickstart 支持整段/整组 `--optional`，无细粒度 optional 点选。
 
-| 输出字段 | 来源 | 缺失时 |
-|---|---|---|
-| `schema_version` | 固定 `1` | — |
-| `kind` | 固定 `"diskless"`（本版仅此路径） | — |
-| `node_id` | `boot.json` → `node_id` | 整体失败（见 §4） |
-| `session_id` | 优先文件 `session-id` 首行；否则 `boot.json` → `session_id` | null |
-| `plan_digest` | `boot.json` → `plan_digest` | null |
-| `rootfs_input_digest` | `boot.json` → `rootfs_input_digest` | null |
-| `desired_plan_digest` | `boot.json` → `desired_plan_digest` | null |
-| `deployment_id` | `boot.json` → `deployment_id` | null |
-| `hostname` | `node_apply_projection.hostname` | null |
-| `mac` | `node_apply_projection.mac` | null |
-| `arch` | `node_apply_projection.arch` | null |
-| `first_boot_bundle` | `boot.json` → `first_boot_bundle` | null |
-| `profile` | **AgentPlan 无此字段** → **恒为 null**（不臆造） | null |
-| `paths.boot_json` | 文件是否存在 | bool |
-| `paths.session_id_file` | `/var/lib/nodeforge/session-id` 是否存在 | bool |
-| `paths.initrd_log` / `firstboot_log` | 是否存在（不倾倒内容） | bool |
-| `notes` | 固定短文案（只读 lower / upper 易失等） | 可选数组 |
-| `generated_at` | 执行时刻 UTC | — |
+### 1.2 目标
 
-**禁止输出：** `credentials/*`、任何 token、密码哈希、完整 authorized_keys 列表。
+1. 增加 **OS 层模式** `os_layer.mode = minimal | full`，**默认 / 缺省 / 非法值均 fallback 为 `minimal`**（与当前已实现行为一致）。
+2. **`full` Profile / BootBundle 命名带 `full` qualifier**；**minimal 命名保持现状**（无 qualifier）。
+3. **`full` 下** OS 层真正按 install source 能力与用户选择装包；支持 **groups/packages（及 Ubuntu tasks）叠加**。
+4. **optional**：仅提供 **整组/整段级** 属性开关，默认关；不做 optional 细粒度扫描写入 packages。
+5. **CLI 交互配方**（human 模式）：RHEL 未指定 environment 时强制从 ISO index 选；Ubuntu 有 task 则交互选 task；**无 task 时不以「介质全集」为默认安装集**，基线=casper + 用户显式 packages（交互多选或 `packages.include`）；两端均可交互增删 packages（及 RHEL groups）。
+6. **非交互 / CI**：缺必填选择 **fail closed**，不静默猜「最大 environment / Server with GUI」。
 
-### 2.2 成功 / 失败条件（exit）
+### 1.3 非目标
 
-| 码 | 条件 |
+| 非目标 | 说明 |
 |---|---|
-| `0` | root，且 `boot.json` 存在且能解析为含 `node_id` 的 AgentPlan 对象；允许部分字段 null |
-| `1` | root，但 **不是** 可识别的 diskless 部署痕迹（无 boot.json / 解析失败 / 无 node_id） |
-| `2` | 非 root、用法错误、未知子命令 |
-| `其它` | 意外 I/O |
-
-说明：exit `1` 表示「这台机器上没有可展示的 diskless 部署信息」，不是「字段缺一个就失败」。
+| 自动猜「最大 environment」 | 跨发行版不稳定（Server with GUI / GNOME / workstation 等） |
+| optional 包级点选 | 过设计；用整组 `--optional` 属性即可 |
+| 破 local-only 拉公网 archive | full 上界 = **该 install source 受管仓库** |
+| 用 staging 会话代替 full 配方 | staging 仍是运维特需路径，与 mode 正交 |
+| 把 Node `overrides.software` 烤进公共 rootfs | 共享 rootfs 边界不变 |
 
 ---
 
-## 3. CLI 重构（v0.4.3 起骨架，0.4.4 沿用）
-
-### 3.1 子命令模型（**不**兼容旧 argv）
+## 2. 概念模型
 
 ```text
-nodeforge-agent <subcommand> [flags…]
+                    Profile
+         os_layer.mode = minimal | full
+         software.*（environment / groups / tasks / packages / include_optional）
+                              │
+              ┌───────────────┴───────────────┐
+              │ mode=minimal                    │ mode=full
+              ▼                               ▼
+     保护闭包 OS 层（现状）            配方驱动 OS 层
+     （不展开 env/group/task）         + casper（Ubuntu）或 dnf 基线
+     packages.include 仍可叠加*        + env/groups/tasks/packages
+              │                               │
+              └───────────────┬───────────────┘
+                              ▼
+                    rootfs-build phase → squashfs
 ```
 
-**硬性规则：必须有子命令。** 无子命令 / 仅旧式 `--pre-init` flag → **usage + exit 2**，**不**再隐式 first-boot / pre-init。
+\* **minimal 下 `packages.include`**：允许作为「最小闭包上的显式加包」（实现必须支持）；**不**因 mode=minimal 去交互要 environment。  
+\* **full 下** 以配方为主；保护闭包仍是 **下界**（不可被 exclude 拆掉）。
 
-| 子命令 | 版本 | 行为 |
-|---|---|---|
-| `pre-init` | 既有逻辑迁入 | 原 `--pre-init` 路径（切根后 PID1） |
-| `first-boot` | 既有逻辑迁入 | 原 unit 无参路径 |
-| `inspect` | **0.4.3** | 本机部署摘要 |
-| `version` | **0.4.3** | 打印版本 |
-| `help` | **0.4.3** | 用法 |
-| （0.4.4）`rootfs …` | 见 V0_4_4 | 本机构建 |
-
-**调用方必须同步改（实现本版时一并改，不做双认过渡）：**
-
-| 调用方 | 旧 | 新 |
-|---|---|---|
-| initrd `execve` agent | `nodeforge-agent --pre-init` | `nodeforge-agent pre-init` |
-| `nodeforge-firstboot.service` | `ExecStart=…/nodeforge-agent` | `ExecStart=…/nodeforge-agent first-boot` |
-| 文档 / runbook / 测试脚本 | 旧 argv | 子命令 |
-
-### 3.2 全局约束
-
-| 项 | 裁决 |
+| 术语 | 定义 |
 |---|---|
-| 执行身份 | **所有子命令要求 root**（`euid==0`），含 `inspect` / `version` |
-| 连接 nodeforged | **inspect 禁止** |
-| 输出 | `inspect --output human\|json`（默认 human）；json 时业务在 stdout，诊断在 stderr |
+| **保护闭包（protected closure）** | 可启动 + nodeforge-agent 收敛 + SSH/网络/包管理器所需最小集合；两 mode 均 ⊇ 此集合 |
+| **配方（recipe）** | Profile 上持久化的 `software.*` + `os_layer.mode`；进入 `rootfs_input_digest` |
+| **介质宇宙（universe）** | 该 install source 受管 repodata/Packages 中全部 **package** 名；**仅**作选包上界/候选，**不是**默认安装集（旧称「介质全集」已废弃为安装语义） |
+| **交互配置（wizard）** | human TTY 下补全 full 配方的 CLI 流程；结果 **写回 Profile** 后才 build |
 
-### 3.3 全面调整清单（实现 v0.4.3 时必须闭合）
+---
 
-子命令硬切、**不做旧 argv 兼容**。下表为变更全集；实现 PR 应按表勾选，缺一即 boot 断链。
+## 3. 命名规则（与现有一致）
 
-#### A. 代码 / 构建产物
+既有语法（`src/profile/naming.zig`）：
 
-| # | 项 | 现状 | 目标 |
+```text
+Profile:     <install-source>[-<qualifier>]-<install|diskless>
+BootBundle:  <install-source>[-<qualifier>]-diskless-bundle
+```
+
+| mode | qualifier | 示例（install source = `rocky-9.7-aarch64-minimal`） |
+|---|---|---|
+| **minimal** | **无**（现状不变） | `rocky-9.7-aarch64-minimal-diskless` |
+| **full** | **`full`** | `rocky-9.7-aarch64-minimal-full-diskless` |
+| full + 其它用途 | `full` 与其它 qualifier **组合顺序**见下 | `…-full-compute-diskless` 或 `…-compute-full-diskless` |
+
+### 3.1 qualifier 裁决
+
+1. **ISO 导入自动创建的 default Profile**：仅 **minimal** 命名（今天行为），`os_layer.mode=minimal`。  
+2. **创建 full Profile**（CLI `profile create` / `profile clone` / 显式 wizard「另存为 full」）：名称必须带 qualifier **`full`**。  
+3. 若已有其它 qualifier（如 `compute`），**full 作为独立 token 插入 source 与 kind 后缀之间**，规范为：
+
+```text
+<install-source>-full[-<other-qualifier>]-<install|diskless>
+```
+
+示例：
+
+```text
+rocky-9.7-aarch64-minimal-full-diskless
+rocky-9.7-aarch64-minimal-full-install
+rocky-9.7-aarch64-minimal-full-diskless-bundle
+ubuntu-22.04.5-live-server-arm64-full-diskless
+```
+
+4. **校验**：`os_layer.mode=full` 的 Profile 名 **必须** 满足 `profileIsCanonical` 且 base 段含 `-full`（或 name 在 source 后第一段 qualifier 为 `full`）。`mode=minimal` **不得** 强制改名；允许历史名无 full。  
+5. **禁止** 仅靠改 mode 而不改名导致「同名 Profile 语义从 minimal 变 full」——`profile set os_layer.mode=full` 若名称无 `full` qualifier → **fail closed**，提示 `profile clone` 到规范 full 名或 rename 流程。
+6. **现有 `naming.zig` 语法**：当前 `<install-source>[-<qualifier>]-<install|diskless>` 仅支持单个 qualifier 段。若需 `full` 与其它 qualifier（如 `compute`）组合，实现须扩展 qualifier 解析为有序多段；未扩展前，单 qualifier `full` 优先交付，多 qualifier 组合可在首个 full Profile 出现时再迭代。
+
+---
+
+## 4. 配置模型
+
+### 4.1 新 / 明确字段
+
+| 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| A1 | `src/agent.zig` 入口 | `--pre-init` / 无参 first-boot | **强制** `pre-init` \| `first-boot` \| `inspect` \| `version` \| `help` |
-| A2 | 删除旧解析 | flag / 无参语义 | 无子命令 → exit 2 + usage |
-| A3 | `src/initrd.zig` | `argv = {agent, "--pre-init"}`（约 L407） | `argv = {agent, "pre-init"}`；日志字符串同步 |
-| A4 | initrd 模块注释 | 写 `--pre-init` | 改为 `pre-init` 子命令 |
-| A5 | agent 文件头注释 | 两阶段旧 argv | 子命令说明 |
-| A6 | `zig-out/share/.../nodeforge-firstboot.service` 源模板 | `ExecStart=.../nodeforge-agent` | `ExecStart=.../nodeforge-agent first-boot` |
-| A7 | rootfs 烤入 unit 的路径 | 构建/注入逻辑若写死 ExecStart | 与 A6 一致（搜 firstboot.service 注入点） |
-| A8 | agent 单测 | 无分发测试 | 无子命令失败；inspect 夹具；pre-init/first-boot 入口仍可测 |
-| A9 | （可选预留）`rootfs` 命名空间 | — | 仅 help 列出「见 v0.4.4」，本版不实现 |
+| `os_layer.mode` | enum `minimal` \| `full` | **`minimal`** | 缺省、空、未知值 → **fallback `minimal`**（不报错，日志 debug 一条） |
+| `software.include_optional` | bool | **`false`** | 仅 **full** 且存在 group/environment 展开时生效；映射 Kickstart/dnf **整组 optional** |
+| `software.environment` | string? | null | **RHEL/dnf only**；full 且未设置时交互必选或非交互失败 |
+| `software.groups` | set | [] | RHEL groups 叠加 |
+| `software.tasks` | set | [] | Ubuntu tasks 叠加 |
+| `software.packages.include` | set | [] | 显式加包 |
+| `software.packages.exclude` | set | [] | 显式减包（不可减 protected） |
 
-#### B. 启动链与制品（必须同版发布）
+存储位置：Profile catalog（与其它 software 字段同级 owner）。  
+`os_layer.mode` 建议挂在 Profile 根或 `software` 旁；**PropertySpec 注册**为 scalar，mutable，进 digest。
 
-| # | 项 | 说明 |
+### 4.2 include_optional（整组级，非细粒度）
+
+| 值 | dnf diskless OS 层 | Kickstart install 渲染 |
 |---|---|---|
-| B1 | **nodeforge-initrd 与 nodeforge-agent 必须同构建、同发版** | initrd 内嵌/拷贝的 agent 与 rootfs 内 agent 调用约定一致；禁止只升其一 |
-| B2 | **重建 diskless initrd 资产** | 改 A3 后旧 initrd 仍会 exec `--pre-init` → 新 agent 直接失败；发版闸：相关 boot_bundle 的 initrd 必须 rebuild |
-| B3 | **重建 / 替换已发布 rootfs 中的 unit + agent** | 旧 squashfs 内 unit 无参、旧 agent 不认 `first-boot`；发版或运维须 rootfs rebuild 或明确「仅新 profile」 |
-| B4 | install-root 的 `share/systemd` 与 setup 拷贝 | `setup` / 打包脚本带上新 unit |
-| B5 | 现场已部署节点 | 滚动：先发管理节点新二进制 → rebuild initrd+rootfs → 再开 diskless；文档写清顺序 |
+| `false`（默认） | `group install` **不含** optional（mandatory+default） | `%packages` **无** `--optional`；`@group` 无 `--optional` |
+| `true` | 对选中的 environment 所含 groups + 显式 groups 使用 **with-optional** 语义 | `%packages --optional` **或** 每个 `@group --optional`（实现选一种并固定；推荐 **段级 `--optional`** 与「全局/整组」产品语义一致） |
 
-#### C. 文档（现行有效，非 archive）
+**不做**：扫描 comps optional 列表自动写入 `packages.include`。
 
-| # | 路径 | 改什么 |
-|---|---|---|
-| C1 | 本文件 | 契约与清单（本文） |
-| C2 | [`DISKLESS_FINAL.md`](DISKLESS_FINAL.md) | 凡 `nodeforge-agent --pre-init` / 无参 unit → 子命令（现行行为入口） |
-| C3 | [`V0_2_PROGRAM_DESIGN.md`](V0_2_PROGRAM_DESIGN.md) 等仍被引用的冻结分册 | 启动 argv 处加脚注「v0.4.3 起为子命令」或改关键句，避免与实现矛盾 |
-| C4 | [`README.md`](../../README.md) | agent 职责一句 + 子命令示例 |
-| C5 | [`docs/cli/REFERENCE.md`](../cli/REFERENCE.md) | 增加 **nodeforge-agent** 小节：子命令表、root-only、inspect |
-| C6 | [`docs/validation/PLATFORM_VALIDATION_RUNBOOK.md`](../validation/PLATFORM_VALIDATION_RUNBOOK.md) | 核验 agent/initrd 成对、unit ExecStart、实机 boot 用新 argv |
-| C7 | [`docs/validation/V0_4_FULL_VALIDATION_RUNBOOK.md`](../validation/V0_4_FULL_VALIDATION_RUNBOOK.md) | diskless 闭环步骤注明 first-boot unit 子命令 |
-| C8 | v0.4.1 / v0.4.4 设计交叉引用 | 已/同步指向子命令模型 |
+`mode=minimal` 时 `include_optional=true` → **fail closed**（minimal 无 group 展开，属性无意义）。
 
-#### D. 测试与脚本
+**校验时机**：在 **`profile validate` / `rootfs build`（及 daemon 构建入口）** 时执行，**不**在单字段 `profile set` 时硬拦中间态（允许先设 optional 再切 mode，或先切 minimal 再清 optional）。`profile set` 可给 warning，但以 build 时闭合为准。
 
-| # | 路径 / 类型 | 改什么 |
-|---|---|---|
-| D1 | `tests/v0_4_contract.sh` 等 | 若 strings/调用假定旧 argv，改为新约定 |
-| D2 | `tests/setup.sh` / `cli.sh` / rootfs 相关 | 不直接起 agent 则至少安装产物检查 unit 模板 |
-| D3 | 任何手工 QEMU/VMware 脚本 | `pre-init` / `first-boot` |
-| D4 | CI 若有 agent 冒烟 | 无子命令必须 fail |
-
-#### E. 明确不改（避免误伤）
-
-| 项 | 原因 |
-|---|---|
-| `nodeforge-initrd` 的 `single_threaded` / 无 pthread | 见 §6；与子命令无关 |
-| install first-boot **plan** 协议 | 另一路径；本版 inspect 不做 install |
-| 管理 CLI `nodeforge` 命令树 | 不改 |
-| archive/ 下历史验证记录 | 只读快照，不回写 |
-
-#### F. 发版检查单（勾选）
+### 4.3 fallback 规则
 
 ```text
-[ ] agent 无子命令 → exit 2
-[ ] initrd 源码 argv = pre-init
-[ ] firstboot.service ExecStart = … first-boot
-[ ] zig build 产物 unit 已更新
-[ ] 新 initrd 资产已 build 并挂到测试 boot_bundle
-[ ] 新 rootfs 含新 agent + 新 unit（或明确仅测新 profile）
-[ ] r97n1（或等价）diskless 冷启动：pre-init → systemd → first-boot 成功
-[ ] inspect 在已启动 diskless 上 root 可跑
-[ ] 文档 C1–C7 已改
-[ ] 旧 initrd + 新 agent 组合已在文档标为不支持
+mode_raw = profile.os_layer.mode
+if mode_raw is null or empty or not in {minimal, full}:
+    mode = minimal
+else:
+    mode = mode_raw
 ```
 
 ---
 
-## 4. 完成标准
+## 5. OS 层装包语义（按 mode × 发行版）
 
-1. diskless 节点 root 执行 `nodeforge-agent inspect`，JSON 含 `node_id`、`rootfs_input_digest` 或 `plan_digest` 等 AgentPlan 实有字段；`profile` 为 null 可接受。  
-2. 无 boot.json 的机器 → exit 1。  
-3. 非 root → exit 2。  
-4. 无 token/密钥泄漏；不访问网络管理 API。  
-5. `pre-init` / `first-boot` **仅**子命令形式可用；旧 argv 拒绝。  
-6. §3.3 清单 A–F 完成（含新 initrd + 新 rootfs/unit 联调 boot）。  
-7. `version`/`help` 可用。
+### 5.1 公共：保护闭包
 
----
+两 mode 在 Stage 1 结束后必须满足保护闭包。`packages.exclude` 若触及闭包 → **fail closed**。
 
-## 5. diskless initrd 如何构建？（现状说明）
+**dnf 严格闭包**（缺一构建失败；对齐 `rootfs_os_builder.dnf_core_packages`）：
 
-实现入口：`src/provision/initrd_build_executor.zig`（`nodeforge assets initrd build …` → daemon worker）。
+`bash`, `coreutils`, `dnf`, `systemd`, `shadow-utils`, `util-linux`, `iproute`, `NetworkManager`, `openssh-server`, `procps-ng`, `kernel-core`, `kernel-modules`
 
-### 5.1 流水线（摘要）
+**dnf archive 工具**（best-effort，**不**算保护闭包，exclude 可去掉）：`tar`, `gzip`, `xz`
+
+**apt/casper 严格文件**（对齐 `casper_required_files`）：
+
+`sbin/init`, `usr/lib/systemd/systemd`, `usr/bin/apt`, `usr/sbin/sshd`
+
+清单变更必须 bump `builder_revision`。
+
+### 5.2 mode = minimal
+
+| 族 | 行为 |
+|---|---|
+| **dnf** | **仅**保护闭包（+ 可选 archive 工具 best-effort，与现状一致）；**不**安装 environment/groups/tasks |
+| **apt** | **仅** casper 叠层 + 保护文件检查；**不**按 task 装 |
+| **packages.include** | 在闭包/casper **之后** 从受管源安装（显式加包）。**当前代码未接线，本版新增实现**（非「现状已支持」） |
+| **packages.exclude** | 仅对 **本模式实际装上的可移除包** 生效；不可拆闭包 |
+| **environment/groups/tasks** | 可存在于 Profile（供 install 路径或将来展示），**minimal diskless OS 层忽略**；`profile show` 标注 `os_layer: ignored for diskless OS` |
+
+### 5.3 mode = full · RHEL/Rocky（dnf）
+
+**输入要求：**
+
+1. `software.environment` **必须** 已设置且落在 install source software index 的 `kind=environment` 中。  
+2. 未设置：见 §6 交互；非交互 → `error os_layer.environment_required`。  
+3. **禁止** 实现「自动选包数最多的 environment」。
+
+**装包顺序（受管 file:// only）：**
 
 ```text
-1. 准备 work 目录
-2a. 有 vendor installer initrd（来自 ISO / install source）
-    → 不解包重打 vendor 成员（防宿主 libc 混进发行版 initrd）
-    → 只搭 NodeForge overlay 根
-2b. 无 vendor 基底
-    → dracut --no-hostonly（network base + squashfs/overlay 等）→ 解包为根
-3. 注入 nodeforge-initrd → /usr/sbin/nodeforge-initrd
-4. 注入 同目录构建的 nodeforge-agent → /usr/sbin/nodeforge-agent
-5. 注入最小 DHCP hook 脚本（udhcpc/dhclient 脚本）
-6. 将 nodeforge-initrd 安装为 /init（PID 1，不用 #!/bin/sh wrapper）
-7. 预创建 /capsule 等目录
-8. 打 gzip/newc overlay；有 vendor 时：vendor initrd 字节作前缀 + overlay 第二 member
+1. bootstrap 保护闭包（可与 minimal 共用原语）
+2. dnf group install @^<environment>
+   （include_optional=true 时带 optional）
+3. dnf group install @<group>…（software.groups）
+4. dnf install <packages.include>…
+5. dnf remove <packages.exclude>…（受 protected 约束）
+6. 再次断言保护闭包存在
 ```
 
-运行时：`/init`（nodeforge-initrd）拉 rootfs → overlay → 把 initrd 内 agent **再 cp 到 merged root** `/usr/sbin/nodeforge-agent` → `execve(agent, pre-init 子命令)`（v0.4.3 起）。
+**与「介质全包 `*`」的关系：**  
+本设计 **不以 `*` 作为 full 定义**。full = **用户选定的 environment（+ groups/packages）**。  
+若用户希望「尽量多」：交互时选择更完整的 environment，并追加 groups/packages；**不**静默 `*`。
 
-### 5.2 是否支持「导入 pthread」？
+### 5.4 mode = full · Ubuntu（apt）
 
-| 问题 | 结论 |
+**分支 A — index 中存在至少一个 `kind=task`：**
+
+1. `software.tasks` **必须** 非空（交互必选至少一个，或允许显式空？→ **至少一个 task 或显式 packages.include 非空** 二选一，避免空 full）。  
+2. 解析 task → 包闭包：仅使用 **受管 Packages 中带对应 `Task:` 的包** + metapackage 惯例；解析失败 fail closed。  
+3. casper 叠层 → `apt-get install`（tasks 闭包 ∪ packages.include）→ exclude。
+
+**分支 B — index 中无任何 task（live-server 典型）：**
+
+**裁决（相对旧稿「介质全集默认安装」的收敛）：**
+
+| 概念 | 定义 |
 |---|---|
-| 当前 initrd/agent 是否链 pthread？ | **否**。`build.zig` 对二者 `single_threaded=true`，产物仅 `NEEDED libc`（r97n0 实证） |
-| 构建器会不会往 initrd 里塞 libpthread.so？ | **不会**。overlay 只拷贝 **nodeforge 自有二进制 + 文本 hook**，明确 **禁止** 用宿主 `dracut-install` 拉 libc/pthread（防 Rocky 版本混配） |
-| 若强行 agent/initrd 关闭 single_threaded？ | 链接可能出现 `NEEDED libpthread.so.0`；**vendor initrd 或 dracut fallback 不保证提供该 .so** → 早期 PID 1 / pre-init **加载失败** 风险高 |
-| 正确做法若需要线程 | **仅**对运行在 **完整 rootfs 用户态** 的二进制考虑线程；**initrd 内 `/init` 与 pre-init 保持无 pthread**。0.4.4 本机构建若需线程，也只影响「运维场景 agent」，且依赖 **目标盘上完整 glibc**，与 initrd 闭包分离 |
+| **介质宇宙（universe）** | 受管 `Packages*` 中全部 `Package:` 名 —— **仅**作可选集 / 校验上界 / 交互候选列表，**不是**默认 `apt-get install` 目标 |
+| **OS 层基线** | **casper 叠层**（已是 live 介质 rootfs，内容远大于 dnf 保护闭包） |
+| **full 配方** | 在 casper 之上 **显式** 安装 `packages.include`（及交互所选包）；`packages.exclude` 仅对本次实际装上的可移除包生效，不可拆保护闭包文件 |
 
-**产品裁决：**
+**规则：**
 
-- **initrd：始终 single_threaded**，不导入、不依赖 pthread。  
-- **agent：Linux 构建主机默认允许多线程**（`single_threaded=false`）；非 Linux 交叉默认单线程；可用 `-Dagent-single-threaded=` 覆盖。详见 `build.zig`。
+1. **禁止**将「Packages 索引内全部包名」作为默认安装列表（体积、冲突、离线解算均不可接受）。  
+2. full 且无 task 时：`packages.include` **必须非空**，或 human wizard 从 universe **多选至少 1 个包**后写回 Profile。  
+3. 非交互且 `packages.include` 空 → fail closed：`os_layer.packages_required`。  
+4. 装包顺序：casper 叠层 → `apt-get install <packages.include>`（仅受管源）→ exclude。  
+5. 包名不在 universe 内 → `software.unknown_capability`。  
+6. **禁止**：chroot 后改写 sources 指向公网 archive 来补 task/包组。
+
+**与 RHEL full 对称性：** RHEL full 也不以 `*` 为定义，而要求显式 environment；Ubuntu 无 task 时对称要求显式 packages，casper 承担「介质已提供的文件系统基线」。
+
+### 5.5 install Profile（Kickstart / Autoinstall）
+
+| mode | Kickstart | Autoinstall |
+|---|---|---|
+| minimal | 现状：`@^minimal-environment` 或已配置 environment；groups/packages 照旧 | packages/tasks 照旧 |
+| full | 必须有 environment；`%packages` 写 `@^env` + `@groups` + pkgs；`include_optional` → 段级 `--optional` | tasks + packages；无 task 时 **仅** 显式 packages 列表（非介质全集） |
+
+install 的 full Profile **同样**遵守 `-full-` 命名。
 
 ---
 
-## 6. 裁决摘要
+## 6. CLI 交互配方（human）
 
-1. **仅 diskless 本地 inspect**；install 不考虑。  
-2. **字段严格映射 AgentPlan + session-id 文件**；无 profile 字段则 null。  
-3. **只读本机**；不连 nodeforged。  
-4. **子命令硬切、不兼容旧 argv**；§3.3 全量调整清单 + 发版检查单。  
-5. **initrd = vendor/dracut 基底 + NodeForge overlay**；**不支持/不引入 pthread**。  
-6. **构建能力在 0.4.4**（nodeforge 备料 + 节点 agent 执行）。
+### 6.1 入口
+
+推荐一等公民命令（资源树内，不引入顶层乱命令）：
+
+```text
+nodeforge profile os-layer configure <profile>
+# 或
+nodeforge profile software configure <profile> --os-layer full
+```
+
+亦可在：
+
+```text
+nodeforge profile create <name> --kind diskless --from-install-source <src> --os-layer full
+```
+
+时，若 TTY 且缺配方，**进入同一 wizard**；`--yes` / `--output json` / 非 TTY → **不进入 wizard**，缺字段直接失败。
+
+### 6.2 何时触发强制交互
+
+| 条件 | 行为 |
+|---|---|
+| `mode=full`，dnf，`environment` 未设，human TTY | **必须**列出 index environments，用户选 1 个 |
+| `mode=full`，apt，存在 tasks，且 `tasks` 空且 `packages.include` 空，human TTY | **必须**多选 tasks（至少 1 个）或进入「仅自定义 packages」路径 |
+| `mode=full`，apt，无 tasks，且 `packages.include` 空，human TTY | **不**问 task；提示 casper 为基线、须从介质宇宙选包；**强制**多选 packages（≥1） |
+| `mode=minimal` | **不**强制 env/task 交互 |
+| 非交互且缺必填 | fail closed，打印可执行的 `profile set` / `add-values` 示例 |
+
+### 6.3 Wizard 步骤（full · RHEL）
+
+```text
+1. 确认 install source 与 software index revision
+2. 列表 environments（id + name），单选 → software.environment
+3. 可选：列表 groups，多选 → software.groups（可跳过）
+4. 可选：include_optional? [y/N] → software.include_optional
+5. 可选：packages include（逗号/多行，校验在 index 内）
+6. 可选：packages exclude（校验 protected）
+7. 预览配方摘要 + 写回 Profile
+8. 询问是否立即 rootfs build
+```
+
+### 6.4 Wizard 步骤（full · Ubuntu · 有 task）
+
+```text
+1. 列表 tasks，多选（至少 1）或选「跳过 task，仅 packages」
+2. packages include / exclude
+3. 写回 + 可选 build
+```
+
+### 6.5 Wizard 步骤（full · Ubuntu · 无 task）
+
+```text
+1. 提示：index 无 Task 字段；基线 = casper；介质宇宙仅作候选（共 N 个 package）
+2. 从候选多选 packages.include（至少 1；支持搜索/过滤，禁止一键「全选介质」作为默认路径）
+3. 可选 packages.exclude
+4. 写回 + 可选 build
+```
+
+### 6.6 非交互完备示例
+
+```bash
+# RHEL full
+nodeforge profile clone rocky-9.7-aarch64-minimal-diskless \
+  rocky-9.7-aarch64-minimal-full-diskless
+nodeforge profile set rocky-9.7-aarch64-minimal-full-diskless os_layer.mode=full
+nodeforge profile set rocky-9.7-aarch64-minimal-full-diskless software.environment=minimal-environment
+nodeforge profile add-values rocky-9.7-aarch64-minimal-full-diskless software.groups -- core
+nodeforge profile add-values rocky-9.7-aarch64-minimal-full-diskless software.packages.include -- vim-enhanced
+nodeforge profile set rocky-9.7-aarch64-minimal-full-diskless software.include_optional=false
+nodeforge profile rootfs build rocky-9.7-aarch64-minimal-full-diskless --yes
+
+# Ubuntu full（无 task → casper 基线 + 显式 packages.include）
+nodeforge profile set ubuntu-…-full-diskless os_layer.mode=full
+nodeforge profile add-values ubuntu-…-full-diskless software.packages.include -- openssh-server vim
+nodeforge profile add-values ubuntu-…-full-diskless software.packages.exclude -- unneeded-pkg
+nodeforge profile rootfs build ubuntu-…-full-diskless --yes
+```
 
 ---
 
-*v0.4.3 唯一设计入口。*
+## 7. 构建与 digest
+
+### 7.1 `rootfs_input_digest` 必须包含
+
+- `os_layer.mode`（归一化后的 minimal/full）  
+- `software.environment` / `groups` / `tasks` / `packages.include|exclude`  
+- `software.include_optional`  
+- 相关 repository `software_index.revision_digest`  
+- 既有 OS/source/casper/builder ABI 等  
+
+**minimal 忽略 env/groups/tasks 装包时**：这些字段 **仍进入 digest**（避免「改了 env 却不 rebuild」的认知陷阱）；或文档明确 minimal 下变更 env **不改变** digest——**推荐仍进入 digest**，实现简单、可预期。
+
+### 7.2 Stage 1 伪代码
+
+```text
+mode = normalize(profile.os_layer.mode)  // default minimal
+protected = protectedClosure(family)
+recipe = profile.software
+
+if mode == minimal:
+    installMinimal(protected)
+    installPackages(recipe.packages.include)
+    applyExclude(recipe.packages.exclude, protected)
+else: // full
+    validateFullRecipe(family, recipe, index)  // 非交互缺字段则失败
+    if family == rhel:
+        installMinimal(protected)  // bootstrap
+        groupInstallEnvironment(recipe.environment, optional=recipe.include_optional)
+        groupInstall(recipe.groups, optional=recipe.include_optional)
+        installPackages(recipe.packages.include)
+        applyExclude(...)
+    else: // ubuntu
+        casperOverlay()
+        if index.hasTasks:
+            pkgs = resolveTasks(recipe.tasks) ∪ recipe.packages.include
+        else:
+            // universe = allPackagesInIndex() 仅校验；不安装全集
+            requireNonEmpty(recipe.packages.include)  // 或 task 路径
+            pkgs = recipe.packages.include
+        aptInstall(pkgs)  // 仅受管源；包须 ∈ universe
+        applyExclude(...)
+assertProtected(protected)
+```
+
+### 7.3 与 rootfs-build phase
+
+- OS 层只负责 mode+software 基线。  
+- `rootfs-build` 的 package/script/archive **之后**叠加，语义不变。  
+- staging enter / from-staging **不**改 `os_layer.mode`。
+
+---
+
+## 8. 校验与错误码
+
+| 条件 | 码（稳定字符串） |
+|---|---|
+| full Profile 名无 `full` qualifier | `os_layer.full_name_required` |
+| full + dnf + 无 environment（非交互） | `os_layer.environment_required` |
+| full + dnf + environment 不在 index | `software.unknown_capability` |
+| full + apt + 有 task + tasks 与 packages.include 皆空（非交互） | `os_layer.task_or_packages_required` |
+| full + apt + **无** task + packages.include 空（非交互） | `os_layer.packages_required` |
+| include_optional=true + mode=minimal | `os_layer.optional_requires_full` |
+| exclude 命中 protected | `software.protected_exclude` |
+| 包/group/task 不在 index | `software.unknown_capability` |
+| Ubuntu full 拉公网 | 不实现 |
+
+---
+
+## 9. CLI / API 表面
+
+```text
+# 属性
+nodeforge profile set <p> os_layer.mode=minimal|full
+nodeforge profile set <p> software.include_optional=true|false
+nodeforge profile set <p> software.environment=<id>
+nodeforge profile add-values <p> software.groups|tasks|packages.include|packages.exclude -- …
+
+# 交互配方
+nodeforge profile os-layer configure <p> [--os-layer full]
+
+# 创建
+nodeforge profile create … --os-layer full   # 生成 -full- 名并 mode=full
+nodeforge profile clone <src> <dst-full-name> --os-layer full
+
+# 查询（增强提示）
+nodeforge profile software available <p> --kind environment|group|task|package
+# task 为空时 stderr hint：live ISO 常无 Task 字段；full 基线=casper，须显式 packages.include
+```
+
+HTTP：与 CLI 同字段；**无** 远程 TTY wizard；daemon 只接受已完备的 Profile 做 rootfs build。
+
+---
+
+## 10. 实现落点（v0.4.3 全量清单）
+
+| 模块 | 工作 |
+|---|---|
+| `model` / PropertySpec / catalog schema | `os_layer.mode`、`software.include_optional` |
+| `profile/naming.zig` | full qualifier 约定与 `full` 名校验 helper；现有语法 `<source>[-<qualifier>]-<kind>` 仅支持单个 qualifier 段，需扩展为支持 `full` 与其它 qualifier（如 `compute`）的组合解析（见 §3.1 point 3） |
+| `config/validate.zig` | §8 规则；family 与 kind 适用性 |
+| `provision/os_layer_software.zig`（新） | recipe 归一化、protected、解析 task 闭包、装包计划 |
+| `provision/rootfs_os_builder.zig` | Stage 1 按 mode 分支；去掉「software 未接线」状态 |
+| `profile/adapter/kickstart.zig` | full + include_optional 渲染 |
+| `profile/adapter/ubuntu.zig` | full tasks/packages |
+| `main.zig` | set/configure wizard、create/clone `--os-layer`、available hint |
+| `profile/diskless.zig` `ProfileBuildProjection` | **新增** `os_layer_mode` 字段（归一化后的 `minimal`/`full`），确保 `rootfs_input_digest` 覆盖 mode 变更；`software.include_optional` 作为 `SoftwareSelection` 新字段自动进入既有 `software` 序列化路径 |
+| 测试 | 命名、fallback、validate、recipe 渲染契约、wizard 非 TTY 失败 |
+| 文档 | REFERENCE、DISKLESS_FINAL 交叉链接、本文件完成闸 |
+
+---
+
+## 11. 完成标准（v0.4.3 发布闸）
+
+1. 未配置 / 非法 `os_layer.mode` → 行为与 **当前 minimal OS 层**一致。  
+2. `mode=minimal` 命名 **无需** `full`；现有 `*-diskless` 回归通过。  
+3. `mode=full` 要求规范名含 `-full-`；否则 set/build fail closed。  
+4. RHEL full：必须选定 index 内 environment；groups/packages/include_optional 按 §5.3 装入 rootfs。  
+5. Ubuntu full：有 task 则按 tasks；无 task 则 casper + 非空 packages.include（禁止默认装介质全集）；packages 增删生效。  
+6. `include_optional=true` 仅 full；Kickstart/dnf 呈整组 optional，默认 false。  
+7. human wizard 在缺 environment（RHEL）时强制选择；非交互缺字段失败。  
+8. exclude 无法拆除 protected；local-only 无公网。  
+9. digest 随 mode/software 变化；改配方必须 rebuild 才变内容。  
+10. 无「自动最大 environment」逻辑。
+
+---
+
+## 12. 裁决摘要
+
+1. **`os_layer.mode=minimal|full`，默认与 fallback 均为 minimal。**  
+2. **full 资源名使用 qualifier `full`：`<source>-full[-…]-diskless|install`；minimal 名不变。**  
+3. **full · RHEL = 必选 environment + 可选 groups/packages；不猜最大 env；不以 `*` 为定义。**  
+4. **full · Ubuntu = 有 task 则选 task；无 task 则 casper 基线 + 显式 packages（介质宇宙仅作上界/候选，非默认安装集）。**  
+5. **`software.include_optional` 整组级，默认 false；不扫 optional 进 packages。**  
+6. **交互写回 Profile；CI 非交互 fail closed。**  
+7. **保护闭包两 mode 下界；local-only 不变。**
+
+
+---
+
+## 13. 文档与版本关系
+
+| 文档 | 角色 |
+|---|---|
+| 本文件 `V0_4_3_DESIGN.md` | v0.4.3 **唯一设计入口** |
+| [`V0_4_DESIGN.md`](V0_4_DESIGN.md) | v0.4 冻结基线；rootfs 服务端生成与 staging 保留 |
+| [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) | v0.4.1 staging 会话；与 os_layer mode 正交 |
+| [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md) | v0.4.2 agent 子命令 + inspect；与本版正交 |
+| [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) | 延期/非目标；本主题自独立设计进入 v0.4.3 |
+| 后续 `V0_4_3` validation runbook | 实现接近完成时再写证据清单 |
+
+### 13.1 相对 v0.4.1 的增量
+
+| 增量 | v0.4.1 | v0.4.3 |
+|---|---|---|
+| OS 层硬编码保护闭包 | 有（唯一路径） | **minimal** 保留为默认 |
+| `os_layer.mode=full` + 配方装包 | 无 | **有** |
+| full 命名 qualifier | 无 | **有**（`-full-`） |
+| 交互 wizard 选 env/task/packages | 无 | **有** |
+| `software.include_optional` | 无 | **有**（默认 false） |
+| staging enter/exec | 有 | 保留，正交 |
+
+---
+
+*本文件为 NodeForge **v0.4.3** 设计入口，作为实现与评审基准。*

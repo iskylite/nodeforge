@@ -31,23 +31,25 @@ ISO 导入和 initrd 构建会创建 durable operation。ISO 导入由 daemon �
 终态，超时不会取消 daemon 中的任务。`assets initrd build --detach` 立即返回
 operation；CLI 超时均不取消 daemon 侧任务。
 
-## nodeforge-agent（节点侧；v0.4.3 起子命令）
+## nodeforge-agent（节点侧；v0.4.2 起子命令）
 
 ```text
 nodeforge-agent <subcommand> [options]
 ```
 
-**必须**带子命令；无子命令或旧式 `--pre-init` / 无参调用 → 用法错误退出。  
-**要求 root**（`euid==0`）。完整契约见 [`../design/V0_4_3_DESIGN.md`](../design/V0_4_3_DESIGN.md)。
+**必须**带子命令；无子命令或旧式 `--pre-init` / `--install-first-boot` / 无参调用 → 用法错误退出。  
+**要求 root**（`euid==0`）。完整契约见 [`../design/V0_4_2_DESIGN.md`](../design/V0_4_2_DESIGN.md)。
 
 | 子命令 | 含义 |
 |---|---|
 | `pre-init` | diskless `switch_root` 后、真正 init 前的短生命周期入口（由 **新** initrd 调用） |
-| `first-boot` | systemd oneshot：重放 first-boot 步骤（unit：`ExecStart=…/nodeforge-agent first-boot`） |
+| `first-boot` | diskless systemd oneshot：重放 first-boot 步骤（`ExecStart=…/nodeforge-agent first-boot`） |
+| `install-first-boot` | install 路径 first-boot（`ExecStart=…/nodeforge-agent install-first-boot`） |
 | `inspect` | 只读本机 diskless 部署摘要（不连 nodeforged） |
 | `version` / `help` | 版本与用法 |
 
-发版注意：**initrd 与 agent 必须同版重建**；旧 initrd 仍传 `--pre-init` 时与新 agent 不兼容。
+发版注意：**initrd 与 agent 必须同版重建**；旧 initrd 仍传 `--pre-init` 时与新 agent 不兼容。  
+**v0.4.4 起** 指定节点 rootfs 构建使用独立二进制 **`nodeforge-builder`**（不进默认 agent）；见 [`../design/V0_4_4_DESIGN.md`](../design/V0_4_4_DESIGN.md)。
 
 ## Profile
 

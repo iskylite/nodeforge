@@ -5,10 +5,10 @@
 v0.4 在 v0.3 的 install、diskless 与 install-post 基线上增加能力：目标网络 topology、install first-boot、SN+IP draft Node discovery、容量与恢复闸，以及**可选 rootfs staging 保留与基于保留树再打包**（运维特需，不改变「rootfs 仅服务端生成」边界）。本版本采用 fresh replacement，不迁移旧部署状态。容量目标按部署波次、传输并发和实现安全天花板分层定义，不把某个压力测试点写成产品最高上限。
 
 > **v0.4.1（已实现，不改写 v0.4 闸）**：保留树上规范会话（`profile rootfs staging enter` / `exec`、cgroup 挂载与限额、树内核导入等）。见 [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md)。  
-> **v0.4.2（设计中，不阻断 v0.4 / v0.4.1）**：rootfs **OS 层** `os_layer.mode=minimal|full`、full 命名 qualifier、交互软件配方、`software.include_optional`。见 [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md)。  
-> **v0.4.3（设计中）**：diskless 上 **`nodeforge-agent inspect`**（只读本机，不连 daemon）。见 [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md)。  
-> **v0.4.4（设计中）**：**nodeforge 指定节点备料并 register**；节点上 **agent 只做本机 rootfs/stage 构建**。见 [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md)。  
-> **v0.4.5（骨架）**：克隆打包与本地盘恢复（细节待定）。见 [`V0_4_5_DESIGN.md`](V0_4_5_DESIGN.md)。
+> **v0.4.2（设计中，不阻断 v0.4 / v0.4.1）**：agent **子命令硬切** + diskless **`nodeforge-agent inspect`**（只读本机）；含 `install-first-boot`。见 [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md)。  
+> **v0.4.3（设计中）**：rootfs **OS 层** `os_layer.mode=minimal|full`、full 命名 qualifier、交互软件配方、`software.include_optional`。见 [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md)。  
+> **v0.4.4（设计中）**：**nodeforge 指定节点备料并 register**；节点上 **`nodeforge-builder`** 本机构建（默认不部署进 agent）。见 [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md)。  
+> **v0.4.5（骨架）**：克隆打包与本地盘恢复（候选 **`nodeforge-imager`**，细节待定）。见 [`V0_4_5_DESIGN.md`](V0_4_5_DESIGN.md)。
 
 ## 1. 强制架构边界
 

@@ -15,10 +15,10 @@
 | 公开命令树与 exit code | [cli/REFERENCE.md](cli/REFERENCE.md)（参数以 `--help-full` 为准） |
 | 当前版本设计（v0.4） | [design/V0_4_DESIGN.md](design/V0_4_DESIGN.md) |
 | v0.4.1（已实现） | [design/V0_4_1_DESIGN.md](design/V0_4_1_DESIGN.md) — staging enter/exec、cgroup 限额、树内核导入；验证见 [validation/V0_4_1_VALIDATION_RUNBOOK.md](validation/V0_4_1_VALIDATION_RUNBOOK.md) |
-| 下一增量设计（v0.4.2，设计中） | [design/V0_4_2_DESIGN.md](design/V0_4_2_DESIGN.md) — `os_layer.mode` minimal/full、full 命名 qualifier、交互配方、`include_optional` |
-| v0.4.3（设计中） | [design/V0_4_3_DESIGN.md](design/V0_4_3_DESIGN.md) — diskless 本地 `inspect`；agent 子命令骨架 |
-| v0.4.4（设计中） | [design/V0_4_4_DESIGN.md](design/V0_4_4_DESIGN.md) — nodeforge 备料/register + 节点 agent 本机 build/stage |
-| v0.4.5（骨架） | [design/V0_4_5_DESIGN.md](design/V0_4_5_DESIGN.md) — 克隆打包与本地盘恢复（细节待定） |
+| 下一增量设计（v0.4.2，设计中） | [design/V0_4_2_DESIGN.md](design/V0_4_2_DESIGN.md) — agent 子命令硬切 + diskless `inspect`（含 install-first-boot） |
+| v0.4.3（设计中） | [design/V0_4_3_DESIGN.md](design/V0_4_3_DESIGN.md) — `os_layer.mode` minimal/full、交互配方、`include_optional` |
+| v0.4.4（设计中） | [design/V0_4_4_DESIGN.md](design/V0_4_4_DESIGN.md) — nodeforge 备料/register + **`nodeforge-builder`** 本机 build/stage（默认 HTTP 源） |
+| v0.4.5（骨架） | [design/V0_4_5_DESIGN.md](design/V0_4_5_DESIGN.md) — 克隆/恢复；候选 **`nodeforge-imager`**（细节待定） |
 | 延期 / 非目标唯一状态表 | [design/DEFERRED_DESIGN_INDEX.md](design/DEFERRED_DESIGN_INDEX.md) |
 | 大更新公共发布闸 | [validation/PLATFORM_VALIDATION_RUNBOOK.md](validation/PLATFORM_VALIDATION_RUNBOOK.md) |
 | v0.4 增量发布闸 | [validation/V0_4_FULL_VALIDATION_RUNBOOK.md](validation/V0_4_FULL_VALIDATION_RUNBOOK.md) |

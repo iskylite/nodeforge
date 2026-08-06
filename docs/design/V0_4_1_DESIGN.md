@@ -616,10 +616,10 @@ nodeforge profile rootfs build <profile> --from-staging \
 |---|---|
 | 本文件 `V0_4_1_DESIGN.md` | v0.4.1 **唯一设计入口** |
 | [`V0_4_DESIGN.md`](V0_4_DESIGN.md) | v0.4 冻结基线；staging 保留/再打包契约 |
-| [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md) | **下一增量（设计中）**：OS 层 minimal/full 与交互配方；与 staging 正交 |
-| [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md) | diskless `inspect` + agent 子命令（设计中） |
-| [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md) | nodeforge 备料/register + agent 本机 build/stage（设计中） |
-| [`V0_4_5_DESIGN.md`](V0_4_5_DESIGN.md) | 克隆/恢复本地盘（骨架） |
+| [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md) | **下一增量（设计中）**：agent 子命令 + diskless `inspect` |
+| [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md) | OS 层 minimal/full 与交互配方；与 staging 正交（设计中） |
+| [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md) | nodeforge 备料/register + **`nodeforge-builder`** 本机 build/stage（设计中） |
+| [`V0_4_5_DESIGN.md`](V0_4_5_DESIGN.md) | 克隆/恢复；候选 **`nodeforge-imager`**（骨架） |
 | [`DEFERRED_DESIGN_INDEX.md`](DEFERRED_DESIGN_INDEX.md) | 延期项；节点 vermagic 等环境延期 |
 | [`V0_4_1_VALIDATION_RUNBOOK.md`](../validation/V0_4_1_VALIDATION_RUNBOOK.md) | v0.4.1 验证任务书 |
 

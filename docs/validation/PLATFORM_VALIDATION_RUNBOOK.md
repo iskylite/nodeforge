@@ -352,7 +352,7 @@ done
 **注意**：`nodeforge-initrd` 是 initramfs PID 1，**禁止**把直接执行
 `nodeforge-initrd --version` 当作普通版本检查（会进入 bootstrap）。它与
 `nodeforge-agent` 通过同构建、ELF 架构、摘要、注入与 diskless 实机共同核验。
-v0.4.3 起 agent **强制子命令**：initrd 须 `exec … pre-init`，firstboot unit 须 `… first-boot`；**initrd 与 agent 同构建同发版**，禁止旧 initrd + 新 agent 混搭（见 [`../design/V0_4_3_DESIGN.md`](../design/V0_4_3_DESIGN.md) §3.3）。
+v0.4.2 起 agent **强制子命令**：initrd 须 `exec … pre-init`，diskless firstboot unit 须 `… first-boot`，install firstboot unit 须 `… install-first-boot`；**initrd 与 agent 同构建同发版**，禁止旧 initrd + 新 agent 混搭（见 [`../design/V0_4_2_DESIGN.md`](../design/V0_4_2_DESIGN.md) §3.3）。
 
 Make 等价：`make linux-arm64` / `make linux-amd64` / `make dist-linux-arm64`。
 

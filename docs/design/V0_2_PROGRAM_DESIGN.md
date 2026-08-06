@@ -51,7 +51,7 @@ restart 仍是显式运维动作，避免 reconfigure 在无确认时改变服�
 | server compile | 节点启动前 | 读取 pinned Profile/Node/resource snapshot | 生成 BootConfig、AgentPlan、digest；只给敏感控制面读取签发 capability | 不操作节点 rootfs |
 | firmware/GRUB | kernel 之前 | boot config/capsule | 选择 kernel/initrd、追加 `kernel_args`、传递无密钥 node/session/config URL | 不配置目标系统 |
 | `nodeforge-initrd` | `switch_root` 前 | 最小 BootConfig、共享 rootfs | 维持 bootstrap NIC/address，下载/校验 rootfs，建立 lower/upper，写 AgentPlan locator/token handoff | 不取得 AgentPlan，不写 `/etc`、用户、SSH、hosts、软件或目标网络 |
-| agent `pre-init` 子命令 | `switch_root` 后、`/sbin/init` 前 | immutable AgentPlan 与全部 Node payload | 预取校验后清 capability；写最终 rootfs 的 network/hostname/machine-id/users/password/SSH/hosts/NTP/localization/security/software/services | 不读取 latest catalog，不接远程临时命令，不 daemonize；v0.4.3 起强制子命令 argv |
+| agent `pre-init` 子命令 | `switch_root` 后、`/sbin/init` 前 | immutable AgentPlan 与全部 Node payload | 预取校验后清 capability；写最终 rootfs 的 network/hostname/machine-id/users/password/SSH/hosts/NTP/localization/security/software/services | 不读取 latest catalog，不接远程临时命令，不 daemonize；v0.4.2 起强制子命令 argv |
 | agent `--first-boot` | 真正 init/systemd 后 | 不再获取配置；只读 pre-init/rootfs 本地 payload | 按固定 action 顺序执行后处理并上报结果 | 不重复 merge/apply Node baseline，不做 reconciliation |
 
 这里“initrd 写 handoff”与“更新 rootfs 配置”是两类动作：前者只写 `/var/lib/nodeforge/*` 的 locator、摘要和短时凭据，

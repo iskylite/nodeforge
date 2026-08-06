@@ -58,10 +58,10 @@ v0.4 当前边界是：r97n1 各完成至少一次真实 install 与 diskless �
 | `V041-D05` staging HTTP 非交互 API（`exec` / `kernels`） | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §8 | **从 v0.4.1 移出**；首版仅 `nodeforge` 本机特权 CLI，无远程触发需求 | 明确远程触发/operation 日志消费方后设计鉴权与 worker 契约，再排期 |
 | `V041-D06` `rootfs-stagings.json` 索引可选字段（`last_session_at` / `detected_kernels`） | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §8 | **从 v0.4.1 移出**；首版只扫磁盘不写回，字段无消费方 | 明确索引字段消费方后设计 schema 版本与失效策略，再排期 |
 | `V041-D07` staging status 暴露 `session_active` | `UNSCHEDULED` | [`V0_4_1_DESIGN.md`](V0_4_1_DESIGN.md) §7.3 | **从 v0.4.1 移出**；非阻塞观测无消费方 | 明确状态观测消费方后设计 status 契约，再排期 |
-| rootfs `os_layer.mode` minimal/full + 交互配方 + `include_optional` | **已排入 v0.4.2（设计中）** | [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md) | v0.4.2 **唯一设计入口**：默认 minimal=现状；full 用 `-full-` 命名 qualifier；RHEL 必选 environment（不猜最大）；Ubuntu 有 task 则选 task、无则介质全包；optional 仅整组属性。**不阻断** v0.4 / v0.4.1 | 实现与完成闸见 [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md) §11；发布后更新本行状态为已实现 |
-| 节点本地部署信息查询（`nodeforge-agent inspect`） | **已排入 v0.4.3（设计中）** | [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md) | 仅 diskless；只读本机 AgentPlan/session；子命令重构；root-only；不连 nodeforged | 实现与完成闸见该文档 §4 |
-| 指定节点本机 rootfs 构建（nodeforge 备料 + agent 执行 + 管理面 register） | **已排入 v0.4.4（设计中）** | [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md) | nodeforge 同步材料并 collect/register；agent 只 build/stage；管理 API 不暴露给计算节点 | 实现与完成闸见该文档 §8 |
-| 节点克隆打包与本地盘恢复 | **已排入 v0.4.5（骨架）** | [`V0_4_5_DESIGN.md`](V0_4_5_DESIGN.md) | 范围锁定；**细节后续待定**，禁止抢跑实现 | 补全设计后再开完成闸 |
+| 节点本地部署信息查询（`nodeforge-agent inspect`）+ agent 子命令硬切 | **已排入 v0.4.2（设计中）** | [`V0_4_2_DESIGN.md`](V0_4_2_DESIGN.md) | 仅 diskless inspect；子命令含 `pre-init` / `first-boot` / **`install-first-boot`** / inspect；root-only；不连 nodeforged；**不含** rootfs 构建 | 实现与完成闸见该文档 §4 |
+| rootfs `os_layer.mode` minimal/full + 交互配方 + `include_optional` | **已排入 v0.4.3（设计中）** | [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md) | v0.4.3 **唯一设计入口**：默认 minimal=现状；full 用 `-full-` qualifier；RHEL 必选 environment；Ubuntu 有 task 选 task、**无 task 则 casper + 显式 packages**（介质宇宙仅上界，非默认装全集）；optional 仅整组属性。**不阻断** v0.4 / v0.4.1 | 实现与完成闸见 [`V0_4_3_DESIGN.md`](V0_4_3_DESIGN.md) §11；发布后更新本行状态为已实现 |
+| 指定节点本机 rootfs 构建（nodeforge 备料 + **`nodeforge-builder`** + 管理面 register） | **已排入 v0.4.4（设计中）** | [`V0_4_4_DESIGN.md`](V0_4_4_DESIGN.md) | 默认 HTTP 受管源；builder 按需下发、不进默认 agent；collect 含大文件预检/续传/哈希；管理 API 不暴露给计算节点 | 实现与完成闸见该文档 §10 |
+| 节点克隆打包与本地盘恢复 | **已排入 v0.4.5（骨架）** | [`V0_4_5_DESIGN.md`](V0_4_5_DESIGN.md) | 范围锁定；候选二进制 **`nodeforge-imager`**；**细节后续待定**，禁止抢跑实现 | 补全设计后再开完成闸 |
 
 三项独立保留设计彼此不绑定：BIOS 不等于 static PXE，`ram_rootfs` 也不改变 firmware、bootloader 或 bootstrap 协议。
 
